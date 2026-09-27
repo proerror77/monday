@@ -148,6 +148,7 @@ pub(super) fn report_before_settlement(
 pub(super) struct TerminalJobReadback {
     pub job_uid: String,
     pub pod_uid: String,
+    pub job: Value,
     pub pod: Value,
 }
 
@@ -200,8 +201,44 @@ pub(super) fn read_terminal_job(
     Ok(TerminalJobReadback {
         job_uid,
         pod_uid,
+        job,
         pod: items[0].clone(),
     })
+}
+
+impl TerminalJobReadback {
+    pub(super) fn completion(
+        &self,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<alpha_store::campaign_ledger::CampaignDispatchCompletionV1> {
+        let parse = |value: &Value, name: &str| -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+            value
+                .as_str()
+                .with_context(|| format!("missing {name}"))?
+                .parse()
+                .with_context(|| format!("invalid {name}"))
+        };
+        let job_started_at = parse(&self.job["status"]["startTime"], "Job startTime")?;
+        let completed_at = parse(&self.job["status"]["completionTime"], "Job completionTime")?;
+        let terminated = &self.pod["status"]["containerStatuses"][0]["state"]["terminated"];
+        let pod_started_at = parse(&terminated["startedAt"], "Pod startedAt")?;
+        let pod_finished_at = parse(&terminated["finishedAt"], "Pod finishedAt")?;
+        if self.job["metadata"]["uid"] != self.job_uid
+            || self.pod["metadata"]["uid"] != self.pod_uid
+            || pod_started_at < job_started_at
+            || pod_finished_at < pod_started_at
+            || completed_at < pod_finished_at
+            || completed_at > observed_at
+        {
+            bail!("terminal Kubernetes times or identities are inconsistent");
+        }
+        Ok(alpha_store::campaign_ledger::CampaignDispatchCompletionV1 {
+            job_uid: self.job_uid.clone(),
+            pod_uid: self.pod_uid.clone(),
+            job_started_at,
+            completed_at,
+        })
+    }
 }
 
 pub(super) fn validate_terminal_provenance(

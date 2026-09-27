@@ -380,14 +380,15 @@ fn require_cumulative_study(
     let study = store
         .campaign_study_grant(&study_id)?
         .context("market encoder cumulative Study authority is missing")?;
-    if study.grant.budget.max_trials > request.max_trials()
+    if study.grant.study_id != market.plan.study_id
+        || study.grant.budget.max_trials > request.max_trials()
         || study.grant.budget.max_llm_tokens != 0
         || !study.grant.members.iter().any(|member| {
             member.matches_root(&signed.grant, &signed.content_sha256)
                 && member.label_horizon_sha256 == horizon
         })
     {
-        bail!("market encoder Study widens the cumulative fit ceiling or changes its Root");
+        bail!("market encoder Study changes the scientific Study identity, cumulative fit ceiling or Root");
     }
     Ok(())
 }
@@ -691,7 +692,10 @@ pub(super) fn inspection(
             )?;
         let expected =
             json!({"name":"work","mountPath":"/work","subPath":work_sub_path(&reservation)?});
-        if pod["affinity"] != controller_affinity(&validated.identity[..32], "monday-research")
+        let namespace = manifest["items"][1]["metadata"]["namespace"]
+            .as_str()
+            .context("market Job namespace is missing")?;
+        if pod["affinity"] != controller_affinity(&validated.identity[..32], namespace)
             || pod["containers"][0]["volumeMounts"][0] != expected
             || pod["volumes"][0]
                 != json!({"name":"work","persistentVolumeClaim":{"claimName":r.stage_authority.work_pvc_name}})
@@ -954,6 +958,31 @@ pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         false,
     )?;
     let record = admitted.record()?;
+    if let Some(settlement) = &record.settlement {
+        if matches!(
+            &validated.submission.request,
+            StudyRequest::MarketEncoder(_)
+        ) && report_path.try_exists()?
+        {
+            let report: Value = admission::read_json(&report_path)?;
+            if report["schema_version"] == "monday.market_completion_authority_failure.v1" {
+                if settlement.outcome
+                    != alpha_domain::campaign_control::CampaignAttemptOutcomeV1::Failed
+                    || settlement.consumed_trials != Some(admitted.reservation.declared_trials)
+                    || canonical_json_hash(&report)? != settlement.evidence_sha256
+                    || report["completion"]["job_uid"].as_str() != record.claim.job_uid.as_deref()
+                    || report["completion"]["pod_uid"].as_str()
+                        != record.terminal_pod_uid.as_deref()
+                {
+                    bail!(
+                        "completion authority failure cache differs from authenticated settlement"
+                    );
+                }
+                admitted.publish_receipts()?;
+                return print_json(&report);
+            }
+        }
+    }
     if let Some(cancellation) = &record.cancellation {
         let report = if record.settlement.is_some() {
             admission::read_json::<Value>(&report_path)?
@@ -1022,6 +1051,52 @@ pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         }
         None
     };
+    let completion = if matches!(
+        &validated.submission.request,
+        StudyRequest::MarketEncoder(_)
+    ) {
+        terminal
+            .as_ref()
+            .map(|terminal| terminal.completion(chrono::Utc::now()))
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(completion) = &completion {
+        if !admitted.completion_active(completion)? {
+            let terminal = terminal
+                .as_ref()
+                .context("missing bound terminal evidence")?;
+            let report = json!({
+                "schema_version":"monday.market_completion_authority_failure.v1",
+                "operation_id":admitted.reservation.operation_id()?,
+                "request_sha256":validated.request_sha256,
+                "root_grant_sha256":admitted.reservation.root_grant_sha256,
+                "completion":completion,
+                "job_sha256":canonical_json_hash(&terminal.job)?,
+                "pod_sha256":canonical_json_hash(&terminal.pod)?,
+                "kubernetes_outcome":"Complete", "research_outcome":"Failed",
+                "reason":"campaign_authority_invalid_at_completion",
+                "charged_trials":admitted.reservation.declared_trials,
+                "sealed_holdout_opened":false,
+            });
+            let evidence = alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
+                job_uid: completion.job_uid.clone(),
+                pod_uid: completion.pod_uid.clone(),
+                settlement: alpha_domain::campaign_control::CampaignAttemptSettlementV1 {
+                    operation_id: admitted.reservation.operation_id()?,
+                    reservation_sha256: admitted.reservation.content_hash()?,
+                    evidence_sha256: canonical_json_hash(&report)?,
+                    outcome: alpha_domain::campaign_control::CampaignAttemptOutcomeV1::Failed,
+                    consumed_trials: Some(admitted.reservation.declared_trials),
+                },
+            };
+            data_mission::write_json_atomic(&report_path, &report)?;
+            admitted.settle_at_completion(&evidence, completion)?;
+            admitted.publish_receipts()?;
+            return print_json(&report);
+        }
+    }
     let input_root = args
         .input_root
         .as_deref()
@@ -1065,19 +1140,22 @@ pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     };
     data_mission::write_json_atomic(&report_path, &report)?;
     if let Some(terminal) = terminal {
-        admitted.settle(
-            &alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
-                job_uid: terminal.job_uid,
-                pod_uid: terminal.pod_uid,
-                settlement: alpha_domain::campaign_control::CampaignAttemptSettlementV1 {
-                    operation_id: admitted.reservation.operation_id()?,
-                    reservation_sha256: admitted.reservation.content_hash()?,
-                    evidence_sha256: hash.clone(),
-                    outcome, // Charge the entire attempt; failed fits are never refunded.
-                    consumed_trials: Some(admitted.reservation.declared_trials),
-                },
+        let evidence = alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
+            job_uid: terminal.job_uid,
+            pod_uid: terminal.pod_uid,
+            settlement: alpha_domain::campaign_control::CampaignAttemptSettlementV1 {
+                operation_id: admitted.reservation.operation_id()?,
+                reservation_sha256: admitted.reservation.content_hash()?,
+                evidence_sha256: hash.clone(),
+                outcome, // Charge the entire attempt; failed fits are never refunded.
+                consumed_trials: Some(admitted.reservation.declared_trials),
             },
-        )?;
+        };
+        if let Some(completion) = &completion {
+            admitted.settle_at_completion(&evidence, completion)?;
+        } else {
+            admitted.settle(&evidence)?;
+        }
     }
     admitted.publish_receipts()?;
     let record = admitted.record()?;
@@ -1097,6 +1175,14 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn check_dispatch_ledger_and_historical_readback(request: StudyRequest, revoke_root: bool) {
+        check_dispatch_case(request, revoke_root, None);
+    }
+
+    fn check_dispatch_case(
+        request: StudyRequest,
+        revoke_root: bool,
+        completion_case: Option<&str>,
+    ) {
         let root = tempfile::tempdir().unwrap();
         let expected_trials = request.declared_trials().unwrap();
         let is_market = matches!(&request, StudyRequest::MarketEncoder(_));
@@ -1175,7 +1261,7 @@ mod tests {
             attempt_ordinal: 0,
             receipt_access: (1..=16).flat_map(|sequence| {
                 let mut keys = vec![format!("research/campaign-ledger/family-id={}/sequence={sequence:020}/receipt.json", request.family_id().unwrap())];
-                if is_market { keys.push(format!("research/campaign-ledger/study-id=original-sol-budget/sequence={sequence:020}/receipt.json")); }
+                if is_market { keys.push(format!("research/campaign-ledger/study-id=sol-market-encoder-controlled-test/sequence={sequence:020}/receipt.json")); }
                 keys.into_iter().map(|key| {
                 let url = format!("https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/{key}?signature=fixture");
                 (key, serde_json::from_value(json!({"put_url":url,"readback_url":url})).unwrap())
@@ -1226,6 +1312,13 @@ mod tests {
             .is_err());
         }
         let inspected = inspection(&validated, &control, &manifest).unwrap();
+        if is_market {
+            let mut custom = render(&validated, &control, "market-custom-namespace").unwrap();
+            inspection(&validated, &control, &custom).unwrap();
+            custom["items"][1]["spec"]["template"]["spec"]["affinity"] =
+                controller_affinity(&validated.identity[..32], "monday-research");
+            assert!(inspection(&validated, &control, &custom).is_err());
+        }
         let mut gpu = manifest.clone();
         gpu["items"][1]["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]
             ["nvidia.com/gpu"] = json!(1);
@@ -1274,6 +1367,154 @@ mod tests {
             .unwrap();
         let record = admitted.record().unwrap();
         assert_eq!(record.reservation.declared_trials, expected_trials);
+        assert_eq!(record.claim.target.require_completion_authority, is_market);
+        if let Some(case) = completion_case {
+            drop(admitted);
+            let mut store = alpha_store::AlphaStore::open(&control.ledger_path).unwrap();
+            let before = store
+                .campaign_study_usage("sol-market-encoder-controlled-test")
+                .unwrap();
+            let mut downgrade = record.claim.target.clone();
+            downgrade.require_completion_authority = false;
+            assert!(store
+                .claim_campaign_dispatch(&record.root, &reserved, &downgrade, now)
+                .unwrap_err()
+                .to_string()
+                .contains("dispatch target changed"));
+            let mut completion = alpha_store::campaign_ledger::CampaignDispatchCompletionV1 {
+                job_uid: "sequence-job-uid".into(),
+                pod_uid: "successful-pod".into(),
+                job_started_at: now,
+                completed_at: now + TimeDelta::seconds(2),
+            };
+            let mut observed_at = now + TimeDelta::seconds(10);
+            assert!(store
+                .campaign_dispatch_completion_active(&reserved, &completion, observed_at)
+                .unwrap());
+            let mut invalid = completion.clone();
+            invalid.job_uid = "another-job".into();
+            assert!(store
+                .campaign_dispatch_completion_active(&reserved, &invalid, observed_at)
+                .is_err());
+            invalid = completion.clone();
+            invalid.completed_at = now - TimeDelta::seconds(1);
+            assert!(store
+                .campaign_dispatch_completion_active(&reserved, &invalid, observed_at)
+                .is_err());
+            assert!(store
+                .campaign_dispatch_completion_active(&reserved, &completion, now)
+                .is_err());
+            if case == "expired" {
+                completion.completed_at = signed.grant.expires_at + TimeDelta::seconds(1);
+                observed_at = completion.completed_at;
+            } else {
+                // Record revocation after the optimistic read above. Settlement
+                // must independently recompute the decision inside its write.
+                store
+                    .revoke_approval(
+                        if revoke_root {
+                            "sequence-approval"
+                        } else {
+                            "study-approval"
+                        },
+                        "operator",
+                        "terminal authorization regression",
+                        now + TimeDelta::seconds(if case == "completed_before_revoke" {
+                            3
+                        } else {
+                            1
+                        }),
+                    )
+                    .unwrap();
+            }
+            let expected_active = case == "completed_before_revoke";
+            assert_eq!(
+                store
+                    .campaign_dispatch_completion_active(&reserved, &completion, observed_at)
+                    .unwrap(),
+                expected_active
+            );
+            let mut evidence = alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
+                job_uid: completion.job_uid.clone(),
+                pod_uid: completion.pod_uid.clone(),
+                settlement: CampaignAttemptSettlementV1 {
+                    operation_id: reserved.operation_id().unwrap(),
+                    reservation_sha256: reserved.content_hash().unwrap(),
+                    evidence_sha256: "f".repeat(64),
+                    outcome: CampaignAttemptOutcomeV1::SelectedPreHoldout,
+                    consumed_trials: Some(reserved.declared_trials),
+                },
+            };
+            assert!(store
+                .settle_campaign_dispatch(&reserved, &evidence, observed_at)
+                .unwrap_err()
+                .to_string()
+                .contains("requires completion authority"));
+            assert!(store
+                .settle_campaign_attempt(&reserved.family_id, &evidence.settlement, observed_at)
+                .is_err());
+            let mut refund = evidence.clone();
+            refund.settlement.consumed_trials = Some(0);
+            assert!(store
+                .settle_campaign_dispatch(&reserved, &refund, observed_at)
+                .is_err());
+            if !expected_active {
+                assert!(store
+                    .settle_campaign_dispatch_at_completion(
+                        &reserved,
+                        &evidence,
+                        &completion,
+                        observed_at
+                    )
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires Failed"));
+                assert!(store
+                    .campaign_dispatch_record(
+                        &reserved.family_id,
+                        &reserved.operation_id().unwrap()
+                    )
+                    .unwrap()
+                    .settlement
+                    .is_none());
+                evidence.settlement.outcome = CampaignAttemptOutcomeV1::Failed;
+                evidence.settlement.consumed_trials = Some(0);
+                assert!(store
+                    .settle_campaign_dispatch_at_completion(
+                        &reserved,
+                        &evidence,
+                        &completion,
+                        observed_at
+                    )
+                    .is_err());
+                evidence.settlement.consumed_trials = Some(reserved.declared_trials);
+            }
+            store
+                .settle_campaign_dispatch_at_completion(
+                    &reserved,
+                    &evidence,
+                    &completion,
+                    observed_at,
+                )
+                .unwrap();
+            let terminal = store
+                .campaign_dispatch_record(&reserved.family_id, &reserved.operation_id().unwrap())
+                .unwrap();
+            assert_eq!(terminal.settlement, Some(evidence.settlement));
+            assert!(
+                terminal.cancellation.is_none(),
+                "Kubernetes Complete was not patched or relabelled Failed"
+            );
+            let after = store
+                .campaign_study_usage("sol-market-encoder-controlled-test")
+                .unwrap();
+            assert_eq!(
+                before.accounted_trials().unwrap(),
+                after.accounted_trials().unwrap()
+            );
+            assert_eq!(after.consumed_trials, reserved.declared_trials);
+            return;
+        }
         if is_market {
             // This fold Root has one admitted Job; a retry is not another fold.
             // Cross-fold cumulative rejection is covered by the two-Root test.
@@ -1296,7 +1537,9 @@ mod tests {
                     || error.to_ascii_lowercase().contains("study"),
                 "{error}"
             );
-            let before = store.campaign_study_usage("original-sol-budget").unwrap();
+            let before = store
+                .campaign_study_usage("sol-market-encoder-controlled-test")
+                .unwrap();
             let late_start = signed.grant.expires_at
                 - TimeDelta::seconds(reserved.reserved_job_seconds as i64 + 1);
             let late = late_start + TimeDelta::seconds(reserved.reserved_job_seconds as i64 - 5);
@@ -1331,7 +1574,9 @@ mod tests {
             assert!(wrong.is_err());
             assert_eq!(
                 before,
-                store.campaign_study_usage("original-sol-budget").unwrap()
+                store
+                    .campaign_study_usage("sol-market-encoder-controlled-test")
+                    .unwrap()
             );
             store
                 .revoke_approval(
@@ -1381,7 +1626,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 before,
-                store.campaign_study_usage("original-sol-budget").unwrap()
+                store
+                    .campaign_study_usage("sol-market-encoder-controlled-test")
+                    .unwrap()
             );
             let evidence = alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
                 job_uid: cancellation.job_uid.clone(),
@@ -1407,7 +1654,9 @@ mod tests {
             store
                 .settle_campaign_dispatch(&reserved, &evidence, Utc::now())
                 .unwrap();
-            let after = store.campaign_study_usage("original-sol-budget").unwrap();
+            let after = store
+                .campaign_study_usage("sol-market-encoder-controlled-test")
+                .unwrap();
             assert_eq!(
                 after.accounted_trials().unwrap(),
                 before.accounted_trials().unwrap()
@@ -1474,7 +1723,7 @@ mod tests {
         let signed_study = sign_campaign_study_grant(
             CampaignStudyGrantV1 {
                 schema_version: STUDY_GRANT_SCHEMA.into(),
-                study_id: "original-sol-budget".into(),
+                study_id: "sol-market-encoder-controlled-test".into(),
                 members: vec![CampaignStudyMemberV1 {
                     family_id: signed.grant.family.family_id.clone(),
                     root_grant_sha256: signed.content_sha256.clone(),
@@ -1524,6 +1773,22 @@ mod tests {
             (&crate::mission_campaign::sequence::tests::request()).into(),
             false,
         );
+    }
+    #[test]
+    fn market_completion_authority_is_temporal_and_rechecked_at_settlement() {
+        for revoke_root in [false, true] {
+            for case in [
+                "completed_before_revoke",
+                "revoked_during_final_fit",
+                "expired",
+            ] {
+                check_dispatch_case(
+                    (&crate::mission_campaign::market_encoder::request_tests::request()).into(),
+                    revoke_root,
+                    Some(case),
+                );
+            }
+        }
     }
     #[test]
     fn market_dispatch_reuses_cumulative_study_and_historical_readback() {
@@ -1688,7 +1953,7 @@ mod tests {
         let controller = format!("registry/controller@sha256:{}", "f".repeat(64));
         let signing = ed25519_dalek::SigningKey::from_bytes(&[33; 32]);
         let keys = BTreeMap::from([("operator".into(), signing.verifying_key())]);
-        for ceiling in [43, 44] {
+        for ceiling in [43, 44, 60] {
             let directory = tempfile::tempdir().unwrap();
             let mut store =
                 alpha_store::AlphaStore::open(directory.path().join("ledger.duckdb")).unwrap();
@@ -1750,7 +2015,11 @@ mod tests {
             let study = sign_campaign_study_grant(
                 CampaignStudyGrantV1 {
                     schema_version: STUDY_GRANT_SCHEMA.into(),
-                    study_id: "original-twofold-budget".into(),
+                    study_id: if ceiling == 60 {
+                        "separate-budget".into()
+                    } else {
+                        first.plan.study_id.clone()
+                    },
                     members: signed_roots
                         .iter()
                         .map(|signed| CampaignStudyMemberV1 {
@@ -1785,6 +2054,20 @@ mod tests {
             store
                 .register_campaign_study(&verified_study, "original-study-approval", now)
                 .unwrap();
+            for (request, signed) in [&first, &second].into_iter().zip(&signed_roots) {
+                let admission = require_cumulative_study(&store, &request.into(), signed);
+                if ceiling == 60 {
+                    assert!(admission
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Study identity"));
+                } else {
+                    admission.unwrap();
+                }
+            }
+            if ceiling == 60 {
+                continue;
+            }
             store
                 .reserve_campaign_attempt(&verified_roots[0], &reservations[0], now)
                 .unwrap();
@@ -1799,7 +2082,7 @@ mod tests {
                     .contains("cumulative study budget"));
             }
             let usage = store
-                .campaign_study_usage("original-twofold-budget")
+                .campaign_study_usage("sol-market-encoder-controlled-test")
                 .unwrap();
             assert_eq!(
                 usage.accounted_trials().unwrap(),

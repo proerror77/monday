@@ -407,9 +407,14 @@ impl State {
                     .attempts
                     .get_mut(&settlement.operation_id)
                     .ok_or_else(|| err("settlement has no reservation"))?;
-                if attempt.cancellation.is_some() {
+                if attempt.cancellation.is_some()
+                    || attempt
+                        .dispatch
+                        .as_ref()
+                        .is_some_and(|claim| claim.target.require_completion_authority)
+                {
                     return Err(err(
-                        "cancelled dispatch requires independent native failed settlement",
+                        "controlled dispatch requires independent native terminal settlement",
                     ));
                 }
                 settlement

@@ -1718,6 +1718,7 @@ mod tests {
                 namespace: "monday-research".into(),
                 job_name: validated.job_name.clone(),
                 manifest_sha256: "a".repeat(64),
+                require_completion_authority: false,
             },
             job_uid: Some("original".into()),
             sequence: 4,
@@ -1841,6 +1842,34 @@ mod tests {
                 "accepted changed {pointer}"
             );
         }
+        // Market completion authority uses the bound Kubernetes timestamps,
+        // including the unique successful Pod; worker result times are unused.
+        let mut timed = terminal::TerminalJobReadback {
+            job_uid: "bound-job".into(),
+            pod_uid: "pod-1".into(),
+            job,
+            pod,
+        };
+        timed.job["status"]["startTime"] = json!("2026-09-27T01:00:00Z");
+        timed.job["status"]["completionTime"] = json!("2026-09-27T01:00:03Z");
+        timed.pod["status"]["containerStatuses"][0]["state"]["terminated"]["startedAt"] =
+            json!("2026-09-27T01:00:01Z");
+        timed.pod["status"]["containerStatuses"][0]["state"]["terminated"]["finishedAt"] =
+            json!("2026-09-27T01:00:02Z");
+        let observed = "2026-09-27T01:00:04Z".parse().unwrap();
+        timed.completion(observed).unwrap();
+        for invalid in [
+            Value::Null,
+            json!("2026-09-27T00:59:59Z"),
+            json!("2026-09-27T01:00:05Z"),
+            json!("2026-09-27T01:00:01Z"),
+        ] {
+            timed.job["status"]["completionTime"] = invalid;
+            assert!(timed.completion(observed).is_err());
+        }
+        timed.job["status"]["completionTime"] = json!("2026-09-27T01:00:03Z");
+        timed.pod["metadata"]["uid"] = json!("replacement-pod");
+        assert!(timed.completion(observed).is_err());
     }
 
     struct AdmissionFixture {
@@ -2979,6 +3008,7 @@ mod tests {
             namespace: "monday-research".into(),
             job_name: fixture.validated.job_name.clone(),
             manifest_sha256: alpha_domain::canonical_json_hash(&fixture.manifest).unwrap(),
+            require_completion_authority: false,
         };
         let origin = reqwest::Url::parse(
             &fixture

@@ -14,8 +14,8 @@ pub use final_dispatch::{
 mod state;
 
 pub use dispatch::{
-    CampaignDispatchCancellationV1, CampaignDispatchClaimV1, CampaignDispatchRecord,
-    CampaignDispatchSettlementV1, CampaignDispatchTargetV1,
+    CampaignDispatchCancellationV1, CampaignDispatchClaimV1, CampaignDispatchCompletionV1,
+    CampaignDispatchRecord, CampaignDispatchSettlementV1, CampaignDispatchTargetV1,
 };
 pub use study::{
     AuthenticatedCampaignStudyReceiptV1, CampaignStudyLedgerEventV1, CampaignStudyLedgerReceiptV1,
@@ -1246,6 +1246,7 @@ mod tests {
             namespace: "monday-research".into(),
             job_name: "campaign-job".into(),
             manifest_sha256: "a".repeat(64),
+            require_completion_authority: false,
         }
     }
 

@@ -225,7 +225,7 @@ pub(crate) fn run(args: CampaignStageControllerArgs) -> anyhow::Result<()> {
     let mut delay = 1_u64;
     loop {
         let state = iteration(&args)?;
-        if args.once || state == "terminal" {
+        if args.once || state == "terminal" || state == "terminal_authority_violation" {
             return print_json(&json!({"status":state,"accounting_changed":false}));
         }
         delay = if state == previous && state != "stage_issued" {
@@ -351,6 +351,33 @@ fn iteration(args: &CampaignStageControllerArgs) -> anyhow::Result<&'static str>
             .any(|c| c["status"] == "True" && (c["type"] == "Complete" || c["type"] == "Failed"))
     });
     if terminal {
+        if job["status"]["conditions"]
+            .as_array()
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|c| c["status"] == "True" && c["type"] == "Complete")
+            })
+        {
+            let terminal = super::terminal::read_terminal_job(
+                &args.context,
+                &args.namespace,
+                &loaded.manifest["items"][1],
+                &loaded.validated.job_name,
+                uid,
+            )?;
+            let completion = terminal.completion(Utc::now())?;
+            let store = alpha_store::AlphaStore::open_read_only(&loaded.control.ledger_path)?;
+            if !store.campaign_dispatch_completion_active(
+                &loaded.reservation,
+                &completion,
+                Utc::now(),
+            )? {
+                // Kubernetes succeeded; only the research outcome is rejected.
+                // Settlement independently repeats this check under its locks.
+                return Ok("terminal_authority_violation");
+            }
+        }
         return Ok("terminal");
     }
     let Some(start) = job["status"]["startTime"].as_str() else {
