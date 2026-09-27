@@ -8,6 +8,7 @@ pub mod campaign_study;
 mod evaluation_calendar;
 mod evaluation_partition;
 pub mod frozen_model;
+pub mod market_encoder_study;
 pub mod mlp_training;
 pub mod research_accelerator;
 pub mod sec_orderflow;
