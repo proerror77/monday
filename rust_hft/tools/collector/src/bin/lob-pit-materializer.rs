@@ -1,3 +1,6 @@
+#[path = "lob-pit-materializer/market_encoder.rs"]
+mod market_encoder;
+
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
@@ -84,6 +87,9 @@ struct Args {
     /// Export a separate SOL 60-row sequence dataset from the same verified replay.
     #[arg(long)]
     sequence_output: bool,
+    /// Export feature-only market sequences and separately bound 30-second targets.
+    #[arg(long)]
+    market_encoder_output: bool,
     /// Decision and label-maturity window; input blobs retain complete provenance.
     #[arg(long, requires = "output_end_received_at_ns")]
     output_start_received_at_ns: Option<u64>,
@@ -196,6 +202,8 @@ struct MaterializationReport {
     sequence_manifest_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sequence_manifest_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    market_encoder: Option<market_encoder::PublishedDatasets>,
     created_at: DateTime<Utc>,
 }
 
@@ -439,7 +447,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     if args.bucket_ms == 0 || args.label_horizon_buckets == 0 || args.top_depth == 0 {
         bail!("bucket, label horizon, and top depth must be positive");
     }
-    if args.sequence_output
+    if (args.sequence_output || args.market_encoder_output)
         && (symbol != "SOLUSDT"
             || !matches!(args.market, Market::Usdm)
             || args.bucket_ms != 1000
@@ -476,7 +484,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .checked_mul(1_000_000)
         .context("bucket size overflow")?;
     let mut replay = Replay::new(bucket_ns, args.top_depth);
-    replay.capture_levels = args.sequence_output;
+    replay.capture_levels = args.sequence_output || args.market_encoder_output;
     let mut aggregate_trades = Vec::new();
     let mut has_aggregate_trades = None;
     log_event(
@@ -526,7 +534,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         );
     }
     let has_aggregate_trades = has_aggregate_trades.unwrap_or(false);
-    if args.sequence_output && !has_aggregate_trades {
+    if (args.sequence_output || args.market_encoder_output) && !has_aggregate_trades {
         bail!("sequence output requires verified aggregate-trade coverage");
     }
     log_event(
@@ -671,6 +679,13 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .then(|| publish_sequence_dataset(&replay, &rows, &snapshot_sha256, &args.artifact_dir))
         .transpose()?;
 
+    let market_encoder = args
+        .market_encoder_output
+        .then(|| {
+            market_encoder::publish(&replay, &aggregate_trades, args, &symbol, &snapshot_sha256)
+        })
+        .transpose()?;
+
     let report = MaterializationReport {
         dataset_kind: "lob_point_in_time_materialization".to_string(),
         schema_version: BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7.to_string(),
@@ -695,6 +710,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         snapshot_sha256,
         sequence_manifest_path: sequence.as_ref().map(|(path, _)| path.clone()),
         sequence_manifest_sha256: sequence.map(|(_, hash)| hash),
+        market_encoder,
         created_at,
     };
     let report_bytes = serde_json::to_vec_pretty(&report)?;
@@ -2466,7 +2482,7 @@ mod tests {
             Args {
                 mission_id: "data-btc-usdm-1".to_string(), symbol: "BTCUSDT".to_string(),
                 market: self.market, bucket_ms: 1_000, label_horizon_buckets: 2, top_depth: 5,
-                output_start_received_at_ns: None, output_end_received_at_ns: None, sequence_output: false,
+                output_start_received_at_ns: None, output_end_received_at_ns: None, sequence_output: false, market_encoder_output: false,
                 segment: vec![self.data.clone()],
                 segment_content_sha256: vec![self.content_sha256.clone()], segment_manifest_sha256: vec![self.manifest_sha256.clone()],
                 artifact_dir: self.directory.join("artifacts"),
@@ -2619,6 +2635,149 @@ mod tests {
         let frame = sequence_frame(&replay, &cropped[0]).unwrap();
         assert_eq!(frame.series_id, event_ns(200_000));
         assert_eq!(frame.forward_returns[2], cropped[0].label as f32);
+    }
+
+    #[test]
+    fn market_encoder_export_keeps_unlabeled_tail_and_separate_bound_targets() {
+        use hft_research_manifest::market_encoder::{
+            MarketFeatureDatasetV1, MarketFeatureFrameV1, MarketTargetDatasetV1,
+        };
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut args = fixture.args();
+        args.symbol = "SOLUSDT".into();
+        args.label_horizon_buckets = 30;
+        args.market_encoder_output = true;
+        let state = |second: i64| BookState {
+            bids: (0..5)
+                .map(|level| {
+                    (
+                        Decimal::from(100 - level) + Decimal::new(second, 2),
+                        Decimal::from(level + 1),
+                    )
+                })
+                .collect(),
+            asks: (0..5)
+                .map(|level| {
+                    (
+                        Decimal::from(102 + level) + Decimal::new(second, 2),
+                        Decimal::from(level + 6),
+                    )
+                })
+                .collect(),
+        };
+        let mut replay = Replay::new(1_000_000_000, 5);
+        replay.capture_levels = true;
+        replay.start_series(state(0), START_NS).unwrap();
+        for second in 0..=180 {
+            replay.state = Some(state(second));
+            replay.emit_at(event_ns(second as u64 * 1000)).unwrap();
+        }
+        let published =
+            market_encoder::publish(&replay, &[], &args, "SOLUSDT", &"b".repeat(64)).unwrap();
+        let features: MarketFeatureDatasetV1 = serde_json::from_slice(
+            &std::fs::read(args.artifact_dir.join(&published.features.file)).unwrap(),
+        )
+        .unwrap();
+        let targets: MarketTargetDatasetV1 = serde_json::from_slice(
+            &std::fs::read(args.artifact_dir.join(&published.targets.file)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(features.digest().unwrap(), published.features.sha256);
+        assert_eq!(targets.digest().unwrap(), published.targets.sha256);
+        assert_eq!(targets.feature_dataset_sha256, features.digest().unwrap());
+        assert_eq!(features.shards.iter().map(|s| s.rows).sum::<u64>(), 180);
+        assert_eq!(targets.shards.iter().map(|s| s.rows).sum::<u64>(), 150);
+        let text =
+            std::fs::read_to_string(args.artifact_dir.join(&features.shards[0].file)).unwrap();
+        let frames = text
+            .lines()
+            .map(|l| {
+                let value: serde_json::Value = serde_json::from_str(l).unwrap();
+                assert!(value.get("forward_returns").is_none());
+                assert!(value.get("simple_return").is_none());
+                assert!(value.get("spread_bps").is_none());
+                serde_json::from_value::<MarketFeatureFrameV1>(value).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            frames.last().unwrap().observed_at_ms,
+            (event_ns(180000) / 1_000_000) as i64
+        );
+        let repeated =
+            market_encoder::publish(&replay, &[], &args, "SOLUSDT", &"b".repeat(64)).unwrap();
+        assert_eq!(repeated.features.sha256, published.features.sha256);
+        let original = replay.samples[31].mid_price;
+        replay.samples[31].mid_price *= 1.01;
+        let changed = market_encoder::feature_frames(&replay, &[], &args, "SOLUSDT").unwrap();
+        assert_eq!(frames[..30], changed[..30]);
+        replay.samples[31].mid_price = original;
+        let trade = |id, received, quantity, is_buyer_maker| AggregateTrade {
+            symbol: "SOLUSDT".into(),
+            aggregate_trade_id: id,
+            first_trade_id: id,
+            last_trade_id: id,
+            price: Decimal::from(101),
+            quantity: Decimal::from(quantity),
+            event_time_ms: 0,
+            trade_time_ms: 0,
+            is_buyer_maker,
+            received_at_ns: event_ns(received),
+        };
+        let trades = vec![
+            trade(1, 1500, 2, false),
+            trade(2, 2000, 1, true),
+            trade(3, 2001, 999, false),
+        ];
+        let with_trades =
+            market_encoder::feature_frames(&replay, &trades, &args, "SOLUSDT").unwrap();
+        assert_eq!(with_trades[1].channels[21], 3.0_f64.ln_1p() as f32);
+        assert_eq!(with_trades[1].channels[22], 1.0_f64.asinh() as f32);
+        assert_eq!(with_trades[1].channels[23], 2.0_f64.ln_1p() as f32);
+        // A late arrival's old venue clock cannot place it in an earlier bucket.
+        assert_eq!(with_trades[0], frames[0]);
+        assert_eq!(with_trades[2].channels[21], 999.0_f64.ln_1p() as f32);
+        let missing = replay.samples.remove(80);
+        let gap = market_encoder::publish(&replay, &[], &args, "SOLUSDT", &"b".repeat(64)).unwrap();
+        let gap_targets: MarketTargetDatasetV1 = serde_json::from_slice(
+            &std::fs::read(args.artifact_dir.join(gap.targets.file)).unwrap(),
+        )
+        .unwrap();
+        for shard in gap_targets.shards {
+            let text = std::fs::read_to_string(args.artifact_dir.join(shard.file)).unwrap();
+            for line in text.lines() {
+                let row: hft_research_manifest::market_encoder::MarketTargetFrameV1 =
+                    serde_json::from_str(line).unwrap();
+                assert!(!(event_ns(50000) / 1_000_000..=event_ns(79000) / 1_000_000)
+                    .contains(&(row.observed_at_ms as u64)));
+            }
+        }
+        replay.samples.insert(80, missing);
+        // An end boundary removes neither earlier features nor invents tail labels.
+        args.output_start_received_at_ns = Some(event_ns(0));
+        args.output_end_received_at_ns = Some(event_ns(90000));
+        let cropped =
+            market_encoder::publish(&replay, &[], &args, "SOLUSDT", &"b".repeat(64)).unwrap();
+        let features: MarketFeatureDatasetV1 = serde_json::from_slice(
+            &std::fs::read(args.artifact_dir.join(cropped.features.file)).unwrap(),
+        )
+        .unwrap();
+        let targets: MarketTargetDatasetV1 = serde_json::from_slice(
+            &std::fs::read(args.artifact_dir.join(cropped.targets.file)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(features.shards.iter().map(|s| s.rows).sum::<u64>(), 89);
+        assert_eq!(targets.shards.iter().map(|s| s.rows).sum::<u64>(), 59);
+    }
+
+    #[test]
+    fn market_encoder_output_rejects_an_unregistered_instrument_before_input_access() {
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut args = fixture.args();
+        args.market_encoder_output = true;
+        assert!(materialize(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("SOLUSDT"));
     }
 
     #[test]

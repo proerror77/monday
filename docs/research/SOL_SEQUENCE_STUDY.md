@@ -141,7 +141,16 @@ no encoder update is a failed fit. The complete task bundle restores both the
 adapted encoder and one return head. Exact JSON floating-point roundtrips and
 original Burnpack bytes preserve immutable artifact identity across restore.
 
-These are library capabilities verified with controlled data. Real feature and
-target materialization, Campaign stage accounting, reconstruction-head audit
-publication, final-evaluation integration, real-data fits and economic evidence
-remain pending. The library exposes no dispatch, holdout or order authority.
+The materializer's opt-in `--market-encoder-output` exports these feature and
+target manifests from the same verified replay. It requires SOLUSDT USD-M,
+1s/Top5, a 30-second target and aggregate-trade evidence. Feature rows are built
+before target eligibility: an unlabeled tail remains in the feature artifact,
+while missing endpoints or recovery gaps omit targets instead of inventing zeros.
+Trade buckets use receive-time availability. The report binds both manifests;
+the target manifest pins its exact feature dataset.
+
+These library and exporter capabilities are verified with controlled data.
+Canonical preparation/worker input binding, Campaign stage accounting,
+reconstruction-head audit publication, final-evaluation integration, real-data
+fits and economic evidence remain pending. The library and export option expose
+no dispatch, holdout or order authority.
