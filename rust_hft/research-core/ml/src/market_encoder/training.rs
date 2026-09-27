@@ -6,7 +6,7 @@ use super::{
     },
     network::*,
 };
-use crate::{lock_ndarray_backend, CpuAutodiffBackend};
+use crate::{lock_ndarray_backend, CpuAutodiffBackend, CpuBackend};
 use burn::{
     module::AutodiffModule,
     nn::{
@@ -19,6 +19,7 @@ use burn::{
 use burn_ndarray::NdArrayDevice;
 use hft_research_manifest::market_encoder::*;
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 
 fn diagnostics(initial: String) -> MarketFitDiagnosticsV1 {
     MarketFitDiagnosticsV1 {
@@ -165,11 +166,26 @@ pub fn pretrain_market_encoder(
         diag.gradient_norms.push(norm);
     }
     reader.finish_pass()?;
-    let encoder = model.encoder.valid();
+    let trained = model.valid();
+    let (reconstruction_diagnostics, diagnostic_elapsed_micros) =
+        if reconstruction_channel_groups(&request.spec.input).is_some() {
+            let started = Instant::now();
+            let report = reconstruction_diagnostics(reader, &request, &scaling, &trained)?;
+            (
+                Some(report),
+                Some(
+                    u64::try_from(started.elapsed().as_micros())
+                        .map_err(|_| "reconstruction diagnostic clock overflow")?,
+                ),
+            )
+        } else {
+            (None, None)
+        };
+    let encoder = trained.encoder;
     diag.final_encoder_values_sha256 = values_digest(&encoder)?;
     diag.validate(&request)?;
     let weights = save(&encoder)?;
-    let head = model.head.valid();
+    let head = trained.head;
     let head_weights = save(&head)?;
     let head_values = values_digest(&head)?;
     let mut checkpoint = MarketEncoderCheckpoint {
@@ -187,16 +203,203 @@ pub fn pretrain_market_encoder(
     };
     checkpoint.reconstruction = Some(ReconstructionAudit {
         metadata: ReconstructionAuditManifest {
-            schema_version: "monday.market_reconstruction_audit.v1".into(),
+            schema_version: RECONSTRUCTION_AUDIT_SCHEMA.into(),
             encoder_checkpoint_sha256: checkpoint.identity()?,
             mask_policy: MASK_POLICY.into(),
             weights_sha256: bytes_digest(&head_weights),
             parameter_values_sha256: head_values,
+            diagnostics: reconstruction_diagnostics,
+            diagnostic_elapsed_micros,
         },
         weights: head_weights,
     });
     Ok(checkpoint)
 }
+#[derive(Default)]
+pub(super) struct ReconstructionMse {
+    count: u64,
+    model_squared_error: f64,
+    baseline_squared_error: f64,
+}
+impl ReconstructionMse {
+    pub(super) fn finish(
+        &self,
+        group: &str,
+        channels: usize,
+    ) -> Result<ReconstructionGroupMse, String> {
+        if self.count == 0
+            || !self.model_squared_error.is_finite()
+            || !self.baseline_squared_error.is_finite()
+        {
+            return Err("invalid reconstruction diagnostic accumulation".into());
+        }
+        Ok(ReconstructionGroupMse {
+            group: group.into(),
+            channels: channels as u64,
+            masked_scalar_count: self.count,
+            model_mse: self.model_squared_error / self.count as f64,
+            last_visible_mse: self.baseline_squared_error / self.count as f64,
+        })
+    }
+}
+/// Output is [time,channel], matching Reconstruction::forward's [batch,time,channel].
+/// The baseline holds the last UNMASKED frame across an entire adjacent masked run.
+pub(super) fn observe_reconstruction(
+    item: &UnlabeledSequenceExample,
+    mask: &[bool; 60],
+    predicted: &[f32],
+    scaling: &MarketFeatureScalingV1,
+    groups: &[Vec<usize>; 3],
+    sums: &mut [ReconstructionMse; 3],
+) -> Result<(), String> {
+    if item.inputs.len() != 60 * 24
+        || predicted.len() != 60 * 24
+        || scaling.means.len() != 24
+        || scaling.scales.len() != 24
+        || mask[..6].iter().any(|v| *v)
+        || mask.iter().filter(|v| **v).count() != 18
+        || predicted.iter().any(|v| !v.is_finite())
+    {
+        return Err("reconstruction diagnostic tensor shape, mask or value differs".into());
+    }
+    let normalized = |time: usize, channel: usize| -> Result<f64, String> {
+        let raw = item.inputs[time * 24 + channel];
+        let value = ((f64::from(raw) - scaling.means[channel]) / scaling.scales[channel]) as f32;
+        if !raw.is_finite() || !value.is_finite() {
+            return Err("nonfinite reconstruction target".into());
+        }
+        Ok(f64::from(value))
+    };
+    let mut last_visible = 0;
+    for (time, masked) in mask.iter().enumerate() {
+        if !masked {
+            last_visible = time;
+            continue;
+        }
+        for (channels, sum) in groups.iter().zip(sums.iter_mut()) {
+            for &channel in channels {
+                let observed = normalized(time, channel)?;
+                let error = f64::from(predicted[time * 24 + channel]) - observed;
+                let baseline = normalized(last_visible, channel)? - observed;
+                sum.count += 1;
+                sum.model_squared_error += error * error;
+                sum.baseline_squared_error += baseline * baseline;
+            }
+        }
+    }
+    Ok(())
+}
+fn diagnose_batch(
+    model: &Reconstruction<CpuBackend>,
+    batch: &[UnlabeledSequenceExample],
+    request: &MarketFitRequestV1,
+    scaling: &MarketFeatureScalingV1,
+    groups: &[Vec<usize>; 3],
+    sums: &mut [ReconstructionMse; 3],
+) -> Result<(), String> {
+    let output = model.forward(input_tensor::<CpuBackend>(
+        batch,
+        request,
+        scaling,
+        Some(0),
+    )?);
+    if output.dims() != [batch.len(), 60, 24] {
+        return Err("reconstruction output is not batch/time/channel".into());
+    }
+    let values = output
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|e| e.to_string())?;
+    for (item, predicted) in batch.iter().zip(values.as_chunks::<{ 60 * 24 }>().0) {
+        observe_reconstruction(
+            item,
+            &masked_positions(request.seed, 0, item),
+            predicted,
+            scaling,
+            groups,
+            sums,
+        )?;
+    }
+    Ok(())
+}
+fn reconstruction_diagnostics(
+    reader: &mut MarketFeatureReader,
+    request: &MarketFitRequestV1,
+    scaling: &MarketFeatureScalingV1,
+    model: &Reconstruction<CpuBackend>,
+) -> Result<ReconstructionDiagnostics, String> {
+    let groups = reconstruction_channel_groups(&request.spec.input)
+        .ok_or("unverified reconstruction channel registry")?;
+    let selected = diagnostic_ordinals(scaling.examples);
+    let mut selection = 0;
+    let mut seen = 0;
+    let mut batches = 0;
+    let mut pending = Vec::with_capacity(request.batch_size);
+    let mut sums: [ReconstructionMse; 3] = Default::default();
+    let mut identities = Sha256::new();
+    identities.update(b"monday.reconstruction-diagnostic-anchor-keys.v1");
+    reader.rewind()?;
+    loop {
+        let batch = reader.next_batch(DIAGNOSTIC_SAMPLE_LIMIT)?;
+        if batch.is_empty() {
+            break;
+        }
+        for item in batch {
+            if seen >= scaling.examples {
+                return Err("diagnostic training anchor coverage increased".into());
+            }
+            if selected.get(selection) == Some(&seen) {
+                identities.update(seen.to_le_bytes());
+                identities.update(item.series_id.to_le_bytes());
+                identities.update(item.observed_at_ms.to_le_bytes());
+                pending.push(item);
+                selection += 1;
+                if pending.len() == request.batch_size {
+                    diagnose_batch(model, &pending, request, scaling, &groups, &mut sums)?;
+                    batches += 1;
+                    pending.clear();
+                }
+            }
+            seen += 1;
+        }
+    }
+    reader.finish_pass()?;
+    if seen != scaling.examples || selection != selected.len() {
+        return Err("diagnostic training anchor coverage changed".into());
+    }
+    if !pending.is_empty() {
+        diagnose_batch(model, &pending, request, scaling, &groups, &mut sums)?;
+        batches += 1;
+    }
+    let count = selection as u64;
+    let report = ReconstructionDiagnostics {
+        schema_version: "monday.market_reconstruction_diagnostics.v1".into(),
+        sampling_policy: DIAGNOSTIC_SAMPLING.into(),
+        grouping_policy: DIAGNOSTIC_GROUPING.into(),
+        metric_space: "train-channel-standardized-f32".into(),
+        mask_epoch: 0,
+        eligible_training_anchors: seen,
+        scanned_training_anchors: seen,
+        sampled_ordinals: selected,
+        sampled_anchor_keys_sha256: format!("{:x}", identities.finalize()),
+        additional_feature_passes: 1,
+        forward_batch_size: request.batch_size,
+        cpu_forward_batches: batches,
+        cpu_forward_examples: count,
+        cpu_forward_frames: count * 60,
+        cpu_output_scalars: count * 60 * 24,
+        additional_optimizer_updates: 0,
+        groups: sums
+            .iter()
+            .zip(&groups)
+            .zip(["price", "depth", "trade"])
+            .map(|((sum, indices), name)| sum.finish(name, indices.len()))
+            .collect::<Result<_, _>>()?,
+    };
+    report.validate(request, scaling)?;
+    Ok(report)
+}
+
 pub fn adapt_market_encoder(
     reader: &mut MarketTaskReader,
     request: MarketAdaptationRequestV1,

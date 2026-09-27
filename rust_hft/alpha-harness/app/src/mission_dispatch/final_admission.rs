@@ -307,6 +307,7 @@ impl FinalAdmission {
             namespace: namespace.into(),
             job_name: validated.job_name.clone(),
             manifest_sha256: canonical_json_hash(&manifest)?,
+            require_completion_authority: false,
         };
         target.validate()?;
         let receipt_origin = reqwest::Url::parse(&validated.submission.request.output_root)?

@@ -3,34 +3,33 @@ title: SOL 市场编码器自监督预训练与下游微调实施方案
 type: feat
 date: 2026-09-27
 status: implementation-in-progress
-source_revision: 741d0f862041e87d2675d0205451b4f3747871ae
+source_revision: 462769a6a5850cca1ff4d91813812f9046c90fae
 ---
 
 # SOL 市场编码器：先预训练，再继承权重微调
 
-该方案于 2026-09-27 形成，随后用户明确要求继续实施。跟踪 [#1235](https://github.com/proerror77/monday/issues/1235)。已采用 30 秒单目标、14 天窗口和两阶段路线；具体数据、资源与执行身份仍须冻结，不把该方案当作签名 grant 或研究结果。
+本研究落实历史市场序列 → 自监督预训练 → 编码器检查点 → 继承权重微调 → 预测与交易成本评估。用户已要求启动训练；此前账户余额阻断经 2026-09-27 08:28 UTC 的 ECS DryRun 复核解除。跟踪 [#1235](https://github.com/proerror77/monday/issues/1235)。源代码、镜像、真实输入、累计预算和实际 Job 仍须逐项绑定，方案或受控测试不能代替真实训练证据。
 
-当前正在交付独立无标签读取、编码器预训练/保存/恢复及 A/B/C 参数继承的代码切片。真实数据物化、Campaign 阶段预算、最终评估适配和实际实验仍待完成。旧序列路径仍服务 #1230；在新路径完成接入前保留其行为，不重标历史产物。
+首轮回答：**相同 SOL 数据和下游任务上，自监督预训练后微调是否比同架构从零训练更有效？** 复用 Rust/Burn CPU TCN，以 C 为主路线，A/B 和计算量对照解释增量来源。
 
-建议复用 Monday 的 Rust/Burn CPU TCN，先补齐无标签数据读取、编码器检查点、参数继承和训练阶段记账，再通过现有 Campaign 做 A/B/C 对照。首轮回答：**在相同 SOL 数据和下游任务上，自监督预训练后微调，是否比同架构从零训练更有效？**
+## 1. 当前源码与运行边界
 
-## 1. 当前已核实的状态
+本方案基准主线为 `462769a6a5850cca1ff4d91813812f9046c90fae`；以下接入能力属于当前实现切片，发布及真实运行状态仍以跟踪记录为准。
 
-核对基准：本地 `main` 的 `741d0f862041e87d2675d0205451b4f3747871ae`；GitHub 已读回 [PR #1234](https://github.com/proerror77/monday/pull/1234) 为 MERGED，合并提交与基准一致。原工作区在核对时干净。方案在独立工作区编写。
-
-| 环节 | 当前代码事实 | 与新路线的差距 |
+| 环节 | 已有能力 | 仍需核实 |
 | --- | --- | --- |
-| 输入 | `SequenceInputSpecV1::sol_lob()` 定义每秒一帧、60 帧上下文、24 个市场通道：1 个中价收益、买卖各五档的相对价格与数量、3 个成交聚合量 | 属于快照和聚合成交，不能当成 LOBERT 的逐笔订单消息 |
-| 数据导出 | `lob-pit-materializer::sequence_frame` 从已验证回放导出盘口、成交及 5/10/30 秒标签，绑定来源并检查断点 | 导出依赖带标签 PIT 行和未来标签端点，无标签预训练不能只换一个 loss |
-| 读取 | `SequenceReader` 有哈希校验、有界批次、可用时间检查、跨缺口重置 | `next_batch` 强制三个标签全部成熟；缺少独立无标签样本类型 |
-| 模型 | `CausalTcn` 有五层因果卷积，dilation 为 1/2/4/8/16；最后一个隐藏状态接三输出线性层 | 编码器和输出层尚未形成可独立保存、加载和冻结的契约 |
-| 训练 | `train_sequence_model` 每次设置种子并创建新网络，用三目标 MSE 训练 | 没有预训练请求、父检查点参数、冻结策略或微调入口 |
-| 产物 | `SequenceBundleV1` 保存完整模型、缩放、诊断与 Burnpack 哈希；支持推理恢复 | 推理恢复不等于带梯度微调；没有可复用的编码器产物和继承收据 |
-| 对照 | `SolSequenceStudyV1` 固定 Ridge/MLP/price-TCN/LOB-TCN、两个种子、两个时间折各 7/14 天窗，共 28 个开发主要拟合，主目标 30 秒 | 旧分组、窗口、三输出 loss 和预算都不适合直接装入两阶段路线 |
-| Campaign | freeze/finalize/dispatch/worker/readback 已有序列接入；worker 重训核验、预测、IOC 回放、发布结果；readback 恢复模型并复算 | 每折固定 7 个主要拟合、7 个验证拟合和 14 个计费 trial，缺少阶段依赖及共享检查点记账 |
-| 最终评估 | 序列 worker 明确只做 pre-holdout；序列 freeze 拒绝 final-evaluation 模式 | 不能把通用最终评估入口视作已经支持序列模型；需明确适配再打开最终样本 |
+| 输入及模型核心 | #1236 已合入；1s/Top5 盘口与聚合成交、60 帧/24 通道，独立特征与 30s 标签，遮蔽预训练与 P/A/B/C 参数继承 | 不是 LOBERT 消息级复现，也不是跨市场基础模型有效性证明 |
+| 导出 | #1237 已合入；无标签尾部、完整 feature_sources、标签成熟所需独立尾部；当前切片新增最多 60s 的显式预热与 feature_start | 真实小时分片、整日回放的覆盖和内存要在 ACK 核验 |
+| 对照与产物 | #1238 已合入；共有训练 anchors、独立复核、固定双种子均值、重建头审计、Ridge 共享缩放及额外计算量对照 | 没有真实收益或预测增量结论 |
+| 原生 Campaign 接入 | 当前切片提供 cohort/freeze/finalize/dispatch/worker/settlement/readback，旧 #1230 路由保留 | 当前切片的 CI、合并和不可变镜像发布仍须完成 |
+| 运行中授权 | 每阶段 nonce 许可由原 controller 在有效 Root/Study 审批下签发；撤销时按原 Job UID/RV 取消，独立确认失败后全额结算 | 真实 Pod 同节点、PVC UID/挂载及取消效果要单独读回 |
+| 阶段状态 | 开始标记、完整阶段产物与收据保留在独立 attempt 子目录；完整阶段不重训，部分拟合不隐式恢复 | 持久卷能力不等于已验证跨 Spot 自动恢复 |
+| 操作入口 | 原生 Root/Study 签名、审批登记衔接和累计 Study 登记/检查；每折独立 family/Root，同一累计 Study | 实际元数据、签名、ledger 与真实消费尚需填实；不复用无关旧研究的预算 |
+| 最终评估 | 开发实验停在 pre-holdout；当前结果没有部署权限 | 本模型的最终评估适配仍待完成，不能直接打开 sealed |
 
-[现有 SOL 文档](../research/SOL_SEQUENCE_STUDY.md)仍写着排除预训练，并把导出和 Campaign 接入列为待办，已落后于该基准的代码。[Issue #1230](https://github.com/proerror77/monday/issues/1230)仍为 OPEN，正文描述旧方案，未附评论。本次未核验 ACK 运行、镜像发布、真实数据完整性、账本余额或云账单；不能据此断言“没有运行过”或“预算尚未使用”。也没有重新执行代码测试。
+本任务尚未创建云节点、PVC、grant 或真实训练 Job。旧 #1230 的保留记录指向未创建真实 grant/ledger、主拟合为零；这是已有记录的范围，不是全云不存在其他活动的证明。开始前仍核对当前所有权及累计资源承诺。
+
+受控验证覆盖实际 P 权重继承、冻结/微调、两种子独立拟合、缺口与共有 anchors、完整来源、许可/撤销/取消、历史消费及远端结果读回。它们证明代码行为；真实连续覆盖、样本外表现与资源释放需要本轮 ACK 证据。
 
 ## 2. 建议冻结的首轮范围
 
@@ -43,9 +42,11 @@ source_revision: 741d0f862041e87d2675d0205451b4f3747871ae
 | 诊断目标 | 第一轮不把 5/10 秒作为额外训练 loss，避免混入多任务训练；保留历史三目标产物为审计记录 |
 | 数据窗 | 两个时间顺序的开发折，每折固定 14 天训练窗；移除本轮 7/14 天窗口对照；每折建议至少一个完整 24 小时验证区间 |
 | 数据用量 | 首轮预训练和下游使用同一训练窗、同一合格 anchor 集，不额外加入更早数据，先控制数据量因素 |
+| 训练取样 | 建议每 60 秒一个训练 anchor，仍保留其内部每秒 60 帧；14 天至多约 20,160 个样本，低于当前 32,768 上限。验证保留每秒完整决策网格，不能沿用训练筛选删除困难时点 |
+| 成本 | 初始研究假设为每边 5bps 手续费、无返佣、0.5bps 额外延迟费用；不声称账户实测费率。原生 IOC 100ms 到达延迟另计；资金费 0 表示暂未建模，不能称真实账户净收益 |
 | 种子 | 7、11；逐种子配对比较，经济评估使用两种子的平均预测，不挑最好种子 |
 | 算力 | 现有 Burn ndarray CPU、已准入 ACK 资源形状；训练和原始数据验证保持 ACK 内执行 |
-| 经费 | 沿用此前记录的人民币 100 元总上限；剩余额度未知，冻结前从原账本和费用证据扣除已耗及在途费用 |
+| 经费 | 原人民币 100 元总上限；节点目录价、磁盘与最大寿命绑定费用上界，扣除原已耗及在途承诺后再冻结 |
 
 14 天窗是为了给预训练提供较多样本、同时缩小实验维度的建议，不是已证明最优的窗口。具体 UTC 起止、可用样本数、更新次数和学习率必须在数据与资源核验后写入协议，不能先填写没有证据的日期或收敛时长。仍需保留原记录中的 9 月 24–25 日缺口风险；本轮未重新核实该缺口。
 
@@ -68,11 +69,13 @@ flowchart LR
 
 ### 3.1 数据与标准化
 
-建议在 `hft-research-manifest::sequence` 将特征帧和监督标签分开表示：特征帧只含 series、观测/可用时间及 24 个通道；标签按稳定时间/series 键关联。成本元数据可保留在独立评估记录，不能进入编码器输入。
+已在 `hft-research-manifest::market_encoder` 将特征帧和监督标签分开表示：特征帧只含 series、观测/可用时间及 24 个通道；标签按稳定时间/series 键关联。成本元数据保留在独立评估记录，不能进入编码器输入。
 
 在 collector 的已验证 replay seam 先产生不依赖未来标签的特征流，再生成监督标签。复用已有源哈希、分片、上下界、连续性和字节验证，不重新实现行情回放。移除被替换的活跃生产路径，保留旧 schema 产物为只读历史；不为本轮添加旧新模式回退链。
 
-ML 层从同一特征流提供 `UnlabeledSequenceExample` 和监督样本。预训练进程的输入清单不包含收益标签文件；后续监督阶段才加载其允许的标签。共有的 anchor 清单根据时间、上下文连续性和标签端点可用性预先构造，不按标签正负或幅度选择样本。首轮 P/A/B/C 使用这个共同 anchor 集；无标签接口未来可以使用额外历史，但那将是另一个数据量实验。
+原始/PIT 窗口可以比显式 feature_start 最多早 60 秒，以取得首帧和 OFI 所需预热；该前缀不进入训练特征。每个特征分片结束后可额外准入 30 秒行情用于标签成熟，但不能把这段尾部重复导出为本分片特征；所有尾部仍必须落在该折训练截止以内。否则会在每个分片末尾损失样本，或将训练外行情带入标签。共有 anchor 索引只含时间与 series，由上下文和标签可用性生成；先固定索引，预训练入口只接收特征 reader 和该索引。评估不使用该索引过滤决策。
+
+ML 层从同一特征流提供无标签样本和监督样本。预训练函数的数据契约不接受标签 reader，也不读取收益标签；同一个 Campaign Job 在监督阶段才通过任务 reader 使用其允许的标签。这是数据接口隔离，不能称为已实现独立进程或文件权限隔离。共有的 anchor 清单根据时间、上下文连续性和标签端点可用性预先构造，不按标签正负或幅度选择样本。首轮 P/A/B/C 使用这个共同 anchor 集；无标签接口未来可以使用额外历史，但那将是另一个数据量实验。
 
 特征缩放只用训练视图中实际输入的唯一帧拟合，避免滑窗重复次数改变样本权重；将缩放产物及哈希固定给所有组。收益缩放是另一份下游训练产物，不进入预训练检查点。推理必须复用原缩放，不得因到达验证期而重新拟合。
 
@@ -92,15 +95,15 @@ ML 层从同一特征流提供 `UnlabeledSequenceExample` 和监督样本。预�
 
 ### 3.3 检查点与权重继承
 
-建议新增以下类型，名称仅为实施建议：
+产物契约与目前接口的对应关系如下；来源代码、镜像和 Campaign 身份在阶段收据中补齐，不能误称核心库已经绑定所有外层身份：
 
 | 产物/请求 | 必须绑定的内容 |
 | --- | --- |
 | `MarketEncoderSpecV1` | 架构版本、24 个市场通道顺序、遮蔽输入约定、上下文长度、宽度、逐层形状、dtype |
-| `SequencePretrainingRequestV1` | 特征数据和 anchor 哈希、训练视图与截止时间、缩放哈希、目标与遮蔽策略、种子、优化器和更新/样本预算 |
-| `MarketEncoderCheckpointV1` | 编码器 Burnpack 哈希、张量名/形状及规范参数值摘要、spec/request/缩放哈希、来源代码和镜像、终止诊断、允许的数据范围 |
-| `SequenceAdaptationRequestV1` | scratch/probe/full-finetune 模式、父检查点哈希（scratch 必须为空）、单任务标签定义、训练视图、任务头种子和冻结日程 |
-| `SequenceTaskBundleV2` | 最终编码器与任务头权重、父检查点、输入和目标缩放、训练诊断、逐阶段继承收据、study/fold/成本/预测协议哈希 |
+| `MarketFitRequestV1` + 预训练入口 | 特征数据和 anchor 哈希、训练视图与截止时间、spec、种子、优化器和更新/样本预算；固定遮蔽策略另绑定 |
+| `MarketEncoderCheckpoint` | 编码器 Burnpack 哈希及规范参数值摘要、request/缩放、终止诊断、允许的数据范围；外层收据补充来源代码和镜像 |
+| `MarketAdaptationRequestV1` | scratch/probe/full-finetune 模式、父检查点哈希（scratch 必须为空）、单任务标签定义、训练视图、任务头种子和冻结日程 |
+| `MarketTaskModel` + `FittedMarketStage` | 最终编码器与任务头权重、父检查点、输入和目标缩放、训练诊断；阶段产物绑定 study/fold/purpose，Campaign 再绑定执行收据 |
 
 微调开始前按张量名、形状和值摘要确认编码器参数与父产物一致；缺失参数、额外参数、架构/通道/标准化不匹配一律失败。不能仅因路径存在或 `load` 返回成功就宣称继承。
 
@@ -174,19 +177,26 @@ B 和 C 各自从 P 分叉，使用相同头初始化规则；C 不继承 B 训�
 - 为已完成阶段保存不可覆盖的产物和完成收据，绑定 request/source/image/父哈希。只有这些都吻合才可复用。部分阶段没有完整收据时，不提供隐式恢复或无成本重跑；使用原 reservation、记录失败，等待有界恢复安排。
 - 缺少父检查点、撤销/过期 grant、预算不足或数据变动阻止依赖阶段。C 失败可以有终态负面结果，不能自动转去尝试未冻结的新配置。
 
-目前序列最终评估接入尚缺。实施需适配既有 closed-family final evaluation：关闭开发 family、固定 C 的日程和种子平均规则、在允许的最终训练窗完成至多两份 P+C、先锁定全部模型，再做独立选择与一次性 sealed 评估。两者均不能进入最终重训或标准化。没有合格 C 就以负面结果结案，不为了花完预算打开 holdout。
+目前市场编码器最终评估接入尚缺。实施需适配既有 closed-family final evaluation：关闭开发 family、固定 C 的日程和种子平均规则、在允许的最终训练窗完成至多两份 P+C、先锁定全部模型，再做独立选择与一次性 sealed 评估。两者均不能进入最终重训或标准化。没有合格 C 就以负面结果结案，不为了花完预算打开 holdout。
 
 ## 7. 实施切片、文件责任与验收
 
-下表是实施顺序；完成状态以该切片的测试、提交和读回证据为准。每个切片独立可审查；源码可以用受控数据测试，真实研究原始数据、模型和账本仍留在 ACK/OSS。
+下表是实施责任和验收清单；早期状态以本节上方的最新源码边界为准。完成状态以该切片的测试、提交和读回证据为准。每个切片独立可审查；源码可以用受控数据测试，真实研究原始数据、模型和账本仍留在 ACK/OSS。
 
-| 切片 | 主要文件/模块 | 交付与可证伪验收 |
+| 切片与当前状态 | 主要文件/模块 | 交付与可证伪验收 |
 | --- | --- | --- |
-| 1. 数据与协议 | `research-core/manifest/src/sequence.rs`、`research-core/ml/src/sequence.rs`、`tools/collector/src/bin/lob-pit-materializer.rs`、`alpha-harness/domain/src/sequence_study.rs` | 无标签流与监督标签分离；stage/anchor/task 协议；改变或删除收益标签不改变预训练可读样本；未来数据、跨 gap、乱序/哈希错误被拒绝 |
-| 2. 编码器和训练 | `research-core/ml/src/sequence/training.rs`，必要时拆为同目录 `encoder.rs`、`pretraining.rs`、`adaptation.rs`；产物类型归 manifest | encoder/head 可分离；遮蔽只用允许输入、只对目标位置计 loss；P roundtrip；错父/错形状失败；B 不更新编码器；C 确实继承并能更新；受控有效任务上 loss 可下降 |
-| 3. 对照和计费 | `alpha-harness/engine/src/sequence_study.rs`、`app/src/mission_campaign/sequence{.rs,/*}`、`app/src/mission_dispatch/sequence_admission.rs`，按需要扩展现有 store 收据 | A/B/C 配对、阶段图、独立重训、模型与预测恢复、预算动态一致；重放同一阶段不多训练；失败/中断不退还已耗 trial；逐行预测和回放可以独立复算 |
-| 4. 最终研究适配 | 既有 `campaign_finalization`、`mission_campaign/final_evaluation` 及其 dispatch/readback 契约 | 已关闭开发 family 的序列任务模型才能进入；父子训练截止满足隔离；重复 claim/更换模型/将 sealed 用于 P 一律失败；负面结果可完整读回 |
-| 5. 文档与实际研究准备 | `docs/research/SOL_SEQUENCE_STUDY.md`、相关 Campaign 使用说明、#1230 跟踪关系 | 修正过时待办、记录新问题与预算映射；具备数据清单、曝光历史、剩余额度、基准和精确镜像才可冻结；按切片更新实际实施与验收证据 |
+| 0. 真实可行性 | ACK 数据、曝光、原预算、云资源报价与释放期限 | 真实候选窗口与样本数；未观察标签表现前固定日期；费用和试验累计不重置 |
+| 1. 数据准备 | collector market_encoder、mission_fresh_inputs、market_encoder inputs/cohort、物化脚本 | 预热/特征/标签尾部边界分离；独立重算 anchors；纯特征来源覆盖；16MiB 元数据及原 64GiB 输入界限；无填补缺口 |
+| 2. 模型与对照 | research-core market_encoder、domain/engine market_encoder_study | P/B/C 真实参数关系、重建头与完整任务恢复、共享缩放与独立复核、固定种子均值及逐种子诊断 |
+| 3. 运行授权和结算 | campaign_stage、stage_controller、study_authority、market worker/readback、store campaign_ledger | 两个 fold Root 共用一个累计 Study；只许可下一阶段；撤销、过期、错 UID/nonce、取消丢响应与失败计费；完整远端结果复算 |
+| 4. 开发启动 | 当前源发布、task-owned 资源、原生 Campaign 接口 | 先有镜像再计费开节点；真实输入及权限读回；开始拟合事件与 Job/Pod UID，不把准备/Running 当训练结果 |
+| 5. 最终研究适配 | closed-family final evaluation 及 dispatch/readback | 另行完成相同模型的最终适配、独立选择和一次性 sealed claim；无合格 C 时负面结案 |
+
+每个阶段许可使用 controller 独立私钥，公钥及 work PVC 进入冻结请求。worker 只有公钥，不持活动账本或完整授权密钥。开始标记先于拟合持久化；已开始但缺少完成收据的阶段不得自动重训。controller 根据当前有效审批持续监督原 Job，取消仅作用于精确 UID；结果未知时不声称已停止或退还预算。
+
+每折使用不同 family/Root、一个 generation0 Job、22 个计费 trial；两个 Root 登记在同一份累计 Study。科学 study_id 和模型比较协议相同，不能用新 family 获得新预算。
+
+验证与原始回放可能携带边界源文件的完整字节，选择/封存分区必须晚于真实最后 source-segment.end。预热和训练标签尾部同样不能越过所属训练截止。独立选择及 sealed 产物单独保留，不挂载给开发 worker/controller。
 
 collector 的特征导出变化只属于研究数据物化，不混入采集器线上切换。若新增持久收据必须迁移数据库，新增迁移而不改已应用迁移。更新活跃协议时用新的明确版本与身份，历史结果不重标为新试验。
 
@@ -196,14 +206,16 @@ collector 的特征导出变化只属于研究数据物化，不混入采集器�
 
 ## 8. 开工前需要填实的四项
 
-1. **研究选择**：推荐 30 秒单目标、14 天单窗口、两个开发折；5 秒仍是可替换的设计选择。本轮不要求再次确认，后续冻结应明确选定。
+1. **研究选择**：推荐 30 秒单目标、14 天单窗口、两个开发折、训练每 60 秒取样；5 秒仍是可替换的设计选择。它们是待冻结默认值，不是已证明最优的参数。
 2. **真实数据与曝光**：ACK 内获得可用的连续区间、输入收据、开发/独立选择/封存边界；元数据中“有小时目录”不等于可训练覆盖。
 3. **资源和余额**：核验历史 trial 消费与人民币 100 元余额，确定批量、更新数、Job 时限及收尾余量。无法在上限内完成时报告受限结论。
 4. **执行身份与终点**：实现完成后重新绑定源码、镜像与 grant；先以已验证的开发对照为阶段结果，只有完成最终适配和相应技术准入才走 sealed。模型有效性、经济可用性和线上激活分别报告。
 
 ## 9. 依据
 
-代码核对入口（均为本方案基准版本）：
+代码核对入口：主分支核心与 PR 中的导出/对照已在第 1 节分开标明；未合入文件不能当作主分支可用接口。
+
+- [新输入和训练契约](../../rust_hft/research-core/manifest/src/market_encoder.rs)、[新训练入口](../../rust_hft/research-core/ml/src/market_encoder/training.rs)、[编码器与任务产物](../../rust_hft/research-core/ml/src/market_encoder/artifacts.rs)。
 
 - [输入和数据契约](../../rust_hft/research-core/manifest/src/sequence.rs)、[序列读取器](../../rust_hft/research-core/ml/src/sequence.rs)、[训练和模型保存](../../rust_hft/research-core/ml/src/sequence/training.rs)。
 - [真实盘口序列物化](../../rust_hft/tools/collector/src/bin/lob-pit-materializer.rs)、[旧 study 固定分组和预算](../../rust_hft/alpha-harness/domain/src/sequence_study.rs)、[现有对照引擎](../../rust_hft/alpha-harness/engine/src/sequence_study.rs)。
@@ -215,4 +227,4 @@ collector 的特征导出变化只属于研究数据物化，不混入采集器�
 - [LOBERT v2，§2.4 与 §3](https://arxiv.org/html/2511.12563v2)：遮蔽订单消息预训练，下游从预训练检查点初始化并使用任务头。它使用消息级信息和配套盘口；本方案的数据粒度、因果 TCN 及损失都不同，不是 LOBERT 复现。
 - [PatchTST v2，§4.2](https://arxiv.org/html/2211.14730v2)：分别评估冻结编码器的线性探测，以及先训练头再端到端微调。这里采用该对照逻辑；其长期预测数据集结果不能证明 SOL 交易有效。
 
-预算沿用此前会话记录中的 30 次主要拟合与人民币 100 元上限；本次代码核验确认旧 study 的 `max_primary_fits=30`、`max_verification_fits=30`，但没有确认实际剩余次数或经费。
+预算沿用此前会话记录中的 30 次主要拟合与人民币 100 元上限；本次代码核验确认新 study 的 `max_primary_fits=30`、`max_verification_fits=30`、`max_cost_fen=10000`，但没有确认实际剩余次数或经费。旧方案消耗必须计入同一累计约束。

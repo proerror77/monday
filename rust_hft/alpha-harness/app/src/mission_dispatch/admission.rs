@@ -467,6 +467,12 @@ impl Admission {
             namespace: namespace.into(),
             job_name: job_name.into(),
             manifest_sha256: canonical_json_hash(manifest)?,
+            require_completion_authority: serde_json::from_str::<serde_json::Value>(
+                manifest["items"][0]["stringData"]["campaign.json"]
+                    .as_str()
+                    .context("missing admitted Campaign request")?,
+            )?["schema_version"]
+                == crate::mission_campaign::market_encoder::REQUEST_SCHEMA,
         };
         target.validate()?;
         let admission = Self {
@@ -513,6 +519,36 @@ impl Admission {
                 "outcome": evidence.settlement.outcome,
             }),
         );
+        Ok(())
+    }
+
+    pub(super) fn completion_active(
+        &self,
+        completion: &alpha_store::campaign_ledger::CampaignDispatchCompletionV1,
+    ) -> anyhow::Result<bool> {
+        self.record()?;
+        Ok(self.store.campaign_dispatch_completion_active(
+            &self.reservation,
+            completion,
+            Utc::now(),
+        )?)
+    }
+
+    pub(super) fn settle_at_completion(
+        &mut self,
+        evidence: &CampaignDispatchSettlementV1,
+        completion: &alpha_store::campaign_ledger::CampaignDispatchCompletionV1,
+    ) -> anyhow::Result<()> {
+        if self.purpose != Purpose::Settlement {
+            bail!("settlement requires historical evidence mode");
+        }
+        self.record()?;
+        self.store.settle_campaign_dispatch_at_completion(
+            &self.reservation,
+            evidence,
+            completion,
+            Utc::now(),
+        )?;
         Ok(())
     }
 

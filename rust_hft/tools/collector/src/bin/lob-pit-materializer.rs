@@ -90,6 +90,9 @@ struct Args {
     /// Export feature-only market sequences and separately bound 30-second targets.
     #[arg(long)]
     market_encoder_output: bool,
+    /// Inclusive feature start after at most 60 seconds of raw/PIT warmup.
+    #[arg(long, requires = "market_encoder_output")]
+    market_feature_start_received_at_ns: Option<u64>,
     /// Exclusive feature-partition end; labels may use the remaining admitted output window.
     #[arg(long, requires = "market_encoder_output")]
     market_feature_end_received_at_ns: Option<u64>,
@@ -2492,7 +2495,7 @@ mod tests {
             Args {
                 mission_id: "data-btc-usdm-1".to_string(), symbol: "BTCUSDT".to_string(),
                 market: self.market, bucket_ms: 1_000, label_horizon_buckets: 2, top_depth: 5,
-                output_start_received_at_ns: None, output_end_received_at_ns: None, sequence_output: false, market_encoder_output: false, market_feature_end_received_at_ns: None,
+                output_start_received_at_ns: None, output_end_received_at_ns: None, sequence_output: false, market_encoder_output: false, market_feature_start_received_at_ns: None, market_feature_end_received_at_ns: None,
                 segment: vec![self.data.clone()],
                 segment_content_sha256: vec![self.content_sha256.clone()], segment_manifest_sha256: vec![self.manifest_sha256.clone()],
                 artifact_dir: self.directory.join("artifacts"),
@@ -2875,6 +2878,108 @@ mod tests {
         assert!(market_encoder::feature_window(&args).is_err());
         args.market_feature_end_received_at_ns = Some(event_ns(0));
         assert!(market_encoder::feature_window(&args).is_err());
+    }
+
+    #[test]
+    fn market_encoder_feature_start_preserves_adjacent_partitions_and_bounds_warmup() {
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut args = fixture.args();
+        args.symbol = "SOLUSDT".into();
+        args.label_horizon_buckets = 30;
+        args.market_encoder_output = true;
+        let state = BookState {
+            bids: (0..5)
+                .map(|i| (Decimal::from(100 - i), Decimal::from(10)))
+                .collect(),
+            asks: (0..5)
+                .map(|i| (Decimal::from(102 + i), Decimal::from(10)))
+                .collect(),
+        };
+        let mut replay = Replay::new(1_000_000_000, 5);
+        replay.capture_levels = true;
+        replay.start_series(state, START_NS).unwrap();
+        replay.emit_at(event_ns(300000)).unwrap();
+        args.output_start_received_at_ns = Some(START_NS);
+        args.output_end_received_at_ns = Some(event_ns(180000));
+        args.market_feature_start_received_at_ns = Some(event_ns(60000));
+        args.market_feature_end_received_at_ns = Some(event_ns(150000));
+        let first = market_encoder::feature_frames(&replay, &[], &args, "SOLUSDT").unwrap();
+        let mut segments = market_source_fixture(&replay);
+        let mut prefix = segments[0].clone();
+        prefix.path = "prefix.jsonl.zst".into();
+        prefix.sha256 = "d".repeat(64);
+        prefix.success_marker_sha256 = hex::encode(Sha256::digest(format!("{}\n", prefix.sha256)));
+        prefix.end_received_at_ns = event_ns(59999);
+        segments[0].start_received_at_ns = event_ns(60000);
+        segments.insert(0, prefix);
+        // The full preceding blob does not overlap feature output, but it
+        // remains admitted evidence for the first return and OFI context.
+        let published = market_encoder::publish(&replay, &[], &args, "SOLUSDT", &segments).unwrap();
+        assert_eq!(
+            published.feature_start_received_at_ns,
+            Some(event_ns(60000))
+        );
+        let sources: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(args.artifact_dir.join(&published.feature_sources.file)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sources["feature_start_received_at_ns"], event_ns(60000));
+        assert!(
+            sources["source_segments"][0]["end_received_at_ns"]
+                .as_u64()
+                .unwrap()
+                < sources["feature_start_received_at_ns"].as_u64().unwrap()
+        );
+        assert_eq!(
+            sources["first_feature_observed_at_ms"],
+            event_ns(60000) / 1_000_000
+        );
+        assert_eq!(first.len(), 90);
+        assert_eq!(
+            first[0].observed_at_ms,
+            (event_ns(60000) / 1_000_000) as i64
+        );
+        args.output_start_received_at_ns = Some(event_ns(90000));
+        args.output_end_received_at_ns = Some(event_ns(270000));
+        args.market_feature_start_received_at_ns = Some(event_ns(150000));
+        args.market_feature_end_received_at_ns = Some(event_ns(240000));
+        let second = market_encoder::feature_frames(&replay, &[], &args, "SOLUSDT").unwrap();
+        assert_eq!(second.len(), 90);
+        let joined = first.into_iter().chain(second).collect::<Vec<_>>();
+        assert!(joined
+            .windows(2)
+            .all(|p| p[1].observed_at_ms == p[0].observed_at_ms + 1000
+                && p[0].series_id == p[1].series_id));
+        args.output_start_received_at_ns = Some(START_NS);
+        args.market_feature_start_received_at_ns = Some(event_ns(60000));
+        assert_eq!(
+            joined,
+            market_encoder::feature_frames(&replay, &[], &args, "SOLUSDT").unwrap()
+        );
+        // Removing a real observation still creates a gap; no warmup flag fills it.
+        replay.samples.remove(100);
+        let gapped = market_encoder::feature_frames(&replay, &[], &args, "SOLUSDT").unwrap();
+        assert!(!gapped.iter().any(
+            |r| r.observed_at_ms == (event_ns(100000) / 1_000_000) as i64
+                || r.observed_at_ms == (event_ns(101000) / 1_000_000) as i64
+        ));
+        args.market_feature_start_received_at_ns = Some(event_ns(61000));
+        assert!(market_encoder::feature_window(&args).is_err());
+        args.market_feature_start_received_at_ns = Some(event_ns(60000) + 1);
+        assert!(market_encoder::feature_window(&args).is_err());
+        args.market_feature_start_received_at_ns = Some(START_NS - 1_000_000_000);
+        assert!(market_encoder::feature_window(&args).is_err());
+        args.market_feature_start_received_at_ns = Some(event_ns(60000));
+        args.market_feature_end_received_at_ns = Some(event_ns(60000));
+        assert!(market_encoder::feature_window(&args).is_err());
+        args.market_feature_end_received_at_ns = None;
+        args.market_encoder_output = false;
+        assert!(market_encoder::feature_window(&args).is_err());
+        args.market_feature_start_received_at_ns = None;
+        assert_eq!(
+            market_encoder::feature_window(&args).unwrap(),
+            output_window(&args).unwrap()
+        );
     }
 
     #[test]

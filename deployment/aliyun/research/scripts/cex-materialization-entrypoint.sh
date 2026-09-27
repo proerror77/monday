@@ -13,7 +13,7 @@ usage: cex-materialization-entrypoint.sh \
   [--role all|slice|reduce] \
   [--shard-index N] \
   [--shard-count N] \
-  [--sequence-output] \
+  [--sequence-output] [--market-encoder-output] [--market-feature-start-received-at-ns <ns>] [--market-feature-end-received-at-ns <ns>] \
   [--dry-run]
 EOF
   exit 2
@@ -494,6 +494,9 @@ WORK_DIR=
 BINARY_DIR=/usr/local/bin
 DRY_RUN=0
 SEQUENCE_OUTPUT=0
+MARKET_ENCODER_OUTPUT=0
+MARKET_FEATURE_END=
+MARKET_FEATURE_START=
 ROLE=all
 SHARD_INDEX=
 SHARD_COUNT=
@@ -541,6 +544,20 @@ while [ $# -gt 0 ]; do
     --sequence-output)
       SEQUENCE_OUTPUT=1
       shift
+      ;;
+    --market-encoder-output)
+      MARKET_ENCODER_OUTPUT=1
+      shift
+      ;;
+    --market-feature-start-received-at-ns)
+      MARKET_FEATURE_START=${2-}
+      case "$MARKET_FEATURE_START" in ''|*[!0-9]*) die "market feature start must be an integer clock" ;; esac
+      shift 2
+      ;;
+    --market-feature-end-received-at-ns)
+      MARKET_FEATURE_END=${2-}
+      case "$MARKET_FEATURE_END" in ''|*[!0-9]*) die "market feature end must be an integer clock" ;; esac
+      shift 2
       ;;
     --dry-run)
       DRY_RUN=1
@@ -987,6 +1004,17 @@ set -- "$PIT_BIN" \
 if [ "$SEQUENCE_OUTPUT" -eq 1 ]; then
   set -- "$@" --sequence-output
 fi
+if [ "$MARKET_ENCODER_OUTPUT" -eq 1 ]; then
+  set -- "$@" --market-encoder-output
+  if [ -n "$MARKET_FEATURE_START" ]; then
+    set -- "$@" --market-feature-start-received-at-ns "$MARKET_FEATURE_START"
+  fi
+  if [ -n "$MARKET_FEATURE_END" ]; then
+    set -- "$@" --market-feature-end-received-at-ns "$MARKET_FEATURE_END"
+  fi
+elif [ -n "$MARKET_FEATURE_END" ] || [ -n "$MARKET_FEATURE_START" ]; then
+  die "market feature partition requires market encoder output"
+fi
 if [ -n "$window_start_received_at_ns" ]; then
   set -- "$@" --output-start-received-at-ns "$window_start_received_at_ns" --output-end-received-at-ns "$window_end_received_at_ns"
 fi
@@ -1146,6 +1174,20 @@ if [ "$SEQUENCE_OUTPUT" -eq 1 ]; then
   done
 else
   [ -z "$sequence_hash" ] || die "sequence output differs from requested preparation mode"
+fi
+market_marker=$(sed -n '/^[[:space:]]*"market_encoder": {/p' "$materialization_path")
+if [ "$MARKET_ENCODER_OUTPUT" -eq 1 ]; then
+  [ -n "$market_marker" ] || die "market encoder export is missing from the PIT report"
+  for market_file in "$LOCAL_MATERIALIZATION_DIR"/*.market-feature-sources.json "$LOCAL_MATERIALIZATION_DIR"/*.market-features.jsonl "$LOCAL_MATERIALIZATION_DIR"/*.market-features.json "$LOCAL_MATERIALIZATION_DIR"/*.market-targets.jsonl "$LOCAL_MATERIALIZATION_DIR"/*.market-targets.json; do
+    [ -f "$market_file" ] && [ ! -L "$market_file" ] || die "market encoder output is missing or unsafe"
+    market_name=${market_file##*/}
+    market_sha=${market_name%%.*}
+    [ ${#market_sha} -eq 64 ] || die "market encoder object is not content-addressed"
+    case "$market_sha" in *[!a-f0-9]*) die "invalid market object digest" ;; esac
+    publish_verified_file market_encoder "$market_file" "$MATERIALIZATION_DIR/$market_name" "$market_sha"
+  done
+else
+  [ -z "$market_marker" ] || die "market encoder output differs from requested preparation mode"
 fi
 publish_verified_file feature_artifact "$feature_path" "$feature_publish_path" "$feature_sha"
 publish_verified_file materialization_report "$materialization_path" "$materialization_publish_path" "$materialization_sha"

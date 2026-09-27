@@ -1009,6 +1009,140 @@ pub(super) fn check_member_reservation(
     Ok(())
 }
 
+/// Running-stage checks retain the original charged attempt instead of adding
+/// its full duration to the current clock on every stage boundary.
+pub(super) fn lock_completion_approval(
+    tx: &Transaction<'_>,
+    key: &[u8; 32],
+    family_id: &str,
+) -> Result<(), StoreError> {
+    let (study_id, _, _) = read_member_projection(tx, key, family_id)?
+        .ok_or_else(|| err("completion requires a cumulative Study"))?;
+    let (state, _) = study_load(tx, key, &study_id)?;
+    let state = state.ok_or_else(|| err("missing completion Study"))?;
+    serialize_approval_mutation(
+        tx,
+        &state
+            .approval
+            .as_ref()
+            .ok_or_else(|| err("missing Study approval"))?
+            .approval_id,
+    )
+}
+
+pub(super) fn completion_member_active(
+    conn: &Connection,
+    key: &[u8; 32],
+    verified: &VerifiedCampaignRootGrant,
+    reservation: &CampaignAttemptReservationV1,
+    at: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    let (study_id, root_hash, binding) = read_member_projection(conn, key, &reservation.family_id)?
+        .ok_or_else(|| err("completion requires a cumulative Study"))?;
+    if root_hash != verified.content_sha256()
+        || !binding.matches_root(verified.grant(), verified.content_sha256())
+        || reservation.root_grant_sha256 != root_hash
+        || reservation.execution != binding.execution
+    {
+        return Err(err("completion changed its Study member"));
+    }
+    let (state, history) = study_load(conn, key, &study_id)?;
+    let state = state.ok_or_else(|| err("missing completion Study"))?;
+    let grant = state.grant()?;
+    let approval = read_effective_approval(
+        conn,
+        key,
+        &state
+            .approval
+            .as_ref()
+            .ok_or_else(|| err("missing Study approval"))?
+            .approval_id,
+    )?;
+    let attempt = state
+        .attempts
+        .get(&reservation.operation_id().map_err(err)?)
+        .ok_or_else(|| err("missing Study attempt"))?;
+    if attempt.reservation != *reservation {
+        return Err(err("completion Study attempt changed"));
+    }
+    let sequence = history
+        .iter()
+        .find_map(|r| match &r.receipt.event {
+            CampaignStudyLedgerEventV1::AttemptReserved {
+                reservation: observed,
+                ..
+            } if observed == reservation => Some(r.receipt.sequence),
+            _ => None,
+        })
+        .ok_or_else(|| err("missing completion Study reservation receipt"))?;
+    require_published_study_receipts(conn, key, &study_id, &history, sequence)?;
+    Ok(grant.validate_active_at(at).is_ok()
+        && approval.is_active_at(at)
+        && !state.revoked_at.is_some_and(|when| at >= when))
+}
+
+pub(super) fn check_running_member(
+    conn: &Connection,
+    key: &[u8; 32],
+    verified: &VerifiedCampaignRootGrant,
+    reservation: &CampaignAttemptReservationV1,
+    at: DateTime<Utc>,
+) -> Result<DateTime<Utc>, StoreError> {
+    let (study_id, root_hash, binding) = read_member_projection(conn, key, &reservation.family_id)?
+        .ok_or_else(|| err("running attempt lacks a Study"))?;
+    if root_hash != verified.content_sha256()
+        || !binding.matches_root(verified.grant(), verified.content_sha256())
+        || reservation.root_grant_sha256 != root_hash
+        || reservation.execution != binding.execution
+    {
+        return Err(err("running attempt changed its Study member"));
+    }
+    let (state, history) = study_load(conn, key, &study_id)?;
+    let state = state.ok_or_else(|| err("missing running Study"))?;
+    let grant = state.grant()?;
+    grant.validate_active_at(at).map_err(err)?;
+    let approval = read_effective_approval(
+        conn,
+        key,
+        &state
+            .approval
+            .as_ref()
+            .ok_or_else(|| err("missing Study approval"))?
+            .approval_id,
+    )?;
+    let operation = reservation.operation_id().map_err(err)?;
+    let attempt = state
+        .attempts
+        .get(&operation)
+        .ok_or_else(|| err("missing Study attempt"))?;
+    if !approval.is_active_at(at)
+        || state.revoked_at.is_some_and(|when| at >= when)
+        || attempt.reservation != *reservation
+        || attempt.settlement.is_some()
+    {
+        return Err(err("running Study is inactive or attempt changed"));
+    }
+    let sequence = history
+        .iter()
+        .find_map(|r| match &r.receipt.event {
+            CampaignStudyLedgerEventV1::AttemptReserved {
+                reservation: observed,
+                ..
+            } if observed == reservation => Some(r.receipt.sequence),
+            _ => None,
+        })
+        .ok_or_else(|| err("missing running Study reservation receipt"))?;
+    require_published_study_receipts(conn, key, &study_id, &history, sequence)?;
+    let mut deadline = grant.grant().expires_at;
+    for when in [state.revoked_at, approval.revoked_at, approval.expires_at]
+        .into_iter()
+        .flatten()
+    {
+        deadline = deadline.min(when);
+    }
+    Ok(deadline)
+}
+
 fn study_prepare_reservation(
     conn: &Connection,
     key: &[u8; 32],
@@ -2648,6 +2782,7 @@ mod tests {
             namespace: "research".into(),
             job_name: "study-job".into(),
             manifest_sha256: repeat_hex('a'),
+            require_completion_authority: false,
         }
     }
 
@@ -2685,6 +2820,7 @@ mod tests {
         acknowledge_family_receipts(&mut store, &attempt.family_id);
 
         let evidence = CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "study-job-uid".into(),
             pod_uid: "study-pod-uid".into(),
             settlement: settlement(
@@ -2694,6 +2830,48 @@ mod tests {
                 'b',
             ),
         };
+        let completion = CampaignDispatchCompletionV1 {
+            job_uid: evidence.job_uid.clone(),
+            pod_uid: evidence.pod_uid.clone(),
+            job_sha256: repeat_hex('a'),
+            pod_sha256: repeat_hex('b'),
+            job_started_at: at(3),
+            completed_at: at(4),
+        };
+        // An in-flight Root or Study approval revocation must conflict with
+        // completion settlement, even after an optimistic active read.
+        assert!(store
+            .campaign_dispatch_completion_active(&attempt, &completion, at(4))
+            .unwrap());
+        let mut competing = store.connection.try_clone().unwrap();
+        for guard in ["root-approval-1", "study-approval", "family", "study"] {
+            let tx = competing.transaction().unwrap();
+            match guard {
+                "family" => {
+                    tx.execute(
+                        "UPDATE campaign_family_heads SET sequence = sequence WHERE family_id = ?",
+                        params![attempt.family_id],
+                    )
+                    .unwrap();
+                }
+                "study" => {
+                    ensure_study_head(&tx, &store.integrity_key, &study.grant().study_id).unwrap()
+                }
+                approval => serialize_approval_mutation(&tx, approval).unwrap(),
+            }
+            assert!(
+                store
+                    .settle_campaign_dispatch_at_completion(&attempt, &evidence, &completion, at(4))
+                    .is_err(),
+                "settlement did not conflict with {guard}"
+            );
+            tx.rollback().unwrap();
+        }
+        assert!(store
+            .campaign_dispatch_record(&attempt.family_id, &attempt.operation_id().unwrap())
+            .unwrap()
+            .settlement
+            .is_none());
         let receipt = store
             .settle_campaign_dispatch(&attempt, &evidence, at(4))
             .unwrap();

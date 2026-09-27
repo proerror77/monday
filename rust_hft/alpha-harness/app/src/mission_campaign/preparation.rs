@@ -257,6 +257,7 @@ fn member_plans(plan: &PreparationPlan) -> anyhow::Result<Vec<CexCampaignResearc
 
 fn freeze_args(plan: &PreparationPlan, receipt: &Path) -> CampaignFreezeArgs {
     CampaignFreezeArgs {
+        stage_authority: None,
         preparation_ledger: None,
         reuse: None,
         reuse_sha256: None,

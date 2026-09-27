@@ -574,3 +574,79 @@ fn market_ridge_keeps_shared_channel_scaling_across_different_lags() {
         assert!((model.predict(row).unwrap() - expected).abs() < 1e-6);
     }
 }
+
+#[test]
+fn market_study_reconstruction_diagnostics_are_independently_compared_and_restored() {
+    use MarketTrainingStageKindV1::Pretrain;
+    use MarketTrainingStagePurposeV1::{Primary, Verification};
+    let root = tempfile::tempdir().unwrap();
+    let mut plan = study();
+    let (features, targets) = fixture(root.path(), &mut plan);
+    let p = fit(
+        &plan,
+        root.path(),
+        &features,
+        &targets,
+        key(Pretrain, Primary),
+        None,
+    )
+    .unwrap();
+    let mut v = fit(
+        &plan,
+        root.path(),
+        &features,
+        &targets,
+        key(Pretrain, Verification),
+        None,
+    )
+    .unwrap();
+    verify_market_stage_pair(&p, &v).unwrap();
+    let (metadata, weights) = p.bundle().unwrap();
+    let restored = FittedMarketStage::restore(
+        &plan,
+        key(Pretrain, Primary),
+        &metadata,
+        &bytes_digest(&metadata),
+        weights.clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(p.fitted_values_digest(), restored.fitted_values_digest());
+    let mut changed: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+    let mut audit: serde_json::Value =
+        serde_json::from_str(changed["reconstruction"]["metadata"].as_str().unwrap()).unwrap();
+    assert_eq!(audit["diagnostics"]["cpu_forward_examples"], 68);
+    assert_eq!(audit["diagnostics"]["additional_optimizer_updates"], 0);
+    let mse = audit["diagnostics"]["groups"][0]["model_mse"]
+        .as_f64()
+        .unwrap();
+    audit["diagnostics"]["groups"][0]["model_mse"] = serde_json::json!(mse + 1.0);
+    changed["reconstruction"]["metadata"] =
+        serde_json::json!(serde_json::to_string(&audit).unwrap());
+    let changed = serde_json::to_vec(&changed).unwrap();
+    assert!(FittedMarketStage::restore(
+        &plan,
+        key(Pretrain, Primary),
+        &changed,
+        &bytes_digest(&changed),
+        weights,
+        None
+    )
+    .is_err());
+    // Even with identical encoder/head parameters, numerical diagnostic drift
+    // must invalidate the independently fitted witness.
+    let Fitted::Encoder(checkpoint) = &mut v.model else {
+        panic!("P must be an encoder");
+    };
+    let (metadata, head) = checkpoint.reconstruction_bundle().unwrap().unwrap();
+    let mut audit: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+    let mse = audit["diagnostics"]["groups"][0]["model_mse"]
+        .as_f64()
+        .unwrap();
+    audit["diagnostics"]["groups"][0]["model_mse"] = serde_json::json!(mse + 1.0);
+    let altered = serde_json::to_vec(&audit).unwrap();
+    checkpoint
+        .attach_reconstruction_audit(&altered, &bytes_digest(&altered), head)
+        .unwrap();
+    assert!(verify_market_stage_pair(&p, &v).is_err());
+}

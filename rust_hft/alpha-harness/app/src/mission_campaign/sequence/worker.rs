@@ -439,11 +439,44 @@ pub(super) fn evaluate_group(
         });
         next = next.checked_add(1_000_000).context("tail clock overflow")?;
     }
+    let (state, replay, diagnostic) = replay_group(
+        root,
+        &request.inputs.replay_artifact,
+        &request.inputs.replay_manifest,
+        &request.plan.costs,
+        end_us,
+        &decisions,
+        &name,
+        results_dir,
+        artifacts,
+        group.report.as_mut().context("missing sequence report")?,
+    )?;
+    group.state = state;
+    group.replay = replay;
+    group.diagnostic = diagnostic;
+    Ok(group)
+}
+
+/// Both study protocols use the same native IOC execution and economic gates.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_group(
+    root: &Path,
+    replay_artifact: &inputs::Artifact,
+    replay_manifest: &inputs::Artifact,
+    costs: &alpha_domain::EvaluationCostsV1,
+    end_us: i64,
+    decisions: &[TargetPositionDecision],
+    name: &str,
+    results_dir: &Path,
+    artifacts: &mut BTreeMap<String, String>,
+    report: &mut SequenceGroupReportV1,
+) -> anyhow::Result<(String, Option<TargetPositionReplayMetrics>, Option<String>)> {
     let policy =
         alpha_domain::CexEventReplayPolicyV1::controlled_v2("sol-sequence-30s-ioc-v1", 5, 1000)?;
-    let costs = &request.plan.costs;
     let config = TargetPositionReplayConfig {
-        holding: Some(holding),
+        holding: Some(HorizonHoldingPolicyV1 {
+            horizon_millis: 30000,
+        }),
         market: "usdm".into(),
         max_depth_levels: 5,
         max_decision_delay_us: policy.max_decision_delay_millis * 1000,
@@ -463,13 +496,13 @@ pub(super) fn evaluate_group(
         trade_tape_declared: false,
     };
     let replay = verify_and_replay_canonical_target_positions_with_trace(
-        &request.inputs.replay_artifact.path(root)?,
-        &request.inputs.replay_manifest.path(root)?,
-        &request.inputs.replay_artifact.sha256,
-        &request.inputs.replay_manifest.sha256,
+        &replay_artifact.path(root)?,
+        &replay_manifest.path(root)?,
+        &replay_artifact.sha256,
+        &replay_manifest.sha256,
         None,
         Some(end_us),
-        &decisions,
+        decisions,
         &config,
     );
     match replay {
@@ -486,7 +519,6 @@ pub(super) fn evaluate_group(
                 config_name.clone(),
                 crate::mission_runner::sha256_file(&results_dir.join(config_name))?,
             );
-            let report = group.report.as_mut().context("missing sequence report")?;
             report.blocks = blocks_from_trace(&replay.trace_bytes, costs.position_notional_usd)?;
             report.fees = Some(SequenceFeeBreakdownV1 {
                 total_fees: replay.metrics.total_fees,
@@ -495,17 +527,27 @@ pub(super) fn evaluate_group(
                 executed_turnover: replay.metrics.executed_turnover,
             });
             report.largest_block_abs_net_return_share = block_concentration(&report.blocks);
-            report.stresses = diagnostic_stresses(root, request, end_us, &decisions, &config)?;
+            report.stresses = diagnostic_stresses(
+                root,
+                replay_artifact,
+                replay_manifest,
+                end_us,
+                decisions,
+                &config,
+            )?;
             let metrics = replay.metrics;
-            group.state = classify_replay(&metrics, costs.max_book_depth_fraction).into();
-            group.replay = Some(metrics);
+            Ok((
+                classify_replay(&metrics, costs.max_book_depth_fraction).into(),
+                Some(metrics),
+                None,
+            ))
         }
-        Err(error) => {
-            group.state = "replay_failed".into();
-            group.diagnostic = Some(format!("{error:#}").chars().take(2048).collect());
-        }
+        Err(error) => Ok((
+            "replay_failed".into(),
+            None,
+            Some(format!("{error:#}").chars().take(2048).collect()),
+        )),
     }
-    Ok(group)
 }
 
 pub(crate) fn classify_replay(
@@ -553,7 +595,7 @@ pub(crate) fn classify_replay(
 const SEQUENCE_REPORT_SCHEMA: &str = "monday.sol_sequence_group_report.v1";
 const BLOCK_US: i64 = 6 * 3_600 * 1_000_000;
 const HORIZON_MS: [u32; 3] = [5_000, 10_000, 30_000];
-const REPORT_NOTE: &str = "Seeds 7 and 11 stay equal-weight and are not a confidence interval. Six-hour block net return is realized cash PnL divided by notional and attributed to the entry block; fees inside a block are those charged on its decisions. cost_plus_50pct and slower_latency_1000ms replay the same entry tape and do not select or retune a model. Canonical replay is L2 IOC taker execution and does not simulate a maker queue.";
+pub(crate) const REPORT_NOTE: &str = "Seeds 7 and 11 stay equal-weight and are not a confidence interval. Six-hour block net return is realized cash PnL divided by notional and attributed to the entry block; fees inside a block are those charged on its decisions. cost_plus_50pct and slower_latency_1000ms replay the same entry tape and do not select or retune a model. Canonical replay is L2 IOC taker execution and does not simulate a maker queue.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -618,7 +660,7 @@ pub(crate) struct SequenceGroupReportV1 {
 }
 
 #[derive(Clone, Copy, Default)]
-struct HorizonMoments {
+pub(crate) struct HorizonMoments {
     count: u64,
     sum_prediction: f64,
     sum_observed: f64,
@@ -632,7 +674,7 @@ struct HorizonMoments {
 }
 
 impl HorizonMoments {
-    fn observe(&mut self, predicted: f64, observed: f64) -> Result<(), String> {
+    pub(crate) fn observe(&mut self, predicted: f64, observed: f64) -> Result<(), String> {
         if !predicted.is_finite() || !observed.is_finite() {
             return Err("non-finite sequence prediction diagnostic".into());
         }
@@ -650,7 +692,7 @@ impl HorizonMoments {
         Ok(())
     }
 
-    fn finish(&self, horizon_ms: u32) -> Result<SequenceHorizonDiagnosticV1, String> {
+    pub(crate) fn finish(&self, horizon_ms: u32) -> Result<SequenceHorizonDiagnosticV1, String> {
         if self.count == 0 {
             return Err("sequence diagnostic has no predictions".into());
         }
@@ -821,7 +863,8 @@ fn block_concentration(blocks: &[SequenceBlockPnlV1]) -> Option<f64> {
 
 fn diagnostic_stresses(
     root: &Path,
-    request: &SequenceRequest,
+    replay_artifact: &inputs::Artifact,
+    replay_manifest: &inputs::Artifact,
     end_us: i64,
     decisions: &[TargetPositionDecision],
     base: &TargetPositionReplayConfig,
@@ -842,10 +885,10 @@ fn diagnostic_stresses(
         ("slower_latency_1000ms", slower),
     ] {
         let replay = verify_and_replay_canonical_target_positions_with_trace(
-            &request.inputs.replay_artifact.path(root)?,
-            &request.inputs.replay_manifest.path(root)?,
-            &request.inputs.replay_artifact.sha256,
-            &request.inputs.replay_manifest.sha256,
+            &replay_artifact.path(root)?,
+            &replay_manifest.path(root)?,
+            &replay_artifact.sha256,
+            &replay_manifest.sha256,
             None,
             Some(end_us),
             decisions,
@@ -885,18 +928,27 @@ fn diagnostic_stresses(
     Ok(stresses)
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
 }
 
-fn write_new_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+pub(crate) fn write_new_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
     write_new(path, &serde_json::to_vec_pretty(value)?)
 }
 
 fn pack_results(root: &Path, destination: &Path, result: &FoldResult) -> anyhow::Result<()> {
+    pack_result_artifacts(root, destination, "sequence-results", &result.artifacts)
+}
+
+pub(crate) fn pack_result_artifacts(
+    root: &Path,
+    destination: &Path,
+    directory: &str,
+    artifacts: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
     let file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -905,12 +957,9 @@ fn pack_results(root: &Path, destination: &Path, result: &FoldResult) -> anyhow:
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
         .unix_permissions(0o600);
-    for name in result.artifacts.keys() {
-        zip.start_file(format!("sequence-results/{name}"), options)?;
-        std::io::copy(
-            &mut File::open(root.join("sequence-results").join(name))?,
-            &mut zip,
-        )?;
+    for name in artifacts.keys() {
+        zip.start_file(format!("{directory}/{name}"), options)?;
+        std::io::copy(&mut File::open(root.join(directory).join(name))?, &mut zip)?;
     }
     zip.start_file("result.json", options)?;
     std::io::copy(&mut File::open(root.join("result.json"))?, &mut zip)?;
