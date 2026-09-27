@@ -126,6 +126,9 @@ impl MarketTaskModel {
     pub fn scaling(&self) -> &MarketFeatureScalingV1 {
         &self.manifest.scaling
     }
+    pub fn target_scaling(&self) -> (f64, f64) {
+        (self.manifest.target_mean, self.manifest.target_scale)
+    }
     pub fn parameter_digest(&self) -> &str {
         &self.manifest.parameter_values_sha256
     }

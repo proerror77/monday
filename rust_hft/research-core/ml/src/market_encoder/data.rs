@@ -159,6 +159,12 @@ impl MarketTaskReader {
             next_target: None,
         })
     }
+    pub fn feature_request(&self) -> &MarketDataReadRequestV1 {
+        self.features.request()
+    }
+    pub fn is_at_start(&self) -> bool {
+        self.features.is_at_start() && self.targets.is_at_start() && self.next_target.is_none()
+    }
     pub fn target_digest(&self) -> &str {
         &self.target_digest
     }

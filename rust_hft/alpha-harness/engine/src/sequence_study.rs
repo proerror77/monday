@@ -236,7 +236,10 @@ pub fn fit_sequence_comparison(
     }
 }
 
-fn fit_sequence_ridge(inputs: &[Vec<f64>], labels: &[f64]) -> Result<CexBaselineModelV1, String> {
+pub(crate) fn fit_sequence_ridge(
+    inputs: &[Vec<f64>],
+    labels: &[f64],
+) -> Result<CexBaselineModelV1, String> {
     let first = inputs.first().ok_or("empty SOL Ridge inputs")?;
     let varying = (0..first.len())
         .filter(|column| inputs.iter().any(|row| row[*column] != first[*column]))
@@ -510,31 +513,49 @@ fn sequence_entry_decision(
     costs: &alpha_domain::EvaluationCostsV1,
     declared_end_ms: i64,
 ) -> Result<SequenceEntryDecisionV1, String> {
+    if prediction.predicted_returns.iter().any(|v| !v.is_finite()) {
+        return Err("invalid SOL entry clock, spread or prediction".into());
+    }
+    sequence_entry_from_return(
+        prediction.observed_at_ms,
+        prediction.spread_bps,
+        prediction.predicted_returns[2],
+        costs,
+        declared_end_ms,
+    )
+}
+
+pub(crate) fn sequence_entry_from_return(
+    observed_at_ms: i64,
+    spread_bps: f64,
+    predicted_return: f64,
+    costs: &alpha_domain::EvaluationCostsV1,
+    declared_end_ms: i64,
+) -> Result<SequenceEntryDecisionV1, String> {
     use hft_research_manifest::model::{CexDecisionCostsV1, CexSupervisedDecisionPolicyV2};
     costs.validate().map_err(|e| e.to_string())?;
     if !costs.cross_spread
-        || prediction.observed_at_ms < 0
-        || !prediction.spread_bps.is_finite()
-        || prediction.spread_bps < 0.0
-        || prediction.predicted_returns.iter().any(|v| !v.is_finite())
-        || prediction.observed_at_ms >= declared_end_ms
+        || observed_at_ms < 0
+        || !spread_bps.is_finite()
+        || spread_bps < 0.0
+        || !predicted_return.is_finite()
+        || observed_at_ms >= declared_end_ms
     {
         return Err("invalid SOL entry clock, spread or prediction".into());
     }
     let one_way_cost_bps = costs.fee_bps - costs.rebate_bps
         + costs.latency_bps
         + costs.slippage_bps
-        + prediction.spread_bps / 2.0;
+        + spread_bps / 2.0;
     let round_trip_gate_bps = 2.0 * one_way_cost_bps + costs.funding_bps;
     if !round_trip_gate_bps.is_finite() || one_way_cost_bps < 0.0 {
         return Err("invalid SOL round-trip cost gate".into());
     }
-    let eligible = prediction
-        .observed_at_ms
+    let eligible = observed_at_ms
         .checked_add(30000)
         .is_some_and(|end| end < declared_end_ms);
     let proposed = CexSupervisedDecisionPolicyV2::controlled_v2().target_position(
-        prediction.predicted_returns[2],
+        predicted_return,
         0.0,
         CexDecisionCostsV1 {
             one_way_cost_bps,
@@ -542,8 +563,7 @@ fn sequence_entry_decision(
         },
     )?;
     Ok(SequenceEntryDecisionV1 {
-        timestamp_us: prediction
-            .observed_at_ms
+        timestamp_us: observed_at_ms
             .checked_mul(1000)
             .ok_or("SOL decision clock overflow")?,
         entry_target: (eligible && proposed != 0.0).then(|| proposed.signum()),

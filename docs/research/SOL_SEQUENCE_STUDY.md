@@ -145,3 +145,24 @@ These are library capabilities verified with controlled data. Real feature and
 target materialization, Campaign stage accounting, reconstruction-head audit
 publication, final-evaluation integration, real-data fits and economic evidence
 remain pending. The library exposes no dispatch, holdout or order authority.
+
+## Two-stage study comparison contract
+
+`alpha-domain::market_encoder_study` fixes two 14-day development folds, seeds
+7/11, separate independent-selection and sealed identities, and 30-second tasks.
+The generated stage list contains pretraining, scratch, linear probe, full
+fine-tuning, a compute-control scratch model and Ridge. Each primary stage has a
+separate verification stage; downstream inheritance requires its own fold/seed's
+primary encoder and verified refit. The plan reserves 22 development plus 4
+conditional final primary fits, with matching verification budgets. Checking
+remaining capacity requires authenticated cumulative consumption, not an assumed
+zero balance.
+
+`alpha-engine::market_encoder_study` binds the fitter and restored artifacts to
+that study and stage identity. Learned-value digests compare parameters, feature/target scaling, fit requests
+and input identities independently of container IDs and stage purpose.
+Task ensembles require both declared seeds and use their mean. The entry policy
+shares the existing 30-second IOC cost gate; target labels do not enter an entry
+decision. Development prediction coverage remains explicit, and incomplete
+coverage prohibits an economic pass. These library contracts do not by themselves
+reserve a Campaign, authenticate raw provenance, open holdout or start research.
