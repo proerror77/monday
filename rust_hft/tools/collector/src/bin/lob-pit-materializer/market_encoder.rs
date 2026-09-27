@@ -14,8 +14,89 @@ pub(super) struct PublishedArtifact {
 pub(super) struct PublishedDatasets {
     pub schema_version: String,
     pub feature_end_received_at_ns: Option<u64>,
+    pub feature_sources: PublishedArtifact,
     pub features: PublishedArtifact,
     pub targets: PublishedArtifact,
+}
+
+/// Complete feature coverage has its own identity. The supervised PIT snapshot
+/// describes mature rows and therefore cannot attest warmup or unlabeled tails.
+#[derive(Debug, Serialize)]
+struct FeatureSources<'a> {
+    schema_version: &'static str,
+    market: &'a str,
+    symbol: &'a str,
+    replay_clock: &'static str,
+    source_revision: String,
+    source_segments: &'a [SourceSegmentEvidence],
+    feature_start_received_at_ns: Option<u64>,
+    feature_end_received_at_ns: Option<u64>,
+    first_feature_observed_at_ms: i64,
+    last_feature_observed_at_ms: i64,
+    first_dependency_received_at_ns: u64,
+    last_dependency_received_at_ns: u64,
+}
+
+fn publish_feature_sources(
+    replay: &Replay,
+    features: &[MarketFeatureFrameV1],
+    args: &Args,
+    symbol: &str,
+    segments: &[SourceSegmentEvidence],
+) -> Result<PublishedArtifact> {
+    let first = features
+        .first()
+        .context("market feature source has no frames")?;
+    let last = features
+        .last()
+        .context("market feature source has no frames")?;
+    let first_dependency = features
+        .iter()
+        .map(|frame| frame.series_id)
+        .min()
+        .context("market feature source has no series")?;
+    let last_dependency = u64::try_from(last.observed_at_ms)?
+        .checked_mul(1_000_000)
+        .context("market source clock overflow")?;
+    if segments.is_empty()
+        || segments
+            .iter()
+            .map(|s| s.start_received_at_ns)
+            .min()
+            .is_none_or(|t| t > first_dependency)
+        || segments
+            .iter()
+            .map(|s| s.end_received_at_ns)
+            .max()
+            .is_none_or(|t| t < last_dependency)
+        || !replay
+            .cont_ofi
+            .series_started_at_ns
+            .values()
+            .any(|t| *t == first_dependency)
+    {
+        bail!("market feature dependencies escape verified source segments");
+    }
+    let window = feature_window(args)?;
+    let source = FeatureSources {
+        schema_version: "monday.market_feature_sources.v1",
+        market: args.market.as_str(),
+        symbol,
+        replay_clock: CEX_REPLAY_CLOCK_RECEIVED_AT_NS,
+        source_revision: source_revision(segments),
+        source_segments: segments,
+        feature_start_received_at_ns: window.map(|w| w.0),
+        feature_end_received_at_ns: window.map(|w| w.1),
+        first_feature_observed_at_ms: first.observed_at_ms,
+        last_feature_observed_at_ms: last.observed_at_ms,
+        first_dependency_received_at_ns: first_dependency,
+        last_dependency_received_at_ns: last_dependency,
+    };
+    let bytes = serde_json::to_vec(&source)?;
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let file = format!("{sha256}.market-feature-sources.json");
+    publish_immutable(&args.artifact_dir.join(&file), &bytes)?;
+    Ok(PublishedArtifact { file, sha256 })
 }
 
 pub(super) fn feature_window(args: &Args) -> Result<Option<(u64, u64)>> {
@@ -215,11 +296,13 @@ pub(super) fn publish(
     trades: &[AggregateTrade],
     args: &Args,
     symbol: &str,
-    source_hash: &str,
+    source_segments: &[SourceSegmentEvidence],
 ) -> Result<PublishedDatasets> {
     // Build features first. Target omission cannot remove a feature observation.
     let features = feature_frames(replay, trades, args, symbol)?;
     let targets = target_frames(replay, &features, args)?;
+    let feature_sources =
+        publish_feature_sources(replay, &features, args, symbol, source_segments)?;
     let feature_shards = write_shards(&features, "market-features", &args.artifact_dir, |f| {
         f.observed_at_ms
     })?;
@@ -227,7 +310,7 @@ pub(super) fn publish(
         schema_version: FEATURE_SCHEMA.into(),
         venue: "binance-usdm".into(),
         symbol: symbol.into(),
-        source_manifest_sha256: source_hash.into(),
+        source_manifest_sha256: feature_sources.sha256.clone(),
         input: SequenceInputSpecV1::sol_lob(),
         shards: feature_shards,
     };
@@ -254,6 +337,7 @@ pub(super) fn publish(
     Ok(PublishedDatasets {
         schema_version: "monday.market_encoder_export.v1".into(),
         feature_end_received_at_ns: args.market_feature_end_received_at_ns,
+        feature_sources,
         features: PublishedArtifact {
             file: feature_file,
             sha256: feature_hash,

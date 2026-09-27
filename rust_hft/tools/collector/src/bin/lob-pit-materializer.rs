@@ -247,6 +247,7 @@ struct Replay {
     best_quote: Option<BestQuote>,
     cont_ofi: ContOfiTape,
     capture_levels: bool,
+    flush_checkpoints: bool,
 }
 
 impl Replay {
@@ -261,6 +262,7 @@ impl Replay {
             best_quote: None,
             cont_ofi: ContOfiTape::default(),
             capture_levels: false,
+            flush_checkpoints: false,
         }
     }
 
@@ -389,7 +391,10 @@ impl Replay {
                     ReplayedBinanceBookEvent::Checkpoint { .. } => {}
                 }
             }
-            if has_snapshot || has_diff {
+            // Market feature export includes unchanged observations through a
+            // verified checkpoint. Keep legacy PIT/sequence clocks unchanged;
+            // a subsequent snapshot still starts a separate recovery series.
+            if has_snapshot || has_diff || self.flush_checkpoints {
                 self.emit_at(received_at_ns)?;
             }
             start = end;
@@ -489,6 +494,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .context("bucket size overflow")?;
     let mut replay = Replay::new(bucket_ns, args.top_depth);
     replay.capture_levels = args.sequence_output || args.market_encoder_output;
+    replay.flush_checkpoints = args.market_encoder_output;
     let mut aggregate_trades = Vec::new();
     let mut has_aggregate_trades = None;
     log_event(
@@ -686,7 +692,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     let market_encoder = args
         .market_encoder_output
         .then(|| {
-            market_encoder::publish(&replay, &aggregate_trades, args, &symbol, &snapshot_sha256)
+            market_encoder::publish(&replay, &aggregate_trades, args, &symbol, &source_segments)
         })
         .transpose()?;
 
@@ -2641,6 +2647,20 @@ mod tests {
         assert_eq!(frame.forward_returns[2], cropped[0].label as f32);
     }
 
+    fn market_source_fixture(replay: &Replay) -> Vec<SourceSegmentEvidence> {
+        vec![SourceSegmentEvidence {
+            path: "segment.jsonl.zst".into(),
+            sha256: "b".repeat(64),
+            collector_manifest_path: "segment.manifest.json".into(),
+            collector_manifest_sha256: "c".repeat(64),
+            success_marker_path: "segment._SUCCESS".into(),
+            success_marker_sha256: hex::encode(Sha256::digest(format!("{}\n", "b".repeat(64)))),
+            start_received_at_ns: replay.samples.first().unwrap().time_ns,
+            end_received_at_ns: replay.samples.last().unwrap().time_ns,
+            events: replay.samples.len() as u64,
+        }]
+    }
+
     #[test]
     fn market_encoder_export_keeps_unlabeled_tail_and_separate_bound_targets() {
         use hft_research_manifest::market_encoder::{
@@ -2676,8 +2696,14 @@ mod tests {
             replay.state = Some(state(second));
             replay.emit_at(event_ns(second as u64 * 1000)).unwrap();
         }
-        let published =
-            market_encoder::publish(&replay, &[], &args, "SOLUSDT", &"b".repeat(64)).unwrap();
+        let published = market_encoder::publish(
+            &replay,
+            &[],
+            &args,
+            "SOLUSDT",
+            &market_source_fixture(&replay),
+        )
+        .unwrap();
         let features: MarketFeatureDatasetV1 = serde_json::from_slice(
             &std::fs::read(args.artifact_dir.join(&published.features.file)).unwrap(),
         )
@@ -2686,6 +2712,25 @@ mod tests {
             &std::fs::read(args.artifact_dir.join(&published.targets.file)).unwrap(),
         )
         .unwrap();
+        let sources: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(args.artifact_dir.join(&published.feature_sources.file)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            features.source_manifest_sha256,
+            published.feature_sources.sha256
+        );
+        assert_eq!(sources["first_dependency_received_at_ns"], START_NS);
+        assert_eq!(
+            sources["first_feature_observed_at_ms"],
+            event_ns(1000) / 1_000_000
+        );
+        assert_eq!(
+            sources["last_feature_observed_at_ms"],
+            event_ns(180000) / 1_000_000
+        );
+        assert_eq!(sources["source_segments"][0]["sha256"], "b".repeat(64));
+        assert!(sources.get("pit_snapshot_sha256").is_none());
         assert_eq!(features.digest().unwrap(), published.features.sha256);
         assert_eq!(targets.digest().unwrap(), published.targets.sha256);
         assert_eq!(targets.feature_dataset_sha256, features.digest().unwrap());
@@ -2707,8 +2752,14 @@ mod tests {
             frames.last().unwrap().observed_at_ms,
             (event_ns(180000) / 1_000_000) as i64
         );
-        let repeated =
-            market_encoder::publish(&replay, &[], &args, "SOLUSDT", &"b".repeat(64)).unwrap();
+        let repeated = market_encoder::publish(
+            &replay,
+            &[],
+            &args,
+            "SOLUSDT",
+            &market_source_fixture(&replay),
+        )
+        .unwrap();
         assert_eq!(repeated.features.sha256, published.features.sha256);
         let original = replay.samples[31].mid_price;
         replay.samples[31].mid_price *= 1.01;
@@ -2741,7 +2792,14 @@ mod tests {
         assert_eq!(with_trades[0], frames[0]);
         assert_eq!(with_trades[2].channels[21], 999.0_f64.ln_1p() as f32);
         let missing = replay.samples.remove(80);
-        let gap = market_encoder::publish(&replay, &[], &args, "SOLUSDT", &"b".repeat(64)).unwrap();
+        let gap = market_encoder::publish(
+            &replay,
+            &[],
+            &args,
+            "SOLUSDT",
+            &market_source_fixture(&replay),
+        )
+        .unwrap();
         let gap_targets: MarketTargetDatasetV1 = serde_json::from_slice(
             &std::fs::read(args.artifact_dir.join(gap.targets.file)).unwrap(),
         )
@@ -2759,8 +2817,14 @@ mod tests {
         // An end boundary removes neither earlier features nor invents tail labels.
         args.output_start_received_at_ns = Some(event_ns(0));
         args.output_end_received_at_ns = Some(event_ns(90000));
-        let cropped =
-            market_encoder::publish(&replay, &[], &args, "SOLUSDT", &"b".repeat(64)).unwrap();
+        let cropped = market_encoder::publish(
+            &replay,
+            &[],
+            &args,
+            "SOLUSDT",
+            &market_source_fixture(&replay),
+        )
+        .unwrap();
         let features: MarketFeatureDatasetV1 = serde_json::from_slice(
             &std::fs::read(args.artifact_dir.join(cropped.features.file)).unwrap(),
         )
@@ -2773,8 +2837,14 @@ mod tests {
         assert_eq!(targets.shards.iter().map(|s| s.rows).sum::<u64>(), 59);
         args.output_end_received_at_ns = Some(event_ns(120000));
         args.market_feature_end_received_at_ns = Some(event_ns(90000));
-        let extended =
-            market_encoder::publish(&replay, &[], &args, "SOLUSDT", &"b".repeat(64)).unwrap();
+        let extended = market_encoder::publish(
+            &replay,
+            &[],
+            &args,
+            "SOLUSDT",
+            &market_source_fixture(&replay),
+        )
+        .unwrap();
         let extended_features: MarketFeatureDatasetV1 = serde_json::from_slice(
             &std::fs::read(args.artifact_dir.join(extended.features.file)).unwrap(),
         )
@@ -2788,6 +2858,16 @@ mod tests {
             89
         );
         assert_eq!(
+            extended.features.sha256, cropped.features.sha256,
+            "label-only lookahead must not change feature identity"
+        );
+        let mut missing_tail_sources = market_source_fixture(&replay);
+        missing_tail_sources[0].end_received_at_ns = event_ns(80000);
+        assert!(
+            market_encoder::publish(&replay, &[], &args, "SOLUSDT", &missing_tail_sources).is_err()
+        );
+
+        assert_eq!(
             extended_targets.shards.iter().map(|s| s.rows).sum::<u64>(),
             89
         );
@@ -2795,6 +2875,97 @@ mod tests {
         assert!(market_encoder::feature_window(&args).is_err());
         args.market_feature_end_received_at_ns = Some(event_ns(0));
         assert!(market_encoder::feature_window(&args).is_err());
+    }
+
+    #[test]
+    fn market_encoder_checkpoint_tail_flushes_without_crossing_recovery_gap() {
+        let snapshot = |received_at_ns| {
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                received_at_ns,
+                bids: (0..5)
+                    .map(|i| level(&(100 - i).to_string(), "10"))
+                    .collect(),
+                asks: (0..5)
+                    .map(|i| level(&(102 + i).to_string(), "10"))
+                    .collect(),
+            })
+        };
+        // Top5 capture alone (legacy sequence output) must not opt in.
+        for capture_levels in [false, true] {
+            let mut legacy = Replay::new(1_000_000_000, 5);
+            legacy.capture_levels = capture_levels;
+            legacy
+                .consume(&[
+                    snapshot(START_NS),
+                    ReplayedBinanceBookEvent::Checkpoint {
+                        received_at_ns: event_ns(180000),
+                    },
+                    snapshot(event_ns(300000)),
+                    ReplayedBinanceBookEvent::Checkpoint {
+                        received_at_ns: event_ns(360000),
+                    },
+                ])
+                .unwrap();
+            assert_eq!(
+                legacy
+                    .samples
+                    .iter()
+                    .map(|sample| sample.time_ns)
+                    .collect::<Vec<_>>(),
+                vec![START_NS, event_ns(300000)]
+            );
+        }
+        let mut replay = Replay::new(1_000_000_000, 5);
+        replay.capture_levels = true;
+        replay.flush_checkpoints = true;
+        replay
+            .consume(&[
+                snapshot(START_NS),
+                ReplayedBinanceBookEvent::Checkpoint {
+                    received_at_ns: event_ns(180000),
+                },
+            ])
+            .unwrap();
+        assert_eq!(replay.samples.len(), 181);
+        assert_eq!(replay.samples.last().unwrap().time_ns, event_ns(180000));
+        replay
+            .consume(&[
+                snapshot(event_ns(300000)),
+                ReplayedBinanceBookEvent::Checkpoint {
+                    received_at_ns: event_ns(360000),
+                },
+            ])
+            .unwrap();
+        assert!(!replay
+            .samples
+            .iter()
+            .any(|s| s.time_ns > event_ns(180000) && s.time_ns < event_ns(300000)));
+        let fixture = Fixture::new(Market::Usdm, &valid_rows("usdm"));
+        let mut args = fixture.args();
+        args.symbol = "SOLUSDT".into();
+        args.label_horizon_buckets = 30;
+        args.market_encoder_output = true;
+        let features = market_encoder::feature_frames(&replay, &[], &args, "SOLUSDT").unwrap();
+        assert_eq!(features.len(), 240);
+        assert_eq!(features[180].series_id, event_ns(300000));
+        assert_eq!(
+            features[180].observed_at_ms,
+            (event_ns(301000) / 1_000_000) as i64
+        );
+        let exported = market_encoder::publish(
+            &replay,
+            &[],
+            &args,
+            "SOLUSDT",
+            &market_source_fixture(&replay),
+        )
+        .unwrap();
+        let targets: hft_research_manifest::market_encoder::MarketTargetDatasetV1 =
+            serde_json::from_slice(
+                &std::fs::read(args.artifact_dir.join(exported.targets.file)).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(targets.shards.iter().map(|s| s.rows).sum::<u64>(), 180);
     }
 
     #[test]
