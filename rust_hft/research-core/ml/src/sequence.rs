@@ -1,15 +1,9 @@
 //! Bounded causal sequence loading. No future rows enter the predictor input.
 pub mod training;
+use crate::sequence_storage::{Frame, Frames};
 use hft_research_manifest::sequence::{SequenceDatasetV1, SequenceFrameV1, SequenceViewV1};
-use sha2::{Digest, Sha256};
-use std::{
-    collections::VecDeque,
-    fs::File,
-    io::{BufRead, BufReader, Read},
-    path::Path,
-};
+use std::{collections::VecDeque, path::Path};
 
-const MAX_FRAME_BYTES: usize = 32 * 1024;
 pub const MAX_SEQUENCE_BATCH: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,24 +15,23 @@ pub struct SequenceExample {
     pub targets: [f32; 3],
 }
 
-struct ShardReader {
-    reader: BufReader<File>,
-    digest: Sha256,
-    bytes: u64,
-    rows: u64,
-    first: Option<i64>,
-    last: Option<i64>,
+impl Frame for SequenceFrameV1 {
+    fn clock(&self) -> i64 {
+        self.observed_at_ms
+    }
+    fn validate(
+        &self,
+        input: &hft_research_manifest::sequence::SequenceInputSpecV1,
+    ) -> Result<(), String> {
+        self.validate(input)
+    }
 }
 
 pub struct SequenceReader {
     dataset: SequenceDatasetV1,
-    files: Vec<File>,
+    frames: Frames<SequenceFrameV1>,
     view: SequenceViewV1,
-    shard_index: usize,
-    shard: Option<ShardReader>,
     history: VecDeque<SequenceFrameV1>,
-    previous_clock: Option<i64>,
-    finished: bool,
 }
 
 impl SequenceReader {
@@ -55,51 +48,12 @@ impl SequenceReader {
         if dataset.digest()? != expected_digest {
             return Err("sequence dataset digest mismatch".into());
         }
-        let mut files = Vec::with_capacity(dataset.shards.len());
-        for descriptor in &dataset.shards {
-            let path = root.join(&descriptor.file);
-            let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-            if !metadata.file_type().is_file() || metadata.len() != descriptor.bytes {
-                return Err("sequence shard is not a regular file of the declared size".into());
-            }
-            let mut file = File::open(&path).map_err(|e| e.to_string())?;
-            use std::os::unix::fs::MetadataExt;
-            let opened = file.metadata().map_err(|e| e.to_string())?;
-            if opened.len() != descriptor.bytes
-                || opened.dev() != metadata.dev()
-                || opened.ino() != metadata.ino()
-            {
-                return Err("sequence shard size changed during admission".into());
-            }
-            let mut digest = Sha256::new();
-            let mut buffer = [0_u8; 64 * 1024];
-            let mut bytes = 0_u64;
-            loop {
-                let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
-                if count == 0 {
-                    break;
-                }
-                bytes += count as u64;
-                if bytes > descriptor.bytes {
-                    return Err("sequence shard grew during admission".into());
-                }
-                digest.update(&buffer[..count]);
-            }
-            if bytes != descriptor.bytes || format!("{:x}", digest.finalize()) != descriptor.sha256
-            {
-                return Err("sequence shard checksum mismatch".into());
-            }
-            files.push(file);
-        }
+        let frames = Frames::open(root, dataset.shards.clone(), dataset.input.clone())?;
         Ok(Self {
             dataset,
-            files,
+            frames,
             view,
-            shard_index: 0,
-            shard: None,
             history: VecDeque::new(),
-            previous_clock: None,
-            finished: false,
         })
     }
 
@@ -116,24 +70,18 @@ impl SequenceReader {
     }
 
     pub fn is_at_start(&self) -> bool {
-        self.shard_index == 0 && self.shard.is_none() && self.history.is_empty() && !self.finished
+        self.frames.is_at_start() && self.history.is_empty()
     }
 
     pub fn rewind(&mut self) -> Result<(), String> {
-        if !self.finished {
-            return Err("cannot rewind an incompletely verified sequence pass".into());
-        }
-        self.shard_index = 0;
-        self.shard = None;
+        self.frames.rewind()?;
         self.history.clear();
-        self.previous_clock = None;
-        self.finished = false;
         Ok(())
     }
 
-    /// Verify any remaining bytes before committing a model after a bounded update budget.
+    /// Verify remaining bytes before publishing a bounded training result.
     pub fn finish_pass(&mut self) -> Result<(), String> {
-        while self.next_frame()?.is_some() {}
+        self.frames.finish()?;
         self.history.clear();
         Ok(())
     }
@@ -144,7 +92,7 @@ impl SequenceReader {
         }
         let mut batch = Vec::with_capacity(max_examples);
         while batch.len() < max_examples {
-            let Some(frame) = self.next_frame()? else {
+            let Some(frame) = self.frames.next()? else {
                 break;
             };
             let discontinuity = self.history.back().is_some_and(|previous| {
@@ -193,72 +141,6 @@ impl SequenceReader {
         }
         Ok(batch)
     }
-
-    fn next_frame(&mut self) -> Result<Option<SequenceFrameV1>, String> {
-        use std::io::{Seek, SeekFrom};
-        loop {
-            if self.shard_index == self.files.len() {
-                self.finished = true;
-                return Ok(None);
-            }
-            if self.shard.is_none() {
-                let mut file = self.files[self.shard_index]
-                    .try_clone()
-                    .map_err(|e| e.to_string())?;
-                file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-                self.shard = Some(ShardReader {
-                    reader: BufReader::new(file),
-                    digest: Sha256::new(),
-                    bytes: 0,
-                    rows: 0,
-                    first: None,
-                    last: None,
-                });
-            }
-            let shard = self.shard.as_mut().expect("opened shard");
-            let mut line = Vec::new();
-            let count = (&mut shard.reader)
-                .take((MAX_FRAME_BYTES + 1) as u64)
-                .read_until(b'\n', &mut line)
-                .map_err(|e| e.to_string())?;
-            if count == 0 {
-                let shard = self.shard.take().expect("opened shard");
-                let descriptor = &self.dataset.shards[self.shard_index];
-                if shard.bytes != descriptor.bytes
-                    || shard.rows != descriptor.rows
-                    || shard.first != Some(descriptor.first_observed_at_ms)
-                    || shard.last != Some(descriptor.last_observed_at_ms)
-                    || format!("{:x}", shard.digest.finalize()) != descriptor.sha256
-                {
-                    return Err("sequence shard content or coverage changed".into());
-                }
-                self.shard_index += 1;
-                continue;
-            }
-            if count > MAX_FRAME_BYTES || line.last() != Some(&b'\n') {
-                return Err("oversized or unterminated sequence frame".into());
-            }
-            shard.bytes += count as u64;
-            if shard.bytes > self.dataset.shards[self.shard_index].bytes {
-                return Err("sequence shard exceeded declared bytes".into());
-            }
-            shard.digest.update(&line);
-            let frame: SequenceFrameV1 =
-                serde_json::from_slice(&line).map_err(|e| e.to_string())?;
-            frame.validate(&self.dataset.input)?;
-            if self
-                .previous_clock
-                .is_some_and(|previous| frame.observed_at_ms <= previous)
-            {
-                return Err("sequence frames are duplicate or out of order".into());
-            }
-            self.previous_clock = Some(frame.observed_at_ms);
-            shard.first.get_or_insert(frame.observed_at_ms);
-            shard.last = Some(frame.observed_at_ms);
-            shard.rows += 1;
-            return Ok(Some(frame));
-        }
-    }
 }
 
 #[cfg(test)]
@@ -267,6 +149,7 @@ mod tests {
     use hft_research_manifest::sequence::{
         SequenceInputSpecV1, SequenceShardV1, SEQUENCE_DATASET_SCHEMA,
     };
+    use sha2::{Digest, Sha256};
 
     fn frames() -> Vec<SequenceFrameV1> {
         (0..100)

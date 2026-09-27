@@ -394,7 +394,7 @@ pub fn train_sequence_model(
     {
         return Err("sequence training request differs from admitted dataset or view".into());
     }
-    if reader.shard_index != 0 || reader.shard.is_some() {
+    if !reader.is_at_start() {
         return Err("sequence training reader must start at its admitted beginning".into());
     }
     let scaling = fit_scaling(reader, &request)?;

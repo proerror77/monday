@@ -123,3 +123,25 @@ Its entry policy is constructed from the fitted study identity, so callers
 cannot substitute cheaper fees or a later exit boundary while preserving that
 identity. Each declared training view must permit at least 64 mature anchors;
 validation and sealed views must each permit a mature decision.
+
+## Separate self-supervised encoder route
+
+The two-stage route tracked by [#1235](https://github.com/proerror77/monday/issues/1235)
+uses the [market encoder implementation plan](../plans/2026-09-27-sol-market-encoder-pretraining.md).
+It does not change the already defined four-group #1230 study or reuse its grant
+under different semantics.
+
+`hft-research-manifest::market_encoder` defines separate feature-only and
+30-second target datasets. `hft-research-ml::market_encoder` provides bounded,
+hash-verified feature readers, causal whole-frame masked reconstruction, an
+encoder-only checkpoint, and scratch / frozen linear probe / full fine-tuning
+APIs. Adaptation verifies the actual loaded encoder values and fixed train-only
+scaling. A frozen probe cannot update encoder parameters; full fine-tuning with
+no encoder update is a failed fit. The complete task bundle restores both the
+adapted encoder and one return head. Exact JSON floating-point roundtrips and
+original Burnpack bytes preserve immutable artifact identity across restore.
+
+These are library capabilities verified with controlled data. Real feature and
+target materialization, Campaign stage accounting, reconstruction-head audit
+publication, final-evaluation integration, real-data fits and economic evidence
+remain pending. The library exposes no dispatch, holdout or order authority.
