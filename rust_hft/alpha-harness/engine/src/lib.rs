@@ -13,6 +13,7 @@ pub mod llm;
 pub mod model_metrics;
 pub mod prediction_diagnostics;
 pub mod sec_orderflow;
+pub mod sequence_study;
 
 #[cfg(feature = "kernel")]
 use alpha_domain::{
