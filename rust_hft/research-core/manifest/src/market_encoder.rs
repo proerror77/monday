@@ -153,6 +153,33 @@ impl MarketEncoderSpecV1 {
     }
 }
 
+/// A data view has no optimizer budget. Evaluation and Ridge readers use the
+/// same admitted clocks without pretending to be a neural training request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketDataReadRequestV1 {
+    pub feature_dataset_sha256: String,
+    pub input: SequenceInputSpecV1,
+    pub view: SequenceViewV1,
+    pub anchor_end_ms: i64,
+}
+impl MarketDataReadRequestV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        self.input.validate()?;
+        self.view.validate()?;
+        if !valid_sha256(&self.feature_dataset_sha256)
+            || self.view.decision_start_ms - self.view.history_start_ms
+                < ((self.input.context_rows - 1) * 1000) as i64
+            || self.anchor_end_ms <= self.view.decision_start_ms
+            || self.anchor_end_ms > self.view.end_ms
+            || self.anchor_end_ms % 1000 != 0
+        {
+            return Err("invalid market data view identity or clocks".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarketFitRequestV1 {
@@ -169,7 +196,16 @@ pub struct MarketFitRequestV1 {
     pub max_examples: u64,
 }
 impl MarketFitRequestV1 {
+    pub fn read_request(&self) -> MarketDataReadRequestV1 {
+        MarketDataReadRequestV1 {
+            feature_dataset_sha256: self.feature_dataset_sha256.clone(),
+            input: self.spec.input.clone(),
+            view: self.view,
+            anchor_end_ms: self.anchor_end_ms,
+        }
+    }
     pub fn validate(&self) -> Result<(), String> {
+        self.read_request().validate()?;
         self.spec.validate()?;
         self.view.validate()?;
         if !valid_sha256(&self.feature_dataset_sha256)
@@ -252,15 +288,31 @@ pub struct MarketFeatureScalingV1 {
 }
 impl MarketFeatureScalingV1 {
     pub fn validate(&self, request: &MarketFitRequestV1) -> Result<(), String> {
-        let n = request.spec.input.ordered_channels.len();
-        if self.means.len() != n
+        self.validate_for_data(
+            &request.read_request(),
+            request.min_examples,
+            request.max_examples,
+        )
+    }
+    pub fn validate_for_data(
+        &self,
+        request: &MarketDataReadRequestV1,
+        min_examples: u64,
+        max_examples: u64,
+    ) -> Result<(), String> {
+        request.validate()?;
+        let n = request.input.ordered_channels.len();
+        if min_examples < 2
+            || max_examples < min_examples
+            || max_examples > 32_768
+            || self.means.len() != n
             || self.scales.len() != n
             || self.means.iter().any(|v| !v.is_finite())
             || self.scales.iter().any(|v| !v.is_finite() || *v <= 0.0)
-            || self.examples < request.min_examples
-            || self.examples > request.max_examples
-            || self.unique_frames < request.spec.input.context_rows as u64
-            || self.unique_frames > self.examples * request.spec.input.context_rows as u64
+            || self.examples < min_examples
+            || self.examples > max_examples
+            || self.unique_frames < request.input.context_rows as u64
+            || self.unique_frames > self.examples * request.input.context_rows as u64
             || self.unique_frames
                 > ((request.view.end_ms - request.view.history_start_ms) / 1000) as u64
         {

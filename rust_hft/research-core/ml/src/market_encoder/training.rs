@@ -107,10 +107,10 @@ pub fn pretrain_market_encoder(
     request: MarketFitRequestV1,
 ) -> Result<MarketEncoderCheckpoint, String> {
     request.validate()?;
-    if reader.request() != &request || !reader.is_at_start() {
+    if reader.request() != &request.read_request() || !reader.is_at_start() {
         return Err("pretraining reader differs from request".into());
     }
-    let scaling = fit_market_scaling(reader)?;
+    let scaling = fit_market_scaling(reader, request.min_examples, request.max_examples)?;
     let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
     let device = NdArrayDevice::Cpu;
     CpuAutodiffBackend::seed(&device, request.seed);
@@ -189,13 +189,17 @@ pub fn adapt_market_encoder(
 ) -> Result<MarketTaskModel, String> {
     request.validate()?;
     check_parent(&request, parent)?;
-    if reader.features.request() != &request.fit
+    if reader.features.request() != &request.fit.read_request()
         || !reader.features.is_at_start()
         || reader.target_digest() != request.target_dataset_sha256
     {
         return Err("adaptation reader differs from request".into());
     }
-    let scaling = fit_market_scaling(&mut reader.features)?;
+    let scaling = fit_market_scaling(
+        &mut reader.features,
+        request.fit.min_examples,
+        request.fit.max_examples,
+    )?;
     if parent.is_some_and(|p| p.scaling() != &scaling) {
         return Err("adaptation changed its parent normalization".into());
     }

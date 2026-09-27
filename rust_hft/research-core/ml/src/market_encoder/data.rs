@@ -30,18 +30,18 @@ pub struct UnlabeledSequenceExample {
 pub struct MarketFeatureReader {
     frames: Frames<MarketFeatureFrameV1>,
     history: VecDeque<MarketFeatureFrameV1>,
-    request: MarketFitRequestV1,
+    request: MarketDataReadRequestV1,
 }
 impl MarketFeatureReader {
     pub fn open(
         root: &Path,
         dataset: MarketFeatureDatasetV1,
-        request: &MarketFitRequestV1,
+        request: &MarketDataReadRequestV1,
     ) -> Result<Self, String> {
         request.validate()?;
         dataset.validate()?;
         if dataset.digest()? != request.feature_dataset_sha256
-            || dataset.input != request.spec.input
+            || dataset.input != request.input
             || dataset.shards.iter().any(|s| {
                 s.first_observed_at_ms < request.view.history_start_ms
                     || s.last_observed_at_ms >= request.view.end_ms
@@ -55,7 +55,7 @@ impl MarketFeatureReader {
             request: request.clone(),
         })
     }
-    pub fn request(&self) -> &MarketFitRequestV1 {
+    pub fn request(&self) -> &MarketDataReadRequestV1 {
         &self.request
     }
     pub fn is_at_start(&self) -> bool {
@@ -82,11 +82,11 @@ impl MarketFeatureReader {
                 self.history.clear();
             }
             self.history.push_back(row);
-            if self.history.len() > self.request.spec.input.context_rows {
+            if self.history.len() > self.request.input.context_rows {
                 self.history.pop_front();
             }
             let row = self.history.back().expect("pushed frame");
-            if self.history.len() != self.request.spec.input.context_rows
+            if self.history.len() != self.request.input.context_rows
                 || row.observed_at_ms < self.request.view.decision_start_ms
                 || row.observed_at_ms >= self.request.anchor_end_ms
                 || (row.observed_at_ms - self.request.view.decision_start_ms)
@@ -151,7 +151,7 @@ impl MarketTaskReader {
         {
             return Err("market targets expose another dataset or future view".into());
         }
-        let frames = Frames::open(root, targets.shards, features.request.spec.input.clone())?;
+        let frames = Frames::open(root, targets.shards, features.request.input.clone())?;
         Ok(Self {
             features,
             targets: frames,
@@ -241,29 +241,34 @@ impl Moments {
 
 pub fn fit_market_scaling(
     reader: &mut MarketFeatureReader,
+    min_examples: u64,
+    max_examples: u64,
 ) -> Result<MarketFeatureScalingV1, String> {
+    if min_examples < 2 || max_examples < min_examples || max_examples > 32_768 {
+        return Err("invalid market scaling sample budget".into());
+    }
     if !reader.is_at_start() {
         return Err("scaling reader must start at beginning".into());
     }
     let request = reader.request.clone();
-    let n = request.spec.input.ordered_channels.len();
+    let n = request.input.ordered_channels.len();
     let mut moments = vec![Moments::default(); n];
     let mut last = None;
     let mut unique = 0;
     let mut examples = 0;
     loop {
-        let batch = reader.next_batch(request.batch_size)?;
+        let batch = reader.next_batch(256)?;
         if batch.is_empty() {
             break;
         }
         for item in batch {
             examples += 1;
-            if examples > request.max_examples {
+            if examples > max_examples {
                 return Err("market anchor budget exceeded".into());
             }
             for (index, frame) in item.inputs.chunks_exact(n).enumerate() {
-                let clock = item.observed_at_ms
-                    - ((request.spec.input.context_rows - index - 1) * 1000) as i64;
+                let clock =
+                    item.observed_at_ms - ((request.input.context_rows - index - 1) * 1000) as i64;
                 if last.is_some_and(|t| clock <= t) {
                     continue;
                 }
@@ -283,6 +288,6 @@ pub fn fit_market_scaling(
         unique_frames: unique,
         examples,
     };
-    scaling.validate(&request)?;
+    scaling.validate_for_data(&request, min_examples, max_examples)?;
     Ok(scaling)
 }

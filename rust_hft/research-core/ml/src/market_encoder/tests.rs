@@ -102,7 +102,7 @@ fn reader(
     data: &MarketFeatureDatasetV1,
     fit: &MarketFitRequestV1,
 ) -> MarketFeatureReader {
-    MarketFeatureReader::open(root, data.clone(), fit).unwrap()
+    MarketFeatureReader::open(root, data.clone(), &fit.read_request()).unwrap()
 }
 fn task_reader(
     root: &Path,
@@ -231,7 +231,7 @@ fn market_encoder_features_are_label_free_and_scaling_counts_unique_frames() {
     let (features, _, fit) = fixture(root.path());
     std::fs::remove_file(root.path().join("targets.jsonl")).unwrap();
     let mut r = reader(root.path(), &features, &fit);
-    let scaling = fit_market_scaling(&mut r).unwrap();
+    let scaling = fit_market_scaling(&mut r, fit.min_examples, fit.max_examples).unwrap();
     assert_eq!(scaling.unique_frames, 123);
     assert_eq!(scaling.examples, 64);
     let expected = (0..123)
@@ -251,7 +251,7 @@ fn market_encoder_masks_every_channel_and_excludes_visible_loss_shortcut() {
     let root = tempfile::tempdir().unwrap();
     let (features, _, fit) = fixture(root.path());
     let mut r = reader(root.path(), &features, &fit);
-    let scaling = fit_market_scaling(&mut r).unwrap();
+    let scaling = fit_market_scaling(&mut r, fit.min_examples, fit.max_examples).unwrap();
     let item = r.next_batch(1).unwrap().remove(0);
     let mask = masked_positions(fit.seed, 0, &item);
     assert_eq!(mask.iter().filter(|v| **v).count(), 18);
@@ -286,7 +286,9 @@ fn market_encoder_rejects_future_views_tampering_and_wrong_parent() {
     let (features, targets, fit) = fixture(root.path());
     let mut future = fit.clone();
     future.view.end_ms = 149000;
-    assert!(MarketFeatureReader::open(root.path(), features.clone(), &future).is_err());
+    assert!(
+        MarketFeatureReader::open(root.path(), features.clone(), &future.read_request()).is_err()
+    );
     let parent =
         pretrain_market_encoder(&mut reader(root.path(), &features, &fit), fit.clone()).unwrap();
     let mut request = MarketAdaptationRequestV1 {
@@ -334,7 +336,12 @@ fn market_encoder_gaps_reset_context_and_targets_cannot_skip_common_anchors() {
     let anchors = r.next_batch(256).unwrap();
     assert_eq!(anchors.len(), 11);
     assert_eq!(anchors.last().unwrap().observed_at_ms, 69000);
-    assert!(fit_market_scaling(&mut reader(root.path(), &features, &fit)).is_err());
+    assert!(fit_market_scaling(
+        &mut reader(root.path(), &features, &fit),
+        fit.min_examples,
+        fit.max_examples
+    )
+    .is_err());
     let (features, _, fit) = fixture(root.path());
     let text = std::fs::read_to_string(root.path().join("targets.jsonl")).unwrap();
     let mut rows = text
@@ -372,7 +379,12 @@ fn market_encoder_rejects_fine_tuning_that_only_updates_the_head() {
     let (features, targets, mut fit) = fixture(root.path());
     fit.updates = 2;
     fit.batch_size = 64;
-    let scaling = fit_market_scaling(&mut reader(root.path(), &features, &fit)).unwrap();
+    let scaling = fit_market_scaling(
+        &mut reader(root.path(), &features, &fit),
+        fit.min_examples,
+        fit.max_examples,
+    )
+    .unwrap();
     let parent = {
         let _guard = lock_ndarray_backend().unwrap();
         let model =
@@ -415,4 +427,19 @@ fn market_encoder_rejects_fine_tuning_that_only_updates_the_head() {
     .err()
     .unwrap();
     assert!(error.contains("without updating the encoder"), "{error}");
+}
+
+#[test]
+fn market_encoder_data_views_do_not_invent_an_optimizer_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let (features, _, mut fit) = fixture(root.path());
+    fit.updates = 0;
+    assert!(fit.validate().is_err());
+    let mut view = fit.read_request();
+    view.anchor_end_ms = 150000;
+    let mut r = MarketFeatureReader::open(root.path(), features.clone(), &view).unwrap();
+    assert_eq!(r.next_batch(256).unwrap().len(), 91);
+    // Read access cannot be promoted into an unbudgeted fit.
+    let mut r = MarketFeatureReader::open(root.path(), features, &fit.read_request()).unwrap();
+    assert!(pretrain_market_encoder(&mut r, fit).is_err());
 }
