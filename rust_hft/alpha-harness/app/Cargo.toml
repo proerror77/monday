@@ -19,6 +19,7 @@ hft-collector = { path = "../../tools/collector", features = ["collector-binance
 hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 hft-backtest = { path = "../../apps/backtest" }
 hft-research-manifest = { path = "../../research-core/manifest" }
+hft-research-ml = { path = "../../research-core/ml" }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

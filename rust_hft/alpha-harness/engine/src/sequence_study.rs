@@ -720,4 +720,131 @@ mod tests {
             None
         );
     }
+
+    fn study() -> SolSequenceStudyV1 {
+        use alpha_domain::sequence_study::{SequenceFoldV1, SOL_SEQUENCE_STUDY_SCHEMA};
+        use alpha_domain::EvaluationCostsV1;
+        use hft_research_manifest::sequence::SequenceViewV1;
+        let day = 86_400_000;
+        let mut folds = Vec::new();
+        for fold_id in [1, 2] {
+            let end = (16 + i64::from(fold_id) * 2) * day;
+            for days in [7, 14] {
+                let start = end - i64::from(days) * day;
+                let stride = ((end - start + 32_768_000 - 1) / 32_768_000) * 1000;
+                folds.push(SequenceFoldV1 {
+                    fold_id,
+                    training_window_days: days,
+                    train_dataset_sha256: "a".repeat(64),
+                    validation_dataset_sha256: "b".repeat(64),
+                    replay_manifest_sha256: "c".repeat(64),
+                    train: SequenceViewV1 {
+                        history_start_ms: start,
+                        decision_start_ms: start + 59_000,
+                        end_ms: end,
+                        decision_stride_ms: stride,
+                    },
+                    validation: SequenceViewV1 {
+                        history_start_ms: end + 1000,
+                        decision_start_ms: end + 60_000,
+                        end_ms: end + day,
+                        decision_stride_ms: 1000,
+                    },
+                });
+            }
+        }
+        SolSequenceStudyV1 {
+            schema_version: SOL_SEQUENCE_STUDY_SCHEMA.into(),
+            study_id: "sol-sequence-test".into(),
+            symbol: "SOLUSDT".into(),
+            input: SequenceInputSpecV1::sol_lob(),
+            models: vec![
+                SequenceStudyModelV1::Ridge,
+                SequenceStudyModelV1::FlattenedMlp,
+                SequenceStudyModelV1::PriceTcn,
+                SequenceStudyModelV1::LobTcn,
+            ],
+            neural_seeds: vec![7, 11],
+            folds,
+            sealed_dataset_sha256: "d".repeat(64),
+            sealed_view: SequenceViewV1 {
+                history_start_ms: 23 * day,
+                decision_start_ms: 23 * day + 59_000,
+                end_ms: 28 * day,
+                decision_stride_ms: 1000,
+            },
+            primary_horizon_ms: 30_000,
+            max_primary_fits: 30,
+            max_verification_fits: 30,
+            neural_updates: 1024,
+            batch_size: 32,
+            hidden_channels: 16,
+            learning_rate: 0.0003,
+            max_training_examples: 32_768,
+            costs: EvaluationCostsV1 {
+                fee_bps: 2.0,
+                rebate_bps: 0.0,
+                funding_bps: 0.0,
+                latency_bps: 0.5,
+                slippage_bps: 0.0,
+                cross_spread: true,
+                position_notional_usd: 100.0,
+                capacity_depth_levels: 5,
+                max_book_depth_fraction: 0.05,
+            },
+        }
+    }
+
+    #[test]
+    fn sequence_restore_rejects_identity_and_weight_drift() {
+        let plan = study();
+        let width = plan.input.context_rows * plan.input.ordered_channels.len();
+        let inputs = (0..80)
+            .map(|row| {
+                let mut values = vec![0.0; width];
+                values[0] = row as f64 / 80.0;
+                values
+            })
+            .collect::<Vec<_>>();
+        let labels = vec![0.0001; 80];
+        let model = fit_sequence_ridge(&inputs, &labels).unwrap();
+        let fitted = SequenceFit {
+            identity: identity(&plan, 1, 7, SequenceStudyModelV1::Ridge, 0).unwrap(),
+            model: FittedModel::Ridge(Box::new([model.clone(), model.clone(), model])),
+            training_examples: 80,
+        };
+        let (manifest, weights) = fitted.bundle().unwrap();
+        let hash = format!("{:x}", Sha256::digest(&manifest));
+        SequenceFit::restore(&plan, &manifest, &hash, weights.clone()).unwrap();
+
+        let mut header: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        header["neural_metadata"] = serde_json::json!("drift");
+        let drifted = serde_json::to_vec(&header).unwrap();
+        assert!(SequenceFit::restore(
+            &plan,
+            &drifted,
+            &format!("{:x}", Sha256::digest(&drifted)),
+            weights.clone(),
+        )
+        .is_err());
+
+        let mut value: serde_json::Value = serde_json::from_slice(&weights).unwrap();
+        let intercept = value[0]["intercept"].as_f64().unwrap();
+        value[0]["intercept"] = serde_json::json!(intercept + 1.0);
+        let tampered = serde_json::to_vec(&value).unwrap();
+        header = serde_json::from_slice(&manifest).unwrap();
+        header["model_sha256"] = serde_json::json!(format!("{:x}", Sha256::digest(&tampered)));
+        let tampered_manifest = serde_json::to_vec(&header).unwrap();
+        assert!(SequenceFit::restore(
+            &plan,
+            &tampered_manifest,
+            &format!("{:x}", Sha256::digest(&tampered_manifest)),
+            tampered,
+        )
+        .is_err());
+
+        let mut other = plan.clone();
+        other.costs.fee_bps = 3.0;
+        assert!(SequenceFit::restore(&other, &manifest, &hash, weights).is_err());
+    }
 }

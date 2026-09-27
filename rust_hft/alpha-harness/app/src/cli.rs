@@ -116,6 +116,8 @@ enum MissionCommand {
     /// Summarize completed model evidence without training or submitting research.
     ModelMetrics(ModelMetricsArgs),
     PrepareFreshInputs(Box<PrepareFreshInputsArgs>),
+    /// Assemble an immutable SOL sequence cohort from prepared PIT receipts.
+    PrepareSequenceCohort(PrepareSequenceCohortArgs),
     Dispatch {
         #[command(subcommand)]
         command: MissionDispatchCommand,
@@ -278,6 +280,9 @@ pub struct MissionDispatchSubmitArgs {
     /// Lightweight report derived in ACK from the authenticated settled cache.
     #[arg(long, requires = "readback_cache")]
     pub model_report: Option<PathBuf>,
+    /// Mounted sequence cohort. Required for sequence settlement; ignored by other submissions.
+    #[arg(long)]
+    pub input_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -489,6 +494,20 @@ pub struct CampaignIdArgs {
 /// Freeze a bounded archive window, run the existing CEX materializer, and
 /// verify its immutable local receipt before the canonical Campaign freeze.
 #[derive(Debug, Clone, Args)]
+pub struct PrepareSequenceCohortArgs {
+    #[arg(long)]
+    pub request: PathBuf,
+    #[arg(long)]
+    pub input_root: PathBuf,
+    /// Fresh directory containing only the worker's declared development view.
+    #[arg(long)]
+    pub output_root: PathBuf,
+    /// Receipt outside the worker view, retained by the ACK controller.
+    #[arg(long)]
+    pub inputs_out: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct PrepareFreshInputsArgs {
     /// Read-only root of sealed raw collector triplets.
     #[arg(long)]
@@ -555,6 +574,9 @@ pub struct PrepareFreshInputsArgs {
     pub materializer_work_dir: PathBuf,
     #[arg(long)]
     pub binary_dir: Option<PathBuf>,
+    /// Export verified SOL 1s/top5/30s sequence inputs along with PIT artifacts.
+    #[arg(long)]
+    pub sequence_output: bool,
     /// Upper bound for the materializer process lifetime.
     #[arg(long, default_value_t = 7_200)]
     pub materializer_timeout_seconds: u64,
@@ -1239,6 +1261,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 tokio::task::spawn_blocking(move || mission_fresh_inputs::prepare(*args))
                     .await
                     .context("fresh Campaign input preparation worker failed")?
+            }
+            MissionCommand::PrepareSequenceCohort(args) => {
+                require_cloud_data_host(std::env::consts::OS)?;
+                tokio::task::spawn_blocking(move || {
+                    mission_campaign::sequence::cohort::prepare(args)
+                })
+                .await
+                .context("sequence cohort preparation worker failed")?
             }
             MissionCommand::Dispatch { command } => match command {
                 MissionDispatchCommand::Submit(args) => {

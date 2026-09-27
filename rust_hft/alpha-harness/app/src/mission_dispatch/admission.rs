@@ -71,15 +71,15 @@ pub(super) struct ReceiptAccess {
 #[derive(Debug, Serialize)]
 pub(super) struct DispatchInspection {
     pub(super) execution: CampaignExecutionBindingV1,
-    campaign_id: String,
-    generation: u8,
-    parent_result_sha256: Option<String>,
-    policy_revision_id: String,
-    request_sha256: String,
-    attempt_ordinal: u32,
-    declared_trials: u64,
-    reserved_job_seconds: u64,
-    reserved_llm_tokens: u64,
+    pub(super) campaign_id: String,
+    pub(super) generation: u8,
+    pub(super) parent_result_sha256: Option<String>,
+    pub(super) policy_revision_id: String,
+    pub(super) request_sha256: String,
+    pub(super) attempt_ordinal: u32,
+    pub(super) declared_trials: u64,
+    pub(super) reserved_job_seconds: u64,
+    pub(super) reserved_llm_tokens: u64,
 }
 
 impl DispatchInspection {
@@ -282,9 +282,22 @@ pub(super) fn reconstruct_binding(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Purpose {
+pub(super) enum Purpose {
     Dispatch,
     Settlement,
+}
+
+/// Input-specific code derives this binding; the shared admission below owns
+/// signature checks, cumulative reservation, approval/revocation and Job claims.
+pub(super) struct InspectedDispatch<'a> {
+    pub(super) inspection: DispatchInspection,
+    pub(super) manifest: &'a Value,
+    pub(super) job_name: &'a str,
+    pub(super) result_readback_url: &'a str,
+    pub(super) study_proposal:
+        Option<&'a alpha_domain::campaign_horizon::CampaignNextFamilyProposalV1>,
+    pub(super) context: &'a str,
+    pub(super) namespace: &'a str,
 }
 
 pub(super) struct Admission {
@@ -362,7 +375,6 @@ impl Admission {
         read_only: bool,
     ) -> anyhow::Result<Self> {
         let control = read_control(path)?;
-        let signed: SignedCampaignRootGrantV1 = read_json(&control.signed_root_grant_path)?;
         let inspect = match purpose {
             Purpose::Dispatch => inspect_binding,
             Purpose::Settlement => reconstruct_binding,
@@ -374,6 +386,41 @@ impl Admission {
             &control.controller_image,
             control.attempt_ordinal,
         )?;
+        Self::from_inspection(
+            control,
+            InspectedDispatch {
+                inspection,
+                manifest,
+                job_name: &validated.job_name,
+                result_readback_url: &validated.submission.request.campaign_result_readback_url,
+                study_proposal: validated.submission.request.study_proposal.as_ref(),
+                context,
+                namespace,
+            },
+            purpose,
+            read_only,
+        )
+    }
+
+    pub(super) fn from_inspection(
+        control: DispatchControl,
+        binding: InspectedDispatch<'_>,
+        purpose: Purpose,
+        read_only: bool,
+    ) -> anyhow::Result<Self> {
+        let signed: SignedCampaignRootGrantV1 = read_json(&control.signed_root_grant_path)?;
+        let InspectedDispatch {
+            inspection,
+            manifest,
+            job_name,
+            result_readback_url,
+            study_proposal,
+            context,
+            namespace,
+        } = binding;
+        if read_only && purpose != Purpose::Settlement {
+            bail!("read-only admission cannot dispatch");
+        }
         // Opening the existing database read/write retains DuckDB's process
         // exclusion. Never create an empty replacement database.
         let store = if read_only {
@@ -396,7 +443,7 @@ impl Admission {
             }
         };
         let reservation = inspection.reservation(&verified);
-        if let Some(proposal) = validated.submission.request.study_proposal.as_ref() {
+        if let Some(proposal) = study_proposal {
             validate_study_member_binding(
                 &store,
                 &signed,
@@ -410,17 +457,15 @@ impl Admission {
         if purpose == Purpose::Dispatch {
             verified.validate_attempt_scope(&reservation, Utc::now())?;
         }
-        let result_object = canonical_tokyo_oss_internal_object(
-            "Campaign result",
-            &validated.submission.request.campaign_result_readback_url,
-        )?;
+        let result_object =
+            canonical_tokyo_oss_internal_object("Campaign result", result_readback_url)?;
         let receipt_origin = reqwest::Url::parse(&result_object)?
             .origin()
             .ascii_serialization();
         let target = CampaignDispatchTargetV1 {
             context: context.into(),
             namespace: namespace.into(),
-            job_name: validated.job_name.clone(),
+            job_name: job_name.into(),
             manifest_sha256: canonical_json_hash(manifest)?,
         };
         target.validate()?;

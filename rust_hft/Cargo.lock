@@ -663,6 +663,7 @@ dependencies = [
  "hft-factor-dsl",
  "hft-governance-contracts",
  "hft-research-manifest",
+ "hft-research-ml",
  "parquet",
  "reqwest 0.12.28",
  "serde",

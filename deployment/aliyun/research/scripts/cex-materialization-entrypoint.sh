@@ -13,6 +13,7 @@ usage: cex-materialization-entrypoint.sh \
   [--role all|slice|reduce] \
   [--shard-index N] \
   [--shard-count N] \
+  [--sequence-output] \
   [--dry-run]
 EOF
   exit 2
@@ -492,6 +493,7 @@ OUTPUT_ROOT=
 WORK_DIR=
 BINARY_DIR=/usr/local/bin
 DRY_RUN=0
+SEQUENCE_OUTPUT=0
 ROLE=all
 SHARD_INDEX=
 SHARD_COUNT=
@@ -535,6 +537,10 @@ while [ $# -gt 0 ]; do
     --shard-count)
       SHARD_COUNT=${2-}
       shift 2
+      ;;
+    --sequence-output)
+      SEQUENCE_OUTPUT=1
+      shift
       ;;
     --dry-run)
       DRY_RUN=1
@@ -978,6 +984,9 @@ set -- "$PIT_BIN" \
   --label-horizon-buckets "$label_horizon_buckets" \
   --top-depth "$top_depth" \
   --artifact-dir "$LOCAL_MATERIALIZATION_DIR"
+if [ "$SEQUENCE_OUTPUT" -eq 1 ]; then
+  set -- "$@" --sequence-output
+fi
 if [ -n "$window_start_received_at_ns" ]; then
   set -- "$@" --output-start-received-at-ns "$window_start_received_at_ns" --output-end-received-at-ns "$window_end_received_at_ns"
 fi
@@ -1120,6 +1129,24 @@ stage_event stage_complete receipt_build 1 1 "campaign_inputs_sha256=$campaign_i
 fi
 stage_event stage_start publish 0 1
 mkdir -p "$MATERIALIZATION_DIR" "$REPLAY_DIR" "$RECEIPT_DIR"
+# The signed preparation request binds this opt-in mode. Every sequence object
+# has a content-addressed basename; the native preparation verifier additionally
+# checks the manifest inventory, PIT source identity and every row after publish.
+sequence_hash=$(sed -n 's/^[[:space:]]*"sequence_manifest_sha256": "\([a-f0-9]*\)".*/\1/p' "$materialization_path")
+if [ "$SEQUENCE_OUTPUT" -eq 1 ]; then
+  [ ${#sequence_hash} -eq 64 ] || die "sequence manifest is missing from the PIT report"
+  [ -f "$LOCAL_MATERIALIZATION_DIR/$sequence_hash.sequence.json" ] || die "sequence manifest is missing"
+  for sequence_file in "$LOCAL_MATERIALIZATION_DIR"/*.sequence.jsonl "$LOCAL_MATERIALIZATION_DIR"/*.sequence.json; do
+    [ -f "$sequence_file" ] && [ ! -L "$sequence_file" ] || die "sequence output is missing or unsafe"
+    sequence_name=${sequence_file##*/}
+    sequence_sha=${sequence_name%%.*}
+    [ ${#sequence_sha} -eq 64 ] || die "sequence object is not content-addressed"
+    case "$sequence_sha" in *[!a-f0-9]*) die "invalid sequence object digest" ;; esac
+    publish_verified_file sequence "$sequence_file" "$MATERIALIZATION_DIR/$sequence_name" "$sequence_sha"
+  done
+else
+  [ -z "$sequence_hash" ] || die "sequence output differs from requested preparation mode"
+fi
 publish_verified_file feature_artifact "$feature_path" "$feature_publish_path" "$feature_sha"
 publish_verified_file materialization_report "$materialization_path" "$materialization_publish_path" "$materialization_sha"
 publish_verified_file replay_artifact "$replay_artifact_path" "$replay_artifact_publish_path" "$replay_artifact_sha"

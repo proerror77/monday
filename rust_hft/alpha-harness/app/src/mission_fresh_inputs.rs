@@ -62,6 +62,8 @@ struct PreparationRequest {
     materializer: PathBuf,
     binary_dir: Option<PathBuf>,
     materializer_work_dir: PathBuf,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    sequence_output: bool,
     materializer_timeout_seconds: u64,
     max_materializer_output_bytes: u64,
     inventory_path: PathBuf,
@@ -356,6 +358,15 @@ pub fn prepare(args: PrepareFreshInputsArgs) -> anyhow::Result<()> {
 
 fn validate_args(args: &PrepareFreshInputsArgs) -> anyhow::Result<()> {
     parse_market(&args.market)?;
+    if args.sequence_output
+        && (args.symbol != "SOLUSDT"
+            || args.market != "usdm"
+            || args.bucket_ms != 1000
+            || args.top_depth != 5
+            || args.label_horizon_buckets != 30)
+    {
+        bail!("sequence preparation requires SOLUSDT USD-M 1s/top5/30s");
+    }
     let has_explicit = args.start_received_at_ns.is_some() || args.end_received_at_ns.is_some();
     let has_latest = args.duration_ns.is_some()
         || args.cutoff_received_at_ns.is_some()
@@ -592,6 +603,7 @@ fn build_preparation_request(
         materializer: args.materializer.canonicalize()?,
         binary_dir,
         materializer_work_dir: args.materializer_work_dir.canonicalize()?,
+        sequence_output: args.sequence_output,
         materializer_timeout_seconds: args.materializer_timeout_seconds,
         max_materializer_output_bytes: args.max_materializer_output_bytes,
         inventory_path: normalize_for_compare(&args.inventory_out)?,
@@ -1010,6 +1022,9 @@ fn run_materializer(args: &PrepareFreshInputsArgs, inventory: &Path) -> anyhow::
         .arg(&args.materializer_work_dir)
         .arg("--role")
         .arg("all");
+    if args.sequence_output {
+        command.arg("--sequence-output");
+    }
     if let Some(binary_dir) = &args.binary_dir {
         command.arg("--binary-dir").arg(binary_dir);
     }
@@ -1229,6 +1244,7 @@ fn verify_materialized_outputs(
         "replay manifest",
         MAX_INPUT_BYTES,
     )?;
+    verify_sequence_output(args, run_root, &receipt.materialization)?;
     Ok(VerifiedOutputs {
         receipt_sha256,
         materialization_receipt_sha256,
@@ -1238,6 +1254,94 @@ fn verify_materialized_outputs(
         replay_artifact_sha256,
         replay_manifest_sha256,
     })
+}
+
+fn file_contains_pattern(path: &Path, needle: &[u8]) -> anyhow::Result<bool> {
+    if needle.is_empty() {
+        bail!("empty sequence marker");
+    }
+    let mut file = File::open(path)?;
+    let mut carry = Vec::with_capacity(needle.len() + 65_536);
+    let mut buffer = vec![0_u8; 65_536];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(false);
+        }
+        carry.extend_from_slice(&buffer[..read]);
+        if carry.windows(needle.len()).any(|window| window == needle) {
+            return Ok(true);
+        }
+        if carry.len() >= needle.len() {
+            carry.drain(..carry.len() + 1 - needle.len());
+        }
+    }
+}
+
+fn verify_sequence_output(
+    args: &PrepareFreshInputsArgs,
+    root: &Path,
+    materialization: &CampaignInputItem,
+) -> anyhow::Result<()> {
+    use hft_research_manifest::sequence::{SequenceDatasetV1, SequenceInputSpecV1, SequenceViewV1};
+    let path = root.join(&materialization.relative_path);
+    ensure_regular_file(&path, "materialization report")?;
+    // Legacy reports are not sequence JSON. Scan the requested marker without
+    // requiring a parse, then leave the historical receipt contract unchanged.
+    let declares_sequence = file_contains_pattern(&path, br#""sequence_manifest_sha256""#)?;
+    if declares_sequence != args.sequence_output {
+        bail!("sequence output differs from frozen preparation mode");
+    }
+    if !args.sequence_output {
+        return Ok(());
+    }
+    let report: serde_json::Value = read_json_bounded(&path)?;
+    let hash = report["sequence_manifest_sha256"].as_str();
+    let Some(hash) = hash else {
+        bail!("sequence output differs from frozen preparation mode");
+    };
+    if !hft_research_manifest::sequence::valid_sha256(hash) {
+        bail!("invalid sequence manifest identity");
+    }
+    let parent = path.parent().context("sequence output has no parent")?;
+    let manifest = parent.join(format!("{hash}.sequence.json"));
+    if sha256_file(&manifest)? != hash {
+        bail!("published sequence manifest differs");
+    }
+    let dataset: SequenceDatasetV1 = read_json_bounded(&manifest)?;
+    dataset.validate().map_err(anyhow::Error::msg)?;
+    let materialized = crate::mission_runner::decode_materialization(&read_file_bounded(
+        &path,
+        MAX_PREPARATION_BYTES,
+        "sequence PIT report",
+    )?)?;
+    if dataset.input != SequenceInputSpecV1::sol_lob()
+        || dataset.source_manifest_sha256 != materialized.snapshot.sha256()
+        || dataset.shards.iter().map(|shard| shard.rows).sum::<u64>() != materialized.rows as u64
+    {
+        bail!("published sequence input channels differ");
+    }
+    let first = dataset
+        .shards
+        .first()
+        .context("empty sequence")?
+        .first_observed_at_ms;
+    let last = dataset
+        .shards
+        .last()
+        .context("empty sequence")?
+        .last_observed_at_ms;
+    let view = SequenceViewV1 {
+        history_start_ms: first,
+        decision_start_ms: first,
+        end_ms: last
+            .checked_add(31_000)
+            .context("sequence clock overflow")?,
+        decision_stride_ms: 1000,
+    };
+    let mut reader = hft_research_ml::sequence::SequenceReader::open(parent, dataset, hash, view)
+        .map_err(anyhow::Error::msg)?;
+    reader.finish_pass().map_err(anyhow::Error::msg)
 }
 
 /// Validate the owner/hash evidence that makes a partial materializer output
@@ -1582,6 +1686,7 @@ mod tests {
             materializer: PathBuf::from("materializer.sh"),
             materializer_work_dir: PathBuf::from("materializer-work"),
             binary_dir: None,
+            sequence_output: false,
             materializer_timeout_seconds: 10,
             max_materializer_output_bytes: 1024,
             report_out: None,
@@ -1743,6 +1848,7 @@ EOF
             materializer,
             materializer_work_dir: work_dir.clone(),
             binary_dir: None,
+            sequence_output: false,
             materializer_timeout_seconds: 10,
             max_materializer_output_bytes: 16 * 1024,
             report_out: None,
@@ -1982,5 +2088,37 @@ exit 0
             .status()
             .unwrap()
             .success());
+    }
+
+    #[test]
+    fn legacy_materialization_report_is_not_parsed_as_sequence_json() {
+        let root = tempfile::tempdir().unwrap();
+        let report = root.path().join("materialization.json");
+        fs::write(&report, b"materialization\n").unwrap();
+        let item = CampaignInputItem {
+            relative_path: PathBuf::from("materialization.json"),
+            object_url: "https://bucket.example/materialization.json".into(),
+            sha256: "a".repeat(64),
+        };
+        let mut request = args();
+        assert!(verify_sequence_output(&request, root.path(), &item).is_ok());
+        request.sequence_output = true;
+        assert!(verify_sequence_output(&request, root.path(), &item).is_err());
+        fs::write(
+            &report,
+            format!("{{\"sequence_manifest_sha256\":\"{}\"}}\n", "a".repeat(64)),
+        )
+        .unwrap();
+        request.sequence_output = false;
+        assert!(verify_sequence_output(&request, root.path(), &item).is_err());
+        request.symbol = "SOLUSDT".into();
+        request.market = "usdm".into();
+        request.bucket_ms = 1000;
+        request.top_depth = 5;
+        request.label_horizon_buckets = 30;
+        request.sequence_output = true;
+        assert!(validate_args(&request).is_ok());
+        request.symbol = "BTCUSDT".into();
+        assert!(validate_args(&request).is_err());
     }
 }

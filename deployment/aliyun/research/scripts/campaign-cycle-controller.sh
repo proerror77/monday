@@ -1834,12 +1834,21 @@ while ((generation <= max_follow_ups)); do
   # neither a completed Job nor these shell checkpoint files authorize a child.
   controller_stage="ledger_settlement"
   [[ -s "$submission" ]] || die "Campaign settlement requires the original finalized submission"
-  "$alpha_harness" mission dispatch settle \
-    --submission "$submission" \
-    --context "$context" \
-    --namespace "$namespace" \
-    --readback-cache "$generation_dir" \
-    --model-report "$generation_dir/model-report.json" >"$generation_dir/settlement-report.json.partial"
+  settle_cmd=(
+    "$alpha_harness" mission dispatch settle
+    --submission "$submission"
+    --context "$context"
+    --namespace "$namespace"
+    --readback-cache "$generation_dir"
+    --model-report "$generation_dir/model-report.json"
+  )
+  submission_purpose="$(jq -r '.purpose // empty' "$submission")"
+  if [[ "$submission_purpose" == "sequence_study" ]]; then
+    [[ -n "${SEQUENCE_INPUT_ROOT:-}" && -d "$SEQUENCE_INPUT_ROOT" ]] \
+      || die "sequence settlement requires SEQUENCE_INPUT_ROOT mounted from the cohort PVC"
+    settle_cmd+=(--input-root "$SEQUENCE_INPUT_ROOT")
+  fi
+  "${settle_cmd[@]}" >"$generation_dir/settlement-report.json.partial"
   jq -e --arg request "$request_sha256" --arg result "$result_sha256" \
     '.status == "settled" and .request_sha256 == $request and .campaign_result_sha256 == $result' \
     "$generation_dir/settlement-report.json.partial" >/dev/null \

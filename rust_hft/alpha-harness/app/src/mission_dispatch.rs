@@ -2,6 +2,7 @@ mod admission;
 pub(crate) mod controller;
 pub(crate) mod final_admission;
 pub(crate) mod final_authority;
+pub(crate) mod sequence_admission;
 mod terminal;
 
 use crate::{
@@ -84,6 +85,9 @@ enum SubmissionObjectState {
 }
 
 pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
+    if sequence_admission::is_sequence_submission(&args.submission)? {
+        return sequence_admission::inspect(args);
+    }
     if final_admission::is_final_submission(&args.submission)? {
         return final_admission::inspect(args);
     }
@@ -111,6 +115,9 @@ pub fn status(args: crate::cli::MissionDispatchStatusArgs) -> anyhow::Result<()>
 
 fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> anyhow::Result<Value> {
     validate_cluster_target(&args.context, &args.namespace)?;
+    if sequence_admission::is_sequence_submission(&args.submission)? {
+        return sequence_admission::status_report(args);
+    }
     if final_admission::is_final_submission(&args.submission)? {
         bail!("Campaign workflow status is limited to pre-holdout dispatch");
     }
@@ -145,6 +152,9 @@ fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> anyhow::Result
 }
 
 pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
+    if sequence_admission::is_sequence_submission(&args.submission)? {
+        return sequence_admission::settle(args);
+    }
     if final_admission::is_final_submission(&args.submission)? {
         if args.readback_cache.is_some() || args.model_report.is_some() {
             anyhow::bail!(
@@ -159,6 +169,9 @@ pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
 pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     if args.readback_cache.is_some() || args.model_report.is_some() {
         anyhow::bail!("readback cache and model report options are settlement-only");
+    }
+    if sequence_admission::is_sequence_submission(&args.submission)? {
+        return sequence_admission::submit(args);
     }
     if final_admission::is_final_submission(&args.submission)? {
         return final_admission::submit(args);
@@ -830,6 +843,10 @@ fn job_execution_projection(job: &Value) -> Value {
                 "emptyDir": volume["emptyDir"].clone(),
                 "secretName": volume["secret"]["secretName"].clone(),
                 "secretItems": volume["secret"]["items"].clone(),
+                "persistentVolumeClaim": volume["persistentVolumeClaim"].clone(),
+                "otherSources": volume.as_object().into_iter().flatten().filter(|(key, _)|
+                    !matches!(key.as_str(), "name" | "emptyDir" | "secret" | "persistentVolumeClaim"))
+                    .map(|(key,value)| (key.clone(), value.clone())).collect::<serde_json::Map<String, Value>>(),
             })
         })
         .collect::<Vec<_>>();
