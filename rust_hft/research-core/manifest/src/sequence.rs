@@ -159,34 +159,7 @@ impl SequenceDatasetV1 {
         {
             return Err("invalid SOL sequence dataset identity".into());
         }
-        let mut files = BTreeSet::new();
-        let mut previous = None;
-        for shard in &self.shards {
-            if shard.file.is_empty()
-                || shard.file.len() > 128
-                || !shard
-                    .file
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-                || !shard.file.ends_with(".jsonl")
-                || shard.file.starts_with('.')
-                || !valid_sha256(&shard.sha256)
-                || shard.bytes == 0
-                || shard.bytes > 256 * 1024 * 1024
-                || shard.rows == 0
-                || shard.rows > 86_400
-                || shard.first_observed_at_ms < 0
-                || shard.last_observed_at_ms < shard.first_observed_at_ms
-                || shard.first_observed_at_ms % 1_000 != 0
-                || shard.last_observed_at_ms % 1_000 != 0
-                || !files.insert(&shard.file)
-                || previous.is_some_and(|end| shard.first_observed_at_ms <= end)
-            {
-                return Err("invalid, duplicate or unordered sequence shard".into());
-            }
-            previous = Some(shard.last_observed_at_ms);
-        }
-        Ok(())
+        validate_sequence_shards(&self.shards)
     }
 
     pub fn digest(&self) -> Result<String, String> {
@@ -196,6 +169,40 @@ impl SequenceDatasetV1 {
             Sha256::digest(serde_json::to_vec(self).map_err(|e| e.to_string())?)
         ))
     }
+}
+
+pub(crate) fn validate_sequence_shards(shards: &[SequenceShardV1]) -> Result<(), String> {
+    if shards.is_empty() || shards.len() > MAX_SEQUENCE_SHARDS {
+        return Err("invalid sequence shard count".into());
+    }
+    let mut files = BTreeSet::new();
+    let mut previous = None;
+    for shard in shards {
+        if shard.file.is_empty()
+            || shard.file.len() > 128
+            || !shard
+                .file
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            || !shard.file.ends_with(".jsonl")
+            || shard.file.starts_with('.')
+            || !valid_sha256(&shard.sha256)
+            || shard.bytes == 0
+            || shard.bytes > 256 * 1024 * 1024
+            || shard.rows == 0
+            || shard.rows > 86_400
+            || shard.first_observed_at_ms < 0
+            || shard.last_observed_at_ms < shard.first_observed_at_ms
+            || shard.first_observed_at_ms % 1_000 != 0
+            || shard.last_observed_at_ms % 1_000 != 0
+            || !files.insert(&shard.file)
+            || previous.is_some_and(|end| shard.first_observed_at_ms <= end)
+        {
+            return Err("invalid, duplicate or unordered sequence shard".into());
+        }
+        previous = Some(shard.last_observed_at_ms);
+    }
+    Ok(())
 }
 
 /// A half-open view. Context may precede the first decision but never history_start.
