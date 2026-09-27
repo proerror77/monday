@@ -2896,6 +2896,7 @@ mod tests {
         )
         .unwrap();
         let evidence = CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "job-uid-1".into(),
             pod_uid: "pod-uid-1".into(),
             settlement: CampaignAttemptSettlementV1 {
@@ -3069,6 +3070,7 @@ mod tests {
         assert!(gate.claim().is_err());
         assert!(gate.bind_job("another-job").is_err());
         gate.settle(&CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "historical-job".into(),
             pod_uid: "historical-pod".into(),
             settlement: CampaignAttemptSettlementV1 {
@@ -3135,6 +3137,7 @@ mod tests {
         )
         .unwrap();
         gate.settle(&CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "job-uid-1".into(),
             pod_uid: "pod-uid-1".into(),
             settlement: CampaignAttemptSettlementV1 {
@@ -3379,6 +3382,7 @@ mod tests {
         .unwrap();
         parent_settlement
             .settle(&CampaignDispatchSettlementV1 {
+                completion_provenance: None,
                 job_uid: "parent-job".into(),
                 pod_uid: "parent-pod".into(),
                 settlement: CampaignAttemptSettlementV1 {
@@ -3615,6 +3619,7 @@ mod tests {
         .unwrap();
         target_parent_settlement
             .settle(&CampaignDispatchSettlementV1 {
+                completion_provenance: None,
                 job_uid: "target-parent-job".into(),
                 pod_uid: "target-parent-pod".into(),
                 settlement: CampaignAttemptSettlementV1 {
@@ -3708,6 +3713,7 @@ mod tests {
         .unwrap();
         target_settlement
             .settle(&CampaignDispatchSettlementV1 {
+                completion_provenance: None,
                 job_uid: "target-job".into(),
                 pod_uid: "target-pod".into(),
                 settlement: CampaignAttemptSettlementV1 {

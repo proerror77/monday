@@ -17,6 +17,7 @@ pub(super) struct Attempt {
     pub dispatch: Option<CampaignDispatchClaimV1>,
     pub terminal_pod_uid: Option<String>,
     pub cancellation: Option<CampaignDispatchCancellationV1>,
+    pub completion_provenance: Option<CampaignDispatchCompletionProvenanceV1>,
 }
 
 pub(super) struct FinalClosure {
@@ -286,6 +287,7 @@ impl State {
                         dispatch: None,
                         terminal_pod_uid: None,
                         cancellation: None,
+                        completion_provenance: None,
                     },
                 );
             }
@@ -387,6 +389,28 @@ impl State {
                     .dispatch
                     .as_ref()
                     .ok_or_else(|| err("dispatch settlement has no claim"))?;
+                if dispatch.target.require_completion_authority
+                    && attempt.cancellation.is_none()
+                    && evidence.completion_provenance.is_none()
+                {
+                    return Err(err(
+                        "controlled settlement lacks authenticated completion provenance",
+                    ));
+                }
+                if let Some(provenance) = &evidence.completion_provenance {
+                    provenance.completion.validate(receipt.recorded_at)?;
+                    if provenance.completion.job_uid != evidence.job_uid
+                        || provenance.completion.pod_uid != evidence.pod_uid
+                        || (!provenance.authority_active_at_completion
+                            && (evidence.settlement.outcome != CampaignAttemptOutcomeV1::Failed
+                                || evidence.settlement.consumed_trials
+                                    != Some(attempt.reservation.declared_trials)))
+                    {
+                        return Err(err(
+                            "completion provenance differs from terminal identity or outcome",
+                        ));
+                    }
+                }
                 if dispatch.job_uid.as_deref() != Some(evidence.job_uid.as_str())
                     || attempt.settlement.is_some()
                     || !(matches!(
@@ -401,6 +425,7 @@ impl State {
                 }
                 attempt.settlement = Some(evidence.settlement.clone());
                 attempt.terminal_pod_uid = Some(evidence.pod_uid.clone());
+                attempt.completion_provenance = evidence.completion_provenance.clone();
             }
             CampaignLedgerEventV1::AttemptSettled { settlement } => {
                 let attempt = self

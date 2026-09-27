@@ -14,8 +14,9 @@ pub use final_dispatch::{
 mod state;
 
 pub use dispatch::{
-    CampaignDispatchCancellationV1, CampaignDispatchClaimV1, CampaignDispatchCompletionV1,
-    CampaignDispatchRecord, CampaignDispatchSettlementV1, CampaignDispatchTargetV1,
+    CampaignDispatchCancellationV1, CampaignDispatchClaimV1,
+    CampaignDispatchCompletionProvenanceV1, CampaignDispatchCompletionV1, CampaignDispatchRecord,
+    CampaignDispatchSettlementV1, CampaignDispatchTargetV1,
 };
 pub use study::{
     AuthenticatedCampaignStudyReceiptV1, CampaignStudyLedgerEventV1, CampaignStudyLedgerReceiptV1,
@@ -1534,6 +1535,7 @@ mod tests {
             .unwrap();
         acknowledge_all(&mut store);
         let evidence = CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "job-uid-1".into(),
             pod_uid: "pod-uid-1".into(),
             settlement: settlement(&attempt, CampaignAttemptOutcomeV1::NoCandidate, Some(31)),
@@ -1616,6 +1618,7 @@ mod tests {
             .unwrap();
         acknowledge_all(&mut store);
         let terminal = CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "job-uid-1".into(),
             pod_uid: "pod-uid-1".into(),
             settlement: settlement(&parent, CampaignAttemptOutcomeV1::NoCandidate, Some(31)),
@@ -1697,6 +1700,7 @@ mod tests {
             .settle_campaign_dispatch(
                 attempt,
                 &CampaignDispatchSettlementV1 {
+                    completion_provenance: None,
                     job_uid: "final-source-job".into(),
                     pod_uid: "final-source-pod".into(),
                     settlement: settlement(

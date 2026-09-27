@@ -926,7 +926,8 @@ pub(crate) fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> any
         "request_sha256":validated.request_sha256,"campaign_id":validated.submission.request.campaign_id(),
         "job_name":record.claim.target.job_name,"job_uid":record.claim.job_uid,
         "authority_deadline_epoch":record.root.grant().expires_at.timestamp(),"reserved_trials":record.reservation.declared_trials,
-        "settlement":record.settlement,"cancellation":record.cancellation,"accounting_changed":false}),
+        "settlement":record.settlement,"cancellation":record.cancellation,
+        "completion_provenance":record.completion_provenance,"accounting_changed":false}),
     )
 }
 
@@ -1009,6 +1010,7 @@ pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             data_mission::write_json_atomic(&report_path, &report)?;
             admitted.settle(
                 &alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
+                    completion_provenance: None,
                     job_uid: cancellation.job_uid.clone(),
                     pod_uid: cancellation.pod_uid.clone(),
                     settlement: alpha_domain::campaign_control::CampaignAttemptSettlementV1 {
@@ -1081,6 +1083,7 @@ pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
                 "sealed_holdout_opened":false,
             });
             let evidence = alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
+                completion_provenance: None,
                 job_uid: completion.job_uid.clone(),
                 pod_uid: completion.pod_uid.clone(),
                 settlement: alpha_domain::campaign_control::CampaignAttemptSettlementV1 {
@@ -1141,6 +1144,7 @@ pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     data_mission::write_json_atomic(&report_path, &report)?;
     if let Some(terminal) = terminal {
         let evidence = alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: terminal.job_uid,
             pod_uid: terminal.pod_uid,
             settlement: alpha_domain::campaign_control::CampaignAttemptSettlementV1 {
@@ -1163,7 +1167,8 @@ pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         &json!({"status":"settled","operation_id":admitted.reservation.operation_id()?,
         "campaign_id":validated.submission.request.campaign_id(),"job_name":validated.job_name,
         "job_uid":record.claim.job_uid,"pod_uid":record.terminal_pod_uid,"result_sha256":hash,
-        "settlement":record.settlement,"model_report":report_path,"sealed_holdout_opened":false}),
+        "settlement":record.settlement,"completion_provenance":record.completion_provenance,
+        "model_report":report_path,"sealed_holdout_opened":false}),
     )
 }
 
@@ -1384,6 +1389,8 @@ mod tests {
             let mut completion = alpha_store::campaign_ledger::CampaignDispatchCompletionV1 {
                 job_uid: "sequence-job-uid".into(),
                 pod_uid: "successful-pod".into(),
+                job_sha256: "a".repeat(64),
+                pod_sha256: "b".repeat(64),
                 job_started_at: now,
                 completed_at: now + TimeDelta::seconds(2),
             };
@@ -1435,6 +1442,7 @@ mod tests {
                 expected_active
             );
             let mut evidence = alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
+                completion_provenance: None,
                 job_uid: completion.job_uid.clone(),
                 pod_uid: completion.pod_uid.clone(),
                 settlement: CampaignAttemptSettlementV1 {
@@ -1489,7 +1497,22 @@ mod tests {
                     .is_err());
                 evidence.settlement.consumed_trials = Some(reserved.declared_trials);
             }
-            store
+            let mut mismatched = evidence.clone();
+            mismatched.completion_provenance = Some(
+                alpha_store::campaign_ledger::CampaignDispatchCompletionProvenanceV1 {
+                    completion: completion.clone(),
+                    authority_active_at_completion: !expected_active,
+                },
+            );
+            assert!(store
+                .settle_campaign_dispatch_at_completion(
+                    &reserved,
+                    &mismatched,
+                    &completion,
+                    observed_at
+                )
+                .is_err());
+            let receipt = store
                 .settle_campaign_dispatch_at_completion(
                     &reserved,
                     &evidence,
@@ -1497,10 +1520,64 @@ mod tests {
                     observed_at,
                 )
                 .unwrap();
+            let alpha_store::campaign_ledger::CampaignLedgerEventV1::DispatchSettled {
+                evidence: persisted,
+            } = &receipt.receipt.event
+            else {
+                panic!("not native settlement");
+            };
+            let provenance = persisted.completion_provenance.as_ref().unwrap();
+            assert_eq!(provenance.completion, completion);
+            assert_eq!(provenance.authority_active_at_completion, expected_active);
+            assert_eq!(
+                persisted.settlement.evidence_sha256,
+                "f".repeat(64),
+                "remote result identity is unchanged"
+            );
+            let bytes = serde_json::to_vec(&receipt).unwrap();
+            let decoded: alpha_store::campaign_ledger::AuthenticatedCampaignReceiptV1 =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded, receipt);
+            assert_eq!(
+                canonical_json_hash(&decoded.receipt).unwrap(),
+                decoded.content_sha256
+            );
+            let snapshot = store
+                .campaign_study_snapshot("sol-market-encoder-controlled-test")
+                .unwrap();
+            for field in ["time", "job_hash", "pod_hash", "decision", "missing"] {
+                let mut tampered = snapshot.clone();
+                let last = tampered.member_snapshots[0].receipts.last_mut().unwrap();
+                let alpha_store::campaign_ledger::CampaignLedgerEventV1::DispatchSettled {
+                    evidence,
+                } = &mut last.receipt.event
+                else {
+                    panic!("not terminal snapshot");
+                };
+                if field == "missing" {
+                    evidence.completion_provenance = None;
+                } else {
+                    let provenance = evidence.completion_provenance.as_mut().unwrap();
+                    match field {
+                        "time" => provenance.completion.completed_at += TimeDelta::seconds(1),
+                        "job_hash" => provenance.completion.job_sha256 = "c".repeat(64),
+                        "pod_hash" => provenance.completion.pod_sha256 = "d".repeat(64),
+                        "decision" => provenance.authority_active_at_completion = !expected_active,
+                        _ => unreachable!(),
+                    }
+                }
+                assert!(
+                    store.import_campaign_study_snapshot(&tampered).is_err(),
+                    "accepted tampered {field}"
+                );
+            }
+            drop(store);
+            let store = alpha_store::AlphaStore::open(&control.ledger_path).unwrap();
             let terminal = store
                 .campaign_dispatch_record(&reserved.family_id, &reserved.operation_id().unwrap())
                 .unwrap();
             assert_eq!(terminal.settlement, Some(evidence.settlement));
+            assert_eq!(terminal.completion_provenance.as_ref(), Some(provenance));
             assert!(
                 terminal.cancellation.is_none(),
                 "Kubernetes Complete was not patched or relabelled Failed"
@@ -1631,6 +1708,7 @@ mod tests {
                     .unwrap()
             );
             let evidence = alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
+                completion_provenance: None,
                 job_uid: cancellation.job_uid.clone(),
                 pod_uid: cancellation.pod_uid.clone(),
                 settlement: CampaignAttemptSettlementV1 {

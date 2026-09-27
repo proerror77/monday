@@ -2820,6 +2820,7 @@ mod tests {
         acknowledge_family_receipts(&mut store, &attempt.family_id);
 
         let evidence = CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "study-job-uid".into(),
             pod_uid: "study-pod-uid".into(),
             settlement: settlement(
@@ -2832,6 +2833,8 @@ mod tests {
         let completion = CampaignDispatchCompletionV1 {
             job_uid: evidence.job_uid.clone(),
             pod_uid: evidence.pod_uid.clone(),
+            job_sha256: repeat_hex('a'),
+            pod_sha256: repeat_hex('b'),
             job_started_at: at(3),
             completed_at: at(4),
         };

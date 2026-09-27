@@ -65,6 +65,8 @@ pub struct CampaignDispatchSettlementV1 {
     pub job_uid: String,
     pub pod_uid: String,
     pub settlement: CampaignAttemptSettlementV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_provenance: Option<CampaignDispatchCompletionProvenanceV1>,
 }
 
 /// Times from the independently verified bound Kubernetes Job and unique Pod,
@@ -76,6 +78,33 @@ pub struct CampaignDispatchCompletionV1 {
     pub pod_uid: String,
     pub job_started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
+    pub job_sha256: String,
+    pub pod_sha256: String,
+}
+
+impl CampaignDispatchCompletionV1 {
+    pub(super) fn validate(&self, observed_at: DateTime<Utc>) -> Result<(), StoreError> {
+        validate_job_uid(&self.job_uid)?;
+        validate_job_uid(&self.pod_uid)?;
+        super::final_dispatch::validate_digest(&self.job_sha256)?;
+        super::final_dispatch::validate_digest(&self.pod_sha256)?;
+        if self.completed_at < self.job_started_at || self.completed_at > observed_at {
+            return Err(err(
+                "completion time precedes Job start or is in the future",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The store computes this decision under the same guards as settlement. Its
+/// authenticated receipt keeps the completion-time decision auditable after
+/// Kubernetes TTL cleanup, without replacing the remote model-result digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignDispatchCompletionProvenanceV1 {
+    pub completion: CampaignDispatchCompletionV1,
+    pub authority_active_at_completion: bool,
 }
 
 /// Authenticated evidence that the native controller shortened this exact Job's
@@ -131,6 +160,7 @@ pub struct CampaignDispatchRecord {
     pub settlement: Option<CampaignAttemptSettlementV1>,
     pub terminal_pod_uid: Option<String>,
     pub cancellation: Option<CampaignDispatchCancellationV1>,
+    pub completion_provenance: Option<CampaignDispatchCompletionProvenanceV1>,
 }
 
 pub(super) fn validate_job_uid(uid: &str) -> Result<(), StoreError> {
@@ -167,6 +197,7 @@ impl AlphaStore {
             settlement: attempt.settlement.clone(),
             terminal_pod_uid: attempt.terminal_pod_uid.clone(),
             cancellation: attempt.cancellation.clone(),
+            completion_provenance: attempt.completion_provenance.clone(),
         })
     }
 
@@ -254,6 +285,7 @@ impl AlphaStore {
         completion: Option<&CampaignDispatchCompletionV1>,
         at: DateTime<Utc>,
     ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
+        let mut evidence = evidence.clone();
         let tx = self.connection.transaction().map_err(database_error)?;
         let (state, _) = load(&tx, &self.integrity_key, &expected.family_id)?;
         let operation_id = expected.operation_id().map_err(err)?;
@@ -267,11 +299,12 @@ impl AlphaStore {
         }
         let attempt = &state.attempts[&operation_id];
         if completion.is_none()
-            && attempt
-                .dispatch
-                .as_ref()
-                .is_some_and(|claim| claim.target.require_completion_authority)
-            && attempt.cancellation.is_none()
+            && (evidence.completion_provenance.is_some()
+                || (attempt
+                    .dispatch
+                    .as_ref()
+                    .is_some_and(|claim| claim.target.require_completion_authority)
+                    && attempt.cancellation.is_none()))
         {
             return Err(err(
                 "this native dispatch requires completion authority evidence",
@@ -295,7 +328,9 @@ impl AlphaStore {
             if completion.job_uid != evidence.job_uid || completion.pod_uid != evidence.pod_uid {
                 return Err(err("completion provenance differs from settlement"));
             }
-            if !completion_active(&tx, &self.integrity_key, expected, completion, at)?
+            let authority_active_at_completion =
+                completion_active(&tx, &self.integrity_key, expected, completion, at)?;
+            if !authority_active_at_completion
                 && (evidence.settlement.outcome != CampaignAttemptOutcomeV1::Failed
                     || evidence.settlement.consumed_trials != Some(expected.declared_trials))
             {
@@ -303,6 +338,20 @@ impl AlphaStore {
                     "authority at completion requires Failed settlement with full charge",
                 ));
             }
+            let provenance = CampaignDispatchCompletionProvenanceV1 {
+                completion: completion.clone(),
+                authority_active_at_completion,
+            };
+            if evidence
+                .completion_provenance
+                .as_ref()
+                .is_some_and(|existing| existing != &provenance)
+            {
+                return Err(err(
+                    "completion provenance differs from the guarded authority decision",
+                ));
+            }
+            evidence.completion_provenance = Some(provenance);
         }
         let prepared_study_id = study::prepare_member_settlement(
             &tx,
@@ -670,14 +719,7 @@ fn completion_active(
     completion: &CampaignDispatchCompletionV1,
     observed_at: DateTime<Utc>,
 ) -> Result<bool, StoreError> {
-    validate_job_uid(&completion.job_uid)?;
-    validate_job_uid(&completion.pod_uid)?;
-    if completion.completed_at < completion.job_started_at || completion.completed_at > observed_at
-    {
-        return Err(err(
-            "completion time precedes Job start or is in the future",
-        ));
-    }
+    completion.validate(observed_at)?;
     let (state, history) = load(conn, key, &expected.family_id)?;
     let attempt = state
         .attempts

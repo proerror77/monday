@@ -70,6 +70,7 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             cache,
         )?;
         let evidence = CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid,
             pod_uid,
             settlement: CampaignAttemptSettlementV1 {
@@ -237,6 +238,8 @@ impl TerminalJobReadback {
             pod_uid: self.pod_uid.clone(),
             job_started_at,
             completed_at,
+            job_sha256: alpha_domain::canonical_json_hash(&self.job)?,
+            pod_sha256: alpha_domain::canonical_json_hash(&self.pod)?,
         })
     }
 }
