@@ -169,9 +169,13 @@ pub fn pretrain_market_encoder(
     diag.final_encoder_values_sha256 = values_digest(&encoder)?;
     diag.validate(&request)?;
     let weights = save(&encoder)?;
-    Ok(MarketEncoderCheckpoint {
+    let head = model.head.valid();
+    let head_weights = save(&head)?;
+    let head_values = values_digest(&head)?;
+    let mut checkpoint = MarketEncoderCheckpoint {
         model: encoder,
         weights: weights.clone(),
+        reconstruction: None,
         manifest: EncoderManifest {
             schema_version: ENCODER_SCHEMA.into(),
             request,
@@ -180,7 +184,18 @@ pub fn pretrain_market_encoder(
             diagnostics: diag,
             weights_sha256: bytes_digest(&weights),
         },
-    })
+    };
+    checkpoint.reconstruction = Some(ReconstructionAudit {
+        metadata: ReconstructionAuditManifest {
+            schema_version: "monday.market_reconstruction_audit.v1".into(),
+            encoder_checkpoint_sha256: checkpoint.identity()?,
+            mask_policy: MASK_POLICY.into(),
+            weights_sha256: bytes_digest(&head_weights),
+            parameter_values_sha256: head_values,
+        },
+        weights: head_weights,
+    });
+    Ok(checkpoint)
 }
 pub fn adapt_market_encoder(
     reader: &mut MarketTaskReader,

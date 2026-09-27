@@ -164,6 +164,7 @@ pub fn fit_market_stage(
             {
                 return Err("market Ridge input differs from its fixed training view".into());
             }
+            let scaling = reader.fit_feature_scaling(64, study.training.max_training_examples)?;
             let mut inputs = Vec::new();
             let mut targets = Vec::new();
             loop {
@@ -189,7 +190,7 @@ pub fn fit_market_stage(
             if inputs.len() < 64 {
                 return Err("insufficient market Ridge anchors".into());
             }
-            let model = crate::sequence_study::fit_sequence_ridge(&inputs, &targets)?;
+            let model = fit_market_ridge(&inputs, &targets, &scaling)?;
             (Fitted::Ridge(Box::new(model)), inputs.len() as u64)
         }
         (kind, MarketStageInput::Targets(reader))
@@ -214,6 +215,90 @@ pub fn fit_market_stage(
     })
 }
 
+fn fit_market_ridge(
+    inputs: &[Vec<f64>],
+    targets: &[f64],
+    scaling: &MarketFeatureScalingV1,
+) -> Result<CexBaselineModelV1, String> {
+    let first = inputs.first().ok_or("empty market Ridge inputs")?;
+    let width = first.len();
+    let channels = scaling.means.len();
+    if channels == 0
+        || scaling.scales.len() != channels
+        || !width.is_multiple_of(channels)
+        || inputs.len() != targets.len()
+        || inputs.len() < 2
+        || inputs.iter().any(|row| row.len() != width)
+        || inputs
+            .iter()
+            .flatten()
+            .chain(targets)
+            .chain(&scaling.means)
+            .any(|x| !x.is_finite())
+        || scaling.scales.iter().any(|x| !x.is_finite() || *x <= 0.0)
+    {
+        return Err("invalid frozen market Ridge scaling or input".into());
+    }
+    let means = (0..width)
+        .map(|j| scaling.means[j % channels])
+        .collect::<Vec<_>>();
+    let scales = (0..width)
+        .map(|j| scaling.scales[j % channels])
+        .collect::<Vec<_>>();
+    let varying = (0..width)
+        .filter(|j| inputs.iter().any(|row| row[*j] != first[*j]))
+        .collect::<Vec<_>>();
+    let column_means = varying
+        .iter()
+        .map(|j| inputs.iter().map(|row| row[*j]).sum::<f64>() / inputs.len() as f64)
+        .collect::<Vec<_>>();
+    let target_mean = targets.iter().sum::<f64>() / targets.len() as f64;
+    let mut coefficients = vec![0.0; width];
+    let mut intercept = target_mean;
+    if !varying.is_empty() {
+        let n = varying.len();
+        let mut matrix = vec![vec![0.0; n]; n];
+        let mut rhs = vec![0.0; n];
+        for (row, target) in inputs.iter().zip(targets) {
+            // Center only to solve an unpenalized intercept. The L2 penalty uses
+            // the shared channel scale, never a new scale for each lag column.
+            let centered = varying
+                .iter()
+                .zip(&column_means)
+                .map(|(j, mean)| (row[*j] - mean) / scales[*j])
+                .collect::<Vec<_>>();
+            for j in 0..n {
+                rhs[j] += centered[j] * (target - target_mean);
+                for k in 0..n {
+                    matrix[j][k] += centered[j] * centered[k];
+                }
+            }
+        }
+        for (j, row) in matrix.iter_mut().enumerate() {
+            row[j] += 1e-6;
+        }
+        let fitted = crate::engines::solve(matrix, rhs)?;
+        for ((j, mean), coefficient) in varying.iter().zip(column_means).zip(fitted) {
+            coefficients[*j] = coefficient;
+            intercept -= coefficient * (mean - means[*j]) / scales[*j];
+        }
+    }
+    let model = CexBaselineModelV1::Ridge {
+        intercept,
+        means,
+        scales,
+        coefficients,
+    };
+    model.validate_inference(width)?;
+    Ok(model)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedReconstruction {
+    metadata: String,
+    weights_hex: String,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StageManifest {
@@ -222,6 +307,7 @@ struct StageManifest {
     key: MarketTrainingStageKeyV1,
     model_sha256: String,
     neural_metadata: Option<String>,
+    reconstruction: Option<EmbeddedReconstruction>,
     examples: u64,
     fitted_values_sha256: String,
 }
@@ -235,7 +321,9 @@ impl FittedMarketStage {
     pub fn fitted_values_digest(&self) -> Result<String, String> {
         let values = match &self.model {
             Fitted::Encoder(p) => {
-                serde_json::json!({"parameters":p.diagnostics().final_encoder_values_sha256,"scaling":p.scaling(),"request":p.request()})
+                serde_json::json!({"parameters":p.diagnostics().final_encoder_values_sha256,
+                    "reconstruction_parameters":p.reconstruction_parameter_digest().ok_or("pretraining stage omitted its reconstruction head")?,
+                    "scaling":p.scaling(),"request":p.request()})
             }
             Fitted::Task(m) => {
                 serde_json::json!({"parameters":m.parameter_digest(),"scaling":m.scaling(),"target_scaling":m.target_scaling(),"request":m.request()})
@@ -277,12 +365,25 @@ impl FittedMarketStage {
             }
             Fitted::Ridge(m) => (serde_json::to_vec(m).map_err(|e| e.to_string())?, None),
         };
+        let reconstruction = match &self.model {
+            Fitted::Encoder(p) => {
+                let (metadata, weights) = p
+                    .reconstruction_bundle()?
+                    .ok_or("missing reconstruction audit")?;
+                Some(EmbeddedReconstruction {
+                    metadata: String::from_utf8(metadata).map_err(|e| e.to_string())?,
+                    weights_hex: hex::encode(weights),
+                })
+            }
+            _ => None,
+        };
         let header = StageManifest {
             schema_version: "monday.market_stage_fit.v1".into(),
             study_sha256: self.study_sha256.clone(),
             key: self.key,
             model_sha256: bytes_digest(&weights),
             neural_metadata,
+            reconstruction,
             examples: self.examples,
             fitted_values_sha256: self.fitted_values_digest()?,
         };
@@ -313,6 +414,8 @@ impl FittedMarketStage {
             || header.model_sha256 != bytes_digest(&weights)
             || header.examples < 64
             || header.examples > study.training.max_training_examples
+            || (header.reconstruction.is_some()
+                != (key.kind == MarketTrainingStageKindV1::Pretrain))
         {
             return Err("market stage artifact drifted from study or coverage".into());
         }
@@ -337,8 +440,19 @@ impl FittedMarketStage {
                     .ok_or("missing market neural metadata")?;
                 let digest = bytes_digest(metadata.as_bytes());
                 if kind == MarketTrainingStageKindV1::Pretrain {
-                    let p =
+                    let mut p =
                         MarketEncoderCheckpoint::restore(metadata.as_bytes(), &digest, weights)?;
+                    let audit = header
+                        .reconstruction
+                        .ok_or("missing reconstruction audit")?;
+                    if audit.weights_hex.len() > 128 * 1024 {
+                        return Err("reconstruction audit exceeds byte limit".into());
+                    }
+                    p.attach_reconstruction_audit(
+                        audit.metadata.as_bytes(),
+                        &bytes_digest(audit.metadata.as_bytes()),
+                        hex::decode(audit.weights_hex).map_err(|e| e.to_string())?,
+                    )?;
                     if p.request() != &study.fit_request(key)?
                         || p.scaling().examples != header.examples
                     {
@@ -440,18 +554,18 @@ impl<'a> MarketStudyEnsemble<'a> {
         )
     }
     pub fn predict(&self, inputs: &[f32]) -> Result<f64, String> {
-        let mean = self
-            .members
-            .iter()
-            .map(|m| m.predict(inputs))
-            .collect::<Result<Vec<_>, _>>()?
-            .iter()
-            .sum::<f64>()
-            / self.members.len() as f64;
+        let values = self.predict_members(inputs)?;
+        let mean = values.iter().map(|(_, value)| value).sum::<f64>() / values.len() as f64;
         if !mean.is_finite() {
             return Err("nonfinite market ensemble prediction".into());
         }
         Ok(mean)
+    }
+    pub fn predict_members(&self, inputs: &[f32]) -> Result<Vec<(u64, f64)>, String> {
+        self.members
+            .iter()
+            .map(|m| Ok((m.key.seed, m.predict(inputs)?)))
+            .collect()
     }
 }
 
@@ -461,6 +575,7 @@ pub struct MarketPredictionV1 {
     pub observed_at_ms: i64,
     pub spread_bps: f64,
     pub predicted_return: f64,
+    pub member_returns: Vec<(u64, f64)>,
     pub observed_return: f32,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,10 +633,17 @@ pub fn predict_market_validation(
                 .observed_at_ms
                 .checked_add(1000)
                 .ok_or("market prediction clock overflow")?;
+            let member_returns = ensemble.predict_members(&row.features.inputs)?;
+            let predicted_return = member_returns.iter().map(|(_, value)| value).sum::<f64>()
+                / member_returns.len() as f64;
+            if !predicted_return.is_finite() {
+                return Err("nonfinite market ensemble prediction".into());
+            }
             emit(MarketPredictionV1 {
                 observed_at_ms: row.features.observed_at_ms,
                 spread_bps: row.target.spread_bps,
-                predicted_return: ensemble.predict(&row.features.inputs)?,
+                predicted_return,
+                member_returns,
                 observed_return: row.target.simple_return,
             })?;
             report.emitted += 1;

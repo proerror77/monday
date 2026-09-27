@@ -143,6 +143,25 @@ fn market_encoder_two_stage_inheritance_freeze_learning_and_roundtrip() {
     assert_eq!(parent.diagnostics(), restored.diagnostics());
     assert_eq!(parent.identity().unwrap(), restored.identity().unwrap());
     assert!(restored.bundle().is_ok());
+    let (audit, head) = parent.reconstruction_bundle().unwrap().unwrap();
+    let mut audited = MarketEncoderCheckpoint::restore(
+        &manifest,
+        &bytes_digest(&manifest),
+        restored.bundle().unwrap().1,
+    )
+    .unwrap();
+    audited
+        .attach_reconstruction_audit(&audit, &bytes_digest(&audit), head.clone())
+        .unwrap();
+    assert_eq!(
+        audited.reconstruction_parameter_digest(),
+        parent.reconstruction_parameter_digest()
+    );
+    let mut corrupt = head;
+    corrupt[0] ^= 1;
+    assert!(audited
+        .attach_reconstruction_audit(&audit, &bytes_digest(&audit), corrupt)
+        .is_err());
     let sample = reader(root.path(), &features, &fit)
         .next_batch(1)
         .unwrap()
@@ -396,6 +415,7 @@ fn market_encoder_rejects_fine_tuning_that_only_updates_the_head() {
         MarketEncoderCheckpoint {
             model,
             weights: weights.clone(),
+            reconstruction: None,
             manifest: artifacts::EncoderManifest {
                 schema_version: ENCODER_SCHEMA.into(),
                 request: fit.clone(),

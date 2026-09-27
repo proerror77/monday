@@ -222,6 +222,17 @@ impl MarketTaskReader {
     pub fn target_digest(&self) -> &str {
         &self.target_digest
     }
+    /// Reuses the unique-frame, per-channel scaling of the neural arms.
+    pub fn fit_feature_scaling(
+        &mut self,
+        min: u64,
+        max: u64,
+    ) -> Result<MarketFeatureScalingV1, String> {
+        if !self.is_at_start() {
+            return Err("market scaling reader must start at beginning".into());
+        }
+        fit_market_scaling(&mut self.features, min, max)
+    }
     fn read_target(&mut self) -> Result<Option<MarketTargetFrameV1>, String> {
         let row = self.targets.next()?;
         if row

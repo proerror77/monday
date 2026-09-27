@@ -228,6 +228,41 @@ fn market_study_requires_verified_parent_and_restores_the_inherited_task() {
     )
     .unwrap();
     let verified = verify_market_stage_pair(&p, &pv).unwrap();
+    let (manifest, weights) = p.bundle().unwrap();
+    let restored_p = FittedMarketStage::restore(
+        &plan,
+        key(Pretrain, Primary),
+        &manifest,
+        &bytes_digest(&manifest),
+        weights.clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(p.fitted_values_digest(), restored_p.fitted_values_digest());
+    let mut missing: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+    missing["reconstruction"] = serde_json::Value::Null;
+    let missing = serde_json::to_vec(&missing).unwrap();
+    assert!(FittedMarketStage::restore(
+        &plan,
+        key(Pretrain, Primary),
+        &missing,
+        &bytes_digest(&missing),
+        weights.clone(),
+        None
+    )
+    .is_err());
+    let mut corrupt: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+    corrupt["reconstruction"]["weights_hex"] = "00".into();
+    let corrupt = serde_json::to_vec(&corrupt).unwrap();
+    assert!(FittedMarketStage::restore(
+        &plan,
+        key(Pretrain, Primary),
+        &corrupt,
+        &bytes_digest(&corrupt),
+        weights,
+        None
+    )
+    .is_err());
     assert!(fit(
         &plan,
         root.path(),
@@ -426,6 +461,7 @@ fn market_study_ridge_roundtrip_rejects_changed_groups_costs_and_duplicate_seed(
         observed_at_ms: plan.folds[0].validation.data.view.decision_start_ms,
         spread_bps: 1.0,
         predicted_return: 0.001,
+        member_returns: vec![(0, 0.001)],
         observed_return: 0.0,
     };
     let decision = ensemble.entry_decision(&plan, &row).unwrap();
@@ -511,4 +547,30 @@ fn market_study_ridge_roundtrip_rejects_changed_groups_costs_and_duplicate_seed(
         None
     )
     .is_err());
+}
+
+#[test]
+fn market_ridge_keeps_shared_channel_scaling_across_different_lags() {
+    let inputs = (0..64)
+        .map(|i| vec![i as f64, (i % 7) as f64 * 10.0 + 100.0])
+        .collect::<Vec<_>>();
+    let labels = inputs
+        .iter()
+        .map(|x| 0.02 * x[0] - 0.003 * x[1] + 0.7)
+        .collect::<Vec<_>>();
+    let scaling = MarketFeatureScalingV1 {
+        means: vec![50.0],
+        scales: vec![20.0],
+        unique_frames: 128,
+        examples: 64,
+    };
+    let model = fit_market_ridge(&inputs, &labels, &scaling).unwrap();
+    let CexBaselineModelV1::Ridge { means, scales, .. } = &model else {
+        panic!("wrong model")
+    };
+    assert_eq!(means, &[50.0, 50.0]);
+    assert_eq!(scales, &[20.0, 20.0]);
+    for (row, expected) in inputs.iter().zip(labels) {
+        assert!((model.predict(row).unwrap() - expected).abs() < 1e-6);
+    }
 }

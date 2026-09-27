@@ -163,7 +163,7 @@ impl MarketEncoderStudyV1 {
             || self.training.max_training_examples < 64
             || self.training.max_training_examples > 32_768
             || self.training.task_updates < 2
-            || self.training.compute_control_updates < self.training.task_updates
+            || self.training.compute_control_updates <= self.training.task_updates
         {
             return Err(
                 "market encoder study differs from its fixed task, groups or budget".into(),
@@ -488,6 +488,9 @@ mod tests {
         assert!(p.validate().is_err());
         let mut p = base.clone();
         p.training.pretraining_updates = 1;
+        assert!(p.validate().is_err());
+        let mut p = base.clone();
+        p.training.compute_control_updates = p.training.task_updates;
         assert!(p.validate().is_err());
         let mut p = base.clone();
         p.folds[0].train.view.decision_stride_ms = 1000;
