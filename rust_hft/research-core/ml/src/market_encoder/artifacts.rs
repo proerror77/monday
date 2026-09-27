@@ -8,6 +8,7 @@ use hft_research_manifest::market_encoder::*;
 use serde::{Deserialize, Serialize};
 
 pub(super) const MASK_POLICY: &str = "causal-whole-frame-3s-30pct-prefix6s-v1";
+pub type MarketArtifactBytes = (Vec<u8>, Vec<u8>);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EncoderManifest {
@@ -18,11 +19,25 @@ pub(super) struct EncoderManifest {
     pub diagnostics: MarketFitDiagnosticsV1,
     pub weights_sha256: String,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReconstructionAuditManifest {
+    pub schema_version: String,
+    pub encoder_checkpoint_sha256: String,
+    pub mask_policy: String,
+    pub weights_sha256: String,
+    pub parameter_values_sha256: String,
+}
+pub(super) struct ReconstructionAudit {
+    pub metadata: ReconstructionAuditManifest,
+    pub weights: Vec<u8>,
+}
 /// Immutable encoder only, with no predictive or trading interface.
 pub struct MarketEncoderCheckpoint {
     pub(super) model: Encoder<CpuBackend>,
     pub(super) manifest: EncoderManifest,
     pub(super) weights: Vec<u8>,
+    pub(super) reconstruction: Option<ReconstructionAudit>,
 }
 impl MarketEncoderCheckpoint {
     /// Last causal hidden state; no task head or decision policy is applied.
@@ -50,6 +65,60 @@ impl MarketEncoderCheckpoint {
             return Err("nonfinite market representation".into());
         }
         Ok(values)
+    }
+    /// Auxiliary reconstruction head is separate from the reusable encoder.
+    pub fn reconstruction_bundle(&self) -> Result<Option<MarketArtifactBytes>, String> {
+        self.reconstruction
+            .as_ref()
+            .map(|audit| {
+                Ok((
+                    serde_json::to_vec(&audit.metadata).map_err(|e| e.to_string())?,
+                    audit.weights.clone(),
+                ))
+            })
+            .transpose()
+    }
+    pub fn reconstruction_parameter_digest(&self) -> Option<&str> {
+        self.reconstruction
+            .as_ref()
+            .map(|audit| audit.metadata.parameter_values_sha256.as_str())
+    }
+    pub fn attach_reconstruction_audit(
+        &mut self,
+        metadata: &[u8],
+        expected: &str,
+        weights: Vec<u8>,
+    ) -> Result<(), String> {
+        if metadata.len() > 64 * 1024
+            || weights.len() > 64 * 1024
+            || bytes_digest(metadata) != expected
+        {
+            return Err("reconstruction audit size or external identity differs".into());
+        }
+        let audit: ReconstructionAuditManifest =
+            serde_json::from_slice(metadata).map_err(|e| e.to_string())?;
+        if audit.schema_version != "monday.market_reconstruction_audit.v1"
+            || audit.encoder_checkpoint_sha256 != self.identity()?
+            || audit.mask_policy != MASK_POLICY
+            || audit.weights_sha256 != bytes_digest(&weights)
+        {
+            return Err("reconstruction audit belongs to another encoder or objective".into());
+        }
+        let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
+        let mut head = LinearConfig::new(
+            self.manifest.request.spec.hidden_channels,
+            self.manifest.request.spec.input.ordered_channels.len(),
+        )
+        .init::<CpuBackend>(&NdArrayDevice::Cpu);
+        load(&mut head, weights.clone())?;
+        if values_digest(&head)? != audit.parameter_values_sha256 {
+            return Err("reconstruction head values differ".into());
+        }
+        self.reconstruction = Some(ReconstructionAudit {
+            metadata: audit,
+            weights,
+        });
+        Ok(())
     }
     pub fn request(&self) -> &MarketFitRequestV1 {
         &self.manifest.request
@@ -96,6 +165,7 @@ impl MarketEncoderCheckpoint {
             model,
             manifest: meta,
             weights,
+            reconstruction: None,
         })
     }
 }
@@ -125,6 +195,9 @@ impl MarketTaskModel {
     }
     pub fn scaling(&self) -> &MarketFeatureScalingV1 {
         &self.manifest.scaling
+    }
+    pub fn target_scaling(&self) -> (f64, f64) {
+        (self.manifest.target_mean, self.manifest.target_scale)
     }
     pub fn parameter_digest(&self) -> &str {
         &self.manifest.parameter_values_sha256
@@ -246,6 +319,7 @@ pub(super) fn check_parent(
             if request.parent_checkpoint_sha256.as_deref() != Some(parent.identity()?.as_str())
                 || p.spec != f.spec
                 || p.feature_dataset_sha256 != f.feature_dataset_sha256
+                || p.qualified_anchors_sha256 != f.qualified_anchors_sha256
                 || p.view != f.view
                 || p.anchor_end_ms != f.anchor_end_ms
                 || p.seed != f.seed

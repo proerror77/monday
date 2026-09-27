@@ -77,6 +77,7 @@ fn fixture(
     };
     let fit = MarketFitRequestV1 {
         feature_dataset_sha256: features.digest().unwrap(),
+        qualified_anchors_sha256: None,
         spec: MarketEncoderSpecV1 {
             input: features.input.clone(),
             hidden_channels: 8,
@@ -142,6 +143,25 @@ fn market_encoder_two_stage_inheritance_freeze_learning_and_roundtrip() {
     assert_eq!(parent.diagnostics(), restored.diagnostics());
     assert_eq!(parent.identity().unwrap(), restored.identity().unwrap());
     assert!(restored.bundle().is_ok());
+    let (audit, head) = parent.reconstruction_bundle().unwrap().unwrap();
+    let mut audited = MarketEncoderCheckpoint::restore(
+        &manifest,
+        &bytes_digest(&manifest),
+        restored.bundle().unwrap().1,
+    )
+    .unwrap();
+    audited
+        .attach_reconstruction_audit(&audit, &bytes_digest(&audit), head.clone())
+        .unwrap();
+    assert_eq!(
+        audited.reconstruction_parameter_digest(),
+        parent.reconstruction_parameter_digest()
+    );
+    let mut corrupt = head;
+    corrupt[0] ^= 1;
+    assert!(audited
+        .attach_reconstruction_audit(&audit, &bytes_digest(&audit), corrupt)
+        .is_err());
     let sample = reader(root.path(), &features, &fit)
         .next_batch(1)
         .unwrap()
@@ -395,6 +415,7 @@ fn market_encoder_rejects_fine_tuning_that_only_updates_the_head() {
         MarketEncoderCheckpoint {
             model,
             weights: weights.clone(),
+            reconstruction: None,
             manifest: artifacts::EncoderManifest {
                 schema_version: ENCODER_SCHEMA.into(),
                 request: fit.clone(),
@@ -442,4 +463,62 @@ fn market_encoder_data_views_do_not_invent_an_optimizer_budget() {
     // Read access cannot be promoted into an unbudgeted fit.
     let mut r = MarketFeatureReader::open(root.path(), features, &fit.read_request()).unwrap();
     assert!(pretrain_market_encoder(&mut r, fit).is_err());
+}
+
+#[test]
+fn market_qualified_anchors_ignore_label_values_and_survive_missing_label_file() {
+    let root = tempfile::tempdir().unwrap();
+    let (features, mut targets, mut fit) = fixture(root.path());
+    let text = std::fs::read_to_string(root.path().join("targets.jsonl")).unwrap();
+    let mut rows = text
+        .lines()
+        .map(|l| serde_json::from_str::<MarketTargetFrameV1>(l).unwrap())
+        .filter(|r| r.observed_at_ms != 60000)
+        .collect::<Vec<_>>();
+    targets.shards = vec![shard(root.path(), "targets.jsonl", &rows, 0, 122000)];
+    let anchors = derive_market_training_anchors(
+        &mut reader(root.path(), &features, &fit),
+        root.path(),
+        targets.clone(),
+        &targets.digest().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(anchors.anchors.len(), 63);
+    assert!(anchors.anchors.iter().all(|a| a.observed_at_ms != 60000));
+    for row in &mut rows {
+        row.simple_return = -row.simple_return + 0.1;
+    }
+    targets.shards = vec![shard(root.path(), "targets.jsonl", &rows, 0, 122000)];
+    let changed = derive_market_training_anchors(
+        &mut reader(root.path(), &features, &fit),
+        root.path(),
+        targets.clone(),
+        &targets.digest().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(anchors, changed);
+    let hash = anchors.digest().unwrap();
+    std::fs::write(
+        root.path().join(format!("{hash}.market-anchors.json")),
+        serde_json::to_vec(&anchors).unwrap(),
+    )
+    .unwrap();
+    fit.qualified_anchors_sha256 = Some(hash);
+    fit.min_examples = 2;
+    fit.updates = 3;
+    fit.batch_size = 32;
+    std::fs::remove_file(root.path().join("targets.jsonl")).unwrap();
+    let checkpoint =
+        pretrain_market_encoder(&mut reader(root.path(), &features, &fit), fit.clone()).unwrap();
+    assert_eq!(checkpoint.scaling().examples, 63);
+    let mut invalid = anchors;
+    invalid.anchors[0].series_id = 999;
+    let hash = invalid.digest().unwrap();
+    std::fs::write(
+        root.path().join(format!("{hash}.market-anchors.json")),
+        serde_json::to_vec(&invalid).unwrap(),
+    )
+    .unwrap();
+    fit.qualified_anchors_sha256 = Some(hash);
+    assert!(reader(root.path(), &features, &fit).next_batch(1).is_err());
 }

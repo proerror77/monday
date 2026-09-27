@@ -141,6 +141,36 @@ no encoder update is a failed fit. The complete task bundle restores both the
 adapted encoder and one return head. Exact JSON floating-point roundtrips and
 original Burnpack bytes preserve immutable artifact identity across restore.
 
+## Two-stage study comparison contract
+
+`alpha-domain::market_encoder_study` fixes two 14-day development folds, seeds
+7/11, separate independent-selection and sealed identities, and 30-second tasks.
+The generated stage list contains pretraining, scratch, linear probe, full
+fine-tuning, a compute-control scratch model and Ridge. Each primary stage has a
+separate verification stage; downstream inheritance requires its own fold/seed's
+primary encoder and verified refit. The plan reserves 22 development plus 4
+conditional final primary fits, with matching verification budgets. Checking
+remaining capacity requires authenticated cumulative consumption, not an assumed
+zero balance.
+
+`alpha-engine::market_encoder_study` binds the fitter and restored artifacts to
+that study and stage identity. Learned-value digests compare parameters, feature/target scaling, fit requests
+and input identities independently of container IDs and stage purpose.
+Task ensembles require both declared seeds and use their mean. The entry policy
+shares the existing 30-second IOC cost gate; target labels do not enter an entry
+decision. Development prediction coverage remains explicit, and incomplete
+coverage prohibits an economic pass. These library contracts do not by themselves
+reserve a Campaign, authenticate raw provenance, open holdout or start research.
+
+A production training view also pins `market_training_anchors.v1`: an immutable
+index of `(series_id, observed_at_ms)` whose causal context and mature target are
+both available. Its derivation never uses target magnitudes. P and all downstream
+arms bind the same index, so real gaps do not create unequal training populations
+or synthetic labels. The pretraining reader needs the index and features only;
+the target file can remain absent. It rejects an index entry missing from the
+actual series/context. Evaluation views forbid this filtering and retain their
+full expected decision grid.
+
 The materializer's opt-in `--market-encoder-output` exports these feature and
 target manifests from the same verified replay. It requires SOLUSDT USD-M,
 1s/Top5, a 30-second target and aggregate-trade evidence. Feature rows are built

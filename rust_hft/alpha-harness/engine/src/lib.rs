@@ -10,6 +10,7 @@ pub mod formula_evaluator;
 #[cfg(feature = "kernel")]
 pub mod learning;
 pub mod llm;
+pub mod market_encoder_study;
 pub mod model_metrics;
 pub mod prediction_diagnostics;
 pub mod sec_orderflow;

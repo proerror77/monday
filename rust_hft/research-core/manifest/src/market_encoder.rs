@@ -159,6 +159,9 @@ impl MarketEncoderSpecV1 {
 #[serde(deny_unknown_fields)]
 pub struct MarketDataReadRequestV1 {
     pub feature_dataset_sha256: String,
+    /// Training may pin an eligible anchor index; evaluation uses the full grid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_anchors_sha256: Option<String>,
     pub input: SequenceInputSpecV1,
     pub view: SequenceViewV1,
     pub anchor_end_ms: i64,
@@ -168,6 +171,10 @@ impl MarketDataReadRequestV1 {
         self.input.validate()?;
         self.view.validate()?;
         if !valid_sha256(&self.feature_dataset_sha256)
+            || self
+                .qualified_anchors_sha256
+                .as_deref()
+                .is_some_and(|hash| !valid_sha256(hash))
             || self.view.decision_start_ms - self.view.history_start_ms
                 < ((self.input.context_rows - 1) * 1000) as i64
             || self.anchor_end_ms <= self.view.decision_start_ms
@@ -180,10 +187,60 @@ impl MarketDataReadRequestV1 {
     }
 }
 
+/// Contains only structural eligibility, never target values. The producer
+/// joins causal contexts to mature target timestamps before any model fitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketTrainingAnchorV1 {
+    pub series_id: u64,
+    pub observed_at_ms: i64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarketTrainingAnchorSetV1 {
+    pub schema_version: String,
+    pub feature_dataset_sha256: String,
+    pub view: SequenceViewV1,
+    pub anchor_end_ms: i64,
+    pub anchors: Vec<MarketTrainingAnchorV1>,
+}
+impl MarketTrainingAnchorSetV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        self.view.validate()?;
+        if self.schema_version != "monday.market_training_anchors.v1"
+            || !valid_sha256(&self.feature_dataset_sha256)
+            || self.anchor_end_ms <= self.view.decision_start_ms
+            || self.anchor_end_ms > self.view.end_ms
+            || self.anchors.is_empty()
+            || self.anchors.len() > 32_768
+            || self
+                .anchors
+                .windows(2)
+                .any(|rows| rows[0].observed_at_ms >= rows[1].observed_at_ms)
+            || self.anchors.iter().any(|a| {
+                a.observed_at_ms < self.view.decision_start_ms
+                    || a.observed_at_ms >= self.anchor_end_ms
+                    || (a.observed_at_ms - self.view.decision_start_ms)
+                        % self.view.decision_stride_ms
+                        != 0
+            })
+        {
+            return Err("invalid qualified market training anchors".into());
+        }
+        Ok(())
+    }
+    pub fn digest(&self) -> Result<String, String> {
+        self.validate()?;
+        digest(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarketFitRequestV1 {
     pub feature_dataset_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_anchors_sha256: Option<String>,
     pub spec: MarketEncoderSpecV1,
     pub view: SequenceViewV1,
     /// Exclusive anchor end. Labels, if used, must mature before view.end_ms.
@@ -199,6 +256,7 @@ impl MarketFitRequestV1 {
     pub fn read_request(&self) -> MarketDataReadRequestV1 {
         MarketDataReadRequestV1 {
             feature_dataset_sha256: self.feature_dataset_sha256.clone(),
+            qualified_anchors_sha256: self.qualified_anchors_sha256.clone(),
             input: self.spec.input.clone(),
             view: self.view,
             anchor_end_ms: self.anchor_end_ms,
@@ -363,6 +421,7 @@ mod tests {
     fn market_adaptation_binds_mature_targets_and_exact_parent_mode() {
         let fit = MarketFitRequestV1 {
             feature_dataset_sha256: "a".repeat(64),
+            qualified_anchors_sha256: None,
             spec: MarketEncoderSpecV1 {
                 input: SequenceInputSpecV1::sol_lob(),
                 hidden_channels: 16,
