@@ -141,11 +141,6 @@ no encoder update is a failed fit. The complete task bundle restores both the
 adapted encoder and one return head. Exact JSON floating-point roundtrips and
 original Burnpack bytes preserve immutable artifact identity across restore.
 
-These are library capabilities verified with controlled data. Real feature and
-target materialization, Campaign stage accounting, reconstruction-head audit
-publication, final-evaluation integration, real-data fits and economic evidence
-remain pending. The library exposes no dispatch, holdout or order authority.
-
 ## Two-stage study comparison contract
 
 `alpha-domain::market_encoder_study` fixes two 14-day development folds, seeds
@@ -175,3 +170,22 @@ or synthetic labels. The pretraining reader needs the index and features only;
 the target file can remain absent. It rejects an index entry missing from the
 actual series/context. Evaluation views forbid this filtering and retain their
 full expected decision grid.
+
+The materializer's opt-in `--market-encoder-output` exports these feature and
+target manifests from the same verified replay. It requires SOLUSDT USD-M,
+1s/Top5, a 30-second target and aggregate-trade evidence. Feature rows are built
+before target eligibility: an unlabeled tail remains in the feature artifact,
+while missing endpoints or recovery gaps omit targets instead of inventing zeros.
+Trade buckets use receive-time availability. The report binds both manifests;
+the target manifest pins its exact feature dataset. For internal training shards,
+`--market-feature-end-received-at-ns` can end the non-overlapping feature partition
+before the admitted output window ends, leaving room to materialize its last
+30-second labels. That label-only lookahead must remain inside the training view;
+it cannot read validation or sealed data. The last training shard may retain an
+unlabeled tail, which lies outside the common supervised anchor range.
+
+These library and exporter capabilities are verified with controlled data.
+Canonical preparation/worker input binding, Campaign stage accounting,
+reconstruction-head audit publication, final-evaluation integration, real-data
+fits and economic evidence remain pending. The library and export option expose
+no dispatch, holdout or order authority.
