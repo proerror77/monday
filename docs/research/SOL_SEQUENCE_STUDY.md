@@ -268,6 +268,11 @@ identities, approved budgets, real input hashes and task-specific control files.
 guide, not a prefilled grant or a runnable set of credentials. Ledger registration
 and inspection require Linux with `MONDAY_EXECUTION_HOST=ack`.
 
+The Study also requires real independent-selection and sealed artifact hashes.
+Prepare and bind those identities separately under their isolation and exposure
+contract; keep the artifacts sealed and off development mounts. Never substitute
+placeholder hashes for these required identities.
+
 | Order | Boundary and command | Required result |
 | --- | --- | --- |
 | 1 | ACK: `mission prepare-fresh-inputs --market-encoder-output`, then `mission prepare-sequence-cohort` | Verified native receipts, bounded non-overlapping feature partitions, common training anchors, a complete validation decision grid and matching replay. Prepare train and development validation only. |
