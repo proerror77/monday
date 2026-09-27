@@ -14,6 +14,8 @@ pub const MARKET_ENCODER_STUDY_SCHEMA: &str = "monday.sol_market_encoder_study.v
 pub struct MarketDataViewV1 {
     pub features_sha256: String,
     pub targets_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_anchors_sha256: Option<String>,
     pub view: SequenceViewV1,
 }
 impl MarketDataViewV1 {
@@ -22,6 +24,10 @@ impl MarketDataViewV1 {
         if !valid_sha256(&self.features_sha256)
             || !valid_sha256(&self.targets_sha256)
             || self.features_sha256 == self.targets_sha256
+            || self
+                .qualified_anchors_sha256
+                .as_deref()
+                .is_some_and(|hash| !valid_sha256(hash))
             || self.view.decision_start_ms - self.view.history_start_ms < 59_000
             || self.view.end_ms - self.view.decision_start_ms <= 30_000
         {
@@ -39,7 +45,8 @@ pub struct MarketEvaluationViewV1 {
 impl MarketEvaluationViewV1 {
     fn validate(&self) -> Result<(), String> {
         self.data.validate()?;
-        if !valid_sha256(&self.replay_manifest_sha256)
+        if self.data.qualified_anchors_sha256.is_some()
+            || !valid_sha256(&self.replay_manifest_sha256)
             || self.data.view.decision_stride_ms != 1000
             || self.data.view.end_ms - self.data.view.decision_start_ms - 30_000 < DAY_MS
         {
@@ -192,7 +199,8 @@ impl MarketEncoderStudyV1 {
         for fold in &self.folds {
             fold.validation.validate()?;
             let train = fold.train.view;
-            if train.end_ms - train.history_start_ms != 14 * DAY_MS
+            if fold.train.qualified_anchors_sha256.is_none()
+                || train.end_ms - train.history_start_ms != 14 * DAY_MS
                 || fold.validation.data.view.history_start_ms - train.end_ms < 30_000
                 || fold.validation.data.view.end_ms
                     >= self.independent_selection.data.view.history_start_ms
@@ -236,6 +244,7 @@ impl MarketEncoderStudyV1 {
     ) -> MarketFitRequestV1 {
         MarketFitRequestV1 {
             feature_dataset_sha256: fold.train.features_sha256.clone(),
+            qualified_anchors_sha256: fold.train.qualified_anchors_sha256.clone(),
             spec: MarketEncoderSpecV1 {
                 input: self.input.clone(),
                 hidden_channels: self.training.hidden_channels,
@@ -361,6 +370,7 @@ mod tests {
             data: MarketDataViewV1 {
                 features_sha256: hash(id),
                 targets_sha256: hash(id + 20),
+                qualified_anchors_sha256: None,
                 view: SequenceViewV1 {
                     history_start_ms: start,
                     decision_start_ms: start + 59000,
@@ -386,6 +396,7 @@ mod tests {
                         train: MarketDataViewV1 {
                             features_sha256: hash(id),
                             targets_sha256: hash(id + 20),
+                            qualified_anchors_sha256: Some(hash(id + 60)),
                             view: SequenceViewV1 {
                                 history_start_ms: end - 14 * DAY_MS,
                                 decision_start_ms: end - 14 * DAY_MS + 59000,

@@ -11,6 +11,7 @@ fn evaluation(day: i64, id: u8) -> MarketEvaluationViewV1 {
         data: MarketDataViewV1 {
             features_sha256: hash(id),
             targets_sha256: hash(id + 20),
+            qualified_anchors_sha256: None,
             view: SequenceViewV1 {
                 history_start_ms: start,
                 decision_start_ms: start + 59000,
@@ -36,6 +37,7 @@ fn study() -> MarketEncoderStudyV1 {
                     train: MarketDataViewV1 {
                         features_sha256: hash(id),
                         targets_sha256: hash(id + 20),
+                        qualified_anchors_sha256: Some(hash(id + 60)),
                         view: SequenceViewV1 {
                             history_start_ms: end - 14 * DAY,
                             decision_start_ms: end - 14 * DAY + 59000,
@@ -144,6 +146,23 @@ fn fixture(
     };
     plan.folds[0].train.features_sha256 = data.digest().unwrap();
     plan.folds[0].train.targets_sha256 = labels.digest().unwrap();
+    let mut grid = read_request(plan, &plan.folds[0].train);
+    grid.qualified_anchors_sha256 = None;
+    let mut reader = MarketFeatureReader::open(root, data.clone(), &grid).unwrap();
+    let anchors = hft_research_ml::market_encoder::data::derive_market_training_anchors(
+        &mut reader,
+        root,
+        labels.clone(),
+        &labels.digest().unwrap(),
+    )
+    .unwrap();
+    let anchor_hash = anchors.digest().unwrap();
+    std::fs::write(
+        root.join(format!("{anchor_hash}.market-anchors.json")),
+        serde_json::to_vec(&anchors).unwrap(),
+    )
+    .unwrap();
+    plan.folds[0].train.qualified_anchors_sha256 = Some(anchor_hash);
     plan.validate().unwrap();
     (data, labels)
 }

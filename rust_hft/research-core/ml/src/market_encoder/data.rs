@@ -1,7 +1,7 @@
 //! Verified streaming feature/target readers. Pretraining cannot deserialize labels.
 use crate::sequence_storage::{Frame, Frames};
 use hft_research_manifest::{market_encoder::*, sequence::SequenceInputSpecV1};
-use std::{collections::VecDeque, path::Path};
+use std::{collections::VecDeque, fs::File, io::Read, path::Path};
 
 impl Frame for MarketFeatureFrameV1 {
     fn clock(&self) -> i64 {
@@ -31,6 +31,8 @@ pub struct MarketFeatureReader {
     frames: Frames<MarketFeatureFrameV1>,
     history: VecDeque<MarketFeatureFrameV1>,
     request: MarketDataReadRequestV1,
+    qualified: Option<Vec<MarketTrainingAnchorV1>>,
+    anchor_cursor: usize,
 }
 impl MarketFeatureReader {
     pub fn open(
@@ -49,17 +51,47 @@ impl MarketFeatureReader {
         {
             return Err("market features expose another dataset, input or time view".into());
         }
+        let qualified = if let Some(hash) = &request.qualified_anchors_sha256 {
+            let path = root.join(format!("{hash}.market-anchors.json"));
+            let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            if !metadata.file_type().is_file() || metadata.len() > 4 * 1024 * 1024 {
+                return Err("invalid qualified market anchor file".into());
+            }
+            let mut bytes = Vec::new();
+            File::open(path)
+                .map_err(|e| e.to_string())?
+                .take(4 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.len() > 4 * 1024 * 1024 || bytes_digest(&bytes) != *hash {
+                return Err("qualified anchor checksum mismatch".into());
+            }
+            let anchors: MarketTrainingAnchorSetV1 =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            anchors.validate()?;
+            if anchors.feature_dataset_sha256 != request.feature_dataset_sha256
+                || anchors.view != request.view
+                || anchors.anchor_end_ms != request.anchor_end_ms
+            {
+                return Err("qualified anchors belong to another input or time view".into());
+            }
+            Some(anchors.anchors)
+        } else {
+            None
+        };
         Ok(Self {
             frames: Frames::open(root, dataset.shards, dataset.input)?,
             history: VecDeque::new(),
             request: request.clone(),
+            qualified,
+            anchor_cursor: 0,
         })
     }
     pub fn request(&self) -> &MarketDataReadRequestV1 {
         &self.request
     }
     pub fn is_at_start(&self) -> bool {
-        self.frames.is_at_start()
+        self.frames.is_at_start() && self.anchor_cursor == 0
     }
     pub fn next_batch(&mut self, size: usize) -> Result<Vec<UnlabeledSequenceExample>, String> {
         if !(1..=256).contains(&size) {
@@ -68,6 +100,13 @@ impl MarketFeatureReader {
         let mut result = Vec::with_capacity(size);
         while result.len() < size {
             let Some(row) = self.frames.next()? else {
+                if self
+                    .qualified
+                    .as_ref()
+                    .is_some_and(|a| self.anchor_cursor != a.len())
+                {
+                    return Err("qualified market anchor was not present in the dataset".into());
+                }
                 break;
             };
             if row.observed_at_ms < self.request.view.history_start_ms
@@ -86,13 +125,27 @@ impl MarketFeatureReader {
                 self.history.pop_front();
             }
             let row = self.history.back().expect("pushed frame");
-            if self.history.len() != self.request.input.context_rows
-                || row.observed_at_ms < self.request.view.decision_start_ms
-                || row.observed_at_ms >= self.request.anchor_end_ms
-                || (row.observed_at_ms - self.request.view.decision_start_ms)
+            let eligible = self.history.len() == self.request.input.context_rows
+                && row.observed_at_ms >= self.request.view.decision_start_ms
+                && row.observed_at_ms < self.request.anchor_end_ms
+                && (row.observed_at_ms - self.request.view.decision_start_ms)
                     % self.request.view.decision_stride_ms
-                    != 0
-            {
+                    == 0;
+            if let Some(anchors) = &self.qualified {
+                let Some(anchor) = anchors.get(self.anchor_cursor) else {
+                    continue;
+                };
+                if anchor.observed_at_ms < row.observed_at_ms {
+                    return Err("qualified market anchor crossed a missing observation".into());
+                }
+                if anchor.observed_at_ms != row.observed_at_ms {
+                    continue;
+                }
+                if !eligible || anchor.series_id != row.series_id {
+                    return Err("qualified market anchor lacks its declared causal context".into());
+                }
+                self.anchor_cursor += 1;
+            } else if !eligible {
                 continue;
             }
             result.push(UnlabeledSequenceExample {
@@ -108,13 +161,14 @@ impl MarketFeatureReader {
         Ok(result)
     }
     pub fn finish_pass(&mut self) -> Result<(), String> {
-        self.frames.finish()?;
+        while !self.next_batch(256)?.is_empty() {}
         self.history.clear();
         Ok(())
     }
     pub fn rewind(&mut self) -> Result<(), String> {
         self.frames.rewind()?;
         self.history.clear();
+        self.anchor_cursor = 0;
         Ok(())
     }
 }
@@ -296,4 +350,90 @@ pub fn fit_market_scaling(
     };
     scaling.validate_for_data(&request, min_examples, max_examples)?;
     Ok(scaling)
+}
+
+/// Derive a shared training index from context/target availability only. Target
+/// magnitudes never select anchors, and this index must not filter evaluation.
+pub fn derive_market_training_anchors(
+    features: &mut MarketFeatureReader,
+    target_root: &Path,
+    targets: MarketTargetDatasetV1,
+    expected_target_sha256: &str,
+) -> Result<MarketTrainingAnchorSetV1, String> {
+    targets.validate()?;
+    let request = features.request().clone();
+    if !features.is_at_start()
+        || request.qualified_anchors_sha256.is_some()
+        || targets.digest()? != expected_target_sha256
+        || targets.feature_dataset_sha256 != request.feature_dataset_sha256
+        || targets.shards.iter().any(|s| {
+            s.first_observed_at_ms < request.view.history_start_ms
+                || s.last_observed_at_ms
+                    .checked_add(TASK_HORIZON_MS)
+                    .is_none_or(|end| end >= request.view.end_ms)
+        })
+    {
+        return Err("anchor derivation requires the original grid and bounded target view".into());
+    }
+    let mut target_reader =
+        Frames::<MarketTargetFrameV1>::open(target_root, targets.shards, request.input.clone())?;
+    let mut current = None::<MarketTargetFrameV1>;
+    let mut anchors = Vec::new();
+    loop {
+        let batch = features.next_batch(256)?;
+        if batch.is_empty() {
+            break;
+        }
+        for row in batch {
+            loop {
+                if current
+                    .as_ref()
+                    .is_some_and(|t| t.observed_at_ms >= row.observed_at_ms)
+                {
+                    break;
+                }
+                current = target_reader.next()?;
+                if current
+                    .as_ref()
+                    .is_some_and(|t| t.available_at_ms >= request.view.end_ms)
+                {
+                    return Err("anchor target exposes an unavailable future label".into());
+                }
+                if current.is_none() {
+                    break;
+                }
+            }
+            if current.as_ref().is_some_and(|t| {
+                t.observed_at_ms == row.observed_at_ms && t.series_id != row.series_id
+            }) {
+                return Err("anchor target belongs to another recovery series".into());
+            }
+            if current.as_ref().is_some_and(|t| {
+                t.observed_at_ms == row.observed_at_ms && t.series_id == row.series_id
+            }) {
+                anchors.push(MarketTrainingAnchorV1 {
+                    series_id: row.series_id,
+                    observed_at_ms: row.observed_at_ms,
+                });
+                if anchors.len() > 32_768 {
+                    return Err("qualified anchor count exceeds bound".into());
+                }
+            }
+        }
+    }
+    while let Some(row) = target_reader.next()? {
+        if row.available_at_ms >= request.view.end_ms {
+            return Err("anchor target exposes an unavailable future label".into());
+        }
+    }
+    features.finish_pass()?;
+    let result = MarketTrainingAnchorSetV1 {
+        schema_version: "monday.market_training_anchors.v1".into(),
+        feature_dataset_sha256: request.feature_dataset_sha256,
+        view: request.view,
+        anchor_end_ms: request.anchor_end_ms,
+        anchors,
+    };
+    result.validate()?;
+    Ok(result)
 }

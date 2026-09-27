@@ -88,6 +88,7 @@ fn train_data(
 fn read_request(study: &MarketEncoderStudyV1, data: &MarketDataViewV1) -> MarketDataReadRequestV1 {
     MarketDataReadRequestV1 {
         feature_dataset_sha256: data.features_sha256.clone(),
+        qualified_anchors_sha256: data.qualified_anchors_sha256.clone(),
         input: study.input.clone(),
         view: data.view,
         anchor_end_ms: data.view.end_ms - 30_000,

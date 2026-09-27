@@ -166,3 +166,12 @@ shares the existing 30-second IOC cost gate; target labels do not enter an entry
 decision. Development prediction coverage remains explicit, and incomplete
 coverage prohibits an economic pass. These library contracts do not by themselves
 reserve a Campaign, authenticate raw provenance, open holdout or start research.
+
+A production training view also pins `market_training_anchors.v1`: an immutable
+index of `(series_id, observed_at_ms)` whose causal context and mature target are
+both available. Its derivation never uses target magnitudes. P and all downstream
+arms bind the same index, so real gaps do not create unequal training populations
+or synthetic labels. The pretraining reader needs the index and features only;
+the target file can remain absent. It rejects an index entry missing from the
+actual series/context. Evaluation views forbid this filtering and retain their
+full expected decision grid.

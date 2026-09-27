@@ -249,6 +249,7 @@ pub(super) fn check_parent(
             if request.parent_checkpoint_sha256.as_deref() != Some(parent.identity()?.as_str())
                 || p.spec != f.spec
                 || p.feature_dataset_sha256 != f.feature_dataset_sha256
+                || p.qualified_anchors_sha256 != f.qualified_anchors_sha256
                 || p.view != f.view
                 || p.anchor_end_ms != f.anchor_end_ms
                 || p.seed != f.seed
