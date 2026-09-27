@@ -13,8 +13,22 @@ pub(super) struct PublishedArtifact {
 #[derive(Debug, Serialize)]
 pub(super) struct PublishedDatasets {
     pub schema_version: String,
+    pub feature_end_received_at_ns: Option<u64>,
     pub features: PublishedArtifact,
     pub targets: PublishedArtifact,
+}
+
+pub(super) fn feature_window(args: &Args) -> Result<Option<(u64, u64)>> {
+    let window = output_window(args)?;
+    let Some(end) = args.market_feature_end_received_at_ns else {
+        return Ok(window);
+    };
+    let (start, label_end) =
+        window.context("feature partition requires an explicit admitted output window")?;
+    if !args.market_encoder_output || end <= start || end > label_end || end % 1_000_000_000 != 0 {
+        bail!("feature partition end escapes the admitted label window");
+    }
+    Ok(Some((start, end)))
 }
 
 fn stable_series(replay: &Replay, sample: &BookSample) -> Result<u64> {
@@ -32,7 +46,7 @@ pub(super) fn feature_frames(
     args: &Args,
     symbol: &str,
 ) -> Result<Vec<MarketFeatureFrameV1>> {
-    let window = output_window(args)?;
+    let window = feature_window(args)?;
     let trades = trades
         .iter()
         .filter(|t| t.symbol == symbol)
@@ -239,6 +253,7 @@ pub(super) fn publish(
     )?;
     Ok(PublishedDatasets {
         schema_version: "monday.market_encoder_export.v1".into(),
+        feature_end_received_at_ns: args.market_feature_end_received_at_ns,
         features: PublishedArtifact {
             file: feature_file,
             sha256: feature_hash,

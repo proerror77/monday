@@ -90,6 +90,9 @@ struct Args {
     /// Export feature-only market sequences and separately bound 30-second targets.
     #[arg(long)]
     market_encoder_output: bool,
+    /// Exclusive feature-partition end; labels may use the remaining admitted output window.
+    #[arg(long, requires = "market_encoder_output")]
+    market_feature_end_received_at_ns: Option<u64>,
     /// Decision and label-maturity window; input blobs retain complete provenance.
     #[arg(long, requires = "output_end_received_at_ns")]
     output_start_received_at_ns: Option<u64>,
@@ -456,6 +459,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     {
         bail!("sequence output requires SOLUSDT USD-M, 1s/top5 and a 30-second primary label");
     }
+    market_encoder::feature_window(args)?;
     log_event(
         "segment_verification_started",
         json!({"segment_count": args.segment.len()}),
@@ -2482,7 +2486,7 @@ mod tests {
             Args {
                 mission_id: "data-btc-usdm-1".to_string(), symbol: "BTCUSDT".to_string(),
                 market: self.market, bucket_ms: 1_000, label_horizon_buckets: 2, top_depth: 5,
-                output_start_received_at_ns: None, output_end_received_at_ns: None, sequence_output: false, market_encoder_output: false,
+                output_start_received_at_ns: None, output_end_received_at_ns: None, sequence_output: false, market_encoder_output: false, market_feature_end_received_at_ns: None,
                 segment: vec![self.data.clone()],
                 segment_content_sha256: vec![self.content_sha256.clone()], segment_manifest_sha256: vec![self.manifest_sha256.clone()],
                 artifact_dir: self.directory.join("artifacts"),
@@ -2767,6 +2771,30 @@ mod tests {
         .unwrap();
         assert_eq!(features.shards.iter().map(|s| s.rows).sum::<u64>(), 89);
         assert_eq!(targets.shards.iter().map(|s| s.rows).sum::<u64>(), 59);
+        args.output_end_received_at_ns = Some(event_ns(120000));
+        args.market_feature_end_received_at_ns = Some(event_ns(90000));
+        let extended =
+            market_encoder::publish(&replay, &[], &args, "SOLUSDT", &"b".repeat(64)).unwrap();
+        let extended_features: MarketFeatureDatasetV1 = serde_json::from_slice(
+            &std::fs::read(args.artifact_dir.join(extended.features.file)).unwrap(),
+        )
+        .unwrap();
+        let extended_targets: MarketTargetDatasetV1 = serde_json::from_slice(
+            &std::fs::read(args.artifact_dir.join(extended.targets.file)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            extended_features.shards.iter().map(|s| s.rows).sum::<u64>(),
+            89
+        );
+        assert_eq!(
+            extended_targets.shards.iter().map(|s| s.rows).sum::<u64>(),
+            89
+        );
+        args.market_feature_end_received_at_ns = Some(event_ns(121000));
+        assert!(market_encoder::feature_window(&args).is_err());
+        args.market_feature_end_received_at_ns = Some(event_ns(0));
+        assert!(market_encoder::feature_window(&args).is_err());
     }
 
     #[test]

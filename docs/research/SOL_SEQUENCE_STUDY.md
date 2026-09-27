@@ -147,7 +147,12 @@ target manifests from the same verified replay. It requires SOLUSDT USD-M,
 before target eligibility: an unlabeled tail remains in the feature artifact,
 while missing endpoints or recovery gaps omit targets instead of inventing zeros.
 Trade buckets use receive-time availability. The report binds both manifests;
-the target manifest pins its exact feature dataset.
+the target manifest pins its exact feature dataset. For internal training shards,
+`--market-feature-end-received-at-ns` can end the non-overlapping feature partition
+before the admitted output window ends, leaving room to materialize its last
+30-second labels. That label-only lookahead must remain inside the training view;
+it cannot read validation or sealed data. The last training shard may retain an
+unlabeled tail, which lies outside the common supervised anchor range.
 
 These library and exporter capabilities are verified with controlled data.
 Canonical preparation/worker input binding, Campaign stage accounting,
