@@ -1,5 +1,6 @@
 pub(crate) mod final_evaluation;
 pub(crate) mod preparation;
+pub(crate) mod sequence;
 pub(crate) mod workflow;
 use crate::{
     cli::{
@@ -455,6 +456,9 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     if args.final_evaluation {
         return final_evaluation::execute(args);
     }
+    if sequence::is_sequence_request(&args.request)? {
+        return sequence::execute(args);
+    }
     let loaded = load_request(&args.request)?;
     if loaded.sha256 != normalized_sha256("campaign request", &args.request_sha256)? {
         bail!("campaign request SHA256 mismatch");
@@ -496,6 +500,12 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
 }
 
 pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
+    if args.reuse.is_none()
+        && args.final_evaluation_control.is_none()
+        && sequence::is_sequence_plan(args.research_plan.as_deref())?
+    {
+        return sequence::freeze(args);
+    }
     if args.reuse.is_some() != args.reuse_sha256.is_some()
         || (args.final_evaluation_control.is_some() && args.reuse.is_some())
     {
@@ -1235,6 +1245,9 @@ fn campaign_learn_report(
 }
 
 pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
+    if sequence::is_sequence_freeze(&args.freeze)? {
+        return sequence::finalize(args);
+    }
     if final_evaluation::is_final_freeze(&args.freeze)? {
         return final_evaluation::finalize(args);
     }
