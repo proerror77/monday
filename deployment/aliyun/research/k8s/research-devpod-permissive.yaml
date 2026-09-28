@@ -1,0 +1,242 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: research-devpod-permissive
+  namespace: monday-research-dev
+  labels:
+    app: research-devpod-permissive
+    role: development
+spec:
+  serviceName: research-devpod-permissive
+  replicas: 1
+  selector:
+    matchLabels:
+      app: research-devpod-permissive
+  template:
+    metadata:
+      labels:
+        app: research-devpod-permissive
+    spec:
+      # 放宽策略：root，可 apt。只存在于 monday-research-dev。
+      # 不覆盖 monday-research/research-devpod，不挂 campaign 卷。
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: backtest
+      securityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+        runAsGroup: 0
+
+      # 使用 init container 拉取代码
+      initContainers:
+        - name: git-sync
+          image: alpine/git:latest
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "🔄 Syncing code from GitHub..."
+
+              if [ -d /workspace/.git ]; then
+                cd /workspace
+                echo "Repository exists, updating..."
+                git -c safe.directory=/workspace fetch origin
+                git -c safe.directory=/workspace checkout ${GIT_BRANCH}
+                git -c safe.directory=/workspace pull origin ${GIT_BRANCH}
+                echo "✓ Code updated to latest"
+              else
+                echo "Cloning repository..."
+                rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null || true
+                git clone -b ${GIT_BRANCH} ${GIT_REPO} /workspace
+                echo "✓ Repository cloned"
+              fi
+
+              cd /workspace
+              echo ""
+              echo "Current commit:"
+              git -c safe.directory=/workspace log -1 --oneline
+              echo ""
+              echo "Branch: $(git -c safe.directory=/workspace branch --show-current)"
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: GIT_TERMINAL_PROMPT
+              value: "0"
+            - name: GIT_REPO
+              value: "https://github.com/proerror77/monday.git"
+            - name: GIT_BRANCH
+              value: "feat/segment-index-and-replay-fix"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+
+      # 主容器：开发环境
+      containers:
+        - name: devpod
+          image: rust:1.98.1-bookworm
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              echo "🚀 Research DevPod Starting..."
+              echo ""
+
+              # 安装必要工具
+              echo "📦 Installing tools..."
+              apt-get update -qq
+              apt-get install -y -qq wget unzip jq curl > /dev/null 2>&1
+
+              # 安装 DuckDB
+              if ! command -v duckdb &> /dev/null; then
+                echo "Installing DuckDB v1.1.3..."
+                cd /tmp
+                wget -q https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip
+                unzip -q duckdb_cli-linux-amd64.zip
+                chmod +x duckdb
+                mv duckdb /usr/local/bin/
+                rm duckdb_cli-linux-amd64.zip
+                echo "✓ DuckDB installed"
+              fi
+
+              cd /workspace
+
+              echo ""
+              echo "✅ DevPod Ready!"
+              echo ""
+              echo "📂 Workspace: /workspace"
+              echo "🔧 Cargo cache: /cargo-cache"
+              echo "🏗️  Build cache: /workspace/target"
+              echo "No production lake mounts."
+              echo ""
+              echo "Available commands:"
+              echo "  - cargo build -p hft-collector --release"
+              echo "  - cargo test -p hft-collector segment_index"
+              echo "  - ./target/release/segment-index-cli --help"
+              echo ""
+              echo "To update code:"
+              echo "  cd /workspace && git pull"
+              echo ""
+              echo "Keeping pod alive..."
+
+              # 保持运行
+              tail -f /dev/null
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: CARGO_HOME
+              value: "/cargo-cache"
+            - name: RUST_BACKTRACE
+              value: "1"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: cargo-cache
+              mountPath: /cargo-cache
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: workspace
+          emptyDir:
+            sizeLimit: 12Gi
+        - name: cargo-cache
+          emptyDir:
+            sizeLimit: 8Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: research-devpod-permissive-guide
+  namespace: monday-research-dev
+data:
+  README.md: |
+    # Research DevPod (Permissive Security Policy)
+
+    ## ⚠️ 注意
+
+    这是**开发环境**配置，使用放宽的安全策略：
+    - 允许以 root 运行
+    - 可以安装系统工具
+    - 适合快速迭代开发
+
+    **生产环境**应使用 `research-devpod-statefulset.yaml`（严格安全策略）。
+
+    ## 🚀 部署
+
+    ```bash
+    kubectl apply -f dev-namespace.yaml
+    kubectl apply -f research-devpod-permissive.yaml
+    ```
+
+    ## 🔍 监控启动
+
+    ```bash
+    # 查看状态
+    kubectl get pod research-devpod-permissive-0 -n monday-research-dev -w
+
+    # 查看日志
+    kubectl logs -f research-devpod-permissive-0 -n monday-research-dev
+    ```
+
+    ## 📝 使用
+
+    ```bash
+    # 连接到 DevPod
+    kubectl exec -it research-devpod-permissive-0 -n monday-research-dev -- bash
+
+    # 在 DevPod 内：
+    cd /workspace
+
+    # 切换分支
+    git checkout main
+    git pull
+
+    # 增量编译
+    cargo build -p hft-collector --release
+
+    # 运行测试
+    ./target/release/segment-index-cli info
+
+    ```
+
+    ## 🔄 更新代码
+
+    ```bash
+    # 在 DevPod 内：
+    cd /workspace
+    git fetch origin
+    git checkout <branch>
+    git pull
+    cargo build -p hft-collector --release
+    ```
+
+    ## ⏱️ 预期启动时间
+
+    - **首次启动**: 3-5 分钟
+      - PVC 创建: ~30s
+      - Git clone: ~30s
+      - 镜像拉取: ~1-2 分钟
+      - 工具安装: ~1-2 分钟
+
+    - **重启** (PVC 保留): 1-2 分钟
+      - Git pull: ~5s
+      - 工具安装: ~1-2 分钟
+
+    - **代码切换**: ~10 秒
+      - git checkout + pull
+
+    - **增量编译**: < 1 分钟
+      - Cargo 缓存命中

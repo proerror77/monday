@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: research-dev-simple
+  namespace: monday-research-dev
+  labels:
+    app: research-dev-simple
+    role: development
+spec:
+  nodeSelector:
+    kubernetes.io/arch: amd64
+    workload: backtest
+  securityContext:
+    runAsNonRoot: false
+    runAsUser: 0
+    runAsGroup: 0
+  restartPolicy: Always
+  containers:
+    - name: devpod
+      image: rust:1.98.1-bookworm
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Research Dev Pod"
+          echo "user=$(id)"
+          for bin in bash git rustc cargo; do
+            if command -v "$bin" >/dev/null 2>&1; then
+              echo "present $bin $(command -v "$bin")"
+            else
+              echo "absent $bin"
+            fi
+          done
+          echo "workspace=/workspace"
+          echo "No production lake mounts."
+          exec sleep infinity
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 4Gi
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: workspace
+      emptyDir:
+        sizeLimit: 10Gi
