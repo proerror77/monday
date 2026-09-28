@@ -9213,7 +9213,8 @@ mod tests {
             ),
         ];
         for (frame, frame_received_at_ns) in frames {
-            let event = event_from_frame_for_shard(Market::Usdm, frame, frame_received_at_ns, 7).unwrap();
+            let event =
+                event_from_frame_for_shard(Market::Usdm, frame, frame_received_at_ns, 7).unwrap();
             assert_eq!(
                 process_event(
                     &config,
@@ -9275,7 +9276,8 @@ mod tests {
             ),
         ];
         for (index, (frame, frame_received_at_ns)) in frames.into_iter().enumerate() {
-            let event = event_from_frame_for_shard(Market::Usdm, frame, frame_received_at_ns, 7).unwrap();
+            let event =
+                event_from_frame_for_shard(Market::Usdm, frame, frame_received_at_ns, 7).unwrap();
             let result = process_event(
                 &config,
                 &mut segment,
@@ -9634,7 +9636,8 @@ mod tests {
             };
             for (frame, received_at_ns) in frames {
                 let event =
-                    event_from_frame_for_shard(Market::Usdm, frame, received_at_ns, producer_id).unwrap();
+                    event_from_frame_for_shard(Market::Usdm, frame, received_at_ns, producer_id)
+                        .unwrap();
                 process_event(
                     &config,
                     &mut segment,
@@ -9882,7 +9885,8 @@ mod tests {
             },
         });
         let event =
-            event_from_frame_for_shard(Market::Spot, trade, trade_received_at_ns, producer_id).unwrap();
+            event_from_frame_for_shard(Market::Spot, trade, trade_received_at_ns, producer_id)
+                .unwrap();
         assert_eq!(
             process_event(
                 &config,
@@ -9913,7 +9917,8 @@ mod tests {
             },
         });
         let event =
-            event_from_frame_for_shard(Market::Spot, depth, depth_received_at_ns, producer_id).unwrap();
+            event_from_frame_for_shard(Market::Spot, depth, depth_received_at_ns, producer_id)
+                .unwrap();
         assert_eq!(
             process_event(
                 &config,
