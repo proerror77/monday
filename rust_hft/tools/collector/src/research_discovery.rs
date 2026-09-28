@@ -87,6 +87,11 @@ struct WalkPlace {
 struct DiscoveryIndex {
     schema_version: String,
     root: String,
+    /// Operator seal token from `archive-generation` in the index directory.
+    /// A backfill, repair, or mount-source change updates that file and drops
+    /// cached listings. An empty token only matches an index that also has none.
+    #[serde(default)]
+    archive_generation: String,
     partitions: BTreeMap<String, CachedPartition>,
 }
 
@@ -119,13 +124,13 @@ pub(crate) fn discover_manifests(
     let env_index = std::env::var_os("MONDAY_RESEARCH_DISCOVERY_INDEX").map(PathBuf::from);
     let index_dir = index_dir.or(env_index.as_deref());
     let mut remaining = max_entries;
+    let generation = match index_dir {
+        Some(dir) => read_archive_generation(dir)?,
+        None => String::new(),
+    };
     let mut index = match index_dir {
-        Some(dir) => load_index(dir, root)?,
-        None => DiscoveryIndex {
-            schema_version: INDEX_SCHEMA.to_string(),
-            root: root.display().to_string(),
-            partitions: BTreeMap::new(),
-        },
+        Some(dir) => load_index(dir, root, &generation)?,
+        None => empty_index(root, &generation),
     };
     let mut manifests = Vec::new();
     walk(
@@ -584,21 +589,58 @@ fn index_path(dir: &Path, root: &Path) -> PathBuf {
     dir.join(format!("{digest}.json"))
 }
 
-fn load_index(dir: &Path, root: &Path) -> Result<DiscoveryIndex> {
+fn empty_index(root: &Path, generation: &str) -> DiscoveryIndex {
+    DiscoveryIndex {
+        schema_version: INDEX_SCHEMA.to_string(),
+        root: root.display().to_string(),
+        archive_generation: generation.to_string(),
+        partitions: BTreeMap::new(),
+    }
+}
+
+fn read_archive_generation(dir: &Path) -> Result<String> {
+    let path = dir.join("archive-generation");
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("stat archive generation {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "archive generation must be a regular file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() > 128 {
+        bail!("archive generation exceeds 128 bytes: {}", path.display());
+    }
+    let generation = fs::read_to_string(&path)
+        .with_context(|| format!("read archive generation {}", path.display()))?;
+    let generation = generation.trim();
+    if !generation.is_empty()
+        && !generation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    {
+        bail!("archive generation contains an unsupported character");
+    }
+    Ok(generation.to_string())
+}
+
+fn load_index(dir: &Path, root: &Path, generation: &str) -> Result<DiscoveryIndex> {
     let path = index_path(dir, root);
     if !path.is_file() {
-        return Ok(DiscoveryIndex {
-            schema_version: INDEX_SCHEMA.to_string(),
-            root: root.display().to_string(),
-            partitions: BTreeMap::new(),
-        });
+        return Ok(empty_index(root, generation));
     }
     let bytes =
         fs::read(&path).with_context(|| format!("read discovery index {}", path.display()))?;
     let index: DiscoveryIndex = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse discovery index {}", path.display()))?;
-    if index.schema_version != INDEX_SCHEMA || index.root != root.display().to_string() {
-        bail!("discovery index does not belong to this archive root");
+    if index.schema_version != INDEX_SCHEMA {
+        bail!("discovery index schema is not {INDEX_SCHEMA}");
+    }
+    if index.root != root.display().to_string() || index.archive_generation != generation {
+        return Ok(empty_index(root, generation));
     }
     Ok(index)
 }

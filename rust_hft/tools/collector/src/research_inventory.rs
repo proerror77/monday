@@ -1556,7 +1556,6 @@ fn build_frozen_inventory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lob_archiver::files_with_suffix_bounded;
     use crate::binance_spot_reference_artifact::{
         publish_spot_reference, SpotReferenceArtifactConfig,
     };
@@ -1565,6 +1564,7 @@ mod tests {
         publish_reference_batch, ReferenceArtifactConfig,
     };
     use crate::binance_usdm_reference_collector::OFFICIAL_USDM_SOURCE_ORIGIN;
+    use crate::lob_archiver::files_with_suffix_bounded;
     use data::binance_spot_reference::{
         SpotInstrumentRules, SpotNotionalFilter, SpotPriceFilter, SpotQuantityFilter,
         SpotReferenceBatch, EXCHANGE_INFO_ENDPOINT as SPOT_EXCHANGE_INFO_ENDPOINT,
@@ -2777,6 +2777,62 @@ mod tests {
         assert_eq!(second.raw.len(), 2);
         assert_eq!(
             second.input_fingerprint_sha256,
+            first.input_fingerprint_sha256
+        );
+    }
+
+    #[test]
+    fn hive_discovery_refreshes_when_the_archive_generation_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let raw_root = root.join("raw");
+        let reference_root = root.join("reference");
+        let index = root.join("index");
+        fs::create_dir_all(&raw_root).unwrap();
+        fs::create_dir_all(&reference_root).unwrap();
+        fs::create_dir_all(&index).unwrap();
+        fs::write(index.join("archive-generation"), "seal-1\n").unwrap();
+        let window_start = RECEIVED_NS;
+        let window_end = RECEIVED_NS + 2_000_000_000;
+        write_hive_segment(&raw_root, window_start, window_start + 1_000_000_000, true);
+        write_hive_segment(
+            &raw_root,
+            window_start - 300_000_000_000,
+            window_start + 10,
+            true,
+        );
+        publish_reference_batch(
+            &ReferenceArtifactConfig {
+                output_root: reference_root.clone(),
+                observed_at_ns: window_start + 100,
+                max_staleness_ms: 1000,
+            },
+            OFFICIAL_USDM_SOURCE_ORIGIN,
+            &fixture_reference_batch(),
+        )
+        .unwrap();
+        let mut request = fixture().1;
+        request.raw_root = raw_root.clone();
+        request.reference_root = reference_root;
+        request.start_received_at_ns = window_start;
+        request.end_received_at_ns = window_end;
+        request.discovery_index = Some(index.clone());
+        let first = freeze_inventory(&request).unwrap();
+        assert_eq!(first.raw.len(), 2);
+
+        write_hive_segment(&raw_root, window_start + 40, window_start + 50, true);
+        let cached = freeze_inventory(&request).unwrap();
+        assert_eq!(cached.raw.len(), 2);
+        assert_eq!(
+            cached.input_fingerprint_sha256,
+            first.input_fingerprint_sha256
+        );
+
+        fs::write(index.join("archive-generation"), "seal-2\n").unwrap();
+        let refreshed = freeze_inventory(&request).unwrap();
+        assert_eq!(refreshed.raw.len(), 3);
+        assert_ne!(
+            refreshed.input_fingerprint_sha256,
             first.input_fingerprint_sha256
         );
     }

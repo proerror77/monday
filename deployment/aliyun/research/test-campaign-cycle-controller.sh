@@ -62,6 +62,9 @@ case "$1 $2" in
     if [[ " $* " == *" --binary-dir "* ]]; then
       printf 'binary:%s\n' "$(value_after --binary-dir "$@")" >>"$FAKE_STATE/fresh-binary-dirs"
     fi
+    if [[ " $* " == *" --discovery-index "* ]]; then
+      printf '%s\n' "$(value_after --discovery-index "$@")" >>"$FAKE_STATE/fresh-discovery-indexes"
+    fi
     symbol="$(value_after --symbol "$@")"
     mission_id="$(value_after --mission-id "$@")"
     request_out="$(value_after --request-out "$@")"
@@ -951,10 +954,16 @@ for scenario in \
 done
 [[ "$selected_recovery" == true ]]
 
+if [[ -e "$FAKE_STATE/fresh-preparation-count" ]]; then
+  echo "receipt-mode campaign materialized fresh inputs" >&2
+  exit 1
+fi
+
 fresh_case_root="$root/fresh-inputs"
 fresh_cycle="$fresh_case_root/cycle"
 fresh_output="$fresh_case_root/output"
-mkdir -p "$fresh_case_root/raw" "$fresh_case_root/reference" "$fresh_output"
+fresh_discovery="$fresh_case_root/discovery-index"
+mkdir -p "$fresh_case_root/raw" "$fresh_case_root/reference" "$fresh_output" "$fresh_discovery"
 export FAKE_SOURCE_REVISION="$source_revision"
 fresh_args=(
   start
@@ -982,6 +991,7 @@ fresh_args=(
   --fresh-max-input-bytes 1000000
   --fresh-materializer-timeout-seconds 10
   --fresh-max-materializer-output-bytes 1024
+  --fresh-discovery-index "$fresh_discovery"
   --source-revision "$source_revision"
   --image "registry.example/research@sha256:$image_digest"
   --campaign-root https://bucket.oss-ap-northeast-1-internal.aliyuncs.com/research/campaigns
@@ -1002,6 +1012,9 @@ jq -e '
 ' "$fresh_cycle/needs-authority.json" >/dev/null
 test "$(<"$FAKE_STATE/fresh-preparation-count")" == 1
 test "$(<"$FAKE_STATE/dispatch-count")" == "$fresh_dispatch_before"
+test "$(<"$FAKE_STATE/fresh-discovery-indexes")" == "$fresh_discovery"
+jq -e --arg index "$fresh_discovery" '.fresh.discovery_index == $index' \
+  "$fresh_cycle/controller-inputs.json" >/dev/null
 test ! -e "$fresh_cycle/generation-0"
 grep -Fq 'event=needs_authority stage=fresh_inputs reason=signer_missing' \
   "$root/fresh-needs-authority.stderr"

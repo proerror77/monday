@@ -225,6 +225,7 @@ build_fresh_controller_contract() {
     --arg request_out "$fresh_request_out" \
     --arg materializer_work_dir "$fresh_materializer_work_dir" \
     --arg preparation_report "$fresh_report_out" \
+    --arg discovery_index "$fresh_discovery_index" \
     '{
       raw_root:$raw_root,reference_root:$reference_root,market:$market,
       start_received_at_ns:$start_received_at_ns,end_received_at_ns:$end_received_at_ns,
@@ -239,7 +240,8 @@ build_fresh_controller_contract() {
       max_materializer_output_bytes:$max_materializer_output_bytes,
       inventory_out:$inventory_out,request_out:$request_out,
       materializer_work_dir:$materializer_work_dir,
-      preparation_report:$preparation_report
+      preparation_report:$preparation_report,
+      discovery_index:$discovery_index
     }')
 }
 
@@ -298,6 +300,7 @@ load_fresh_controller_contract() {
   fresh_request_out="$(jq -er '.fresh.request_out' "$controller_state")"
   fresh_materializer_work_dir="$(jq -er '.fresh.materializer_work_dir' "$controller_state")"
   fresh_report_out="$(jq -er '.fresh.preparation_report' "$controller_state")"
+  fresh_discovery_index="$(jq -r '.fresh.discovery_index // empty' "$controller_state")"
 }
 
 mark_study_handoff_consumed() {
@@ -340,7 +343,7 @@ validate_fresh_controller_owner() {
        and .max_follow_ups == $max_follow_ups
        and .job_timeout == $job_timeout
        and (.seeds | map(tostring)) == $seeds
-       and .fresh == $fresh' \
+       and ((.fresh + {discovery_index:(.fresh.discovery_index // "")}) == $fresh)' \
       "$state" >/dev/null \
       || die "existing work directory belongs to different fresh controller inputs"
     [[ ! -L "$campaign_inputs" && -s "$campaign_inputs" ]] \
@@ -596,6 +599,7 @@ fresh_inventory_out=""
 fresh_request_out=""
 fresh_materializer_work_dir=""
 fresh_report_out=""
+fresh_discovery_index=""
 study_id=""
 study_target_family_id=""
 study_target_horizon=""
@@ -669,6 +673,7 @@ while (($#)); do
     --fresh-request-out) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_request_out="$2"; shift 2 ;;
     --fresh-materializer-work-dir) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_materializer_work_dir="$2"; shift 2 ;;
     --fresh-report-out) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_report_out="$2"; shift 2 ;;
+    --fresh-discovery-index) [[ "$mode" == "start" ]] || die "$mode loads fresh inputs from controller state"; fresh_discovery_index="$2"; shift 2 ;;
     --input-root) [[ "$mode" == "start" ]] || die "$mode loads --input-root from controller state"; input_root="$2"; shift 2 ;;
     --source-revision) [[ "$mode" == "start" ]] || die "$mode loads --source-revision from controller state"; source_revision="$2"; shift 2 ;;
     --image) [[ "$mode" == "start" ]] || die "$mode loads --image from controller state"; image="$2"; shift 2 ;;
@@ -806,12 +811,23 @@ if [[ "$mode" == "start" ]]; then
     [[ -n "$fresh_request_out" ]] || fresh_request_out="$fresh_output_root/.fresh-inputs/$fresh_output_prefix/request.json"
     [[ -n "$fresh_materializer_work_dir" ]] || fresh_materializer_work_dir="$work_dir/fresh-inputs/materializer"
     [[ -n "$fresh_report_out" ]] || fresh_report_out="$work_dir/fresh-inputs/preparation.json"
+    if [[ -n "$fresh_discovery_index" ]]; then
+      mkdir -p -- "$fresh_discovery_index"
+      fresh_discovery_index="$(cd "$fresh_discovery_index" && pwd -P)" \
+        || die "fresh discovery index does not exist: $fresh_discovery_index"
+      fresh_work_canonical="$(cd "$(dirname "$work_dir")" && pwd -P)/$(basename "$work_dir")"
+      case "$fresh_discovery_index" in
+        "$fresh_work_canonical"|"$fresh_work_canonical"/*)
+          die "fresh discovery index must outlive the campaign work directory"
+          ;;
+      esac
+    fi
     fresh_output_root="$(cd "$fresh_output_root" && pwd -P)" \
       || die "fresh output root does not exist: $fresh_output_root"
     input_root="$fresh_output_root/$fresh_output_prefix"
     campaign_inputs="$input_root/receipts/campaign-inputs.json"
   else
-    [[ -z "$fresh_raw_root$fresh_reference_root$fresh_market$fresh_start_received_at_ns$fresh_end_received_at_ns$fresh_duration_ns$fresh_cutoff_received_at_ns$fresh_max_candidates$fresh_symbol$fresh_image_ref$fresh_mission_id$fresh_output_root$fresh_output_prefix$fresh_bucket_ms$fresh_label_horizon_buckets$fresh_top_depth$fresh_materializer$fresh_binary_dir$fresh_max_scan_entries$fresh_max_inputs$fresh_max_input_bytes$fresh_materializer_timeout_seconds$fresh_max_materializer_output_bytes$fresh_inventory_out$fresh_request_out$fresh_materializer_work_dir$fresh_report_out" ]] \
+    [[ -z "$fresh_raw_root$fresh_reference_root$fresh_market$fresh_start_received_at_ns$fresh_end_received_at_ns$fresh_duration_ns$fresh_cutoff_received_at_ns$fresh_max_candidates$fresh_symbol$fresh_image_ref$fresh_mission_id$fresh_output_root$fresh_output_prefix$fresh_bucket_ms$fresh_label_horizon_buckets$fresh_top_depth$fresh_materializer$fresh_binary_dir$fresh_max_scan_entries$fresh_max_inputs$fresh_max_input_bytes$fresh_materializer_timeout_seconds$fresh_max_materializer_output_bytes$fresh_inventory_out$fresh_request_out$fresh_materializer_work_dir$fresh_report_out$fresh_discovery_index" ]] \
       || die "fresh input arguments require --fresh-inputs"
     [[ -n "$campaign_inputs" ]] || die "--campaign-inputs is required when --fresh-inputs is absent"
   fi
@@ -1099,6 +1115,9 @@ study_handoff() {
     if [[ -n "$fresh_binary_dir" ]]; then
       target_prepare_args+=(--binary-dir "$fresh_binary_dir")
     fi
+    if [[ -n "$fresh_discovery_index" ]]; then
+      target_prepare_args+=(--discovery-index "$fresh_discovery_index")
+    fi
     "$alpha_harness" "${target_prepare_args[@]}" >"$study_dir/preparation.stdout"
   fi
   [[ -s "$target_report" && -s "$target_campaign_inputs" ]] \
@@ -1308,6 +1327,9 @@ if [[ "$mode" == "start" && "$fresh_mode" == true ]]; then
   fi
   if [[ -n "$fresh_binary_dir" ]]; then
     fresh_prepare_args+=(--binary-dir "$fresh_binary_dir")
+  fi
+  if [[ -n "$fresh_discovery_index" ]]; then
+    fresh_prepare_args+=(--discovery-index "$fresh_discovery_index")
   fi
   log_event stage_started "stage=fresh_inputs" \
     "selection_mode=$(if [[ -n "$fresh_start_received_at_ns" ]]; then printf explicit; else printf latest; fi)" \
