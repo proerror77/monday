@@ -261,6 +261,22 @@ require_empty_segment_spool() {
   fi
 }
 
+capture_upload_failure_baseline() {
+  local status="$CANONICAL_SPOOL/upload-status.json"
+  case "$OLD_MODE" in
+    new-host)
+      require_empty_segment_spool || return 1
+      if [[ ! -e $status && ! -L $status ]]; then
+        printf '0\n'
+        return
+      fi
+      ;;
+    upgrade) ;;
+    *) return 1 ;;
+  esac
+  bybit_options_upload_failure_count "$status"
+}
+
 run_candidate_drain() {
   local unit_template="$1/bybit-options-archiver.service"
   local key value
@@ -664,7 +680,7 @@ else
   fail "ambiguous production state: active=$active_count enabled=$enabled_count symlink=$PRODUCTION_LINK"
 fi
 
-UPLOAD_FAILURE_BASELINE=$(bybit_options_upload_failure_count "$CANONICAL_SPOOL/upload-status.json") \
+UPLOAD_FAILURE_BASELINE=$(capture_upload_failure_baseline) \
   || fail 'production upload failure baseline is invalid'
 copy_health_evidence before-transition
 
@@ -691,8 +707,9 @@ if [[ $OLD_MODE == upgrade ]]; then
   STEP=drain-old-production-with-candidate
   run_candidate_drain "$CANDIDATE_DEPLOYMENT"
 else
-  STEP=verify-new-host-spool
+  STEP=initialize-new-host-upload-status
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
+  run_candidate_drain "$CANDIDATE_DEPLOYMENT"
 fi
 
 STEP=switch-production-symlink

@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 
-# Missing status represents a new spool; malformed or indirect status never
-# resets the cumulative counter to zero.
+# Missing, malformed or indirect status never resets the cumulative counter.
 bybit_options_upload_failure_count() {
   local status=$1
-  if [[ ! -e $status && ! -L $status ]]; then
-    printf '0\n'
-    return
-  fi
   [[ -f $status && ! -L $status ]] || return 1
   jq -er '.failure_count | select(type == "number" and . >= 0 and . == floor)' "$status"
 }
@@ -19,7 +14,6 @@ bybit_options_upload_status_ready() {
   [[ $baseline =~ ^[0-9]+$ ]] || return 1
   count=$(bybit_options_upload_failure_count "$status") || return 1
   [[ $count == "$baseline" ]] || return 1
-  [[ -e $status ]] || return 0
   jq -e 'has("last_error_at") and has("last_error")
     and .last_error_at == null and .last_error == null' "$status" >/dev/null
 }

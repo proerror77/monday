@@ -182,6 +182,10 @@ if bybit_options_upload_status_ready "$tmp_dir/missing-status.json" 28; then
   printf 'production status disappearance erased historical failures\n' >&2
   exit 1
 fi
+if bybit_options_upload_status_ready "$tmp_dir/missing-status.json" 0; then
+  printf 'zero-baseline readiness accepted missing persisted status\n' >&2
+  exit 1
+fi
 printf '{bad json' >"$tmp_dir/bad-status.json"
 if bybit_options_upload_failure_count "$tmp_dir/bad-status.json" >/dev/null 2>&1; then
   printf 'malformed production status erased historical failures\n' >&2
@@ -203,6 +207,40 @@ for filter in '.failure_count=29' '.last_error="current failure"'; do
     exit 1
   fi
 done
+
+# Only an explicitly new, empty host can capture an absent status as baseline
+# zero. Its candidate uploader must still write status before readiness passes.
+eval "$(sed -n '/^capture_upload_failure_baseline() {/,/^}/p' "$cutover")"
+CANONICAL_SPOOL="$tmp_dir/bootstrap-spool"
+mkdir "$CANONICAL_SPOOL"
+# shellcheck disable=SC2034 # consumed by the actual host function loaded above
+OLD_MODE=upgrade
+if capture_upload_failure_baseline; then
+  printf 'upgrade accepted missing cumulative upload history\n' >&2
+  exit 1
+fi
+# shellcheck disable=SC2034 # consumed by the actual host function loaded above
+OLD_MODE=new-host
+spool_empty=false
+if capture_upload_failure_baseline; then
+  printf 'new host accepted missing history with a nonempty spool\n' >&2
+  exit 1
+fi
+spool_empty=true
+UPLOAD_FAILURE_BASELINE=$(capture_upload_failure_baseline)
+[[ $UPLOAD_FAILURE_BASELINE == 0 ]]
+if bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" 0; then
+  printf 'new host became ready before the candidate persisted status\n' >&2
+  exit 1
+fi
+jq '.failure_count=0 | .last_success_at=null' "$tmp_dir/resolved-status.json" >"$tmp_dir/drain-result.json"
+run_candidate_drain "$tmp_dir"
+bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" 0
+rm "$CANONICAL_SPOOL/upload-status.json"
+if bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" 0; then
+  printf 'new host remained ready after persisted status disappeared\n' >&2
+  exit 1
+fi
 
 # Render the real unit template with a digest, then validate exact command
 # identity. A bare release-root prefix was previously compared as a whole line.
