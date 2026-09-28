@@ -13,31 +13,34 @@ node_for() {
 
 blockers() {
   local node="$1"
-  kubectl get pods -A --field-selector "spec.nodeName=${node}" -o json | python3 -c '
-import json, sys
-bad = []
-for pod in json.load(sys.stdin)["items"]:
-    owners = pod["metadata"].get("ownerReferences") or []
-    if any(owner.get("kind") == "DaemonSet" for owner in owners):
-        continue
-    ns = pod["metadata"]["namespace"]
-    if ns in ("kube-system", "ack-csi-fuse"):
-        continue
-    bad.append(ns + "/" + pod["metadata"]["name"])
-print("\n".join(bad))
-'
+  kubectl get pods -A --field-selector "spec.nodeName=${node}" -o json | jq -ers '
+    if length != 1 then error("expected one PodList") else .[0] end
+    | .items
+    | if type != "array" then error("expected PodList.items array") else . end
+    | map(
+        (.metadata.ownerReferences // []) as $owners
+        | if ($owners | type) != "array" then error("expected ownerReferences array") else . end
+        | select(any($owners[]; .kind == "DaemonSet") | not)
+        | select(.metadata.namespace != "kube-system" and .metadata.namespace != "ack-csi-fuse")
+        | if (.metadata.namespace | type) != "string" or (.metadata.name | type) != "string"
+          then error("expected pod namespace and name")
+          else .metadata.namespace + "/" + .metadata.name end
+      )
+    | join("\n")
+  '
 }
 
 release_one() {
   local instance_id="$1"
   local node
-  node="$(node_for "$instance_id")"
+  node="$(node_for "$instance_id")" || return 1
   if [ -z "$node" ]; then
     echo "实例 ${instance_id} 不在集群里，跳过。"
     return 0
   fi
   local held
-  held="$(blockers "$node")"
+  # release_one is called under ||, so errexit alone cannot reject query/parse failures.
+  held="$(blockers "$node")" || return 1
   if [ -n "$held" ]; then
     echo "拒绝释放 ${instance_id}（节点 ${node}）。上面还有："
     echo "$held"
