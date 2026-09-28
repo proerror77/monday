@@ -1,3 +1,18 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: research-devpod-data
+  namespace: monday-research
+  labels:
+    app: research-devpod
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: monday-spot-essd-689
+  resources:
+    requests:
+      storage: 40Gi
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -26,6 +41,7 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       # 使用 init container 拉取代码
@@ -39,27 +55,28 @@ spec:
               set -e
               echo "🔄 Syncing code from GitHub..."
 
-              if [ -d /workspace/.git ]; then
-                cd /workspace
+              mkdir -p /persist/workspace /persist/cargo-cache
+              if [ -d /persist/workspace/.git ]; then
+                cd /persist/workspace
                 echo "Repository exists, updating..."
                 # 使用 -c 参数临时设置 safe.directory
-                git -c safe.directory=/workspace fetch origin
-                git -c safe.directory=/workspace checkout ${GIT_BRANCH}
-                git -c safe.directory=/workspace pull origin ${GIT_BRANCH}
+                git -c safe.directory=/persist/workspace fetch origin
+                git -c safe.directory=/persist/workspace checkout ${GIT_BRANCH}
+                git -c safe.directory=/persist/workspace pull origin ${GIT_BRANCH}
                 echo "✓ Code updated to latest"
               else
                 echo "Cloning repository..."
-                rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null || true
-                git clone --depth 1 -b "${GIT_BRANCH}" "${GIT_REPO}" /workspace
+                rm -rf /persist/workspace/* /persist/workspace/.[!.]* 2>/dev/null || true
+                git clone --depth 1 -b "${GIT_BRANCH}" "${GIT_REPO}" /persist/workspace
                 echo "✓ Repository cloned"
               fi
 
-              cd /workspace
+              cd /persist/workspace
               echo ""
               echo "Current commit:"
-              git -c safe.directory=/workspace log -1 --oneline
+              git -c safe.directory=/persist/workspace log -1 --oneline
               echo ""
-              echo "Branch: $(git -c safe.directory=/workspace branch --show-current)"
+              echo "Branch: $(git -c safe.directory=/persist/workspace branch --show-current)"
           env:
             - name: HOME
               value: "/tmp"
@@ -70,8 +87,8 @@ spec:
             - name: GIT_BRANCH
               value: "feat/segment-index-and-replay-fix"
           volumeMounts:
-            - name: workspace
-              mountPath: /workspace
+            - name: data
+              mountPath: /persist
             - name: tmp
               mountPath: /tmp
           securityContext:
@@ -85,29 +102,29 @@ spec:
       containers:
         - name: devpod
           image: rust:1.98.1-bookworm
-          workingDir: /workspace/rust_hft
+          workingDir: /persist/workspace/rust_hft
           command:
             - /bin/bash
             - -c
             - |
               export HOME=/tmp
               export PATH="/usr/local/cargo/bin:${PATH}"
-              export CARGO_HOME=/cargo-cache
+              export CARGO_HOME=/persist/cargo-cache
               export RUSTUP_HOME=/usr/local/rustup
               echo "Research DevPod ready"
-              echo "uid=$(id -u) workspace=/workspace cargo-cache=/cargo-cache"
+              echo "uid=$(id -u) workspace=/persist/workspace cargo-cache=/persist/cargo-cache"
               echo "No production lake mounts. Campaign data stays on Campaign Jobs."
               cargo --version || echo "cargo is not usable yet"
               rustc --version || echo "rustc is not usable yet"
               printf '%s\n' \
                 'export PATH="/usr/local/cargo/bin:${PATH}"' \
-                'export CARGO_HOME=/cargo-cache' \
+                'export CARGO_HOME=/persist/cargo-cache' \
                 'export RUSTUP_HOME=/usr/local/rustup' \
-                'cd /workspace/rust_hft' \
+                'cd /persist/workspace/rust_hft' \
                 > /tmp/.profile
               cp /tmp/.profile /tmp/.bashrc
-              git config --global --add safe.directory /workspace
-              git config --global --add safe.directory /workspace/rust_hft
+              git config --global --add safe.directory /persist/workspace
+              git config --global --add safe.directory /persist/workspace/rust_hft
               echo "profile-ready"
               exec tail -f /dev/null
           env:
@@ -118,7 +135,7 @@ spec:
             - name: RUST_LOG
               value: "info"
             - name: CARGO_HOME
-              value: "/cargo-cache"
+              value: "/persist/cargo-cache"
             - name: RUSTUP_HOME
               value: "/usr/local/rustup"
             - name: RUST_BACKTRACE
@@ -131,10 +148,8 @@ spec:
               cpu: "2"
               memory: 6Gi
           volumeMounts:
-            - name: workspace
-              mountPath: /workspace
-            - name: cargo-cache
-              mountPath: /cargo-cache
+            - name: data
+              mountPath: /persist
             - name: tmp
               mountPath: /tmp
           securityContext:
@@ -144,15 +159,12 @@ spec:
                 - ALL
             readOnlyRootFilesystem: false
 
-      # 账户余额不足，按量云盘下单会被拒绝。工作区用节点临时盘，
-      # Pod 删除后代码和编译缓存消失，不新增 ESSD 账单。
+      # 一块 40Gi ESSD：代码和 cargo 缓存在 /persist 下，Pod 重启后还在。
+      # 不使用 subPath，避免子目录权限把 uid 1000 挡在外面。
       volumes:
-        - name: workspace
-          emptyDir:
-            sizeLimit: 12Gi
-        - name: cargo-cache
-          emptyDir:
-            sizeLimit: 8Gi
+        - name: data
+          persistentVolumeClaim:
+            claimName: research-devpod-data
         - name: tmp
           emptyDir:
             sizeLimit: 2Gi
@@ -171,7 +183,7 @@ data:
     - ✅ **代码热加载**：git pull 即可更新，无需重建镜像
     - ✅ **同一次 Pod 生命周期内增量编译**：缓存只活在当前 Pod
     - ✅ **不挂生产数据**：不挂 sol-market、campaign 输出或账本卷
-    - ✅ **不买新云盘**：workspace 和 cargo cache 是 emptyDir，Pod 删除后消失
+    - ✅ **一块 40Gi ESSD**：`/persist/workspace` 和 `/persist/cargo-cache` 在 Pod 删除后保留
     - ✅ **快速切换**：切换分支或 PR 只需 git checkout
 
     ## 🚀 使用方法
@@ -190,7 +202,7 @@ data:
 
     # 你会看到：
     # ✅ DevPod Ready!
-    # 📂 Workspace: /workspace
+    # 📂 Workspace: /persist/workspace
     # ...
     ```
 
@@ -198,7 +210,7 @@ data:
 
     ```bash
     # 在 DevPod 内：
-    cd /workspace
+    cd /persist/workspace
 
     # 切换到 main
     git checkout main
@@ -217,7 +229,7 @@ data:
 
     ```bash
     # 首次编译（25-40 分钟）。工作区清单在 rust_hft。
-    cd /workspace/rust_hft
+    cd /persist/workspace/rust_hft
     cargo build -p hft-collector --release
 
     # 后续编译（增量，< 1 分钟）
@@ -249,17 +261,17 @@ data:
 
     # 2. 在 DevPod 中拉取（< 10 秒）
     kubectl exec -it research-devpod-0 -n monday-research -- bash -c "
-      cd /workspace && git fetch && git checkout feat/my-experiment && git pull
+      cd /persist/workspace && git fetch && git checkout feat/my-experiment && git pull
     "
 
     # 3. 增量编译（< 1 分钟）
     kubectl exec -it research-devpod-0 -n monday-research -- bash -c "
-      cd /workspace && cargo build -p hft-collector --release
+      cd /persist/workspace/rust_hft && cargo build -p hft-collector --release
     "
 
     # 4. 测试
     kubectl exec -it research-devpod-0 -n monday-research -- bash -c "
-      cd /workspace && ./target/release/segment-index-cli info
+      cd /persist/workspace/rust_hft && ./target/release/segment-index-cli info
     "
     ```
 
@@ -273,7 +285,7 @@ data:
     ### 重启 DevPod
 
     ```bash
-    # 删除 Pod 后 StatefulSet 会重建。emptyDir 会清空，init 会重新浅克隆。
+    # 删除 Pod 后 StatefulSet 会重建。代码和 cargo 缓存在 ESSD 上，init 只做 git pull。
     kubectl delete pod research-devpod-0 -n monday-research
     ```
 
@@ -281,7 +293,7 @@ data:
 
     ```bash
     kubectl exec -it research-devpod-0 -n monday-research -- bash -c "
-      cd /workspace && cargo clean
+      cd /persist/workspace/rust_hft && cargo clean
     "
     ```
 
@@ -295,8 +307,7 @@ data:
     ## 总结
 
     - 代码在 Pod 启动时浅克隆
-    - 编译缓存在这次 Pod 里保留
+    - 编译缓存在 `/persist/cargo-cache`，随 40Gi ESSD 保留
     - 不挂生产研究数据
-    - 不申请新的云盘
 
     **不再需要为每次代码修改重建镜像！**
