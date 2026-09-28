@@ -146,11 +146,17 @@ CANONICAL_SPOOL="$tmp_dir/drain-spool"
   SAFE_PATH=/usr/bin:/bin
   UPLOAD_FAILURE_BASELINE=28
   DRAIN_ENV_KEYS=()
+  BOOTSTRAP_DEADLINE=0
 }
 mkdir "$CANONICAL_SPOOL"
 canonical_spool_paths_safe() { return 0; }
 require_empty_segment_spool() { [[ $spool_empty == true ]]; }
 runuser() { cp "$tmp_dir/drain-result.json" "$CANONICAL_SPOOL/upload-status.json"; }
+timeout() {
+  [[ $1 == --signal=TERM && $2 == --kill-after=10s && $3 =~ ^[1-9][0-9]*$ ]] || return 1
+  shift 3
+  "$@"
+}
 spool_empty=true
 jq -n '{failure_count:28,last_success_at:20,last_error_at:null,last_error:null}' \
   >"$tmp_dir/resolved-status.json"
@@ -253,7 +259,12 @@ for invalid_unit in \
   "ExecStart=$old_binary --upload-only" \
   "ExecStart=/opt/monday/releases/bybit-options-archiver/$bundle/bybit-options-archiver" \
   "${rendered_unit}"$'\n''ExecStart=/untrusted/binary' \
-  "${rendered_unit}"$'\n'' ExecStart = /untrusted/binary'; do
+  "${rendered_unit}"$'\n'' ExecStart = /untrusted/binary' \
+  "${rendered_unit}"$'\n''ExecStart=' \
+  "${rendered_unit}"$'\n'' ExecStart =  ' \
+  "ExecStart="$'\n'"${rendered_unit}" \
+  "${rendered_unit}"$'\n'"ExecStart=$old_binary" \
+  'ExecStart='; do
   if bybit_options_unit_exec_start_matches "$old_binary" "$invalid_unit"; then
     printf 'collector unit accepted a mismatched/duplicate ExecStart\n' >&2
     exit 1
@@ -328,4 +339,5 @@ grep -Fq 'BYBIT_OPTIONS_SPOOL_MAX_BYTES 53687091200' "$cutover" \
 grep -Fq 'AssertPathIsMountPoint=/data' "$script_dir/bybit-options-archiver.service"
 grep -Fq 'AssertPathIsMountPoint=/data' "$script_dir/bybit-options-upload.service"
 
+bash "$script_dir/test-bybit-options-cutover.sh"
 printf '%s\n' 'Bybit Options shadow gate tests passed'

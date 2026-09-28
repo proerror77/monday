@@ -16,7 +16,7 @@ if [[ $# -ne 1 || ! $1 =~ ^[A-Fa-f0-9]{64}$ ]]; then
   exit 2
 fi
 
-for command in awk chmod cmp date env find flock grep id install jq ln mkdir mountpoint mv readlink rm runuser sed sha256sum sleep stat systemctl tr wc; do
+for command in awk chmod cmp date env find flock grep id install jq ln mkdir mountpoint mv readlink rm runuser sed sha256sum sleep stat systemctl timeout tr wc; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'missing required command: %s\n' "$command" >&2
     exit 2
@@ -42,6 +42,8 @@ PRODUCTION_LINK=/opt/monday/bin/bybit-options-archiver
 SHADOW_LINK=/opt/monday/bin/bybit-options-archiver-shadow
 CANONICAL_SPOOL=/data/monday/spool/bybit-options
 HEALTH_TIMEOUT_SECONDS=300
+BOOTSTRAP_TIMEOUT_SECONDS=1500
+BOOTSTRAP_DEADLINE=0
 MINIMUM_SYMBOLS=500
 SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -121,6 +123,13 @@ TRANSITION_STARTED=0
 SUCCESS=0
 CANDIDATE_STARTED_MS=0
 UPLOAD_FAILURE_BASELINE=
+ROLLBACK_MAIN_PID=
+ROLLBACK_INVOCATION_ID=
+ROLLBACK_UPLOAD_WARNING=null
+ROLLBACK_WARNING_INTERPRETED=false
+BOOTSTRAP_STARTED_MS=0
+BOOTSTRAP_PREVIOUS_SUCCESS_MS=0
+BOOTSTRAP_UPLOAD_VERIFIED=false
 
 fail() {
   FAILURE_REASON=$*
@@ -279,7 +288,7 @@ capture_upload_failure_baseline() {
 
 run_candidate_drain() {
   local unit_template="$1/bybit-options-archiver.service"
-  local key value
+  local key value drain_seconds=900 remaining
   local -a env_args
   canonical_spool_paths_safe || return 1
   env_args=()
@@ -288,7 +297,12 @@ run_candidate_drain() {
     [[ -n $value ]] || return 1
     env_args+=("$key=$value")
   done
-  runuser --user hftcollector -- env -i \
+  if (( BOOTSTRAP_DEADLINE > 0 )); then
+    remaining=$(bootstrap_remaining_seconds) || return 1
+    (( remaining >= drain_seconds )) || drain_seconds=$remaining
+  fi
+  timeout --signal=TERM --kill-after=10s "$drain_seconds" \
+    runuser --user hftcollector -- env -i \
     HOME=/var/lib/hft-collector \
     PATH="$SAFE_PATH" \
     RUST_LOG=info \
@@ -376,6 +390,9 @@ runtime_matches_release() {
 wait_for_release_health() {
   local binary=$1 minimum_updated_ms=${2:-0}
   local deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
+  if (( BOOTSTRAP_DEADLINE > 0 && BOOTSTRAP_DEADLINE < deadline )); then
+    deadline=$BOOTSTRAP_DEADLINE
+  fi
   while (( SECONDS < deadline )); do
     systemctl is-active --quiet "$UNIT" || return 1
     if health_ready_for_release "$MINIMUM_SYMBOLS" "$minimum_updated_ms" \
@@ -385,6 +402,159 @@ wait_for_release_health() {
     sleep 5
   done
   return 1
+}
+
+# Only the captured previous release can use the historical-warning
+# interpretation. Its process invocation must remain stable throughout readback.
+capture_rollback_runtime_identity() {
+  [[ $OLD_MODE == upgrade && -n $OLD_SHA256 ]] || return 1
+  [[ $OLD_BINARY == "$RELEASE_ROOT/$OLD_SHA256/bybit-options-archiver" ]] || return 1
+  [[ $(readlink -f "$PRODUCTION_LINK") == "$OLD_BINARY" ]] || return 1
+  printf '%s  %s\n' "$OLD_SHA256" "$OLD_BINARY" | sha256sum --check --strict >/dev/null || return 1
+  runtime_matches_release "$OLD_BINARY" false || return 1
+  ROLLBACK_MAIN_PID=$(systemctl show "$UNIT" --property=MainPID --value) || return 1
+  ROLLBACK_INVOCATION_ID=$(systemctl show "$UNIT" --property=InvocationID --value) || return 1
+  [[ $ROLLBACK_MAIN_PID =~ ^[1-9][0-9]*$ && $ROLLBACK_INVOCATION_ID =~ ^[a-f0-9]{32}$ ]]
+}
+
+rollback_runtime_identity_matches() {
+  [[ $OLD_MODE == upgrade && -n $ROLLBACK_MAIN_PID && -n $ROLLBACK_INVOCATION_ID ]] || return 1
+  [[ $OLD_BINARY == "$RELEASE_ROOT/$OLD_SHA256/bybit-options-archiver" ]] || return 1
+  [[ $(readlink -f "$PRODUCTION_LINK") == "$OLD_BINARY" ]] || return 1
+  printf '%s  %s\n' "$OLD_SHA256" "$OLD_BINARY" | sha256sum --check --strict >/dev/null || return 1
+  runtime_matches_release "$OLD_BINARY" false || return 1
+  [[ $(systemctl show "$UNIT" --property=MainPID --value) == "$ROLLBACK_MAIN_PID" \
+    && $(systemctl show "$UNIT" --property=InvocationID --value) == "$ROLLBACK_INVOCATION_ID" ]]
+}
+
+health_ready_for_rollback() {
+  local minimum_updated_ms=$1 health="$CANONICAL_SPOOL/health.json" snapshot original_warning
+  rollback_runtime_identity_matches || return 1
+  bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" "$UPLOAD_FAILURE_BASELINE" || return 1
+  [[ -f $health && ! -L $health ]] || return 1
+  snapshot=$(<"$health") || return 1
+  # The old schema derived this bit from the lifetime counter. Interpret only
+  # that bit, after checking the underlying active-error fields and count; all
+  # ordinary freshness, disk, catalog and worker gates still apply unchanged.
+  printf '%s\n' "$snapshot" | jq --argjson baseline "$UPLOAD_FAILURE_BASELINE" '
+    if .upload_warning == true and $baseline > 0
+      and .upload_failure_count == $baseline and .last_upload_error_at == null
+    then .upload_warning = false else . end' \
+    | jq -e --argjson minimum_symbols "$MINIMUM_SYMBOLS" \
+      --argjson minimum_updated_ms "$minimum_updated_ms" \
+      --argjson old_updated_ms "$minimum_updated_ms" \
+      --argjson upload_failure_baseline "$UPLOAD_FAILURE_BASELINE" \
+      -f "$RUNTIME_HEALTH_POLICY" >/dev/null || return 1
+  rollback_runtime_identity_matches || return 1
+  bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" "$UPLOAD_FAILURE_BASELINE" || return 1
+  original_warning=$(jq -c '.upload_warning' <<<"$snapshot") || return 1
+  ROLLBACK_UPLOAD_WARNING=$original_warning
+  ROLLBACK_WARNING_INTERPRETED=$original_warning
+  printf '%s\n' "$snapshot" >"$EVIDENCE_DIR/rollback-verified-health.json"
+}
+
+wait_for_rollback_health() {
+  local minimum_updated_ms=$1 deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
+  while (( SECONDS < deadline )); do
+    rollback_runtime_identity_matches || return 1
+    if health_ready_for_rollback "$minimum_updated_ms"; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+bootstrap_remaining_seconds() {
+  local remaining=$((BOOTSTRAP_DEADLINE - SECONDS))
+  (( BOOTSTRAP_DEADLINE > 0 && remaining > 0 )) || return 1
+  printf '%s\n' "$remaining"
+}
+
+capture_bootstrap_segments() {
+  local data name manifest digest bytes count=0
+  install -d -m 0750 "$EVIDENCE_DIR/bootstrap"
+  : >"$EVIDENCE_DIR/bootstrap/segments.ndjson"
+  for data in "$CANONICAL_SPOOL"/*.ndjson; do
+    [[ -e $data || -L $data ]] || continue
+    [[ -f $data && ! -L $data ]] || return 1
+    name=${data##*/}
+    [[ $name =~ ^bybit-options\.[0-9]+\.ndjson$ ]] || return 1
+    manifest="$data.manifest.json"
+    [[ -f $manifest && ! -L $manifest && -f $data._SUCCESS && ! -L $data._SUCCESS ]] || return 1
+    digest=$(sha256sum "$data" | awk '{print $1}') || return 1
+    bytes=$(wc -c <"$data") || return 1
+    jq -ec --arg file "$name" --arg digest "$digest" --argjson bytes "$bytes" \
+      --argjson started "$BOOTSTRAP_STARTED_MS" '
+      select(.schema == "monday.bybit_options_quote.v1" and .file == $file
+        and .sha256 == $digest and .bytes == $bytes and $bytes > 0
+        and .start_received_at_ms >= $started and .end_received_at_ms >= $started
+        and .end_received_at_ms >= .start_received_at_ms and .events > 1
+        and ((.event_types.orderbook // 0) + (.event_types.ticker // 0)) > 0)
+      | {file,sha256,bytes,start_received_at_ms,end_received_at_ms,events,source_revision}' \
+      "$manifest" >>"$EVIDENCE_DIR/bootstrap/segments.ndjson" || return 1
+    install -m 0640 "$manifest" "$EVIDENCE_DIR/bootstrap/$name.manifest.json" || return 1
+    count=$((count + 1))
+  done
+  (( count > 0 ))
+}
+
+verify_bootstrap_upload() {
+  local require_drained=${1:-true} entries name source_sha bytes marker compressed_sha now_ms
+  bootstrap_remaining_seconds >/dev/null || return 1
+  bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" "$UPLOAD_FAILURE_BASELINE" || return 1
+  if [[ $require_drained == true ]]; then
+    require_empty_segment_spool || return 1
+  fi
+  now_ms=$(( $(date +%s) * 1000 + 999 ))
+  jq -e --argjson started "$BOOTSTRAP_STARTED_MS" \
+    --argjson previous "$BOOTSTRAP_PREVIOUS_SUCCESS_MS" --argjson now "$now_ms" '
+    (.last_success_at | type) == "number" and .last_success_at == (.last_success_at | floor)
+    and .last_success_at >= $started and .last_success_at > $previous
+    and .last_success_at <= $now' "$CANONICAL_SPOOL/upload-status.json" >/dev/null || return 1
+  entries=$(jq -ser 'if length > 0 then .[] | [.file,.sha256,.bytes] | @tsv
+    else error("no bootstrap segments") end' "$EVIDENCE_DIR/bootstrap/segments.ndjson") || return 1
+  while IFS=$'\t' read -r name source_sha bytes; do
+    [[ $name =~ ^bybit-options\.[0-9]+\.ndjson$ && $source_sha =~ ^[a-f0-9]{64}$ ]] || return 1
+    marker="$CANONICAL_SPOOL/$name.uploaded.json"
+    [[ ! -e $CANONICAL_SPOOL/$name && ! -L $CANONICAL_SPOOL/$name ]] || return 1
+    [[ -f $marker && ! -L $marker \
+      && -f $CANONICAL_SPOOL/$name.zst && ! -L $CANONICAL_SPOOL/$name.zst ]] || return 1
+    compressed_sha=$(sha256sum "$CANONICAL_SPOOL/$name.zst" | awk '{print $1}') || return 1
+    jq -e --arg source "$source_sha" --arg compressed "$compressed_sha" --arg file "$name" \
+      --argjson started "$BOOTSTRAP_STARTED_MS" --argjson now "$now_ms" '
+      .schema == "monday.bybit_options_upload.v1" and .source_sha256 == $source
+      and .compressed_sha256 == $compressed and .uploaded_at_ms >= $started
+      and .uploaded_at_ms <= $now
+      and (.object | startswith("oss://monday-lob-apne1-1045353359/lake/raw/venue=bybit/market=option/dataset=options_quotes/"))
+      and (.object | endswith("/sha256=" + $compressed + "/" + $file + ".zst"))' \
+      "$marker" >/dev/null || return 1
+    install -m 0640 "$marker" "$EVIDENCE_DIR/bootstrap/$name.uploaded.json" || return 1
+  done <<<"$entries"
+  install -m 0640 "$CANONICAL_SPOOL/upload-status.json" "$EVIDENCE_DIR/bootstrap/upload-status.json" || return 1
+  BOOTSTRAP_UPLOAD_VERIFIED=true
+}
+
+complete_new_host_bootstrap() {
+  local remaining
+  [[ $OLD_MODE == new-host ]] || return 1
+  bootstrap_remaining_seconds >/dev/null || return 1
+  systemctl is-active --quiet "$TIMER" && return 1
+  systemctl is-active --quiet "$UPLOAD_UNIT" && return 1
+  runtime_matches_release "$CANDIDATE_BINARY" false || return 1
+  copy_health_evidence bootstrap-collection || return 1
+  remaining=$(bootstrap_remaining_seconds) || return 1
+  timeout --signal=TERM --kill-after=10s "$remaining" systemctl stop "$UNIT" || return 1
+  systemctl is-active --quiet "$UNIT" && return 1
+  capture_bootstrap_segments || return 1
+  run_candidate_drain "$CANDIDATE_DEPLOYMENT" || return 1
+  verify_bootstrap_upload || return 1
+  clear_health_before_restart || return 1
+  CANDIDATE_STARTED_MS=$(( $(date +%s) * 1000 ))
+  remaining=$(bootstrap_remaining_seconds) || return 1
+  timeout --signal=TERM --kill-after=10s "$remaining" systemctl start "$UNIT" || return 1
+  wait_for_release_health "$CANDIDATE_BINARY" "$CANDIDATE_STARTED_MS" || return 1
+  verify_bootstrap_upload false || return 1
 }
 
 clear_health_before_restart() {
@@ -421,6 +591,12 @@ write_evidence() {
     --arg current_binary "$current_target" \
     --argjson production_active "$(unit_active_json)" \
     --argjson upload_failure_baseline "${UPLOAD_FAILURE_BASELINE:-null}" \
+    --argjson rollback_upload_warning "$ROLLBACK_UPLOAD_WARNING" \
+    --argjson rollback_warning_interpreted "$ROLLBACK_WARNING_INTERPRETED" \
+    --arg rollback_main_pid "$ROLLBACK_MAIN_PID" \
+    --arg rollback_invocation_id "$ROLLBACK_INVOCATION_ID" \
+    --argjson bootstrap_upload_verified "$BOOTSTRAP_UPLOAD_VERIFIED" \
+    --argjson bootstrap_started_ms "$BOOTSTRAP_STARTED_MS" \
     '{
       schema: "monday.bybit_options_cutover.v1",
       started_at: $started_at,
@@ -437,6 +613,10 @@ write_evidence() {
       previous_sha256: (if $previous_sha256 == "" then null else $previous_sha256 end),
       host_mode: $mode,
       upload_failure_baseline: $upload_failure_baseline,
+      rollback_health: {main_pid:$rollback_main_pid,invocation_id:$rollback_invocation_id,
+        original_upload_warning:$rollback_upload_warning,
+        historical_warning_interpreted:$rollback_warning_interpreted},
+      bootstrap: {started_at_ms:$bootstrap_started_ms,upload_verified:$bootstrap_upload_verified},
       current_binary: (if $current_binary == "" then null else $current_binary end),
       production_active: $production_active
     }' > "$temporary" || return 1
@@ -509,10 +689,11 @@ rollback_after_failure() {
     if (( safe_to_restart )); then
       systemctl reset-failed "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
       if systemctl start "${PRODUCTION_UNITS[@]}" \
-        && wait_for_release_health "$OLD_BINARY" "$rollback_started_ms" \
+        && capture_rollback_runtime_identity \
+        && wait_for_rollback_health "$rollback_started_ms" \
         && systemctl enable "${PRODUCTION_UNITS[@]}" >/dev/null \
         && runtime_matches_release "$OLD_BINARY" true \
-        && health_ready_for_release "$MINIMUM_SYMBOLS" "$rollback_started_ms"; then
+        && health_ready_for_rollback "$rollback_started_ms"; then
         ROLLBACK_RESULT=previous-release-health-verified
         systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null 2>&1 || true
         systemctl start "$TIMER" >/dev/null 2>&1 || true
@@ -675,6 +856,7 @@ if (( active_count == 1 && enabled_count == 1 )); then
   stage_existing_deployment_for_rollback
 elif (( active_count == 0 && enabled_count == 0 )) && [[ ! -e $PRODUCTION_LINK && ! -L $PRODUCTION_LINK ]]; then
   OLD_MODE=new-host
+  BOOTSTRAP_DEADLINE=$((SECONDS + BOOTSTRAP_TIMEOUT_SECONDS))
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
 else
   fail "ambiguous production state: active=$active_count enabled=$enabled_count symlink=$PRODUCTION_LINK"
@@ -682,6 +864,11 @@ fi
 
 UPLOAD_FAILURE_BASELINE=$(capture_upload_failure_baseline) \
   || fail 'production upload failure baseline is invalid'
+if [[ $OLD_MODE == new-host && -f $CANONICAL_SPOOL/upload-status.json ]]; then
+  BOOTSTRAP_PREVIOUS_SUCCESS_MS=$(jq -er '(.last_success_at // 0)
+    | select(type == "number" and . >= 0 and . == floor)' "$CANONICAL_SPOOL/upload-status.json") \
+    || fail 'new host previous upload success is invalid'
+fi
 copy_health_evidence before-transition
 
 STEP=stop-production
@@ -689,12 +876,14 @@ TRANSITION_STARTED=1
 if [[ $OLD_MODE == upgrade ]]; then
   systemctl disable --now "${PRODUCTION_UNITS[@]}" "$TIMER"
 else
-  systemctl disable "${PRODUCTION_UNITS[@]}" "$TIMER" >/dev/null 2>&1 || true
+  systemctl disable --now "${PRODUCTION_UNITS[@]}" "$TIMER" >/dev/null 2>&1 || true
 fi
 for unit in "${PRODUCTION_UNITS[@]}"; do
   systemctl is-active --quiet "$unit" && fail "production unit did not stop: $unit"
 done
 systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null
+systemctl is-active --quiet "$TIMER" && fail 'upload timer remained active during transition'
+systemctl is-active --quiet "$UPLOAD_UNIT" && fail 'uploader became active during transition'
 canonical_spool_paths_safe || fail 'canonical spool path changed during production stop'
 
 STEP=install-candidate-production-assets
@@ -721,15 +910,27 @@ copy_health_evidence previous-production
 clear_health_before_restart \
   || fail 'could not clear stale production health before starting the candidate'
 CANDIDATE_STARTED_MS=$(( $(date +%s) * 1000 ))
+if [[ $OLD_MODE == new-host ]]; then
+  BOOTSTRAP_STARTED_MS=$CANDIDATE_STARTED_MS
+fi
 
 STEP=start-candidate-production
 systemctl reset-failed "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
 systemctl unmask --runtime "${PRODUCTION_UNITS[@]}" >/dev/null
-systemctl start "${PRODUCTION_UNITS[@]}"
+if [[ $OLD_MODE == new-host ]]; then
+  remaining=$(bootstrap_remaining_seconds) || fail 'new host bootstrap deadline expired'
+  timeout --signal=TERM --kill-after=10s "$remaining" systemctl start "${PRODUCTION_UNITS[@]}"
+else
+  systemctl start "${PRODUCTION_UNITS[@]}"
+fi
 
 STEP=verify-candidate-production
 wait_for_release_health "$CANDIDATE_BINARY" "$CANDIDATE_STARTED_MS" \
   || fail 'candidate production did not reach verified full-catalog health'
+if [[ $OLD_MODE == new-host ]]; then
+  STEP=verify-new-host-first-upload
+  complete_new_host_bootstrap || fail 'new host did not complete a real first upload and healthy restart'
+fi
 copy_health_evidence production
 
 STEP=enable-verified-candidate
@@ -741,6 +942,9 @@ health_ready_for_release "$MINIMUM_SYMBOLS" "$CANDIDATE_STARTED_MS" \
 systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null
 systemctl start "$TIMER"
 systemctl enable "$TIMER" >/dev/null
+if [[ $OLD_MODE == new-host ]]; then
+  verify_bootstrap_upload false || fail 'new host first-upload evidence changed before completion'
+fi
 
 STEP=write-cutover-evidence
 RESULT=passed

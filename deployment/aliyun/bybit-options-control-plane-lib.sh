@@ -21,16 +21,17 @@ bybit_options_upload_status_ready() {
 # Validate a complete rendered collector ExecStart, including immutable digest,
 # and reject alternate/duplicate commands in unit fragments or drop-ins.
 bybit_options_unit_exec_start_matches() {
-  local binary=$1 unit_text=$2 exec_lines
+  local binary=$1 unit_text=$2
   [[ $binary =~ ^/opt/monday/releases/bybit-options-archiver/[a-f0-9]{64}/bybit-options-archiver$ ]] \
     || return 1
-  exec_lines=$(printf '%s\n' "$unit_text" | awk '
+  printf '%s\n' "$unit_text" | awk -v expected="$binary" '
     /^[[:space:]]*ExecStart[[:space:]]*=/ {
+      count++
       sub(/^[^=]*=[[:space:]]*/, "")
       sub(/[[:space:]]*$/, "")
-      print
-    }')
-  [[ $exec_lines == "$binary" ]]
+      command=$0
+    }
+    END { exit !(count == 1 && command == expected) }'
 }
 
 # Pure monotonic freshness transition used by the Bybit Options shadow gate,
