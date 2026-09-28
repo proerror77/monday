@@ -1458,6 +1458,18 @@ signing metadata, bounded logs, and report receipts/summaries within their
 declared byte limits. Signed root keys remain in the established signing
 boundary; the active ledger stays on its single-writer cloud volume.
 
+**DevPod access policy**: The research DevPod StatefulSet
+(`k8s/research-devpod-statefulset.yaml`) is a code development and compilation
+tool, not a research execution environment. It must not mount production
+research data PVCs (`sol-market-*`, campaign output volumes, or ledger volumes).
+DevPod keeps workspace and cargo-cache on node-local emptyDir while postpaid
+disk orders are rejected for insufficient balance. Those volumes disappear with
+the Pod. It may use small synthetic test datasets in `/tmp`. Production research
+must use dedicated Campaign Jobs with frozen inventory, signed grants, and
+audit trails. DevPod may compile binaries and run unit tests; it may not access
+raw market data, run backtests against production datasets, or write to
+campaign result directories.
+
 Independent readback means checking the actual cloud object against its bound
 identity, not downloading the full dataset, model bundle, ledger, or archive to
 a workstation. Use existing authenticated ACK caches for subsequent verification

@@ -60,33 +60,44 @@ ACK Research Cluster（monday-research-apne1）
 
 **文件**: `deployment/aliyun/research/k8s/research-devpod-statefulset.yaml`
 
+**⚠️ 定位说明**：
+DevPod 是**代码开发和编译工具**，不是数据分析环境。
+
+- ✅ **允许**：代码编辑、编译、单元测试、工具开发
+- ❌ **禁止**：访问生产研究数据、运行回测、数据分析
+
+生产数据研究走 `mission campaign` 的 Research Job。
+
 **架构特点**：
 ```yaml
 StatefulSet
   ├─ Init Container: git-sync
-  │   └─ 从 GitHub 拉取/更新代码（< 10 秒）
+  │   └─ 从 GitHub 浅克隆当前分支
   │
   └─ Main Container: rust:1.98.1-bookworm
-      ├─ 安装 DuckDB
-      ├─ 挂载 workspace PVC（持久化代码）
-      ├─ 挂载 cargo-cache PVC（持久化依赖）
-      ├─ 挂载 OSS raw（只读数据）
-      └─ 挂载 OSS output（读写结果）
+      ├─ 挂载 workspace emptyDir（代码，12Gi，随 Pod 删除）
+      ├─ 挂载 cargo-cache emptyDir（依赖缓存，8Gi，随 Pod 删除）
+      └─ 挂载 /tmp（临时文件，2Gi emptyDir）
 ```
+
+**不再挂载**：
+- ❌ `/lake/raw`（生产原始数据 PVC）
+- ❌ `/lake/output`（生产输出 PVC）
 
 **工作流**：
 ```bash
 # 1. 本地推送代码
 git push origin feat/my-experiment
 
-# 2. DevPod 拉取（10 秒）
+# 2. 在 DevPod 里更新（工作区清单在 rust_hft）
 cd /workspace && git pull
+cd /workspace/rust_hft
 
-# 3. 增量编译（< 1 分钟）
+# 3. 增量编译
 cargo build -p hft-collector --release
 
-# 4. 测试（秒级）
-./target/release/segment-index-cli info
+# 4. 单元测试
+cargo test -p hft-collector --lib
 ```
 
 **性能对比**：

@@ -17,6 +17,10 @@ spec:
       labels:
         app: research-devpod
     spec:
+      # 节点选择：调度到 research worker 节点
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: backtest
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -38,23 +42,29 @@ spec:
               if [ -d /workspace/.git ]; then
                 cd /workspace
                 echo "Repository exists, updating..."
-                git fetch origin
-                git checkout ${GIT_BRANCH}
-                git pull origin ${GIT_BRANCH}
+                # 使用 -c 参数临时设置 safe.directory
+                git -c safe.directory=/workspace fetch origin
+                git -c safe.directory=/workspace checkout ${GIT_BRANCH}
+                git -c safe.directory=/workspace pull origin ${GIT_BRANCH}
                 echo "✓ Code updated to latest"
               else
                 echo "Cloning repository..."
-                git clone -b ${GIT_BRANCH} ${GIT_REPO} /workspace
+                rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null || true
+                git clone --depth 1 -b "${GIT_BRANCH}" "${GIT_REPO}" /workspace
                 echo "✓ Repository cloned"
               fi
 
               cd /workspace
               echo ""
               echo "Current commit:"
-              git log -1 --oneline
+              git -c safe.directory=/workspace log -1 --oneline
               echo ""
-              echo "Branch: $(git branch --show-current)"
+              echo "Branch: $(git -c safe.directory=/workspace branch --show-current)"
           env:
+            - name: HOME
+              value: "/tmp"
+            - name: GIT_TERMINAL_PROMPT
+              value: "0"
             - name: GIT_REPO
               value: "https://github.com/proerror77/monday.git"
             - name: GIT_BRANCH
@@ -62,6 +72,8 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -73,78 +85,56 @@ spec:
       containers:
         - name: devpod
           image: rust:1.98.1-bookworm
+          workingDir: /workspace/rust_hft
           command:
             - /bin/bash
             - -c
             - |
-              set -e
-
-              echo "🚀 Research DevPod Starting..."
-              echo ""
-
-              # 安装必要工具
-              echo "📦 Installing tools..."
-              apt-get update -qq
-              apt-get install -y -qq wget unzip jq > /dev/null 2>&1
-
-              # 安装 DuckDB
-              if ! command -v duckdb &> /dev/null; then
-                echo "Installing DuckDB..."
-                cd /tmp
-                wget -q https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip
-                unzip -q duckdb_cli-linux-amd64.zip
-                chmod +x duckdb
-                mv duckdb /usr/local/bin/
-                rm duckdb_cli-linux-amd64.zip
-                echo "✓ DuckDB installed"
-              fi
-
-              cd /workspace
-
-              echo ""
-              echo "✅ DevPod Ready!"
-              echo ""
-              echo "📂 Workspace: /workspace"
-              echo "🔧 Cargo cache: /cargo-cache"
-              echo "🏗️  Build cache: /workspace/target"
-              echo ""
-              echo "Available commands:"
-              echo "  - cargo build -p hft-collector --release"
-              echo "  - cargo test -p hft-collector segment_index"
-              echo "  - ./target/release/segment-index-cli --help"
-              echo "  - duckdb /lake/output/metadata/segments.parquet"
-              echo ""
-              echo "To update code:"
-              echo "  cd /workspace && git pull"
-              echo ""
-              echo "Keeping pod alive..."
-
-              # 保持运行
-              tail -f /dev/null
+              export HOME=/tmp
+              export PATH="/usr/local/cargo/bin:${PATH}"
+              export CARGO_HOME=/cargo-cache
+              export RUSTUP_HOME=/usr/local/rustup
+              echo "Research DevPod ready"
+              echo "uid=$(id -u) workspace=/workspace cargo-cache=/cargo-cache"
+              echo "No production lake mounts. Campaign data stays on Campaign Jobs."
+              cargo --version || echo "cargo is not usable yet"
+              rustc --version || echo "rustc is not usable yet"
+              printf '%s\n' \
+                'export PATH="/usr/local/cargo/bin:${PATH}"' \
+                'export CARGO_HOME=/cargo-cache' \
+                'export RUSTUP_HOME=/usr/local/rustup' \
+                'cd /workspace/rust_hft' \
+                > /tmp/.profile
+              cp /tmp/.profile /tmp/.bashrc
+              git config --global --add safe.directory /workspace
+              git config --global --add safe.directory /workspace/rust_hft
+              echo "profile-ready"
+              exec tail -f /dev/null
           env:
+            - name: HOME
+              value: "/tmp"
+            - name: PATH
+              value: "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             - name: RUST_LOG
               value: "info"
             - name: CARGO_HOME
               value: "/cargo-cache"
+            - name: RUSTUP_HOME
+              value: "/usr/local/rustup"
             - name: RUST_BACKTRACE
               value: "1"
           resources:
             requests:
               cpu: "2"
-              memory: 4Gi
+              memory: 6Gi
             limits:
-              cpu: "4"
-              memory: 8Gi
+              cpu: "2"
+              memory: 6Gi
           volumeMounts:
             - name: workspace
               mountPath: /workspace
             - name: cargo-cache
               mountPath: /cargo-cache
-            - name: raw
-              mountPath: /lake/raw
-              readOnly: true
-            - name: output
-              mountPath: /lake/output
             - name: tmp
               mountPath: /tmp
           securityContext:
@@ -154,36 +144,18 @@ spec:
                 - ALL
             readOnlyRootFilesystem: false
 
+      # 账户余额不足，按量云盘下单会被拒绝。工作区用节点临时盘，
+      # Pod 删除后代码和编译缓存消失，不新增 ESSD 账单。
       volumes:
-        - name: raw
-          persistentVolumeClaim:
-            claimName: sol-market-1235-raw-0927
-            readOnly: true
-        - name: output
-          persistentVolumeClaim:
-            claimName: sol-market-1235-published-0927
+        - name: workspace
+          emptyDir:
+            sizeLimit: 12Gi
+        - name: cargo-cache
+          emptyDir:
+            sizeLimit: 8Gi
         - name: tmp
           emptyDir:
             sizeLimit: 2Gi
-
-  # 持久化存储：代码和缓存
-  volumeClaimTemplates:
-    - metadata:
-        name: workspace
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 20Gi
-        storageClassName: alicloud-disk-efficiency
-    - metadata:
-        name: cargo-cache
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 20Gi
-        storageClassName: alicloud-disk-efficiency
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -197,8 +169,9 @@ data:
     ## 🎯 设计理念（类 AX 架构）
 
     - ✅ **代码热加载**：git pull 即可更新，无需重建镜像
-    - ✅ **增量编译**：Cargo 缓存持久化，第二次编译 < 1 分钟
-    - ✅ **状态保存**：workspace 和 cache 都在 PVC 上
+    - ✅ **同一次 Pod 生命周期内增量编译**：缓存只活在当前 Pod
+    - ✅ **不挂生产数据**：不挂 sol-market、campaign 输出或账本卷
+    - ✅ **不买新云盘**：workspace 和 cargo cache 是 emptyDir，Pod 删除后消失
     - ✅ **快速切换**：切换分支或 PR 只需 git checkout
 
     ## 🚀 使用方法
@@ -243,8 +216,8 @@ data:
     ### 编译和测试
 
     ```bash
-    # 首次编译（25-40 分钟）
-    cd /workspace
+    # 首次编译（25-40 分钟）。工作区清单在 rust_hft。
+    cd /workspace/rust_hft
     cargo build -p hft-collector --release
 
     # 后续编译（增量，< 1 分钟）
@@ -253,29 +226,11 @@ data:
     # 运行测试
     cargo test -p hft-collector segment_index
 
-    # 运行 CLI 工具
-    ./target/release/segment-index-cli \
-      --index /lake/output/metadata/segments.parquet \
-      info
+    # 运行 CLI 工具（只使用 /tmp 里的合成数据）
+    ./target/release/segment-index-cli --help
     ```
 
-    ### 测试新代码
-
-    ```bash
-    # 测试 DuckDB 查询
-    duckdb /lake/output/metadata/segments.parquet -c "
-      SELECT COUNT(*) FROM read_parquet('/lake/output/metadata/segments.parquet')
-    "
-
-    # 运行 backfill 工具
-    ./target/release/segment-index-backfill \
-      --raw-root /lake/raw \
-      --index-output /tmp/test-index.parquet \
-      --market usdm \
-      --start-date 2026-09-01 \
-      --end-date 2026-09-02 \
-      --dry-run
-    ```
+    生产数据回测走 Campaign Job，不在这个 Pod 里读 `/lake/raw` 或写 campaign 输出。
 
     ## ⚡ 性能对比
 
@@ -308,28 +263,18 @@ data:
     "
     ```
 
-    ## 🎨 多人协作
+    ## 副本
 
-    ```bash
-    # 每个开发者可以有自己的 DevPod
-    kubectl scale statefulset research-devpod --replicas=3 -n monday-research
-
-    # 访问不同的实例
-    kubectl exec -it research-devpod-0 -n monday-research -- bash  # 开发者 1
-    kubectl exec -it research-devpod-1 -n monday-research -- bash  # 开发者 2
-    kubectl exec -it research-devpod-2 -n monday-research -- bash  # 开发者 3
-    ```
+    保持 `replicas: 1`。这个 Pod 和正在运行的 Campaign operator 共用同一台
+    `workload=backtest` 节点，不要扩成多个副本。
 
     ## 🔧 维护
 
-    ### 重启 DevPod（保留状态）
+    ### 重启 DevPod
 
     ```bash
-    # 删除 Pod，StatefulSet 会自动重建
+    # 删除 Pod 后 StatefulSet 会重建。emptyDir 会清空，init 会重新浅克隆。
     kubectl delete pod research-devpod-0 -n monday-research
-
-    # 新 Pod 会挂载相同的 PVC，代码和缓存都保留
-    # 启动时间：< 1 分钟
     ```
 
     ### 清理缓存
@@ -343,20 +288,15 @@ data:
     ### 完全重置
 
     ```bash
-    # 删除 StatefulSet 和 PVC
     kubectl delete statefulset research-devpod -n monday-research
-    kubectl delete pvc workspace-research-devpod-0 -n monday-research
-    kubectl delete pvc cargo-cache-research-devpod-0 -n monday-research
-
-    # 重新部署会从头开始
+    kubectl apply -f research-devpod-statefulset.yaml
     ```
 
-    ## 🎯 总结
+    ## 总结
 
-    这就是类似 AX 的架构：
-    - ✅ 代码热加载（git pull）
-    - ✅ 状态持久化（PVC）
-    - ✅ 快速迭代（增量编译）
-    - ✅ 随时切换（checkout 任何分支）
+    - 代码在 Pod 启动时浅克隆
+    - 编译缓存在这次 Pod 里保留
+    - 不挂生产研究数据
+    - 不申请新的云盘
 
     **不再需要为每次代码修改重建镜像！**
