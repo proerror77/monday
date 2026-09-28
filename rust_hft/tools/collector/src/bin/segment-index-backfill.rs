@@ -43,17 +43,22 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let args = Args::parse();
 
-    log::info!("Starting segment index backfill");
-    log::info!("  Raw root: {}", args.raw_root.display());
-    log::info!("  Index output: {}", args.index_output.display());
-    log::info!("  Market: {}", args.market);
-    log::info!("  Date range: {} to {}", args.start_date, args.end_date);
-    log::info!("  Batch size: {}", args.batch_size);
-    log::info!("  Dry run: {}", args.dry_run);
+    tracing::info!("Starting segment index backfill");
+    tracing::info!("  Raw root: {}", args.raw_root.display());
+    tracing::info!("  Index output: {}", args.index_output.display());
+    tracing::info!("  Market: {}", args.market);
+    tracing::info!("  Date range: {} to {}", args.start_date, args.end_date);
+    tracing::info!("  Batch size: {}", args.batch_size);
+    tracing::info!("  Dry run: {}", args.dry_run);
 
     // Parse dates
     let start_date = chrono::NaiveDate::parse_from_str(&args.start_date, "%Y-%m-%d")
@@ -72,12 +77,12 @@ fn main() -> Result<()> {
     }
 
     // Scan manifests
-    log::info!("Scanning manifests...");
+    tracing::info!("Scanning manifests...");
     let manifests = find_manifests(&args.raw_root, &args.market, start_date, end_date)?;
-    log::info!("Found {} manifest files", manifests.len());
+    tracing::info!("Found {} manifest files", manifests.len());
 
     if manifests.is_empty() {
-        log::warn!("No manifests found in the specified range");
+        tracing::warn!("No manifests found in the specified range");
         return Ok(());
     }
 
@@ -94,7 +99,7 @@ fn main() -> Result<()> {
     };
 
     for (batch_idx, chunk) in manifests.chunks(args.batch_size).enumerate() {
-        log::info!(
+        tracing::info!(
             "Processing batch {}/{} ({} manifests)",
             batch_idx + 1,
             (manifests.len() + args.batch_size - 1) / args.batch_size,
@@ -113,7 +118,7 @@ fn main() -> Result<()> {
                 }
                 Err(e) => {
                     failed.fetch_add(1, Ordering::Relaxed);
-                    log::warn!("Failed to process {}: {}", manifest_path.display(), e);
+                    tracing::warn!("Failed to process {}: {}", manifest_path.display(), e);
                 }
             }
         }
@@ -123,16 +128,19 @@ fn main() -> Result<()> {
         let safe = replay_safe.load(Ordering::Relaxed);
         let unsafe_count = replay_unsafe.load(Ordering::Relaxed);
 
-        log::info!(
+        tracing::info!(
             "Progress: {} processed, {} failed, {} safe, {} unsafe",
-            p, f, safe, unsafe_count
+            p,
+            f,
+            safe,
+            unsafe_count
         );
     }
 
     // Finalize
     if !args.dry_run {
         if let Some(temp) = temp_index {
-            log::info!("Finalizing index...");
+            tracing::info!("Finalizing index...");
             std::fs::rename(&temp, &args.index_output)
                 .context("Failed to move temporary index to final location")?;
         }
@@ -143,22 +151,22 @@ fn main() -> Result<()> {
     let total_safe = replay_safe.load(Ordering::Relaxed);
     let total_unsafe = replay_unsafe.load(Ordering::Relaxed);
 
-    log::info!("=== Backfill Complete ===");
-    log::info!("  Total processed: {}", total_processed);
-    log::info!("  Failed: {}", total_failed);
-    log::info!("  Replay safe: {}", total_safe);
-    log::info!("  Replay unsafe: {}", total_unsafe);
-    log::info!(
+    tracing::info!("=== Backfill Complete ===");
+    tracing::info!("  Total processed: {}", total_processed);
+    tracing::info!("  Failed: {}", total_failed);
+    tracing::info!("  Replay safe: {}", total_safe);
+    tracing::info!("  Replay unsafe: {}", total_unsafe);
+    tracing::info!(
         "  Safety rate: {:.2}%",
         (total_safe as f64 / total_processed as f64) * 100.0
     );
 
     if !args.dry_run {
-        log::info!("  Index written to: {}", args.index_output.display());
+        tracing::info!("  Index written to: {}", args.index_output.display());
 
         // Verify output
         let metadata = std::fs::metadata(&args.index_output)?;
-        log::info!("  Index size: {} bytes", metadata.len());
+        tracing::info!("  Index size: {} bytes", metadata.len());
     }
 
     Ok(())
@@ -195,9 +203,7 @@ fn find_manifests(
             }
         }
 
-        current_date = current_date
-            .succ_opt()
-            .context("Date overflow")?;
+        current_date = current_date.succ_opt().context("Date overflow")?;
     }
 
     Ok(manifests)

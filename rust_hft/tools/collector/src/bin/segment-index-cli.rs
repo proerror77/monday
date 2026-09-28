@@ -2,9 +2,9 @@
 //!
 //! Utility for querying, validating, and maintaining the Parquet segment index.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use hft_collector::segment_index::{query_segments, diagnose_empty_result};
+use hft_collector::segment_index::{diagnose_empty_result, query_segments};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -106,7 +106,12 @@ impl std::str::FromStr for OutputFormat {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let args = Args::parse();
 
@@ -123,12 +128,14 @@ fn main() -> Result<()> {
             safe_only,
             format,
         } => {
-            let segments = query_segments(&args.index, &market, &symbol, start_ns, end_ns, safe_only)?;
+            let segments =
+                query_segments(&args.index, &market, &symbol, start_ns, end_ns, safe_only)?;
 
             if segments.is_empty() {
                 eprintln!("No segments found.");
                 if safe_only {
-                    let diagnosis = diagnose_empty_result(&args.index, &market, &symbol, start_ns, end_ns)?;
+                    let diagnosis =
+                        diagnose_empty_result(&args.index, &market, &symbol, start_ns, end_ns)?;
                     eprintln!("\n{}", diagnosis);
                 }
                 return Ok(());
@@ -136,34 +143,42 @@ fn main() -> Result<()> {
 
             match format {
                 OutputFormat::Table => {
-                    println!("{:<12} {:<5} {:<10} {:<20} {:<10} {:<15}",
-                             "Date", "Hour", "Symbol", "Start (ns)", "Safe", "Bytes");
+                    println!(
+                        "{:<12} {:<5} {:<10} {:<20} {:<10} {:<15}",
+                        "Date", "Hour", "Symbol", "Start (ns)", "Safe", "Bytes"
+                    );
                     println!("{}", "-".repeat(90));
                     for seg in segments {
-                        println!("{:<12} {:<5} {:<10} {:<20} {:<10} {:<15}",
-                                 seg.date,
-                                 seg.hour,
-                                 seg.symbol,
-                                 seg.start_received_at_ns,
-                                 seg.replay_safe,
-                                 seg.verified_bytes);
+                        println!(
+                            "{:<12} {:<5} {:<10} {:<20} {:<10} {:<15}",
+                            seg.date,
+                            seg.hour,
+                            seg.symbol,
+                            seg.start_received_at_ns,
+                            seg.replay_safe,
+                            seg.verified_bytes
+                        );
                     }
                 }
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&segments)?);
                 }
                 OutputFormat::Csv => {
-                    println!("date,hour,symbol,start_ns,end_ns,replay_safe,verified_bytes,tape_path");
+                    println!(
+                        "date,hour,symbol,start_ns,end_ns,replay_safe,verified_bytes,tape_path"
+                    );
                     for seg in segments {
-                        println!("{},{},{},{},{},{},{},{}",
-                                 seg.date,
-                                 seg.hour,
-                                 seg.symbol,
-                                 seg.start_received_at_ns,
-                                 seg.end_received_at_ns,
-                                 seg.replay_safe,
-                                 seg.verified_bytes,
-                                 seg.tape_path);
+                        println!(
+                            "{},{},{},{},{},{},{},{}",
+                            seg.date,
+                            seg.hour,
+                            seg.symbol,
+                            seg.start_received_at_ns,
+                            seg.end_received_at_ns,
+                            seg.replay_safe,
+                            seg.verified_bytes,
+                            seg.tape_path
+                        );
                     }
                 }
             }
@@ -171,7 +186,11 @@ fn main() -> Result<()> {
             println!("\nTotal: {} segments", segments.len());
         }
 
-        Command::Stats { group_by, symbol, limit } => {
+        Command::Stats {
+            group_by,
+            symbol,
+            limit,
+        } => {
             let conn = duckdb::Connection::open_in_memory()?;
 
             let symbol_filter = symbol
@@ -203,8 +222,14 @@ fn main() -> Result<()> {
             let mut stmt = conn.prepare(&query)?;
             let mut rows = stmt.query([])?;
 
-            println!("{:<15} {:<10} {:<10} {:<12} {:<10}",
-                     group_by.to_uppercase(), "Total", "Safe", "Safe %", "Total GB");
+            println!(
+                "{:<15} {:<10} {:<10} {:<12} {:<10}",
+                group_by.to_uppercase(),
+                "Total",
+                "Safe",
+                "Safe %",
+                "Total GB"
+            );
             println!("{}", "-".repeat(65));
 
             while let Some(row) = rows.next()? {
@@ -214,12 +239,18 @@ fn main() -> Result<()> {
                 let safe_pct: f64 = row.get(3)?;
                 let total_gb: f64 = row.get(4)?;
 
-                println!("{:<15} {:<10} {:<10} {:<11.2}% {:<10.2}",
-                         group_key, total, safe, safe_pct, total_gb);
+                println!(
+                    "{:<15} {:<10} {:<10} {:<11.2}% {:<10.2}",
+                    group_key, total, safe, safe_pct, total_gb
+                );
             }
         }
 
-        Command::Problems { start_date, end_date, symbol } => {
+        Command::Problems {
+            start_date,
+            end_date,
+            symbol,
+        } => {
             let conn = duckdb::Connection::open_in_memory()?;
 
             let mut conditions = vec!["replay_safe = FALSE".to_string()];
@@ -261,8 +292,10 @@ fn main() -> Result<()> {
             let mut stmt = conn.prepare(&query)?;
             let mut rows = stmt.query([])?;
 
-            println!("{:<12} {:<5} {:<10} {:<25} {:<50}",
-                     "Date", "Hour", "Symbol", "Issue", "Manifest Path");
+            println!(
+                "{:<12} {:<5} {:<10} {:<25} {:<50}",
+                "Date", "Hour", "Symbol", "Issue", "Manifest Path"
+            );
             println!("{}", "-".repeat(110));
 
             let mut count = 0;
@@ -273,8 +306,14 @@ fn main() -> Result<()> {
                 let issue: String = row.get(3)?;
                 let path: String = row.get(4)?;
 
-                println!("{:<12} {:<5} {:<10} {:<25} {:<50}",
-                         date, hour, symbol, issue, &path[..path.len().min(50)]);
+                println!(
+                    "{:<12} {:<5} {:<10} {:<25} {:<50}",
+                    date,
+                    hour,
+                    symbol,
+                    issue,
+                    &path[..path.len().min(50)]
+                );
                 count += 1;
             }
 
@@ -293,7 +332,10 @@ fn main() -> Result<()> {
 
             // Check 2: Can read as Parquet
             let count: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM read_parquet('{}')", args.index.display()),
+                &format!(
+                    "SELECT COUNT(*) FROM read_parquet('{}')",
+                    args.index.display()
+                ),
                 [],
                 |row| row.get(0),
             )?;
@@ -369,24 +411,36 @@ fn main() -> Result<()> {
                 args.index.display()
             );
 
-            let (total, symbols, dates, first, last, gb, safe): (i64, i64, i64, String, String, f64, i64) =
-                conn.query_row(&query, [], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                })?;
+            let (total, symbols, dates, first, last, gb, safe): (
+                i64,
+                i64,
+                i64,
+                String,
+                String,
+                f64,
+                i64,
+            ) = conn.query_row(&query, [], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?;
 
             println!("Total segments: {}", total);
             println!("Unique symbols: {}", symbols);
             println!("Date range: {} to {} ({} days)", first, last, dates);
             println!("Total data: {:.2} GB", gb);
-            println!("Replay safe: {}/{} ({:.2}%)", safe, total, (safe as f64 / total as f64) * 100.0);
+            println!(
+                "Replay safe: {}/{} ({:.2}%)",
+                safe,
+                total,
+                (safe as f64 / total as f64) * 100.0
+            );
         }
     }
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "duckdb")]
+
 //! Integration tests for segment index
 //!
 //! These tests verify the complete workflow:
@@ -8,9 +10,9 @@
 
 #[cfg(test)]
 mod integration_tests {
+    use hft_collector::research_inventory::*;
     use hft_collector::segment_index::*;
     use hft_collector::segment_index_query::*;
-    use hft_collector::research_inventory::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -53,7 +55,7 @@ mod integration_tests {
         let manifests = vec![
             (true, "2026-09-01", 0),
             (true, "2026-09-01", 1),
-            (false, "2026-09-01", 2),  // Unsafe!
+            (false, "2026-09-01", 2), // Unsafe!
             (true, "2026-09-01", 3),
         ];
 
@@ -106,10 +108,7 @@ mod integration_tests {
         );
 
         let mut manifest2 = create_test_manifest(false, "2026-09-01", 1);
-        manifest2.insert(
-            "all_symbols_bridged".to_string(),
-            serde_json::json!(false),
-        );
+        manifest2.insert("all_symbols_bridged".to_string(), serde_json::json!(false));
 
         let mut manifest3 = create_test_manifest(false, "2026-09-01", 2);
         manifest3.insert(
@@ -128,14 +127,7 @@ mod integration_tests {
         }
 
         // Diagnose
-        let diagnosis = diagnose_empty_result(
-            &index_path,
-            "usdm",
-            "SOLUSDT",
-            0,
-            u64::MAX,
-        )
-        .unwrap();
+        let diagnosis = diagnose_empty_result(&index_path, "usdm", "SOLUSDT", 0, u64::MAX).unwrap();
 
         // Should report the issues
         assert!(diagnosis.contains("3 segments"));
@@ -150,11 +142,7 @@ mod integration_tests {
         // Create segments across multiple days
         for day in 1..=3 {
             for hour in 0..24 {
-                let manifest = create_test_manifest(
-                    true,
-                    &format!("2026-09-{:02}", day),
-                    hour,
-                );
+                let manifest = create_test_manifest(true, &format!("2026-09-{:02}", day), hour);
                 let metadata = SegmentMetadata::from_manifest(
                     &manifest,
                     &format!("/test/day{}/hour{}/manifest.json", day, hour),
@@ -167,17 +155,10 @@ mod integration_tests {
 
         // Query only day 2
         let day2_start = 1725235200000000000u64; // 2026-09-02 00:00
-        let day2_end = 1725321599999999999u64;   // 2026-09-02 23:59
+        let day2_end = 1725321599999999999u64; // 2026-09-02 23:59
 
-        let segments = query_segments(
-            &index_path,
-            "usdm",
-            "SOLUSDT",
-            day2_start,
-            day2_end,
-            true,
-        )
-        .unwrap();
+        let segments =
+            query_segments(&index_path, "usdm", "SOLUSDT", day2_start, day2_end, true).unwrap();
 
         // Should return exactly 24 hours from day 2
         assert_eq!(segments.len(), 24);
@@ -240,15 +221,7 @@ mod integration_tests {
         append_to_parquet_index(&index_path, &metadata).unwrap();
 
         // Query should return 2 rows (not deduplicated)
-        let segments = query_segments(
-            &index_path,
-            "usdm",
-            "SOLUSDT",
-            0,
-            u64::MAX,
-            true,
-        )
-        .unwrap();
+        let segments = query_segments(&index_path, "usdm", "SOLUSDT", 0, u64::MAX, true).unwrap();
 
         // This is expected behavior - append is truly append
         // Deduplication should happen at query time or during maintenance

@@ -3,8 +3,8 @@
 //! This module extends the existing research inventory to support
 //! DuckDB-based Parquet index queries as an alternative to filesystem scanning.
 
-use crate::segment_index::{query_segments, diagnose_empty_result, SegmentMetadata};
 use crate::research_inventory::{FreshWindowRequest, FreshWindowSelection, FrozenInput};
+use crate::segment_index::{diagnose_empty_result, query_segments};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
@@ -27,8 +27,7 @@ pub fn select_segments_from_index(
 
     let end_ns = match &request.mode {
         crate::research_inventory::FreshWindowMode::Explicit {
-            end_received_at_ns,
-            ..
+            end_received_at_ns, ..
         } => *end_received_at_ns,
         crate::research_inventory::FreshWindowMode::Latest {
             cutoff_received_at_ns,
@@ -61,12 +60,17 @@ pub fn select_segments_from_index(
     }
 
     // Convert to FrozenInput format
+    // Index rows do not carry a manifest digest or PIT references, so this
+    // selection cannot pass freeze_inventory_from_selection.
     let raw_inputs: Vec<FrozenInput> = segments
         .iter()
         .map(|seg| FrozenInput {
-            path: seg.tape_path.clone(),
-            sha256: seg.tape_sha256.clone().unwrap_or_default(),
-            verified_bytes: seg.verified_bytes,
+            relative_path: seg.tape_path.clone(),
+            content_sha256: seg.tape_sha256.clone().unwrap_or_default(),
+            manifest_sha256: String::new(),
+            bytes: seg.verified_bytes,
+            start_received_at_ns: seg.start_received_at_ns,
+            end_received_at_ns: seg.end_received_at_ns,
         })
         .collect();
 
@@ -88,8 +92,8 @@ pub fn select_segments_from_index(
     use sha2::Digest;
     for seg in &segments {
         hasher.update(seg.segment_id.as_bytes());
-        hasher.update(&seg.start_received_at_ns.to_le_bytes());
-        hasher.update(&seg.end_received_at_ns.to_le_bytes());
+        hasher.update(seg.start_received_at_ns.to_le_bytes());
+        hasher.update(seg.end_received_at_ns.to_le_bytes());
     }
     let input_fingerprint_sha256 = format!("{:x}", hasher.finalize());
 
@@ -100,12 +104,12 @@ pub fn select_segments_from_index(
         selected_start_received_at_ns: selected_start,
         selected_end_received_at_ns: selected_end,
         raw: raw_inputs,
-        references: vec![], // TODO: handle reference data
+        references: vec![],
         verified_bytes,
-        verification_bytes: 0, // Index query doesn't scan bytes
+        verification_bytes: verified_bytes,
         input_fingerprint_sha256,
-        inventory_eligible: true,
-        materialized_pit_admitted: true,
+        inventory_eligible: false,
+        materialized_pit_admitted: false,
     })
 }
 
@@ -118,9 +122,13 @@ pub fn select_segments_hybrid(
     if let Some(path) = index_path {
         if path.exists() {
             match select_segments_from_index(request, path) {
-                Ok(selection) => {
+                Ok(selection) if selection.inventory_eligible => {
                     eprintln!("✓ Used Parquet index (fast path)");
                     return Ok(selection);
+                }
+                Ok(_) => {
+                    eprintln!("⚠ Parquet index has no inventory-eligible selection");
+                    eprintln!("  Falling back to filesystem scan...");
                 }
                 Err(e) => {
                     eprintln!("⚠ Parquet index query failed: {}", e);
@@ -138,7 +146,7 @@ pub fn select_segments_hybrid(
     crate::research_inventory::select_fresh_window(request)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "duckdb"))]
 mod tests {
     use super::*;
     use crate::segment_index::append_to_parquet_index;
@@ -203,7 +211,9 @@ mod tests {
         let selection = select_segments_from_index(&request, &index_path).unwrap();
 
         assert_eq!(selection.raw.len(), 1);
-        assert_eq!(selection.raw[0].path, "/test/tape.jsonl.zst");
+        assert_eq!(selection.raw[0].relative_path, "/test/tape.jsonl.zst");
+        assert_eq!(selection.raw[0].bytes, 1024);
+        assert!(!selection.inventory_eligible);
         assert_eq!(selection.verified_bytes, 1024);
     }
 }

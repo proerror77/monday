@@ -11,7 +11,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const SEGMENT_INDEX_SCHEMA_V1: &str = "monday.segment_index.v1";
 
@@ -23,7 +23,7 @@ pub struct SegmentMetadata {
     pub market: String,
     pub dataset: String,
     pub symbol: String,
-    pub date: String,  // YYYY-MM-DD
+    pub date: String, // YYYY-MM-DD
     pub hour: u32,
     pub shard_id: String,
 
@@ -88,10 +88,7 @@ impl SegmentMetadata {
             .unwrap_or(true);
 
         // Compute replay_safe flag
-        let replay_safe = has_replay
-            && symbols_bridged
-            && coverage
-            && !depth_complete;
+        let replay_safe = has_replay && symbols_bridged && coverage && !depth_complete;
 
         Ok(Self {
             segment_id,
@@ -177,16 +174,20 @@ fn required_string<'a>(
 }
 
 /// Append segment metadata to Parquet index
-pub fn append_to_parquet_index(
-    index_path: &Path,
-    metadata: &SegmentMetadata,
-) -> Result<()> {
-    // Use DuckDB to append (simpler than raw Parquet writing)
-    let conn = duckdb::Connection::open(":memory:")?;
+pub fn append_to_parquet_index(index_path: &Path, metadata: &SegmentMetadata) -> Result<()> {
+    #[cfg(not(feature = "duckdb"))]
+    {
+        let _ = (index_path, metadata);
+        bail!("segment index requires building hft-collector with --features duckdb");
+    }
+    #[cfg(feature = "duckdb")]
+    {
+        // Use DuckDB to append (simpler than raw Parquet writing)
+        let conn = duckdb::Connection::open(":memory:")?;
 
-    // Create temp table
-    conn.execute(
-        r#"
+        // Create temp table
+        conn.execute(
+            r#"
         CREATE TABLE segments (
             segment_id VARCHAR,
             schema_version VARCHAR,
@@ -213,65 +214,66 @@ pub fn append_to_parquet_index(
             ingested_at_ms BIGINT
         )
         "#,
-        [],
-    )?;
+            [],
+        )?;
 
-    // Insert new record
-    conn.execute(
-        r#"
+        // Insert new record
+        conn.execute(
+            r#"
         INSERT INTO segments VALUES (
             ?, ?, ?, ?, ?, ?::DATE, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?::VARCHAR[], ?::VARCHAR[], ?::VARCHAR[], ?
         )
         "#,
-        duckdb::params![
-            &metadata.segment_id,
-            &metadata.schema_version,
-            &metadata.market,
-            &metadata.dataset,
-            &metadata.symbol,
-            &metadata.date,
-            metadata.hour as i32,
-            &metadata.shard_id,
-            metadata.start_received_at_ns as i64,
-            metadata.end_received_at_ns as i64,
-            metadata.has_replay_safe_checkpoint,
-            metadata.all_symbols_bridged,
-            metadata.all_stream_coverage_verified,
-            metadata.venue_depth_complete,
-            metadata.replay_safe,
-            &metadata.manifest_path,
-            &metadata.tape_path,
-            metadata.tape_sha256.as_deref().unwrap_or(""),
-            metadata.verified_bytes as i64,
-            &metadata.snapshot_only_symbols,
-            &metadata.raw_trade_incomplete_symbols,
-            &metadata.stream_types,
-            metadata.ingested_at_ms,
-        ],
-    )?;
+            duckdb::params![
+                &metadata.segment_id,
+                &metadata.schema_version,
+                &metadata.market,
+                &metadata.dataset,
+                &metadata.symbol,
+                &metadata.date,
+                metadata.hour as i32,
+                &metadata.shard_id,
+                metadata.start_received_at_ns as i64,
+                metadata.end_received_at_ns as i64,
+                metadata.has_replay_safe_checkpoint,
+                metadata.all_symbols_bridged,
+                metadata.all_stream_coverage_verified,
+                metadata.venue_depth_complete,
+                metadata.replay_safe,
+                &metadata.manifest_path,
+                &metadata.tape_path,
+                metadata.tape_sha256.as_deref().unwrap_or(""),
+                metadata.verified_bytes as i64,
+                &metadata.snapshot_only_symbols,
+                &metadata.raw_trade_incomplete_symbols,
+                &metadata.stream_types,
+                metadata.ingested_at_ms,
+            ],
+        )?;
 
-    // Append to Parquet (creates if not exists)
-    if index_path.exists() {
-        conn.execute(
-            &format!(
-                "COPY segments TO '{}' (FORMAT PARQUET, APPEND true)",
-                index_path.display()
-            ),
-            [],
-        )?;
-    } else {
-        conn.execute(
-            &format!(
-                "COPY segments TO '{}' (FORMAT PARQUET)",
-                index_path.display()
-            ),
-            [],
-        )?;
+        // Append to Parquet (creates if not exists)
+        if index_path.exists() {
+            conn.execute(
+                &format!(
+                    "COPY segments TO '{}' (FORMAT PARQUET, APPEND true)",
+                    index_path.display()
+                ),
+                [],
+            )?;
+        } else {
+            conn.execute(
+                &format!(
+                    "COPY segments TO '{}' (FORMAT PARQUET)",
+                    index_path.display()
+                ),
+                [],
+            )?;
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Query segments from Parquet index
@@ -287,11 +289,18 @@ pub fn query_segments(
         bail!("Segment index not found: {}", index_path.display());
     }
 
-    let conn = duckdb::Connection::open(":memory:")?;
+    #[cfg(not(feature = "duckdb"))]
+    {
+        let _ = (market, symbol, start_ns, end_ns, require_replay_safe);
+        bail!("segment index requires building hft-collector with --features duckdb");
+    }
+    #[cfg(feature = "duckdb")]
+    {
+        let conn = duckdb::Connection::open(":memory:")?;
 
-    // Build query
-    let query = format!(
-        r#"
+        // Build query
+        let query = format!(
+            r#"
         SELECT *
         FROM read_parquet('{}')
         WHERE market = ?
@@ -301,48 +310,49 @@ pub fn query_segments(
           {}
         ORDER BY start_received_at_ns
         "#,
-        index_path.display(),
-        if require_replay_safe {
-            "AND replay_safe = TRUE"
-        } else {
-            ""
-        }
-    );
+            index_path.display(),
+            if require_replay_safe {
+                "AND replay_safe = TRUE"
+            } else {
+                ""
+            }
+        );
 
-    let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map(
-        duckdb::params![market, symbol, end_ns as i64, start_ns as i64],
-        |row| {
-            Ok(SegmentMetadata {
-                segment_id: row.get(0)?,
-                schema_version: row.get(1)?,
-                market: row.get(2)?,
-                dataset: row.get(3)?,
-                symbol: row.get(4)?,
-                date: row.get::<_, String>(5)?,
-                hour: row.get::<_, i32>(6)? as u32,
-                shard_id: row.get(7)?,
-                start_received_at_ns: row.get::<_, i64>(8)? as u64,
-                end_received_at_ns: row.get::<_, i64>(9)? as u64,
-                has_replay_safe_checkpoint: row.get(10)?,
-                all_symbols_bridged: row.get(11)?,
-                all_stream_coverage_verified: row.get(12)?,
-                venue_depth_complete: row.get(13)?,
-                replay_safe: row.get(14)?,
-                manifest_path: row.get(15)?,
-                tape_path: row.get(16)?,
-                tape_sha256: Some(row.get::<_, String>(17)?),
-                verified_bytes: row.get::<_, i64>(18)? as u64,
-                snapshot_only_symbols: row.get(19)?,
-                raw_trade_incomplete_symbols: row.get(20)?,
-                stream_types: row.get(21)?,
-                ingested_at_ms: row.get(22)?,
-            })
-        },
-    )?;
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(
+            duckdb::params![market, symbol, end_ns as i64, start_ns as i64],
+            |row| {
+                Ok(SegmentMetadata {
+                    segment_id: row.get(0)?,
+                    schema_version: row.get(1)?,
+                    market: row.get(2)?,
+                    dataset: row.get(3)?,
+                    symbol: row.get(4)?,
+                    date: row.get::<_, String>(5)?,
+                    hour: row.get::<_, i32>(6)? as u32,
+                    shard_id: row.get(7)?,
+                    start_received_at_ns: row.get::<_, i64>(8)? as u64,
+                    end_received_at_ns: row.get::<_, i64>(9)? as u64,
+                    has_replay_safe_checkpoint: row.get(10)?,
+                    all_symbols_bridged: row.get(11)?,
+                    all_stream_coverage_verified: row.get(12)?,
+                    venue_depth_complete: row.get(13)?,
+                    replay_safe: row.get(14)?,
+                    manifest_path: row.get(15)?,
+                    tape_path: row.get(16)?,
+                    tape_sha256: Some(row.get::<_, String>(17)?),
+                    verified_bytes: row.get::<_, i64>(18)? as u64,
+                    snapshot_only_symbols: row.get(19)?,
+                    raw_trade_incomplete_symbols: row.get(20)?,
+                    stream_types: row.get(21)?,
+                    ingested_at_ms: row.get(22)?,
+                })
+            },
+        )?;
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("Failed to query segments: {}", e))
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Failed to query segments: {}", e))
+    }
 }
 
 /// Diagnose why no segments were found
@@ -353,10 +363,17 @@ pub fn diagnose_empty_result(
     start_ns: u64,
     end_ns: u64,
 ) -> Result<String> {
-    let conn = duckdb::Connection::open(":memory:")?;
+    #[cfg(not(feature = "duckdb"))]
+    {
+        let _ = (index_path, market, symbol, start_ns, end_ns);
+        bail!("segment index requires building hft-collector with --features duckdb");
+    }
+    #[cfg(feature = "duckdb")]
+    {
+        let conn = duckdb::Connection::open(":memory:")?;
 
-    let query = format!(
-        r#"
+        let query = format!(
+            r#"
         SELECT
             COUNT(*) as total,
             SUM(CASE WHEN replay_safe THEN 1 ELSE 0 END) as safe_count,
@@ -370,53 +387,58 @@ pub fn diagnose_empty_result(
           AND start_received_at_ns <= ?
           AND end_received_at_ns >= ?
         "#,
-        index_path.display()
-    );
+            index_path.display()
+        );
 
-    let result = conn.query_row(
-        &query,
-        duckdb::params![market, symbol, end_ns as i64, start_ns as i64],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        },
-    )?;
+        let result = conn.query_row(
+            &query,
+            duckdb::params![market, symbol, end_ns as i64, start_ns as i64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
 
-    let (total, safe, missing_checkpoint, missing_bridge, missing_coverage, wrong_depth) = result;
+        let (total, safe, missing_checkpoint, missing_bridge, missing_coverage, wrong_depth) =
+            result;
 
-    if total == 0 {
-        return Ok(format!(
-            "No segments found for {} {} in range {}-{}",
-            market, symbol, start_ns, end_ns
-        ));
-    }
+        if total == 0 {
+            return Ok(format!(
+                "No segments found for {} {} in range {}-{}",
+                market, symbol, start_ns, end_ns
+            ));
+        }
 
-    let mut reasons = Vec::new();
-    if missing_checkpoint > 0 {
-        reasons.push(format!("{} missing replay_safe_checkpoint", missing_checkpoint));
-    }
-    if missing_bridge > 0 {
-        reasons.push(format!("{} missing symbols_bridged", missing_bridge));
-    }
-    if missing_coverage > 0 {
-        reasons.push(format!("{} missing coverage_verified", missing_coverage));
-    }
-    if wrong_depth > 0 {
-        reasons.push(format!("{} wrong venue_depth_complete flag", wrong_depth));
-    }
+        let mut reasons = Vec::new();
+        if missing_checkpoint > 0 {
+            reasons.push(format!(
+                "{} missing replay_safe_checkpoint",
+                missing_checkpoint
+            ));
+        }
+        if missing_bridge > 0 {
+            reasons.push(format!("{} missing symbols_bridged", missing_bridge));
+        }
+        if missing_coverage > 0 {
+            reasons.push(format!("{} missing coverage_verified", missing_coverage));
+        }
+        if wrong_depth > 0 {
+            reasons.push(format!("{} wrong venue_depth_complete flag", wrong_depth));
+        }
 
-    Ok(format!(
-        "Found {} segments, but only {} are replay-safe. Issues: {}",
-        total,
-        safe,
-        reasons.join(", ")
-    ))
+        Ok(format!(
+            "Found {} segments, but only {} are replay-safe. Issues: {}",
+            total,
+            safe,
+            reasons.join(", ")
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -474,22 +496,16 @@ mod tests {
             "venue_depth_complete": false,
         });
 
-        let metadata = SegmentMetadata::from_manifest(
-            manifest.as_object().unwrap(),
-            "/test",
-            "/test",
-        )
-        .unwrap();
+        let metadata =
+            SegmentMetadata::from_manifest(manifest.as_object().unwrap(), "/test", "/test")
+                .unwrap();
         assert!(metadata.replay_safe);
 
         // Missing checkpoint
         manifest["has_replay_safe_checkpoint"] = serde_json::json!(false);
-        let metadata = SegmentMetadata::from_manifest(
-            manifest.as_object().unwrap(),
-            "/test",
-            "/test",
-        )
-        .unwrap();
+        let metadata =
+            SegmentMetadata::from_manifest(manifest.as_object().unwrap(), "/test", "/test")
+                .unwrap();
         assert!(!metadata.replay_safe);
     }
 }
