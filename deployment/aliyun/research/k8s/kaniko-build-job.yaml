@@ -1,0 +1,179 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kaniko-build-segment-index
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/name: kaniko-build
+    app.kubernetes.io/component: ci
+    build-target: segment-index
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 7200  # 2 hours max
+  ttlSecondsAfterFinished: 86400  # Keep for 1 day
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kaniko-build
+    spec:
+      restartPolicy: Never
+      serviceAccountName: default
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:v1.23.2
+          args:
+            # 从 GitHub 拉取代码
+            - --context=git://github.com/proerror77/monday.git#refs/heads/feat/segment-index-and-replay-fix
+            - --dockerfile=rust_hft/deployment/docker/Dockerfile.research
+            # 目标镜像
+            - --destination=crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner:segment-index-$(date +%Y%m%d-%H%M%S)
+            - --destination=crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner:segment-index-latest
+            # 构建参数
+            - --build-arg=SOURCE_REVISION=$(git rev-parse feat/segment-index-and-replay-fix)
+            # 缓存加速
+            - --cache=true
+            - --cache-ttl=720h
+            - --compressed-caching=false
+            # 其他优化
+            - --snapshot-mode=redo
+            - --use-new-run
+            - --log-format=text
+            - --verbosity=info
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: kaniko-secret
+              mountPath: /kaniko/.docker
+              readOnly: true
+            - name: workspace
+              mountPath: /workspace
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: kaniko-secret
+          secret:
+            secretName: monday-acr
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+        - name: workspace
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: cache
+          emptyDir:
+            sizeLimit: 10Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kaniko-build-instructions
+  namespace: monday-research
+data:
+  README.md: |
+    # Kaniko Build Job for Segment Index
+
+    ## Purpose
+    Build the research-runner image with new segment index code using Kaniko.
+
+    ## Prerequisites
+
+    1. Create ACR credentials secret:
+       ```bash
+       kubectl create secret docker-registry acr-credentials \
+         --docker-server=crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com \
+         --docker-username=<ACR_USERNAME> \
+         --docker-password=<ACR_PASSWORD> \
+         -n monday-research
+       ```
+
+    2. Verify the secret:
+       ```bash
+       kubectl get secret acr-credentials -n monday-research
+       ```
+
+    ## Usage
+
+    1. Apply the Job:
+       ```bash
+       kubectl apply -f kaniko-build-job.yaml
+       ```
+
+    2. Monitor build progress:
+       ```bash
+       kubectl logs -f job/kaniko-build-segment-index -n monday-research
+       ```
+
+    3. Check build status:
+       ```bash
+       kubectl get job kaniko-build-segment-index -n monday-research
+       ```
+
+    ## Expected Timeline
+    - Image pull: 1-2 minutes
+    - Rust compilation: 25-45 minutes
+    - Image push: 3-5 minutes
+    - Total: 30-60 minutes
+
+    ## Output
+    Two image tags will be created:
+    - `research-runner:segment-index-YYYYMMDD-HHMMSS` (timestamped)
+    - `research-runner:segment-index-latest` (always latest)
+
+    ## Troubleshooting
+
+    ### Authentication failed
+    - Verify ACR credentials are correct
+    - Check secret exists: `kubectl get secret acr-credentials -n monday-research`
+    - Recreate secret if needed
+
+    ### Build timeout
+    - Default timeout: 2 hours
+    - If needed, increase `activeDeadlineSeconds` in the Job
+
+    ### Out of memory
+    - Current limits: 16Gi
+    - Increase memory limits if needed
+
+    ### Context fetch failed
+    - Verify GitHub repo is accessible
+    - Check branch name: feat/segment-index-and-replay-fix
+    - Try using HTTPS instead of git:// protocol
+
+    ## After Build Completes
+
+    1. Verify image was pushed:
+       ```bash
+       # List images in ACR (if you have aliyun CLI)
+       aliyun cr ListRepoTag --RepoNamespace wildcard0923 --RepoName research-runner
+       ```
+
+    2. Update test pod to use new image:
+       ```bash
+       kubectl set image pod/segment-index-test \
+         test=crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner:segment-index-latest \
+         -n monday-research
+       ```
+
+    3. Or deploy backfill job with new image:
+       ```bash
+       # Edit segment-index-backfill-job.yaml to use new image
+       kubectl apply -f segment-index-backfill-job.yaml
+       ```

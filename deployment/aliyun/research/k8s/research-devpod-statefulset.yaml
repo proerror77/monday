@@ -1,0 +1,362 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: research-devpod
+  namespace: monday-research
+  labels:
+    app: research-devpod
+    role: development
+spec:
+  serviceName: research-devpod
+  replicas: 1
+  selector:
+    matchLabels:
+      app: research-devpod
+  template:
+    metadata:
+      labels:
+        app: research-devpod
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # 使用 init container 拉取代码
+      initContainers:
+        - name: git-sync
+          image: alpine/git:latest
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "🔄 Syncing code from GitHub..."
+
+              if [ -d /workspace/.git ]; then
+                cd /workspace
+                echo "Repository exists, updating..."
+                git fetch origin
+                git checkout ${GIT_BRANCH}
+                git pull origin ${GIT_BRANCH}
+                echo "✓ Code updated to latest"
+              else
+                echo "Cloning repository..."
+                git clone -b ${GIT_BRANCH} ${GIT_REPO} /workspace
+                echo "✓ Repository cloned"
+              fi
+
+              cd /workspace
+              echo ""
+              echo "Current commit:"
+              git log -1 --oneline
+              echo ""
+              echo "Branch: $(git branch --show-current)"
+          env:
+            - name: GIT_REPO
+              value: "https://github.com/proerror77/monday.git"
+            - name: GIT_BRANCH
+              value: "feat/segment-index-and-replay-fix"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+
+      # 主容器：开发环境
+      containers:
+        - name: devpod
+          image: rust:1.98.1-bookworm
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              echo "🚀 Research DevPod Starting..."
+              echo ""
+
+              # 安装必要工具
+              echo "📦 Installing tools..."
+              apt-get update -qq
+              apt-get install -y -qq wget unzip jq > /dev/null 2>&1
+
+              # 安装 DuckDB
+              if ! command -v duckdb &> /dev/null; then
+                echo "Installing DuckDB..."
+                cd /tmp
+                wget -q https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip
+                unzip -q duckdb_cli-linux-amd64.zip
+                chmod +x duckdb
+                mv duckdb /usr/local/bin/
+                rm duckdb_cli-linux-amd64.zip
+                echo "✓ DuckDB installed"
+              fi
+
+              cd /workspace
+
+              echo ""
+              echo "✅ DevPod Ready!"
+              echo ""
+              echo "📂 Workspace: /workspace"
+              echo "🔧 Cargo cache: /cargo-cache"
+              echo "🏗️  Build cache: /workspace/target"
+              echo ""
+              echo "Available commands:"
+              echo "  - cargo build -p hft-collector --release"
+              echo "  - cargo test -p hft-collector segment_index"
+              echo "  - ./target/release/segment-index-cli --help"
+              echo "  - duckdb /lake/output/metadata/segments.parquet"
+              echo ""
+              echo "To update code:"
+              echo "  cd /workspace && git pull"
+              echo ""
+              echo "Keeping pod alive..."
+
+              # 保持运行
+              tail -f /dev/null
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: CARGO_HOME
+              value: "/cargo-cache"
+            - name: RUST_BACKTRACE
+              value: "1"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: cargo-cache
+              mountPath: /cargo-cache
+            - name: raw
+              mountPath: /lake/raw
+              readOnly: true
+            - name: output
+              mountPath: /lake/output
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+
+      volumes:
+        - name: raw
+          persistentVolumeClaim:
+            claimName: sol-market-1235-raw-0927
+            readOnly: true
+        - name: output
+          persistentVolumeClaim:
+            claimName: sol-market-1235-published-0927
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+
+  # 持久化存储：代码和缓存
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+        storageClassName: alicloud-disk-efficiency
+    - metadata:
+        name: cargo-cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+        storageClassName: alicloud-disk-efficiency
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: research-devpod-guide
+  namespace: monday-research
+data:
+  USAGE.md: |
+    # Research DevPod - 快速开发环境
+
+    ## 🎯 设计理念（类 AX 架构）
+
+    - ✅ **代码热加载**：git pull 即可更新，无需重建镜像
+    - ✅ **增量编译**：Cargo 缓存持久化，第二次编译 < 1 分钟
+    - ✅ **状态保存**：workspace 和 cache 都在 PVC 上
+    - ✅ **快速切换**：切换分支或 PR 只需 git checkout
+
+    ## 🚀 使用方法
+
+    ### 部署 DevPod
+
+    ```bash
+    kubectl apply -f research-devpod-statefulset.yaml
+    ```
+
+    ### 连接到 DevPod
+
+    ```bash
+    # 进入容器
+    kubectl exec -it research-devpod-0 -n monday-research -- bash
+
+    # 你会看到：
+    # ✅ DevPod Ready!
+    # 📂 Workspace: /workspace
+    # ...
+    ```
+
+    ### 切换到不同的分支/PR
+
+    ```bash
+    # 在 DevPod 内：
+    cd /workspace
+
+    # 切换到 main
+    git checkout main
+    git pull
+
+    # 切换到其他 PR
+    git fetch origin pull/1240/head:pr-1240
+    git checkout pr-1240
+
+    # 切换到特性分支
+    git checkout feat/segment-index-and-replay-fix
+    git pull
+    ```
+
+    ### 编译和测试
+
+    ```bash
+    # 首次编译（25-40 分钟）
+    cd /workspace
+    cargo build -p hft-collector --release
+
+    # 后续编译（增量，< 1 分钟）
+    cargo build -p hft-collector --release
+
+    # 运行测试
+    cargo test -p hft-collector segment_index
+
+    # 运行 CLI 工具
+    ./target/release/segment-index-cli \
+      --index /lake/output/metadata/segments.parquet \
+      info
+    ```
+
+    ### 测试新代码
+
+    ```bash
+    # 测试 DuckDB 查询
+    duckdb /lake/output/metadata/segments.parquet -c "
+      SELECT COUNT(*) FROM read_parquet('/lake/output/metadata/segments.parquet')
+    "
+
+    # 运行 backfill 工具
+    ./target/release/segment-index-backfill \
+      --raw-root /lake/raw \
+      --index-output /tmp/test-index.parquet \
+      --market usdm \
+      --start-date 2026-09-01 \
+      --end-date 2026-09-02 \
+      --dry-run
+    ```
+
+    ## ⚡ 性能对比
+
+    | 操作 | 重建镜像方式 | DevPod 方式 |
+    |---|---|---|
+    | 切换代码 | 60-90 分钟 | **10 秒**（git checkout） |
+    | 首次编译 | 60-90 分钟 | 25-40 分钟 |
+    | 增量编译 | 60-90 分钟 | **< 1 分钟** |
+    | 测试迭代 | 每次 60-90 分钟 | **秒级** |
+
+    ## 🔄 更新代码工作流
+
+    ```bash
+    # 1. 本地推送代码到 GitHub
+    git push origin feat/my-experiment
+
+    # 2. 在 DevPod 中拉取（< 10 秒）
+    kubectl exec -it research-devpod-0 -n monday-research -- bash -c "
+      cd /workspace && git fetch && git checkout feat/my-experiment && git pull
+    "
+
+    # 3. 增量编译（< 1 分钟）
+    kubectl exec -it research-devpod-0 -n monday-research -- bash -c "
+      cd /workspace && cargo build -p hft-collector --release
+    "
+
+    # 4. 测试
+    kubectl exec -it research-devpod-0 -n monday-research -- bash -c "
+      cd /workspace && ./target/release/segment-index-cli info
+    "
+    ```
+
+    ## 🎨 多人协作
+
+    ```bash
+    # 每个开发者可以有自己的 DevPod
+    kubectl scale statefulset research-devpod --replicas=3 -n monday-research
+
+    # 访问不同的实例
+    kubectl exec -it research-devpod-0 -n monday-research -- bash  # 开发者 1
+    kubectl exec -it research-devpod-1 -n monday-research -- bash  # 开发者 2
+    kubectl exec -it research-devpod-2 -n monday-research -- bash  # 开发者 3
+    ```
+
+    ## 🔧 维护
+
+    ### 重启 DevPod（保留状态）
+
+    ```bash
+    # 删除 Pod，StatefulSet 会自动重建
+    kubectl delete pod research-devpod-0 -n monday-research
+
+    # 新 Pod 会挂载相同的 PVC，代码和缓存都保留
+    # 启动时间：< 1 分钟
+    ```
+
+    ### 清理缓存
+
+    ```bash
+    kubectl exec -it research-devpod-0 -n monday-research -- bash -c "
+      cd /workspace && cargo clean
+    "
+    ```
+
+    ### 完全重置
+
+    ```bash
+    # 删除 StatefulSet 和 PVC
+    kubectl delete statefulset research-devpod -n monday-research
+    kubectl delete pvc workspace-research-devpod-0 -n monday-research
+    kubectl delete pvc cargo-cache-research-devpod-0 -n monday-research
+
+    # 重新部署会从头开始
+    ```
+
+    ## 🎯 总结
+
+    这就是类似 AX 的架构：
+    - ✅ 代码热加载（git pull）
+    - ✅ 状态持久化（PVC）
+    - ✅ 快速迭代（增量编译）
+    - ✅ 随时切换（checkout 任何分支）
+
+    **不再需要为每次代码修改重建镜像！**
