@@ -1172,6 +1172,7 @@ pub(crate) fn freeze_research_inventory_request(
         max_scan_entries: args.max_scan_entries,
         max_inputs: args.max_inputs,
         max_input_bytes: args.max_input_bytes,
+        discovery_index: args.discovery_index.clone(),
     };
     hft_collector::research_inventory::freeze_inventory(&request)
 }

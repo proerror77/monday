@@ -18,6 +18,7 @@ pub mod polymarket_research_import;
 pub mod polymarket_research_normalize;
 pub mod polymarket_research_select;
 pub mod polymarket_upload;
+pub(crate) mod research_discovery;
 pub mod research_inventory;
 pub mod research_memory;
 pub mod source_catalog;
