@@ -3529,13 +3529,19 @@ fn begin_segment_rotation(
         rotation_boundary_ns,
     )?;
     let mut next = Segment::create(config.segment_config(), rotation_boundary_ns)?;
-    if seed_next {
+    // The verified subscription catalog is recovery evidence even when a
+    // reconnect, incomplete snapshot, or missing trade prevents replay seeding.
+    // Keep it in every rotated part so losing this process does not also lose
+    // the only catalog record with an already-finalized earlier segment.
+    if process_state.stream_coverage_trusted {
         write_stream_coverage(
             &mut next,
             session_id,
             &process_state.stream_coverage_shards,
             rotation_boundary_ns,
         )?;
+    }
+    if seed_next {
         write_checkpoints(
             &mut next,
             states,
@@ -12006,6 +12012,116 @@ mod tests {
             .find(|event| event["type"] == "checkpoint" && event["symbol"] == "ETHUSDT")
             .unwrap();
         assert_eq!(eth_checkpoint["replay_safe"], true);
+    }
+
+    #[test]
+    fn unseeded_rotation_preserves_catalog_for_crash_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = std::fs::canonicalize(root.path()).unwrap();
+        let states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Spot),
+        )]);
+        let mut process_state = trusted_process_state(&config.symbols);
+        process_state.mark_shard_disconnected(vec!["btcusdt@trade".to_owned()]);
+        let mut previous = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let original_start_ns = previous.start_ns;
+        write_stream_coverage(
+            &mut previous,
+            "session-1",
+            &process_state.stream_coverage_shards,
+            original_start_ns,
+        )
+        .unwrap();
+        let next = begin_segment_rotation(
+            &mut previous,
+            &config,
+            &states,
+            "session-1",
+            "scheduled",
+            &process_state,
+        )
+        .unwrap();
+        assert!(!next.is_replay_safe());
+        assert_eq!(next.event_count("checkpoint"), 0);
+        assert_eq!(next.event_count("stream_coverage"), 1);
+        assert!(previous.close().unwrap().is_some());
+        // Dropping without close leaves the interrupted part, as a restart
+        // sees it after the catalog's original segment has been finalized.
+        drop(next);
+        let parts = files_with_suffix(&config.spool_dir, ".jsonl.part").unwrap();
+        assert_eq!(parts.len(), 1);
+        let recovered = recover_recovery_batches(
+            prepare_recovery_batches(&config.segment_config(), &parts, &parts).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recovered.len(), 1);
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(&recovered[0].manifest).unwrap()).unwrap();
+        assert_eq!(manifest["symbols"], json!(["BTCUSDT"]));
+        assert_eq!(manifest["stream_types"], json!(config.stream_types()));
+        assert_eq!(manifest["has_replay_safe_checkpoint"], false);
+        assert!(files_with_suffix(root.path(), ".part.corrupt")
+            .unwrap()
+            .is_empty());
+        let artifact = &recovered[0];
+        let manifest_sha256 = sha256_file(&artifact.manifest).unwrap();
+        write_success_marker(&artifact.data, &artifact.sha256).unwrap();
+        let trust =
+            BinanceMarketTapeTrustAnchor::from_lower_hex(&artifact.sha256, &manifest_sha256)
+                .unwrap();
+        let triplet = BinanceMarketTapeTriplet {
+            data: artifact.data.clone(),
+            manifest: artifact.manifest.clone(),
+            success: artifact.success.clone(),
+        };
+        let sealed = seal_binance_market_tape_triplet(&triplet, &trust).unwrap();
+        let error = verify_binance_market_tape_for_strict_gate(vec![sealed])
+            .expect_err("the recovered catalog must not grant replay readiness");
+        assert!(
+            error.to_string().contains("missing a replay-safe checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unverified_rotation_does_not_invent_a_recovery_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_owned();
+        let states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Spot),
+        )]);
+        let process_state = ProcessState::new(false);
+        let mut previous = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut next = begin_segment_rotation(
+            &mut previous,
+            &config,
+            &states,
+            "session-1",
+            "scheduled",
+            &process_state,
+        )
+        .unwrap();
+        assert!(!next.is_replay_safe());
+        assert_eq!(next.event_count("stream_coverage"), 0);
+        next.write(
+            "sequence_gap",
+            json!({"session_id":"session-1","kind":"stream_disconnect"}),
+            next.start_ns,
+        )
+        .unwrap();
+        previous.close().unwrap();
+        drop(next);
+        let parts = files_with_suffix(root.path(), ".jsonl.part").unwrap();
+        let error =
+            discover_recovery_catalog(&parts, config.market, &config.stream_types()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no complete stream-coverage catalog"));
+        assert_eq!(files_with_suffix(root.path(), ".jsonl.part").unwrap(), parts);
     }
 
     #[tokio::test]

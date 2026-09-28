@@ -1289,6 +1289,19 @@ check_upload_readback() {
   require_empty_segment_spool "$spool" || fail "detached spool still contains segment artifacts"
 }
 
+run_logged_recovery_step() {
+  local log=$1 message=$2 status=0
+  shift 2
+  [[ ! -e $log && ! -L $log ]] || fail "refusing to replace recovery stderr: $log"
+  # This directory belongs to the immutable attempt, not the collector. Keep
+  # stderr even when the journal has rotated, without masking the child status.
+  (umask 077; set -o noclobber; "$@" 2>"$log") || status=$?
+  chmod 0440 "$log" || fail 'could not protect recovery stderr'
+  recovery_sync_path "$log" || fail 'could not persist recovery stderr'
+  cat -- "$log" >&2
+  (( status == 0 )) || fail "$message (exit=$status)"
+}
+
 run_drain_job() {
   local running_dir=$1 release_dir release_binary release_env evidence_root backup_dir result_path
   local -a env_args
@@ -1323,7 +1336,8 @@ run_drain_job() {
   if has_incomplete_parts "$running_dir"; then
     [[ ! -e $backup_dir && ! -L $backup_dir ]] \
       || fail 'recovery inputs were already backed up; use a new explicit resume request after inspecting the interrupted attempt'
-    env -i \
+    run_logged_recovery_step "$evidence_root/recover.stderr" \
+      'detached recovery of incomplete parts failed' env -i \
       HOME=/root \
       PATH="$SAFE_PATH" \
       RUST_LOG=info \
@@ -1334,8 +1348,7 @@ run_drain_job() {
       RECOVERY_UID="$(id -u hftcollector)" \
       RECOVERY_GID="$(id -g hftcollector)" \
       RECOVERY_BACKUP_DIR="$backup_dir" \
-      "$release_binary" --recover-parts-only \
-      || fail 'detached recovery of incomplete parts failed'
+      "$release_binary" --recover-parts-only
   fi
   if has_cleanup_marker_only_leftover "$running_dir"; then
     fail 'detached spool has leftover uploaded-cleanup markers without local segment artifacts; refusing fresh-upload verify so the marker remains inspectable'
@@ -1344,13 +1357,13 @@ run_drain_job() {
   # interrupted controller may therefore have only metadata left.  Re-running
   # an empty upload cannot refresh its timestamp and is not completion proof.
   if ! require_empty_segment_spool "$running_dir" 2>/dev/null; then
-    runuser --user hftcollector -- env -i \
+    run_logged_recovery_step "$evidence_root/upload.stderr" \
+      'detached recovery upload failed' runuser --user hftcollector -- env -i \
       HOME=/var/lib/hft-collector \
       PATH="$SAFE_PATH" \
       RUST_LOG=info \
       "${env_args[@]}" \
-      "$release_binary" --upload-only \
-      || fail 'detached recovery upload failed'
+      "$release_binary" --upload-only
   fi
   check_upload_readback "$running_dir"
   verify_upload_triplet_readback "$running_dir" "$JOB_MINIMUM_SUCCESS_AT" 0
@@ -1363,7 +1376,7 @@ run_drain_job() {
 }
 
 mark_failed() {
-  local running_dir=$1 step=$2 message=$3 failed_dir evidence_root result_path
+  local running_dir=$1 step=$2 message=$3 failed_dir evidence_root result_path log
   load_execution_context "$running_dir" \
     || fail 'failed recovery identity is no longer active; preserving unfinished evidence'
   UPLOAD_TRIPLET_READBACK='{}'
@@ -1377,6 +1390,19 @@ mark_failed() {
   [[ ! -e $result_path && ! -L $result_path ]] \
     || fail "recovery already committed a result; preserving it for archival readback: $result_path"
   start_execution
+  if [[ $message == 'drain failed' ]]; then
+    # Prefer the last executed stage; keep the full bytes in the protected log
+    # and bound the receipt so a verbose child cannot balloon every health read.
+    log="$evidence_root/recover.stderr"
+    [[ ! -e $evidence_root/upload.stderr && ! -L $evidence_root/upload.stderr ]] \
+      || log="$evidence_root/upload.stderr"
+    if [[ -e $log || -L $log ]]; then
+      secure_regular_file "$log" 0
+      if [[ -s $log ]]; then
+        message="$message: $(tail -c 8192 -- "$log")"
+      fi
+    fi
+  fi
   write_result "$result_path" failed "$step" "$message"
   if [[ $running_dir != "$failed_dir" ]]; then
     [[ ! -e $failed_dir && ! -L $failed_dir ]] || fail 'failed recovery destination already exists'
@@ -1444,6 +1470,11 @@ drain_market() {
   recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist running recovery queue state'
   CURRENT_RUNNING_DIR=$running_dir
   CURRENT_STEP=recover-upload
+  # Only the ready -> running claim needs the per-market queue lock. The
+  # global drain lock still excludes other drain/resume and release cutovers;
+  # production may isolate a different spool while this detached job runs.
+  flock -u 9 || fail 'could not release claimed recovery queue lock'
+  exec 9>&-
   set +e
   (
     set -Eeuo pipefail
@@ -1497,7 +1528,7 @@ main() {
       shift 2
     done
   fi
-  for command in awk chmod date env find flock grep head id install jq ln mktemp mv readlink rm runuser sed sha256sum sort stat sync systemctl wc; do
+  for command in awk cat chmod date env find flock grep head id install jq ln mktemp mv readlink rm runuser sed sha256sum sort stat sync systemctl tail wc; do
     command -v "$command" >/dev/null 2>&1 \
       || fail "missing required command: $command"
   done
