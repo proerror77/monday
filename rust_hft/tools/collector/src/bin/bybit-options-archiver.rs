@@ -1028,7 +1028,7 @@ fn write_health(
     let (disk_free_gb, spool_usage_bytes, disk_warning, spool_warning) =
         spool_disk_state(config);
     let upload = read_upload_status(&config.spool_dir)?;
-    let upload_warning = upload.failure_count > 0;
+    let upload_warning = upload.last_error_at.is_some() || upload.last_error.is_some();
     write_json_atomic(
         &config.spool_dir.join("health.json"),
         &serde_json::to_value(Health {
@@ -1391,5 +1391,33 @@ mod tests {
         assert!(status.last_error_at.is_some());
         assert_eq!(status.last_error.as_deref(), Some("manifest missing sha256"));
         assert!(dir.path().join(name).exists());
+    }
+
+    #[test]
+    fn health_separates_active_upload_errors_from_cumulative_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_for(dir.path());
+        let segment = Segment::open(dir.path(), 1).unwrap();
+        for (last_error_at, last_error, warning) in [
+            (None, None, false),
+            (Some(10), None, true),
+            (None, Some("current failure".to_owned()), true),
+        ] {
+            let status = UploadStatus {
+                failure_count: 28,
+                last_success_at: Some(20),
+                last_error_at,
+                last_error,
+            };
+            write_upload_status(dir.path(), &status).unwrap();
+            write_health(&config, &segment, 1, 1, Some(20), 1).unwrap();
+            let health: Value = serde_json::from_slice(
+                &fs::read(dir.path().join("health.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(health["upload_failure_count"], 28);
+            assert_eq!(health["upload_warning"], warning);
+            assert_eq!(health["last_upload_error_at"], json!(last_error_at));
+        }
     }
 }

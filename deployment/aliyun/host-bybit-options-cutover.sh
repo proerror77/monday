@@ -120,6 +120,7 @@ OLD_MODE=new-host
 TRANSITION_STARTED=0
 SUCCESS=0
 CANDIDATE_STARTED_MS=0
+UPLOAD_FAILURE_BASELINE=
 
 fail() {
   FAILURE_REASON=$*
@@ -277,7 +278,7 @@ run_candidate_drain() {
     RUST_LOG=info \
     "${env_args[@]}" \
     "$CANDIDATE_BINARY" --upload-only || return 1
-  jq -e '.failure_count == 0' "$CANONICAL_SPOOL/upload-status.json" >/dev/null \
+  bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" "$UPLOAD_FAILURE_BASELINE" \
     || return 1
   require_empty_segment_spool || return 1
 }
@@ -320,16 +321,23 @@ copy_health_evidence() {
   if [[ -f $source && ! -L $source ]]; then
     install -m 0640 "$source" "$EVIDENCE_DIR/$label-health.json"
   fi
+  source="$CANONICAL_SPOOL/upload-status.json"
+  if [[ -f $source && ! -L $source ]]; then
+    install -m 0640 "$source" "$EVIDENCE_DIR/$label-upload-status.json"
+  fi
 }
 
 health_ready_for_release() {
   local minimum_symbols=$1 minimum_updated_ms=$2 old_updated_ms=${3:-0}
   local health="$CANONICAL_SPOOL/health.json"
   [[ -f $health && ! -L $health ]] || return 1
+  bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" "$UPLOAD_FAILURE_BASELINE" \
+    || return 1
   jq -e \
     --argjson minimum_symbols "$minimum_symbols" \
     --argjson minimum_updated_ms "$minimum_updated_ms" \
     --argjson old_updated_ms "$old_updated_ms" \
+    --argjson upload_failure_baseline "$UPLOAD_FAILURE_BASELINE" \
     -f "$RUNTIME_HEALTH_POLICY" "$health" >/dev/null
 }
 
@@ -396,6 +404,7 @@ write_evidence() {
     --arg mode "$OLD_MODE" \
     --arg current_binary "$current_target" \
     --argjson production_active "$(unit_active_json)" \
+    --argjson upload_failure_baseline "${UPLOAD_FAILURE_BASELINE:-null}" \
     '{
       schema: "monday.bybit_options_cutover.v1",
       started_at: $started_at,
@@ -411,6 +420,7 @@ write_evidence() {
       deployment_bundle_sha256: (if $deployment_bundle_sha256 == "" then null else $deployment_bundle_sha256 end),
       previous_sha256: (if $previous_sha256 == "" then null else $previous_sha256 end),
       host_mode: $mode,
+      upload_failure_baseline: $upload_failure_baseline,
       current_binary: (if $current_binary == "" then null else $current_binary end),
       production_active: $production_active
     }' > "$temporary" || return 1
@@ -575,6 +585,8 @@ jq -e --arg sha "$CANDIDATE_SHA256" --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
   || fail 'candidate release metadata does not match the requested identity'
 ( cd "$CANDIDATE_DEPLOYMENT" && sha256sum --check --strict DEPLOYMENT_BUNDLE.sha256 ) \
   || fail 'candidate deployment bundle failed its digest check'
+# shellcheck disable=SC1090,SC1091
+. "$CONTROL_PLANE_LIB"
 GATE_BUNDLE_DIR="$GATE_ROOT/$CANDIDATE_SHA256/$DEPLOYMENT_BUNDLE_SHA256"
 validate_deployment "$CANDIDATE_DEPLOYMENT" true
 id hftcollector >/dev/null 2>&1 || fail 'service account hftcollector is missing'
@@ -620,10 +632,6 @@ install -m 0640 "$GATE_MARKER" "$EVIDENCE_DIR/shadow-gate/PASSED.sha256"
 STEP=validate-host-state
 canonical_spool_paths_safe || fail 'canonical spool path contains a symlink or escapes /data'
 systemctl is-active --quiet "$UPLOAD_UNIT" && fail "upload unit must be inactive before cutover: $UPLOAD_UNIT"
-if systemctl is-active --quiet "$UNIT"; then
-  systemctl cat "$UNIT" | grep -Fqx "ExecStart=$RELEASE_ROOT/" \
-    || fail 'active production unit ExecStart is not digest-addressed'
-fi
 
 active_count=0
 enabled_count=0
@@ -643,7 +651,8 @@ if (( active_count == 1 && enabled_count == 1 )); then
   OLD_SHA256=${BASH_REMATCH[1]}
   [[ $OLD_SHA256 != "$CANDIDATE_SHA256" ]] || fail 'candidate is already the production release'
   printf '%s  %s\n' "$OLD_SHA256" "$OLD_BINARY" | sha256sum --check --strict
-  systemctl cat "$UNIT" | grep -Fqx "ExecStart=$OLD_BINARY" \
+  current_unit=$(systemctl cat "$UNIT") || fail 'could not read active production unit'
+  bybit_options_unit_exec_start_matches "$OLD_BINARY" "$current_unit" \
     || fail 'active production unit ExecStart does not match the release symlink'
   OLD_DEPLOYMENT="$RELEASE_ROOT/$OLD_SHA256/deployment"
   validate_deployment "$OLD_DEPLOYMENT" false
@@ -654,6 +663,10 @@ elif (( active_count == 0 && enabled_count == 0 )) && [[ ! -e $PRODUCTION_LINK &
 else
   fail "ambiguous production state: active=$active_count enabled=$enabled_count symlink=$PRODUCTION_LINK"
 fi
+
+UPLOAD_FAILURE_BASELINE=$(bybit_options_upload_failure_count "$CANONICAL_SPOOL/upload-status.json") \
+  || fail 'production upload failure baseline is invalid'
+copy_health_evidence before-transition
 
 STEP=stop-production
 TRANSITION_STARTED=1
