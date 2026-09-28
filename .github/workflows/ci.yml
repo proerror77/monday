@@ -152,6 +152,8 @@ jobs:
           ../deployment/aliyun/test-binance-fee-release-contract.sh
           ../deployment/aliyun/test-binance-usdm-account-release-contract.sh
           ../deployment/aliyun/test-binance-fee-cutover.sh
+          ../deployment/aliyun/test-bybit-options-release-contract.sh
+          ../deployment/aliyun/test-bybit-options-shadow-gate.sh
 
       - name: Summarize check plan
         env:
