@@ -7,12 +7,31 @@ export MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL=monday-v2-fixture
 ROOT=$(readlink -f "$(mktemp -d)")
 fixture_root=$ROOT
 trap 'chmod -R u+w "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"' EXIT
-trap 'status=$?; printf "ERR status=%s line=%s command=%s\n" "$status" "$LINENO" "$BASH_COMMAND" >&2' ERR
+trap 'status=$?; printf "ERR status=%s line=%s command=%s\n" "$status" "$LINENO" "$BASH_COMMAND" >&2; if [[ -n ${scheduler_failure:-} && -f $ROOT/scheduler-rollback-$scheduler_failure.log ]]; then cat "$ROOT/scheduler-rollback-$scheduler_failure.log" >&2; fi' ERR
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/host-rust-lob-controller-release.sh"
 ROOT=$fixture_root
+
+# Rollback calls this fixture guard from a failing EXIT trap. Bash 5.2 must
+# return the validation result, not the trap's original nonzero exit status.
+if ! (
+  export MONDAY_CONTROL_PLANE_TEST=1
+  trap 'monday_rust_lob_require_owned_drain_lock "$ROOT" || exit 72; exit 0' EXIT
+  exit 19
+); then
+  printf 'valid fixture drain-lock guard inherited the failing EXIT trap status\n' >&2
+  exit 1
+fi
+if (
+  export MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL=invalid
+  trap 'monday_rust_lob_require_owned_drain_lock "$ROOT" || exit 72; exit 0' EXIT
+  exit 19
+); then
+  printf 'fixture drain-lock guard accepted an invalid sentinel in EXIT cleanup\n' >&2
+  exit 1
+fi
 
 # Resource Envelope V2 is a single immutable runtime contract: the production
 # template and its aggregate slice carry the pair cap, while each sequential

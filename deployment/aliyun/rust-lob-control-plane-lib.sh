@@ -594,8 +594,9 @@ monday_rust_lob_require_owned_drain_lock() {
   [[ $# -eq 1 ]] || return 2
   local root=$1 lock
   if [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]]; then
-    monday_control_plane_validate_mode "$root" true
-    return
+    monday_control_plane_validate_mode "$root" true || return 1
+    # Bash 5.2's bare return inside an EXIT trap inherits the trap status.
+    return 0
   fi
   lock=$(monday_root_join "$root" run/lock/monday-rust-lob-recovery-drain.lock) || return 1
   [[ $(readlink -f -- "/proc/$$/fd/8") == "$lock" ]] || return 1
