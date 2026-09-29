@@ -22,7 +22,9 @@ for directory in /opt/monday /etc/systemd/system /run/systemd/system; do
   [[ $(stat -f -c %T "$directory") == tmpfs ]]
   [[ -z $(find "$directory" -mindepth 1 -maxdepth 1 -print -quit) ]]
 done
-command systemctl --version
+SYSTEMCTL_BIN=$(type -P systemctl)
+[[ $SYSTEMCTL_BIN == /* && -x $SYSTEMCTL_BIN ]]
+"$SYSTEMCTL_BIN" --version
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 work=$(mktemp -d)
@@ -75,20 +77,20 @@ printf '%s\tloaded\tactive\tenabled\n' "$unit" >"$work/snapshot"
 
 select_controller() { ln -sfn -- "$controller_root/$1" "$controller_root/active"; }
 prepare_candidate_instance() {
-  command systemctl --root=/ disable "$unit" >/dev/null 2>&1
-  command systemctl --root=/ --runtime unmask "$unit" >/dev/null 2>&1
+  "$SYSTEMCTL_BIN" --root=/ disable "$unit" >/dev/null 2>&1
+  "$SYSTEMCTL_BIN" --root=/ --runtime unmask "$unit" >/dev/null 2>&1
   select_controller "$c1"
-  command systemctl --root=/ enable "$unit" >/dev/null 2>&1
+  "$SYSTEMCTL_BIN" --root=/ enable "$unit" >/dev/null 2>&1
   [[ $(readlink -- "$instance") == "$controller_root/$c1/deployment/$asset" ]]
   select_controller "$c0"
 }
 
 # First reproduce the old behavior with the real Linux unit-file installer.
 prepare_candidate_instance
-command systemctl --root=/ --runtime unmask "$unit" >/dev/null 2>&1
-command systemctl --root=/ enable "$unit" >/dev/null 2>&1
+"$SYSTEMCTL_BIN" --root=/ --runtime unmask "$unit" >/dev/null 2>&1
+"$SYSTEMCTL_BIN" --root=/ enable "$unit" >/dev/null 2>&1
 [[ $(readlink -- "$instance") == "$controller_root/$c1/deployment/$asset" ]]
-[[ $(command systemctl --root=/ is-enabled "$unit") == enabled ]]
+[[ $("$SYSTEMCTL_BIN" --root=/ is-enabled "$unit") == enabled ]]
 printf 'reproduced: enable preserves the C1 instance after active=C0\n'
 
 # There is no service manager in the container. Only service start/stop/show
@@ -126,10 +128,10 @@ systemctl() {
         LoadState)
           if [[ -L /run/systemd/system/$requested && ! -e /etc/systemd/system/$requested ]]; then printf 'masked\n'
           else printf 'loaded\n'; fi ;;
-        UnitFileState) command systemctl --root=/ is-enabled "$requested" || : ;;
+        UnitFileState) "$SYSTEMCTL_BIN" --root=/ is-enabled "$requested" || : ;;
         *) return 1 ;;
       esac ;;
-    disable|enable|mask|unmask) command systemctl --root=/ "$@" ;;
+    disable|enable|mask|unmask) "$SYSTEMCTL_BIN" --root=/ "$@" ;;
     *) return 1 ;;
   esac
 }
@@ -137,7 +139,7 @@ systemctl() {
 restore() { monday_rust_lob_restore_writer_snapshot "$work/snapshot" v2 / "$c0" "$c1"; }
 restore
 [[ $starts == 1 && $(readlink -- "$instance") == "$controller_root/$c0/deployment/$asset" ]]
-[[ $(command systemctl --root=/ is-enabled "$unit") == enabled ]]
+[[ $("$SYSTEMCTL_BIN" --root=/ is-enabled "$unit") == enabled ]]
 printf 'passed: restore rebuilt C0 before starting production\n'
 
 # A corrupted candidate executable is a reason to restore C0, not a reason to
@@ -152,8 +154,8 @@ cp -- "$work/candidate-backup" "$candidate_binary"
 
 # No candidate enable happened yet: the exact instance is absent under a
 # runtime mask, and rollback must still recreate C0 from the stable template.
-command systemctl --root=/ disable "$unit" >/dev/null 2>&1
-command systemctl --root=/ --runtime mask "$unit" >/dev/null 2>&1
+"$SYSTEMCTL_BIN" --root=/ disable "$unit" >/dev/null 2>&1
+"$SYSTEMCTL_BIN" --root=/ --runtime mask "$unit" >/dev/null 2>&1
 restore
 [[ $starts == 3 && $(readlink -- "$instance") == "$controller_root/$c0/deployment/$asset" ]]
 
@@ -183,8 +185,8 @@ done
 # Existing masked, disabled, and static snapshots must not become enabled or
 # start a service. These branches retain their previous restore behavior.
 for state in masked-runtime disabled static; do
-  command systemctl --root=/ --runtime unmask "$unit" >/dev/null 2>&1
-  command systemctl --root=/ disable "$unit" >/dev/null 2>&1
+  "$SYSTEMCTL_BIN" --root=/ --runtime unmask "$unit" >/dev/null 2>&1
+  "$SYSTEMCTL_BIN" --root=/ disable "$unit" >/dev/null 2>&1
   if [[ $state == static ]]; then
     # A separate static allowlisted shadow instance, not a production release.
     snapshot_unit=binance-lob-archiver-rust-upload@spot.service
@@ -195,6 +197,6 @@ for state in masked-runtime disabled static; do
   before_starts=$starts
   restore
   [[ $starts == "$before_starts" ]]
-  [[ $(command systemctl --root=/ is-enabled "$snapshot_unit" || :) == "$state" ]]
+  [[ $("$SYSTEMCTL_BIN" --root=/ is-enabled "$snapshot_unit" || :) == "$state" ]]
 done
 printf 'passed: 7 unsafe boundaries and masked/disabled/static state preservation\n'
