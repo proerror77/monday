@@ -290,6 +290,10 @@ monitor service and GitHub Cloud Assistant invocation 480 seconds. The workflow
 polls for 600 seconds. The invocation explicitly overrides the stored command's
 older timeout; changing the poll window alone is insufficient. Keep all these
 budgets aligned when the retained index or monitor implementation changes.
+JSON output is compact and reports archive span/break counts instead of copying
+the growing archive lists into Cloud Assistant's bounded stdout buffer. The
+collector's original `health.json` retains those complete lists. Breaches,
+warnings, admission status, and recovery custody semantics are unchanged.
 
 The service must NOT add `ConditionPathIsMountPoint=/data`: the whole point of
 the mount check is to detect and alert when `/data` is missing.

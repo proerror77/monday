@@ -726,7 +726,8 @@ check_binance_health() {
     archive_coverage=$(jq -c '
       if .archive_coverage.schema == "monday.archive_coverage.v1" then
         .archive_coverage | {schema,evidence,segments,longest_candidate_duration_ns,
-          eight_hour_candidate_available,native_tape_verification,calendar_admission,spans,breaks}
+          eight_hour_candidate_available,native_tape_verification,calendar_admission,
+          span_count:(.spans|length),break_count:(.breaks|length)}
       else {status:"not_observed",native_tape_verification:"pending",calendar_admission:"pending"} end' \
       "$health_file")
     gaps=$(jq -r '.sequence_gaps // 0' "$health_file" 2>/dev/null || printf '0')
@@ -1518,7 +1519,9 @@ if [ "$JSON_MODE" -eq 1 ]; then
     --argjson uploads "$uploads_json" --argjson queue "$recovery_queue_json" \
     --argjson delay "$delay_gate_json" \
     '{disk: $disk, mount: $mount, units: $units, health: $health, uploads: $uploads, recovery_queue: $queue, delay_gate: $delay}')
-  jq -n --argjson ok "$ok_str" --arg checked "$CHECKED_AT" \
+  # Cloud Assistant has a bounded stdout buffer. Report coverage counts above;
+  # the full span/break evidence remains in each collector's source health.json.
+  jq -cn --argjson ok "$ok_str" --arg checked "$CHECKED_AT" \
     --argjson breaches "$breaches_json" --argjson warnings "$warnings_json" \
     --argjson checks "$checks_json" \
     '{ok: $ok, checked_at: $checked, breaches: $breaches, warnings: $warnings, checks: $checks}'

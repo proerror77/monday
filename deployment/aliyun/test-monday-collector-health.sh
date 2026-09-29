@@ -485,11 +485,15 @@ run_health --json
 expect "healthy: archive unknown without evidence" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].archive_coverage.status == "not_observed"'; echo $?)"
 jq '.archive_coverage = {schema:"monday.archive_coverage.v1",evidence:"verified_upload_manifests",
   segments:97,longest_candidate_duration_ns:28800000000000,eight_hour_candidate_available:true,
-  native_tape_verification:"pending",calendar_admission:"pending",spans:[],breaks:[]}' \
+  native_tape_verification:"pending",calendar_admission:"pending",
+  spans:[range(0;1000)|{start_ns:.,end_ns:(.+1),objects:["source-manifest-evidence"]}],
+  breaks:[{reason:"source-gap"},{reason:"source-gap"}]}' \
   "$spool_root/binance-lob/usdm/health.json" > "$test_root/coverage.json"
 cp "$test_root/coverage.json" "$spool_root/binance-lob/usdm/health.json"
 run_health --json
 expect "archive candidate does not imply native or calendar admission" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].archive_coverage | .eight_hour_candidate_available == true and .native_tape_verification == "pending" and .calendar_admission == "pending"'; echo $?)"
+expect "monitor summarizes unbounded archive rows for Cloud Assistant" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].archive_coverage | .span_count==1000 and .break_count==2 and (has("spans")|not) and (has("breaks")|not)'; echo $?)"
+expect "monitor summary fits Cloud Assistant output without losing source rows" "$(if [ "$(wc -c <"$out_file")" -lt 24576 ] && jq -e '.archive_coverage.spans|length==1000' "$spool_root/binance-lob/usdm/health.json" >/dev/null; then echo 0; else echo 1; fi)"
 
 # ---------------------------------------------------------------------------
 # 2. Gate 1: missing upload-status.json on a mandated lane is a breach
