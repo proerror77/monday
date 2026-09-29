@@ -103,6 +103,9 @@ SPOOL_ROOT=${MONDAY_COLLECTOR_SPOOL_ROOT:-/data/monday/spool}
 STATE_DIR=${MONDAY_COLLECTOR_STATE_DIR:-/var/lib/monday-collector-health}
 STATE_FILE="$STATE_DIR/state.json"
 RECOVERY_QUEUE_ROOT="$SPOOL_ROOT/binance-lob-recovery"
+RETENTION_EVIDENCE_ROOT=/data/monday/evidence/recoveries/lob-queue
+RETENTION_READER=/opt/monday/bin/monday-rust-lob-recovery-queue
+RETENTION_READER_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 HEALTH_SILENCE_SECONDS=300
 DISK_WARN_PERCENT=25
@@ -195,6 +198,9 @@ if [ "${MONDAY_COLLECTOR_HEALTH_TEST_MODE:-0}" = 1 ]; then
       ;;
   esac
   POLY_RAW_OPS_GATE_RUN_ROOT="$test_root/run/monday/polymarket-raw-ops-gates"
+  RETENTION_EVIDENCE_ROOT="$test_root/evidence/lob-queue"
+  RETENTION_READER="$test_root/bin/monday-rust-lob-retained-check"
+  RETENTION_READER_PATH=$PATH
   POLY_RAW_OPS_GATE_CONTROL_LOCK="$POLY_RAW_OPS_GATE_RUN_ROOT/control.lock"
 elif [ -n "${MONDAY_COLLECTOR_HEALTH_TEST_ROOT:-}" ]; then
   printf 'collector-health test root requires explicit test mode\n' >&2
@@ -928,6 +934,66 @@ recovery_isolation_marker_valid() {
   [ "$actual_receipt_sha256" = "$receipt_sha256" ]
 }
 
+# The active native reader is side-effect-free and runs once per market, with
+# no inherited MONDAY_* writer overrides. Preserve physical failed counts even
+# if the reader is unavailable: only its exact validated subset is classified.
+read_recovery_retention() {
+  retention_check_status=not_present
+  retained_failed_count=0
+  retained_bytes=0
+  invalid_retention_count=0
+  retained_jobs='[]'
+  retention_index="$RETENTION_EVIDENCE_ROOT/retained/$market"
+  if [ ! -e "$retention_index" ] && [ ! -L "$retention_index" ]; then
+    # A lost index must not hide retained claims in the original evidence tree.
+    if [ "$market" != spot ] || { [ ! -e "$RETENTION_EVIDENCE_ROOT" ] && [ ! -L "$RETENTION_EVIDENCE_ROOT" ]; }; then return; fi
+  fi
+  retention_check_status=failed
+  invalid_retention_count=null
+  if [ "$market" != spot ]; then
+    record_breach "$label: unsupported historical retention claim"
+    return
+  fi
+  if ! retained_output=$(timeout --signal=TERM --kill-after=2s 30 \
+    env -i PATH="$RETENTION_READER_PATH" HOME=/root LC_ALL=C \
+    "$RETENTION_READER" check-retained "$market" 2>/dev/null); then
+    record_breach "$label: retained evidence validation failed"
+    return
+  fi
+  expected_failed_ids=$(printf '%s\n' "$failed_entries" | jq -Rcs \
+    'split("\n")|map(select(length>0)|split("/")[-1]|rtrimstr(".failed"))|sort')
+  if [ "${#retained_output}" -gt 262144 ] || ! printf '%s\n' "$retained_output" | jq -e \
+    --arg market "$market" --argjson failed "$expected_failed_ids" '
+    .schema=="monday.rust_lob_recovery_retention_check.v1" and .market==$market
+    and .failed_job_ids==$failed and (.retained|type)=="array"
+    and .retained_failed_count==(.retained|length)
+    and ([.retained[].job_id]|unique|length)==.retained_failed_count
+    and (.invalid_retention_count|type)=="number" and .invalid_retention_count>=0
+    and .invalid_retention_count==(.invalid_retention_count|floor)
+    and .retained_bytes==([.retained[].retained_bytes]|add//0)
+    and .inventory_validation=="content_hash_at_commit_with_metadata_drift_checks"
+    and all(.retained[]; .job_id as $id | ($failed|index($id))!=null
+      and .disposition=="retained_unrecovered" and .data_recovered==false
+      and .delivery_verified==false and .replay_eligibility=="not_assessed"
+      and (.retained_bytes|type)=="number" and .retained_bytes>=0 and .retained_bytes==(.retained_bytes|floor)
+      and ([.old_payload_sha256,.result_sha256,.request_sha256,.inventory_sha256,.receipt_sha256]
+        | all(.[]; type=="string" and test("^[a-f0-9]{64}$"))))' >/dev/null 2>&1; then
+    record_breach "$label: retained evidence response is incomplete or inconsistent"
+    return
+  fi
+  retention_check_status=verified
+  retained_failed_count=$(printf '%s\n' "$retained_output" | jq -r .retained_failed_count)
+  retained_bytes=$(printf '%s\n' "$retained_output" | jq -r .retained_bytes)
+  invalid_retention_count=$(printf '%s\n' "$retained_output" | jq -r .invalid_retention_count)
+  retained_jobs=$(printf '%s\n' "$retained_output" | jq -c .retained)
+  if [ "$invalid_retention_count" -gt 0 ]; then
+    record_breach "$label: invalid or drifted retained evidence ($invalid_retention_count)"
+  fi
+  if [ "$retained_failed_count" -gt 0 ]; then
+    record_warning "$label: $retained_failed_count historical failed job(s) retained as unrecovered evidence"
+  fi
+}
+
 check_recovery_queue_market() {
   market=$1
   queue_dir="$RECOVERY_QUEUE_ROOT/$market"
@@ -1042,8 +1108,10 @@ check_recovery_queue_market() {
   if [ "$legacy_unreceipted_count" -gt 0 ]; then
     record_breach "$label: legacy unreceipted recovery job(s) present ($legacy_unreceipted_count)"
   fi
-  if [ "$failed_count" -gt 0 ]; then
-    record_breach "$label: failed recovery job(s) present ($failed_count)"
+  read_recovery_retention
+  undisposed_failed_count=$((failed_count - retained_failed_count))
+  if [ "$undisposed_failed_count" -gt 0 ]; then
+    record_breach "$label: undisposed failed recovery job(s) present ($undisposed_failed_count of $failed_count)"
   fi
   if [ "$stale_count" -gt 0 ]; then
     record_breach "$label: stale recovery job(s) present ($stale_count)"
@@ -1061,6 +1129,12 @@ check_recovery_queue_market() {
     --argjson uc "$running_count" \
     --argjson ua "$running_oldest_age" \
     --argjson fc "$failed_count" \
+    --argjson retained "$retained_failed_count" \
+    --argjson undisposed "$undisposed_failed_count" \
+    --argjson invalid "$invalid_retention_count" \
+    --argjson retained_bytes "$retained_bytes" \
+    --argjson retained_jobs "$retained_jobs" \
+    --arg retention_status "$retention_check_status" \
     --argjson fa "$failed_oldest_age" \
     --argjson sc "$stale_count" \
     --argjson sa "$stale_oldest_age" \
@@ -1072,6 +1146,10 @@ check_recovery_queue_market() {
     '{ready_count: $rc, ready_oldest_age_seconds: $ra,
       running_count: $uc, running_oldest_age_seconds: $ua,
       failed_count: $fc, failed_oldest_age_seconds: $fa,
+      retained_failed_count:$retained,undisposed_failed_count:$undisposed,
+      invalid_retention_count:$invalid,retained_bytes:$retained_bytes,retained_jobs:$retained_jobs,
+      retention_check_status:$retention_status,
+      historical_data_status:(if $retained>0 then "retained_unrecovered" else null end),
       stale_count: $sc, stale_oldest_age_seconds: $sa,
       malformed_count: $mc, legacy_unreceipted_count: $lc,
       isolation_active: ($ia == 1), isolation_valid: ($iv == 1),
