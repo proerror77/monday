@@ -3665,7 +3665,8 @@ scheduler_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
 scheduler_gate=$(sed -n 's/^V2 Gate receipt: //p' <<<"$scheduler_gate_output")
 scheduler_gate_sha=$(sed -n 's/^SHA-256: //p' <<<"$scheduler_gate_output")
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
-  MONDAY_CUTOVER_FIXTURE_TIMER_ANCHOR_LOST=1 MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_EVIDENCE_COMMIT=1 MONDAY_ROOT="$ROOT" \
+  MONDAY_CUTOVER_FIXTURE_TIMER_ANCHOR_LOST=1 MONDAY_CUTOVER_FIXTURE_PRODUCTION_ACTIVE=1 \
+  MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_EVIDENCE_COMMIT=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$old_scheduler_c" --to "$scheduler_c" \
   --gate-receipt "$scheduler_gate" --gate-sha256 "$scheduler_gate_sha" --root "$ROOT" >"$ROOT/scheduler-rollback.log" 2>&1; then
   printf 'scheduler rollback fault unexpectedly succeeded\n' >&2; exit 1
@@ -3677,6 +3678,15 @@ for asset in binance-lob-archiver-recovery@.service binance-lob-archiver-recover
   cmp "$legacy_work/deployment/$asset" "$target"
 done
 for market in spot usdm; do
+  [[ $(readlink "$ROOT/etc/systemd/system/binance-lob-archiver-production@$market.service") == \
+    "$old_scheduler_release/deployment/binance-lob-archiver-production@.service" ]]
+  [[ $(cat "$ROOT/run/cutover-fixture.processes/binance-lob-archiver-production_${market}.service") == "$old_scheduler_c" ]]
+  scheduler_rollback_start=$(grep -nFx "start binance-lob-archiver-production@$market.service" "$ROOT/run/cutover-fixture.calls" | tail -n1 | cut -d: -f1)
+  scheduler_rollback_fragment=$(grep -nFx "verify-fragment binance-lob-archiver-production@$market.service" "$ROOT/run/cutover-fixture.calls" | tail -n1 | cut -d: -f1)
+  scheduler_rollback_seed=$(grep -nFx "native-defer binance-lob-archiver-recovery@$market.service" "$ROOT/run/cutover-fixture.calls" | cut -d: -f1)
+  scheduler_rollback_timer=$(grep -nFx "start binance-lob-archiver-recovery@$market.timer" "$ROOT/run/cutover-fixture.calls" | tail -n1 | cut -d: -f1)
+  [[ $scheduler_rollback_fragment -lt $scheduler_rollback_start && $scheduler_rollback_start -lt $scheduler_rollback_timer \
+    && $scheduler_rollback_timer -lt $scheduler_rollback_seed ]]
   grep -Fqx "native-defer binance-lob-archiver-recovery@$market.service" "$ROOT/run/cutover-fixture.calls"
   grep -Fq "recovery scheduler bootstrap: market=$market native_defer=true timer_trigger=false" "$ROOT/scheduler-rollback.log"
 done

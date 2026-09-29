@@ -205,7 +205,6 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
           ExecStart) printf '{ path=/opt/monday/bin/monday-rust-lob-recovery-queue ; argv[]=/opt/monday/bin/monday-rust-lob-recovery-queue drain %s ; }\n' "${unit#*@}" | sed 's/\.service ;/ ;/' ;;
           Result) printf 'success\n' ;;
           ExecMainStatus) printf '0\n' ;;
-          FragmentPath) monday_root_join "$ROOT" "etc/systemd/system/binance-lob-archiver-recovery@.${unit##*.}" ;;
           DropInPaths) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_SCHEDULER_DROPIN:-}" ;;
           TimeoutStartUSec)
             if [[ -n ${MONDAY_CUTOVER_FIXTURE_RECOVERY_START_TIMEOUT:-} ]]; then printf '%s\n' "$MONDAY_CUTOVER_FIXTURE_RECOVERY_START_TIMEOUT"
@@ -229,12 +228,18 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
             printf '%s\n' "$fixture_pid" ;;
           RuntimeMaxUSec) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RUNTIME_MAX:-infinity}" ;;
           FragmentPath)
-            printf 'verify-fragment %s\n' "$unit" >>"$fixture_calls"
-            if [[ -e $ROOT/etc/systemd/system/$unit ]]; then
-              printf '%s\n' "$ROOT/etc/systemd/system/$unit"
-            else
-              printf '%s\n' "$ROOT/etc/systemd/system/binance-lob-archiver-production@.service"
-            fi ;;
+            case "$unit" in
+              binance-lob-archiver-recovery@*)
+                monday_root_join "$ROOT" "etc/systemd/system/binance-lob-archiver-recovery@.${unit##*.}" ;;
+              binance-lob-archiver-production@*)
+                printf 'verify-fragment %s\n' "$unit" >>"$fixture_calls"
+                if [[ -e $ROOT/etc/systemd/system/$unit ]]; then
+                  printf '%s\n' "$ROOT/etc/systemd/system/$unit"
+                else
+                  printf '%s\n' "$ROOT/etc/systemd/system/binance-lob-archiver-production@.service"
+                fi ;;
+              *) return 1 ;;
+            esac ;;
           NRestarts) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RESTARTS:-0}" ;;
           *) printf '\n' ;;
         esac
