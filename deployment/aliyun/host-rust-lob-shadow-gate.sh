@@ -875,6 +875,8 @@ is_usdm_top100() {
 candidate_release="$CONTROLLER_ROOT/$CANDIDATE_CONTROLLER"; candidate_deployment="$candidate_release/deployment"
 candidate_manifest="$candidate_release/release.json"
 monday_verify_controller_release "$ROOT" "$CANDIDATE_CONTROLLER" || die 'candidate controller release is not an exact immutable V2 release'
+[[ $(monday_recovery_scheduler_contract_version "$candidate_deployment") == 2 ]] \
+  || die 'candidate recovery scheduler contract is not current'
 [[ $TEST_ONLY == true || $(readlink -f -- "${BASH_SOURCE[0]}") == "$candidate_deployment/host-rust-lob-shadow-gate.sh" ]] || die 'Gate must execute from candidate controller bytes'
 candidate_payload=$(monday_manifest_field "$candidate_manifest" artifact_sha256)
 candidate_runtime=$(monday_manifest_field "$candidate_manifest" runtime_contract_sha256)
