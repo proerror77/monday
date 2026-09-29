@@ -259,6 +259,42 @@ systemctl is-active monday-collector-health.timer
 systemctl status monday-collector-health.service --no-pager -n 5
 ```
 
+For an existing host, deploy the monitor unit separately from a LOB controller
+cutover. The controller bundle owns the health executable, but does not carry
+or project this host-wide unit. Use the unit and
+`host-collector-health-unit-release.sh` from the same exact source revision
+whose required release checks passed. Record the SHA-256 of both staged files,
+verify them after transfer, and pass the current installed unit's SHA-256 as
+the preimage:
+
+```bash
+sudo bash /root/health-release/host-collector-health-unit-release.sh \
+  /root/health-release/monday-collector-health.service \
+  "$UNIT_SHA256" "$INSTALLED_UNIT_SHA256" "$SOURCE_REVISION"
+```
+
+The installer takes one monitor transition lock, stops only the monitor units,
+preserves the old unit, installs atomically, reloads systemd, and verifies the
+effective timeout and fragment. Failure restores the old bytes and timer
+state. Receipts and the rollback backup remain under
+`/data/monday/evidence/health-unit-releases/<unit-sha256>/`. Read back that receipt,
+the installed unit hash, `TimeoutStartUSec`, and timer state independently.
+Then run the installed health executable and observe a real timer invocation;
+a successful unit install alone does not establish healthy data collection.
+Rollback uses the receipt's `before.service` with the same stop/install/reload
+and independent readback procedure, without removing historical monitor state.
+
+The measured 23-job retention scan took 225 seconds on the collector. The
+aggregate reader limit is 300 seconds, its health child 360 seconds, and the
+monitor service and GitHub Cloud Assistant invocation 480 seconds. The workflow
+polls for 600 seconds. The invocation explicitly overrides the stored command's
+older timeout; changing the poll window alone is insufficient. Keep all these
+budgets aligned when the retained index or monitor implementation changes.
+JSON output is compact and reports archive span/break counts instead of copying
+the growing archive lists into Cloud Assistant's bounded stdout buffer. The
+collector's original `health.json` retains those complete lists. Breaches,
+warnings, admission status, and recovery custody semantics are unchanged.
+
 The service must NOT add `ConditionPathIsMountPoint=/data`: the whole point of
 the mount check is to detect and alert when `/data` is missing.
 
