@@ -86,6 +86,13 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
       fixture_unit_load_state[$fixture_legacy_unit]=loaded
     done < <(monday_rust_lob_legacy_writer_units)
   fi
+  if [[ ${MONDAY_CUTOVER_FIXTURE_PRODUCTION_ACTIVE:-0} == 1 ]]; then
+    while IFS= read -r fixture_production_unit; do
+      fixture_unit_state[$fixture_production_unit]=active
+      fixture_unit_file_state[$fixture_production_unit]=enabled
+      fixture_unit_load_state[$fixture_production_unit]=loaded
+    done < <(monday_rust_lob_production_writer_units)
+  fi
   systemctl() {
     local action=${1:-} unit=${2:-} argument fixture_pid fixture_spot_health
     case "$action" in
@@ -123,8 +130,20 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
           case "$action" in
             mask) fixture_unit_file_state[$argument]=masked; fixture_unit_load_state[$argument]=masked ;;
             unmask) fixture_unit_file_state[$argument]=disabled; fixture_unit_load_state[$argument]=loaded ;;
-            disable) fixture_unit_file_state[$argument]=disabled ;;
-            enable) fixture_unit_file_state[$argument]=enabled ;;
+            disable)
+              fixture_unit_file_state[$argument]=disabled
+              if [[ $argument == binance-lob-archiver-production@*.service \
+                && -L $ROOT/etc/systemd/system/$argument ]]; then
+                rm -- "$ROOT/etc/systemd/system/$argument"
+              fi ;;
+            enable)
+              fixture_unit_file_state[$argument]=enabled
+              if [[ $argument == binance-lob-archiver-production@*.service \
+                && ! -e $ROOT/etc/systemd/system/$argument \
+                && ! -L $ROOT/etc/systemd/system/$argument ]]; then
+                ln -s "$(readlink -f -- "$ROOT/etc/systemd/system/binance-lob-archiver-production@.service")" \
+                  "$ROOT/etc/systemd/system/$argument"
+              fi ;;
           esac
           printf '%s %s\n' "$action" "$argument" >>"$fixture_calls"
         done
@@ -174,6 +193,13 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
             fi
             printf '%s\n' "$fixture_pid" ;;
           RuntimeMaxUSec) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RUNTIME_MAX:-infinity}" ;;
+          FragmentPath)
+            printf 'verify-fragment %s\n' "$unit" >>"$fixture_calls"
+            if [[ -e $ROOT/etc/systemd/system/$unit ]]; then
+              printf '%s\n' "$ROOT/etc/systemd/system/$unit"
+            else
+              printf '%s\n' "$ROOT/etc/systemd/system/binance-lob-archiver-production@.service"
+            fi ;;
           NRestarts) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RESTARTS:-0}" ;;
           *) printf '\n' ;;
         esac
@@ -536,12 +562,12 @@ cleanup() {
         systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=true
         if [[ $rollback_failed == false ]]; then
           if [[ $FROM == direct ]]; then
-            monday_rust_lob_restore_writer_snapshot "$writer_snapshot" legacy \
+            monday_rust_lob_restore_writer_snapshot "$writer_snapshot" legacy "$ROOT" "$before_controller" "$TO" \
               || rollback_failed=true
           else
             # A V2 transition may restore only the pre-existing V2 units; old
             # canonical writers must remain permanently contained.
-            monday_rust_lob_restore_writer_snapshot "$writer_snapshot" v2 \
+            monday_rust_lob_restore_writer_snapshot "$writer_snapshot" v2 "$ROOT" "$before_controller" "$TO" \
               || rollback_failed=true
             monday_rust_lob_contain_legacy_writers || rollback_failed=true
             monday_rust_lob_verify_legacy_contained || rollback_failed=true

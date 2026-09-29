@@ -1270,6 +1270,25 @@ Python instance units must be inactive and disabled before the transition; they
 are included in the transition mask so they cannot become a second canonical
 writer.
 
+On a failed V2 cutover after candidate instances have been enabled, rollback
+rebuilds the two previously enabled production instance links against the
+verified previous controller before restarting them. Switching `active` and
+running `enable` alone is insufficient: systemd can retain concrete instance
+links to the candidate template. Only links owned by this transition's exact
+previous/candidate controllers may be replaced. Rollback checks the loaded
+fragment and effective production lifetime before start; unknown links or
+regular files fail closed. Existing masked, disabled and static snapshot paths
+retain their state-restoration behavior.
+
+The Linux unit-file regression uses an already available local image with
+systemctl, Bash, jq and coreutils. It runs without networking or image pulls;
+all system paths are private container tmpfs mounts:
+
+```bash
+MONDAY_SYSTEMD_FIXTURE_IMAGE=kindest/node:v1.36.1 \
+  ./deployment/aliyun/test-rust-lob-rollback-unit-bindings.sh
+```
+
 The drain is bootstrap-safe: it runs the digest-pinned target binary against
 the previous production env. Any `.jsonl.part`, `.zst.tmp`, or `.part.corrupt`
 enters the recovery path; `.part.corrupt` is deliberately refused and blocks
