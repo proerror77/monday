@@ -1776,7 +1776,8 @@ reset_state
 healthy_scenario
 healthy_fixtures
 (
-  # shellcheck source=deployment/aliyun/test-recovery-retention-fixture.sh
+  # shellcheck source-path=SCRIPTDIR
+  # shellcheck source=test-recovery-retention-fixture.sh
   . "$script_dir/test-recovery-retention-fixture.sh"
   setup_retention_fixture "$test_root" health
   retention_fixture_job 800 "$(printf '%064d' 41)" v2

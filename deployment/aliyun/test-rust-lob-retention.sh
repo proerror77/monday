@@ -3,7 +3,8 @@
 # shellcheck disable=SC2034,SC2317,SC2329 # Sourced native functions dynamically consume fixture globals/overrides.
 set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
-# shellcheck source=deployment/aliyun/test-recovery-retention-fixture.sh
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=test-recovery-retention-fixture.sh
 . "$script_dir/test-recovery-retention-fixture.sh"
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
