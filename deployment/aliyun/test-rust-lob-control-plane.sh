@@ -7,12 +7,115 @@ export MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL=monday-v2-fixture
 ROOT=$(readlink -f "$(mktemp -d)")
 fixture_root=$ROOT
 trap 'chmod -R u+w "$ROOT" 2>/dev/null || true; rm -rf "$ROOT"' EXIT
-trap 'status=$?; printf "ERR status=%s line=%s command=%s\n" "$status" "$LINENO" "$BASH_COMMAND" >&2' ERR
+trap 'status=$?; printf "ERR status=%s line=%s command=%s\n" "$status" "$LINENO" "$BASH_COMMAND" >&2; if [[ -n ${scheduler_failure:-} && -f $ROOT/scheduler-rollback-$scheduler_failure.log ]]; then cat "$ROOT/scheduler-rollback-$scheduler_failure.log" >&2; fi' ERR
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/rust-lob-control-plane-lib.sh"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/host-rust-lob-controller-release.sh"
 ROOT=$fixture_root
+
+# Rollback calls this fixture guard from a failing EXIT trap. Bash 5.2 must
+# return the validation result, not the trap's original nonzero exit status.
+fixture_exit_drain_guard() {
+  MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL=$1 \
+    "$BASH" -s -- "$SCRIPT_DIR/rust-lob-control-plane-lib.sh" "$ROOT" <<'GUARD'
+. "$1"
+trap 'monday_rust_lob_require_owned_drain_lock "$2" || exit 72; exit 0' EXIT
+exit 19
+GUARD
+}
+if ! fixture_exit_drain_guard monday-v2-fixture; then
+  printf 'valid fixture drain-lock guard inherited the failing EXIT trap status\n' >&2
+  exit 1
+fi
+if fixture_exit_drain_guard invalid; then
+  printf 'fixture drain-lock guard accepted an invalid sentinel in EXIT cleanup\n' >&2
+  exit 1
+fi
+
+# Sampling may straddle a timer firing or a oneshot exiting. Transient mixed
+# properties must settle to a coherent sample; a persistent bad state stays closed.
+(
+  sample_root=$(mktemp -d "$ROOT/scheduler-samples.XXXXXX")
+  # These overrides are invoked by the sourced scheduler sampler.
+  # shellcheck disable=SC2317,SC2329
+  monday_recovery_scheduler_contract_for_release() { printf '2\n'; }
+  # shellcheck disable=SC2317,SC2329
+  monday_rust_lob_verify_recovery_scheduler_units() { return 0; }
+  # shellcheck disable=SC2317,SC2329
+  systemctl() {
+    local action=$1 unit=${2:-} market property phase reads substate
+    [[ $unit != --quiet ]] || unit=$3
+    market=${unit#*@}; market=${market%.*}
+    case $action in
+      is-enabled|is-active) return 0 ;;
+      show) property=${3#--property=} ;;
+      *) return 2 ;;
+    esac
+    phase=$(cat "$sample_root/$market.phase")
+    reads=$(cat "$sample_root/$market.reads")
+    substate=$(cat "$sample_root/$market.state")
+    case $property in
+      SubState)
+        reads=$((reads + 1)); printf '%s\n' "$reads" >"$sample_root/$market.reads"
+        if [[ $sample_case == confirmation_change && $reads == 2 ]]; then
+          substate=running; printf '%s\n' "$substate" >"$sample_root/$market.state"
+        elif [[ $sample_case == never_coherent ]]; then
+          substate=waiting; (( reads % 2 == 1 )) || substate=running
+        fi
+        printf '%s\n' "$substate" ;;
+      NextElapseUSecMonotonic)
+        if [[ $sample_case == waiting_to_running && $phase == 0 ]]; then
+          printf '1\n' >"$sample_root/$market.phase"
+          printf 'running\n' >"$sample_root/$market.state"
+          printf 'infinity\n'
+        elif [[ $substate == waiting ]]; then printf '1d 2h 3min\n'
+        else printf 'infinity\n'; fi ;;
+      ActiveState)
+        if [[ $sample_case == running_to_waiting && $phase == 0 ]]; then
+          printf '1\n' >"$sample_root/$market.phase"
+          printf 'waiting\n' >"$sample_root/$market.state"
+          printf 'inactive\n'
+        elif [[ $substate == running ]]; then printf 'activating\n'
+        else printf 'inactive\n'; fi ;;
+      Result)
+        if [[ $sample_case == result_reset && $phase == 0 ]]; then
+          printf '1\n' >"$sample_root/$market.phase"; printf '\n'
+        elif [[ $sample_case == failed_result ]]; then printf 'timeout\n'
+        else printf 'success\n'; fi ;;
+      MainPID)
+        if [[ $sample_case == pid_reset && $phase == 0 ]]; then
+          printf '1\n' >"$sample_root/$market.phase"; printf '0\n'
+        elif [[ $sample_case == missing_pid || $substate != running ]]; then printf '0\n'
+        else printf '42\n'; fi ;;
+      *) return 2 ;;
+    esac
+  }
+  for sample_case in waiting_to_running running_to_waiting confirmation_change result_reset pid_reset elapsed failed_result missing_pid never_coherent; do
+    for sample_market in spot usdm; do
+      printf '0\n' >"$sample_root/$sample_market.phase"
+      printf '0\n' >"$sample_root/$sample_market.reads"
+      case $sample_case in
+        waiting_to_running|confirmation_change|never_coherent) printf 'waiting\n' ;;
+        elapsed) printf 'elapsed\n' ;;
+        *) printf 'running\n' ;;
+      esac >"$sample_root/$sample_market.state"
+    done
+    case $sample_case in
+      elapsed|failed_result|missing_pid|never_coherent)
+        if monday_rust_lob_recovery_scheduler_state "$ROOT" "$(printf 'a%.0s' {1..64})" >/dev/null; then
+          printf 'scheduler sampling accepted persistent invalid state: %s\n' "$sample_case" >&2; exit 1
+        fi
+        sample_reads=$(cat "$sample_root/spot.reads")
+        [[ $sample_reads -ge 3 && $sample_reads -le 6 ]] ;;
+      *)
+        sample=$(monday_rust_lob_recovery_scheduler_state "$ROOT" "$(printf 'a%.0s' {1..64})")
+        expected_sample=running; [[ $sample_case != running_to_waiting ]] || expected_sample=waiting
+        jq -e --arg state "$expected_sample" 'all(.[]; .substate == $state)' <<<"$sample" >/dev/null
+        [[ $(cat "$sample_root/spot.reads") -ge 3 && $(cat "$sample_root/usdm.reads") -ge 3 ]] ;;
+    esac
+  done
+)
 
 # Resource Envelope V2 is a single immutable runtime contract: the production
 # template and its aggregate slice carry the pair cap, while each sequential
@@ -528,7 +631,7 @@ publish_fixture() {
       topology:"stable",artifact_uri:$uri,artifact_sha256:$sha,
       runtime_contract_sha256:$runtime,deployment_source_revision:$source,
       deployment_bundle_uri:$bundle,deployment_bundle_sha256:$bundle_sha}' >"$manifest"
-  publish_controller_release "$payload" "$bundle" "$manifest" "$ROOT" >/dev/null
+  publish_controller_release "$payload" "$bundle" "$manifest" "$ROOT" >/dev/null || return 1
   rm -f "$bundle"
   printf '%s\n' "$payload_sha"
 }
@@ -606,6 +709,15 @@ for asset in host-rust-lob-recovery-queue.sh monday-collector-health.sh; do
   # legacy files from the verified active controller, rather than silently
   # accepting whichever bytes happened to be left on disk.
   printf '\n# legacy C0 helper projection fixture\n' >>"$legacy_work/deployment/$asset"
+done
+# The old host installed unmanaged recovery units, including an unbounded
+# oneshot timeout. Preserve these exact bytes as the migration/rollback input.
+for asset in binance-lob-archiver-recovery@.service binance-lob-archiver-recovery@.timer; do
+  sed -e 's/^OnActiveSec=10min$/OnBootSec=10min/' \
+    -e 's/^TimeoutStartSec=7200$/TimeoutStartSec=0/' -e '/^TimeoutStopSec=120$/d' \
+    "$source_dir/$asset" >"$legacy_work/deployment/$asset"
+  chmod 0640 "$legacy_work/deployment/$asset"
+  cp -p -- "$legacy_work/deployment/$asset" "$ROOT/etc/systemd/system/$asset"
 done
 mkdir -p "$legacy_root/$legacy_c0/deployment"
 cp -p -- "$legacy_work/release.json" "$legacy_root/$legacy_c0/release.json"
@@ -991,6 +1103,7 @@ fi
 [[ $(readlink -- "$direct_production") == "$direct_production_before" ]]
 [[ $(monday_rust_lob_live_runtime_contract_sha256_v1 "$ROOT") == "$legacy_delta_runtime" ]]
 if [[ ! -f $payload_delta_recovery || -L $payload_delta_recovery ]]; then
+  cat "$ROOT/run/payload-delta-precommit.err" >&2
   printf 'pre-commit hard crash did not preserve its recovery intent\n' >&2
   exit 1
 fi
@@ -1254,6 +1367,7 @@ jq -e --arg transition "$payload_delta_transition" \
 # Return to the immutable legacy pair so the remaining direct-bootstrap
 # rejection and ordinary success cases keep their original starting state.
 rm -rf -- "$ROOT/data/monday/evidence/restores/$c1"
+chmod -R u+w "$ROOT/data/monday/evidence/cutovers/$c1" 2>/dev/null || true
 rm -rf -- "$ROOT/data/monday/evidence/cutovers/$c1"
 rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
 ln -s "$legacy_root/$legacy_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
@@ -1930,6 +2044,7 @@ hard_crash_retry_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
 grep -Fq 'Pair cutover complete' <<<"$hard_crash_retry_output"
 [[ $(monday_active_controller_sha "$ROOT") == "$c0" ]]
 [[ ! -e $legacy_hard_crash_recovery && ! -L $legacy_hard_crash_recovery ]]
+chmod -R u+w "$ROOT/data/monday/evidence/cutovers/$c0" 2>/dev/null || true
 rm -rf -- "$ROOT/data/monday/evidence/cutovers/$c0"
 rm -f -- "$ROOT/opt/monday/releases/binance-lob-controller/active"
 ln -s "$legacy_root/$legacy_c0" "$ROOT/opt/monday/releases/binance-lob-controller/active"
@@ -2146,6 +2261,7 @@ ln -s "$mixed_production_target" "$ROOT/opt/monday/bin/binance-lob-archiver"
 simulate_recovery_execstartpre() {
   local asset target expected
   while IFS= read -r asset; do
+    [[ $asset == *.sh ]] || continue
     target=$(monday_controller_projection_target "$ROOT" "$asset")
     expected="$ROOT/opt/monday/releases/binance-lob-controller/active/deployment/$asset"
     bash -c 'set -eu
@@ -2952,6 +3068,15 @@ run_readback_fixture() {
   fi
 }
 run_readback_fixture success
+for scheduler_sequence in waiting,running running,waiting; do
+  MONDAY_READBACK_FIXTURE_TIMER_SEQUENCE=$scheduler_sequence run_readback_fixture success
+  jq -e --arg before "${scheduler_sequence%%,*}" --arg after "${scheduler_sequence##*,}" '
+    .recovery_scheduler_observations.before.spot.substate == $before
+    and .recovery_scheduler_observations.after.spot.substate == $after
+    and .recovery_scheduler_observations.before.spot.next_elapse_monotonic
+      != .recovery_scheduler_observations.after.spot.next_elapse_monotonic
+  ' "$readback_out" >/dev/null
+done
 run_readback_fixture unsynced
 run_readback_fixture gaps
 run_readback_fixture nonready
@@ -3460,5 +3585,225 @@ if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT=/ \
   printf 'Readback accepted an unsafe production root in test mode\n' >&2
   exit 1
 fi
+
+# A signed stable V2 controller can predate scheduler projections. Model the
+# deployed C1: nine stable runtime assets, two helper projections, old regular
+# service bytes and an OnBoot timer. This is immutable historical data, never
+# published through the new candidate publisher.
+source_dir="$ROOT/scheduler-source"
+mkdir -p "$source_dir"
+for asset in "${assets[@]}"; do cp "$SCRIPT_DIR/$asset" "$source_dir/$asset"; done
+old_scheduler_stage="$ROOT/old-scheduler-controller"
+mkdir -p "$old_scheduler_stage/deployment"
+cp -p "$source_dir/"* "$old_scheduler_stage/deployment/"
+sed 's/OnActiveSec=10min/OnBootSec=10min/' \
+  "$source_dir/binance-lob-archiver-recovery@.timer" \
+  >"$old_scheduler_stage/deployment/binance-lob-archiver-recovery@.timer"
+COPYFILE_DISABLE=1 tar -C "$old_scheduler_stage/deployment" -cf "$ROOT/old-scheduler.tar" "${assets[@]}"
+jq -cS --arg bundle_sha "$(monday_sha256_file "$ROOT/old-scheduler.tar")" \
+  '.deployment_bundle_sha256 = $bundle_sha' "$m2" >"$old_scheduler_stage/release.json"
+old_scheduler_c=$(monday_sha256_file "$old_scheduler_stage/release.json")
+old_scheduler_release="$legacy_root/$old_scheduler_c"
+mv "$old_scheduler_stage" "$old_scheduler_release"
+ln -s "$ROOT/opt/monday/releases/binance-lob-archiver/$p2_sha/binance-lob-archiver" \
+  "$old_scheduler_release/binance-lob-archiver"
+(cd "$old_scheduler_release" && sha256sum release.json >release.json.sha256 \
+  && for asset in deployment/*; do monday_sha256_checksum_line "$asset"; done | sort -k2 >deployment.sha256)
+chmod -R a-w "$old_scheduler_release"
+monday_verify_controller_release "$ROOT" "$old_scheduler_c"
+[[ $(monday_recovery_scheduler_contract_for_release "$ROOT" "$old_scheduler_c") == 1 ]]
+[[ $(monday_controller_projection_assets_for_release "$ROOT" "$old_scheduler_c" | wc -l | tr -d ' ') == 2 ]]
+
+reset_old_scheduler_topology() {
+  monday_atomic_symlink "$old_scheduler_release" "$legacy_root/active"
+  for asset in binance-lob-archiver-recovery@.service binance-lob-archiver-recovery@.timer; do
+    target=$(monday_controller_projection_target "$ROOT" "$asset")
+    rm -f -- "$target"
+    cp "$legacy_work/deployment/$asset" "$target"
+    chmod 0640 "$target"
+  done
+  rm -f "$ROOT/run/cutover-fixture.calls" "$ROOT/run/restore-fixture.calls"
+}
+
+# The new publisher must reject a wrong first trigger or unbounded candidate
+# timeout, even when all manifest/checksum identities are recomputed.
+for invalid_scheduler in delay timeout; do
+  saved_scheduler_source=$source_dir
+  source_dir="$ROOT/scheduler-invalid-$invalid_scheduler"
+  mkdir -p "$source_dir"; cp "$saved_scheduler_source/"* "$source_dir/"
+  if [[ $invalid_scheduler == delay ]]; then
+    sed 's/OnActiveSec=10min/OnActiveSec=1min/' "$source_dir/binance-lob-archiver-recovery@.timer" >"$ROOT/scheduler-invalid"
+    cp "$ROOT/scheduler-invalid" "$source_dir/binance-lob-archiver-recovery@.timer"
+  else
+    sed 's/TimeoutStartSec=7200/TimeoutStartSec=0/' "$source_dir/binance-lob-archiver-recovery@.service" >"$ROOT/scheduler-invalid"
+    cp "$ROOT/scheduler-invalid" "$source_dir/binance-lob-archiver-recovery@.service"
+  fi
+  if (publish_fixture "$ROOT/invalid-scheduler-$invalid_scheduler" "$ROOT/invalid-scheduler-$invalid_scheduler.json") >/dev/null 2>&1; then
+    printf 'publisher accepted invalid scheduler %s\n' "$invalid_scheduler" >&2; exit 1
+  fi
+  source_dir=$saved_scheduler_source
+ done
+
+for scheduler_crash in active partial complete; do
+  reset_old_scheduler_topology
+  scheduler_manifest="$ROOT/scheduler-$scheduler_crash.json"
+  publish_fixture "$ROOT/scheduler-$scheduler_crash" "$scheduler_manifest" >/dev/null
+  scheduler_c=$(monday_sha256_file "$scheduler_manifest")
+  scheduler_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+    "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$old_scheduler_c" \
+    --candidate-controller "$scheduler_c" --root "$ROOT")
+  scheduler_gate=$(sed -n 's/^V2 Gate receipt: //p' <<<"$scheduler_gate_output")
+  scheduler_gate_sha=$(sed -n 's/^SHA-256: //p' <<<"$scheduler_gate_output")
+  scheduler_crash_env=MONDAY_CUTOVER_HARD_CRASH_AFTER_ACTIVE=1
+  [[ $scheduler_crash != partial ]] || scheduler_crash_env=MONDAY_CUTOVER_HARD_CRASH_AFTER_SCHEDULER_SERVICE=1
+  [[ $scheduler_crash != complete ]] || scheduler_crash_env=MONDAY_CUTOVER_HARD_CRASH_AFTER_SCHEDULER_TIMER=1
+  if env MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 "$scheduler_crash_env" MONDAY_ROOT="$ROOT" \
+    "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$old_scheduler_c" --to "$scheduler_c" \
+    --gate-receipt "$scheduler_gate" --gate-sha256 "$scheduler_gate_sha" --root "$ROOT" >/dev/null 2>&1; then
+    printf 'stable scheduler crash fixture survived %s\n' "$scheduler_crash" >&2; exit 1
+  fi
+  [[ $(monday_active_controller_sha "$ROOT") == "$scheduler_c" ]]
+  scheduler_cutover_dir="$ROOT/data/monday/evidence/cutovers/$scheduler_c"
+  scheduler_intent="$scheduler_cutover_dir/recovery.json"
+  scheduler_record="$scheduler_cutover_dir/recovery-scheduler-before.json"
+  [[ -f $scheduler_intent && ! -e $scheduler_cutover_dir/transition.json ]]
+  jq -e --arg from "$old_scheduler_c" --arg gate "$scheduler_gate" --arg sha "$scheduler_gate_sha" \
+    '.from_source_mode == "stable" and .from_controller_sha256 == $from
+      and .gate_receipt == $gate and .gate_sha256 == $sha' "$scheduler_intent" >/dev/null
+  monday_validate_scheduler_migration_record "$ROOT" "$scheduler_c" "$old_scheduler_c"
+  if monday_validate_scheduler_migration_record "$ROOT" "$scheduler_c" ''; then
+    printf 'migration evidence supplied its own missing Gate authority\n' >&2; exit 1
+  fi
+  # Missing authority and changed Gate bytes cannot start a writer or repair
+  # a projection. Existing fail-closed cleanup still contains every writer.
+  mv "$scheduler_intent" "$scheduler_intent.saved"
+  if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 MONDAY_ROOT="$ROOT" \
+    "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$scheduler_c" --root "$ROOT" >/dev/null 2>&1; then
+    printf 'stable scheduler restore accepted missing recovery intent\n' >&2; exit 1
+  fi
+  if [[ -e $ROOT/run/restore-fixture.calls ]] && grep -Eq '^(start|unmask|enable|daemon-reload)' "$ROOT/run/restore-fixture.calls"; then
+    printf 'unauthorized scheduler recovery started a writer\n' >&2; exit 1
+  fi
+  [[ ! -e $ROOT/data/monday/evidence/restores/$scheduler_c/restore.json ]]
+  rm -f "$ROOT/run/restore-fixture.calls"
+  jq --arg gate "$gate3" '.gate_receipt = $gate' "$scheduler_intent.saved" >"$scheduler_intent"
+  chmod 0440 "$scheduler_intent"
+  if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 MONDAY_ROOT="$ROOT" \
+    "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$scheduler_c" --root "$ROOT" >/dev/null 2>&1; then
+    printf 'stable scheduler restore accepted a different Gate\n' >&2; exit 1
+  fi
+  if [[ -e $ROOT/run/restore-fixture.calls ]] && grep -Eq '^(start|unmask|enable|daemon-reload)' "$ROOT/run/restore-fixture.calls"; then
+    printf 'unauthorized scheduler recovery started a writer\n' >&2; exit 1
+  fi
+  [[ ! -e $ROOT/data/monday/evidence/restores/$scheduler_c/restore.json ]]
+  rm -f "$ROOT/run/restore-fixture.calls"
+  rm "$scheduler_intent"; mv "$scheduler_intent.saved" "$scheduler_intent"
+  # Backup completeness, original metadata, and backup bytes are independently
+  # bound. An intact before.json cannot excuse a deleted evidence.files entry.
+  cp -p "$scheduler_record" "$scheduler_record.saved"
+  chmod u+w "$scheduler_record"
+  jq 'del(.evidence.files["binance-lob-archiver-recovery@.timer"])' "$scheduler_record.saved" >"$scheduler_record"
+  chmod 0440 "$scheduler_record"
+  if monday_validate_scheduler_migration_record "$ROOT" "$scheduler_c" "$old_scheduler_c"; then
+    printf 'scheduler backup omitted one present template\n' >&2; exit 1
+  fi
+  rm "$scheduler_record"; mv "$scheduler_record.saved" "$scheduler_record"
+  scheduler_backup=$(jq -r '.evidence.path' "$scheduler_record")
+  scheduler_backup_timer="$scheduler_backup/binance-lob-archiver-recovery@.timer"
+  # A recorded gid drift must fail even with matching bytes/mode/uid.
+  if [[ $scheduler_crash != complete ]]; then
+    cp -p "$scheduler_record" "$ROOT/scheduler-record-$scheduler_crash.saved"
+    cp -p "$scheduler_backup/before.json" "$ROOT/scheduler-before-$scheduler_crash.saved"
+    chmod u+w "$scheduler_record" "$scheduler_backup/before.json"
+    jq '.before["binance-lob-archiver-recovery@.timer"].gid |= (tonumber + 1 | tostring)' \
+      "$ROOT/scheduler-record-$scheduler_crash.saved" >"$scheduler_record"
+    jq '.before' "$scheduler_record" >"$scheduler_backup/before.json"
+    chmod 0440 "$scheduler_record" "$scheduler_backup/before.json"
+    if monday_verify_scheduler_migration_before "$ROOT" "$scheduler_c" binance-lob-archiver-recovery@.timer \
+      "$(monday_controller_projection_target "$ROOT" binance-lob-archiver-recovery@.timer)" "$old_scheduler_c"; then
+      printf 'scheduler migration accepted gid drift\n' >&2; exit 1
+    fi
+    chmod u+w "$scheduler_record" "$scheduler_backup/before.json"
+    cp -p "$ROOT/scheduler-record-$scheduler_crash.saved" "$scheduler_record"
+    cp -p "$ROOT/scheduler-before-$scheduler_crash.saved" "$scheduler_backup/before.json"
+  fi
+  cp -p "$scheduler_backup_timer" "$ROOT/scheduler-backup-$scheduler_crash.saved"
+  chmod u+w "$scheduler_backup_timer"; printf '\nchanged\n' >>"$scheduler_backup_timer"; chmod 0440 "$scheduler_backup_timer"
+  if monday_validate_scheduler_migration_record "$ROOT" "$scheduler_c" "$old_scheduler_c"; then
+    printf 'scheduler backup accepted damaged original bytes\n' >&2; exit 1
+  fi
+  chmod u+w "$scheduler_backup_timer"; cp -p "$ROOT/scheduler-backup-$scheduler_crash.saved" "$scheduler_backup_timer"
+  mkdir -p "$ROOT/proc/4242" "$production_spool_root/spot" "$production_spool_root/usdm"
+  rm -f "$ROOT/proc/4242/exe" "$ROOT/run/restore-fixture-health.stop" \
+    "$ROOT/run/restore-fixture-start-spot" "$ROOT/run/restore-fixture-start-usdm" \
+    "$production_spool_root/spot/health.json" "$production_spool_root/usdm/health.json"
+  ln -s "$(readlink -f "$ROOT/opt/monday/bin/binance-lob-archiver")" "$ROOT/proc/4242/exe"
+  (write_restore_fixture_health success) &
+  scheduler_health_writer=$!
+  if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 MONDAY_RESTORE_FIXTURE_PID=4242 \
+    MONDAY_RESTORE_HEALTH_TIMEOUT_SECONDS=3 MONDAY_ROOT="$ROOT" \
+    "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$scheduler_c" --root "$ROOT" >/dev/null; then
+    scheduler_restore_status=0
+  else scheduler_restore_status=$?; fi
+  : >"$ROOT/run/restore-fixture-health.stop"
+  wait "$scheduler_health_writer"
+  [[ $scheduler_restore_status == 0 && ! -e $scheduler_intent ]]
+  monday_verify_controller_projections "$ROOT" "$scheduler_c"
+  rm "$ROOT/run/restore-fixture.calls"
+  MONDAY_CONTROL_PLANE_TEST=1 MONDAY_RESTORE_FIXTURE_SYSTEMD=1 MONDAY_RESTORE_FIXTURE_PID=4242 MONDAY_ROOT="$ROOT" \
+    "$SCRIPT_DIR/host-rust-lob-restore.sh" --controller "$scheduler_c" --root "$ROOT" >/dev/null
+  if [[ -e $ROOT/run/restore-fixture.calls ]] && grep -Eq '^(start|stop|mask|unmask|enable|disable|daemon-reload)' "$ROOT/run/restore-fixture.calls"; then
+    printf 'stable scheduler repeat restore mutated systemd\n' >&2; exit 1
+  fi
+done
+
+# A normal failed C2 migration restores exact legacy bytes/metadata and seeds
+# the old timer only after it is active, while the native global lock is owned.
+for scheduler_failure in scheduler-enable transition-evidence; do
+reset_old_scheduler_topology
+publish_fixture "$ROOT/scheduler-rollback-$scheduler_failure" "$ROOT/scheduler-rollback-$scheduler_failure.json" >/dev/null
+scheduler_c=$(monday_sha256_file "$ROOT/scheduler-rollback-$scheduler_failure.json")
+scheduler_gate_output=$(MONDAY_CONTROL_PLANE_TEST=1 MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-shadow-gate.sh" --from-controller "$old_scheduler_c" \
+  --candidate-controller "$scheduler_c" --root "$ROOT")
+scheduler_gate=$(sed -n 's/^V2 Gate receipt: //p' <<<"$scheduler_gate_output")
+scheduler_gate_sha=$(sed -n 's/^SHA-256: //p' <<<"$scheduler_gate_output")
+scheduler_failure_env=MONDAY_CUTOVER_FAIL_AFTER_TRANSITION_EVIDENCE_COMMIT=1
+[[ $scheduler_failure != scheduler-enable ]] || scheduler_failure_env=MONDAY_CUTOVER_FAIL_AFTER_RECOVERY_SCHEDULERS=1
+if env MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
+  MONDAY_CUTOVER_FIXTURE_TIMER_ANCHOR_LOST=1 MONDAY_CUTOVER_FIXTURE_PRODUCTION_ACTIVE=1 \
+  "$scheduler_failure_env" MONDAY_ROOT="$ROOT" \
+  "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$old_scheduler_c" --to "$scheduler_c" \
+  --gate-receipt "$scheduler_gate" --gate-sha256 "$scheduler_gate_sha" --root "$ROOT" >"$ROOT/scheduler-rollback-$scheduler_failure.log" 2>&1; then
+  printf 'scheduler rollback fault unexpectedly succeeded\n' >&2; exit 1
+fi
+[[ $(monday_active_controller_sha "$ROOT") == "$old_scheduler_c" ]]
+for asset in binance-lob-archiver-recovery@.service binance-lob-archiver-recovery@.timer; do
+  target=$(monday_controller_projection_target "$ROOT" "$asset")
+  [[ ! -L $target && $(monday_file_mode "$target") == 640 ]]
+  cmp "$legacy_work/deployment/$asset" "$target"
+done
+for market in spot usdm; do
+  scheduler_timer="binance-lob-archiver-recovery@$market.timer"
+  grep -Fqx "bind-timer $scheduler_timer $legacy_root/$scheduler_c/deployment/binance-lob-archiver-recovery@.timer" "$ROOT/run/cutover-fixture.calls"
+  [[ ! -e $ROOT/etc/systemd/system/$scheduler_timer && ! -L $ROOT/etc/systemd/system/$scheduler_timer ]]
+  scheduler_candidate_timer_start=$(grep -nFx "start $scheduler_timer" "$ROOT/run/cutover-fixture.calls" | head -n1 | cut -d: -f1)
+  scheduler_candidate_timer_disable=$(grep -nFx "disable $scheduler_timer" "$ROOT/run/cutover-fixture.calls" | tail -n1 | cut -d: -f1)
+  [[ $(readlink "$ROOT/etc/systemd/system/binance-lob-archiver-production@$market.service") == \
+    "$old_scheduler_release/deployment/binance-lob-archiver-production@.service" ]]
+  [[ $(cat "$ROOT/run/cutover-fixture.processes/binance-lob-archiver-production_${market}.service") == "$old_scheduler_c" ]]
+  scheduler_rollback_start=$(grep -nFx "start binance-lob-archiver-production@$market.service" "$ROOT/run/cutover-fixture.calls" | tail -n1 | cut -d: -f1)
+  scheduler_rollback_fragment=$(grep -nFx "verify-fragment binance-lob-archiver-production@$market.service" "$ROOT/run/cutover-fixture.calls" | tail -n1 | cut -d: -f1)
+  scheduler_rollback_seed=$(grep -nFx "native-defer binance-lob-archiver-recovery@$market.service" "$ROOT/run/cutover-fixture.calls" | cut -d: -f1)
+  scheduler_rollback_timer=$(grep -nFx "start binance-lob-archiver-recovery@$market.timer" "$ROOT/run/cutover-fixture.calls" | tail -n1 | cut -d: -f1)
+  [[ $scheduler_candidate_timer_start -lt $scheduler_candidate_timer_disable \
+    && $scheduler_candidate_timer_disable -lt $scheduler_rollback_fragment \
+    && $scheduler_rollback_fragment -lt $scheduler_rollback_start && $scheduler_rollback_start -lt $scheduler_rollback_timer \
+    && $scheduler_rollback_timer -lt $scheduler_rollback_seed ]]
+  grep -Fqx "native-defer binance-lob-archiver-recovery@$market.service" "$ROOT/run/cutover-fixture.calls"
+  grep -Fq "recovery scheduler bootstrap: market=$market native_defer=true timer_trigger=false" "$ROOT/scheduler-rollback-$scheduler_failure.log"
+done
+
+done
 
 printf 'V2 Gate contract passed\n'

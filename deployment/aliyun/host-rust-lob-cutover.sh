@@ -73,7 +73,7 @@ fi
 FIXTURE_SYSTEMD=false
 if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
   FIXTURE_SYSTEMD=true
-  declare -A fixture_unit_state=() fixture_unit_file_state=() fixture_unit_load_state=()
+  declare -A fixture_unit_state=() fixture_unit_file_state=() fixture_unit_load_state=() fixture_recovery_anchor=()
   fixture_calls=$(monday_root_join "$ROOT" run/cutover-fixture.calls)
   fixture_process_root=$(monday_root_join "$ROOT" run/cutover-fixture.processes)
   mkdir -p "$(dirname -- "$fixture_calls")"
@@ -94,7 +94,7 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
     done < <(monday_rust_lob_production_writer_units)
   fi
   systemctl() {
-    local action=${1:-} unit=${2:-} argument fixture_pid fixture_spot_health
+    local action=${1:-} unit=${2:-} argument fixture_pid fixture_spot_health fixture_template
     case "$action" in
       start)
         for argument in "$@"; do
@@ -109,6 +109,13 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
               printf 'start %s\n' "$argument" >>"$fixture_calls"
               return 1
             fi
+          fi
+          if [[ $argument == binance-lob-archiver-recovery@*.service ]]; then
+            [[ ${MONDAY_CUTOVER_FIXTURE_RECOVERY_DEFER_FAIL:-0} != 1 ]] || return 1
+            fixture_unit_state[$argument]=inactive
+            fixture_recovery_anchor[${argument%.service}.timer]=1
+            printf 'native-defer %s\n' "$argument" >>"$fixture_calls"
+            continue
           fi
           fixture_unit_state[$argument]=active
           [[ -n ${fixture_unit_file_state[$argument]:-} ]] || fixture_unit_file_state[$argument]=enabled
@@ -132,17 +139,25 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
             unmask) fixture_unit_file_state[$argument]=disabled; fixture_unit_load_state[$argument]=loaded ;;
             disable)
               fixture_unit_file_state[$argument]=disabled
-              if [[ $argument == binance-lob-archiver-production@*.service \
+              if [[ ($argument == binance-lob-archiver-production@*.service || $argument == binance-lob-archiver-recovery@*.timer) \
                 && -L $ROOT/etc/systemd/system/$argument ]]; then
                 rm -- "$ROOT/etc/systemd/system/$argument"
               fi ;;
             enable)
               fixture_unit_file_state[$argument]=enabled
-              if [[ $argument == binance-lob-archiver-production@*.service \
+              fixture_template=
+              case "$argument" in
+                binance-lob-archiver-production@*.service) fixture_template=binance-lob-archiver-production@.service ;;
+                binance-lob-archiver-recovery@*.timer) fixture_template=binance-lob-archiver-recovery@.timer ;;
+              esac
+              if [[ -n $fixture_template && -L $ROOT/etc/systemd/system/$fixture_template \
                 && ! -e $ROOT/etc/systemd/system/$argument \
                 && ! -L $ROOT/etc/systemd/system/$argument ]]; then
-                ln -s "$(readlink -f -- "$ROOT/etc/systemd/system/binance-lob-archiver-production@.service")" \
+                ln -s "$(readlink -f -- "$ROOT/etc/systemd/system/$fixture_template")" \
                   "$ROOT/etc/systemd/system/$argument"
+                if [[ $argument == binance-lob-archiver-recovery@*.timer ]]; then
+                  printf 'bind-timer %s %s\n' "$argument" "$(readlink "$ROOT/etc/systemd/system/$argument")" >>"$fixture_calls"
+                fi
               fi ;;
           esac
           printf '%s %s\n' "$action" "$argument" >>"$fixture_calls"
@@ -178,7 +193,34 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
         case "$property" in
           LoadState) printf '%s\n' "${fixture_unit_load_state[$unit]:-loaded}" ;;
           ActiveState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'active\n' || printf 'inactive\n' ;;
-          SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
+          SubState)
+            if [[ $unit == binance-lob-archiver-recovery@*.timer ]]; then
+              if [[ ${MONDAY_CUTOVER_FIXTURE_TIMER_ANCHOR_LOST:-0} == 1 \
+                && ${fixture_recovery_anchor[${unit%@*}@${unit#*@}]:-0} == 0 \
+                && $(sed -n 's/^OnBootSec=//p' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.timer)") == 10min ]]; then
+                printf 'elapsed\n'
+              else printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_TIMER_SUBSTATE:-waiting}"; fi
+            elif [[ ${fixture_unit_state[$unit]:-inactive} == active ]]; then printf 'running\n'
+            else printf 'dead\n'; fi ;;
+          NextElapseUSecMonotonic)
+            if [[ $(systemctl show "$unit" --property=SubState --value) == elapsed ]]; then printf 'infinity\n'
+            else printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_TIMER_NEXT:-1000000}"; fi ;;
+          TimersMonotonic)
+            if grep -Fqx 'OnActiveSec=10min' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.timer)"; then
+              printf '{ OnActiveUSec=10min ; next_elapse=1000000 }\n'
+            else printf '{ OnBootUSec=10min ; next_elapse=1000000 }\n'; fi
+            printf '{ OnUnitInactiveUSec=15min ; next_elapse=1000000 }\n' ;;
+          ExecStart) printf '{ path=/opt/monday/bin/monday-rust-lob-recovery-queue ; argv[]=/opt/monday/bin/monday-rust-lob-recovery-queue drain %s ; }\n' "${unit#*@}" | sed 's/\.service ;/ ;/' ;;
+          Result) printf 'success\n' ;;
+          ExecMainStatus) printf '0\n' ;;
+          DropInPaths) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_SCHEDULER_DROPIN:-}" ;;
+          TimeoutStartUSec)
+            if [[ -n ${MONDAY_CUTOVER_FIXTURE_RECOVERY_START_TIMEOUT:-} ]]; then printf '%s\n' "$MONDAY_CUTOVER_FIXTURE_RECOVERY_START_TIMEOUT"
+            elif grep -Fqx 'TimeoutStartSec=0' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.service)"; then printf 'infinity\n'
+            else printf '2h\n'; fi ;;
+          TimeoutStopUSec)
+            if grep -Fqx 'TimeoutStopSec=120' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.service)"; then printf '2min\n'
+            else printf '1min 30s\n'; fi ;;
           UnitFileState) printf '%s\n' "${fixture_unit_file_state[$unit]:-disabled}" ;;
           MainPID)
             fixture_pid=${MONDAY_CUTOVER_FIXTURE_PID:-$$}
@@ -194,12 +236,22 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
             printf '%s\n' "$fixture_pid" ;;
           RuntimeMaxUSec) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RUNTIME_MAX:-infinity}" ;;
           FragmentPath)
-            printf 'verify-fragment %s\n' "$unit" >>"$fixture_calls"
-            if [[ -e $ROOT/etc/systemd/system/$unit ]]; then
-              printf '%s\n' "$ROOT/etc/systemd/system/$unit"
-            else
-              printf '%s\n' "$ROOT/etc/systemd/system/binance-lob-archiver-production@.service"
-            fi ;;
+            case "$unit" in
+              binance-lob-archiver-recovery@*)
+                if [[ -e $ROOT/etc/systemd/system/$unit ]]; then
+                  printf '%s\n' "$ROOT/etc/systemd/system/$unit"
+                else
+                  monday_root_join "$ROOT" "etc/systemd/system/binance-lob-archiver-recovery@.${unit##*.}"
+                fi ;;
+              binance-lob-archiver-production@*)
+                printf 'verify-fragment %s\n' "$unit" >>"$fixture_calls"
+                if [[ -e $ROOT/etc/systemd/system/$unit ]]; then
+                  printf '%s\n' "$ROOT/etc/systemd/system/$unit"
+                else
+                  printf '%s\n' "$ROOT/etc/systemd/system/binance-lob-archiver-production@.service"
+                fi ;;
+              *) return 1 ;;
+            esac ;;
           NRestarts) printf '%s\n' "${MONDAY_CUTOVER_FIXTURE_RESTARTS:-0}" ;;
           *) printf '\n' ;;
         esac
@@ -304,6 +356,8 @@ else
   before_runtime=$(monday_manifest_field "$before_release/release.json" runtime_contract_sha256)
   [[ -L $production && $(readlink -- "$production") == "$stable_projection" ]] \
     || die 'production binary is not the stable active projection'
+  before_production_projection=$(readlink -- "$production") \
+    || die 'stable production projection is unreadable'
   [[ $(readlink -f -- "$production") == \
     "$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-archiver/$before_payload/binance-lob-archiver")" ]] \
     || die 'production payload does not match the before controller'
@@ -356,6 +410,11 @@ mapfile -t CONTROLLER_PROJECTION_ASSETS < <(monday_controller_projection_assets)
 readonly CONTROLLER_PROJECTION_ASSETS
 declare -A asset_target asset_state asset_sha asset_before_target asset_mode
 declare -A controller_projection_target controller_projection_state controller_projection_before_target controller_projection_mode
+declare -A controller_projection_before_sha controller_projection_uid controller_projection_gid
+before_scheduler_version=$(monday_recovery_scheduler_contract_for_release "$ROOT" "$before_controller") \
+  || die 'before recovery scheduler contract is unknown'
+[[ $(monday_recovery_scheduler_contract_version "$target_release/deployment") == 2 ]] \
+  || die 'target recovery scheduler contract is not current'
 for asset in "${PAIR_ASSETS[@]}"; do
   asset_target[$asset]=$(monday_runtime_asset_target "$ROOT" "$asset") || die "unknown runtime asset: $asset"
   asset_mode[$asset]=0644; [[ $asset == *.env ]] && asset_mode[$asset]=0640
@@ -391,8 +450,16 @@ for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
     resolved=$(readlink -f -- "$target") || die "controller projection is dangling: $asset"
     monday_file_direct "$resolved" || die "controller projection target is not a file: $asset"
     controller_projection_state[$asset]=projection
+    controller_projection_before_sha[$asset]=$(monday_sha256_file "$resolved")
   elif [[ -f $target ]]; then
     controller_projection_state[$asset]=present
+    controller_projection_before_sha[$asset]=$(monday_sha256_file "$target")
+    controller_projection_mode[$asset]=$(monday_file_mode "$target") || die "controller projection mode is unavailable: $asset"
+    controller_projection_uid[$asset]=$(monday_file_uid "$target") || die "controller projection owner is unavailable: $asset"
+    controller_projection_gid[$asset]=$(stat -c %g -- "$target" 2>/dev/null || stat -f %g -- "$target") || die "controller projection group is unavailable: $asset"
+    [[ $((8#${controller_projection_mode[$asset]} & 022)) == 0 \
+      && (${controller_projection_uid[$asset]} == 0 || $TEST_ONLY == true) ]] \
+      || die "unsafe regular controller projection: $asset"
   elif [[ ! -e $target ]]; then
     controller_projection_state[$asset]=absent
   else
@@ -403,6 +470,11 @@ if [[ $FROM == direct ]]; then
   # Legacy C0 control bytes are read-only rollback evidence.  Bootstrap backs
   # up the fixed entrypoints but never sources or executes those bytes.
   for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
+    if [[ $asset == binance-lob-archiver-recovery@.* ]]; then
+      [[ ${controller_projection_state[$asset]} == present || ${controller_projection_state[$asset]} == absent ]] \
+        || die "direct scheduler projection is indirect: $asset"
+      continue
+    fi
     [[ ${controller_projection_state[$asset]} == present ]] \
       || die "direct bootstrap controller projection is absent: $asset"
     legacy_asset="$before_release/deployment/$asset"
@@ -413,6 +485,10 @@ if [[ $FROM == direct ]]; then
   done
 else
   for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
+    if [[ $before_scheduler_version == 1 && $asset == binance-lob-archiver-recovery@.* \
+      && (${controller_projection_state[$asset]} == present || ${controller_projection_state[$asset]} == absent) ]]; then
+      continue # The two legacy scheduler files are explicitly captured below.
+    fi
     [[ ${controller_projection_state[$asset]} == projection ]] \
       || die "before controller projection is not stable: $asset"
     resolved=$(readlink -f -- "${controller_projection_target[$asset]}") \
@@ -447,9 +523,46 @@ backup_root="$tmp_root/backup"; controller_backup_root="$backup_root/controller"
 writer_snapshot="$tmp_root/writer-state.tsv"
 monday_rust_lob_writer_state_snapshot >"$writer_snapshot" \
   || die 'could not snapshot canonical writer states'
+scheduler_projection_prepared=0; scheduler_migration_evidence=null; before_controller_projections='{}'
 committed=0; projection_prepared=0; production_prepared=0; writer_containment_started=0; writer_containment_failed=0
+restore_scheduler_topology() {
+  local asset target temporary
+  for asset in binance-lob-archiver-recovery@.service binance-lob-archiver-recovery@.timer; do
+    target=${controller_projection_target[$asset]}
+    if [[ -L $target ]]; then
+      [[ $(readlink -- "$target") == "$active_link/deployment/$asset" ]] || return 1
+    elif [[ -e $target ]]; then
+      [[ ${controller_projection_state[$asset]} == present ]] || return 1
+      monday_file_direct "$target" || return 1
+      [[ $(monday_sha256_file "$target") == "${controller_projection_before_sha[$asset]}" \
+        && $(monday_file_mode "$target") == "${controller_projection_mode[$asset]}" \
+        && $(monday_file_uid "$target") == "${controller_projection_uid[$asset]}" \
+        && $(stat -c %g -- "$target" 2>/dev/null || stat -f %g -- "$target") == "${controller_projection_gid[$asset]}" ]] || return 1
+      continue
+    elif [[ ${controller_projection_state[$asset]} != absent ]]; then
+      return 1
+    fi
+    case ${controller_projection_state[$asset]} in
+      present)
+        temporary="$target.rollback.$$"
+        [[ ! -e $temporary && ! -L $temporary ]] || return 1
+        [[ $(monday_sha256_file "$controller_backup_root/$asset") == "${controller_projection_before_sha[$asset]}" ]] || return 1
+        cp -p -- "$controller_backup_root/$asset" "$temporary" || return 1
+        mv -f -- "$temporary" "$target" || return 1
+        [[ ! -L $target && $(monday_sha256_file "$target") == "${controller_projection_before_sha[$asset]}" \
+          && $(monday_file_mode "$target") == "${controller_projection_mode[$asset]}" \
+          && $(monday_file_uid "$target") == "${controller_projection_uid[$asset]}" \
+          && $(stat -c %g -- "$target" 2>/dev/null || stat -f %g -- "$target") == "${controller_projection_gid[$asset]}" ]] || return 1
+        ;;
+      absent) rm -f -- "$target" || return 1 ;;
+      projection) : ;; # active rollback restores this stable target's bytes.
+      *) return 1 ;;
+    esac
+  done
+  sync -f "$(monday_root_join "$ROOT" etc/systemd/system)"
+}
 restore_direct_topology() {
-  local asset target state
+  local asset target state temporary
   for asset in "${PAIR_ASSETS[@]}"; do
     target=${asset_target[$asset]}; state=${asset_state[$asset]}
     case "$state" in
@@ -466,10 +579,13 @@ restore_direct_topology() {
     esac
   done
   for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
+    [[ $asset == binance-lob-archiver-recovery@.* ]] && continue
     target=${controller_projection_target[$asset]}; state=${controller_projection_state[$asset]}
     case "$state" in
       present)
-        install -m "${controller_projection_mode[$asset]}" "$controller_backup_root/$asset" "$target" 2>/dev/null || return 1
+        temporary="$target.rollback.$$"
+        cp -p -- "$controller_backup_root/$asset" "$temporary" 2>/dev/null || return 1
+        mv -f -- "$temporary" "$target" 2>/dev/null || return 1
         ;;
       absent)
         rm -f -- "$target" 2>/dev/null || return 1
@@ -502,10 +618,20 @@ cleanup() {
     exit "$status"
   fi
   if (( status != 0 )); then
-    if [[ $FROM != direct ]] && (( committed == 1 )); then
+    if (( writer_containment_started == 1 )) && [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
+      # Enabling a projected timer installs a fixed candidate-C instance link.
+      # Remove it while candidate topology still resolves; otherwise restoring
+      # the old regular template leaves systemd pinned to the failed candidate.
+      monday_rust_lob_contain_recovery_schedulers || rollback_failed=true
+      monday_rust_lob_verify_recovery_schedulers_contained || rollback_failed=true
+    fi
+    if [[ $FROM != direct && $rollback_failed == false ]] && (( committed == 1 )); then
       if rollback_active; then committed=0; else rollback_failed=true; fi
     fi
-    if (( production_prepared == 1 )); then
+    if (( scheduler_projection_prepared == 1 )) && [[ $rollback_failed == false ]]; then
+      restore_scheduler_topology || rollback_failed=true
+    fi
+    if (( production_prepared == 1 )) && [[ $rollback_failed == false ]]; then
       rm -f -- "$production" || rollback_failed=true
       if [[ $FROM == direct ]]; then
         if [[ -n ${old_production_target:-} ]]; then
@@ -517,7 +643,7 @@ cleanup() {
         ln -s "$stable_projection" "$production" || rollback_failed=true
       fi
     fi
-    if (( projection_prepared == 1 )) && [[ $FROM == direct ]]; then
+    if (( projection_prepared == 1 )) && [[ $FROM == direct && $rollback_failed == false ]]; then
       restore_direct_topology || rollback_failed=true
     fi
     # Keep active=C1 as the recovery authority until raw P0/R0 and incomplete
@@ -575,7 +701,7 @@ cleanup() {
           # Recovery timers are part of the V2 runtime contract.  Re-enable
           # them only after the previous writer state has been restored; a
           # failed rollback keeps the complete scheduler set contained below.
-          monday_rust_lob_enable_recovery_schedulers || rollback_failed=true
+          monday_rust_lob_enable_recovery_schedulers "$ROOT" "$before_controller" || rollback_failed=true
         fi
         if [[ $rollback_failed == false ]]; then
           monday_rust_lob_verify_writer_state_snapshot() {
@@ -613,10 +739,70 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' HUP INT TERM
 
-# Bootstrap is the only migration that converts regular files to static
-# projections.  All bytes are saved before the active rename; V2 transitions
-# perform no live per-file write at all.  The active rename is deliberately
-# first so an interrupted bootstrap has one authoritative recovery source.
+# Freeze the two legacy scheduler templates before any runtime mutation.
+# Their bytes may predate the active controller; they are rollback evidence,
+# never candidate authority. Keep a read-only copy after success/failure.
+for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
+  target=${controller_projection_target[$asset]}
+  state=${controller_projection_state[$asset]}
+  if [[ $state == present ]]; then
+    cp -p -- "$target" "$controller_backup_root/$asset"
+    [[ $(monday_sha256_file "$controller_backup_root/$asset") == "${controller_projection_before_sha[$asset]}" \
+      && $(monday_file_mode "$target") == "${controller_projection_mode[$asset]}" \
+      && $(monday_file_uid "$target") == "${controller_projection_uid[$asset]}" \
+      && $(stat -c %g -- "$target" 2>/dev/null || stat -f %g -- "$target") == "${controller_projection_gid[$asset]}" ]] \
+      || die "controller projection changed while being frozen: $asset"
+    if [[ $asset == binance-lob-archiver-recovery@.* ]]; then
+      if [[ $scheduler_migration_evidence == null ]]; then
+        mkdir -p "$receipt_root/$TO"
+        monday_path_direct "$receipt_root/$TO" || die 'scheduler evidence parent is indirect'
+        scheduler_backup=$(mktemp -d "$receipt_root/$TO/scheduler-before.XXXXXX")
+        scheduler_migration_evidence=$(jq -cn --arg path "$scheduler_backup" '{path:$path,files:{}}')
+      fi
+      cp -p -- "$controller_backup_root/$asset" "$scheduler_backup/$asset"
+      chmod 0440 "$scheduler_backup/$asset"
+      scheduler_migration_evidence=$(jq -cn --argjson state "$scheduler_migration_evidence" \
+        --arg asset "$asset" --arg sha "${controller_projection_before_sha[$asset]}" \
+        '$state | .files[$asset]=$sha')
+    fi
+  fi
+  before_controller_projections=$(jq -cn --argjson values "$before_controller_projections" \
+    --arg asset "$asset" --arg state "$state" --arg sha "${controller_projection_before_sha[$asset]:-}" \
+    --arg target "${controller_projection_before_target[$asset]:-}" \
+    --arg mode "${controller_projection_mode[$asset]}" \
+    --arg uid "${controller_projection_uid[$asset]:-}" --arg gid "${controller_projection_gid[$asset]:-}" \
+    '$values + {($asset):{state:$state,sha256:$sha,target:$target,mode:$mode,uid:$uid,gid:$gid}}')
+done
+if [[ $scheduler_migration_evidence != null ]]; then
+  printf '%s\n' "$before_controller_projections" >"$scheduler_backup/before.json"
+  chmod 0440 "$scheduler_backup/before.json"; chmod 0550 "$scheduler_backup"
+  sync -f "$scheduler_backup"
+  scheduler_migration_record="$receipt_root/$TO/recovery-scheduler-before.json"
+  scheduler_record_tmp="$tmp_root/recovery-scheduler-before.json"
+  jq -cn --arg from "$before_controller" --arg to "$TO" \
+    --argjson before "$before_controller_projections" --argjson evidence "$scheduler_migration_evidence" \
+    '{schema:"monday.rust_lob_recovery_scheduler_migration.v1",from_controller:$from,controller:$to,before:$before,evidence:$evidence}' >"$scheduler_record_tmp"
+  if [[ -e $scheduler_migration_record || -L $scheduler_migration_record ]]; then
+    monday_validate_scheduler_migration_record "$ROOT" "$TO" "$before_controller" \
+      || die 'existing scheduler migration record failed immutable validation'
+    jq -e --arg from "$before_controller" --arg to "$TO" --argjson before "$before_controller_projections" \
+      '.from_controller == $from and .controller == $to and .before == $before' \
+      "$scheduler_migration_record" >/dev/null || die 'scheduler migration record differs from current before state'
+    scheduler_migration_evidence=$(jq -ce '.evidence' "$scheduler_migration_record")
+  else
+    install -m 0440 "$scheduler_record_tmp" "$scheduler_migration_record.new.$$"
+    ln -- "$scheduler_migration_record.new.$$" "$scheduler_migration_record" \
+      || die 'scheduler migration record already exists'
+    rm -f -- "$scheduler_migration_record.new.$$"
+    sync -f "$scheduler_migration_record"; sync -f "$receipt_root/$TO"
+  fi
+  monday_validate_scheduler_migration_record "$ROOT" "$TO" "$before_controller" \
+    || die 'scheduler migration evidence failed readback before mutation'
+fi
+
+# Freeze all legacy regular bytes before active commits. Direct bootstrap
+# migrates the runtime/helpers; the scheduler migration also applies to old
+# stable controllers whose service/timer templates were never projected.
 old_production_target=$(readlink -- "$production" 2>/dev/null || true)
 if [[ $FROM == direct ]]; then
   [[ -n $old_production_target ]] || die 'bootstrap production projection is unresolved'
@@ -630,6 +816,7 @@ if [[ $FROM == direct ]]; then
     cp -p -- "${asset_target[$asset]}" "$backup_root/$asset"
   done
   for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
+    [[ $asset == binance-lob-archiver-recovery@.* ]] && continue
     [[ ${controller_projection_state[$asset]} == present ]] \
       || die "bootstrap controller projection is not a direct file: $asset"
     mkdir -p "$controller_backup_root/$(dirname -- "$asset")"
@@ -665,7 +852,10 @@ if [[ $FROM == direct ]]; then
     || die 'bootstrap legacy runtime contract disappeared after stopping lanes'
   [[ $live_runtime_after_stop == "$before_runtime" ]] \
     || die 'bootstrap runtime contract changed after stopping lanes'
-
+fi
+if [[ $FROM == direct || $before_scheduler_version == 1 ]]; then
+  recovery_source_mode=stable
+  [[ $FROM == direct ]] && recovery_source_mode=direct
   # The active link is the atomic pair commit, but the fixed production and
   # runtime projections are repaired immediately afterwards.  Persist the
   # exact Gate-authorized P0/R0 first so Restore can recover the intervening
@@ -679,12 +869,12 @@ if [[ $FROM == direct ]]; then
   [[ ! -e $recovery_intent_tmp && ! -L $recovery_intent_tmp ]] \
     || die 'cutover recovery intent temporary path already exists'
   jq -cS -n --arg from "$before_controller" --arg to "$TO" \
-    --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" \
+    --arg source_mode "$recovery_source_mode" --arg before_payload "$before_payload" --arg before_runtime "$before_runtime" \
     --arg before_projection "$before_production_projection" \
     --arg payload "$target_payload" --arg runtime "$target_runtime" \
     --arg gate "$GATE" --arg gate_sha "$GATE_SHA" \
     '{schema:"monday.rust_lob_pair_cutover_recovery.v1",control_plane_version:2,
-      operation:"cutover",from_source_mode:"direct",from_controller_sha256:$from,
+      operation:"cutover",from_source_mode:$source_mode,from_controller_sha256:$from,
       controller_sha256:$to,before_payload_sha256:$before_payload,
       before_runtime_contract_sha256:$before_runtime,
       before_production_projection:$before_projection,payload_sha256:$payload,
@@ -711,7 +901,7 @@ if [[ $FROM == direct ]]; then
         || die 'existing cutover recovery intent has no Gate path'
       existing_recovery_gate_sha=$(jq -er '.gate_sha256' "$recovery_intent") \
         || die 'existing cutover recovery intent has no Gate digest'
-      monday_validate_v2_gate_authoritative "$ROOT" "$existing_recovery_gate" direct \
+      monday_validate_v2_gate_authoritative "$ROOT" "$existing_recovery_gate" "$FROM" \
         "$TO" "$existing_recovery_gate_sha" \
         || die 'existing cutover recovery intent Gate is not authoritative'
       jq -e --arg from "$before_controller" --arg to "$TO" \
@@ -777,6 +967,19 @@ if [[ ${MONDAY_CUTOVER_FAIL_AFTER_ASSET_STAGE:-0} == 1 ]]; then
   die 'fault injection after static projection stage before active commit'
 fi
 
+for asset in binance-lob-archiver-recovery@.service binance-lob-archiver-recovery@.timer; do
+  target=${controller_projection_target[$asset]}
+  case ${controller_projection_state[$asset]} in
+    present)
+      [[ ! -L $target && $(monday_sha256_file "$target") == "${controller_projection_before_sha[$asset]}" \
+        && $(monday_file_mode "$target") == "${controller_projection_mode[$asset]}" \
+        && $(monday_file_uid "$target") == "${controller_projection_uid[$asset]}" \
+      && $(stat -c %g -- "$target" 2>/dev/null || stat -f %g -- "$target") == "${controller_projection_gid[$asset]}" ]] \
+        || die "scheduler template changed before active commit: $asset" ;;
+    absent) [[ ! -e $target && ! -L $target ]] || die "scheduler appeared before active commit: $asset" ;;
+  esac
+done
+
 # Atomic active rename is the sole pair commit.  No live runtime asset is
 # copied before it; bootstrap projections are repaired only after active=C1
 # and are therefore recoverable from the active controller after a crash.
@@ -800,6 +1003,7 @@ link_controller_projections() {
 }
 if [[ $FROM == direct ]]; then
   production_prepared=1
+  scheduler_projection_prepared=1
   link_controller_projections
   for asset in "${PAIR_ASSETS[@]}"; do
     link_projection "${asset_target[$asset]}" "$active_link/deployment/$asset" \
@@ -811,6 +1015,26 @@ else
   [[ -L $production && $(readlink -- "$production") == "$stable_projection" ]] \
     || die 'stable production projection is not active'
 fi
+if [[ $FROM != direct ]]; then
+  scheduler_projection_prepared=1
+  for asset in binance-lob-archiver-recovery@.service binance-lob-archiver-recovery@.timer; do
+    target=${controller_projection_target[$asset]}
+    if [[ ${controller_projection_state[$asset]} != projection ]]; then
+      link_projection "$target" "$active_link/deployment/$asset" \
+        || die "could not migrate scheduler projection: $asset"
+      if [[ $TEST_ONLY == true && $asset == binance-lob-archiver-recovery@.service \
+        && ${MONDAY_CUTOVER_HARD_CRASH_AFTER_SCHEDULER_SERVICE:-0} == 1 ]]; then
+        kill -KILL "$$"
+      fi
+      if [[ $TEST_ONLY == true && $asset == binance-lob-archiver-recovery@.timer \
+        && ${MONDAY_CUTOVER_HARD_CRASH_AFTER_SCHEDULER_TIMER:-0} == 1 ]]; then
+        kill -KILL "$$"
+      fi
+    fi
+  done
+fi
+monday_verify_controller_projections "$ROOT" "$TO" || die 'target controller projections failed readback'
+
 # Re-read the exact static production contract after the active pair and all
 # projections are prepared, but before any production process is started.
 # This closes the identity window between Gate authorization and systemd.
@@ -979,8 +1203,11 @@ verify_production_process() {
 }
 verify_production_process
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
-  monday_rust_lob_enable_recovery_schedulers \
+  monday_rust_lob_enable_recovery_schedulers "$ROOT" "$TO" \
     || die 'recovery schedulers did not become active and enabled after cutover'
+  if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FAIL_AFTER_RECOVERY_SCHEDULERS:-0} == 1 ]]; then
+    die 'fault injection after recovery scheduler enable before transition evidence'
+  fi
 fi
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   monday_rust_lob_verify_legacy_contained \
@@ -1009,13 +1236,8 @@ for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
 done
 recovery_scheduler_state='{}'
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
-  for recovery_timer in $(monday_rust_lob_recovery_timer_units); do
-    recovery_market=${recovery_timer#binance-lob-archiver-recovery@}
-    recovery_market=${recovery_market%.timer}
-    recovery_scheduler_state=$(jq -cn --argjson values "$recovery_scheduler_state" \
-      --arg market "$recovery_market" --arg timer "$recovery_timer" \
-      '$values + {($market):{unit:$timer,active:true,enabled:true}}')
-  done
+  recovery_scheduler_state=$(monday_rust_lob_recovery_scheduler_state "$ROOT" "$TO") \
+    || die 'recovery scheduler contract changed before transition receipt'
 fi
 
 # Commit the active pair and every persistent projection before publishing
@@ -1066,7 +1288,8 @@ source_mode=stable
   --arg projection "$stable_projection" --argjson evidence "$gate_evidence" \
   --argjson production_runtime "$gate_production_runtime" --argjson production_process "$production_process" \
   --argjson recovery_schedulers "$recovery_scheduler_state" \
-  --argjson before_assets "$before_assets" \
+  --argjson before_assets "$before_assets" --argjson before_controller_projections "$before_controller_projections" \
+  --argjson scheduler_migration_evidence "$scheduler_migration_evidence" \
   --argjson installed_assets "$installed_assets" --argjson installed_projections "$installed_projections" \
   --argjson installed_controller_projections "$installed_controller_projections" \
   --argjson test_only "$TEST_ONLY" --argjson eligible "$( [[ $TEST_ONLY == true ]] && printf false || printf true )" \
@@ -1079,7 +1302,8 @@ source_mode=stable
     gate_evidence:$evidence,active_pair_committed:true,completed_at:$completed,completed_at_ns:$completed_ns,
     stable_production_projection:$stable,production_projection:$projection,
     before:{controller:$from,payload_sha256:$before_payload,runtime_contract_sha256:$before_runtime,
-      production_projection:$stable,assets:$before_assets},
+      production_projection:$stable,assets:$before_assets,controller_projections:$before_controller_projections},
+    scheduler_migration_evidence:$scheduler_migration_evidence,
     installed_assets:$installed_assets,installed_projections:$installed_projections,
     installed_controller_projections:$installed_controller_projections,result:"success"}' >"$transition_tmp"
 chmod 0640 "$transition_tmp"

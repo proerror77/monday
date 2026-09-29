@@ -340,7 +340,8 @@ monday_validate_v2_transition() {
   }
   phases='["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"]'
   runtime_keys=$(monday_runtime_assets | jq -Rsc 'split("\n") | map(select(length>0))')
-  controller_keys=$(monday_controller_projection_assets | jq -Rsc 'split("\n") | map(select(length>0))')
+  controller_keys=$(monday_controller_projection_assets_for_release "$ROOT_PREFIX" "$fixture_new_c" \
+    | jq -Rsc 'split("\n") | map(select(length>0))')
   jq -cn --arg payload "$fixture_payload" --arg runtime "$fixture_runtime" --arg from "$fixture_old_c" \
     --argjson phases "$phases" \
     '{candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,
@@ -362,7 +363,9 @@ monday_validate_v2_transition() {
       stable_production_projection:"/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver",
       before:{controller:$from,payload_sha256:$payload,runtime_contract_sha256:$runtime,
         production_projection:"/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver",
+        controller_projections:($controllers|map({key:.,value:{state:"absent",sha256:null,target:null}})|from_entries),
         assets:($assets|map({key:.,value:{state:"absent",sha256:null}})|from_entries)},
+      scheduler_migration_evidence:null,
       installed_assets:($assets|map({key:.,value:$payload})|from_entries),
       installed_projections:($assets|map({key:.,value:"fixture"})|from_entries),
       installed_controller_projections:($controllers|map({key:.,value:{sha256:$payload,
@@ -372,7 +375,10 @@ monday_validate_v2_transition() {
     "$fixture_old_c" "$fixture_new_c" "$fixture/validator-gate.json" "$fixture_transition_sha" \
     || fail 'valid conditional-context transition fixture was rejected'
   for mutation in '.controller_sha256="wrong"' '.active_pair_committed=false' \
-    '.gate_evidence.markets.spot={wrong:true}' '.production_runtime={wrong:true}'; do
+    '.gate_evidence.markets.spot={wrong:true}' '.production_runtime={wrong:true}' \
+    'del(.before.controller_projections)' \
+    'del(.before.controller_projections["binance-lob-archiver-recovery@.timer"])' \
+    'del(.installed_controller_projections["binance-lob-archiver-recovery@.service"])'; do
     jq "$mutation" "$fixture/validator-transition.json" >"$fixture/validator-invalid.json"
     if fixture_real_transition_validator "$ROOT_PREFIX" "$fixture/validator-invalid.json" \
       "$fixture_old_c" "$fixture_new_c" "$fixture/validator-gate.json" "$fixture_transition_sha"; then

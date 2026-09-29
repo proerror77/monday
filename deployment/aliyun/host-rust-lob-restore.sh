@@ -46,7 +46,7 @@ fi
 FIXTURE_SYSTEMD=false
 if [[ $TEST_ONLY == true && ${MONDAY_RESTORE_FIXTURE_SYSTEMD:-0} == 1 ]]; then
   FIXTURE_SYSTEMD=true
-  declare -A fixture_unit_state=() fixture_unit_file_state=() fixture_unit_load_state=()
+  declare -A fixture_unit_state=() fixture_unit_file_state=() fixture_unit_load_state=() fixture_recovery_anchor=()
   fixture_calls=$(monday_root_join "$ROOT" run/restore-fixture.calls)
   mkdir -p "$(dirname -- "$fixture_calls")"
   # A second idempotent invocation is a new shell process, so model the
@@ -81,6 +81,13 @@ if [[ $TEST_ONLY == true && ${MONDAY_RESTORE_FIXTURE_SYSTEMD:-0} == 1 ]]; then
         if [[ ${MONDAY_RESTORE_FIXTURE_FAIL_USDM:-0} == 1 && $unit == *'@usdm.service' ]]; then
           printf 'start %s\n' "$unit" >>"$fixture_calls"
           return 1
+        fi
+        if [[ $unit == binance-lob-archiver-recovery@*.service ]]; then
+          [[ ${MONDAY_RESTORE_FIXTURE_RECOVERY_DEFER_FAIL:-0} != 1 ]] || return 1
+          fixture_unit_state[$unit]=inactive
+          fixture_recovery_anchor[${unit%.service}.timer]=1
+          printf 'native-defer %s\n' "$unit" >>"$fixture_calls"
+          return 0
         fi
         fixture_unit_state[$unit]=active
         [[ -n ${fixture_unit_file_state[$unit]:-} ]] || fixture_unit_file_state[$unit]=enabled
@@ -135,7 +142,35 @@ if [[ $TEST_ONLY == true && ${MONDAY_RESTORE_FIXTURE_SYSTEMD:-0} == 1 ]]; then
         case "$property" in
           LoadState) printf '%s\n' "${fixture_unit_load_state[$unit]:-loaded}" ;;
           ActiveState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'active\n' || printf 'inactive\n' ;;
-          SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
+          SubState)
+            if [[ $unit == binance-lob-archiver-recovery@*.timer ]]; then
+              if [[ ${MONDAY_RESTORE_FIXTURE_TIMER_ANCHOR_LOST:-0} == 1 \
+                && ${fixture_recovery_anchor[${unit%@*}@${unit#*@}]:-0} == 0 \
+                && $(sed -n 's/^OnBootSec=//p' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.timer)") == 10min ]]; then
+                printf 'elapsed\n'
+              else printf '%s\n' "${MONDAY_RESTORE_FIXTURE_TIMER_SUBSTATE:-waiting}"; fi
+            elif [[ ${fixture_unit_state[$unit]:-inactive} == active ]]; then printf 'running\n'
+            else printf 'dead\n'; fi ;;
+          NextElapseUSecMonotonic)
+            if [[ $(systemctl show "$unit" --property=SubState --value) == elapsed ]]; then printf 'infinity\n'
+            else printf '%s\n' "${MONDAY_RESTORE_FIXTURE_TIMER_NEXT:-1000000}"; fi ;;
+          TimersMonotonic)
+            if grep -Fqx 'OnActiveSec=10min' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.timer)"; then
+              printf '{ OnActiveUSec=10min ; next_elapse=1000000 }\n'
+            else printf '{ OnBootUSec=10min ; next_elapse=1000000 }\n'; fi
+            printf '{ OnUnitInactiveUSec=15min ; next_elapse=1000000 }\n' ;;
+          ExecStart) printf '{ path=/opt/monday/bin/monday-rust-lob-recovery-queue ; argv[]=/opt/monday/bin/monday-rust-lob-recovery-queue drain %s ; }\n' "${unit#*@}" | sed 's/\.service ;/ ;/' ;;
+          Result) printf 'success\n' ;;
+          ExecMainStatus) printf '0\n' ;;
+          FragmentPath) monday_root_join "$ROOT" "etc/systemd/system/binance-lob-archiver-recovery@.${unit##*.}" ;;
+          DropInPaths) printf '%s\n' "${MONDAY_RESTORE_FIXTURE_SCHEDULER_DROPIN:-}" ;;
+          TimeoutStartUSec)
+            if [[ -n ${MONDAY_RESTORE_FIXTURE_RECOVERY_START_TIMEOUT:-} ]]; then printf '%s\n' "$MONDAY_RESTORE_FIXTURE_RECOVERY_START_TIMEOUT"
+            elif grep -Fqx 'TimeoutStartSec=0' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.service)"; then printf 'infinity\n'
+            else printf '2h\n'; fi ;;
+          TimeoutStopUSec)
+            if grep -Fqx 'TimeoutStopSec=120' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.service)"; then printf '2min\n'
+            else printf '1min 30s\n'; fi ;;
           UnitFileState) printf '%s\n' "${fixture_unit_file_state[$unit]:-disabled}" ;;
           MainPID) printf '%s\n' "${MONDAY_RESTORE_FIXTURE_PID:-${fixture_pid_from_receipt:-$$}}" ;;
           RuntimeMaxUSec) printf '%s\n' "${MONDAY_RESTORE_FIXTURE_RUNTIME_MAX:-infinity}" ;;
@@ -232,6 +267,7 @@ process_started_at_ns() {
 verify_existing_restore_state() {
   local receipt=$1 expected_runtime=$2 receipt_only=${3:-false} stable_binary expected resolved asset target
   local named_transition named_gate named_gate_sha receipt_gate receipt_gate_sha transition_from transition_mode transition_validator_from
+  local receipt_source_mode receipt_validator_from
   local receipt_process receipt_health market unit pid restarts exe env_file spool health dataset minimum_symbols
   local expected_exe expected_session expected_observed current_session updated now_ns process_started_ns
   [[ $receipt_only == true || $receipt_only == false ]] || die 'restore receipt verification mode is invalid'
@@ -287,18 +323,31 @@ verify_existing_restore_state() {
     if [[ -n $receipt_gate || -n $receipt_gate_sha ]]; then
       [[ -n $receipt_gate && -n $receipt_gate_sha ]] \
         || die 'existing restore recovery Gate identity is incomplete'
-      monday_validate_v2_gate_authoritative "$ROOT" "$receipt_gate" direct \
+      receipt_source_mode=$(jq -er '.source_mode' "$receipt_gate") || die 'existing restore Gate has no source mode'
+      case "$receipt_source_mode" in
+        direct) receipt_validator_from=direct ;;
+        stable) receipt_validator_from=$(jq -er '.from_controller_sha256' "$receipt_gate") \
+          || die 'existing restore Gate has no before controller' ;;
+        *) die 'existing restore Gate source mode is invalid' ;;
+      esac
+      monday_validate_v2_gate_authoritative "$ROOT" "$receipt_gate" "$receipt_validator_from" \
         "$CONTROLLER" "$receipt_gate_sha" \
         || die 'existing restore recovery Gate is not authoritative'
       jq -e --arg payload "$payload" --arg runtime "$runtime" \
         --argjson test_only "$TEST_ONLY" '
           .candidate_payload_sha256 == $payload
           and .candidate_runtime_contract_sha256 == $runtime
-          and .source_mode == "direct"
           and .test_only == $test_only
           and .production_eligible == ($test_only | not)
         ' "$receipt_gate" >/dev/null \
         || die 'existing restore recovery Gate differs from the active pair'
+      if [[ -e $cutover_root/$CONTROLLER/recovery-scheduler-before.json || -L $cutover_root/$CONTROLLER/recovery-scheduler-before.json ]]; then
+        monday_validate_scheduler_migration_record "$ROOT" "$CONTROLLER" \
+          "$(jq -er '.from_controller_sha256' "$receipt_gate")" \
+          || die 'existing restore scheduler migration differs from its Gate'
+      fi
+    elif [[ -e $cutover_root/$CONTROLLER/recovery-scheduler-before.json || -L $cutover_root/$CONTROLLER/recovery-scheduler-before.json ]]; then
+      die 'existing scheduler migration restore receipt has no Gate authority'
     fi
   fi
 
@@ -364,6 +413,9 @@ verify_existing_restore_state() {
     cmp -s "$resolved" "$release/deployment/$asset" \
       || die "existing restore runtime projection bytes drifted: $asset"
   done < <(monday_runtime_assets)
+  local controller_projection_assets
+  controller_projection_assets=$(monday_controller_projection_assets_for_release "$ROOT" "$CONTROLLER") \
+    || die 'existing restore controller projection contract is invalid'
   while IFS= read -r asset; do
     target=$(monday_controller_projection_target "$ROOT" "$asset") \
       || die "existing restore controller projection path is invalid: $asset"
@@ -374,7 +426,7 @@ verify_existing_restore_state() {
     monday_file_direct "$resolved" || die "existing restore controller projection is indirect: $asset"
     cmp -s "$resolved" "$release/deployment/$asset" \
       || die "existing restore controller projection bytes drifted: $asset"
-  done < <(monday_controller_projection_assets)
+  done <<<"$controller_projection_assets"
 
   # A test-only restore without a fixture systemd view deliberately does not
   # claim live production.  Its immutable evidence and projections were
@@ -386,7 +438,7 @@ verify_existing_restore_state() {
 
   monday_rust_lob_verify_legacy_contained \
     || die 'existing restore legacy writers are not contained'
-  monday_rust_lob_verify_recovery_schedulers_active \
+  monday_rust_lob_verify_recovery_schedulers_active "$ROOT" "$CONTROLLER" \
     || die 'existing restore recovery timers are not active and enabled'
   for market in spot usdm; do
     unit="binance-lob-archiver-production@${market}.service"
@@ -490,8 +542,8 @@ if [[ -e $active_transition_receipt || -L $active_transition_receipt ]]; then
   fi
 fi
 
-# A power loss can leave a direct bootstrap with active=C1 while one or more
-# fixed projections still carry Gate-authorized C0/P0/R0 bytes.  The durable
+# A power loss can leave active=C1 while bootstrap or scheduler-migration
+# projections still carry Gate-authorized C0/P0/R0 bytes.  The durable
 # recovery intent names that one exact Gate; without it only active-C bytes are
 # accepted.
 cutover_root=$(monday_root_join "$ROOT" data/monday/evidence/cutovers)
@@ -507,7 +559,15 @@ if [[ -e $recovery_intent || -L $recovery_intent ]]; then
     || die 'cutover recovery intent has no Gate path'
   recovery_gate_sha=$(jq -er '.gate_sha256' "$recovery_intent") \
     || die 'cutover recovery intent has no Gate digest'
-  monday_validate_v2_gate_authoritative "$ROOT" "$recovery_gate" direct \
+  recovery_source_mode=$(jq -er '.from_source_mode' "$recovery_intent") \
+    || die 'cutover recovery intent has no source mode'
+  case "$recovery_source_mode" in
+    direct) recovery_validator_from=direct ;;
+    stable) recovery_validator_from=$(jq -er '.from_controller_sha256' "$recovery_intent") \
+      || die 'cutover recovery intent has no before controller' ;;
+    *) die 'cutover recovery intent source mode is invalid' ;;
+  esac
+  monday_validate_v2_gate_authoritative "$ROOT" "$recovery_gate" "$recovery_validator_from" \
     "$CONTROLLER" "$recovery_gate_sha" \
     || die 'cutover recovery intent Gate is not authoritative'
   if [[ $TEST_ONLY == false ]]; then
@@ -526,7 +586,7 @@ if [[ -e $recovery_intent || -L $recovery_intent ]]; then
   recovery_before_projection=$(jq -er '.before.production_projection' "$recovery_gate") \
     || die 'cutover recovery Gate has no before production projection'
   jq -e --arg controller "$CONTROLLER" --arg payload "$payload" --arg runtime "$runtime" \
-    --arg from "$recovery_before_controller" --arg before_payload "$recovery_before_payload" \
+    --arg source_mode "$recovery_source_mode" --arg from "$recovery_before_controller" --arg before_payload "$recovery_before_payload" \
     --arg before_runtime "$recovery_before_runtime" \
     --arg before_projection "$recovery_before_projection" \
     --arg gate "$recovery_gate" --arg gate_sha "$recovery_gate_sha" '
@@ -539,7 +599,7 @@ if [[ -e $recovery_intent || -L $recovery_intent ]]; then
       ]
       and .schema == "monday.rust_lob_pair_cutover_recovery.v1"
       and .control_plane_version == 2 and .operation == "cutover"
-      and .from_source_mode == "direct"
+      and .from_source_mode == $source_mode
       and .from_controller_sha256 == $from
       and .controller_sha256 == $controller
       and .before_payload_sha256 == $before_payload
@@ -708,7 +768,16 @@ for asset in $(monday_runtime_assets); do
     die "runtime projection is indirect: $asset"
   fi
 done
-for asset in $(monday_controller_projection_assets); do
+scheduler_migration_record="$cutover_root/$CONTROLLER/recovery-scheduler-before.json"
+if [[ -e $scheduler_migration_record || -L $scheduler_migration_record ]]; then
+  [[ $recovery_intent_valid == true || -n $transition_receipt_ref ]] \
+    || die 'scheduler migration has no Gate-bearing recovery intent or transition'
+  monday_validate_scheduler_migration_record "$ROOT" "$CONTROLLER" "${recovery_before_controller:-${transition_from:-}}" \
+    || die 'scheduler migration differs from its Gate-authorized before controller'
+fi
+controller_projection_assets=$(monday_controller_projection_assets_for_release "$ROOT" "$CONTROLLER") \
+  || die 'active controller projection contract is invalid'
+for asset in $controller_projection_assets; do
   target=$(monday_controller_projection_target "$ROOT" "$asset") || die "unknown controller projection: $asset"
   expected="$controller_root/active/deployment/$asset"
   if [[ -L $target ]]; then
@@ -717,6 +786,10 @@ for asset in $(monday_controller_projection_assets); do
     monday_file_direct "$resolved" || die "controller projection is indirect: $asset"
     cmp -s "$resolved" "$release/deployment/$asset" || die "controller projection bytes drifted: $asset"
   elif [[ -f $target && ! -L $target ]]; then
+    if [[ $asset == binance-lob-archiver-recovery@.* ]]; then
+      monday_verify_scheduler_migration_before "$ROOT" "$CONTROLLER" "$asset" "$target" "${recovery_before_controller:-${transition_from:-}}" \
+        || die "scheduler regular file has no exact cutover migration evidence: $asset"
+    fi
     owner=$(monday_file_uid "$target") || die "controller projection owner is unavailable: $asset"
     mode=$(monday_file_mode "$target") || die "controller projection mode is unavailable: $asset"
     [[ $((8#$mode & 022)) == 0 && ($owner == 0 || $TEST_ONLY == true) ]] \
@@ -730,7 +803,7 @@ done
 
 mapfile -t PAIR_ASSETS < <(monday_runtime_assets)
 readonly PAIR_ASSETS
-mapfile -t CONTROLLER_PROJECTION_ASSETS < <(monday_controller_projection_assets)
+mapfile -t CONTROLLER_PROJECTION_ASSETS <<<"$controller_projection_assets"
 readonly CONTROLLER_PROJECTION_ASSETS
 projection="$controller_root/active"
 stable_binary="$projection/binance-lob-archiver"
@@ -827,6 +900,9 @@ ensure_controller_projection() {
   fi
   if [[ -e $target ]]; then
     [[ -f $target && ! -L $target ]] || return 1
+    if [[ ${expected##*/} == binance-lob-archiver-recovery@.* ]]; then
+      monday_verify_scheduler_migration_before "$ROOT" "$CONTROLLER" "${expected##*/}" "$target" "${recovery_before_controller:-${transition_from:-}}" || return 1
+    fi
     owner=$(monday_file_uid "$target") || return 1
     mode=$(monday_file_mode "$target") || return 1
     [[ $((8#$mode & 022)) == 0 && ($owner == 0 || $TEST_ONLY == true) ]] || return 1
@@ -968,7 +1044,7 @@ if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   done
   monday_rust_lob_verify_legacy_contained \
     || die 'legacy canonical writers escaped the restore containment'
-  monday_rust_lob_enable_recovery_schedulers \
+  monday_rust_lob_enable_recovery_schedulers "$ROOT" "$CONTROLLER" \
     || die 'recovery schedulers did not become active and enabled after restore'
   # Take one final paired sample.  The receipt must bind the same fresh
   # session/timestamp that passed the active-C health policy for both lanes.
@@ -1056,19 +1132,10 @@ while IFS= read -r unit; do
 done < <(monday_rust_lob_legacy_writer_units)
 recovery_scheduler_state='{}'
 if [[ $runtime_observed == true ]]; then
-  monday_rust_lob_verify_recovery_schedulers_active \
-    || die 'could not read active recovery scheduler state for restore receipt'
-  while IFS= read -r unit; do
-    market=${unit#binance-lob-archiver-recovery@}; market=${market%.timer}
-    active_state=$(systemctl show "$unit" --property=ActiveState --value)
-    enabled_state=$(systemctl show "$unit" --property=UnitFileState --value)
-    [[ $active_state == active && $enabled_state == enabled ]] \
-      || die "recovery scheduler state changed before restore receipt: $market"
-    recovery_scheduler_state=$(jq -cn --argjson values "$recovery_scheduler_state" \
-      --arg market "$market" --arg unit "$unit" \
-      '$values + {($market):{unit:$unit,active:true,enabled:true}}')
-  done < <(monday_rust_lob_recovery_timer_units)
+  recovery_scheduler_state=$(monday_rust_lob_recovery_scheduler_state "$ROOT" "$CONTROLLER") \
+    || die 'could not read effective recovery scheduler contract for restore receipt'
 fi
+
 tmp=$restore_receipt_tmp; completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 jq -cS -n --arg controller "$CONTROLLER" --arg payload "$payload" --arg runtime "$runtime" \
   --arg policy_sha "$(monday_sha256_file "$release/deployment/rust-lob-runtime-health-policy.jq")" --arg completed "$completed_at" \

@@ -151,6 +151,8 @@ publish_controller_release() (
   done
   [[ $(monday_rust_lob_runtime_contract_sha256 "$extracted") == "$runtime" ]] \
     || die 'runtime contract differs from the manifest'
+  [[ $(monday_recovery_scheduler_contract_version "$extracted") == 2 ]] \
+    || die 'candidate recovery scheduler contract is not current'
   validate_payload "$artifact" "$artifact_sha" "$ARTIFACT_ROOT/$artifact_sha"
   install_payload_release "$artifact" "$artifact_sha" "$artifact_uri" "$source" \
     "$bundle_sha" "$bundle_uri" "$runtime" "$extracted"

@@ -48,8 +48,10 @@ fi
 FIXTURE_SYSTEMD=false
 if [[ $TEST_ONLY == true && ${MONDAY_READBACK_FIXTURE_SYSTEMD:-0} == 1 ]]; then
   FIXTURE_SYSTEMD=true
-  declare -A fixture_unit_state=() fixture_unit_file_state=() fixture_unit_load_state=()
+  declare -A fixture_unit_state=() fixture_unit_file_state=() fixture_unit_load_state=() fixture_recovery_anchor=()
   fixture_pid=${MONDAY_READBACK_FIXTURE_PID:-$$}
+  fixture_scheduler_sample=0
+  fixture_scheduler_substate=${MONDAY_READBACK_FIXTURE_TIMER_SUBSTATE:-waiting}
   fixture_enabled=${MONDAY_READBACK_FIXTURE_UNIT_FILE_STATE:-enabled}
   fixture_timer_active=${MONDAY_READBACK_FIXTURE_TIMER_ACTIVE:-active}
   fixture_timer_enabled=${MONDAY_READBACK_FIXTURE_TIMER_FILE_STATE:-enabled}
@@ -76,8 +78,39 @@ if [[ $TEST_ONLY == true && ${MONDAY_READBACK_FIXTURE_SYSTEMD:-0} == 1 ]]; then
         unit=$2
         case "${3#--property=}" in
           LoadState) printf '%s\n' "${fixture_unit_load_state[$unit]:-loaded}" ;;
-          ActiveState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'active\n' || printf 'inactive\n' ;;
-          SubState) [[ ${fixture_unit_state[$unit]:-inactive} == active ]] && printf 'running\n' || printf 'dead\n' ;;
+          ActiveState)
+            if [[ $unit == binance-lob-archiver-recovery@*.service && $fixture_scheduler_substate == running ]]; then printf 'activating\n'
+            elif [[ ${fixture_unit_state[$unit]:-inactive} == active ]]; then printf 'active\n'
+            else printf 'inactive\n'; fi ;;
+          SubState)
+            if [[ $unit == binance-lob-archiver-recovery@*.timer ]]; then
+              if [[ ${MONDAY_READBACK_FIXTURE_TIMER_ANCHOR_LOST:-0} == 1 \
+                && ${fixture_recovery_anchor[${unit%@*}@${unit#*@}]:-0} == 0 \
+                && $(sed -n 's/^OnBootSec=//p' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.timer)") == 10min ]]; then
+                printf 'elapsed\n'
+              else printf '%s\n' "${fixture_scheduler_substate}"; fi
+            elif [[ ${fixture_unit_state[$unit]:-inactive} == active ]]; then printf 'running\n'
+            else printf 'dead\n'; fi ;;
+          NextElapseUSecMonotonic)
+            if [[ $(systemctl show "$unit" --property=SubState --value) == elapsed ]]; then printf 'infinity\n'
+            else printf '%s\n' "${MONDAY_READBACK_FIXTURE_TIMER_NEXT:-$((1000000 + fixture_scheduler_sample))}"; fi ;;
+          TimersMonotonic)
+            if grep -Fqx 'OnActiveSec=10min' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.timer)"; then
+              printf '{ OnActiveUSec=10min ; next_elapse=1000000 }\n'
+            else printf '{ OnBootUSec=10min ; next_elapse=1000000 }\n'; fi
+            printf '{ OnUnitInactiveUSec=15min ; next_elapse=1000000 }\n' ;;
+          ExecStart) printf '{ path=/opt/monday/bin/monday-rust-lob-recovery-queue ; argv[]=/opt/monday/bin/monday-rust-lob-recovery-queue drain %s ; }\n' "${unit#*@}" | sed 's/\.service ;/ ;/' ;;
+          Result) printf 'success\n' ;;
+          ExecMainStatus) printf '0\n' ;;
+          FragmentPath) monday_root_join "$ROOT" "etc/systemd/system/binance-lob-archiver-recovery@.${unit##*.}" ;;
+          DropInPaths) printf '%s\n' "${MONDAY_READBACK_FIXTURE_SCHEDULER_DROPIN:-}" ;;
+          TimeoutStartUSec)
+            if [[ -n ${MONDAY_READBACK_FIXTURE_RECOVERY_START_TIMEOUT:-} ]]; then printf '%s\n' "$MONDAY_READBACK_FIXTURE_RECOVERY_START_TIMEOUT"
+            elif grep -Fqx 'TimeoutStartSec=0' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.service)"; then printf 'infinity\n'
+            else printf '2h\n'; fi ;;
+          TimeoutStopUSec)
+            if grep -Fqx 'TimeoutStopSec=120' "$(monday_root_join "$ROOT" etc/systemd/system/binance-lob-archiver-recovery@.service)"; then printf '2min\n'
+            else printf '1min 30s\n'; fi ;;
           UnitFileState) printf '%s\n' "${fixture_unit_file_state[$unit]:-disabled}" ;;
           MainPID) printf '%s\n' "$fixture_pid" ;;
           NRestarts) printf '%s\n' "${MONDAY_READBACK_FIXTURE_RESTARTS:-0}" ;;
@@ -156,7 +189,9 @@ stable_projection=$(monday_root_join "$ROOT" opt/monday/releases/binance-lob-con
 deployment=$(monday_root_join "$ROOT" "opt/monday/releases/binance-lob-controller/$CONTROLLER/deployment")
 mapfile -t PAIR_ASSETS < <(monday_runtime_assets)
 readonly PAIR_ASSETS
-mapfile -t CONTROLLER_PROJECTION_ASSETS < <(monday_controller_projection_assets)
+controller_projection_assets=$(monday_controller_projection_assets_for_release "$ROOT" "$CONTROLLER") \
+  || die 'controller projection contract is invalid'
+mapfile -t CONTROLLER_PROJECTION_ASSETS <<<"$controller_projection_assets"
 readonly CONTROLLER_PROJECTION_ASSETS
 production_projection=$(monday_root_join "$ROOT" opt/monday/releases/binance-lob-controller/active/binance-lob-archiver)
 [[ -L $production && $(readlink -- "$production") == "$production_projection" \
@@ -195,11 +230,15 @@ for asset in "${CONTROLLER_PROJECTION_ASSETS[@]}"; do
     '$values + {($asset):{target:$target,sha256:$sha}}')
 done
 
-runtime_identity='{}'; health_identity='{}'; recovery_scheduler_identity='{}'
+runtime_identity='{}'; health_identity='{}'; recovery_scheduler_identity='{}'; recovery_scheduler_observation='{}'
 capture_runtime_identity() {
-  local market unit timer_unit pid restarts enabled exe env_file spool health session updated minimum_ns expected_observed dataset minimum_symbols policy
-  local timer_active timer_enabled
-  runtime_identity='{}'; health_identity='{}'; recovery_scheduler_identity='{}'
+  local market unit pid restarts enabled exe env_file spool health session updated minimum_ns expected_observed dataset minimum_symbols policy
+  runtime_identity='{}'; health_identity='{}'; recovery_scheduler_identity='{}'; recovery_scheduler_observation='{}'
+  if [[ $TEST_ONLY == true && $FIXTURE_SYSTEMD == true && -n ${MONDAY_READBACK_FIXTURE_TIMER_SEQUENCE:-} ]]; then
+    fixture_scheduler_sample=$((fixture_scheduler_sample + 1))
+    if (( fixture_scheduler_sample == 1 )); then fixture_scheduler_substate=${MONDAY_READBACK_FIXTURE_TIMER_SEQUENCE%%,*}
+    else fixture_scheduler_substate=${MONDAY_READBACK_FIXTURE_TIMER_SEQUENCE##*,}; fi
+  fi
   [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 && $FIXTURE_SYSTEMD == false ]] && return 0
   for market in spot usdm; do
     unit="binance-lob-archiver-production@${market}.service"
@@ -248,19 +287,17 @@ capture_runtime_identity() {
       --argjson symbols "$(jq -er '.symbol_count' "$health")" \
       --argjson ready "$(jq -er '.snapshot_ready_count' "$health")" \
       '$values + {($market):{session_id:$session,observed_at_ns:$observed,status:$status,sequence_gaps:$gaps,symbol_count:$symbols,snapshot_ready_count:$ready}}')
-    timer_unit="binance-lob-archiver-recovery@${market}.timer"
-    systemctl is-active --quiet "$timer_unit" || die "recovery timer is inactive: $timer_unit"
-    timer_active=$(systemctl show "$timer_unit" --property=ActiveState --value)
-    timer_enabled=$(systemctl show "$timer_unit" --property=UnitFileState --value)
-    [[ $timer_active == active && $timer_enabled == enabled ]] \
-      || die "recovery timer is not active and enabled: $timer_unit"
-    recovery_scheduler_identity=$(jq -cn --argjson values "$recovery_scheduler_identity" \
-      --arg market "$market" --arg unit "$timer_unit" \
-      '$values + {($market):{unit:$unit,active:true,enabled:true}}')
+
   done
+  recovery_scheduler_observation=$(monday_rust_lob_recovery_scheduler_state "$ROOT" "$CONTROLLER") \
+    || die 'effective recovery scheduler contract failed during readback'
+  # A natural timer trigger may change its deadline/state during OSS reads.
+  # Bind stable contract identity, while retaining both actual observations.
+  recovery_scheduler_identity=$(jq -c 'with_entries(.value |= del(.substate,.next_elapse_monotonic,.service_active_state,.service_result,.service_main_pid))' \
+    <<<"$recovery_scheduler_observation")
 }
 capture_runtime_identity
-runtime_before=$runtime_identity; health_before=$health_identity; recovery_scheduler_before=$recovery_scheduler_identity
+runtime_before=$runtime_identity; health_before=$health_identity; recovery_scheduler_before=$recovery_scheduler_identity; scheduler_observed_before=$recovery_scheduler_observation
 assert_transition_process_identity() {
   local market expected_pid expected_exe expected_restarts expected_enabled expected_session expected_observed
   local current_pid current_exe current_restarts current_enabled current_session current_observed now_ns
@@ -480,7 +517,7 @@ for market in spot usdm; do
   fi
 done
 assert_runtime_stable
-runtime_after=$runtime_identity; health_after=$health_identity; recovery_scheduler_after=$recovery_scheduler_identity
+runtime_after=$runtime_identity; health_after=$health_identity; recovery_scheduler_after=$recovery_scheduler_identity; scheduler_observed_after=$recovery_scheduler_observation
 
 out_root=$(monday_root_join "$ROOT" data/monday/evidence/readbacks)
 if [[ $TEST_ONLY == true && -n ${MONDAY_READBACK_ROOT:-} ]]; then
@@ -500,6 +537,7 @@ tmp_out="$out.tmp.$$"
   --argjson transition_process "$transition_process" \
   --argjson controller_projections "$controller_projections" \
   --argjson recovery_schedulers "$recovery_scheduler_after" \
+  --argjson scheduler_before "$scheduler_observed_before" --argjson scheduler_after "$scheduler_observed_after" \
   --argjson statuses "$status_observations" \
   '{schema:$schema,control_plane_version:2,controller_sha256:$controller,
     payload_sha256:$payload,transition_receipt:$transition,
@@ -509,6 +547,7 @@ tmp_out="$out.tmp.$$"
     health_policy_verified:true,recovery_schedulers_verified:true,installed_assets_verified:true,
     cutover_process_identity:$transition_process,
     process_identity:$processes,health:$health,recovery_schedulers:$recovery_schedulers,
+    recovery_scheduler_observations:{before:$scheduler_before,after:$scheduler_after},
     controller_projections:$controller_projections,
     upload_status:$statuses,
     oss_triplets:$markets,result:"success"}' >"$tmp_out"
