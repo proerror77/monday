@@ -33,6 +33,90 @@ if fixture_exit_drain_guard invalid; then
   exit 1
 fi
 
+# Sampling may straddle a timer firing or a oneshot exiting. Transient mixed
+# properties must settle to a coherent sample; a persistent bad state stays closed.
+(
+  sample_root=$(mktemp -d "$ROOT/scheduler-samples.XXXXXX")
+  # These overrides are invoked by the sourced scheduler sampler.
+  # shellcheck disable=SC2317,SC2329
+  monday_recovery_scheduler_contract_for_release() { printf '2\n'; }
+  # shellcheck disable=SC2317,SC2329
+  monday_rust_lob_verify_recovery_scheduler_units() { return 0; }
+  # shellcheck disable=SC2317,SC2329
+  systemctl() {
+    local action=$1 unit=${2:-} market property phase reads substate
+    [[ $unit != --quiet ]] || unit=$3
+    market=${unit#*@}; market=${market%.*}
+    case $action in
+      is-enabled|is-active) return 0 ;;
+      show) property=${3#--property=} ;;
+      *) return 2 ;;
+    esac
+    phase=$(cat "$sample_root/$market.phase")
+    reads=$(cat "$sample_root/$market.reads")
+    substate=$(cat "$sample_root/$market.state")
+    case $property in
+      SubState)
+        reads=$((reads + 1)); printf '%s\n' "$reads" >"$sample_root/$market.reads"
+        if [[ $sample_case == confirmation_change && $reads == 2 ]]; then
+          substate=running; printf '%s\n' "$substate" >"$sample_root/$market.state"
+        elif [[ $sample_case == never_coherent ]]; then
+          substate=waiting; (( reads % 2 == 1 )) || substate=running
+        fi
+        printf '%s\n' "$substate" ;;
+      NextElapseUSecMonotonic)
+        if [[ $sample_case == waiting_to_running && $phase == 0 ]]; then
+          printf '1\n' >"$sample_root/$market.phase"
+          printf 'running\n' >"$sample_root/$market.state"
+          printf 'infinity\n'
+        elif [[ $substate == waiting ]]; then printf '1d 2h 3min\n'
+        else printf 'infinity\n'; fi ;;
+      ActiveState)
+        if [[ $sample_case == running_to_waiting && $phase == 0 ]]; then
+          printf '1\n' >"$sample_root/$market.phase"
+          printf 'waiting\n' >"$sample_root/$market.state"
+          printf 'inactive\n'
+        elif [[ $substate == running ]]; then printf 'activating\n'
+        else printf 'inactive\n'; fi ;;
+      Result)
+        if [[ $sample_case == result_reset && $phase == 0 ]]; then
+          printf '1\n' >"$sample_root/$market.phase"; printf '\n'
+        elif [[ $sample_case == failed_result ]]; then printf 'timeout\n'
+        else printf 'success\n'; fi ;;
+      MainPID)
+        if [[ $sample_case == pid_reset && $phase == 0 ]]; then
+          printf '1\n' >"$sample_root/$market.phase"; printf '0\n'
+        elif [[ $sample_case == missing_pid || $substate != running ]]; then printf '0\n'
+        else printf '42\n'; fi ;;
+      *) return 2 ;;
+    esac
+  }
+  for sample_case in waiting_to_running running_to_waiting confirmation_change result_reset pid_reset elapsed failed_result missing_pid never_coherent; do
+    for sample_market in spot usdm; do
+      printf '0\n' >"$sample_root/$sample_market.phase"
+      printf '0\n' >"$sample_root/$sample_market.reads"
+      case $sample_case in
+        waiting_to_running|confirmation_change|never_coherent) printf 'waiting\n' ;;
+        elapsed) printf 'elapsed\n' ;;
+        *) printf 'running\n' ;;
+      esac >"$sample_root/$sample_market.state"
+    done
+    case $sample_case in
+      elapsed|failed_result|missing_pid|never_coherent)
+        if monday_rust_lob_recovery_scheduler_state "$ROOT" "$(printf 'a%.0s' {1..64})" >/dev/null; then
+          printf 'scheduler sampling accepted persistent invalid state: %s\n' "$sample_case" >&2; exit 1
+        fi
+        sample_reads=$(cat "$sample_root/spot.reads")
+        [[ $sample_reads -ge 3 && $sample_reads -le 6 ]] ;;
+      *)
+        sample=$(monday_rust_lob_recovery_scheduler_state "$ROOT" "$(printf 'a%.0s' {1..64})")
+        expected_sample=running; [[ $sample_case != running_to_waiting ]] || expected_sample=waiting
+        jq -e --arg state "$expected_sample" 'all(.[]; .substate == $state)' <<<"$sample" >/dev/null
+        [[ $(cat "$sample_root/spot.reads") -ge 3 && $(cat "$sample_root/usdm.reads") -ge 3 ]] ;;
+    esac
+  done
+)
+
 # Resource Envelope V2 is a single immutable runtime contract: the production
 # template and its aggregate slice carry the pair cap, while each sequential
 # shadow phase has its own smaller envelope.  Keep these assertions before any

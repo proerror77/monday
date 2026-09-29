@@ -606,7 +606,7 @@ monday_rust_lob_require_owned_drain_lock() {
 monday_rust_lob_recovery_scheduler_state() {
   [[ $# -eq 2 ]] || return 2
   local root=$1 controller=$2 deployment version market timer service substate next service_state service_result service_pid
-  local state='{}' observed
+  local state='{}' observed attempt coherent substate_after next_after service_state_after service_pid_after
   deployment=$(monday_root_join "$root" "opt/monday/releases/binance-lob-controller/$controller/deployment") || return 1
   version=$(monday_recovery_scheduler_contract_for_release "$1" "$2") || return 1
   monday_rust_lob_verify_recovery_scheduler_units "$root" "$controller" || return 1
@@ -615,21 +615,37 @@ monday_rust_lob_recovery_scheduler_state() {
     service="binance-lob-archiver-recovery@$market.service"
     systemctl is-enabled --quiet "$timer" >/dev/null 2>&1 || return 1
     systemctl is-active --quiet "$timer" >/dev/null 2>&1 || return 1
-    service_result=; service_pid=
     observed=$(jq -cn --arg unit "$timer" '{unit:$unit,active:true,enabled:true}') || return 1
-    substate=$(systemctl show "$timer" --property=SubState --value) || return 1
-    next=$(systemctl show "$timer" --property=NextElapseUSecMonotonic --value) || return 1
-    service_state=$(systemctl show "$service" --property=ActiveState --value) || return 1
-    case "$substate" in
-      waiting) [[ $next =~ ^[1-9][0-9]* && $next != infinity ]] || return 1 ;;
-      running)
-        [[ $service_state == active || $service_state == activating ]] || return 1
-        service_result=$(systemctl show "$service" --property=Result --value) || return 1
-        service_pid=$(systemctl show "$service" --property=MainPID --value) || return 1
-        [[ $service_result == success && $service_pid =~ ^[1-9][0-9]*$ ]] || return 1 ;;
-
-      *) return 1 ;;
-    esac
+    # Separate D-Bus reads can straddle a normal timer/service transition.
+    # Require a stable bracket and retry only a bounded number of samples.
+    for attempt in 1 2 3; do
+      coherent=false; service_result=; service_pid=
+      substate=$(systemctl show "$timer" --property=SubState --value) || return 1
+      next=$(systemctl show "$timer" --property=NextElapseUSecMonotonic --value) || return 1
+      service_state=$(systemctl show "$service" --property=ActiveState --value) || return 1
+      case "$substate" in
+        waiting)
+          if [[ $next =~ ^[1-9][0-9]* && $next != infinity ]]; then
+            substate_after=$(systemctl show "$timer" --property=SubState --value) || return 1
+            next_after=$(systemctl show "$timer" --property=NextElapseUSecMonotonic --value) || return 1
+            [[ $substate_after == "$substate" && $next_after == "$next" ]] && coherent=true
+          fi ;;
+        running)
+          service_result=$(systemctl show "$service" --property=Result --value) || return 1
+          service_pid=$(systemctl show "$service" --property=MainPID --value) || return 1
+          if [[ ($service_state == active || $service_state == activating) \
+            && $service_result == success && $service_pid =~ ^[1-9][0-9]*$ ]]; then
+            substate_after=$(systemctl show "$timer" --property=SubState --value) || return 1
+            service_state_after=$(systemctl show "$service" --property=ActiveState --value) || return 1
+            service_pid_after=$(systemctl show "$service" --property=MainPID --value) || return 1
+            [[ $substate_after == "$substate" && $service_state_after == "$service_state" \
+              && $service_pid_after == "$service_pid" ]] && coherent=true
+          fi ;;
+      esac
+      [[ $coherent == true ]] && break
+      (( attempt < 3 )) || return 1
+      sleep 0.05
+    done
     observed=$(jq -cn --argjson state "$observed" --argjson version "$version" --arg substate "$substate" \
       --arg next "$next" --arg service_state "$service_state" \
       --arg service_result "${service_result:-}" --arg service_pid "${service_pid:-}" \
