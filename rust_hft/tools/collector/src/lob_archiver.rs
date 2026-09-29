@@ -1029,7 +1029,7 @@ pub fn recover_parts_from_paths(
         let mut offset = 0_usize;
         let mut invalid_at = None;
         let mut detected_schema: Option<(bool, String)> = None;
-        let mut quarantine = false;
+        let mut quarantine_reason = None;
         let mut raw_trade_incomplete_symbols = BTreeSet::new();
         loop {
             line.clear();
@@ -1044,7 +1044,7 @@ pub fn recover_parts_from_paths(
             if line.len() - usize::from(complete) > MAX_RECOVERY_ROW_BYTES {
                 // A row this large is corruption, not data; quarantine the
                 // part instead of buffering an unbounded unterminated tail.
-                quarantine = true;
+                quarantine_reason = Some("row exceeds the bounded row size".to_owned());
                 break;
             }
             let parsed = serde_json::from_slice::<Value>(&line);
@@ -1073,7 +1073,7 @@ pub fn recover_parts_from_paths(
                     (true, schema.to_owned())
                 }
                 Some(_) => {
-                    quarantine = true;
+                    quarantine_reason = Some("unsupported schema identity".to_owned());
                     break;
                 }
             };
@@ -1081,7 +1081,7 @@ pub fn recover_parts_from_paths(
                 .as_ref()
                 .is_some_and(|detected| detected != &row_schema)
             {
-                quarantine = true;
+                quarantine_reason = Some("mixed schema identities".to_owned());
                 break;
             }
             detected_schema.get_or_insert_with(|| row_schema.clone());
@@ -1089,12 +1089,12 @@ pub fn recover_parts_from_paths(
                 Some(event_type) if !event_type.is_empty() => event_type,
                 None if !row_schema.0 => "diff",
                 _ => {
-                    quarantine = true;
+                    quarantine_reason = Some("missing event type".to_owned());
                     break;
                 }
             };
             if !event_type_allowed(&row_schema.1, event_type) {
-                quarantine = true;
+                quarantine_reason = Some("event type is not allowed for schema".to_owned());
                 break;
             }
             if row_schema.0
@@ -1103,22 +1103,26 @@ pub fn recover_parts_from_paths(
                     .and_then(Value::as_str)
                     .is_none_or(str::is_empty)
             {
-                quarantine = true;
+                quarantine_reason = Some("missing session identity".to_owned());
                 break;
             }
             if event_type == "agg_trade" {
                 let Some(raw) = event.as_object() else {
-                    quarantine = true;
+                    quarantine_reason = Some("aggregate trade is not an object".to_owned());
                     break;
                 };
-                let Ok(trade) = AggregateTrade::from_archived_event(raw, received) else {
-                    quarantine = true;
-                    break;
+                let trade = match AggregateTrade::from_archived_event(raw, received) {
+                    Ok(trade) => trade,
+                    Err(error) => {
+                        quarantine_reason = Some(format!("invalid aggregate trade: {error:#}"));
+                        break;
+                    }
                 };
-                if aggregate_trade_sequence.observe(&trade).is_err()
-                    || trade_summaries.observe(&trade).is_err()
+                if let Err(error) = aggregate_trade_sequence
+                    .observe(&trade)
+                    .and_then(|()| trade_summaries.observe(&trade))
                 {
-                    quarantine = true;
+                    quarantine_reason = Some(format!("aggregate trade validation failed: {error:#}"));
                     break;
                 }
             }
@@ -1126,7 +1130,7 @@ pub fn recover_parts_from_paths(
                 if let Some(symbol) = event.get("symbol").and_then(Value::as_str) {
                     raw_trade_incomplete_symbols.insert(symbol.to_ascii_uppercase());
                 } else {
-                    quarantine = true;
+                    quarantine_reason = Some("stale raw trade is missing its symbol".to_owned());
                     break;
                 }
             }
@@ -1134,9 +1138,16 @@ pub fn recover_parts_from_paths(
             offset += line.len();
         }
         let mut file = reader.into_inner();
-        if quarantine || invalid_at.is_some_and(|(_, has_following_data)| has_following_data) {
+        if invalid_at.is_some_and(|(_, has_following_data)| has_following_data) {
+            quarantine_reason = Some("invalid row before the end of the part".to_owned());
+        }
+        if let Some(reason) = quarantine_reason {
             quarantine_recovery_part(path, &file, &metadata)?;
-            continue;
+            anyhow::bail!(
+                "recovery quarantined {} at byte {offset}: {reason}; preserved input at {}",
+                path.display(),
+                path.with_extension("part.corrupt").display()
+            );
         }
         if counts.is_empty() {
             unlink_recovery_part(path, &file, &metadata)?;
@@ -2439,31 +2450,36 @@ mod tests {
         let cases = [
             (
                 "mixed",
+                "mixed schema identities",
                 vec![
-                    json!({"schema":RAW_SCHEMA,"received_at_ns":start_ns,"type":"diff"}),
+                    json!({"schema":RAW_SCHEMA,"received_at_ns":start_ns,"type":"diff","session_id":"session-1"}),
                     json!({"received_at_ns":start_ns + 1,"type":"diff"}),
                 ],
             ),
             (
                 "unknown",
+                "unsupported schema identity",
                 vec![
                     json!({"schema":"binance.market_tape.v999","received_at_ns":start_ns,"type":"diff"}),
                 ],
             ),
             (
                 "missing_session",
+                "missing session identity",
                 vec![
                     json!({"schema":RAW_SCHEMA,"received_at_ns":start_ns,"type":"book_ticker","frame":{}}),
                 ],
             ),
             (
                 "incompatible",
+                "event type is not allowed for schema",
                 vec![
                     json!({"schema":LEGACY_LOB_TAPE_SCHEMA,"received_at_ns":start_ns,"type":"agg_trade"}),
                 ],
             ),
             (
                 "aggregate_gap",
+                "BTCUSDT aggregate trade gap expected=11 received=12",
                 vec![
                     json!({
                         "schema":RAW_SCHEMA,"received_at_ns":start_ns,"type":"agg_trade",
@@ -2483,7 +2499,7 @@ mod tests {
             ),
         ];
 
-        for (name, rows) in cases {
+        for (name, reason, rows) in cases {
             let root = tempfile::Builder::new()
                 .prefix(&format!("monday-recovery-{name}-"))
                 .tempdir()
@@ -2491,9 +2507,20 @@ mod tests {
             let config = recovery_config(root.path().to_owned());
             let path = write_recovery_part(&config, start_ns, &rows);
 
-            assert!(recover_parts(&config).unwrap().is_empty(), "case={name}");
+            let original = fs::read(&path).unwrap();
+            let error = recover_parts(&config).unwrap_err().to_string();
+            assert!(error.contains(reason), "case={name}: {error}");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            let offset = if rows.len() > 1 {
+                serde_json::to_vec(&rows[0]).unwrap().len() + 1
+            } else {
+                0
+            };
+            assert!(error.contains(&format!("at byte {offset}:")), "{error}");
             assert!(!path.exists(), "case={name}");
-            assert!(path.with_extension("part.corrupt").exists(), "case={name}");
+            let quarantined = path.with_extension("part.corrupt");
+            assert!(error.contains(&quarantined.display().to_string()), "{error}");
+            assert_eq!(fs::read(quarantined).unwrap(), original, "case={name}");
             assert!(
                 files_with_suffix(root.path(), ".manifest.json")
                     .unwrap()
@@ -2501,6 +2528,37 @@ mod tests {
                 "case={name}"
             );
         }
+    }
+
+    #[test]
+    fn recovery_reports_interior_corruption_and_leaves_later_parts_untouched() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let root = tempfile::tempdir().unwrap();
+        let config = recovery_config(root.path().to_owned());
+        let row = json!({"received_at_ns":start_ns,"type":"diff"});
+        let path = write_recovery_part(&config, start_ns, std::slice::from_ref(&row));
+        let offset = fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "invalid JSON").unwrap();
+        writeln!(file, "{row}").unwrap();
+        drop(file);
+        let later = write_recovery_part(&config, start_ns + 1, &[row]);
+        let original = fs::read(&path).unwrap();
+        let later_original = fs::read(&later).unwrap();
+
+        let error = recover_parts(&config).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("at byte {offset}: invalid row before the end of the part")),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(path.with_extension("part.corrupt")).unwrap(),
+            original
+        );
+        assert_eq!(fs::read(later).unwrap(), later_original);
+        assert!(files_with_suffix(root.path(), ".manifest.json")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2523,7 +2581,8 @@ mod tests {
             .unwrap();
         drop(file);
 
-        assert!(recover_parts(&config).unwrap().is_empty());
+        let error = recover_parts(&config).unwrap_err().to_string();
+        assert!(error.contains("row exceeds the bounded row size"), "{error}");
         assert!(!path.exists());
         assert!(path.with_extension("part.corrupt").exists());
     }

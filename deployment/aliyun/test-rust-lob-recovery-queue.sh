@@ -215,7 +215,19 @@ set -Eeuo pipefail
 printf '%s %s\n' "$1" "$SPOOL_DIR" >>"$fixture_root/payload.calls"
 case $1 in
   --recover-parts-only)
-    [[ ! -e $SPOOL_DIR/.fixture-fail-recover ]] || exit 71
+    if [[ -e $SPOOL_DIR/.fixture-check-locks ]]; then
+      # A separate process must acquire the production startup queue lock,
+      # while the drain/cutover exclusion remains held for this payload.
+      flock -n "$fixture_root/host/run/lock/monday-rust-lob-recovery-queue-spot.lock" true
+      if flock -n "$fixture_root/host/run/lock/monday-rust-lob-recovery-drain.lock" true; then
+        printf 'drain lost execution exclusion\n' >&2; exit 74
+      fi
+      printf 'queue available; drain excluded\n' >"$fixture_root/lock-check"
+    fi
+    if [[ -e $SPOOL_DIR/.fixture-fail-recover ]]; then
+      printf 'Error: recovery parts contain no complete stream-coverage catalog\n' >&2
+      exit 71
+    fi
     [[ ! -e $RECOVERY_BACKUP_DIR ]] || exit 72
     mkdir "$RECOVERY_BACKUP_DIR"
     find "$SPOOL_DIR" -type f \( -name '*.jsonl.part' -o -name '*.zst.tmp' \) \
@@ -227,7 +239,10 @@ case $1 in
     printf 'success\n' >"$SPOOL_DIR/part-900.jsonl.zst._SUCCESS"
     ;;
   --upload-only)
-    [[ ! -e $SPOOL_DIR/.fixture-fail-upload ]] || exit 73
+    if [[ -e $SPOOL_DIR/.fixture-fail-upload ]]; then
+      printf 'Error: fixture upload failed\n' >&2
+      exit 73
+    fi
     find "$SPOOL_DIR" -type f -name 'part-*' -print >>"$fixture_root/uploaded-files"
     find "$SPOOL_DIR" -type f -name 'part-*' -delete
     cp "$fixture_root/status.after.json" "$SPOOL_DIR/upload-status.json"
@@ -517,6 +532,9 @@ expect_rejected new-request-after-success fixture_resume
 # A mixed spool resumes through the same payload: existing sealed segments are
 # uploaded alongside newly recovered parts, with a fresh attempt-owned backup.
 fixture_job 104 ready
+if command -v flock >/dev/null 2>&1 && ! declare -F flock >/dev/null; then
+  : >"$fixture_job_dir/.fixture-check-locks"
+fi
 printf 'raw input\n' >"$fixture_job_dir/part-2.jsonl.part"
 printf 'interrupted derived output\n' >"$fixture_job_dir/part-2.jsonl.zst.tmp"
 printf 'already sealed\n' >"$fixture_job_dir/part-3.jsonl.zst"
@@ -529,6 +547,27 @@ fixture_drain >/dev/null
 grep -Fq -- '--recover-parts-only' "$fixture/payload.calls"
 grep -Fq 'part-3.jsonl.zst' "$fixture/uploaded-files"
 grep -Fq 'part-900.jsonl.zst' "$fixture/uploaded-files"
+if command -v flock >/dev/null 2>&1 && ! declare -F flock >/dev/null; then
+  grep -Fxq 'queue available; drain excluded' "$fixture/lock-check"
+else
+  printf 'Kernel queue/drain contention check unavailable on this host; Linux CI exercises it\n'
+fi
+
+# The application error and original input survive a failed subprocess. The
+# result embeds the diagnostic so journal retention is not required to triage.
+fixture_job 114 ready
+printf 'raw input\n' >"$fixture_job_dir/part-4.jsonl.part"
+: >"$fixture_job_dir/.fixture-fail-recover"
+fixture_resume >/dev/null
+recover_failed_attempt=$(fixture_attempt)
+expect_rejected recover-failure fixture_drain
+[[ -f $QUEUE_MARKET_ROOT/$RESUME_JOB_ID.failed/part-4.jsonl.part ]]
+[[ $(stat -c %a "$recover_failed_attempt/recover.stderr") == 440 ]]
+jq -e '.result == "failed" and (.message | contains("Error: recovery parts contain no complete stream-coverage catalog"))' \
+  "$recover_failed_attempt/result.json" >/dev/null
+recover_log_sha=$(sha256sum "$recover_failed_attempt/recover.stderr" | awk '{print $1}')
+expect_rejected failed-recovery-request-replay fixture_resume
+[[ $(sha256sum "$recover_failed_attempt/recover.stderr" | awk '{print $1}') == "$recover_log_sha" ]]
 
 # Failure evidence is immutable.  Replaying a failed request reports the same
 # failure; only a new explicit request creates a separate attempt after repair.
@@ -539,6 +578,8 @@ fixture_resume >/dev/null
 failed_attempt=$(fixture_attempt)
 expect_rejected upload-failure fixture_drain
 [[ $(jq -r .result "$failed_attempt/result.json") == failed ]]
+jq -e '.message | contains("Error: fixture upload failed")' "$failed_attempt/result.json" >/dev/null
+[[ $(stat -c %a "$failed_attempt/upload.stderr") == 440 ]]
 failed_sha=$(sha256sum "$failed_attempt/result.json" | awk '{print $1}')
 expect_rejected failed-request-replay fixture_resume
 [[ $(sha256sum "$failed_attempt/result.json" | awk '{print $1}') == "$failed_sha" ]]
