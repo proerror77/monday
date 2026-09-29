@@ -824,3 +824,4 @@ if grep -Fq -- '--upload-only' "$fixture/payload.calls" 2>/dev/null; then
   exit 1
 fi
 printf 'Explicit recovery adoption, historical readback, mixed drain and interruption behavior passed\n'
+bash "$SCRIPT_DIR/test-rust-lob-retention.sh"

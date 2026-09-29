@@ -178,7 +178,7 @@ the `monitor-collector-host` workflow issue and blocks `ok:true`.
 | 6. Polymarket upload timers | `polymarket-market-tape-upload.timer` or `polymarket-reference-upload.timer` not active (waiting) while its collector service (`polymarket-market-tape.service` / `polymarket-reference-collector.service`) is active — a stopped timer with a running collector silently strands rotated tapes until the disk fills |
 | 7. Polymarket upload watchdog | `polymarket-market-tape-upload-watchdog.timer` is neither `waiting` nor briefly `running`, or a waiting timer has no finite monotonic next elapse — systemd can otherwise report an enabled, active but elapsed timer that will never run again |
 | 8. `/data` mount | `/data` is not a mount point — otherwise healthy-looking spool paths may write to the root filesystem |
-| 9. Recovery queue | malformed receipts, failed or stale jobs, or ready/running ages over the lane bound |
+| 9. Recovery queue | malformed receipts, undisposed failed or stale jobs, invalid retained evidence, or ready/running ages over the lane bound |
 | 10. Production LOB archivers | `binance-lob-archiver-production@spot/usdm` not active, not enabled, or last systemd `Result` other than `success` |
 | 11. LOB `health.json` | missing, a symlink, unparseable, `updated_at_ns` older than 300s, or `updated_at_ns` missing/non-numeric |
 | 12. LOB sequence gaps | `sequence_gaps > 0`, or `sequence_gap_total` increased since the previous poll. The five-minute host timer latches an increase (`MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1`) so the 15-minute GitHub `monitor-collector-host` poll still observes the breach; that alerting poll then consumes the new baseline |
@@ -1338,6 +1338,50 @@ delivered. The two production instances are each bounded at `CPUQuota=80%` and
 2-vCPU/8-GiB host boundary without increasing the ECS size. A persistent
 pre-start failure is bounded to 120 seconds per start and capped at five
 attempts per two hours instead of restarting forever.
+
+An explicitly reviewed historical Spot failure may instead be retained without
+recovery. The active controller accepts one original `.failed` job whose full
+payload digest differs from production, with no resume/adopted attempt:
+
+```bash
+/opt/monday/bin/monday-rust-lob-recovery-queue retain spot \
+  --job-id "$job_id" --job-sha256 "$original_job_sha256" \
+  --result-sha256 "$original_failed_result_sha256" \
+  --controller "$active_controller_sha256" --request-id "$request_id" \
+  --reason-code retain-unrecovered-historical-evidence
+/opt/monday/bin/monday-rust-lob-recovery-queue check-retained spot
+```
+
+Retention leaves the `.failed` directory, original metadata, data and failure
+counters intact. It records an append-only request, complete content-hashed
+inventory and `retained_unrecovered` receipt beneath the job's evidence directory,
+then commits the root-owned `retained/spot/<job>.json` pointer. It never executes
+an uploader or claims recovery, delivery or replay eligibility; a committed
+retained job cannot be resumed. Exact request repetition reuses the receipt;
+conflicting or incomplete evidence cannot acknowledge the failure.
+Missing pointers and unfinished retention declarations also prohibit resume.
+Metadata publishes through a protected, exact-content pending file and a
+same-directory no-clobber rename. Repeating the same request can finish an
+interrupted publication; unknown pending files or hard-link aliases are
+preserved and refused, never cleaned up by the health reader.
+
+The explicit inventory is bounded to 16 GiB, 4,096 entries and 900 seconds per job
+(including original backups); metadata files are at most 4 MiB. Global drain
+and existing spool locks exclude writers. Full hashing releases the market
+queue lock, then a nonblocking short commit rechecks identity and fingerprints.
+No original file is moved, truncated, chmodded or deleted.
+
+Health keeps the physical `failed_count` and separately reports
+`retained_failed_count`, `undisposed_failed_count`, `invalid_retention_count`,
+retained bytes and historical job identities. Valid retention becomes a visible
+historical-data warning; new failures or invalid/missing evidence still breach.
+Its pure reader rehashes small metadata and checks complete membership plus
+device, inode, links, bytes, owner, mode and nanosecond mtime/ctime. Payload SHA
+was verified at commit: this periodic metadata guard relies on the existing
+single-writer/root trust model and is not a fresh full-payload audit. It does
+not change USD-M, stale-job checks, disk accounting, manifests or data/replay
+gates. Publish and apply this policy as an immutable controller transition;
+never edit the installed health or queue script in place.
 
 After an authorized controller repair has completed release, Gate, cutover and
 independent transition readback, an operator may explicitly adopt one detached
