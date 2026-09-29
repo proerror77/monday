@@ -2150,10 +2150,9 @@ main() {
   # Health calls this branch with env -i. It must run before queue_lock or any
   # writer directory preparation, and cannot create locks or invoke services.
   if [[ $action == check-retained ]]; then
-    # A complete 23-job production index can take over 25 seconds to recheck
-    # on a cold/busy collector host. Keep the read bounded while allowing that
-    # real inventory to finish instead of misreporting stable evidence drift.
-    RETENTION_DEADLINE=$((SECONDS + 90))
+    # A complete 23-job production index can exceed 90 seconds on this host.
+    # Keep the read bounded while allowing the full inventory to finish.
+    RETENTION_DEADLINE=$((SECONDS + 180))
     secure_release_identity
     active_recovery_program_matches "$EXECUTING_RECOVERY_PROGRAM" \
       || fail 'retention reader must be the active immutable controller projection'

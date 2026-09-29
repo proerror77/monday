@@ -1790,7 +1790,7 @@ set -euo pipefail
 retention_fixture_context '$test_root' health
 EXECUTING_RECOVERY_PROGRAM=\$(readlink -f "\$INSTALLED_RECOVERY")
 secure_release_identity
-RETENTION_DEADLINE=\$((SECONDS + 90))
+RETENTION_DEADLINE=\$((SECONDS + 180))
 check_retained_market
 EOF
 chmod 0755 "$stub_dir/monday-rust-lob-retained-check"
