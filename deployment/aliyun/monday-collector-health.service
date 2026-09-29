@@ -25,4 +25,4 @@ UMask=0027
 Nice=10
 MemoryHigh=128M
 MemoryMax=256M
-TimeoutStartSec=120
+TimeoutStartSec=180

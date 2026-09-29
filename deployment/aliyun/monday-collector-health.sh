@@ -954,7 +954,7 @@ read_recovery_retention() {
     record_breach "$label: unsupported historical retention claim"
     return
   fi
-  if ! retained_output=$(timeout --signal=TERM --kill-after=2s 30 \
+  if ! retained_output=$(timeout --signal=TERM --kill-after=2s 120 \
     env -i PATH="$RETENTION_READER_PATH" HOME=/root LC_ALL=C \
     "$RETENTION_READER" check-retained "$market" 2>/dev/null); then
     record_breach "$label: retained evidence validation failed"
