@@ -2565,7 +2565,7 @@ fi
 # remain.  The once-only fixture lets the old USD-M lane recover successfully.
 partial_receipt="$ROOT/data/monday/evidence/cutovers/$c2/transition.json"
 if MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CUTOVER_FIXTURE_SYSTEMD=1 \
-  MONDAY_CUTOVER_FIXTURE_FAIL_USDM_ONCE=1 MONDAY_ROOT="$ROOT" \
+  MONDAY_CUTOVER_FIXTURE_FAIL_USDM_ONCE=1 MONDAY_CUTOVER_FIXTURE_PRODUCTION_ACTIVE=1 MONDAY_ROOT="$ROOT" \
   "$SCRIPT_DIR/host-rust-lob-cutover.sh" --from "$c1" --to "$c2" \
   --gate-receipt "$gate2" --gate-sha256 "$gate2_sha" --root "$ROOT" \
   >/dev/null 2>&1; then
@@ -2579,6 +2579,15 @@ fi
 partial_calls="$ROOT/run/cutover-fixture.calls"
 for unit in binance-lob-archiver-production@spot.service binance-lob-archiver-production@usdm.service; do
   grep -Fq "mask $unit" "$partial_calls"
+  [[ $(readlink -- "$ROOT/etc/systemd/system/$unit") == \
+    "$ROOT/opt/monday/releases/binance-lob-controller/$c1/deployment/binance-lob-archiver-production@.service" ]] || {
+    printf 'partial-start rollback retained the candidate unit binding: %s\n' "$unit" >&2
+    exit 1
+  }
+  [[ $(cat "$ROOT/run/cutover-fixture.processes/${unit//@/_}") == "$c1" ]]
+  fragment_line=$(grep -nF "verify-fragment $unit" "$partial_calls" | tail -n1 | cut -d: -f1)
+  restart_line=$(grep -nF "start $unit" "$partial_calls" | tail -n1 | cut -d: -f1)
+  (( fragment_line < restart_line ))
 done
 partial_process_root="$ROOT/run/cutover-fixture.processes"
 for process in "$partial_process_root"/*; do

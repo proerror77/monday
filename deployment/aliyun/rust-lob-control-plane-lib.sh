@@ -491,14 +491,62 @@ monday_rust_lob_verify_writer_state() {
     && $observed_enabled == "$expected_enabled" ]]
 }
 
+# Resolve the exact previous production fragment before touching an instance.
+# A fixed C1 instance link survives an active=C0 rollback: `enable` alone keeps
+# following C1. Only the two production instances and this transition's verified
+# C0/C1 links may be replaced; an unknown link or regular file is not ours.
+monday_rust_lob_rollback_production_fragment() {
+  [[ $# -eq 4 ]] || return 2
+  local root=$1 unit=$2 before=$3 candidate=$4 controller_root asset template instance target previous manifest
+  case "$unit" in binance-lob-archiver-production@spot.service|binance-lob-archiver-production@usdm.service) ;; *) return 1 ;; esac
+  monday_sha256_ok "$before" && monday_sha256_ok "$candidate" || return 1
+  controller_root=$(monday_root_join "$root" opt/monday/releases/binance-lob-controller) || return 1
+  [[ $(monday_active_controller_sha "$root") == "$before" ]] || return 1
+  monday_verify_controller_release "$root" "$before" || return 1
+  # Only C1's signed runtime bytes authorise removing its instance link. A
+  # failed candidate payload must not prevent rollback to a verified good C0.
+  manifest="$controller_root/$candidate/release.json"
+  [[ $(monday_sha256_file "$manifest") == "$candidate" ]] || return 1
+  monday_validate_v2_manifest "$manifest" || return 1
+  monday_path_direct "$controller_root/$candidate/deployment" || return 1
+  [[ $(monday_rust_lob_runtime_contract_sha256 "$controller_root/$candidate/deployment") \
+    == "$(monday_manifest_field "$manifest" runtime_contract_sha256)" ]] || return 1
+  asset=binance-lob-archiver-production@.service
+  previous="$controller_root/$before/deployment/$asset"
+  template=$(monday_root_join "$root" "etc/systemd/system/$asset") || return 1
+  monday_path_direct "${template%/*}" || return 1
+  [[ -L $template && $(readlink -- "$template") == "$controller_root/active/deployment/$asset" \
+    && $(readlink -f -- "$template") == "$previous" ]] || return 1
+  instance=$(monday_root_join "$root" "etc/systemd/system/$unit") || return 1
+  if [[ -e $instance || -L $instance ]]; then
+    [[ -L $instance ]] || return 1
+    target=$(readlink -- "$instance") || return 1
+    [[ $target == "$previous" || $target == "$controller_root/$candidate/deployment/$asset" ]] || return 1
+  fi
+  printf '%s\n' "$previous"
+}
+
+# Check the fragment systemd actually selected after daemon-reload, rather than
+# merely the template or enabled flag. Existing drop-ins remain untouched; the
+# normal signed-runtime/lifetime checks still apply to their effective values.
+monday_rust_lob_verify_rollback_production_fragment() {
+  [[ $# -eq 2 ]] || return 2
+  local unit=$1 expected=$2 fragment
+  fragment=$(systemctl show "$unit" --property=FragmentPath --value) || return 1
+  [[ -n $fragment && $(readlink -f -- "$fragment") == "$expected" ]] || return 1
+  monday_file_direct "$expected" || return 1
+  cmp -s -- "$fragment" "$expected" || return 1
+  [[ $(systemctl show "$unit" --property=RuntimeMaxUSec --value) == infinity ]] || return 1
+}
+
 # Restore a snapshot captured before direct bootstrap.  Passing `legacy` is
 # allowed only for the direct migration; stable V2 rollback/restore must keep
 # all legacy writers masked.  A failed restoration is deliberately reported so
 # the caller can contain the complete allowlist instead of guessing a state.
 monday_rust_lob_restore_writer_snapshot() {
-  [[ $# -eq 2 ]] || return 2
-  local snapshot=$1 restore_legacy=$2
-  local unit load active enabled
+  [[ $# -eq 5 ]] || return 2
+  local snapshot=$1 restore_legacy=$2 root=$3 before=$4 candidate=$5
+  local unit load active enabled previous_fragment instance
   local failed=0
   while IFS=$'\t' read -r unit load active enabled; do
     [[ -n $unit ]] || continue
@@ -512,17 +560,37 @@ monday_rust_lob_restore_writer_snapshot() {
       systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
       continue
     fi
-    systemctl stop "$unit" >/dev/null 2>&1 || failed=1
+    previous_fragment=
+    if [[ $restore_legacy == v2 && $enabled == enabled \
+      && $unit == binance-lob-archiver-production@*.service ]]; then
+      previous_fragment=$(monday_rust_lob_rollback_production_fragment \
+        "$root" "$unit" "$before" "$candidate") || { failed=1; continue; }
+    fi
+    systemctl stop "$unit" >/dev/null 2>&1 || { failed=1; continue; }
+    if [[ -n $previous_fragment ]]; then
+      # disable removes the transition-owned fixed instance and its wants link.
+      # Recreate only the exact allowlisted instance against C0 before enable;
+      # never use --force to overwrite an unrecognised unit binding.
+      systemctl disable "$unit" >/dev/null 2>&1 || { failed=1; continue; }
+      instance=$(monday_root_join "$root" "etc/systemd/system/$unit") || return 1
+      if [[ -e $instance || -L $instance ]]; then failed=1; continue; fi
+      ln -s -- "$previous_fragment" "$instance" || { failed=1; continue; }
+    fi
     case "$enabled" in
       masked|masked-runtime|masked-runtime*)
         systemctl mask --runtime "$unit" >/dev/null 2>&1 || failed=1 ;;
       enabled|enabled-runtime|enabled-presets|indirect|generated|linked|linked-runtime)
-        systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
-        systemctl enable "$unit" >/dev/null 2>&1 || failed=1 ;;
+        systemctl unmask --runtime "$unit" >/dev/null 2>&1 || { failed=1; continue; }
+        systemctl enable "$unit" >/dev/null 2>&1 || { failed=1; continue; } ;;
       *)
         systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
         systemctl disable "$unit" >/dev/null 2>&1 || failed=1 ;;
     esac
+    if [[ -n $previous_fragment ]]; then
+      systemctl daemon-reload >/dev/null 2>&1 || { failed=1; continue; }
+      monday_rust_lob_verify_rollback_production_fragment "$unit" "$previous_fragment" \
+        || { failed=1; continue; }
+    fi
     if [[ $active == active || $active == activating ]]; then
       systemctl start "$unit" >/dev/null 2>&1 || failed=1
     else
