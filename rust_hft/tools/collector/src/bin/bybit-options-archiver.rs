@@ -327,9 +327,9 @@ struct Health {
     updated_at_ms: u64,
 }
 
-/// Persistent uploader outcome recorded in `upload-status.json` so runtime and
-/// shadow-gate policies can require `upload_failure_count == 0` and observe a
-/// successful OSS drain.
+/// Persistent uploader outcome recorded in `upload-status.json`. Failure count
+/// is cumulative for runtime/shadow gates; the error pair describes unresolved
+/// uploads and is cleared only after a complete, failure-free drain attempt.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct UploadStatus {
     #[serde(default)]
@@ -337,6 +337,19 @@ struct UploadStatus {
     last_success_at: Option<u64>,
     last_error_at: Option<u64>,
     last_error: Option<String>,
+}
+
+impl UploadStatus {
+    fn record_upload_result(&mut self, result: &Result<()>, at_ms: u64) {
+        match result {
+            Ok(()) => self.last_success_at = Some(at_ms),
+            Err(error) => {
+                self.failure_count = self.failure_count.saturating_add(1);
+                self.last_error_at = Some(at_ms);
+                self.last_error = Some(error.to_string());
+            }
+        }
+    }
 }
 
 fn read_upload_status(spool: &Path) -> Result<UploadStatus> {
@@ -666,6 +679,7 @@ async fn upload_pending(config: Config) -> Result<usize> {
     let mut status = read_upload_status(&config.spool_dir)?;
     let mut uploaded = 0;
     let mut failures = 0;
+    let mut unfinished_segments = false;
     for entry in fs::read_dir(&config.spool_dir)? {
         let path = entry?.path();
         if path.extension().and_then(|v| v.to_str()) != Some("ndjson") {
@@ -682,6 +696,7 @@ async fn upload_pending(config: Config) -> Result<usize> {
         // Rotation publishes the data file before its metadata; wait for the
         // atomic metadata markers instead of racing a segment still finishing.
         if !manifest.is_file() || !success.is_file() {
+            unfinished_segments = true;
             continue;
         }
         let marker = path.with_file_name(format!(
@@ -691,17 +706,14 @@ async fn upload_pending(config: Config) -> Result<usize> {
         if marker.exists() {
             continue;
         }
-        match upload_one(&config, &path).await {
+        let result = upload_one(&config, &path).await;
+        status.record_upload_result(&result, now_ms());
+        match result {
             Ok(()) => {
                 uploaded += 1;
-                status.last_success_at = Some(now_ms());
-                status.last_error = None;
             }
             Err(error) => {
                 failures += 1;
-                status.failure_count = status.failure_count.saturating_add(1);
-                status.last_error_at = Some(now_ms());
-                status.last_error = Some(error.to_string());
                 warn!(segment = %path.display(), %error, "Bybit Options upload failed");
             }
         }
@@ -711,6 +723,13 @@ async fn upload_pending(config: Config) -> Result<usize> {
     let swept = sweep_expired_zst(&config.spool_dir, config.local_zst_retention_secs)?;
     if swept > 0 {
         info!(segments = swept, "swept expired local zst fallbacks");
+    }
+    // A successful file must not hide an earlier failure in this attempt.
+    // An empty drained spool can also retire an error from an older attempt,
+    // without inventing a new upload success or resetting historical failures.
+    if failures == 0 && !unfinished_segments {
+        status.last_error_at = None;
+        status.last_error = None;
     }
     write_upload_status(&config.spool_dir, &status)?;
     if failures > 0 {
@@ -1009,7 +1028,7 @@ fn write_health(
     let (disk_free_gb, spool_usage_bytes, disk_warning, spool_warning) =
         spool_disk_state(config);
     let upload = read_upload_status(&config.spool_dir)?;
-    let upload_warning = upload.failure_count > 0;
+    let upload_warning = upload.last_error_at.is_some() || upload.last_error.is_some();
     write_json_atomic(
         &config.spool_dir.join("health.json"),
         &serde_json::to_value(Health {
@@ -1272,5 +1291,133 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert_eq!(fs::read(&status).unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn upload_pending_clears_recovered_error_without_erasing_history() {
+        let dir = tempfile::tempdir().unwrap();
+        // Reproduce the deployed state: a later upload cleared the message but
+        // left the old error timestamp and cumulative failure count behind.
+        let previous = UploadStatus {
+            failure_count: 28,
+            last_success_at: Some(1_790_633_992_851),
+            last_error_at: Some(1_790_273_715_193),
+            last_error: None,
+        };
+        write_upload_status(dir.path(), &previous).unwrap();
+
+        assert_eq!(
+            upload_pending(test_config_for(dir.path())).await.unwrap(),
+            0
+        );
+        let status = read_upload_status(dir.path()).unwrap();
+        assert_eq!(status.failure_count, previous.failure_count);
+        assert_eq!(status.last_success_at, previous.last_success_at);
+        assert_eq!(status.last_error_at, None);
+        assert_eq!(status.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn upload_pending_keeps_error_when_raw_segment_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = UploadStatus {
+            failure_count: 1,
+            last_success_at: Some(10),
+            last_error_at: Some(20),
+            last_error: Some("upload failed".into()),
+        };
+        write_upload_status(dir.path(), &previous).unwrap();
+        fs::write(dir.path().join("bybit-options.1.ndjson"), b"data").unwrap();
+
+        assert_eq!(
+            upload_pending(test_config_for(dir.path())).await.unwrap(),
+            0
+        );
+        let status = read_upload_status(dir.path()).unwrap();
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::to_value(previous).unwrap()
+        );
+    }
+
+    #[test]
+    fn upload_status_preserves_mixed_batch_failure_in_either_order() {
+        for failure_first in [true, false] {
+            let mut status = UploadStatus {
+                failure_count: 28,
+                ..UploadStatus::default()
+            };
+            let success = Ok(());
+            let failure = Err(anyhow::anyhow!("failed segment"));
+            let (first, second) = if failure_first {
+                (&failure, &success)
+            } else {
+                (&success, &failure)
+            };
+            status.record_upload_result(first, 10);
+            status.record_upload_result(second, 20);
+
+            assert_eq!(status.failure_count, 29);
+            assert_eq!(
+                status.last_success_at,
+                Some(if failure_first { 20 } else { 10 })
+            );
+            assert_eq!(status.last_error_at, Some(if failure_first { 10 } else { 20 }));
+            assert_eq!(status.last_error.as_deref(), Some("failed segment"));
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_pending_persists_failed_segment_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = UploadStatus {
+            failure_count: 28,
+            last_success_at: Some(10),
+            ..UploadStatus::default()
+        };
+        write_upload_status(dir.path(), &previous).unwrap();
+        let name = "bybit-options.1.ndjson";
+        fs::write(dir.path().join(name), b"data").unwrap();
+        fs::write(dir.path().join(format!("{name}.manifest.json")), b"{}").unwrap();
+        fs::write(dir.path().join(format!("{name}._SUCCESS")), b"").unwrap();
+
+        let error = upload_pending(test_config_for(dir.path())).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("1 pending Bybit Options OSS uploads failed"));
+        let status = read_upload_status(dir.path()).unwrap();
+        assert_eq!(status.failure_count, 29);
+        assert_eq!(status.last_success_at, previous.last_success_at);
+        assert!(status.last_error_at.is_some());
+        assert_eq!(status.last_error.as_deref(), Some("manifest missing sha256"));
+        assert!(dir.path().join(name).exists());
+    }
+
+    #[test]
+    fn health_separates_active_upload_errors_from_cumulative_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_for(dir.path());
+        let segment = Segment::open(dir.path(), 1).unwrap();
+        for (last_error_at, last_error, warning) in [
+            (None, None, false),
+            (Some(10), None, true),
+            (None, Some("current failure".to_owned()), true),
+        ] {
+            let status = UploadStatus {
+                failure_count: 28,
+                last_success_at: Some(20),
+                last_error_at,
+                last_error,
+            };
+            write_upload_status(dir.path(), &status).unwrap();
+            write_health(&config, &segment, 1, 1, Some(20), 1).unwrap();
+            let health: Value = serde_json::from_slice(
+                &fs::read(dir.path().join("health.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(health["upload_failure_count"], 28);
+            assert_eq!(health["upload_warning"], warning);
+            assert_eq!(health["last_upload_error_at"], json!(last_error_at));
+        }
     }
 }

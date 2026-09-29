@@ -1,5 +1,39 @@
 #!/usr/bin/env bash
 
+# Missing, malformed or indirect status never resets the cumulative counter.
+bybit_options_upload_failure_count() {
+  local status=$1
+  [[ -f $status && ! -L $status ]] || return 1
+  jq -er '.failure_count | select(type == "number" and . >= 0 and . == floor)' "$status"
+}
+
+# The guarded interval must neither introduce failures nor erase history.
+# A historical error can be retired only by the candidate drain itself.
+bybit_options_upload_status_ready() {
+  local status=$1 baseline=$2 count
+  [[ $baseline =~ ^[0-9]+$ ]] || return 1
+  count=$(bybit_options_upload_failure_count "$status") || return 1
+  [[ $count == "$baseline" ]] || return 1
+  jq -e 'has("last_error_at") and has("last_error")
+    and .last_error_at == null and .last_error == null' "$status" >/dev/null
+}
+
+# Validate a complete rendered collector ExecStart, including immutable digest,
+# and reject alternate/duplicate commands in unit fragments or drop-ins.
+bybit_options_unit_exec_start_matches() {
+  local binary=$1 unit_text=$2
+  [[ $binary =~ ^/opt/monday/releases/bybit-options-archiver/[a-f0-9]{64}/bybit-options-archiver$ ]] \
+    || return 1
+  printf '%s\n' "$unit_text" | awk -v expected="$binary" '
+    /^[[:space:]]*ExecStart[[:space:]]*=/ {
+      count++
+      sub(/^[^=]*=[[:space:]]*/, "")
+      sub(/[[:space:]]*$/, "")
+      command=$0
+    }
+    END { exit !(count == 1 && command == expected) }'
+}
+
 # Pure monotonic freshness transition used by the Bybit Options shadow gate,
 # its cutover, and the test harness.  Output:
 #   last_updated_ms last_advance_mono max_gap_seconds sample_increment

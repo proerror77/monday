@@ -274,6 +274,7 @@ health_passes() {
     --argjson minimum_symbols "$MINIMUM_SYMBOLS" \
     --argjson minimum_updated_ms "$gate_started_ms" \
     --argjson old_updated_ms 0 \
+    --argjson upload_failure_baseline 0 \
     -f "$runtime_health_policy" "$health" >/dev/null
 }
 
