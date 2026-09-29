@@ -2217,6 +2217,7 @@ async fn run_session(
     for (producer_id, shard) in stream_shards.into_iter().enumerate() {
         let stall_timeout = shard.stall_timeout(config.stall_timeout);
         tasks.spawn(receive_url(
+            config.market,
             shard,
             sender.clone(),
             stream_connected_tx.clone(),
@@ -3873,6 +3874,7 @@ async fn wait_for_stream_reconnect(
 
 #[allow(clippy::too_many_arguments)]
 async fn receive_url(
+    market: Market,
     shard: StreamShard,
     sender: mpsc::Sender<Event>,
     stream_connected: broadcast::Sender<Vec<String>>,
@@ -4118,7 +4120,7 @@ async fn receive_url(
                     }
                     break;
                 }
-                let event = event_from_frame_for_shard(frame, received_at_ns, producer_id)?;
+                let event = event_from_frame_for_shard(market, frame, received_at_ns, producer_id)?;
                 watchdog.mark_data_for(producer_id);
                 if coverage_announced {
                     if proof_events.len() >= proof_buffer_budget {
@@ -4232,6 +4234,7 @@ async fn receive_url(
             let received_at_ns = now_ns()?;
             if let Message::Text(text) = message {
                 let event = event_from_frame_for_shard(
+                    market,
                     serde_json::from_str(&text)?,
                     received_at_ns,
                     producer_id,
@@ -4497,6 +4500,7 @@ fn raw_trade_from_frame_with_clock_policy(
 }
 
 fn event_from_frame_for_shard(
+    market: Market,
     frame: Value,
     received_at_ns: u64,
     producer_id: usize,
@@ -4554,7 +4558,10 @@ fn event_from_frame_for_shard(
             let recv_minus_event_ms = received_at_ms.saturating_sub(trade.event_time_ms);
             let event_minus_trade_ms = trade.event_time_ms.saturating_sub(trade.trade_time_ms);
             let recv_minus_trade_ms = received_at_ms.saturating_sub(trade.trade_time_ms);
-            if recv_minus_event_ms > MAX_SOURCE_DELAY_MS {
+            // Spot and USD-M raw-trade frames share their core shape. Only
+            // the configured market can authorize the USD-M audit fallback;
+            // Spot must retain its strict freshness error before enqueueing.
+            if market == Market::Usdm && recv_minus_event_ms > MAX_SOURCE_DELAY_MS {
                 return Ok(Event::StaleRawTrade {
                     trade,
                     frame,
@@ -4572,7 +4579,8 @@ fn event_from_frame_for_shard(
             value.map_or_else(|| "<missing>".to_owned(), |value| value.to_string())
         };
         anyhow::bail!(
-            "{strict_error:#}; stream={} symbol={} E={} T={} received_at_ns={received_at_ns} recv_minus_event_ms={} event_minus_trade_ms={} recv_minus_trade_ms={} producer_id={producer_id} frame={frame}",
+            "{strict_error:#}; market={} stream={} symbol={} E={} T={} received_at_ns={received_at_ns} recv_minus_event_ms={} event_minus_trade_ms={} recv_minus_trade_ms={} governed_limit_ms={MAX_SOURCE_DELAY_MS} producer_id={producer_id} frame={frame}",
+            market.as_str(),
             frame.get("stream").and_then(Value::as_str).unwrap_or("<missing>"),
             data.get("s").and_then(Value::as_str).unwrap_or("<missing>"),
             value_or_missing(event_time_ms),
@@ -4592,6 +4600,9 @@ fn event_from_frame_for_shard(
         Ok(event) => return Ok(event),
         Err(error) => error,
     };
+    if market != Market::Usdm {
+        return Err(strict_error);
+    }
     let ticker = match BookTicker::from_frame_allow_stale(&frame, received_at_ns) {
         Ok(ticker) => ticker,
         Err(_) => return Err(strict_error),
@@ -6347,8 +6358,34 @@ mod tests {
 
     #[tokio::test]
     async fn upload_only_fails_while_spool_lock_is_held_and_succeeds_after_release() {
-        let spool_dir = env::temp_dir().join(format!("monday-spool-lock-{}", now_ns().unwrap()));
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CHILD_ROOT: &str = "MONDAY_SPOOL_LOCK_TEST_CHILD_ROOT";
+        const DEADLINE: Duration = Duration::from_secs(5);
+        if let Some(root) = env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let first = SpoolLock::acquire(&root.join("spool")).unwrap();
+            let mut control = tokio::net::UnixStream::connect(root.join("control.sock"))
+                .await
+                .unwrap();
+            control.write_all(b"L").await.unwrap();
+            let mut release = [0];
+            tokio::time::timeout(DEADLINE, control.read_exact(&mut release))
+                .await
+                .expect("parent must release the lock owner")
+                .unwrap();
+            assert_eq!(release, *b"R");
+            drop(first);
+            let released = SpoolLock::acquire(&root.join("spool"))
+                .expect("dropping the sole lock handle must release the lock");
+            drop(released);
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let spool_dir = root.path().join("spool");
         std::fs::create_dir_all(&spool_dir).unwrap();
+        let listener = tokio::net::UnixListener::bind(root.path().join("control.sock")).unwrap();
         let config = UploadConfig {
             spool_dir: spool_dir.clone(),
             oss_bucket: "unused".into(),
@@ -6358,15 +6395,45 @@ mod tests {
             oss_copy_timeout: Duration::from_secs(1),
         };
 
-        let first = SpoolLock::acquire(&spool_dir).unwrap();
+        // Open the lock only after exec in an isolated owner. In the parallel
+        // test runner, an unrelated fork can inherit a parent's flock until
+        // exec even with O_CLOEXEC, so dropping that parent File is not a
+        // sufficient observation that the kernel lock has been released.
+        let mut owner = tokio::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::upload_only_fails_while_spool_lock_is_held_and_succeeds_after_release",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (mut control, _) = tokio::time::timeout(DEADLINE, listener.accept())
+            .await
+            .expect("child lock owner must connect")
+            .unwrap();
+        let mut ready = [0];
+        tokio::time::timeout(DEADLINE, control.read_exact(&mut ready))
+            .await
+            .expect("child must acquire the lock before upload is tested")
+            .unwrap();
+        assert_eq!(ready, *b"L");
         let error = upload_only(&config).await.unwrap_err();
         assert!(error.to_string().contains("spool is already locked"));
         assert!(!spool_dir.join("upload-status.json").exists());
 
-        drop(first);
+        control.write_all(b"R").await.unwrap();
+        let status = tokio::time::timeout(DEADLINE, owner.wait())
+            .await
+            .expect("lock owner must exit before upload is retried")
+            .unwrap();
+        assert!(status.success(), "lock owner failed: {status}");
         upload_only(&config).await.unwrap();
         assert!(spool_dir.join(SPOOL_LOCK_FILE).is_file());
-        std::fs::remove_dir_all(spool_dir).unwrap();
+        assert!(spool_dir.join("upload-status.json").is_file());
     }
 
     #[tokio::test]
@@ -7736,6 +7803,7 @@ mod tests {
         let error = tokio::time::timeout(
             Duration::from_millis(250),
             receive_url(
+                Market::Spot,
                 shard,
                 sender,
                 stream_connected,
@@ -7755,6 +7823,99 @@ mod tests {
 
         assert!(error.to_string().contains("subscription proof timed out"));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_spot_raw_trade_preserves_queued_prefix_for_teardown() {
+        // Exercise both decoder call sites: before LIST_SUBSCRIPTIONS proof
+        // and after it. Keep the valid event queued until the producer fails.
+        for awaiting_proof in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = test_config("http://unused".into());
+            config.spool_dir = root.path().to_owned();
+            let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = websocket.next().await.unwrap().unwrap();
+                assert!(request.to_text().unwrap().contains("LIST_SUBSCRIPTIONS"));
+                if !awaiting_proof {
+                    websocket
+                        .send(Message::Text(
+                            json!({"id":SUBSCRIPTION_PROOF_ID,"result":["btcusdt@trade"]})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                let received_at_ns = now_ns().unwrap();
+                let valid = raw_trade_frame(9, received_at_ns);
+                let mut stale = raw_trade_frame(10, received_at_ns);
+                stale["data"]["E"] = json!(received_at_ns / 1_000_000 - 31_000);
+                stale["data"]["T"] = stale["data"]["E"].clone();
+                for frame in [valid, stale] {
+                    websocket
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+            });
+            let (sender, mut receiver) = mpsc::channel(4);
+            let (stream_connected, _) = broadcast::channel(1);
+            let (_shutdown_tx, shutdown) = watch::channel(false);
+            let (_pause_tx, pause_rx) = watch::channel(0_u64);
+            let (_resume_tx, resume_rx) = watch::channel(0_u64);
+            let shard = StreamShard {
+                url: format!("ws://{address}"),
+                streams: BTreeSet::from(["btcusdt@trade".to_owned()]),
+            };
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                receive_url(
+                    Market::Spot,
+                    shard,
+                    sender,
+                    stream_connected,
+                    shutdown,
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    ProcessWatchdog::new_state(),
+                    7,
+                    pause_rx,
+                    resume_rx,
+                ),
+            )
+            .await
+            .expect("stale Spot frame must terminate its producer promptly")
+            .unwrap_err();
+            server.await.unwrap();
+            assert!(
+                error.to_string().contains("source-to-receive delay"),
+                "{error}"
+            );
+            assert!(error.to_string().contains("market=spot"), "{error}");
+            assert!(error.to_string().contains("producer_id=7"), "{error}");
+
+            // These are the real archive-only drain and close operations used
+            // during session teardown; this is not a full-session liveness test.
+            while let Ok(event) = receiver.try_recv() {
+                assert!(matches!(event, Event::RawTrade { .. }));
+                archive_only(&mut segment, "session-1", Market::Spot, event).unwrap();
+            }
+            let artifact = segment.close().unwrap().expect("valid prefix must survive");
+            let manifest: Value =
+                serde_json::from_reader(std::fs::File::open(&artifact.manifest).unwrap()).unwrap();
+            assert_eq!(manifest["event_types"]["raw_trade"], 1);
+            assert!(manifest["event_types"].get("stale_raw_trade").is_none());
+            assert_eq!(manifest["has_replay_safe_checkpoint"], false);
+            assert!(files_with_suffix(root.path(), ".jsonl.part")
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[tokio::test]
@@ -7806,6 +7967,7 @@ mod tests {
         };
 
         let task = tokio::spawn(receive_url(
+            Market::Usdm,
             shard,
             sender,
             stream_connected,
@@ -7941,6 +8103,7 @@ mod tests {
         };
 
         let task = tokio::spawn(receive_url(
+            Market::Spot,
             shard,
             sender,
             stream_connected,
@@ -8055,6 +8218,7 @@ mod tests {
         let diagnostics = Arc::new(ProducerDiagnostics::new(std::slice::from_ref(&shard)));
         let watchdog = ProcessWatchdog::new_with_diagnostics(diagnostics.clone());
         let task = tokio::spawn(receive_url(
+            Market::Spot,
             shard,
             sender,
             stream_connected,
@@ -8241,6 +8405,7 @@ mod tests {
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
         let task = tokio::spawn(receive_url(
+            Market::Spot,
             StreamShard {
                 url: format!("ws://{address}"),
                 streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
@@ -8322,6 +8487,7 @@ mod tests {
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
         let task = tokio::spawn(receive_url(
+            Market::Spot,
             StreamShard {
                 url: format!("ws://{address}"),
                 streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
@@ -8376,6 +8542,7 @@ mod tests {
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
         let task = tokio::spawn(receive_url(
+            Market::Spot,
             StreamShard {
                 url: format!("ws://{address}"),
                 streams: BTreeSet::from(["btcusdt@aggTrade".to_owned()]),
@@ -8486,6 +8653,7 @@ mod tests {
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
         let task = tokio::spawn(receive_url(
+            Market::Spot,
             StreamShard {
                 url: format!("ws://{address}"),
                 streams: BTreeSet::from([
@@ -8601,6 +8769,7 @@ mod tests {
         let (pause_tx, pause_rx) = watch::channel(0_u64);
         let (resume_tx, resume_rx) = watch::channel(0_u64);
         let task = tokio::spawn(receive_url(
+            Market::Spot,
             StreamShard {
                 url: format!("ws://{address}"),
                 streams: BTreeSet::from([
@@ -8795,7 +8964,7 @@ mod tests {
             },
         });
 
-        let error = event_from_frame_for_shard(frame, received_at_ns, 7)
+        let error = event_from_frame_for_shard(Market::Spot, frame, received_at_ns, 7)
             .expect_err("stale depth must remain fail closed")
             .to_string();
         assert!(error.contains("depth E source-to-receive delay"));
@@ -8808,6 +8977,75 @@ mod tests {
     }
 
     #[test]
+    fn stale_raw_trade_routing_respects_configured_market() {
+        let received_at_ns = 1_700_000_031_000_000_000;
+        let event_time_ms = 1_700_000_000_000_u64;
+        let mut frame = raw_trade_frame(9, received_at_ns);
+        frame["data"]["E"] = json!(event_time_ms);
+        frame["data"]["T"] = json!(event_time_ms - 10);
+        let error = event_from_frame_for_shard(Market::Spot, frame.clone(), received_at_ns, 7)
+            .expect_err("Spot must reject stale source clocks before enqueueing")
+            .to_string();
+        for detail in [
+            "raw trade E source-to-receive delay exceeds the governed limit",
+            "market=spot",
+            "stream=btcusdt@trade",
+            "symbol=BTCUSDT",
+            "E=1700000000000 T=1699999999990",
+            "recv_minus_event_ms=31000",
+            "event_minus_trade_ms=10",
+            "recv_minus_trade_ms=31010",
+            "governed_limit_ms=30000",
+            "producer_id=7",
+        ] {
+            assert!(error.contains(detail), "missing {detail}: {error}");
+        }
+        assert!(error.contains(&format!("frame={frame}")));
+        assert!(matches!(
+            event_from_frame_for_shard(Market::Usdm, frame.clone(), received_at_ns, 7).unwrap(),
+            Event::StaleRawTrade { .. }
+        ));
+
+        frame["data"]["E"] = json!(received_at_ns / 1_000_000 - MAX_SOURCE_DELAY_MS);
+        frame["data"]["T"] = frame["data"]["E"].clone();
+        for market in [Market::Spot, Market::Usdm] {
+            assert!(matches!(
+                event_from_frame_for_shard(market, frame.clone(), received_at_ns, 7).unwrap(),
+                Event::RawTrade { .. }
+            ));
+        }
+        frame["data"]["E"] = json!(received_at_ns / 1_000_000 - 1);
+        frame["data"]["T"] = json!(event_time_ms);
+        for market in [Market::Spot, Market::Usdm] {
+            let error = event_from_frame_for_shard(market, frame.clone(), received_at_ns, 7)
+                .expect_err("T-only staleness must remain fail closed");
+            assert!(error
+                .to_string()
+                .contains("raw trade age exceeds the governed limit"));
+        }
+    }
+
+    #[test]
+    fn spot_decoder_does_not_emit_usdm_only_stale_book_ticker() {
+        let received_at_ns = 1_700_000_031_000_000_000;
+        let mut frame = book_ticker_frame(received_at_ns);
+        frame["data"]["E"] = json!(received_at_ns / 1_000_000 - 31_000);
+        frame["data"]["T"] = frame["data"]["E"].clone();
+        let error = event_from_frame_for_shard(Market::Spot, frame.clone(), received_at_ns, 7)
+            .expect_err("frame shape must not authorize a USD-M-only Spot event");
+        assert!(error.to_string().contains("source-to-receive delay"));
+        assert!(matches!(
+            event_from_frame_for_shard(Market::Usdm, frame, received_at_ns, 7).unwrap(),
+            Event::StaleBookTicker { .. }
+        ));
+        assert!(matches!(
+            event_from_frame_for_shard(Market::Spot, spot_book_ticker_frame(), received_at_ns, 7)
+                .unwrap(),
+            Event::BookTicker { .. }
+        ));
+    }
+
+    #[test]
     fn stale_raw_trade_event_preserves_source_clocks_and_original_frame() {
         let received_at_ns = 1_700_000_031_000_000_000;
         let event_time_ms = 1_700_000_000_000;
@@ -8816,8 +9054,9 @@ mod tests {
         let frame =
             observed_usdm_raw_trade_frame(9, event_time_ms, trade_time_ms, "101", "0.2", "NA");
 
-        let event = event_from_frame_for_shard(frame.clone(), received_at_ns, producer_id)
-            .expect("stale raw trade is isolated as an audit event");
+        let event =
+            event_from_frame_for_shard(Market::Usdm, frame.clone(), received_at_ns, producer_id)
+                .expect("stale raw trade is isolated as an audit event");
         let Event::StaleRawTrade {
             trade,
             frame: audited_frame,
@@ -8838,7 +9077,7 @@ mod tests {
 
         let mut frame = frame;
         frame["data"]["E"] = json!(received_at_ns / 1_000_000 - 1);
-        let error = event_from_frame_for_shard(frame, received_at_ns, producer_id)
+        let error = event_from_frame_for_shard(Market::Usdm, frame, received_at_ns, producer_id)
             .expect_err("T-only raw trade staleness remains fail closed")
             .to_string();
         assert!(error.contains("raw trade age exceeds the governed limit"));
@@ -8892,7 +9131,7 @@ mod tests {
         ];
 
         for (frame, received_at_ns) in frames {
-            let event = event_from_frame_for_shard(frame, received_at_ns, 7).unwrap();
+            let event = event_from_frame_for_shard(Market::Usdm, frame, received_at_ns, 7).unwrap();
             assert_eq!(
                 process_event(
                     &config,
@@ -9030,7 +9269,8 @@ mod tests {
             ),
         ];
         for (frame, frame_received_at_ns) in frames {
-            let event = event_from_frame_for_shard(frame, frame_received_at_ns, 7).unwrap();
+            let event =
+                event_from_frame_for_shard(Market::Usdm, frame, frame_received_at_ns, 7).unwrap();
             assert_eq!(
                 process_event(
                     &config,
@@ -9092,7 +9332,8 @@ mod tests {
             ),
         ];
         for (index, (frame, frame_received_at_ns)) in frames.into_iter().enumerate() {
-            let event = event_from_frame_for_shard(frame, frame_received_at_ns, 7).unwrap();
+            let event =
+                event_from_frame_for_shard(Market::Usdm, frame, frame_received_at_ns, 7).unwrap();
             let result = process_event(
                 &config,
                 &mut segment,
@@ -9450,7 +9691,9 @@ mod tests {
                 unknown => panic!("unexpected USD-M stream type {unknown}"),
             };
             for (frame, received_at_ns) in frames {
-                let event = event_from_frame_for_shard(frame, received_at_ns, producer_id).unwrap();
+                let event =
+                    event_from_frame_for_shard(Market::Usdm, frame, received_at_ns, producer_id)
+                        .unwrap();
                 process_event(
                     &config,
                     &mut segment,
@@ -9618,8 +9861,13 @@ mod tests {
                 "m": false,
             },
         });
-        let event = event_from_frame_for_shard(aggregate, aggregate_received_at_ns, producer_id)
-            .unwrap();
+        let event = event_from_frame_for_shard(
+            Market::Spot,
+            aggregate,
+            aggregate_received_at_ns,
+            producer_id,
+        )
+        .unwrap();
         assert_eq!(
             process_event(
                 &config,
@@ -9654,6 +9902,7 @@ mod tests {
             vec![["0.02215".to_owned(), "1".to_owned()]]
         );
         let event = event_from_frame_for_shard(
+            Market::Spot,
             zero_book_ticker,
             zero_book_ticker_received_at_ns,
             producer_id,
@@ -9691,7 +9940,9 @@ mod tests {
                 "m": false,
             },
         });
-        let event = event_from_frame_for_shard(trade, trade_received_at_ns, producer_id).unwrap();
+        let event =
+            event_from_frame_for_shard(Market::Spot, trade, trade_received_at_ns, producer_id)
+                .unwrap();
         assert_eq!(
             process_event(
                 &config,
@@ -9721,7 +9972,9 @@ mod tests {
                 "a": [],
             },
         });
-        let event = event_from_frame_for_shard(depth, depth_received_at_ns, producer_id).unwrap();
+        let event =
+            event_from_frame_for_shard(Market::Spot, depth, depth_received_at_ns, producer_id)
+                .unwrap();
         assert_eq!(
             process_event(
                 &config,
