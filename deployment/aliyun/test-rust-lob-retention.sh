@@ -13,6 +13,8 @@ rejected() {
   local label=$1; shift
   if ( "$@" ) >"$fixture/rejected.out" 2>"$fixture/rejected.err"; then
     printf 'unexpected acceptance: %s\n' "$label" >&2; exit 1
+  else
+    REJECTED_STATUS=$?
   fi
 }
 
@@ -48,6 +50,15 @@ resume_retained() {
   resume_market
 }
 rejected resume-retained resume_retained
+resume_guard_before_drain() {
+  drain_lock() { : >"$ROOT_PREFIX/resume-entered-drain"; return 1; }
+  resume_retained
+}
+assert_resume_guard() {
+  rejected resume-claim-without-pointer resume_guard_before_drain
+  [[ ! -e $ROOT_PREFIX/resume-entered-drain ]]
+  grep -Fq 'a retained or partially retained historical job cannot be resumed' "$fixture/rejected.err"
+}
 
 # Reader never hashes payload bodies, creates locks or changes metadata. Linux
 # ctime remains an independent guard even if a writer restores the old mtime.
@@ -120,7 +131,98 @@ jq --arg sha "$(printf '%064d' 99)" '.job_receipt_sha256=$sha' "$RETENTION_FIXTU
 mv "$fixture/changed.json" "$RETENTION_FIXTURE_EVIDENCE/result.json"
 RETAIN_RESULT_SHA256=$(sha256sum "$RETENTION_FIXTURE_EVIDENCE/result.json" | awk '{print $1}')
 rejected v2-job-receipt-mismatch retention_fixture_retain
+number=13
+for field in executing_deployment_bundle_sha256 executing_deployment_source_revision; do
+  for invalid in missing wrong; do
+    retention_fixture_job "$number" "$(printf '%064d' 51)" v2
+    jq --arg field "$field" --arg invalid "$invalid" \
+      'if $invalid=="missing" then del(.[$field]) else .[$field]="wrong-identity" end' \
+      "$RETENTION_FIXTURE_EVIDENCE/result.json" >"$fixture/changed.json"
+    mv "$fixture/changed.json" "$RETENTION_FIXTURE_EVIDENCE/result.json"
+    RETAIN_RESULT_SHA256=$(sha256sum "$RETENTION_FIXTURE_EVIDENCE/result.json" | awk '{print $1}')
+    rejected "v2-$field-$invalid" retention_fixture_retain
+    number=$((number + 1))
+  done
+done
 printf 'Current payload, stale state, adoption, wrong digest and other markets are refused\n'
+(
+  root="$fixture/pending-pointer-only"; mkdir "$root"; setup_retention_fixture "$root"
+  retention_fixture_job 17
+  mkdir -p "$EVIDENCE_ROOT/retained/spot"
+  printf '{}\n' >"$EVIDENCE_ROOT/retained/spot/$RETAIN_JOB_ID.json.pending"
+  assert_resume_guard
+)
+
+# Kill the real writer immediately before/after each no-clobber rename. Both
+# states must be recoverable by the exact request, including a pending final
+# pointer and a renamed pointer whose directory fsync was interrupted.
+for publication in intent inventory request receipt pointer; do
+  for edge in before after; do
+    (
+      root="$fixture/crash-$publication-$edge"; mkdir "$root"; setup_retention_fixture "$root"
+      retention_fixture_job 60 "$(printf '%064d' 51)" v2
+      original_files >"$root/original.before"
+      leaf="$publication.json"; [[ $publication != pointer ]] || leaf="$RETAIN_JOB_ID.json"
+      publication_root="$RETENTION_FIXTURE_EVIDENCE/retention"
+      [[ $publication != pointer ]] || publication_root="$EVIDENCE_ROOT/retained/spot"
+      mv() {
+        local destination=${*: -1}
+        if [[ $1 == -nT && ${destination##*/} == "$leaf" ]]; then
+          if [[ $edge == before ]]; then kill -KILL "$BASHPID"; fi
+          command mv "$@"
+          if [[ $edge == after ]]; then kill -KILL "$BASHPID"; fi
+        else command mv "$@"; fi
+      }
+      rejected "interrupted-$publication-$edge" retention_fixture_retain
+      [[ $REJECTED_STATUS == 137 ]]
+      unset -f mv
+      if [[ $edge == before ]]; then expected_leaf="$leaf.pending"; else expected_leaf=$leaf; fi
+      published=$(find "$publication_root" -name "$expected_leaf" -type f -print)
+      [[ -n $published && $(stat -c %h "$published") == 1 ]]
+      published_sha=$(sha256sum "$published" | awk '{print $1}')
+      assert_resume_guard
+      # A process crash must not leave the old implementation's two-link alias.
+      [[ -z $(find "$EVIDENCE_ROOT" -type f -links +1 -print) ]]
+      retention_fixture_retain >"$root/resumed.json"
+      retention_fixture_check | jq -e '.retained_failed_count==1 and .invalid_retention_count==0' >/dev/null
+      published=$(find "$publication_root" -name "$leaf" -type f -print)
+      [[ $(sha256sum "$published" | awk '{print $1}') == "$published_sha" ]]
+      [[ -z $(find "$EVIDENCE_ROOT" -name '*.pending' -o -name '*.tmp.*') ]]
+      original_files >"$root/original.after"
+      cmp "$root/original.before" "$root/original.after"
+      printf 'Recovered %s publication, killed %s rename; exact bytes preserved\n' "$publication" "$edge"
+    )
+  done
+done
+printf 'All five metadata publications survive real process kills before and after atomic rename\n'
+
+# Unknown aliases/pending content are never reclaimed. A real mv -n collision
+# returns success without moving; the writer must detect that and preserve both
+# the foreign destination and its own pending bytes for inspection.
+(
+  root="$fixture/publication-conflicts"; mkdir "$root"; setup_retention_fixture "$root"
+  RETENTION_DEADLINE=$((SECONDS + 900))
+  mkdir -m 0750 "$root/records"
+  printf '{}\n' >"$root/records/foreign.json"; chmod 0440 "$root/records/foreign.json"
+  rejected unknown-destination retention_write_json "$root/records/foreign.json" '{"owned":true}'
+  [[ $(cat "$root/records/foreign.json") == '{}' ]]
+  printf '{}\n' >"$root/records/pending.json.pending"; chmod 0440 "$root/records/pending.json.pending"
+  rejected unknown-pending retention_write_json "$root/records/pending.json" '{"owned":true}'
+  [[ $(cat "$root/records/pending.json.pending") == '{}' && ! -e $root/records/pending.json ]]
+  printf '{}\n' >"$root/records/linked.json.pending"; chmod 0440 "$root/records/linked.json.pending"
+  ln "$root/records/linked.json.pending" "$root/unknown-alias"
+  rejected unknown-alias retention_write_json "$root/records/linked.json" '{}'
+  [[ -f $root/unknown-alias && -f $root/records/linked.json.pending && ! -e $root/records/linked.json ]]
+  [[ $(stat -c %h "$root/unknown-alias") == 2 ]]
+  mv() {
+    local destination=${*: -1}
+    printf '{"foreign":true}\n' >"$destination"; chmod 0440 "$destination"
+    command mv "$@"
+  }
+  rejected no-clobber-no-op retention_write_json "$root/records/race.json" '{}'
+  [[ $(cat "$root/records/race.json") == '{"foreign":true}' && $(cat "$root/records/race.json.pending") == '{}' ]]
+)
+printf 'Foreign destinations, pending files and hard-link aliases remain untouched on rejection\n'
 
 # Each mutation starts from an independently committed record; no test repairs
 # metadata to try to re-acknowledge evidence that has changed.
@@ -161,6 +263,7 @@ for mutation in same-size-restored-mtime added missing renamed replaced hardlink
     retention_fixture_job "$number"; retention_fixture_retain >/dev/null
     mutate_evidence "$mutation"
     retention_fixture_check | jq -e '.retained_failed_count==0 and .invalid_retention_count==1' >/dev/null
+    if [[ $mutation == pointer-missing ]]; then assert_resume_guard; fi
   )
   number=$((number + 1))
 done

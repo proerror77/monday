@@ -1359,6 +1359,11 @@ then commits the root-owned `retained/spot/<job>.json` pointer. It never execute
 an uploader or claims recovery, delivery or replay eligibility; a committed
 retained job cannot be resumed. Exact request repetition reuses the receipt;
 conflicting or incomplete evidence cannot acknowledge the failure.
+Missing pointers and unfinished retention declarations also prohibit resume.
+Metadata publishes through a protected, exact-content pending file and a
+same-directory no-clobber rename. Repeating the same request can finish an
+interrupted publication; unknown pending files or hard-link aliases are
+preserved and refused, never cleaned up by the health reader.
 
 The explicit inventory is bounded to 16 GiB, 4,096 entries and 900 seconds per job
 (including original backups); metadata files are at most 4 MiB. Global drain

@@ -1023,8 +1023,12 @@ resume_market() {
   local previous_execution old_request_sha adoption_sha tmp hft_uid hft_gid result
   validate_resume_request
   [[ ! -e $EVIDENCE_ROOT/retained/$MARKET/$RESUME_JOB_ID.json \
-    && ! -L $EVIDENCE_ROOT/retained/$MARKET/$RESUME_JOB_ID.json ]] \
-    || fail 'a retained historical job cannot be resumed'
+    && ! -L $EVIDENCE_ROOT/retained/$MARKET/$RESUME_JOB_ID.json \
+    && ! -e $EVIDENCE_ROOT/retained/$MARKET/$RESUME_JOB_ID.json.pending \
+    && ! -L $EVIDENCE_ROOT/retained/$MARKET/$RESUME_JOB_ID.json.pending \
+    && ! -e $EVIDENCE_ROOT/$RESUME_JOB_ID/retention \
+    && ! -L $EVIDENCE_ROOT/$RESUME_JOB_ID/retention ]] \
+    || fail 'a retained or partially retained historical job cannot be resumed'
   drain_lock || fail 'a recovery drain or controller transition is active'
   secure_release_identity
   if [[ -n ${EXECUTING_RECOVERY_PROGRAM:-} ]]; then
@@ -1667,6 +1671,8 @@ retention_original_identity() {
     and (if .schema=="monday.rust_lob_recovery_queue_result.v2" then
       .job_receipt_sha256==$job_sha and .adoption_sha256=="" and .request_sha256==""
       and .executing_controller_sha256==$controller
+      and .executing_deployment_bundle_sha256==$bundle
+      and .executing_deployment_source_revision==$source
     else .schema=="monday.rust_lob_recovery_queue_result.v1" end)' "$result" >/dev/null \
     || fail 'retain requires the matching original terminal failed result'
   if [[ -e $spool/upload-status.json || -L $spool/upload-status.json ]]; then
@@ -1694,19 +1700,43 @@ retention_intent_json() {
         deployment_bundle_sha256:$bundle,deployment_source_revision:$source}}'
 }
 
+retention_json_file_matches() {
+  local path=$1 expected_sha=$2 phase=$3 mode
+  secure_regular_file "$path" 0
+  path_is_direct_or_absent "$path" || fail 'indirect retention publication path'
+  [[ $(stat -c %h -- "$path") == 1 ]] || fail 'retention publication has unknown hard-link aliases'
+  mode=$(stat -c %a -- "$path") || fail 'cannot inspect retention publication mode'
+  [[ $mode == 440 || ( $phase == pending && $mode == 600 ) ]] || fail 'retention publication mode is invalid'
+  [[ $(retention_small_sha "$path") == "$expected_sha" ]] || fail 'conflicting retention metadata already exists'
+}
+
 retention_write_json() {
-  local path=$1 json=$2 tmp="$1.tmp.$$" observed
+  local path=$1 json=$2 tmp="$1.pending" expected_sha inode
+  secure_directory "${path%/*}" 0 0
+  expected_sha=$(printf '%s\n' "$json" | sha256sum | awk '{print $1}')
   if [[ -e $path || -L $path ]]; then
-    secure_regular_file "$path" 0
-    observed=$(cat "$path") || fail 'cannot read staged retention metadata'
-    [[ $observed == "$json" ]] || fail 'conflicting retention metadata already exists'
+    retention_json_file_matches "$path" "$expected_sha" committed
+    [[ ! -e $tmp && ! -L $tmp ]] || fail 'unexpected pending metadata beside committed retention'
+    # A prior process may have stopped after rename but before the directory
+    # fsync. Repeating the exact request finishes that durability boundary.
+    recovery_sync_path "$path" "${path%/*}" || fail 'cannot persist existing retention metadata'
     return
   fi
-  (umask 077; set -o noclobber; printf '%s\n' "$json" >"$tmp") || fail 'cannot create retention metadata temporary'
-  chmod 0440 "$tmp" || fail 'cannot protect retention metadata'
+  if [[ ! -e $tmp && ! -L $tmp ]]; then
+    (umask 077; set -o noclobber; printf '%s\n' "$json" >"$tmp") || fail 'cannot create retention metadata pending file'
+  fi
+  # The deterministic pending path can be reused only for these exact bytes,
+  # under the existing global/spool locks. Unknown/partial files are preserved.
+  retention_json_file_matches "$tmp" "$expected_sha" pending
+  if [[ $(stat -c %a -- "$tmp") != 440 ]]; then chmod 0440 "$tmp" || fail 'cannot protect retention metadata'; fi
+  inode=$(stat -c '%d:%i' -- "$tmp") || fail 'cannot identify retention pending file'
   recovery_sync_path "$tmp" || fail 'cannot persist retention metadata'
-  ln -- "$tmp" "$path" || fail 'retention metadata already committed'
-  rm -- "$tmp" || fail 'cannot unlink owned retention metadata temporary'
+  # Same-directory, no-clobber rename has no two-hard-link publication window.
+  # mv -n can report success without moving: verify both names and the inode.
+  mv -nT -- "$tmp" "$path" || fail 'cannot publish retention metadata'
+  [[ ! -e $tmp && ! -L $tmp && $(stat -c '%d:%i' -- "$path") == "$inode" ]] \
+    || fail 'retention metadata destination already exists or publication drifted'
+  retention_json_file_matches "$path" "$expected_sha" committed
   recovery_sync_path "${path%/*}" || fail 'cannot persist retention metadata directory'
 }
 
@@ -1841,7 +1871,7 @@ retention_check_pointer() {
 
 retain_market() {
   local spool evidence root stage intent existing request inventory inventory_sha request_sha receipt receipt_sha
-  local before after fast pointer summary hft_uid current_controller destination fingerprints pointer_json
+  local before after fast pointer summary hft_uid current_controller destination fingerprints pointer_json retained_at intent_sha
   retention_validate_request
   RETENTION_DEADLINE=$((SECONDS + 900))
   drain_lock || fail 'retain requires exclusive global drain ownership'
@@ -1868,17 +1898,26 @@ retain_market() {
     existing=$(jq -cS 'del(.inventory_sha256)|.schema="monday.rust_lob_recovery_retention_intent.v1"' \
       "$root/$request_sha/request.json")
     [[ $existing == "$intent" ]] || fail 'a different retained disposition is already committed'
+    pointer_json=$(cat "$pointer") || fail 'cannot reread committed retention pointer'
+    retention_write_json "$pointer" "$pointer_json"
+    summary=$(retention_check_pointer "$pointer") || fail 'existing retained disposition changed while completing publication'
     printf '%s\n' "$summary"
     flock -u 8; flock -u 7
     return
   fi
   ensure_root_directory "$root"
   stage="$root/.staging-$RETAIN_REQUEST_ID"
+  intent_sha=$(printf '%s\n' "$intent" | sha256sum | awk '{print $1}')
   for existing in "$root"/* "$root"/.staging-*; do
     [[ -e $existing || -L $existing ]] || continue
     secure_directory "$existing" 0 0
-    secure_regular_file "$existing/intent.json" 0
-    request=$(jq -cS . "$existing/intent.json") || fail 'invalid unfinished retention intent'
+    if [[ -e $existing/intent.json || -L $existing/intent.json ]]; then
+      secure_regular_file "$existing/intent.json" 0
+      request=$(jq -cS . "$existing/intent.json") || fail 'invalid unfinished retention intent'
+    elif [[ $existing == "$root/.staging-$RETAIN_REQUEST_ID" ]]; then
+      retention_json_file_matches "$existing/intent.json.pending" "$intent_sha" pending
+      request=$intent
+    else fail 'unfinished retention record has no committed intent'; fi
     [[ $request == "$intent" && ( $stage == "$root/.staging-$RETAIN_REQUEST_ID" || $stage == "$existing" ) ]] \
       || fail 'a conflicting unfinished retention request requires review'
     stage=$existing
@@ -1900,8 +1939,17 @@ retain_market() {
   request_sha=$(printf '%s\n' "$request" | sha256sum | awk '{print $1}')
   retention_write_json "$stage/request.json" "$request"
   if [[ ! -e $stage/receipt.json && ! -L $stage/receipt.json ]]; then
+    retained_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [[ -e $stage/receipt.json.pending || -L $stage/receipt.json.pending ]]; then
+      secure_regular_file "$stage/receipt.json.pending" 0
+      retention_small_sha "$stage/receipt.json.pending" >/dev/null || fail 'invalid pending retention receipt size'
+      retained_at=$(jq -er --arg completed "$(jq -er .completed_at "$evidence/result.json")" '
+        .retained_at | select(type=="string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+        | select((fromdateiso8601)>=($completed|fromdateiso8601) and (fromdateiso8601)<=now)' \
+        "$stage/receipt.json.pending") || fail 'invalid pending retention timestamp'
+    fi
     receipt=$(jq -cnS --argjson request "$request" --arg request_sha "$request_sha" --arg inventory "$inventory_sha" \
-      --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg now "$retained_at" \
       --argjson count "$(jq '[.entries[]|select(.fingerprint.type=="file")]|length' <<<"$inventory")" \
       --argjson bytes "$(jq '[.entries[]|select(.fingerprint.type=="file")|.fingerprint.size|tonumber]|add//0' <<<"$inventory")" \
       '{schema:"monday.rust_lob_recovery_retention.v1",request:$request,request_sha256:$request_sha,
