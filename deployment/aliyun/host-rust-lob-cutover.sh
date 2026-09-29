@@ -94,7 +94,7 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
     done < <(monday_rust_lob_production_writer_units)
   fi
   systemctl() {
-    local action=${1:-} unit=${2:-} argument fixture_pid fixture_spot_health
+    local action=${1:-} unit=${2:-} argument fixture_pid fixture_spot_health fixture_template
     case "$action" in
       start)
         for argument in "$@"; do
@@ -139,17 +139,25 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
             unmask) fixture_unit_file_state[$argument]=disabled; fixture_unit_load_state[$argument]=loaded ;;
             disable)
               fixture_unit_file_state[$argument]=disabled
-              if [[ $argument == binance-lob-archiver-production@*.service \
+              if [[ ($argument == binance-lob-archiver-production@*.service || $argument == binance-lob-archiver-recovery@*.timer) \
                 && -L $ROOT/etc/systemd/system/$argument ]]; then
                 rm -- "$ROOT/etc/systemd/system/$argument"
               fi ;;
             enable)
               fixture_unit_file_state[$argument]=enabled
-              if [[ $argument == binance-lob-archiver-production@*.service \
+              fixture_template=
+              case "$argument" in
+                binance-lob-archiver-production@*.service) fixture_template=binance-lob-archiver-production@.service ;;
+                binance-lob-archiver-recovery@*.timer) fixture_template=binance-lob-archiver-recovery@.timer ;;
+              esac
+              if [[ -n $fixture_template && -L $ROOT/etc/systemd/system/$fixture_template \
                 && ! -e $ROOT/etc/systemd/system/$argument \
                 && ! -L $ROOT/etc/systemd/system/$argument ]]; then
-                ln -s "$(readlink -f -- "$ROOT/etc/systemd/system/binance-lob-archiver-production@.service")" \
+                ln -s "$(readlink -f -- "$ROOT/etc/systemd/system/$fixture_template")" \
                   "$ROOT/etc/systemd/system/$argument"
+                if [[ $argument == binance-lob-archiver-recovery@*.timer ]]; then
+                  printf 'bind-timer %s %s\n' "$argument" "$(readlink "$ROOT/etc/systemd/system/$argument")" >>"$fixture_calls"
+                fi
               fi ;;
           esac
           printf '%s %s\n' "$action" "$argument" >>"$fixture_calls"
@@ -230,7 +238,11 @@ if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
           FragmentPath)
             case "$unit" in
               binance-lob-archiver-recovery@*)
-                monday_root_join "$ROOT" "etc/systemd/system/binance-lob-archiver-recovery@.${unit##*.}" ;;
+                if [[ -e $ROOT/etc/systemd/system/$unit ]]; then
+                  printf '%s\n' "$ROOT/etc/systemd/system/$unit"
+                else
+                  monday_root_join "$ROOT" "etc/systemd/system/binance-lob-archiver-recovery@.${unit##*.}"
+                fi ;;
               binance-lob-archiver-production@*)
                 printf 'verify-fragment %s\n' "$unit" >>"$fixture_calls"
                 if [[ -e $ROOT/etc/systemd/system/$unit ]]; then
@@ -606,13 +618,20 @@ cleanup() {
     exit "$status"
   fi
   if (( status != 0 )); then
-    if [[ $FROM != direct ]] && (( committed == 1 )); then
+    if (( writer_containment_started == 1 )) && [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
+      # Enabling a projected timer installs a fixed candidate-C instance link.
+      # Remove it while candidate topology still resolves; otherwise restoring
+      # the old regular template leaves systemd pinned to the failed candidate.
+      monday_rust_lob_contain_recovery_schedulers || rollback_failed=true
+      monday_rust_lob_verify_recovery_schedulers_contained || rollback_failed=true
+    fi
+    if [[ $FROM != direct && $rollback_failed == false ]] && (( committed == 1 )); then
       if rollback_active; then committed=0; else rollback_failed=true; fi
     fi
-    if (( scheduler_projection_prepared == 1 )); then
+    if (( scheduler_projection_prepared == 1 )) && [[ $rollback_failed == false ]]; then
       restore_scheduler_topology || rollback_failed=true
     fi
-    if (( production_prepared == 1 )); then
+    if (( production_prepared == 1 )) && [[ $rollback_failed == false ]]; then
       rm -f -- "$production" || rollback_failed=true
       if [[ $FROM == direct ]]; then
         if [[ -n ${old_production_target:-} ]]; then
@@ -624,7 +643,7 @@ cleanup() {
         ln -s "$stable_projection" "$production" || rollback_failed=true
       fi
     fi
-    if (( projection_prepared == 1 )) && [[ $FROM == direct ]]; then
+    if (( projection_prepared == 1 )) && [[ $FROM == direct && $rollback_failed == false ]]; then
       restore_direct_topology || rollback_failed=true
     fi
     # Keep active=C1 as the recovery authority until raw P0/R0 and incomplete
@@ -1186,6 +1205,9 @@ verify_production_process
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   monday_rust_lob_enable_recovery_schedulers "$ROOT" "$TO" \
     || die 'recovery schedulers did not become active and enabled after cutover'
+  if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FAIL_AFTER_RECOVERY_SCHEDULERS:-0} == 1 ]]; then
+    die 'fault injection after recovery scheduler enable before transition evidence'
+  fi
 fi
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
   monday_rust_lob_verify_legacy_contained \
