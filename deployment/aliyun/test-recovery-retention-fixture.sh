@@ -76,11 +76,13 @@ setup_retention_fixture() {
 }
 
 retention_fixture_job() {
-  local number=$1 payload=${2:-$(printf '%064d' 41)} env_sha bundle source
+  local number=$1 payload=${2:-$(printf '%064d' 41)} version=${3:-v1} env_sha bundle source job_sha
   RETAIN_JOB_ID="20260901T000000Z-spot-${payload:0:12}-$number"
   RETENTION_FIXTURE_JOB_DIR="$QUEUE_MARKET_ROOT/$RETAIN_JOB_ID.failed"
+  RETENTION_FIXTURE_SEGMENT_DIR="$RETENTION_FIXTURE_JOB_DIR/date=2026-09-01/hour=00"
   RETENTION_FIXTURE_EVIDENCE="$EVIDENCE_ROOT/$RETAIN_JOB_ID"
   mkdir -m 0750 "$RETENTION_FIXTURE_JOB_DIR" "$RETENTION_FIXTURE_EVIDENCE"
+  mkdir -m 0750 "${RETENTION_FIXTURE_SEGMENT_DIR%/*}" "$RETENTION_FIXTURE_SEGMENT_DIR"
   mkdir -m 0750 "$RETENTION_FIXTURE_EVIDENCE/recovery-input"
   cp "$RELEASE_ENV_FILE" "$RETENTION_FIXTURE_JOB_DIR/recovery.env"
   env_sha=$(sha256sum "$RETENTION_FIXTURE_JOB_DIR/recovery.env" | awk '{print $1}')
@@ -96,11 +98,27 @@ retention_fixture_job() {
       deployment_bundle_sha256:$bundle,deployment_source_revision:$source,env_sha256:$env,
       started_at:"2026-09-01T00:00:01Z",completed_at:"2026-09-01T00:00:02Z",result:"failed",step:"drain",message:"fixture"}' \
       >"$RETENTION_FIXTURE_EVIDENCE/result.json"
+  if [[ $version == v2 ]]; then
+    jq --arg controller "$(printf '%064d' 44)" --arg runtime "$(printf '%064d' 45)" --arg payload "$payload" \
+      '.+{controller_sha256:$controller,runtime_contract_sha256:$runtime,payload_sha256:$payload}' \
+      "$RETENTION_FIXTURE_JOB_DIR/job.json" >"$RETENTION_FIXTURE_JOB_DIR/job.new"
+    mv "$RETENTION_FIXTURE_JOB_DIR/job.new" "$RETENTION_FIXTURE_JOB_DIR/job.json"
+    job_sha=$(sha256sum "$RETENTION_FIXTURE_JOB_DIR/job.json" | awk '{print $1}')
+    jq --arg controller "$(printf '%064d' 44)" --arg runtime "$(printf '%064d' 45)" \
+      --arg payload "$payload" --arg job_sha "$job_sha" --arg bundle "$bundle" --arg source "$source" \
+      '.+{schema:"monday.rust_lob_recovery_queue_result.v2",payload_sha256:$payload,
+        controller_sha256:$controller,runtime_contract_sha256:$runtime,job_receipt_sha256:$job_sha,
+        adoption_sha256:"",request_sha256:"",executing_controller_sha256:$controller,
+        executing_deployment_bundle_sha256:$bundle,executing_deployment_source_revision:$source,
+        minimum_upload_success_at:.started_at,upload_triplet_readback:{}}' \
+      "$RETENTION_FIXTURE_EVIDENCE/result.json" >"$RETENTION_FIXTURE_EVIDENCE/result.new"
+    mv "$RETENTION_FIXTURE_EVIDENCE/result.new" "$RETENTION_FIXTURE_EVIDENCE/result.json"
+  fi
   printf 'lock-evidence\n' >"$RETENTION_FIXTURE_JOB_DIR/.binance-lob-archiver.lock"
-  printf 'unfinished-part\n' >"$RETENTION_FIXTURE_JOB_DIR/part-one.jsonl.part"
-  printf 'corrupt-part\n' >"$RETENTION_FIXTURE_JOB_DIR/part-two.part.corrupt"
-  printf 'sealed-but-not-delivered\n' >"$RETENTION_FIXTURE_JOB_DIR/part-three.jsonl.zst"
-  printf '{"readiness":"rejected","sequence_gaps":1}\n' >"$RETENTION_FIXTURE_JOB_DIR/part-three.manifest.json"
+  printf 'unfinished-part\n' >"$RETENTION_FIXTURE_SEGMENT_DIR/part-one.jsonl.part"
+  printf 'corrupt-part\n' >"$RETENTION_FIXTURE_SEGMENT_DIR/part-two.part.corrupt"
+  printf 'sealed-but-not-delivered\n' >"$RETENTION_FIXTURE_SEGMENT_DIR/part-three.jsonl.zst"
+  printf '{"readiness":"rejected","sequence_gaps":1}\n' >"$RETENTION_FIXTURE_SEGMENT_DIR/part-three.manifest.json"
   printf '{"failure_count":7,"last_error":"old failure","last_success_at":null}\n' >"$RETENTION_FIXTURE_JOB_DIR/upload-status.json"
   printf '{"original_backup":"unrecovered"}\n' >"$RETENTION_FIXTURE_EVIDENCE/recovery-input/receipt.json"
   printf 'original-backup\n' >"$RETENTION_FIXTURE_EVIDENCE/recovery-input/original.jsonl.part"

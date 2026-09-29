@@ -33,6 +33,7 @@ record="$RETENTION_FIXTURE_EVIDENCE/retention/$(jq -r .request_sha256 "$pointer"
 jq -e '.data_recovered==false and .delivery_verified==false and .automatic_retry==false
   and .replay_eligibility=="not_assessed" and .recovery_result=="failed"
   and .request.identity.original_controller_sha256==null' "$record/receipt.json" >/dev/null
+jq -e 'any(.entries[]; .scope=="queue" and .path=="date=2026-09-01/hour=00/part-one.jsonl.part")' "$record/inventory.json" >/dev/null
 before=$(retention_fingerprint "$pointer")
 retention_fixture_retain >"$fixture/repeat.json"
 cmp "$fixture/first.json" "$fixture/repeat.json"
@@ -70,9 +71,11 @@ cmp "$fixture/read.before" "$fixture/read.after"
 jq -e '.retained_failed_count==1 and .invalid_retention_count==0 and (.failed_job_ids|length)==1' "$fixture/check.json" >/dev/null
 eval "$(declare -f fixture_real_bounded | sed '1s/fixture_real_bounded/retention_bounded/')"
 
-retention_fixture_job 2 "$(printf '%064d' 51)"
+retention_fixture_job 2 "$(printf '%064d' 51)" v2
 retention_fixture_check | jq -e '.retained_failed_count==1 and (.failed_job_ids|length)==2' >/dev/null
 retention_fixture_retain >/dev/null
+second_receipt="$RETENTION_FIXTURE_EVIDENCE/retention/$(jq -r .request_sha256 "$EVIDENCE_ROOT/retained/spot/$RETAIN_JOB_ID.json")/receipt.json"
+jq -e --arg controller "$(printf '%064d' 44)" '.request.identity.original_controller_sha256==$controller' "$second_receipt" >/dev/null
 retention_fixture_check | jq -e '.retained_failed_count==2 and .invalid_retention_count==0' >/dev/null
 printf 'Retain preserves both full old payload identities, physical failures and original bytes; exact repeat is read-only\n'
 
@@ -107,12 +110,22 @@ rejected malformed-terminal-result retention_fixture_retain
 retention_fixture_job 10
 rm "$RETENTION_FIXTURE_JOB_DIR/.binance-lob-archiver.lock"
 rejected absent-existing-spool-lock retention_fixture_retain
+retention_fixture_job 11 "$(printf '%064d' 51)" v2
+jq --arg sha "$(printf '%064d' 99)" '.executing_controller_sha256=$sha' "$RETENTION_FIXTURE_EVIDENCE/result.json" >"$fixture/changed.json"
+mv "$fixture/changed.json" "$RETENTION_FIXTURE_EVIDENCE/result.json"
+RETAIN_RESULT_SHA256=$(sha256sum "$RETENTION_FIXTURE_EVIDENCE/result.json" | awk '{print $1}')
+rejected v2-executor-mismatch retention_fixture_retain
+retention_fixture_job 12 "$(printf '%064d' 51)" v2
+jq --arg sha "$(printf '%064d' 99)" '.job_receipt_sha256=$sha' "$RETENTION_FIXTURE_EVIDENCE/result.json" >"$fixture/changed.json"
+mv "$fixture/changed.json" "$RETENTION_FIXTURE_EVIDENCE/result.json"
+RETAIN_RESULT_SHA256=$(sha256sum "$RETENTION_FIXTURE_EVIDENCE/result.json" | awk '{print $1}')
+rejected v2-job-receipt-mismatch retention_fixture_retain
 printf 'Current payload, stale state, adoption, wrong digest and other markets are refused\n'
 
 # Each mutation starts from an independently committed record; no test repairs
 # metadata to try to re-acknowledge evidence that has changed.
 mutate_evidence() {
-  local kind=$1 path="$RETENTION_FIXTURE_JOB_DIR/part-one.jsonl.part" old_time
+  local kind=$1 path="$RETENTION_FIXTURE_SEGMENT_DIR/part-one.jsonl.part" old_time
   case $kind in
     same-size-restored-mtime)
       old_time=$(stat -c %y "$path")
@@ -164,7 +177,7 @@ lock_case() (
   mkfifo "$root/hash-entered" "$root/hash-release" "$root/done"
   exec 20<>"$root/hash-entered" 21<>"$root/hash-release" 22<>"$root/done"
   retention_bounded() {
-    if [[ $1 == sha256sum && ${*: -1} == "$RETENTION_FIXTURE_JOB_DIR/part-one.jsonl.part" ]]; then
+    if [[ $1 == sha256sum && ${*: -1} == "$RETENTION_FIXTURE_SEGMENT_DIR/part-one.jsonl.part" ]]; then
       printf 'entered\n' >&20
       read -r -t 20 -u 21 _ || return 1
     fi
@@ -202,7 +215,17 @@ printf 'Real global/spool ownership, released market during hashing, nonblocking
 (
   root="$fixture/batch"; mkdir "$root"; setup_retention_fixture "$root"
   for number in $(seq 1 23); do
-    retention_fixture_job "$number"; retention_fixture_retain >/dev/null
+    retention_fixture_job "$number" "$(printf '%064d' 41)" v2
+    # Real host inventory has 12-24 files/job and an oldest job with roughly
+    # 108 unique directories. Cover both metadata fan-out and empty partitions.
+    for metadata in $(seq 1 8); do printf '{}\n' >"$RETENTION_FIXTURE_EVIDENCE/recovery-input/validation-$metadata.json"; done
+    if [[ $number == 1 ]]; then
+      for empty in $(seq 0 99); do
+        printf -v partition 'date=2026-08-%02d/hour=%02d' "$((empty / 24 + 1))" "$((empty % 24))"
+        mkdir -p "$RETENTION_FIXTURE_JOB_DIR/$partition"
+      done
+    fi
+    retention_fixture_retain >/dev/null
   done
   started=$SECONDS
   retention_fixture_check >"$root/batch.json"

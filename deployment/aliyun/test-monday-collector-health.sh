@@ -1779,7 +1779,7 @@ healthy_fixtures
   # shellcheck source=deployment/aliyun/test-recovery-retention-fixture.sh
   . "$script_dir/test-recovery-retention-fixture.sh"
   setup_retention_fixture "$test_root" health
-  retention_fixture_job 800
+  retention_fixture_job 800 "$(printf '%064d' 41)" v2
   retention_fixture_retain >"$test_root/retained.json"
 )
 cat >"$stub_dir/monday-rust-lob-retained-check" <<EOF
@@ -1827,9 +1827,10 @@ run_health --json --dry-run
 expect 'Spot retention never relieves USD-M failure' "$(json_query '.ok==false and .checks.recovery_queue.usdm.undisposed_failed_count==1'; echo $?)"
 rm -rf "$spool_root/binance-lob-recovery/usdm/untouched.failed"
 
-saved_mtime=$(stat -c %y "$retained_spool/part-one.jsonl.part")
-printf 'UNFINISHED-PART\n' >"$retained_spool/part-one.jsonl.part"
-touch -d "$saved_mtime" "$retained_spool/part-one.jsonl.part"
+retained_part="$retained_spool/date=2026-09-01/hour=00/part-one.jsonl.part"
+saved_mtime=$(stat -c %y "$retained_part")
+printf 'UNFINISHED-PART\n' >"$retained_part"
+touch -d "$saved_mtime" "$retained_part"
 run_health --json --dry-run
 expect 'same-sized rewrite with restored mtime reopens breach' "$(json_query '
   .ok==false and (.checks.recovery_queue.spot|.failed_count==1 and .retained_failed_count==0

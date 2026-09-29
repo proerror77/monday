@@ -1575,7 +1575,7 @@ retention_inventory() (
         *) exit 1 ;;
       esac
       if [[ $relative != . ]]; then
-        [[ $relative =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ \
+        [[ $relative =~ ^[A-Za-z0-9_.=-]+(/[A-Za-z0-9_.=-]+)*$ \
           && /$relative/ != */../* && /$relative/ != */./* ]] || exit 1
       fi
       before=$(retention_fingerprint "$path") || exit 1
