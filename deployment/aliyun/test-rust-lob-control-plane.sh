@@ -16,19 +16,19 @@ ROOT=$fixture_root
 
 # Rollback calls this fixture guard from a failing EXIT trap. Bash 5.2 must
 # return the validation result, not the trap's original nonzero exit status.
-if ! (
-  export MONDAY_CONTROL_PLANE_TEST=1
-  trap 'monday_rust_lob_require_owned_drain_lock "$ROOT" || exit 72; exit 0' EXIT
-  exit 19
-); then
+fixture_exit_drain_guard() {
+  MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL=$1 \
+    "$BASH" -s -- "$SCRIPT_DIR/rust-lob-control-plane-lib.sh" "$ROOT" <<'GUARD'
+. "$1"
+trap 'monday_rust_lob_require_owned_drain_lock "$2" || exit 72; exit 0' EXIT
+exit 19
+GUARD
+}
+if ! fixture_exit_drain_guard monday-v2-fixture; then
   printf 'valid fixture drain-lock guard inherited the failing EXIT trap status\n' >&2
   exit 1
 fi
-if (
-  export MONDAY_CONTROL_PLANE_TEST=1 MONDAY_CONTROL_PLANE_FIXTURE_SENTINEL=invalid
-  trap 'monday_rust_lob_require_owned_drain_lock "$ROOT" || exit 72; exit 0' EXIT
-  exit 19
-); then
+if fixture_exit_drain_guard invalid; then
   printf 'fixture drain-lock guard accepted an invalid sentinel in EXIT cleanup\n' >&2
   exit 1
 fi
