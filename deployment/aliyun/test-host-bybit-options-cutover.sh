@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034,SC2329,SC2030,SC2031
-# Extracted functions consume fixture state; the render-failure subshell intentionally isolates its receipt directory.
+# shellcheck disable=SC2034,SC2317,SC2329,SC2030,SC2031
+# Functions extracted with eval dynamically call these fixture helpers and consume their state.
+# The render-failure subshell intentionally isolates its receipt directory.
 set -Eeuo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 SOURCE="$SCRIPT_DIR/host-bybit-options-cutover.sh"
