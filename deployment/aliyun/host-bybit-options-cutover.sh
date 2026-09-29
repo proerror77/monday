@@ -5,25 +5,57 @@ export LC_ALL=C
 
 usage() {
   printf 'Usage: %s <candidate-binary-sha256>\n' "${0##*/}" >&2
+  printf '       %s resume-rollback --failed-receipt PATH --failed-receipt-sha256 SHA --rollback-snapshot-sha256 SHA --orphan-inventory PATH --orphan-inventory-sha256 SHA --request-id ID\n' "${0##*/}" >&2
 }
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   printf 'must run as root\n' >&2
   exit 2
 fi
-if [[ $# -ne 1 || ! $1 =~ ^[A-Fa-f0-9]{64}$ ]]; then
-  usage
-  exit 2
+OPERATION=cutover
+FAILED_RECEIPT='' FAILED_RECEIPT_SHA256='' RESUME_SNAPSHOT_SHA256=''
+ORPHAN_INVENTORY='' ORPHAN_INVENTORY_SHA256='' RECOVERY_REQUEST_ID=''
+if [[ ${1:-} == resume-rollback ]]; then
+  OPERATION=resume-rollback
+  shift
+  parsed_options=' '
+  while (($#)); do
+    [[ $# -ge 2 && $parsed_options != *" $1 "* ]] || { usage; exit 2; }
+    parsed_options+="$1 "
+    case $1 in
+      --failed-receipt) FAILED_RECEIPT=$2 ;;
+      --failed-receipt-sha256) FAILED_RECEIPT_SHA256=$2 ;;
+      --rollback-snapshot-sha256) RESUME_SNAPSHOT_SHA256=$2 ;;
+      --orphan-inventory) ORPHAN_INVENTORY=$2 ;;
+      --orphan-inventory-sha256) ORPHAN_INVENTORY_SHA256=$2 ;;
+      --request-id) RECOVERY_REQUEST_ID=$2 ;;
+      *) usage; exit 2 ;;
+    esac
+    shift 2
+  done
+  [[ $FAILED_RECEIPT =~ ^/data/monday/evidence/bybit-options-cutovers/[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}-[0-9]+/cutover\.json$ \
+    && $FAILED_RECEIPT_SHA256 =~ ^[a-f0-9]{64}$ && $RESUME_SNAPSHOT_SHA256 =~ ^[a-f0-9]{64}$ \
+    && $ORPHAN_INVENTORY_SHA256 =~ ^[a-f0-9]{64}$ && $ORPHAN_INVENTORY == /* \
+    && $RECOVERY_REQUEST_ID =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$ ]] || { usage; exit 2; }
+else
+  [[ $# == 1 && $1 =~ ^[A-Fa-f0-9]{64}$ ]] || { usage; exit 2; }
 fi
 
-for command in awk chmod cmp date env find flock grep id install jq ln mkdir mountpoint mv readlink rm runuser sed sha256sum sleep stat systemctl timeout tr wc; do
+for command in awk chmod chown cmp date env find flock grep id install jq ln mkdir mountpoint mv paste readlink rm runuser sed sha256sum sleep stat systemctl timeout tr wc; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'missing required command: %s\n' "$command" >&2
     exit 2
   fi
 done
 
-CANDIDATE_SHA256=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+if [[ $OPERATION == resume-rollback ]]; then
+  [[ -f $FAILED_RECEIPT && ! -L $FAILED_RECEIPT \
+    && $(stat -c %s "$FAILED_RECEIPT") -le 65536 \
+    && $(sha256sum "$FAILED_RECEIPT" | awk '{print $1}') == "$FAILED_RECEIPT_SHA256" ]] || exit 2
+  CANDIDATE_SHA256=$(jq -er '.candidate_sha256|select(test("^[a-f0-9]{64}$"))' "$FAILED_RECEIPT")
+else
+  CANDIDATE_SHA256=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+fi
 RELEASE_ROOT=/opt/monday/releases/bybit-options-archiver
 CANDIDATE_RELEASE="$RELEASE_ROOT/$CANDIDATE_SHA256"
 CANDIDATE_BINARY="$CANDIDATE_RELEASE/bybit-options-archiver"
@@ -48,6 +80,15 @@ MINIMUM_SYMBOLS=500
 SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EVIDENCE_DIR="/data/monday/evidence/bybit-options-cutovers/$(date -u +%Y%m%dT%H%M%SZ)-${CANDIDATE_SHA256:0:12}-$$"
+SYSTEMD_DIR=/etc/systemd/system
+PROC_ROOT=/proc
+RECOVERY_REQUEST_ROOT='' CUSTODY_DIR=''
+MASK_OWNED_UNITS=' ' MASK_SEQUENCE=0
+if [[ $OPERATION == resume-rollback ]]; then
+  RECOVERY_REQUEST_ROOT="${FAILED_RECEIPT%/*}/rollback-recoveries/$RECOVERY_REQUEST_ID"
+  CUSTODY_DIR="$RECOVERY_REQUEST_ROOT/custody"
+  EVIDENCE_DIR="$RECOVERY_REQUEST_ROOT/runs/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+fi
 
 UNIT=bybit-options-archiver.service
 UPLOAD_UNIT=bybit-options-upload.service
@@ -100,6 +141,11 @@ path_is_direct_or_absent() {
   [[ $resolved == "$path" ]]
 }
 
+protected_root_directory() {
+  [[ -d $1 && ! -L $1 && $(readlink -f "$1") == "$1" && $(stat -c %u "$1") == 0 ]] || return 1
+  (( (8#$(stat -c %a "$1") & 022) == 0 ))
+}
+
 for path in /data/monday /data/monday/evidence /data/monday/evidence/bybit-options-cutovers; do
   if ! path_is_direct_or_absent "$path"; then
     printf 'evidence path contains a symlink: %s\n' "$path" >&2
@@ -107,6 +153,15 @@ for path in /data/monday /data/monday/evidence /data/monday/evidence/bybit-optio
   fi
 done
 install -d -m 0750 /data/monday/evidence/bybit-options-cutovers
+if [[ $OPERATION == resume-rollback ]]; then
+  for path in "${FAILED_RECEIPT%/*}" "${FAILED_RECEIPT%/*}/rollback-recoveries" "$RECOVERY_REQUEST_ROOT" "$RECOVERY_REQUEST_ROOT/runs"; do
+    path_is_direct_or_absent "$path" || { printf 'indirect recovery evidence path: %s\n' "$path" >&2; exit 1; }
+    if [[ -e $path ]]; then protected_root_directory "$path" || exit 1; fi
+  done
+  [[ ! -e $RECOVERY_REQUEST_ROOT/completed.json && ! -L $RECOVERY_REQUEST_ROOT/completed.json ]] \
+    || { printf 'rollback recovery already completed; inspect its immutable receipt\n' >&2; exit 1; }
+  install -d -m 0750 "$RECOVERY_REQUEST_ROOT/runs"
+fi
 mkdir -m 0750 -- "$EVIDENCE_DIR" \
   || { printf 'refusing to reuse cutover evidence directory: %s\n' "$EVIDENCE_DIR" >&2; exit 1; }
 
@@ -212,32 +267,81 @@ validate_deployment() {
 atomic_install() {
   local mode=$1 source=$2 destination=$3 temporary
   temporary="${destination}.new.$$"
+  [[ ! -e $temporary && ! -L $temporary ]] || return 1
   install -m "$mode" "$source" "$temporary" || return 1
   mv -Tf "$temporary" "$destination" || return 1
 }
 
 render_unit() {
-  local template=$1 destination=$2 binary=$3
+  local template=$1 destination=$2 binary=$3 temporary="$2.new.$$"
+  [[ ! -e $temporary && ! -L $temporary ]] || return 1
   sed "s|/opt/monday/releases/bybit-options-archiver/@BYBIT_OPTIONS_ARCHIVER_SHA256@/bybit-options-archiver|$binary|g" \
-    "$template" >"$destination"
-  chown root:root "$destination"
-  chmod 0444 "$destination"
+    "$template" >"$temporary" || return 1
+  chown root:root "$temporary" || return 1
+  chmod 0444 "$temporary" || return 1
+  mv -Tf -- "$temporary" "$destination"
 }
 
 atomic_symlink() {
   local target=$1 link=$2 temporary
-  temporary="${link}.new.$$"
-  rm -f "$temporary" || return 1
+  temporary="${link}.symlink.$$"
+  [[ ! -e $temporary && ! -L $temporary ]] || return 1
   ln -s "$target" "$temporary" || return 1
   mv -Tf "$temporary" "$link" || return 1
 }
 
 install_deployment() {
   local directory=$1 binary=$2
-  install -d -m 0755 /etc/systemd/system || return 1
-  render_unit "$directory/bybit-options-archiver.service" "/etc/systemd/system/$UNIT" "$binary" || return 1
-  render_unit "$directory/bybit-options-upload.service" "/etc/systemd/system/$UPLOAD_UNIT" "$binary" || return 1
-  atomic_install 0644 "$directory/$TIMER" "/etc/systemd/system/$TIMER" || return 1
+  install -d -m 0755 "$SYSTEMD_DIR" || return 1
+  render_unit "$directory/bybit-options-archiver.service" "$SYSTEMD_DIR/$UNIT" "$binary" || return 1
+  render_unit "$directory/bybit-options-upload.service" "$SYSTEMD_DIR/$UPLOAD_UNIT" "$binary" || return 1
+  atomic_install 0644 "$directory/$TIMER" "$SYSTEMD_DIR/$TIMER" || return 1
+}
+
+rendered_unit_sha() {
+  local directory=$1 binary=$2 unit=$3
+  if [[ $unit == "$TIMER" ]]; then sha256sum "$directory/$unit" | awk '{print $1}'; return; fi
+  sed "s|/opt/monday/releases/bybit-options-archiver/@BYBIT_OPTIONS_ARCHIVER_SHA256@/bybit-options-archiver|$binary|g" \
+    "$directory/$unit" | sha256sum | awk '{print $1}'
+}
+
+mask_transition_units() {
+  local unit path actual allowed backup
+  # Admit all fragments before replacing any. Preserve exact bytes, then put
+  # the mask at /etc precedence; /run masks do not mask these local fragments.
+  for unit in "${TRANSITION_MASK_UNITS[@]}"; do
+    path="$SYSTEMD_DIR/$unit"
+    if [[ -L $path ]]; then
+      [[ $(readlink "$path") == /dev/null && $MASK_OWNED_UNITS == *" $unit "* ]] || return 1
+    elif [[ -e $path ]]; then
+      [[ -f $path && ! -L $path && $(stat -c %u "$path") == 0 ]] || return 1
+      (( (8#$(stat -c %a "$path") & 022) == 0 )) || return 1
+      actual=$(sha256sum "$path" | awk '{print $1}') || return 1
+      allowed=$(rendered_unit_sha "$CANDIDATE_DEPLOYMENT" "$CANDIDATE_BINARY" "$unit") || return 1
+      if [[ $actual != "$allowed" ]]; then
+        [[ $OLD_MODE == upgrade && -n $OLD_DEPLOYMENT ]] || return 1
+        allowed=$(rendered_unit_sha "$OLD_DEPLOYMENT" "$OLD_BINARY" "$unit") || return 1
+        [[ $actual == "$allowed" ]] || return 1
+      fi
+    elif [[ $OLD_MODE == upgrade && $MASK_OWNED_UNITS != *" $unit "* ]]; then
+      return 1
+    fi
+  done
+  MASK_SEQUENCE=$((MASK_SEQUENCE + 1))
+  backup="$EVIDENCE_DIR/mask-$MASK_SEQUENCE"
+  mkdir -m 0750 "$backup" || return 1
+  for unit in "${TRANSITION_MASK_UNITS[@]}"; do
+    path="$SYSTEMD_DIR/$unit"
+    if [[ -f $path && ! -L $path ]]; then
+      install -m 0440 "$path" "$backup/$unit" || return 1
+      sha256sum "$backup/$unit" >>"$backup/files.sha256" || return 1
+      bybit_path_sync "$backup/$unit" "$backup" || return 1
+    fi
+    atomic_symlink /dev/null "$path" || return 1
+    MASK_OWNED_UNITS+="$unit "
+  done
+  systemctl daemon-reload || return 1
+  production_is_fail_closed
 }
 
 canonical_spool_paths_safe() {
@@ -567,9 +671,373 @@ production_is_fail_closed() {
   local unit state
   for unit in "${TRANSITION_MASK_UNITS[@]}"; do
     systemctl is-active --quiet "$unit" && return 1
+    [[ $(systemctl show "$unit" --property=LoadState --value) == masked ]] || return 1
     state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
     [[ $state == masked || $state == masked-runtime ]] || return 1
   done
+}
+
+bybit_path_sync() {
+  local program version
+  program=$(command -v gnusync || command -v sync) || return 1
+  version=$("$program" --version) || return 1
+  [[ $version == 'sync (GNU coreutils)'* ]] || return 1
+  "$program" -- "$@"
+}
+
+bybit_immutable_json() {
+  local path=$1 json=$2 temporary="$1.tmp.$$"
+  if [[ -e $path || -L $path ]]; then
+    [[ -f $path && ! -L $path && $(stat -c %u "$path") == 0 \
+      && $(stat -c %h "$path") == 1 && $(stat -c %a "$path") == 440 \
+      && $(<"$path") == "$json" ]] || return 1
+    return
+  fi
+  protected_root_directory "${path%/*}" || return 1
+  (set -o noclobber; printf '%s\n' "$json" >"$temporary") || return 1
+  chmod 0440 "$temporary" || return 1
+  bybit_path_sync "$temporary" || return 1
+  ln -- "$temporary" "$path" || return 1
+  rm -- "$temporary" || return 1
+  bybit_path_sync "${path%/*}"
+}
+
+bybit_file_fingerprint() {
+  local path=$1 values dev inode links bytes uid gid mode ms cs mt ct mf cf
+  [[ -f $path && ! -L $path ]] || return 1
+  values=$(TZ=UTC stat -c '%d|%i|%h|%s|%u|%g|%a|%Y|%Z|%y|%z' "$path") || return 1
+  IFS='|' read -r dev inode links bytes uid gid mode ms cs mt ct <<<"$values"
+  [[ $mt =~ \.([0-9]{9})\ \+0000$ ]] || return 1; mf=${BASH_REMATCH[1]}
+  [[ $ct =~ \.([0-9]{9})\ \+0000$ ]] || return 1; cf=${BASH_REMATCH[1]}
+  [[ $links == 1 && $mode =~ ^[0-7]{3,4}$ && $ms =~ ^[0-9]{10}$ && $cs =~ ^[0-9]{10}$ ]] || return 1
+  (( inode <= 9007199254740991 && dev <= 9007199254740991 && (8#$mode & 022) == 0 )) || return 1
+  jq -cnS --arg name "${path##*/}" --argjson bytes "$bytes" --argjson device "$dev" --argjson inode "$inode" \
+    --argjson links "$links" --argjson uid "$uid" --argjson gid "$gid" --arg mode "$mode" \
+    --arg mtime_ns "$ms$mf" --arg ctime_ns "$cs$cf" \
+    '{name:$name,bytes:$bytes,device:$device,inode:$inode,links:$links,uid:$uid,gid:$gid,
+      mode:$mode,mtime_ns:$mtime_ns,ctime_ns:$ctime_ns}'
+}
+
+# Return 0 only for an actual writable open descriptor of this filesystem
+# object. PID disappearance is rechecked by callers; no pathname guess suffices.
+bybit_pid_writes_file() {
+  local path=$1 pid=$2 fd flags identity observed
+  identity=$(stat -c '%d:%i' "$path") || return 2
+  [[ -d $PROC_ROOT/$pid/fd && -r $PROC_ROOT/$pid/fd ]] || return 2
+  for fd in "$PROC_ROOT/$pid/fd"/*; do
+    [[ -e $fd || -L $fd ]] || continue
+    if ! observed=$(stat -Lc '%d:%i' "$fd" 2>/dev/null); then
+      if [[ -d $PROC_ROOT/$pid && ( -e $fd || -L $fd ) ]]; then return 2; fi
+      continue
+    fi
+    [[ $observed == "$identity" ]] || continue
+    flags=$(awk '$1=="flags:" {print $2}' "$PROC_ROOT/$pid/fdinfo/${fd##*/}" 2>/dev/null) || return 2
+    [[ $flags =~ ^[0-7]+$ ]] || return 2
+    (( (8#$flags & 3) == 0 )) || return 0
+  done
+  return 1
+}
+
+bybit_no_writer() {
+  local path directory pid fd observed flags identities=$'\n' inspected=0
+  (( $# > 0 )) || return 1
+  [[ -d $PROC_ROOT/self/fd && -r $PROC_ROOT/self/fd && -x $PROC_ROOT/self/fd ]] || return 1
+  for path in "$@"; do
+    observed=$(stat -c '%d:%i' "$path") || return 1
+    identities+="$observed"$'\n'
+  done
+  for directory in "$PROC_ROOT"/[0-9]*/fd; do
+    [[ -d $directory ]] || continue
+    [[ -r $directory && -x $directory ]] || return 1
+    pid=${directory%/fd}; pid=${pid##*/}
+    inspected=$((inspected + 1))
+    for fd in "$directory"/*; do
+      [[ -e $fd || -L $fd ]] || continue
+      if ! observed=$(stat -Lc '%d:%i' "$fd" 2>/dev/null); then
+        if [[ -d $PROC_ROOT/$pid && ( -e $fd || -L $fd ) ]]; then return 1; fi
+        continue
+      fi
+      [[ $identities == *$'\n'"$observed"$'\n'* ]] || continue
+      flags=$(awk '$1=="flags:" {print $2}' "$PROC_ROOT/$pid/fdinfo/${fd##*/}" 2>/dev/null) || return 1
+      [[ $flags =~ ^[0-7]+$ ]] || return 1
+      (( (8#$flags & 3) == 0 )) || return 1
+    done
+  done
+  (( inspected > 0 ))
+}
+
+preflight_active_segments() {
+  local pid invocation path before after status
+  pid=$(systemctl show "$UNIT" --property=MainPID --value) || return 1
+  invocation=$(systemctl show "$UNIT" --property=InvocationID --value) || return 1
+  [[ $pid =~ ^[1-9][0-9]*$ && $invocation =~ ^[a-f0-9]{32}$ \
+    && $(readlink -f "$PROC_ROOT/$pid/exe") == "$OLD_BINARY" ]] || return 1
+  for path in "$CANONICAL_SPOOL"/*.ndjson.active; do
+    [[ -e $path || -L $path ]] || continue
+    before=$(bybit_file_fingerprint "$path") || return 1
+    if bybit_pid_writes_file "$path" "$pid"; then
+      after=$(bybit_file_fingerprint "$path") || return 1
+      [[ $(jq -c '[.device,.inode,.links,.uid,.gid,.mode]' <<<"$before") == \
+        "$(jq -c '[.device,.inode,.links,.uid,.gid,.mode]' <<<"$after")" ]] || return 1
+    else
+      status=$?
+      printf 'pre-stop refusal: orphan or uninspectable active segment %s (fd_status=%s)\n' "$path" "$status" >&2
+      return 1
+    fi
+  done
+  [[ $(systemctl show "$UNIT" --property=MainPID --value) == "$pid" \
+    && $(systemctl show "$UNIT" --property=InvocationID --value) == "$invocation" ]]
+}
+
+resume_units_inactive() {
+  local unit state
+  for unit in "${TRANSITION_MASK_UNITS[@]}"; do
+    state=$(systemctl show "$unit" --property=ActiveState --value) || return 1
+    [[ $state == inactive ]] || return 1
+    state=$(systemctl show "$unit" --property=MainPID --value) || return 1
+    [[ -z $state || $state == 0 ]] || return 1
+    systemctl is-enabled --quiet "$unit" && return 1
+  done
+  return 0
+}
+
+resume_failed_state_matches() {
+  local unit entry path actual drop_paths masked disk_drop_paths expected_drop_paths
+  resume_units_inactive || return 1
+  [[ $(readlink -f "$PRODUCTION_LINK") == "$OLD_BINARY" \
+    && $(jq -er .failed_state.production_link "$ORPHAN_INVENTORY") == "$OLD_BINARY" ]] || return 1
+  [[ $(sha256sum "$CANONICAL_SPOOL/upload-status.json" | awk '{print $1}') == \
+    "$(jq -er .failed_state.upload_status_sha256 "$ORPHAN_INVENTORY")" ]] || return 1
+  bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" "$UPLOAD_FAILURE_BASELINE" || return 1
+  for unit in "${TRANSITION_MASK_UNITS[@]}"; do
+    masked=false
+    path="$SYSTEMD_DIR/$unit"
+    entry=$(jq -ce --arg unit "$unit" '.failed_state.unit_fragments[$unit]' "$ORPHAN_INVENTORY") || return 1
+    [[ $(jq -er .path <<<"$entry") == "$path" ]] || return 1
+    if [[ -L $path && $(readlink "$path") == /dev/null && -f $RECOVERY_REQUEST_ROOT/masks-authorized.json ]]; then
+      MASK_OWNED_UNITS+="$unit "
+      masked=true
+    else
+      [[ -f $path && ! -L $path ]] || return 1
+      actual=$(sha256sum "$path" | awk '{print $1}') || return 1
+      [[ $actual == "$(jq -er .sha256 <<<"$entry")" \
+        && $actual == "$(rendered_unit_sha "$CANDIDATE_DEPLOYMENT" "$CANDIDATE_BINARY" "$unit")" \
+        && $(stat -c %u "$path") == "$(jq -er .uid <<<"$entry")" \
+        && $(stat -c %g "$path") == "$(jq -er .gid <<<"$entry")" \
+        && $(stat -c %a "$path") == "$(jq -er .mode <<<"$entry")" ]] || return 1
+    fi
+    drop_paths=$(systemctl show "$unit" --property=DropInPaths --value) || return 1
+    expected_drop_paths=$(jq -er --arg unit "$unit" '.failed_state.drop_in_paths[$unit]|select(type=="string")' "$ORPHAN_INVENTORY") || return 1
+    if [[ $masked == false ]]; then [[ $drop_paths == "$expected_drop_paths" ]] || return 1
+    else
+      [[ -z $drop_paths || $drop_paths == "$expected_drop_paths" ]] || return 1
+      disk_drop_paths=''
+      if [[ -e $SYSTEMD_DIR/$unit.d || -L $SYSTEMD_DIR/$unit.d ]]; then
+        path_is_direct_or_absent "$SYSTEMD_DIR/$unit.d" || return 1
+        disk_drop_paths=$(find "$SYSTEMD_DIR/$unit.d" -maxdepth 1 -name '*.conf' -print | sort | paste -sd ' ' -) || return 1
+      fi
+      [[ $disk_drop_paths == "$expected_drop_paths" ]] || return 1
+    fi
+  done
+  while IFS= read -r entry; do
+    path=$(jq -er .path <<<"$entry") || return 1
+    [[ $path == "$SYSTEMD_DIR/$UNIT.d/"*.conf && -f $path && ! -L $path ]] || return 1
+    [[ $(sha256sum "$path" | awk '{print $1}') == "$(jq -er .sha256 <<<"$entry")" \
+      && $(stat -c %u "$path") == "$(jq -er .uid <<<"$entry")" \
+      && $(stat -c %g "$path") == "$(jq -er .gid <<<"$entry")" \
+      && $(stat -c %a "$path") == "$(jq -er .mode <<<"$entry")" ]] || return 1
+  done < <(jq -c '.failed_state.drop_ins[]' "$ORPHAN_INVENTORY")
+  return 0
+}
+
+admit_resume_rollback() {
+  local original=${FAILED_RECEIPT%/*} fields expected_assets actual_assets
+  secure_regular_file "$FAILED_RECEIPT"
+  secure_regular_file "$ORPHAN_INVENTORY"
+  [[ $(readlink -f "$ORPHAN_INVENTORY") == "$ORPHAN_INVENTORY" \
+    && $(sha256sum "$FAILED_RECEIPT" | awk '{print $1}') == "$FAILED_RECEIPT_SHA256" \
+    && $(sha256sum "$ORPHAN_INVENTORY" | awk '{print $1}') == "$ORPHAN_INVENTORY_SHA256" ]] || return 1
+  OLD_SHA256=$(jq -er '.previous_sha256|select(test("^[a-f0-9]{64}$"))' "$FAILED_RECEIPT") || return 1
+  OLD_BINARY="$RELEASE_ROOT/$OLD_SHA256/bybit-options-archiver"
+  OLD_DEPLOYMENT="$original/rollback-deployment"
+  OLD_MODE=upgrade
+  UPLOAD_FAILURE_BASELINE=$(jq -er '.upload_failure_baseline|select(type=="number" and .>=0 and .==floor)' "$FAILED_RECEIPT") || return 1
+  jq -e --arg old "$OLD_BINARY" --arg candidate "$CANDIDATE_SHA256" --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
+    --arg snapshot "$RESUME_SNAPSHOT_SHA256" '
+    .schema=="monday.bybit_options_cutover.v1" and .result=="failed" and .host_mode=="upgrade"
+    and .last_step=="drain-old-production-with-candidate" and .production_active==false
+    and .candidate_sha256==$candidate and .deployment_bundle_sha256==$bundle and .current_binary==$old
+    and .rollback_deployment_manifest_sha256==$snapshot and .bootstrap.started_at_ms==0
+    and .bootstrap.upload_verified==false and .rollback_health.main_pid=="" and .rollback_health.invocation_id==""' \
+    "$FAILED_RECEIPT" >/dev/null || return 1
+  secure_regular_file "$original/rollback-deployment.sha256"
+  [[ $(sha256sum "$original/rollback-deployment.sha256" | awk '{print $1}') == "$RESUME_SNAPSHOT_SHA256" ]] || return 1
+  expected_assets=$(printf '%s\n' "${DEPLOYMENT_ASSETS[@]}" | sort)
+  actual_assets=$(awk '$1 !~ /^[a-f0-9]+$/ || length($1)!=64 || NF!=2 {exit 1} {print $2}' "$original/rollback-deployment.sha256" | sort) || return 1
+  [[ $actual_assets == "$expected_assets" ]] || return 1
+  (cd "$OLD_DEPLOYMENT" && sha256sum --check --strict "$original/rollback-deployment.sha256") || return 1
+  validate_deployment "$OLD_DEPLOYMENT" false
+  secure_regular_file "$OLD_BINARY"
+  [[ $(sha256sum "$OLD_BINARY" | awk '{print $1}') == "$OLD_SHA256" ]] || return 1
+  jq -e --arg receipt "$FAILED_RECEIPT" --arg sha "$FAILED_RECEIPT_SHA256" --arg spool "$CANONICAL_SPOOL" '
+    .schema=="monday.bybit_orphan_inventory.v1" and .failed_receipt==$receipt
+    and .failed_receipt_sha256==$sha and .spool==$spool
+    and (.files|type)=="array" and (.files|length)>0 and (.files|length)<=32
+    and ([.files[].name]|unique|length)==(.files|length)
+    and all(.files[]; (.name|test("^bybit-options[.][0-9]+[.]ndjson[.]active$"))
+      and (.sha256|test("^[a-f0-9]{64}$")) and .links==1 and .data_source_revision==null
+      and (.bytes|type)=="number" and .bytes>=0 and .bytes==(.bytes|floor)
+      and (.mtime_ns|test("^[0-9]{19}$")) and (.ctime_ns|test("^[0-9]{19}$")))
+    and ([.files[].bytes]|add)<=17179869184
+    and (.failed_state.drop_ins|type)=="array" and (.failed_state.drop_in_paths|type)=="object"' \
+    "$ORPHAN_INVENTORY" >/dev/null || return 1
+  fields=$(jq -cnS --arg failed "$FAILED_RECEIPT" --arg sha "$FAILED_RECEIPT_SHA256" \
+    --arg snapshot "$RESUME_SNAPSHOT_SHA256" --arg inventory "$ORPHAN_INVENTORY_SHA256" \
+    --arg request "$RECOVERY_REQUEST_ID" --arg destination "$CUSTODY_DIR" \
+    '{schema:"monday.bybit_rollback_recovery_intent.v1",failed_receipt:$failed,failed_receipt_sha256:$sha,
+      rollback_snapshot_sha256:$snapshot,orphan_inventory_sha256:$inventory,request_id:$request,custody_directory:$destination}') || return 1
+  bybit_immutable_json "$RECOVERY_REQUEST_ROOT/intent.json" "$fields" || return 1
+  if [[ -e $RECOVERY_REQUEST_ROOT/masks-authorized.json || -L $RECOVERY_REQUEST_ROOT/masks-authorized.json ]]; then
+    [[ -f $RECOVERY_REQUEST_ROOT/masks-authorized.json && ! -L $RECOVERY_REQUEST_ROOT/masks-authorized.json \
+      && $(<"$RECOVERY_REQUEST_ROOT/masks-authorized.json") == "$fields" ]] || return 1
+  fi
+  resume_failed_state_matches || return 1
+  resume_segment_set_matches || return 1
+  install -m 0440 "$original/rollback-deployment.sha256" "$EVIDENCE_DIR/rollback-deployment.sha256" || return 1
+  ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=$RESUME_SNAPSHOT_SHA256
+}
+
+resume_segment_set_matches() {
+  local artifacts path
+  artifacts=$(segment_artifacts) || return 1
+  while IFS= read -r path; do
+    [[ -n $path ]] || continue
+    [[ ${path%/*} == "$CANONICAL_SPOOL" && ${path##*/} =~ ^bybit-options\.[0-9]+\.ndjson\.active$ ]] || return 1
+  done <<<"$artifacts"
+}
+
+orphan_locations_match_inventory() {
+  local expected actual path names=''
+  expected=$(jq -cS '[.files[].name]|sort' "$ORPHAN_INVENTORY") || return 1
+  for path in "$CANONICAL_SPOOL"/*.ndjson.active "$CUSTODY_DIR"/*; do
+    [[ -e $path || -L $path ]] || continue
+    [[ -f $path && ! -L $path ]] || return 1
+    names+="${path##*/}"$'\n'
+  done
+  actual=$(jq -Rcs 'split("\n")|map(select(length>0))|sort' <<<"$names") || return 1
+  [[ $actual == "$expected" ]]
+}
+
+custody_orphans() {
+  local entry name source destination location before after expected expected_sha actual_sha remaining moved
+  local failed_started_ns deadline=$((SECONDS + 360)) move_receipt verified='[]'
+  local -a locations=()
+  failed_started_ns="$(date -u -d "$(jq -er .started_at "$FAILED_RECEIPT")" +%s)000000000" || return 1
+  [[ $failed_started_ns =~ ^[0-9]{19}$ ]] || return 1
+  path_is_direct_or_absent "$CUSTODY_DIR" || return 1
+  install -d -m 0750 "$CUSTODY_DIR" "$RECOVERY_REQUEST_ROOT/moves" || return 1
+  protected_root_directory "$CUSTODY_DIR" && protected_root_directory "$RECOVERY_REQUEST_ROOT/moves" || return 1
+  [[ $(stat -c %d "$CANONICAL_SPOOL") == "$(stat -c %d "$CUSTODY_DIR")" ]] || return 1
+  orphan_locations_match_inventory || return 1
+  resume_segment_set_matches || return 1
+  while IFS= read -r name; do
+    if [[ -e $CANONICAL_SPOOL/$name ]]; then locations+=("$CANONICAL_SPOOL/$name")
+    else locations+=("$CUSTODY_DIR/$name"); fi
+  done < <(jq -r '.files[].name' "$ORPHAN_INVENTORY")
+  bybit_no_writer "${locations[@]}" || return 1
+  while IFS= read -r entry; do
+    name=$(jq -er .name <<<"$entry") || return 1
+    source="$CANONICAL_SPOOL/$name"; destination="$CUSTODY_DIR/$name"
+    expected=$(jq -cS 'del(.sha256,.data_source_revision)' <<<"$entry") || return 1
+    expected_sha=$(jq -er .sha256 <<<"$entry") || return 1
+    [[ $(jq -r .mtime_ns <<<"$entry") < $failed_started_ns \
+      && $(jq -r .ctime_ns <<<"$entry") < $failed_started_ns ]] || return 1
+    moved=false
+    if [[ -e $source || -L $source ]]; then
+      [[ ! -e $destination && ! -L $destination ]] || return 1
+      location=$source
+      before=$(bybit_file_fingerprint "$location") || return 1
+      [[ $before == "$expected" ]] || return 1
+    else
+      location=$destination; moved=true
+      before=$(bybit_file_fingerprint "$location") || return 1
+      [[ $(jq -cS 'del(.ctime_ns)' <<<"$before") == "$(jq -cS 'del(.ctime_ns)' <<<"$expected")" ]] || return 1
+    fi
+    remaining=$((deadline - SECONDS)); (( remaining > 0 )) || return 1
+    actual_sha=$(timeout --signal=TERM --kill-after=2s "$remaining" sha256sum "$location" | awk '{print $1}') || return 1
+    [[ $actual_sha == "$expected_sha" && $(bybit_file_fingerprint "$location") == "$before" ]] || return 1
+    verified=$(jq -cnS --argjson all "$verified" --argjson original "$entry" --argjson before "$before" \
+      --arg location "$location" --argjson moved "$moved" '$all+[{original:$original,before:$before,location:$location,moved:$moved}]') || return 1
+  done < <(jq -c '.files[]' "$ORPHAN_INVENTORY")
+  # One batch scan before hashing and one immediately before the short rename
+  # transaction cover the exact inode set without ten full /proc walks.
+  bybit_no_writer "${locations[@]}" || return 1
+  resume_units_inactive || return 1
+  while IFS= read -r entry; do
+    before=$(jq -cS .before <<<"$entry"); location=$(jq -r .location <<<"$entry")
+    moved=$(jq -r .moved <<<"$entry"); entry=$(jq -cS .original <<<"$entry")
+    name=$(jq -r .name <<<"$entry"); source="$CANONICAL_SPOOL/$name"; destination="$CUSTODY_DIR/$name"
+    expected=$(jq -cS 'del(.sha256,.data_source_revision)' <<<"$entry")
+    [[ $(bybit_file_fingerprint "$location") == "$before" ]] || return 1
+    (( SECONDS < deadline )) || return 1
+    if [[ $moved == false ]]; then
+      [[ ! -e $destination && ! -L $destination ]] || return 1
+      mv -T -n -- "$source" "$destination" || return 1
+      [[ ! -e $source && ! -L $source ]] || return 1
+      bybit_path_sync "$CANONICAL_SPOOL" "$CUSTODY_DIR" || return 1
+    fi
+    after=$(bybit_file_fingerprint "$destination") || return 1
+    [[ $(jq -cS 'del(.ctime_ns)' <<<"$after") == "$(jq -cS 'del(.ctime_ns)' <<<"$expected")" ]] || return 1
+    move_receipt=$(jq -cnS --arg inventory "$ORPHAN_INVENTORY_SHA256" --arg source "$source" \
+      --arg destination "$destination" --argjson original "$entry" --argjson observed "$after" \
+      '{schema:"monday.bybit_orphan_custody_move.v1",inventory_sha256:$inventory,source:$source,
+        destination:$destination,original:$original,observed:$observed,data_recovered:false,
+        delivery_verified:false,replay_eligibility:"not_assessed"}') || return 1
+    bybit_immutable_json "$RECOVERY_REQUEST_ROOT/moves/$name.json" "$move_receipt" || return 1
+  done < <(jq -c '.[]' <<<"$verified")
+  orphan_locations_match_inventory || return 1
+  [[ -z $(find "$CANONICAL_SPOOL" -maxdepth 1 -name '*.ndjson.active' -print -quit) ]] || return 1
+  bybit_immutable_json "$RECOVERY_REQUEST_ROOT/custody.json" "$(jq -cnS --arg inventory "$ORPHAN_INVENTORY_SHA256" \
+    --arg directory "$CUSTODY_DIR" --arg failed "$FAILED_RECEIPT_SHA256" \
+    '{schema:"monday.bybit_orphan_custody.v1",inventory_sha256:$inventory,failed_receipt_sha256:$failed,
+      directory:$directory,disposition:"retained_orphan_evidence",data_recovered:false,
+      delivery_verified:false,replay_eligibility:"not_assessed"}')"
+}
+
+resume_rollback() {
+  STEP=admit-resume-rollback
+  admit_resume_rollback || fail 'failed receipt, snapshot, inventory or failed host state drifted'
+  canonical_spool_paths_safe || fail 'unsafe canonical spool'
+  [[ -f $CANONICAL_SPOOL/.bybit-options.lock && ! -L $CANONICAL_SPOOL/.bybit-options.lock ]] \
+    || fail 'existing Bybit spool lock required'
+  exec 7<"$CANONICAL_SPOOL/.bybit-options.lock"
+  flock -n 7 || fail 'Bybit uploader still owns the spool'
+  bybit_immutable_json "$RECOVERY_REQUEST_ROOT/masks-authorized.json" "$(<"$RECOVERY_REQUEST_ROOT/intent.json")" \
+    || fail 'cannot bind owned recovery masks'
+  TRANSITION_STARTED=1
+  STEP=contain-resume-rollback
+  mask_transition_units || fail 'could not effectively mask all Bybit units'
+  STEP=custody-historical-orphans
+  custody_orphans || fail 'bounded orphan custody failed; originals or custody copies preserved'
+  [[ $(sha256sum "$FAILED_RECEIPT" | awk '{print $1}') == "$FAILED_RECEIPT_SHA256" ]] || fail 'original failed receipt changed'
+  # The uploader takes this same lock. Keep release/Gate ownership but release
+  # and close the custody FD before real drain or any restored writer starts.
+  flock -u 7 || fail 'cannot release custody spool lock'
+  exec 7<&-
+  STEP=restore-previous-production
+  rollback_after_failure
+  [[ $ROLLBACK_RESULT == previous-release-health-verified ]] || fail 'previous production was not restored and verified'
+  [[ $(sha256sum "$FAILED_RECEIPT" | awk '{print $1}') == "$FAILED_RECEIPT_SHA256" ]] || fail 'original failed receipt changed'
+  RESULT=restored
+  STEP=write-resume-rollback-evidence
+  write_evidence || fail 'cannot write recovery attempt receipt'
+  bybit_immutable_json "$RECOVERY_REQUEST_ROOT/completed.json" "$(jq -cnS --arg receipt "$EVIDENCE_DIR/cutover.json" \
+    --arg sha "$(sha256sum "$EVIDENCE_DIR/cutover.json" | awk '{print $1}')" --arg old "$OLD_SHA256" \
+    '{schema:"monday.bybit_rollback_recovery_completed.v1",receipt:$receipt,receipt_sha256:$sha,restored_old_payload_sha256:$old}')" \
+    || fail 'cannot commit rollback recovery completion'
+  SUCCESS=1
+  trap - EXIT ERR
+  printf 'Bybit rollback recovery restored old payload %s\nEvidence: %s/cutover.json\n' "$OLD_SHA256" "$EVIDENCE_DIR"
 }
 
 write_evidence() {
@@ -597,6 +1065,8 @@ write_evidence() {
     --arg rollback_invocation_id "$ROLLBACK_INVOCATION_ID" \
     --argjson bootstrap_upload_verified "$BOOTSTRAP_UPLOAD_VERIFIED" \
     --argjson bootstrap_started_ms "$BOOTSTRAP_STARTED_MS" \
+    --arg operation "$OPERATION" --arg failed_receipt "$FAILED_RECEIPT" --arg failed_sha "$FAILED_RECEIPT_SHA256" \
+    --arg inventory_sha "$ORPHAN_INVENTORY_SHA256" --arg custody "$CUSTODY_DIR" \
     '{
       schema: "monday.bybit_options_cutover.v1",
       started_at: $started_at,
@@ -617,6 +1087,11 @@ write_evidence() {
         original_upload_warning:$rollback_upload_warning,
         historical_warning_interpreted:$rollback_warning_interpreted},
       bootstrap: {started_at_ms:$bootstrap_started_ms,upload_verified:$bootstrap_upload_verified},
+      operation:$operation,
+      recovery:(if $operation=="resume-rollback" then {failed_receipt:$failed_receipt,
+        failed_receipt_sha256:$failed_sha,orphan_inventory_sha256:$inventory_sha,custody_directory:$custody,
+        restored_old_payload_sha256:$previous_sha256,data_recovered:false,delivery_verified:false,
+        replay_eligibility:"not_assessed"} else null end),
       current_binary: (if $current_binary == "" then null else $current_binary end),
       production_active: $production_active
     }' > "$temporary" || return 1
@@ -627,8 +1102,8 @@ write_evidence() {
 rollback_after_failure() {
   local safe_to_restart=1 unit rollback_started_ms=0
   ROLLBACK_RESULT=disabled
-  systemctl disable --now "${PRODUCTION_UNITS[@]}" "$TIMER" >/dev/null 2>&1 || true
-  systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+  systemctl disable --now "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+  mask_transition_units || safe_to_restart=0
   for unit in "${PRODUCTION_UNITS[@]}"; do
     if systemctl is-active --quiet "$unit" || systemctl is-enabled --quiet "$unit"; then
       safe_to_restart=0
@@ -695,12 +1170,16 @@ rollback_after_failure() {
         && runtime_matches_release "$OLD_BINARY" true \
         && health_ready_for_rollback "$rollback_started_ms"; then
         ROLLBACK_RESULT=previous-release-health-verified
-        systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null 2>&1 || true
-        systemctl start "$TIMER" >/dev/null 2>&1 || true
-        systemctl enable "$TIMER" >/dev/null 2>&1 || true
+        if ! systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null \
+          || ! systemctl start "$TIMER" >/dev/null || ! systemctl enable "$TIMER" >/dev/null \
+          || ! systemctl is-active --quiet "$TIMER" || ! systemctl is-enabled --quiet "$TIMER"; then
+          ROLLBACK_RESULT=previous-release-timer-unverified-disabled
+          systemctl disable --now "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+          mask_transition_units || ROLLBACK_RESULT=previous-release-timer-containment-failed
+        fi
       else
         systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
-        systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+        mask_transition_units || true
         if production_is_fail_closed; then
           ROLLBACK_RESULT=previous-release-health-unverified-disabled
         else
@@ -709,7 +1188,7 @@ rollback_after_failure() {
       fi
     else
       systemctl disable --now "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
-      systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+      mask_transition_units || true
       if ! production_is_fail_closed; then
         ROLLBACK_RESULT=previous-release-restore-containment-failed
       elif [[ $ROLLBACK_RESULT == disabled ]]; then
@@ -743,7 +1222,12 @@ on_exit() {
   if (( SUCCESS == 0 )); then
     RESULT=failed
     if (( TRANSITION_STARTED )); then
-      rollback_after_failure
+      if [[ $OPERATION == resume-rollback ]]; then
+        systemctl disable --now "${TRANSITION_MASK_UNITS[@]}" >/dev/null 2>&1 || true
+        mask_transition_units || ROLLBACK_RESULT=resume-containment-failed
+      else
+        rollback_after_failure
+      fi
     fi
     if write_evidence; then
       printf 'cutover failed; evidence: %s/cutover.json\n' "$EVIDENCE_DIR" >&2
@@ -826,6 +1310,11 @@ install -d -m 0750 "$EVIDENCE_DIR/shadow-gate"
 install -m 0640 "$GATE_JSON" "$EVIDENCE_DIR/shadow-gate/gate.json"
 install -m 0640 "$GATE_MARKER" "$EVIDENCE_DIR/shadow-gate/PASSED.sha256"
 
+if [[ $OPERATION == resume-rollback ]]; then
+  resume_rollback
+  exit 0
+fi
+
 STEP=validate-host-state
 canonical_spool_paths_safe || fail 'canonical spool path contains a symlink or escapes /data'
 systemctl is-active --quiet "$UPLOAD_UNIT" && fail "upload unit must be inactive before cutover: $UPLOAD_UNIT"
@@ -853,6 +1342,7 @@ if (( active_count == 1 && enabled_count == 1 )); then
     || fail 'active production unit ExecStart does not match the release symlink'
   OLD_DEPLOYMENT="$RELEASE_ROOT/$OLD_SHA256/deployment"
   validate_deployment "$OLD_DEPLOYMENT" false
+  preflight_active_segments || fail 'pre-stop active-segment admission failed; production untouched'
   stage_existing_deployment_for_rollback
 elif (( active_count == 0 && enabled_count == 0 )) && [[ ! -e $PRODUCTION_LINK && ! -L $PRODUCTION_LINK ]]; then
   OLD_MODE=new-host
@@ -881,16 +1371,12 @@ fi
 for unit in "${PRODUCTION_UNITS[@]}"; do
   systemctl is-active --quiet "$unit" && fail "production unit did not stop: $unit"
 done
-systemctl mask --runtime "${TRANSITION_MASK_UNITS[@]}" >/dev/null
+mask_transition_units || fail 'effective Bybit containment failed'
 systemctl is-active --quiet "$TIMER" && fail 'upload timer remained active during transition'
 systemctl is-active --quiet "$UPLOAD_UNIT" && fail 'uploader became active during transition'
 canonical_spool_paths_safe || fail 'canonical spool path changed during production stop'
 
-STEP=install-candidate-production-assets
-validate_deployment "$CANDIDATE_DEPLOYMENT" true
-install_deployment "$CANDIDATE_DEPLOYMENT" "$CANDIDATE_BINARY"
 install -d -m 0750 -o hftcollector -g hftcollector "$CANONICAL_SPOOL"
-systemctl daemon-reload
 
 if [[ $OLD_MODE == upgrade ]]; then
   STEP=drain-old-production-with-candidate
@@ -900,6 +1386,11 @@ else
   require_empty_segment_spool || fail 'new host canonical spool contains segment artifacts'
   run_candidate_drain "$CANDIDATE_DEPLOYMENT"
 fi
+
+STEP=install-candidate-production-assets
+validate_deployment "$CANDIDATE_DEPLOYMENT" true
+install_deployment "$CANDIDATE_DEPLOYMENT" "$CANDIDATE_BINARY"
+systemctl daemon-reload
 
 STEP=switch-production-symlink
 atomic_symlink "$CANDIDATE_BINARY" "$PRODUCTION_LINK"

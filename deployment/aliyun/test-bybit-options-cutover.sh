@@ -71,6 +71,7 @@ reject() {
   ROLLBACK_WARNING_INTERPRETED=false
   active=true
   enabled=true
+  timer_active=false
   observed_pid=123
   observed_invocation=$(printf 'a%.0s' {1..32})
   observed_image=$OLD_BINARY
@@ -92,7 +93,7 @@ reject() {
   systemctl() {
     case "$1" in
       disable) active=false; enabled=false ;;
-      is-active) [[ $3 == "$UNIT" && $active == true ]] ;;
+      is-active) [[ ( $3 == "$UNIT" && $active == true ) || ( $3 == "$TIMER" && $timer_active == true ) ]] ;;
       is-enabled)
         if [[ $2 == --quiet ]]; then [[ $enabled == true ]]; else printf 'masked\n'; fi ;;
       show)
@@ -106,7 +107,7 @@ reject() {
         if [[ $2 == "$UNIT" ]]; then
           active=true
           cp "$tmp_dir/rollback-health.json" "$CANONICAL_SPOOL/health.json"
-        fi ;;
+        elif [[ $2 == "$TIMER" ]]; then timer_active=true; fi ;;
       enable) [[ $2 != "$UNIT" ]] || enabled=true ;;
       mask|unmask|daemon-reload|reset-failed) return 0 ;;
       *) return 1 ;;
@@ -115,6 +116,7 @@ reject() {
   run_candidate_drain() {
     bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" "$UPLOAD_FAILURE_BASELINE"
   }
+  mask_transition_units() { return 0; }
   install_deployment() { return 0; }
   atomic_symlink() { ln -sf "$1" "$2"; }
 
