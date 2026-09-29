@@ -6358,8 +6358,34 @@ mod tests {
 
     #[tokio::test]
     async fn upload_only_fails_while_spool_lock_is_held_and_succeeds_after_release() {
-        let spool_dir = env::temp_dir().join(format!("monday-spool-lock-{}", now_ns().unwrap()));
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CHILD_ROOT: &str = "MONDAY_SPOOL_LOCK_TEST_CHILD_ROOT";
+        const DEADLINE: Duration = Duration::from_secs(5);
+        if let Some(root) = env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let first = SpoolLock::acquire(&root.join("spool")).unwrap();
+            let mut control = tokio::net::UnixStream::connect(root.join("control.sock"))
+                .await
+                .unwrap();
+            control.write_all(b"L").await.unwrap();
+            let mut release = [0];
+            tokio::time::timeout(DEADLINE, control.read_exact(&mut release))
+                .await
+                .expect("parent must release the lock owner")
+                .unwrap();
+            assert_eq!(release, *b"R");
+            drop(first);
+            let released = SpoolLock::acquire(&root.join("spool"))
+                .expect("dropping the sole lock handle must release the lock");
+            drop(released);
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let spool_dir = root.path().join("spool");
         std::fs::create_dir_all(&spool_dir).unwrap();
+        let listener = tokio::net::UnixListener::bind(root.path().join("control.sock")).unwrap();
         let config = UploadConfig {
             spool_dir: spool_dir.clone(),
             oss_bucket: "unused".into(),
@@ -6369,15 +6395,45 @@ mod tests {
             oss_copy_timeout: Duration::from_secs(1),
         };
 
-        let first = SpoolLock::acquire(&spool_dir).unwrap();
+        // Open the lock only after exec in an isolated owner. In the parallel
+        // test runner, an unrelated fork can inherit a parent's flock until
+        // exec even with O_CLOEXEC, so dropping that parent File is not a
+        // sufficient observation that the kernel lock has been released.
+        let mut owner = tokio::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::upload_only_fails_while_spool_lock_is_held_and_succeeds_after_release",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (mut control, _) = tokio::time::timeout(DEADLINE, listener.accept())
+            .await
+            .expect("child lock owner must connect")
+            .unwrap();
+        let mut ready = [0];
+        tokio::time::timeout(DEADLINE, control.read_exact(&mut ready))
+            .await
+            .expect("child must acquire the lock before upload is tested")
+            .unwrap();
+        assert_eq!(ready, *b"L");
         let error = upload_only(&config).await.unwrap_err();
         assert!(error.to_string().contains("spool is already locked"));
         assert!(!spool_dir.join("upload-status.json").exists());
 
-        drop(first);
+        control.write_all(b"R").await.unwrap();
+        let status = tokio::time::timeout(DEADLINE, owner.wait())
+            .await
+            .expect("lock owner must exit before upload is retried")
+            .unwrap();
+        assert!(status.success(), "lock owner failed: {status}");
         upload_only(&config).await.unwrap();
         assert!(spool_dir.join(SPOOL_LOCK_FILE).is_file());
-        std::fs::remove_dir_all(spool_dir).unwrap();
+        assert!(spool_dir.join("upload-status.json").is_file());
     }
 
     #[tokio::test]
