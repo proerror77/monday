@@ -340,4 +340,5 @@ grep -Fq 'AssertPathIsMountPoint=/data' "$script_dir/bybit-options-archiver.serv
 grep -Fq 'AssertPathIsMountPoint=/data' "$script_dir/bybit-options-upload.service"
 
 bash "$script_dir/test-bybit-options-cutover.sh"
+bash "$script_dir/test-host-bybit-options-cutover.sh"
 printf '%s\n' 'Bybit Options shadow gate tests passed'

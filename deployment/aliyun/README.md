@@ -906,9 +906,37 @@ local growth and were fixed in this governed lane:
    candidate uploader, renders and installs the candidate units, clears stale
    health, starts the collector, and requires fresh full-catalog health before
    enabling the unit and the upload timer. Failure after the transition starts
-   restores the previous release (or disables and runtime-masks the lane) and
+   restores the previous release (or disables and masks the local unit fragments) and
    writes `cutover.json` evidence under
    `/data/monday/evidence/bybit-options-cutovers/`.
+
+Upgrade preflight rejects historical `.ndjson.active` orphans before stopping
+production; only files actually open for writing by the verified old MainPID
+are admitted. Unit masks replace the `/etc/systemd/system` fragments after
+verified backups, since `/run` masks cannot override those local files.
+Candidate fragments are installed only after drain succeeds.
+
+For a hash-pinned failed upgrade at `drain-old-production-with-candidate` that
+never started the candidate, the same entrypoint supports:
+
+```bash
+host-bybit-options-cutover.sh resume-rollback \
+  --failed-receipt "$FAILED_RECEIPT" --failed-receipt-sha256 "$FAILED_SHA" \
+  --rollback-snapshot-sha256 "$OLD_SNAPSHOT_SHA" \
+  --orphan-inventory "$INVENTORY" --orphan-inventory-sha256 "$INVENTORY_SHA" \
+  --request-id "$REQUEST_ID"
+```
+
+The explicit `monday.bybit_orphan_inventory.v1` inventory binds the complete
+historical file set, full hashes, filesystem fingerprints and failed host state.
+With every unit inactive, the controller rechecks those bytes and atomically
+moves the unchanged `.active` files into that failed transaction's custody
+directory, then releases the spool lock before real drain and verified old-P
+restoration. The original failure receipt is never overwritten; recovery runs
+append beneath `rollback-recoveries/<request-id>/`. `result=restored` means the
+old production was restored. Custody means retained evidence, not recovered,
+uploaded or replay-eligible data. No `ignore`, forced empty spool, tail deletion,
+or Rust finalization is performed.
 
 The lane is fail-closed: the collector and uploader stop writing when the spool
 mount drops below `MIN_FREE_GB` or pending raw bytes reach
