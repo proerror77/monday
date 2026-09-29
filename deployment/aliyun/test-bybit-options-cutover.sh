@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The host functions are loaded below and consume these globals and fakes.
+# ShellCheck versions report those indirect fake calls as SC2317 or SC2329.
 # Each subshell independently initializes its state; no state crosses cases.
-# shellcheck disable=SC2034,SC2329,SC2030,SC2031
+# shellcheck disable=SC2034,SC2317,SC2329,SC2030,SC2031
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
