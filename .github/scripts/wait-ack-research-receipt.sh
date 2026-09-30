@@ -28,7 +28,7 @@ cat "$destination/request.json"
 printf '\nWaiting for an independently verified ACK terminal receipt. No research code runs in this job.\n'
 
 repo_root=$(git rev-parse --show-toplevel)
-public_key="$repo_root/.github/ack-ci/receipt-public-key.pem"
+public_key="$repo_root/.github/ack-ci/receipt-public-key.pub"
 [[ -f $public_key ]] || exit 1
 base="https://raw.githubusercontent.com/proerror77/monday/codex/ack-ci-receipts/$GITHUB_RUN_ID/$GITHUB_JOB/$source_sha"
 timeout=${ACK_RECEIPT_TIMEOUT_SECONDS:-18000}
