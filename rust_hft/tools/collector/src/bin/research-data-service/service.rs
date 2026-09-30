@@ -912,7 +912,11 @@ impl ClickHouse {
         for (name, value) in params {
             request = request.query(&[(*name, value)]);
         }
-        let mut response = request.body(body).send().await?;
+        let mut response = request
+            .header(reqwest::header::CONTENT_LENGTH, body.len().to_string())
+            .body(body)
+            .send()
+            .await?;
         if !response.status().is_success() {
             bail!("ClickHouse operation failed with {}", response.status());
         }
@@ -2535,6 +2539,52 @@ fn decode_targets(bytes: &[u8]) -> Result<Vec<MarketTargetFrameV1>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn data_service_clickhouse_posts_bind_empty_and_nonempty_body_lengths() {
+        for body in [Vec::new(), vec![1, 2, 3]] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected_length = body.len();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0 && headers.len() + read <= 8192);
+                    headers.extend_from_slice(&chunk[..read]);
+                }
+                let headers = String::from_utf8_lossy(&headers).to_ascii_lowercase();
+                let valid = headers
+                    .lines()
+                    .any(|line| line.trim() == format!("content-length: {expected_length}"));
+                let status = if valid {
+                    "200 OK"
+                } else {
+                    "411 Length Required"
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                valid
+            });
+            let client = ClickHouse {
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+                endpoint: format!("http://{address}/"),
+                database: "test".into(),
+                user: "test".into(),
+                password: String::new(),
+            };
+            assert!(client.query("SELECT 1", &[], body).await.is_ok());
+            assert!(server.join().unwrap());
+        }
+    }
 
     fn hash(byte: char) -> String {
         std::iter::repeat_n(byte, 64).collect()
