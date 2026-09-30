@@ -53,8 +53,9 @@ jobs:
   scope:
     name: CI job scope
     needs: selector
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       jobs: ${{ steps.scope.outputs.jobs }}
       owning_packages: ${{ steps.scope.outputs.owning_packages }}
@@ -99,29 +100,34 @@ jobs:
               "focused=$SELECTED_FOCUSED" \
               "toolchain=$SELECTED_TOOLCHAIN"
           else
-            printf '%s\n' \
-              'jobs=,ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,' \
-              'owning_packages=,,' \
-              'loop=true' \
-              'handoff=true' \
-              'json=true' \
-              'ondo=true' \
-              'collector=true' \
-              'control=true' \
-              'focused=true' \
-              'toolchain=true'
+            echo 'CI selection failed or returned an invalid plan; no work is dispatched' >&2
+            exit 1
           fi >> "$GITHUB_OUTPUT"
 
+      - name: Summarize check plan
+        env:
+          SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
+          SELECTED_OWNING_PACKAGES: ${{ steps.scope.outputs.owning_packages }}
+          SELECTED_CONTROL: ${{ steps.scope.outputs.control }}
+        run: |
+          printf '### CI check plan\n\n- Jobs: %s\n- Direct Rust package tests: %s\n- Collector control contract: %s\n' \
+            "$SELECTED_JOBS" "$SELECTED_OWNING_PACKAGES" "$SELECTED_CONTROL" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  control_contracts:
+    name: Collector control contracts
+    needs: scope
+    if: ${{ !cancelled() && contains(needs.scope.outputs.jobs, ',ci/control-contracts,') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
       - name: Checkout collector controls
-        if: steps.scope.outputs.control == 'true'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install shellcheck
-        if: steps.scope.outputs.control == 'true'
         run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" shellcheck
 
       - name: Verify Campaign controller recovery
-        if: steps.scope.outputs.control == 'true'
         run: |
           bash -n deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
             deployment/aliyun/research/scripts/campaign-job-watch.sh \
@@ -133,7 +139,6 @@ jobs:
           deployment/aliyun/research/test-campaign-cycle-controller.sh
 
       - name: Verify collector release shell contracts
-        if: steps.scope.outputs.control == 'true'
         working-directory: rust_hft
         run: |
           for script in ../deployment/aliyun/*.sh; do
@@ -156,15 +161,36 @@ jobs:
           ../deployment/aliyun/test-bybit-options-release-contract.sh
           ../deployment/aliyun/test-bybit-options-shadow-gate.sh
 
-      - name: Summarize check plan
-        env:
-          SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
-          SELECTED_OWNING_PACKAGES: ${{ steps.scope.outputs.owning_packages }}
-          SELECTED_CONTROL: ${{ steps.scope.outputs.control }}
+  monitor_contracts:
+    name: Collector monitor contracts
+    needs: scope
+    if: ${{ !cancelled() && contains(needs.scope.outputs.jobs, ',ci/monitor-contracts,') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Install shellcheck
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" shellcheck
+      - name: Verify monitor and atomic unit deployment
         run: |
-          printf '### CI check plan\n\n- Jobs: %s\n- Direct Rust package tests: %s\n- Collector control contract: %s\n' \
-            "$SELECTED_JOBS" "$SELECTED_OWNING_PACKAGES" "$SELECTED_CONTROL" \
-            >> "$GITHUB_STEP_SUMMARY"
+          shellcheck deployment/aliyun/monday-collector-health.sh deployment/aliyun/host-collector-health-unit-release.sh
+          deployment/aliyun/test-monday-collector-health.sh
+          deployment/aliyun/test-collector-health-unit-release.sh
+          .github/scripts/test-monitor-collector-host.sh
+
+  ci_contracts:
+    name: CI policy contracts
+    needs: scope
+    if: ${{ !cancelled() && contains(needs.scope.outputs.jobs, ',ci/ci-contracts,') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Verify selection, cancellation and aggregate admission
+        run: |
+          .github/scripts/test-select-rust-ci-scope.sh
+          .github/scripts/test-ci-monitor-scope.sh
+          .github/scripts/test-agent-validation-gates.sh
 
   rust_shell_scripts:
     name: Rust shell scripts
@@ -239,7 +265,7 @@ jobs:
             rust_hft
           key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}
           cache-all-crates: false
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
       - name: Test Loop Engineer packages
         if: needs.scope.outputs.loop == 'true'
@@ -667,7 +693,7 @@ jobs:
             rust_hft
           key: hft-engine-fast-lane-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/Cargo.lock') }}
           cache-all-crates: false
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
       - name: Audit unbounded channels
         run: cargo test -p hft-engine --test queue_topology_contract --locked
@@ -761,6 +787,9 @@ jobs:
     needs:
       - selector
       - scope
+      - control_contracts
+      - monitor_contracts
+      - ci_contracts
       - rust_shell_scripts
       - rust
       - rust_fast_gates

@@ -74,7 +74,7 @@ select_security_scope() {
       *) scan_repository=true ;;
     esac
     case "$path" in
-      .github/workflows/security-enabled.yml|rust_hft/docker/Dockerfile|\
+      rust_hft/docker/Dockerfile|\
       rust_hft/deployment/docker/Dockerfile.trading|rust_hft/.dockerignore)
         container_relevant=true
         ;;
@@ -170,6 +170,7 @@ select_all() {
 emit() {
   local value
   [[ $architecture == true ]] && select_job ploy/architecture-contracts
+  [[ $control == true ]] && select_job ci/control-contracts
   # Every path that selects collector verification must exercise its production image.
   if [[ $collector == true ]]; then select_job ci/deployment-artifacts; fi
   select_security_scope
@@ -237,12 +238,6 @@ for path in "${paths[@]}"; do
   case "$path" in
     AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md)
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
-      continue
-      ;;
-    .github/workflows/ploy-ci.yml)
-      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
-      select_job ploy/workflow-lint
-      select_all_ploy_jobs
       continue
       ;;
     .github/workflows/acr-publish.yml|.github/scripts/test-acr-publish-workflow.sh|\
@@ -314,15 +309,14 @@ for path in "${paths[@]}"; do
       select_all_ploy_jobs
       continue
       ;;
-    .github/workflows/ci.yml)
-      select_all
-      select_all_ci_jobs
-      continue
-      ;;
-    .github/workflows/security-enabled.yml)
-      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+    .github/workflows/ci.yml|.github/workflows/ploy-ci.yml|.github/workflows/security-enabled.yml|\
+    .github/scripts/select-rust-ci-scope.sh|\
+    .github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*|\
+    .github/scripts/verify-ci-gate.sh|.github/scripts/test-ci-monitor-scope.sh|\
+    .github/scripts/test-agent-validation-gates.sh|.github/scripts/test-workflow-queue-lint.sh)
+      select_job ci/ci-contracts
       select_job ploy/workflow-lint
-      select_all_security_jobs
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
     .agents/skills/*/SKILL.md|.agents/skills/*/agents/openai.yaml|\
@@ -337,15 +331,16 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
-    .github/scripts/select-rust-ci-scope.sh|.github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*)
-      select_all
-      select_all_ci_jobs
-      select_job ploy/workflow-lint
-      select_all_ploy_jobs
-      continue
-      ;;
     package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|.nvmrc|.node-version)
       select_job ci/node-install
+      continue
+      ;;
+    .github/workflows/monitor-collector-host.yml|.github/scripts/test-monitor-collector-host.sh|\
+    deployment/aliyun/monday-collector-health.*|deployment/aliyun/test-monday-collector-health.sh|\
+    deployment/aliyun/host-collector-health-unit-release.sh|deployment/aliyun/test-collector-health-unit-release.sh)
+      select_job ci/monitor-contracts
+      select_job ploy/workflow-lint
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
     .github/workflows/*|.github/actions/*|.github/scripts/*)

@@ -16,6 +16,10 @@ sealed holdout, trading, risk changes, or resuming a paused runtime.
 All production artifact paths require the same three authenticated GitHub Actions
 checks for the exact source SHA, read by read-release-required-checks.sh. Do not
 accept similarly named checks from another app, skipped checks, or another SHA.
+These checks aggregate the selected validation plan; they do not require every
+product to build for each release. Monitoring and CI-policy changes select their
+own contracts. The current-source aggregate must reject a missing, failed,
+cancelled or skipped selected task; an unrelated task is not a release blocker.
 ACR requires current main and retains its additional binary provenance, smoke and
 artifact readback checks. GHCR main/manual publication requires current main.
 Version-tag publication requires the tagged commit to belong to main history and

@@ -55,7 +55,7 @@ jobs:
   image-smoke-scope:
     name: Research image smoke scope
     needs: image-smoke-selector
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -73,7 +73,8 @@ jobs:
              [[ "$SELECTED_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]]; then
             printf 'jobs=%s\n' "$SELECTED_JOBS"
           else
-            printf '%s\n' 'jobs=,ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts,'
+            echo 'CI selection failed or returned an invalid plan; no work is dispatched' >&2
+            exit 1
           fi >> "$GITHUB_OUTPUT"
 
   commit-hygiene:

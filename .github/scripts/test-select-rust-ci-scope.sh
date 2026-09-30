@@ -8,8 +8,6 @@ fixtures="$script_dir/fixtures/rust-ci-scope"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
-bash "$script_dir/test-agent-worktree-preflight.sh"
-bash "$script_dir/test-agent-validation-gates.sh"
 
 run_case() {
   local name=$1 event=$2 changed=$3 ref=
@@ -59,6 +57,9 @@ assert_flag() {
 assert_jobs() {
   local output=$1 expected=$2
   local actual
+  if grep -Fqx 'control=true' "$output"; then
+    expected="${expected:+$expected,}ci/control-contracts"
+  fi
   actual=$(sed -n 's/^jobs=//p' "$output")
   [[ $actual == ,*, ]] || {
     printf '%s: jobs output must use exact comma-delimited membership: %s\n' "$output" "$actual" >&2
@@ -66,7 +67,7 @@ assert_jobs() {
   }
   actual=${actual#,}
   actual=${actual%,}
-  [[ $actual == "$expected" ]] || {
+  [[ $(printf '%s' "$actual" | tr ',' '\n' | sort) == "$(printf '%s' "$expected" | tr ',' '\n' | sort)" ]] || {
     printf '%s: expected jobs=%s, got jobs=%s\n' "$output" "$expected" "$actual" >&2
     exit 1
   }
@@ -118,10 +119,10 @@ job_cases=(
   'research-dockerfile|pull_request|research-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
   'campaign-controller-dockerfile|pull_request|campaign-controller-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
   'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
-  'prediction-workflow|pull_request|prediction-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
+  'prediction-workflow|pull_request|prediction-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'root-node|pull_request|root-node.txt|ci/node-install'
-  'security-workflow|pull_request|security-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint'
-  'security-workflow-push|push|security-workflow.txt|ploy/workflow-lint'
+  'security-workflow|pull_request|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
+  'security-workflow-push|push|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'skill|pull_request|skill.txt|ploy/commit-hygiene,ploy/workflow-lint'
@@ -241,8 +242,8 @@ assert_flag "$same_suite" focused true
 
 all_security_jobs='security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection'
 assert_security_jobs "$tmp_dir/docs.out" 'security/secret-detection'
-assert_security_jobs "$tmp_dir/security-workflow.out" "$all_security_jobs"
-assert_security_jobs "$tmp_dir/security-workflow-push.out" "$all_security_jobs,security/container-scan"
+assert_security_jobs "$tmp_dir/security-workflow.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/security-workflow-push.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/root-node.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/unknown-nested.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/lob-control.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
@@ -259,8 +260,8 @@ security_workflow_develop="$tmp_dir/security-workflow-develop.out"
 GITHUB_REF=refs/heads/develop "$selector" --event push \
   --changed-files "$tmp_dir/security-workflow.txt" \
   --metadata "$fixtures/metadata.fixture" --output "$security_workflow_develop"
-assert_jobs "$security_workflow_develop" 'ploy/workflow-lint'
-assert_security_jobs "$security_workflow_develop" "$all_security_jobs"
+assert_jobs "$security_workflow_develop" 'ci/ci-contracts,ploy/workflow-lint'
+assert_security_jobs "$security_workflow_develop" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/collector.out" "$all_security_jobs"
 assert_security_jobs "$tmp_dir/unknown-workflow.out" "$all_security_jobs"
 security_schedule="$tmp_dir/security-schedule.out"
@@ -315,7 +316,7 @@ grep -Fqx '    needs: selector' "$ci_workflow"
 grep -Fqx "$always_condition" "$ci_workflow"
 grep -Fqx "          if [[ \"\$SELECTOR_RESULT\" == success && \"\$SELECTED_COMPLETE\" == true ]] &&" "$ci_workflow"
 grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,\$ ]] &&" "$ci_workflow"
-grep -Fq "'jobs=,ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,'" "$ci_workflow"
+grep -Fq 'CI selection failed or returned an invalid plan' "$ci_workflow"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" "$ci_workflow"
 [[ $(grep -Fxc '      owning_packages: ${{ steps.scope.outputs.owning_packages }}' "$ci_workflow") -eq 2 ]]
 grep -Fqx '      - name: Summarize check plan' "$ci_workflow"
@@ -337,6 +338,7 @@ rust_job_block=$(job_block rust)
 rust_shell_scripts_block=$(job_block rust_shell_scripts)
 fast_gates_block=$(job_block rust_fast_gates)
 scope_job_block=$(job_block scope)
+control_job_block=$(job_block control_contracts)
 [ -n "$rust_job_block" ]
 [ -n "$rust_shell_scripts_block" ]
 [ -n "$fast_gates_block" ]
@@ -371,11 +373,11 @@ if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block";
 if grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'shellcheck' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fq 'test-rust-lob-control-plane.sh' <<<"$scope_job_block"
-grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$scope_job_block"
-[[ $scope_job_block != *test-polymarket-raw-ops-control-plane.sh* ]]
-grep -Fq 'test-monday-collector-health.sh' <<<"$scope_job_block"
-grep -Fq 'shellcheck' <<<"$scope_job_block"
+grep -Fq 'test-rust-lob-control-plane.sh' <<<"$control_job_block"
+grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$control_job_block"
+[[ $scope_job_block != *test-* && $scope_job_block != *shellcheck* ]]
+grep -Fq 'test-monday-collector-health.sh' <<<"$control_job_block"
+grep -Fq 'shellcheck' <<<"$control_job_block"
 grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
 grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
 grep -Fqx '      - name: Test directly changed Rust packages' "$ci_workflow"
@@ -409,7 +411,7 @@ grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,\
 for invalid_jobs in '' ci/rust; do
   [[ $invalid_jobs =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]] && exit 1
 done
-grep -Fq "'jobs=,ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts,'" "$ploy_workflow"
+grep -Fq 'CI selection failed or returned an invalid plan' "$ploy_workflow"
 grep -Fq "contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-research-heavy,')" "$ploy_workflow"
 grep -Fqx "            mapfile -d '' workflow_files < <(" "$ploy_workflow"
 grep -Fq -- '--diff-filter=ACMR -z' "$ploy_workflow"
