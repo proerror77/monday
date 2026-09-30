@@ -40,15 +40,17 @@ spec:
               # A prior controller upload atomically renames the code archive.
               [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
               [[ "$SOURCE_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-              test -f /work/source.tar.gz
-              printf '%s  %s\n' "$SOURCE_ARCHIVE_SHA256" /work/source.tar.gz | sha256sum -c -
-              test ! -e /work/source
-              mkdir /work/source
-              tar --no-same-owner -xzf /work/source.tar.gz -C /work/source
-              printf '%s\n' "$SOURCE_REVISION" > /work/source/SOURCE_REVISION
+              archive="/work/source-$SOURCE_REVISION.tar.gz"
+              source="/work/sources/$SOURCE_REVISION"
+              test -f "$archive"
+              printf '%s  %s\n' "$SOURCE_ARCHIVE_SHA256" "$archive" | sha256sum -c -
+              test ! -e "$source"
+              mkdir -p "$source"
+              tar --no-same-owner -xzf "$archive" -C "$source"
+              printf '%s\n' "$SOURCE_REVISION" > "$source/SOURCE_REVISION"
               printf '{"source_revision":"%s","archive_sha256":"%s","execution_host":"ack"}\n' \
-                "$SOURCE_REVISION" "$SOURCE_ARCHIVE_SHA256" > /work/source/ACK_SOURCE_RECEIPT.json
-              chmod -R a-w /work/source
+                "$SOURCE_REVISION" "$SOURCE_ARCHIVE_SHA256" > "$source/ACK_SOURCE_RECEIPT.json"
+              chmod -R a-w "$source"
           env:
             - {name: SOURCE_REVISION, value: "REPLACE_SOURCE_SHA"}
             - {name: SOURCE_ARCHIVE_SHA256, value: "REPLACE_SOURCE_ARCHIVE_SHA256"}
@@ -84,7 +86,10 @@ spec:
               # The controller must also bind the receipt to its live source.
               mkdir -p /work/buildkit /work/receipts /work/tmp /work/runtime
               export TMPDIR=/work/tmp
-              cleanup() { rm -rf /work/buildkit /work/tmp /work/runtime; }
+              # The controller retains the task-scoped cache across source fixes,
+              # then removes it after durable artifact/receipt publication. The
+              # finite worker/PVC lifetime is independent of this client shell.
+              cleanup() { rm -rf /work/tmp /work/runtime; }
               trap cleanup EXIT
               buildctl-daemonless.sh build \
                 --frontend dockerfile.v0 \
@@ -111,7 +116,7 @@ spec:
             limits: {cpu: "3", memory: 10Gi}
           volumeMounts:
             - {name: work, mountPath: /work}
-            - {name: work, mountPath: /work/source, subPath: source, readOnly: true}
+            - {name: work, mountPath: /work/source, subPath: "sources/REPLACE_SOURCE_SHA", readOnly: true}
             - {name: registry, mountPath: /registry, readOnly: true}
       volumes:
         - name: work

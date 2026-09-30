@@ -16,18 +16,18 @@ flowchart LR
     A[Agent DataRequest] --> V[Pinned partition union and time view]
     H --> V
     V --> P[Verified immutable Parquet shards and optional anchors]
-    P --> M[Native ML readers; Campaign admission pending]
+    P --> M[Native ML readers and explicit prepared-cohort admission]
 ```
 
 The existing raw collector verifier and `lob-pit-materializer` still own OSS
 discovery, `_SUCCESS`, source/reference verification, point-in-time construction,
 and normalized market exports. This CLI does **not** discover raw folders or
 infer another normalization policy. The native publication bridge described
-below enqueues those existing verified exports. The native coordinator still
-needs the explicit background data-plane configuration and its bounded
-scheduled invocation before continuous OSS ingestion can be claimed. The
-current Campaign native-source-index provenance/admission branch is also
-pending; compatible numerical readers alone do not establish Campaign admission.
+below enqueues those existing verified exports. The native coordinator needs
+the explicit background data-plane configuration and its bounded scheduled
+invocation before continuous OSS ingestion can be claimed. The opt-in publisher
+hook and explicit prepared-cohort admission branch below provide that source
+connection; their code alone does not prove deployment or real Campaign acceptance.
 
 ## Deployment and ownership
 
@@ -35,6 +35,12 @@ The executable requires `MONDAY_ACK_DATA_PLANE=1`. The published `--version`
 reports its compiled `MONDAY_SOURCE_REVISION`; `source-unbound` is unsuitable for
 production admission. The environment flag is an execution guard, not a signed
 grant or an authentication mechanism.
+Preparation also requires `MONDAY_DATA_PLATFORM_IMAGE` containing the actual
+immutable converter image reference. The `monday.market_ready_receipt.v2` binds
+the compiled source revision and that image; an unbound producer cannot publish
+ready inputs. Kubernetes admission/readback must verify this environment value
+against the actual running image. Campaign consumers pin the independently
+approved converter source/image rather than trusting a caller-supplied string.
 
 Use one controller Deployment and an ACK block-disk state root, for example
 `/work/data-service`. The controller account owns `catalogue`, `claims`, `views`
@@ -133,6 +139,11 @@ the CLI does not invent or bypass a grant. It verifies the paired publication
 receipts, immutable image digest, published path ownership, frozen inventory
 hash, original PIT snapshot/report identity, and pinned feature/source/target
 manifest identities. The bridge does not rerun normalization or scan OSS.
+When the native invocation sets optional market feature start/end clocks,
+manual `enqueue` calls must also provide the same
+`--expected-feature-start-received-at-ns` / `--expected-feature-end-received-at-ns`
+values. The publisher hook forwards them automatically. A changed or omitted
+optional clock cannot silently reuse the old fixed inventory's export.
 
 Under the sole controller lock it atomically replaces
 `<state-root>/receipt-queue.json`, then independently reads and verifies its
@@ -145,6 +156,26 @@ stable partition production rather than reconstructing data per experiment.
 `enqueue` returns `queued`, not ready; `drain` performs the actual payload and
 ClickHouse verification. A failed publication callback can retry that same
 native publication identity without creating a second data partition.
+
+The native `cex-materialization-entrypoint.sh` enables the callback only when
+the fixed background job supplies all three
+`MONDAY_DATA_PLATFORM_STATE_ROOT`, `MONDAY_DATA_PLATFORM_ADMISSION`, and
+`MONDAY_DATA_PLATFORM_ADMISSION_SHA256` values, plus
+`MONDAY_ACK_DATA_PLANE=1`. State must be on the admitted `/work` block disk;
+source jobs must request canonical SOL USDM market encoder exports. Slice
+shards cannot own the shared publisher. Optional endpoint/user are
+`MONDAY_DATA_PLATFORM_CLICKHOUSE_URL` and `MONDAY_DATA_PLATFORM_USER`
+(default `monday_writer`); credentials stay in the existing secret environment.
+
+After immutable native publication, the hook enqueues the verified source and
+drains at most 16 new partitions. An unchanged complete published inventory
+retries through those exact receipts without raw discovery, slicing, or
+normalization, even when its temporary work directory has disappeared. A
+failed data callback preserves the native publication identity and queue cursor
+for retry. A remaining backlog reports `preparing` with `pending_partitions`;
+it is not a failed attempt or evidence of a complete requested view. The
+scheduled background controller must retain one writer and process new
+predeclared sealed inventories independently of consumer experiments.
 
 ## Fixed Agent DataRequest
 
@@ -167,6 +198,10 @@ identity for every source. The source union is ordered and disjoint; duplicate,
 overlapping, out-of-order, unrelated and out-of-grant partitions are blocked.
 Actual canonical timestamp series IDs are preserved. A gap or series boundary
 clears the causal context; the preparer never joins different recovery series.
+The first actual observation must match the requested history start, and the
+actual trailing watermark must cover the exclusive end. A request for 14 days
+cannot silently return only its final day. Interior gaps are reported and
+invalidate the corresponding causal contexts; they are never interpolated.
 
 The canonical request digest is the shared preparation key. A missing source
 returns `preparing`; an active owner of the same preparation claim also returns
@@ -206,6 +241,53 @@ gap counts, first/last observed coverage, at most 32 gap previews, and the pinne
 the ACK artifact and is retrieved through the artifact protocol, rather than
 being copied into workstation logs.
 
+## Explicit prepared Campaign cohort
+
+The prepared cohort path uses `monday.sol_market_encoder_cohort_request.v2` with
+the original native `training_receipts` retained and an additional binding:
+
+```json
+{
+  "prepared_training": {
+    "ready_receipt": {
+      "file": "shared/views/<fixed-request-hash>/_READY.json",
+      "sha256": "<independently verified ready-receipt hash>"
+    },
+    "producer_source_revision": "<approved 40-hex converter source>",
+    "producer_image": "<approved converter image>@sha256:<image-digest>"
+  }
+}
+```
+
+This is the additional block within the existing cohort request, rather than a
+standalone replacement for its identity or native training receipts. Paths are
+relative to the admitted input root. The fixed data request for this path uses
+`purpose: "pre_holdout_supervised"`, the full ordered SOL 24-channel input,
+the exact registered native training view, `anchor_end_ms = view.end_ms - 30000`
+and `qualified_anchors: false`. Campaign admission independently derives and
+binds its qualified anchors.
+
+The existing composition command accepts this explicit v2 request:
+
+```text
+alpha-harness mission prepare-sequence-cohort \
+  --request /work/request.v2.json --input-root /work/admitted-inputs \
+  --output-root /work/prepared-cohort --inputs-out /work/cohort-inputs.v2.json
+```
+
+The admitted input root must contain the pinned native receipts/artifacts and
+the ready prefix. It cannot resolve through symlinks or path traversal. The
+original validation receipt and contiguous replay remain unchanged.
+
+The new consumer verifies the original native receipt/source index, exact
+converter source/image and complete decoded feature/target equivalence before
+producing `Inputs.v2` / `SourceIndex.v2`. It preserves integer clocks, recovery
+series, Float32 values, target availability, source gaps and point-in-time
+lineage. Prepared shards do not replace the source grant, bypass source
+verification, or create another Campaign completion entrypoint. The native
+Campaign remains freeze → finalize → dispatch → generated execute, with its
+existing cumulative scientific budget and terminal-result requirements.
+
 ## Resource and evidence limits
 
 Each ClickHouse query has at most 4,096 rows, an 8 MiB response cap and a 256 MiB
@@ -243,3 +325,10 @@ float bits/value tampering, pre-holdout maturity, path traversal, line limits,
 and ready reuse/cache restoration/same-size corruption without an available
 database. Their fixtures are tests only;
 they must never substitute for the real cloud ingestion acceptance run.
+
+The existing `test-cex-materialization-entrypoint.sh` additionally checks
+partial background configuration rejection, a failed data drain after native
+publication, and restart through the same receipts with raw/reference roots
+unavailable. Its positive callback fixtures require `TMPDIR` under the admitted
+ACK `/work` tree; a non-ACK run explicitly skips those cases. These orchestration
+doubles do not exercise real ClickHouse or substitute for source ingestion.

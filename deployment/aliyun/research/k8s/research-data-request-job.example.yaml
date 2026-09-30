@@ -42,7 +42,10 @@ spec:
             - --database
             - monday_analytics
             - --user
-            - monday_reader
+            # Bind this field and the secret together from the admitted request:
+            # label_free -> monday_reader/monday-clickhouse-reader;
+            # pre_holdout_supervised -> monday_task_reader/monday-clickhouse-task-reader.
+            - REPLACE_ADMITTED_READER_USER
             - request
             - --request
             - /request/request.json
@@ -50,9 +53,10 @@ spec:
             - "REPLACE_REQUEST_SHA256"
           env:
             - {name: MONDAY_ACK_DATA_PLANE, value: "1"}
+            - {name: MONDAY_DATA_PLATFORM_IMAGE, value: REPLACE_IMMUTABLE_DATA_IMAGE}
             - name: CLICKHOUSE_PASSWORD
               valueFrom:
-                secretKeyRef: {name: monday-clickhouse-reader, key: password}
+                secretKeyRef: {name: REPLACE_ADMITTED_READER_SECRET, key: password}
           resources:
             requests: {cpu: 250m, memory: 512Mi}
             limits: {cpu: "1", memory: 2Gi}

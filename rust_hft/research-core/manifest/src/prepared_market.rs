@@ -45,6 +45,161 @@ const MAX_GROUP_UNCOMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PreparedMarketArtifactV1 {
+    pub file: String,
+    pub sha256: String,
+}
+impl PreparedMarketArtifactV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if !valid_sha256(&self.sha256)
+            || self.file.is_empty()
+            || self.file.len() > 1024
+            || self.file.starts_with('/')
+            || self.file.split('/').any(|p| {
+                p.is_empty()
+                    || p == "."
+                    || p == ".."
+                    || !p
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            })
+        {
+            return Err("invalid prepared artifact reference".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedMarketRequestSourceV1 {
+    pub feature_dataset_sha256: String,
+    pub target_dataset_sha256: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedMarketDataRequestV1 {
+    pub schema_version: String,
+    pub sources: Vec<PreparedMarketRequestSourceV1>,
+    pub transform_sha256: String,
+    pub input: SequenceInputSpecV1,
+    pub view: SequenceViewV1,
+    pub anchor_end_ms: i64,
+    pub purpose: String,
+    pub qualified_anchors: bool,
+}
+impl PreparedMarketDataRequestV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        self.input.validate()?;
+        self.view.validate()?;
+        let mut identities = BTreeSet::new();
+        if self.schema_version != "monday.market_data_request.v1"
+            || self.sources.is_empty()
+            || self.sources.len() > 512
+            || !valid_sha256(&self.transform_sha256)
+            || !matches!(
+                self.purpose.as_str(),
+                "label_free" | "pre_holdout_supervised"
+            )
+            || self.sources.iter().any(|s| {
+                !valid_sha256(&s.feature_dataset_sha256)
+                    || !identities.insert(&s.feature_dataset_sha256)
+                    || s.target_dataset_sha256
+                        .as_deref()
+                        .is_some_and(|h| !valid_sha256(h))
+                    || s.target_dataset_sha256.is_some()
+                        != (self.purpose == "pre_holdout_supervised")
+            })
+            || self.view.decision_start_ms - self.view.history_start_ms
+                < (self.input.context_rows as i64 - 1) * 1000
+            || self.anchor_end_ms <= self.view.decision_start_ms
+            || self.anchor_end_ms > self.view.end_ms
+            || self.anchor_end_ms % 1000 != 0
+            || self.view.end_ms - self.view.history_start_ms
+                > MAX_PREPARED_MARKET_ROWS as i64 * 1000
+            || self.anchor_end_ms - self.view.decision_start_ms > 14 * 86_400_000
+        {
+            return Err("invalid prepared data request or admitted time bounds".into());
+        }
+        Ok(())
+    }
+    pub fn digest(&self) -> Result<String, String> {
+        self.validate()?;
+        digest(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedMarketReadyReceiptV2 {
+    pub schema_version: String,
+    pub producer_source_revision: String,
+    pub producer_image: String,
+    pub request_sha256: String,
+    pub request: PreparedMarketDataRequestV1,
+    pub prepared_view_sha256: String,
+    pub prepared_view: PreparedMarketViewV1,
+    pub feature_manifest: PreparedMarketArtifactV1,
+    pub target_manifest: Option<PreparedMarketArtifactV1>,
+    pub qualified_anchors: Option<PreparedMarketArtifactV1>,
+}
+pub fn validate_prepared_producer(revision: &str, image: &str) -> Result<(), String> {
+    let valid_revision = revision.len() == 40
+        && revision
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let valid_image = image.split_once("@sha256:").is_some_and(|(name, hash)| {
+        !name.is_empty() && !name.bytes().any(|b| b.is_ascii_whitespace()) && valid_sha256(hash)
+    });
+    if !valid_revision || !valid_image {
+        return Err("prepared converter requires exact source and image identities".into());
+    }
+    Ok(())
+}
+impl PreparedMarketReadyReceiptV2 {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_prepared_producer(&self.producer_source_revision, &self.producer_image)?;
+        self.request.validate()?;
+        self.prepared_view.validate()?;
+        self.feature_manifest.validate()?;
+        if let Some(v) = &self.target_manifest {
+            v.validate()?;
+        }
+        if let Some(v) = &self.qualified_anchors {
+            v.validate()?;
+        }
+        if self.schema_version != "monday.market_ready_receipt.v2"
+            || self.request.digest()? != self.request_sha256
+            || self.prepared_view.digest()? != self.prepared_view_sha256
+            || self.prepared_view.view != self.request.view
+            || self.prepared_view.transform_sha256 != self.request.transform_sha256
+            || self.feature_manifest.sha256 != self.prepared_view.feature_dataset_sha256
+            || self.target_manifest.as_ref().map(|v| &v.sha256)
+                != self.prepared_view.target_dataset_sha256.as_ref()
+            || self.qualified_anchors.as_ref().map(|v| &v.sha256)
+                != self.prepared_view.qualified_anchors_sha256.as_ref()
+            || self.target_manifest.is_some() != (self.request.purpose == "pre_holdout_supervised")
+            || self.qualified_anchors.is_some() != self.request.qualified_anchors
+            || self.request.sources.len() != self.prepared_view.sources.len()
+            || self
+                .request
+                .sources
+                .iter()
+                .zip(&self.prepared_view.sources)
+                .any(|(r, s)| {
+                    r.feature_dataset_sha256 != s.feature_dataset_sha256
+                        || r.target_dataset_sha256 != s.target_dataset_sha256
+                })
+        {
+            return Err(
+                "prepared ready receipt differs from its request or output identities".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedMarketSourceV1 {
     pub feature_dataset_sha256: String,
     pub target_dataset_sha256: Option<String>,
@@ -123,6 +278,10 @@ impl PreparedMarketViewV1 {
             || self.view.end_ms - self.view.history_start_ms
                 > MAX_PREPARED_MARKET_ROWS as i64 * 1000
             || self.series.is_empty()
+            || self
+                .series
+                .first()
+                .is_none_or(|s| s.first_observed_at_ms != self.view.history_start_ms)
             || self.series.len() as u64 > MAX_PREPARED_MARKET_ROWS
             || self.gaps.len() as u64 > MAX_PREPARED_MARKET_ROWS
         {
@@ -1022,5 +1181,49 @@ mod tests {
         view.sources.reverse();
         view.series[1].rows = 96;
         assert!(view.validate().is_err());
+        view.series[1].rows = 95;
+        for source in &mut view.sources {
+            source.target_dataset_sha256 = None;
+        }
+        view.source_target_dataset_sha256 = None;
+        let request = PreparedMarketDataRequestV1 {
+            schema_version: "monday.market_data_request.v1".into(),
+            sources: view
+                .sources
+                .iter()
+                .map(|s| PreparedMarketRequestSourceV1 {
+                    feature_dataset_sha256: s.feature_dataset_sha256.clone(),
+                    target_dataset_sha256: None,
+                })
+                .collect(),
+            transform_sha256: view.transform_sha256.clone(),
+            input: input(),
+            view: view.view,
+            anchor_end_ms: view.view.end_ms,
+            purpose: "label_free".into(),
+            qualified_anchors: false,
+        };
+        let mut ready = PreparedMarketReadyReceiptV2 {
+            schema_version: "monday.market_ready_receipt.v2".into(),
+            producer_source_revision: "a".repeat(40),
+            producer_image: format!("registry/data@sha256:{}", "b".repeat(64)),
+            request_sha256: request.digest().unwrap(),
+            request,
+            prepared_view_sha256: view.digest().unwrap(),
+            feature_manifest: PreparedMarketArtifactV1 {
+                file: "features/manifest.json".into(),
+                sha256: view.feature_dataset_sha256.clone(),
+            },
+            prepared_view: view,
+            target_manifest: None,
+            qualified_anchors: None,
+        };
+        ready.validate().unwrap();
+        ready.producer_source_revision = "source-unbound".into();
+        assert!(ready.validate().is_err());
+        ready.producer_source_revision = "a".repeat(40);
+        ready.request.sources.reverse();
+        ready.request_sha256 = ready.request.digest().unwrap();
+        assert!(ready.validate().is_err());
     }
 }

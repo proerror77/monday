@@ -6,9 +6,10 @@ use hft_research_manifest::market_encoder::{
     FEATURE_SCHEMA, TARGET_PARQUET_SCHEMA, TARGET_SCHEMA,
 };
 use hft_research_manifest::prepared_market::{
-    write_feature_parquet_shard, write_target_parquet_shard, FeatureParquetReader,
-    PreparedMarketGapV1, PreparedMarketSeriesV1, PreparedMarketSourceV1, PreparedMarketViewV1,
-    TargetParquetReader, PREPARED_MARKET_VIEW_SCHEMA,
+    validate_prepared_producer, write_feature_parquet_shard, write_target_parquet_shard,
+    FeatureParquetReader, PreparedMarketGapV1, PreparedMarketReadyReceiptV2,
+    PreparedMarketSeriesV1, PreparedMarketSourceV1, PreparedMarketViewV1, TargetParquetReader,
+    PREPARED_MARKET_VIEW_SCHEMA,
 };
 use hft_research_manifest::sequence::{
     valid_sha256, SequenceInputSpecV1, SequenceShardV1, SequenceViewV1,
@@ -76,6 +77,10 @@ enum Command {
         admission: PathBuf,
         #[arg(long)]
         admission_sha256: String,
+        #[arg(long)]
+        expected_feature_start_received_at_ns: Option<u64>,
+        #[arg(long)]
+        expected_feature_end_received_at_ns: Option<u64>,
     },
     /// Process a bounded append-only receipt queue; advance the cursor only after verified commit.
     Drain {
@@ -330,7 +335,7 @@ struct RegistryRow {
     materialization_version: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceSegment {
     path: PathBuf,
@@ -361,6 +366,8 @@ struct FeatureSources {
 }
 impl FeatureSources {
     fn validate(&self, features: &MarketFeatureDatasetV1) -> Result<()> {
+        let mut segment_hashes = BTreeSet::new();
+        let mut segment_paths = BTreeSet::new();
         let first = features
             .shards
             .first()
@@ -400,6 +407,9 @@ impl FeatureSources {
                 !valid_sha256(&s.sha256)
                     || !valid_sha256(&s.collector_manifest_sha256)
                     || !valid_sha256(&s.success_marker_sha256)
+                    || s.success_marker_sha256 != bytes_digest(format!("{}\n", s.sha256).as_bytes())
+                    || !segment_hashes.insert(&s.sha256)
+                    || !segment_paths.insert(&s.path)
                     || s.events == 0
                     || s.end_received_at_ns < s.start_received_at_ns
                     || s.path.as_os_str().is_empty()
@@ -433,6 +443,8 @@ impl FeatureSources {
 #[serde(deny_unknown_fields)]
 struct ReadyReceipt {
     schema_version: String,
+    producer_source_revision: String,
+    producer_image: String,
     request_sha256: String,
     request: DataRequest,
     prepared_view_sha256: String,
@@ -475,10 +487,10 @@ pub fn run() -> Result<()> {
     let client = ClickHouse::new(&args)?;
     tokio::runtime::Runtime::new()?.block_on(async {
         match &args.command {
-            Command::Enqueue {campaign_inputs,campaign_inputs_sha256,materialization_receipt,materialization_receipt_sha256,run_root,artifact_root,admission,admission_sha256} => {
+            Command::Enqueue {campaign_inputs,campaign_inputs_sha256,materialization_receipt,materialization_receipt_sha256,run_root,artifact_root,admission,admission_sha256,expected_feature_start_received_at_ns,expected_feature_end_received_at_ns} => {
                 let _owner=claim(&state_root.join("controller.lock"))?.context("another controller owns receipt queue")?;
                 let admission:DataAdmission=read_pinned(admission,admission_sha256)?;
-                let receipt=native_receipt(campaign_inputs,campaign_inputs_sha256,materialization_receipt,materialization_receipt_sha256,run_root,artifact_root,admission)?;
+                let receipt=native_receipt(campaign_inputs,campaign_inputs_sha256,materialization_receipt,materialization_receipt_sha256,run_root,artifact_root,admission,*expected_feature_start_received_at_ns,*expected_feature_end_received_at_ns)?;
                 let result=enqueue_receipt(&state_root,receipt)?;
                 print_response(&result)?;
             }
@@ -495,6 +507,7 @@ pub fn run() -> Result<()> {
                 let path = state_root.join("queue-cursor.json");
                 let mut cursor: Cursor = if path.exists() { read_bounded_json(&path)? } else { Cursor { sequence: 0, receipt_sha256: None } };
                 validate_queue(&receipts, &cursor)?;
+                let queued_sequence=receipts.last().map_or(cursor.sequence,|receipt|receipt.sequence);
                 let mut committed = 0;
                 let committed_sequence = cursor.sequence;
                 for receipt in receipts.into_iter().filter(|r| r.sequence > committed_sequence).take(*max_partitions) {
@@ -504,7 +517,8 @@ pub fn run() -> Result<()> {
                     replace_json(&path, &cursor)?;
                     committed += 1;
                 }
-                print_response(&serde_json::json!({"state":"ready","committed_partitions":committed,"cursor":cursor}))?;
+                let pending_partitions=queued_sequence-cursor.sequence;
+                print_response(&serde_json::json!({"state":if pending_partitions==0{"ready"}else{"preparing"},"committed_partitions":committed,"pending_partitions":pending_partitions,"cursor":cursor}))?;
             }
             Command::Request { request, request_sha256 } => {
                 let request: DataRequest = read_pinned(request, request_sha256)?;
@@ -563,6 +577,8 @@ fn native_receipt(
     run_root: &Path,
     artifact_root: &Path,
     admission: DataAdmission,
+    expected_feature_start_received_at_ns: Option<u64>,
+    expected_feature_end_received_at_ns: Option<u64>,
 ) -> Result<IngestReceipt> {
     let campaign: NativeCampaignInputs = read_pinned(campaign_path, campaign_sha)?;
     let native: NativeMaterializationReceipt =
@@ -672,14 +688,11 @@ fn native_receipt(
             .context("native report has no market encoder output")?
             .clone(),
     )?;
-    if export.schema_version != "monday.market_encoder_export.v1"
-        || export
-            .feature_start_received_at_ns
-            .zip(export.feature_end_received_at_ns)
-            .is_some_and(|(start, end)| start >= end)
-    {
-        bail!("invalid native market encoder export bounds");
-    }
+    validate_export_window(
+        &export,
+        expected_feature_start_received_at_ns,
+        expected_feature_end_received_at_ns,
+    )?;
     let export_root = materialization_path
         .parent()
         .context("native materialization parent missing")?;
@@ -745,6 +758,23 @@ fn native_receipt(
     Ok(receipt)
 }
 
+fn validate_export_window(
+    export: &NativeMarketExport,
+    start: Option<u64>,
+    end: Option<u64>,
+) -> Result<()> {
+    if export.schema_version != "monday.market_encoder_export.v1"
+        || export
+            .feature_start_received_at_ns
+            .zip(export.feature_end_received_at_ns)
+            .is_some_and(|(start, end)| start >= end)
+        || export.feature_start_received_at_ns != start
+        || export.feature_end_received_at_ns != end
+    {
+        bail!("native market encoder optional feature window differs from the fixed publication recipe");
+    }
+    Ok(())
+}
 fn enqueue_receipt(state_root: &Path, mut receipt: IngestReceipt) -> Result<serde_json::Value> {
     receipt.validate()?;
     let path = state_root.join("receipt-queue.json");
@@ -873,6 +903,7 @@ impl ClickHouse {
             .basic_auth(&self.user, Some(&self.password))
             .query(&[
                 ("query", query),
+                ("wait_end_of_query", "1"),
                 ("output_format_json_quote_64bit_integers", "0"),
                 ("max_result_bytes", "8388608"),
                 ("result_overflow_mode", "throw"),
@@ -921,12 +952,16 @@ impl ClickHouse {
         if bytes.len() > MAX_RESPONSE_BYTES {
             bail!("insert batch exceeds byte budget");
         }
-        self.query(
-            &format!("INSERT INTO {}.{table} FORMAT JSONEachRow", self.database),
-            &[],
-            bytes,
-        )
-        .await?;
+        let response = self
+            .query(
+                &format!("INSERT INTO {}.{table} FORMAT JSONEachRow", self.database),
+                &[],
+                bytes,
+            )
+            .await?;
+        if response.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            bail!("ClickHouse insert returned an error payload after success headers");
+        }
         Ok(())
     }
     async fn feature_page(
@@ -1544,6 +1579,7 @@ fn admit_entry(
         || entry.receipt.features.sha256 != source.feature_dataset_sha256
         || entry.receipt.source_manifest_sha256 != entry.feature_dataset.source_manifest_sha256
         || entry.receipt.transform_sha256 != request.transform_sha256
+        || (previous_end.is_none() && first > request.view.history_start_ms)
         || previous_end.is_some_and(|end| first <= end)
         || last < request.view.history_start_ms
         || first >= request.view.end_ms
@@ -1590,6 +1626,9 @@ async fn prepare_view(
     request: &DataRequest,
     entries: &[CatalogueEntry],
 ) -> Result<ReadyReceipt> {
+    let producer_image = std::env::var("MONDAY_DATA_PLATFORM_IMAGE")
+        .context("prepared converter immutable image identity is missing")?;
+    validate_prepared_producer(SOURCE_REVISION, &producer_image).map_err(anyhow::Error::msg)?;
     let feature_root = root.join("features");
     let target_root = root.join("targets");
     fs::create_dir_all(&feature_root)?;
@@ -1664,6 +1703,11 @@ async fn prepare_view(
                 .await?;
             if rows.is_empty() {
                 break;
+            }
+            if total_rows == 0
+                && rows.first().map(|row| row.observed_at_ms) != Some(request.view.history_start_ms)
+            {
+                bail!("requested leading history coverage is missing; no implicit partial view admission");
             }
             for row in &mut rows {
                 row.validate(&entry.feature_dataset.input)
@@ -1809,6 +1853,13 @@ async fn prepare_view(
     if feature_shards.is_empty() {
         bail!("requested view has no verified real feature rows");
     }
+    if feature_shards
+        .first()
+        .map(|shard| shard.first_observed_at_ms)
+        != Some(request.view.history_start_ms)
+    {
+        bail!("requested leading history coverage is missing; no implicit partial view admission");
+    }
     let source_feature = union_digest(
         &request
             .sources
@@ -1926,7 +1977,9 @@ async fn prepare_view(
         .map_err(anyhow::Error::msg)?;
     publish_json(&root.join("prepared-view.json"), &prepared)?;
     Ok(ReadyReceipt {
-        schema_version: "monday.market_ready_receipt.v1".into(),
+        schema_version: "monday.market_ready_receipt.v2".into(),
+        producer_source_revision: SOURCE_REVISION.into(),
+        producer_image,
         request_sha256: request.identity()?,
         request: request.clone(),
         prepared_view_sha256: prepared_hash,
@@ -1965,7 +2018,10 @@ fn print_response<T: Serialize>(response: &T) -> Result<()> {
 }
 fn read_ready(state_root: &Path, root: &Path, request: &DataRequest) -> Result<serde_json::Value> {
     let ready: ReadyReceipt = read_bounded_json(&root.join("_READY.json"))?;
-    if ready.schema_version != "monday.market_ready_receipt.v1"
+    let shared_ready: PreparedMarketReadyReceiptV2 =
+        serde_json::from_value(serde_json::to_value(&ready)?)?;
+    shared_ready.validate().map_err(anyhow::Error::msg)?;
+    if ready.schema_version != "monday.market_ready_receipt.v2"
         || ready.request != *request
         || ready.request_sha256 != request.identity()?
         || ready.prepared_view.digest().map_err(anyhow::Error::msg)? != ready.prepared_view_sha256
@@ -2036,6 +2092,7 @@ fn read_ready(state_root: &Path, root: &Path, request: &DataRequest) -> Result<s
 }
 fn ready_summary(root: &Path, ready: &ReadyReceipt) -> serde_json::Value {
     serde_json::json!({"state":"ready","request_sha256":ready.request_sha256,"prepared_view_sha256":ready.prepared_view_sha256,
+        "producer_source_revision":ready.producer_source_revision,"producer_image":ready.producer_image,
         "prepared_view_manifest":{"file":"prepared-view.json","sha256":ready.prepared_view_sha256},
         "root":root,"feature_manifest":ready.feature_manifest,"target_manifest":ready.target_manifest,"qualified_anchors":ready.qualified_anchors,
         "watermark_ms":ready.prepared_view.data_watermark_ms,"series_count":ready.prepared_view.series.len(),"gap_count":ready.prepared_view.gaps.len(),
@@ -2280,8 +2337,8 @@ fn claim(path: &Path) -> Result<Option<File>> {
         .open(path)?;
     match fs4::FileExt::try_lock(&file) {
         Ok(()) => Ok(Some(file)),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(fs4::TryLockError::WouldBlock) => Ok(None),
+        Err(fs4::TryLockError::Error(error)) => Err(error.into()),
     }
 }
 fn validate_identifier(value: &str) -> Result<()> {
@@ -2525,6 +2582,95 @@ mod tests {
             pre_holdout_supervised: false,
         }
     }
+    #[test]
+    fn data_service_claim_rejects_busy_owner_and_recovers_after_release() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("partition.lock");
+        let owner = claim(&path).unwrap().unwrap();
+        assert!(claim(&path).unwrap().is_none());
+        drop(owner);
+        assert!(claim(&path).unwrap().is_some());
+    }
+    #[test]
+    fn data_service_retry_rejects_changed_or_omitted_optional_feature_window() {
+        let artifact = || NativeMarketArtifact {
+            file: "artifact.json".into(),
+            sha256: hash('a'),
+        };
+        let mut export = NativeMarketExport {
+            schema_version: "monday.market_encoder_export.v1".into(),
+            feature_start_received_at_ns: Some(30_000_000_000),
+            feature_end_received_at_ns: Some(90_000_000_000),
+            feature_sources: artifact(),
+            features: artifact(),
+            targets: artifact(),
+        };
+        validate_export_window(&export, Some(30_000_000_000), Some(90_000_000_000)).unwrap();
+        assert!(
+            validate_export_window(&export, Some(31_000_000_000), Some(90_000_000_000)).is_err()
+        );
+        assert!(validate_export_window(&export, None, Some(90_000_000_000)).is_err());
+        assert!(validate_export_window(&export, Some(30_000_000_000), None).is_err());
+        export.feature_start_received_at_ns = None;
+        export.feature_end_received_at_ns = None;
+        validate_export_window(&export, None, None).unwrap();
+    }
+    #[test]
+    fn data_service_sources_reject_forged_success_marker_and_duplicate_segment() {
+        let segment_hash = hash('b');
+        let segment = SourceSegment {
+            path: "slice.jsonl.zst".into(),
+            sha256: segment_hash.clone(),
+            collector_manifest_path: "slice.jsonl.zst.manifest.json".into(),
+            collector_manifest_sha256: hash('c'),
+            success_marker_path: "slice.jsonl.zst._SUCCESS".into(),
+            success_marker_sha256: bytes_digest(format!("{segment_hash}\n").as_bytes()),
+            start_received_at_ns: 0,
+            end_received_at_ns: 1_000_000_000,
+            events: 2,
+        };
+        let features = MarketFeatureDatasetV1 {
+            schema_version: FEATURE_SCHEMA.into(),
+            venue: "binance-usdm".into(),
+            symbol: "SOLUSDT".into(),
+            source_manifest_sha256: hash('d'),
+            input: SequenceInputSpecV1::sol_lob(),
+            shards: vec![SequenceShardV1 {
+                file: "source.jsonl".into(),
+                sha256: hash('a'),
+                bytes: 1,
+                rows: 2,
+                first_observed_at_ms: 0,
+                last_observed_at_ms: 1000,
+            }],
+        };
+        let mut source = FeatureSources {
+            schema_version: "monday.market_feature_sources.v1".into(),
+            market: "usdm".into(),
+            symbol: "SOLUSDT".into(),
+            replay_clock: "received_at_ns".into(),
+            source_revision: data::binance_lob_replay::source_revision([segment_hash.as_str()]),
+            source_segments: vec![segment],
+            feature_start_received_at_ns: None,
+            feature_end_received_at_ns: None,
+            first_feature_observed_at_ms: 0,
+            last_feature_observed_at_ms: 1000,
+            first_dependency_received_at_ns: 0,
+            last_dependency_received_at_ns: 1_000_000_000,
+        };
+        source.validate(&features).unwrap();
+        let success = source.source_segments[0].success_marker_sha256.clone();
+        source.source_segments[0].success_marker_sha256 = hash('e');
+        assert!(source.validate(&features).is_err());
+        source.source_segments[0].success_marker_sha256 = success;
+        source
+            .source_segments
+            .push(source.source_segments[0].clone());
+        source.source_revision = data::binance_lob_replay::source_revision(
+            source.source_segments.iter().map(|s| s.sha256.as_str()),
+        );
+        assert!(source.validate(&features).is_err());
+    }
     fn row_binary(row: &MarketFeatureFrameV1) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend(row.series_id.to_le_bytes());
@@ -2738,7 +2884,9 @@ mod tests {
             gaps: vec![],
         };
         let ready = ReadyReceipt {
-            schema_version: "monday.market_ready_receipt.v1".into(),
+            schema_version: "monday.market_ready_receipt.v2".into(),
+            producer_source_revision: "a".repeat(40),
+            producer_image: format!("registry.example/monday/research-data@sha256:{}", hash('b')),
             request_sha256: request.identity().unwrap(),
             request: request.clone(),
             prepared_view_sha256: prepared.digest().unwrap(),

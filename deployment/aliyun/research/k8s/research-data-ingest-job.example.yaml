@@ -54,6 +54,7 @@ spec:
             - "16"
           env:
             - {name: MONDAY_ACK_DATA_PLANE, value: "1"}
+            - {name: MONDAY_DATA_PLATFORM_IMAGE, value: REPLACE_IMMUTABLE_DATA_IMAGE}
             - name: CLICKHOUSE_PASSWORD
               valueFrom:
                 secretKeyRef: {name: monday-clickhouse-writer, key: password}
