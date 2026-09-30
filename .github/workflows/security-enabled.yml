@@ -46,7 +46,7 @@ jobs:
   security-scope:
     name: Security job scope
     needs: security-selector
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -69,8 +69,8 @@ jobs:
             printf 'jobs=%s\n' "$SELECTED_SECURITY_JOBS"
             printf 'clippy_loop=%s\nclippy_handoff=%s\n' "$CLIPPY_LOOP" "$CLIPPY_HANDOFF"
           else
-            printf '%s\n' 'clippy_loop=true' 'clippy_handoff=true'
-            printf '%s\n' 'jobs=,security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection,'
+            echo 'CI selection failed or returned an invalid plan; no work is dispatched' >&2
+            exit 1
           fi >> "$GITHUB_OUTPUT"
 
   # ============================================================================
