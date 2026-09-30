@@ -70,9 +70,12 @@ spec:
           # Rootless BuildKit's documented Kubernetes constraints. Admit only
           # after verifying user namespaces/native snapshotter on this worker.
           # Never fall back to a system node or privileged host socket.
+          # RootlessKit needs newuidmap/newgidmap setuid helpers to enter its
+          # subordinate-ID user namespace; no host root capabilities are granted.
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
+            allowPrivilegeEscalation: true
             seccompProfile: {type: Unconfined}
             appArmorProfile: {type: Unconfined}
           command: [/bin/sh, -ceu]
