@@ -1414,6 +1414,9 @@ Health keeps the physical `failed_count` and `stale_count` and separately report
 `undisposed_stale_count`, `invalid_retention_count`,
 retained bytes and historical job identities. Valid retention becomes a visible
 historical-data warning; new failures or invalid/missing evidence still breach.
+Monitor stdout keeps each job's state and receipt digest within the Cloud
+Assistant output budget. `check-retained` and the immutable custody records
+retain the full job/result/request/inventory digests for independent audits.
 Its pure reader rehashes small metadata and checks complete membership plus
 device, inode, links, bytes, owner, mode and nanosecond mtime/ctime. Payload SHA
 was verified at commit: this periodic metadata guard relies on the existing

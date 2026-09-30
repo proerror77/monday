@@ -952,6 +952,13 @@ recovery_isolation_marker_valid() {
 # The active native reader is side-effect-free and runs once per market, with
 # no inherited MONDAY_* writer overrides. Preserve physical failed counts even
 # if the reader is unavailable: only its exact validated subset is classified.
+retention_health_jobs() {
+  # All digests are validated below before projection. Keep receipt identities
+  # in bounded monitor stdout; full requests/inventories remain in custody.
+  jq -c '.retained|map({job_id,queue_state:(.queue_state//"failed"),receipt_sha256,
+    retained_bytes,disposition,data_recovered,delivery_verified,replay_eligibility})'
+}
+
 read_recovery_retention() {
   retention_check_status=not_present
   retained_failed_count=0
@@ -1005,7 +1012,7 @@ read_recovery_retention() {
   retained_stale_count=$(printf '%s\n' "$retained_output" | jq -r '.retained_stale_count//0')
   retained_bytes=$(printf '%s\n' "$retained_output" | jq -r .retained_bytes)
   invalid_retention_count=$(printf '%s\n' "$retained_output" | jq -r .invalid_retention_count)
-  retained_jobs=$(printf '%s\n' "$retained_output" | jq -c .retained)
+  retained_jobs=$(printf '%s\n' "$retained_output" | retention_health_jobs)
   if [ "$invalid_retention_count" -gt 0 ]; then
     record_breach "$label: invalid or drifted retained evidence ($invalid_retention_count)"
   fi
