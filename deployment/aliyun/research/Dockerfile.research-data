@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.7
+# Build only in an ACK worker Job. SOURCE_REVISION is the exact Git commit;
+# the controller verifies its source archive hash before admitting this build.
+FROM rust@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec AS source
+ARG SOURCE_REVISION
+WORKDIR /work/source
+ENV CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 RUST_MIN_STACK=33554432
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang cmake mold pkg-config protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+COPY rust_hft/ rust_hft/
+
+FROM source AS validated
+WORKDIR /work/source/rust_hft
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/work/source/rust_hft/target,sharing=locked \
+    test "${#SOURCE_REVISION}" -eq 40 \
+    && case "$SOURCE_REVISION" in *[!0-9a-f]*) exit 1 ;; esac \
+    && cargo test --locked -p hft-research-manifest prepared \
+    && cargo test --locked -p hft-research-ml prepared_ \
+    && cargo test --locked -p hft-collector --bin clickhouse-analytics-materializer \
+    && cargo test --locked -p hft-collector --bin research-data-service \
+    && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo build --release --locked \
+       -p hft-collector --bin research-data-service --bin clickhouse-analytics-materializer \
+    && install -D -m 0755 target/release/research-data-service /out/research-data-service \
+    && install -D -m 0755 target/release/clickhouse-analytics-materializer /out/clickhouse-analytics-materializer \
+    && printf '%s\n' "$SOURCE_REVISION" > /out/source-revision \
+    && { printf 'execution_host=ack\nsource_revision=%s\ntest_verdict=passed\n' "$SOURCE_REVISION"; \
+         rustc -Vv; sha256sum Cargo.lock; \
+       } > /out/build-receipt.txt \
+    && cd /out && sha256sum research-data-service clickhouse-analytics-materializer > SHA256SUMS
+
+FROM scratch AS binaries
+COPY --from=validated /out/ /
+
+FROM debian:bookworm-slim AS runtime
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+LABEL research.monday.execution-host=ack
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 research \
+    && mkdir -p /work && chown research:research /work
+COPY --from=validated /out/ /opt/monday/
+ENV MONDAY_EXECUTION_HOST=ack
+USER research
+WORKDIR /work
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/monday/research-data-service"]
