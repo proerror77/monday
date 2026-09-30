@@ -1312,4 +1312,30 @@ mod tests {
         );
         assert!(decimal(Some(&json!("not-a-number")), "price", 1).is_err());
     }
+
+    #[test]
+    fn canonical_stream_failures_use_the_existing_tape_error_contract() {
+        let now = Utc::now();
+        let mut builder = initialized(now);
+        for (index, kind) in [
+            "websocket_subscribe",
+            "websocket_payload",
+            "websocket_receive",
+            "websocket_eof",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let record = json!({"sequence":index+1,"recorded_at":now,"update":{
+                "kind":"quote_collection_failure","token_id":"up","request_started_at":now-TimeDelta::milliseconds(1),
+                "http_status":null,"error_kind":kind,"ts":now,"request_status":"failure","collection_result":"api_failure"}});
+            builder.observe(&record, now).unwrap();
+        }
+        let manifest = builder
+            .finish("crypto_expiry", 0, 0, "test.ndjson", 100)
+            .unwrap();
+        assert_eq!(manifest["quality"]["request_attempts"], 4);
+        assert_eq!(manifest["quality"]["request_failures"], 4);
+        assert_eq!(manifest["quality"]["transport_reconnects"], 1);
+    }
 }
