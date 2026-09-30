@@ -1375,23 +1375,25 @@ delivered. The two production instances are each bounded at `CPUQuota=80%` and
 pre-start failure is bounded to 120 seconds per start and capped at five
 attempts per two hours instead of restarting forever.
 
-An explicitly reviewed historical Spot failure may instead be retained without
-recovery. The active controller accepts one original `.failed` job whose full
-payload digest differs from production, with no resume/adopted attempt:
+An explicitly reviewed historical Spot or USD-M failure may instead be retained
+without recovery. The active controller accepts one original `.failed` or
+`.stale` job whose full payload digest differs from production, with no
+resume/adopted attempt. A stale result must be a v2 identity rejection bound to
+its actual immutable executing controller, bundle and source:
 
 ```bash
-/opt/monday/bin/monday-rust-lob-recovery-queue retain spot \
+/opt/monday/bin/monday-rust-lob-recovery-queue retain "$market" \
   --job-id "$job_id" --job-sha256 "$original_job_sha256" \
-  --result-sha256 "$original_failed_result_sha256" \
+  --result-sha256 "$original_terminal_result_sha256" \
   --controller "$active_controller_sha256" --request-id "$request_id" \
   --reason-code retain-unrecovered-historical-evidence
-/opt/monday/bin/monday-rust-lob-recovery-queue check-retained spot
+/opt/monday/bin/monday-rust-lob-recovery-queue check-retained "$market"
 ```
 
-Retention leaves the `.failed` directory, original metadata, data and failure
+Retention leaves the `.failed` or `.stale` directory, original metadata, data and failure
 counters intact. It records an append-only request, complete content-hashed
 inventory and `retained_unrecovered` receipt beneath the job's evidence directory,
-then commits the root-owned `retained/spot/<job>.json` pointer. It never executes
+then commits the root-owned `retained/<market>/<job>.json` pointer. It never executes
 an uploader or claims recovery, delivery or replay eligibility; a committed
 retained job cannot be resumed. Exact request repetition reuses the receipt;
 conflicting or incomplete evidence cannot acknowledge the failure.
@@ -1407,16 +1409,21 @@ and existing spool locks exclude writers. Full hashing releases the market
 queue lock, then a nonblocking short commit rechecks identity and fingerprints.
 No original file is moved, truncated, chmodded or deleted.
 
-Health keeps the physical `failed_count` and separately reports
-`retained_failed_count`, `undisposed_failed_count`, `invalid_retention_count`,
+Health keeps the physical `failed_count` and `stale_count` and separately reports
+`retained_failed_count`, `retained_stale_count`, `undisposed_failed_count`,
+`undisposed_stale_count`, `invalid_retention_count`,
 retained bytes and historical job identities. Valid retention becomes a visible
 historical-data warning; new failures or invalid/missing evidence still breach.
+Monitor stdout keeps each job's state and receipt digest within the Cloud
+Assistant output budget. `check-retained` and the immutable custody records
+retain the full job/result/request/inventory digests for independent audits.
 Its pure reader rehashes small metadata and checks complete membership plus
 device, inode, links, bytes, owner, mode and nanosecond mtime/ctime. Payload SHA
 was verified at commit: this periodic metadata guard relies on the existing
 single-writer/root trust model and is not a fresh full-payload audit. It does
-not change USD-M, stale-job checks, disk accounting, manifests or data/replay
-gates. Publish and apply this policy as an immutable controller transition;
+not change disk accounting, manifests or data/replay gates. Retention validates
+each market independently and leaves undisposed stale jobs as hard breaches.
+Publish and apply this policy as an immutable controller transition;
 never edit the installed health or queue script in place.
 
 After an authorized controller repair has completed release, Gate, cutover and

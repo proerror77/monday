@@ -146,6 +146,50 @@ for field in executing_deployment_bundle_sha256 executing_deployment_source_revi
   done
 done
 printf 'Current payload, stale state, adoption, wrong digest and other markets are refused\n'
+
+# Same custody transaction supports either market and an authentic v2 stale
+# identity rejection, while keeping its original physical/result state.
+for market in spot usdm; do
+  (
+    root="$fixture/terminal-$market"; mkdir "$root"; setup_retention_fixture "$root" native "$market"
+    retention_fixture_job 901 "$(printf '%064d' 51)" v2
+    original_files >"$root/original.before"
+    retention_fixture_retain >"$root/failed.json"
+    original_files >"$root/original.after"
+    cmp "$root/original.before" "$root/original.after"
+    retention_fixture_job 902 "$(printf '%064d' 51)" v2 stale
+    original_files >"$root/stale.before"
+    retention_fixture_retain >"$root/stale.json"
+    original_files >"$root/stale.after"
+    cmp "$root/stale.before" "$root/stale.after"
+    jq -e '.queue_state=="stale" and .data_recovered==false and .delivery_verified==false' "$root/stale.json" >/dev/null
+    retention_fixture_retain >"$root/stale.repeat.json"
+    cmp "$root/stale.json" "$root/stale.repeat.json"
+    retention_fixture_check >"$root/check.json"
+    jq -e '.retained_failed_count==1 and .retained_stale_count==1 and .invalid_retention_count==0
+      and (.failed_job_ids|length)==1 and (.stale_job_ids|length)==1' "$root/check.json" >/dev/null
+    rejected retained-stale-resume resume_retained
+    mv "$RETENTION_FIXTURE_JOB_DIR" "${RETENTION_FIXTURE_JOB_DIR%.stale}.failed"
+    retention_fixture_check | jq -e '.retained_stale_count==0 and .invalid_retention_count==1' >/dev/null
+    retention_fixture_job 903 "$(printf '%064d' 51)" v2 stale
+    jq '.executing_deployment_source_revision="wrong-source"' "$RETENTION_FIXTURE_EVIDENCE/result.json" >"$root/wrong.json"
+    mv "$root/wrong.json" "$RETENTION_FIXTURE_EVIDENCE/result.json"
+    RETAIN_RESULT_SHA256=$(sha256sum "$RETENTION_FIXTURE_EVIDENCE/result.json" | awk '{print $1}')
+    rejected stale-executor-source-mismatch retention_fixture_retain
+    retention_fixture_job 904 "$(printf '%064d' 51)" v2 stale
+    jq '.step="drain"' "$RETENTION_FIXTURE_EVIDENCE/result.json" >"$root/wrong.json"
+    mv "$root/wrong.json" "$RETENTION_FIXTURE_EVIDENCE/result.json"
+    RETAIN_RESULT_SHA256=$(sha256sum "$RETENTION_FIXTURE_EVIDENCE/result.json" | awk '{print $1}')
+    rejected false-stale-reason retention_fixture_retain
+    retention_fixture_job 905 "$(printf '%064d' 51)" v2 stale
+    jq --arg controller "$(printf '%064d' 99)" '.executing_controller_sha256=$controller' \
+      "$RETENTION_FIXTURE_EVIDENCE/result.json" >"$root/wrong.json"
+    mv "$root/wrong.json" "$RETENTION_FIXTURE_EVIDENCE/result.json"
+    RETAIN_RESULT_SHA256=$(sha256sum "$RETENTION_FIXTURE_EVIDENCE/result.json" | awk '{print $1}')
+    rejected missing-immutable-stale-executor retention_fixture_retain
+  )
+done
+printf 'Spot/USD-M failed and authentic stale custody preserve originals; executor and state drift fail closed\n'
 (
   root="$fixture/pending-pointer-only"; mkdir "$root"; setup_retention_fixture "$root"
   retention_fixture_job 17
