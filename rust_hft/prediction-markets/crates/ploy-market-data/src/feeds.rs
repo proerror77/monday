@@ -1122,7 +1122,7 @@ pub fn spawn_polymarket_market_stream_until(
                         &tx,
                         &token_ids,
                         subscription_started_at,
-                        "canonical_subscribe",
+                        "websocket_subscribe",
                     ) {
                         return;
                     }
@@ -1171,7 +1171,7 @@ pub fn spawn_polymarket_market_stream_until(
                                             &tx,
                                             &token_ids,
                                             active_connection_started_at,
-                                            "canonical_book",
+                                            "websocket_payload",
                                             &mut failed_closed,
                                         ) {
                                             return;
@@ -1187,7 +1187,7 @@ pub fn spawn_polymarket_market_stream_until(
                                         &tx,
                                         &token_ids,
                                         active_connection_started_at,
-                                        "canonical_book",
+                                        "websocket_payload",
                                     ) {
                                         return;
                                     }
@@ -1198,7 +1198,7 @@ pub fn spawn_polymarket_market_stream_until(
                                         &tx,
                                         &token_ids,
                                         active_connection_started_at,
-                                        "canonical_disconnect",
+                                        "websocket_receive",
                                         &mut failed_closed,
                                     ) {
                                         return;
@@ -1218,7 +1218,7 @@ pub fn spawn_polymarket_market_stream_until(
                                 &tx,
                                 &token_ids,
                                 active_connection_started_at,
-                                "canonical_stream_error",
+                                "websocket_receive",
                                 &mut failed_closed,
                             ) {
                                 return;
@@ -1230,7 +1230,7 @@ pub fn spawn_polymarket_market_stream_until(
                                 &tx,
                                 &token_ids,
                                 active_connection_started_at,
-                                "canonical_stream_ended",
+                                "websocket_eof",
                                 &mut failed_closed,
                             ) {
                                 return;
@@ -1855,13 +1855,13 @@ mod tests {
             &tx,
             &["7".to_string()],
             Utc::now(),
-            "canonical_disconnect",
+            "websocket_receive",
         ));
 
         assert!(matches!(
             rx.try_recv().unwrap(),
             MarketUpdate::QuoteCollectionFailure { error_kind, .. }
-                if error_kind.as_ref() == "canonical_disconnect"
+                if error_kind.as_ref() == "websocket_receive"
         ));
         assert!(matches!(
             rx.try_recv().unwrap(),

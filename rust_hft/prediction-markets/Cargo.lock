@@ -6067,6 +6067,7 @@ dependencies = [
  "chrono",
  "duckdb",
  "hft-portfolio-core",
+ "libc",
  "ploy-feed-loaders",
  "ploy-market-contracts",
  "ploy-operator-contracts",
