@@ -23,94 +23,45 @@ verifier="$script_dir/verify-research-runner-binaries.sh"
 tmp_dir=$(mktemp -d)
 source_test_tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir" "$source_test_tmp_dir"' EXIT
-mode_restore_block=$(sed -n \
-  '/^      - name: Restore research runner binary modes$/,/^      - name: Verify research runner binary artifact$/p' \
-  "$workflow")
-source_command_block=$(sed -n \
-  '/^          \.github\/scripts\/select-acr-publish-source\.sh \\/,/^            --security-conclusion /p' \
-  "$workflow")
-acr_publish_block=$(sed -n \
-  '/^      - name: Build and push$/,/^      - name: Record immutable image$/p' \
-  "$workflow")
-ci_push_block=$(sed -n '/^  push:$/,/^  pull_request:$/p' "$ci_workflow")
-ploy_push_block=$(sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$ploy_workflow")
-
-grep -Fqx '            [{repository:"research-runner",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt",research_artifact:true},' "$workflow"
-grep -Fqx '             {repository:"campaign-cycle-controller",context:".",file:"deployment/aliyun/research/Dockerfile.campaign-cycle-controller",target:"prebuilt",research_artifact:true},' "$workflow"
-grep -Fqx '                or ($target == "research-runner" and .repository == "campaign-cycle-controller")' "$workflow"
-grep -Fqx '  workflow_run:' "$workflow"
-grep -Fqx '    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]' "$workflow"
-grep -Fqx '    branches: [main]' "$workflow"
-grep -Fqx '        description: Image target (research-runner also publishes its paired Campaign controller)' "$workflow"
-grep -Fqx '          - polymarket-raw-ops' "$workflow"
-grep -Fqx '          - research-source-test' "$workflow"
-grep -Fqx '  actions: read' "$workflow"
-grep -Fqx '  checks: read' "$workflow"
-grep -Fqx 'concurrency:' "$workflow"
-grep -Fqx '  group: acr-publish-${{ github.ref }}' "$workflow"
-grep -Fqx '  cancel-in-progress: false' "$workflow"
-# Native queue:max retains the pending current-source wakeup when a stale CI
-# completion, ignored CI event, or non-research manual request arrives later.
-ruby -ryaml - "$workflow" <<'RUBY'
-concurrency = YAML.safe_load(File.read(ARGV.fetch(0))).fetch('concurrency')
-abort 'ACR publishers must share their existing mutex' unless concurrency.fetch('group') == 'acr-publish-${{ github.ref }}'
-abort 'ACR wakeups require retained pending runs' unless concurrency.fetch('queue') == 'max'
-abort 'running publishers must survive new wakeups' unless concurrency.fetch('cancel-in-progress') == false
-pending = [:current_source_required_ci]
-pending << :stale_source_completion << :ignored_scheduled_ci << :manual_hft << :manual_source_test
-abort 'a later event replaced the current-source wakeup' unless pending.shift == :current_source_required_ci
-abort 'manual requests lost their shared ordering' unless pending == [:stale_source_completion, :ignored_scheduled_ci, :manual_hft, :manual_source_test]
-# GitHub's native bound is 100 pending runs, not an unbounded queue guarantee.
-abort 'test scenario exceeded the documented queue bound' unless pending.length < 100
+ruby -ryaml - "$workflow" "$ploy_workflow" "$ci_workflow" "$script_dir/../workflows/security-enabled.yml" <<'RUBY'
+acr, ploy, ci, security = ARGV.map { |path| YAML.safe_load(File.read(path)) }
+abort 'ACR queue changed' unless acr.fetch('concurrency') == {'group'=>'acr-publish-${{ github.ref }}','queue'=>'max','cancel-in-progress'=>false}
+[acr,ploy,ci,security].each do |doc|
+  doc.fetch('jobs').each do |id,job|
+    abort "public ACK runner exposure: #{id}" if job.fetch('runs-on','').to_s.match?(/self-hosted|monday-ack-research/)
+  end
+end
+[[ploy,%w[research-image-binaries research-image-smoke rust-format rust-research-heavy]], [acr,%w[research-runner-binaries publish-source-test]]].each do |doc,ids|
+  ids.each do |id|
+    steps=doc.fetch('jobs').fetch(id).fetch('steps')
+    abort "missing signed ACK relay: #{id}" unless steps.any? { |step| step.fetch('run','').include?('wait-ack-research-receipt.sh') }
+    steps.each do |step|
+      abort "hosted research execution: #{id}" if step.fetch('run','').match?(/\bcargo\s|\bdocker\s/) || step.fetch('uses','').match?(/docker\/|rust-toolchain|rust-cache|sccache/)
+    end
+  end
+end
+[[ci,'rust'],[ci,'rust_fast_gates'],[security,'clippy-strict']].each do |doc,id|
+  doc.fetch('jobs').fetch(id).fetch('steps').each do |step|
+    next if step.fetch('uses','').include?('actions/checkout@') || step.fetch('run','').include?('wait-ack-research-receipt.sh')
+    abort "unguarded mixed research job #{id}" unless step.fetch('if','').include?("outputs.ack_research != 'true'")
+  end
+end
+acr.fetch('jobs').fetch('publish').fetch('steps').each do |step|
+  next unless step.fetch('run','').match?(/\bdocker\s/) || step.fetch('uses','').match?(/docker\//)
+  abort 'public research image build, smoke or publication' unless step.fetch('if','').include?('!matrix.research_artifact')
+end
+abort 'release relationship changed' unless acr.fetch('jobs').fetch('research-release-complete').fetch('needs') == ['selector','publish']
 RUBY
-if grep -Eq '^    paths(-ignore)?:' <<<"$ci_push_block$ploy_push_block"; then
-  printf 'required CI workflow can skip a main SHA by path\n' >&2
-  exit 1
-fi
-grep -Fqx '      rebuild_research_runner:' "$workflow"
-grep -Fqx '      source_test_source_sha:' "$workflow"
-grep -Fqx '          BINARIES_CONCLUSION: ${{ steps.source-jobs.outputs.binaries_conclusion }}' "$workflow"
-grep -Fqx '          SMOKE_CONCLUSION: ${{ steps.source-jobs.outputs.smoke_conclusion }}' "$workflow"
-grep -Fqx '      - name: Read authenticated release admission' "$workflow"
-grep -Fqx '          .github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID"' "$workflow"
-grep -Fqx '          SOURCE_RUN_ID: ${{ steps.source-jobs.outputs.artifact_run_id }}' "$workflow"
-grep -Fqx '            --automation-state "$AUTOMATION_STATE" \' "$workflow"
-grep -Fqx '    name: Research release complete (${{ needs.selector.outputs.source_sha }})' "$workflow"
-grep -Fqx '    needs: [selector, publish]' "$workflow"
-grep -Fqx "    if: always() && needs.selector.result == 'success' && needs.publish.result == 'success' && (needs.selector.outputs.publish_target == 'research-runner' || needs.selector.outputs.publish_target == 'all')" "$workflow"
-grep -Fqx '          test "$SOURCE_SHA" = "$GITHUB_SHA"' "$workflow"
-if grep -Fq 'SECONDS + 900' "$workflow"; then
-  echo 'automatic ACR admission still waits instead of deferring' >&2
-  exit 1
-fi
-grep -Fqx '            gh api --paginate --slurp \' "$workflow"
-grep -Fqx '          .github/scripts/select-acr-publish-source.sh \' "$workflow"
-grep -Fqx '          CURRENT_REF: ${{ github.ref }}' "$workflow"
-grep -Fqx '          MAIN_SHA: ${{ steps.source-jobs.outputs.main_sha || steps.admission.outputs.main_sha }}' "$workflow"
-grep -Fqx '          MONOREPO_CONCLUSION: ${{ steps.source-jobs.outputs.monorepo_conclusion || steps.admission.outputs.monorepo_conclusion }}' "$workflow"
-grep -Fqx '          PREDICTION_CONCLUSION: ${{ steps.source-jobs.outputs.prediction_conclusion || steps.admission.outputs.prediction_conclusion }}' "$workflow"
-grep -Fqx '          SECURITY_CONCLUSION: ${{ steps.source-jobs.outputs.security_conclusion || steps.admission.outputs.security_conclusion }}' "$workflow"
-grep -Fqx '            --current-ref "$CURRENT_REF" \' "$workflow"
-grep -Fqx '            --main-sha "$MAIN_SHA" \' "$workflow"
-grep -Fqx '            --monorepo-conclusion "$MONOREPO_CONCLUSION" \' "$workflow"
-grep -Fqx '            --prediction-conclusion "$PREDICTION_CONCLUSION" \' "$workflow"
-grep -Fqx '            --security-conclusion "$SECURITY_CONCLUSION"' "$workflow"
-grep -Fqx '      - name: Revalidate current main before publication' "$workflow"
-grep -Fqx '          current_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '\''.object.sha'\'')' "$workflow"
-grep -Fqx '          test "$SOURCE_REVISION" = "$current_main"' "$workflow"
-grep -Fqx '          .github/scripts/wait-release-required-checks.sh "$SOURCE_REVISION" current-main' "$workflow"
-grep -Fqx '          RELEASE_CHECK_TIMEOUT_SECONDS: "0"' "$workflow"
-test "$(grep -n '^      - name: Revalidate current main before publication$' "$workflow" | cut -d: -f1)" \
-  -lt "$(grep -n '^      - name: Build and push$' "$workflow" | cut -d: -f1)"
-if grep -Fq '${{' <<<"$source_command_block"; then
-  printf 'source selector interpolates workflow context directly into shell\n' >&2
-  exit 1
-fi
-grep -Fqx '  research-runner-binaries:' "$workflow"
-grep -Fqx "    if: needs.selector.outputs.research_mode == 'rebuild'" "$workflow"
-grep -Fqx "    if: always() && needs.selector.result == 'success' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'" "$workflow"
-grep -Fqx '    container: rust:1.98.1-bookworm' "$workflow"
-grep -Fqx 'channel = "1.98.1"' "$root_toolchain"
+# Preserve authenticated exact-source native three-workflow admission.
+grep -Fq 'Read authenticated release admission' "$workflow"
+grep -Fq '.github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID"' "$workflow"
+grep -Fq -- '--monorepo-conclusion "$MONOREPO_CONCLUSION"' "$workflow"
+grep -Fq -- '--prediction-conclusion "$PREDICTION_CONCLUSION"' "$workflow"
+grep -Fq -- '--security-conclusion "$SECURITY_CONCLUSION"' "$workflow"
+grep -Fq 'Revalidate current main before publication' "$workflow"
+grep -Fq '.github/scripts/wait-release-required-checks.sh "$SOURCE_REVISION" current-main' "$workflow"
+grep -Fq 'research-data-service' "$workflow"
+grep -Fq 'verify-metadata' "$ploy_workflow"
 grep -Fqx 'FROM rust:1.98.1-bookworm AS builder' "$market_data_dockerfile"
 grep -Fqx 'FROM rust:1.98.1-bookworm AS builder' "$sentinel_dockerfile"
 grep -Fqx 'FROM rust:1.98.1-slim-bookworm AS builder' "$hft_live_dockerfile"
@@ -138,77 +89,67 @@ if grep -Eq '^[[:space:]]+command:' <<<"$controller_container_block"; then
   printf 'ACK controller Job bypasses the image entrypoint\n' >&2
   exit 1
 fi
-grep -Fqx '      - name: Build the Campaign cycle controller image' "$ploy_workflow"
-grep -Fqx '          file: deployment/aliyun/research/Dockerfile.campaign-cycle-controller' "$ploy_workflow"
-grep -Fqx '          tags: monday-campaign-cycle-controller-smoke:local' "$ploy_workflow"
-grep -Fqx '    needs: [selector, research-runner-binaries]' "$workflow"
-grep -Fqx '      - name: Download research runner binaries' "$workflow"
-test "$(grep -Fxc '        if: matrix.research_artifact' "$workflow")" -eq 4
-grep -Fqx '          name: research-image-release-${{ needs.selector.outputs.source_sha }}' "$workflow"
-grep -Fqx '          run-id: ${{ needs.selector.outputs.artifact_run_id }}' "$workflow"
-grep -Fqx '          github-token: ${{ github.token }}' "$workflow"
-grep -Fqx '      - name: Restore research runner binary modes' "$workflow"
-grep -Fqx '          target: ${{ matrix.target }}' "$workflow"
-grep -Fqx '          context: ${{ matrix.context }}' "$workflow"
-grep -Fqx '          ../.github/scripts/research-image-release-artifact.sh create research-release \' "$workflow"
-grep -Fqx '          .github/scripts/research-image-release-artifact.sh verify research-release \' "$workflow"
-grep -Fqx '            "${{ needs.selector.outputs.source_sha }}" \' "$workflow"
-grep -Fqx '            "${{ needs.selector.outputs.artifact_run_id }}" rust_hft' "$workflow"
-grep -Fqx '            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}' "$workflow"
-grep -Fqx '            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}' "$workflow"
-grep -Fqx '      - name: Verify Campaign cycle controller image' "$workflow"
-grep -Fq '          provenance: false' <<<"$acr_publish_block"
-grep -Fq '          sbom: false' <<<"$acr_publish_block"
-grep -Fqx '  publish-source-test:' "$workflow"
-grep -Fqx "    if: needs.selector.outputs.publish_target == 'research-source-test'" "$workflow"
+# Research build/smoke/publication commands belong to fixed private profiles.
+# Public checks bind each terminal receipt to the actual checkout; binary
+# software metadata stays bound to the public producer run before upload.
+ruby -ryaml - "$workflow" "$ploy_workflow" <<'RUBY'
+acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
+profiles={
+  'research-image-binaries'=>'research-image-binaries',
+  'research-image-smoke'=>'research-image-smoke',
+  'rust-format'=>'prediction-research-format',
+  'rust-research-heavy'=>'prediction-research-heavy'
+}
+[[ploy,profiles],[acr,{'research-runner-binaries'=>'research-release-binaries','publish-source-test'=>'research-source-test','publish'=>'research-release-publish'}]].each do |doc,mapping|
+  mapping.each do |id,profile|
+    job=doc.fetch('jobs').fetch(id)
+    relay=job.fetch('steps').select { |s| s.fetch('run','').include?('wait-ack-research-receipt.sh') }
+    abort "ambiguous relay #{id}" unless relay.length==1
+    command=relay.first.fetch('run')
+    abort "wrong private profile or source #{id}" unless command.include?("wait-ack-research-receipt.sh #{profile} \"$(git rev-parse HEAD)\"")
+    if doc.equal?(acr)
+      checkout=job.fetch('steps').find { |s| s.fetch('uses','').include?('actions/checkout@') }
+      abort "unbound publication source #{id}" unless checkout.fetch('with').fetch('ref')=='${{ needs.selector.outputs.source_sha }}'
+    end
+  end
+end
+[[ploy,'research-image-binaries','github.sha'],[acr,'research-runner-binaries','needs.selector.outputs.source_sha']].each do |doc,id,sha|
+  steps=doc.fetch('jobs').fetch(id).fetch('steps')
+  verify=steps.find { |s| s.fetch('run','').include?('verify-metadata') }
+  abort "unbound software producer #{id}" unless verify && verify.fetch('run').include?('"$(git rev-parse HEAD)" "$GITHUB_RUN_ID" rust_hft')
+  upload=steps.find { |s| s.fetch('uses','').include?('actions/upload-artifact@') }
+  abort "missing public release upload #{id}" unless upload
+  with=upload.fetch('with')
+  abort "wrong release artifact identity #{id}" unless with.fetch('name')=="research-image-release-${{ #{sha} }}"
+  abort "software boundary changed #{id}" unless with.fetch('path')=='${{ runner.temp }}/ack-receipt/software/' && with.fetch('if-no-files-found')=='error'
+end
+publication=acr.fetch('jobs').fetch('publish')
+abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']
+readback=publication.fetch('steps').find { |s| s.fetch('name','')=='Read back signed research image identity' }
+abort 'research publication readback absent' unless readback && readback.fetch('if')=='matrix.research_artifact'
+%w[.repository .source_sha .smoke_result .digest .image_ref].each do |field|
+  abort "publication proof omits #{field}" unless readback.fetch('run').include?(field)
+end
+abort 'publication proof allows ambiguous images' unless readback.fetch('run').include?('length == 1')
+RUBY
+# Selector still owns approved source-test SHA/profile/tag; no public job may
+# accept a free-form compiler command or recreate a hosted source-test build.
 grep -Fqx '      source_test_profile: ${{ steps.source.outputs.source_test_profile }}' "$workflow"
 grep -Fqx '      source_test_tag: ${{ steps.source.outputs.source_test_tag }}' "$workflow"
 grep -Fqx '          SOURCE_TEST_SOURCE_SHA: ${{ inputs.source_test_source_sha }}' "$workflow"
 grep -Fqx '          SOURCE_TEST_PROFILE: ${{ inputs.source_test_profile }}' "$workflow"
 grep -Fqx '            --source-test-sha "$SOURCE_TEST_SOURCE_SHA" \' "$workflow"
 grep -Fqx '            --source-test-profile "$SOURCE_TEST_PROFILE" \' "$workflow"
-
-source_test_block=$(sed -n '/^  publish-source-test:$/,$p' "$workflow")
-grep -Fq 'ref: ${{ github.sha }}' <<<"$source_test_block"
-grep -Fq 'ref: ${{ needs.selector.outputs.source_sha }}' <<<"$source_test_block"
-grep -Fq 'path: source' <<<"$source_test_block"
-grep -Fq 'sparse-checkout: rust_hft' <<<"$source_test_block"
-test "$(grep -Fc 'persist-credentials: false' <<<"$source_test_block")" -eq 2
-grep -Fq 'rm -rf -- source/.git' <<<"$source_test_block"
-grep -Fq 'context: .' <<<"$source_test_block"
-grep -Fq 'file: rust_hft/deployment/docker/Dockerfile.source-test' <<<"$source_test_block"
-grep -Fq 'load: true' <<<"$source_test_block"
-grep -Fq 'push: false' <<<"$source_test_block"
-grep -Fq 'provenance: false' <<<"$source_test_block"
-grep -Fq 'research-source-test@${{ steps.push.outputs.digest }}' <<<"$source_test_block"
-grep -Fq 'IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}' <<<"$source_test_block"
-grep -Fq '${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}' <<<"$source_test_block"
-grep -Fq 'com.monday.image.source-test-profile=${{ needs.selector.outputs.source_test_profile }}' <<<"$source_test_block"
-grep -Fq 'com.monday.image.source-test-identity=${{ needs.selector.outputs.source_test_tag }}' <<<"$source_test_block"
-grep -Fq 'SOURCE_TEST_TAG: ${{ needs.selector.outputs.source_test_tag }}' <<<"$source_test_block"
-grep -Fq 'docker run --rm --network none --read-only' <<<"$source_test_block"
-grep -Fq -- '--tmpfs /tmp:rw,nosuid,nodev,size=16g' <<<"$source_test_block"
-grep -Fq -- '--tmpfs /tmp/monday-source-test-target:rw,exec,nosuid,nodev,mode=0700,uid=1000,gid=1000,size=16g' <<<"$source_test_block"
-grep -Fq 'com.monday.image.retention=single-ack-test' <<<"$source_test_block"
-grep -Fq 'Refuse source-test tag overwrite' <<<"$source_test_block"
-grep -Fq 'if probe_output=$(docker manifest inspect "$IMAGE_TAG" 2>&1); then' <<<"$source_test_block"
-grep -Fq '*"manifest unknown"*|*"no such manifest"*) ;;' <<<"$source_test_block"
-grep -Fq 'docker buildx imagetools inspect "$IMAGE_TAG" --format' <<<"$source_test_block"
-grep -Fq 'test "$actual_source_test_profile" = "$TEST_PROFILE"' <<<"$source_test_block"
-grep -Fq 'test "$actual_source_test_identity" = "$SOURCE_TEST_TAG"' <<<"$source_test_block"
-grep -Fq 'echo "publication_identity=$SOURCE_REVISION/$TEST_PROFILE"' <<<"$source_test_block"
-grep -Fq 'echo "publication_tag=$IMAGE_TAG"' <<<"$source_test_block"
-test "$(grep -n '^      - name: Verify source-test image before publication$' "$workflow" | cut -d: -f1)" \
-  -lt "$(grep -n '^      - name: Push verified source-test image$' "$workflow" | cut -d: -f1)"
-if grep -Fq 'research-source-test:run-' <<<"$source_test_block" || grep -Fq 'cache-to: type=gha,mode=max,scope=acr-research-source-test' <<<"$source_test_block"; then
-  printf 'source-test image contract retains a mutable tag or persistent build cache\n' >&2
-  exit 1
-fi
-if grep -Fq 'research-source-test:${{ needs.selector.outputs.source_sha }}' <<<"$source_test_block" || \
-  grep -Fq '${{ inputs.source_test_profile }}' <<<"$source_test_block"; then
-  printf 'source-test image contract bypasses its selected SHA/profile identity\n' >&2
-  exit 1
-fi
+# Signed bridge refuses forks, unapproved profiles and unverifiable receipts;
+# source identity includes run/job/profile, not just a success status string.
+relay_script="$script_dir/wait-ack-research-receipt.sh"
+grep -Fq 'openssl pkeyutl -verify -pubin' "$relay_script"
+grep -Fq '.public_run_id == $run and .public_job == $job' "$relay_script"
+grep -Fq '.checkout_sha == $source and .profile == $profile and .execution_host == "ack"' "$relay_script"
+grep -Fq 'Unknown private ACK execution profile' "$relay_script"
+grep -Fq 'Fork research jobs require independent source admission' "$relay_script"
+grep -Fq 'sha256sum -c -' "$relay_script"
+grep -Fq 'Selected' "$script_dir/classify-ack-research-job.sh"
 
 grep -Fqx 'FROM rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS source-test' "$source_test_dockerfile"
 grep -Fq 'groupadd --gid 1000 research' "$source_test_dockerfile"
@@ -291,70 +232,8 @@ if grep -Eq 'command:|nodeName:|tolerations:|secretKeyRef:|env:|envFrom:|persist
   exit 1
 fi
 
-# research-runner-binaries compiles on the runner and uses per-job local
-# sccache; the publish matrix compiles inside docker, where a host-side wrapper
-# does not apply. Neither path may write the shared GHA object cache.
-grep -Fqx '      RUSTC_WRAPPER: sccache' "$workflow"
-grep -Fqx '      SCCACHE_GHA_ENABLED: "false"' "$workflow"
-grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' "$workflow"
-grep -Fqx '        continue-on-error: true' "$workflow"
-if grep -Fq 'sccache --zero-stats' "$workflow" || \
-  grep -Fq 'path: ~/.cache/sccache' "$workflow" || \
-  grep -Fq -- '}}-${{ github.sha }}' "$workflow"; then
-  exit 1
-fi
-
-grep -Fqx '          key: research-image-bookworm-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}' "$workflow"
-grep -Fqx '          key: research-image-bookworm-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}' "$ploy_workflow"
-grep -Fqx '          key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}' "$ci_workflow"
-# rust-cache@v2 hashes the Rust environment and lockfiles by default. Keep the
-# user prefix stable so that its restore key survives Cargo.lock changes.
-if grep -Eq "key: (research-image-bookworm|rust_hft-ci-rust)-.*hashFiles\\(.*Cargo[.]lock" "$workflow" "$ploy_workflow" "$ci_workflow"; then
-  printf 'Rust cache user key duplicates the action Cargo.lock environment hash\n' >&2
-  exit 1
-fi
-
-grep -Fqx '          name: research-image-release-${{ github.sha }}' "$ploy_workflow"
-grep -Fqx '          retention-days: 1' "$ploy_workflow"
-test "$(grep -Fxc '            jq \' "$workflow")" -eq 1
-test "$(grep -Fxc '            jq \' "$ploy_workflow")" -eq 1
-grep -Fqx '          ../.github/scripts/research-image-release-artifact.sh create \' "$ploy_workflow"
-grep -Fqx '          .github/scripts/research-image-release-artifact.sh verify research-release \' "$ploy_workflow"
-
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
-  grep -Fq "research-release/research-bin/$binary" <<<"$mode_restore_block"
-done
-
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
-  touch "$tmp_dir/$binary"
-  chmod 0644 "$tmp_dir/$binary"
-done
-if "$verifier" "$tmp_dir"; then
-  exit 1
-fi
-chmod 0755 \
-  "$tmp_dir/hft-backtest" \
-  "$tmp_dir/alpha-harness" \
-  "$tmp_dir/lob-pit-materializer" \
-  "$tmp_dir/binance-market-tape-slicer" \
-  "$tmp_dir/binance-replay-parquet-materializer" \
-  "$tmp_dir/monday-prediction-research" \
-  "$tmp_dir/monday-prediction-evaluator" \
-  "$tmp_dir/monday-prediction-snapshot"
-"$verifier" "$tmp_dir"
-rm "$tmp_dir/hft-backtest"
-if "$verifier" "$tmp_dir"; then
-  exit 1
-fi
-touch "$tmp_dir/hft-backtest"
-chmod +x "$tmp_dir/hft-backtest"
-touch "$tmp_dir/unexpected"
-chmod +x "$tmp_dir/unexpected"
-if "$verifier" "$tmp_dir"; then
-  exit 1
-fi
 
 "$script_dir/test-research-image-release-artifact.sh"
 "$script_dir/test-acr-publish-source-readback.sh"
-
-printf 'ACR research-runner prebuilt contract tests passed\n'
+"$script_dir/test-classify-ack-research-job.sh"
+printf 'ACR ACK execution and release metadata contracts passed\n'
