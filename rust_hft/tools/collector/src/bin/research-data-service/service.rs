@@ -968,6 +968,28 @@ impl ClickHouse {
         }
         Ok(())
     }
+    async fn insert_binary(&self, table: &str, columns: &str, bytes: Vec<u8>) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            bail!("binary insert batch exceeds byte budget");
+        }
+        let response = self
+            .query(
+                &format!(
+                    "INSERT INTO {}.{table} ({columns}) FORMAT RowBinary",
+                    self.database
+                ),
+                &[],
+                bytes,
+            )
+            .await?;
+        if response.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            bail!("ClickHouse insert returned an error payload after success headers");
+        }
+        Ok(())
+    }
     async fn feature_page(
         &self,
         identity: &str,
@@ -1034,26 +1056,62 @@ fn target_bytes(row: &MarketTargetFrameV1) -> Vec<u8> {
     bytes
 }
 
-#[derive(Serialize)]
-struct FeatureInsert<'a> {
-    dataset_identity: &'a str,
-    row_identity: String,
-    series_id: u64,
-    observed_at_ms: i64,
-    feature_max_available_at_ms: i64,
-    channels: &'a [f32],
-    materialization_version: u64,
+// Version 2 supersedes partial decimal JSON inserts without changing dataset identity.
+const NUMERIC_ROW_VERSION: u64 = 2;
+const FEATURE_INSERT_COLUMNS: &str = "dataset_identity,row_identity,series_id,observed_at_ms,feature_max_available_at_ms,channels,materialization_version";
+const TARGET_INSERT_COLUMNS: &str = "dataset_identity,row_identity,series_id,observed_at_ms,available_at_ms,simple_return,spread_bps,materialization_version";
+
+fn write_varint(bytes: &mut Vec<u8>, mut value: usize) {
+    while value >= 128 {
+        bytes.push((value as u8 & 127) | 128);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
 }
-#[derive(Serialize)]
-struct TargetInsert<'a> {
-    dataset_identity: &'a str,
-    row_identity: String,
-    series_id: u64,
-    observed_at_ms: i64,
-    available_at_ms: i64,
-    simple_return: f32,
-    spread_bps: f64,
-    materialization_version: u64,
+fn write_string(bytes: &mut Vec<u8>, value: &str) {
+    write_varint(bytes, value.len());
+    bytes.extend_from_slice(value.as_bytes());
+}
+fn encode_feature_inserts(identity: &str, rows: &[MarketFeatureFrameV1]) -> Result<Vec<u8>> {
+    if rows.len() > PAGE_ROWS || !valid_sha256(identity) {
+        bail!("invalid feature insert identity or row budget");
+    }
+    let mut bytes = Vec::new();
+    for row in rows {
+        if row.channels.is_empty() || row.channels.len() > 64 {
+            bail!("invalid feature insert channel budget");
+        }
+        write_string(&mut bytes, identity);
+        write_string(&mut bytes, &bytes_digest(&feature_bytes(row)));
+        bytes.extend(row.series_id.to_le_bytes());
+        bytes.extend(row.observed_at_ms.to_le_bytes());
+        bytes.extend(row.feature_max_available_at_ms.to_le_bytes());
+        write_varint(&mut bytes, row.channels.len());
+        for value in &row.channels {
+            bytes.extend(value.to_bits().to_le_bytes());
+        }
+        bytes.extend(NUMERIC_ROW_VERSION.to_le_bytes());
+    }
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        bail!("feature insert exceeds byte budget");
+    }
+    Ok(bytes)
+}
+fn encode_target_inserts(identity: &str, rows: &[MarketTargetFrameV1]) -> Result<Vec<u8>> {
+    if rows.len() > PAGE_ROWS || !valid_sha256(identity) {
+        bail!("invalid target insert identity or row budget");
+    }
+    let mut bytes = Vec::new();
+    for row in rows {
+        write_string(&mut bytes, identity);
+        write_string(&mut bytes, &bytes_digest(&target_bytes(row)));
+        bytes.extend_from_slice(&target_bytes(row));
+        bytes.extend(NUMERIC_ROW_VERSION.to_le_bytes());
+    }
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        bail!("target insert exceeds byte budget");
+    }
+    Ok(bytes)
 }
 
 async fn ingest(
@@ -1243,40 +1301,28 @@ async fn insert_features(
     identity: &str,
     rows: &[MarketFeatureFrameV1],
 ) -> Result<()> {
-    let insert: Vec<_> = rows
-        .iter()
-        .map(|r| FeatureInsert {
-            dataset_identity: identity,
-            row_identity: bytes_digest(&feature_bytes(r)),
-            series_id: r.series_id,
-            observed_at_ms: r.observed_at_ms,
-            feature_max_available_at_ms: r.feature_max_available_at_ms,
-            channels: &r.channels,
-            materialization_version: 1,
-        })
-        .collect();
-    client.insert("cex_market_feature_frames", &insert).await
+    client
+        .insert_binary(
+            "cex_market_feature_frames",
+            FEATURE_INSERT_COLUMNS,
+            encode_feature_inserts(identity, rows)?,
+        )
+        .await
 }
 async fn insert_targets(
     client: &ClickHouse,
     identity: &str,
     rows: &[MarketTargetFrameV1],
 ) -> Result<()> {
-    let insert: Vec<_> = rows
-        .iter()
-        .map(|r| TargetInsert {
-            dataset_identity: identity,
-            row_identity: bytes_digest(&target_bytes(r)),
-            series_id: r.series_id,
-            observed_at_ms: r.observed_at_ms,
-            available_at_ms: r.available_at_ms,
-            simple_return: r.simple_return,
-            spread_bps: r.spread_bps,
-            materialization_version: 1,
-        })
-        .collect();
-    client.insert("cex_market_target_frames", &insert).await
+    client
+        .insert_binary(
+            "cex_market_target_frames",
+            TARGET_INSERT_COLUMNS,
+            encode_target_inserts(identity, rows)?,
+        )
+        .await
 }
+
 async fn ingest_targets(
     client: &ClickHouse,
     root: &Path,
@@ -2539,6 +2585,70 @@ fn decode_targets(bytes: &[u8]) -> Result<Vec<MarketTargetFrameV1>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_service_rowbinary_insert_protocol_preserves_numeric_bits_and_repair_version() {
+        fn string(reader: &mut Binary<'_>) -> String {
+            let len = reader.varint().unwrap();
+            let start = reader.offset;
+            reader.offset += len;
+            std::str::from_utf8(&reader.bytes[start..reader.offset])
+                .unwrap()
+                .to_owned()
+        }
+        let identity = "a".repeat(64);
+        let feature = MarketFeatureFrameV1 {
+            series_id: u64::MAX - 17,
+            observed_at_ms: 123_000,
+            feature_max_available_at_ms: 122_000,
+            channels: vec![-0.0, f32::from_bits(0x3f800000), f32::from_bits(0x3f800001)],
+        };
+        let payload = encode_feature_inserts(&identity, std::slice::from_ref(&feature)).unwrap();
+        let mut reader = Binary {
+            bytes: &payload,
+            offset: 0,
+        };
+        assert_eq!(string(&mut reader), identity);
+        assert_eq!(string(&mut reader), bytes_digest(&feature_bytes(&feature)));
+        assert_eq!(reader.u64().unwrap(), feature.series_id);
+        assert_eq!(reader.i64().unwrap(), feature.observed_at_ms);
+        assert_eq!(reader.i64().unwrap(), feature.feature_max_available_at_ms);
+        assert_eq!(reader.varint().unwrap(), feature.channels.len());
+        for value in &feature.channels {
+            assert_eq!(u32::from_le_bytes(reader.take().unwrap()), value.to_bits());
+        }
+        assert_eq!(reader.u64().unwrap(), 2);
+        assert_eq!(reader.offset, payload.len());
+        let target = MarketTargetFrameV1 {
+            series_id: feature.series_id,
+            observed_at_ms: feature.observed_at_ms,
+            available_at_ms: 153_000,
+            simple_return: -0.0,
+            spread_bps: f64::from_bits(0x3ff0000000000001),
+        };
+        let payload = encode_target_inserts(&identity, std::slice::from_ref(&target)).unwrap();
+        let mut reader = Binary {
+            bytes: &payload,
+            offset: 0,
+        };
+        assert_eq!(string(&mut reader), identity);
+        assert_eq!(string(&mut reader), bytes_digest(&target_bytes(&target)));
+        assert_eq!(reader.u64().unwrap(), target.series_id);
+        assert_eq!(reader.i64().unwrap(), target.observed_at_ms);
+        assert_eq!(reader.i64().unwrap(), target.available_at_ms);
+        assert_eq!(
+            u32::from_le_bytes(reader.take().unwrap()),
+            target.simple_return.to_bits()
+        );
+        assert_eq!(reader.u64().unwrap(), target.spread_bps.to_bits());
+        assert_eq!(reader.u64().unwrap(), 2);
+        assert_eq!(reader.offset, payload.len());
+        let mut encoded = Vec::new();
+        write_string(&mut encoded, &"x".repeat(128));
+        assert_eq!(&encoded[..2], &[0x80, 0x01]);
+        assert!(encode_feature_inserts(&identity, &vec![feature; PAGE_ROWS + 1]).is_err());
+        assert!(encode_target_inserts("invalid", &[target]).is_err());
+    }
 
     #[tokio::test]
     async fn data_service_clickhouse_posts_bind_empty_and_nonempty_body_lengths() {
