@@ -204,6 +204,9 @@ jobs:
           .github/scripts/test-ci-monitor-scope.sh
           .github/scripts/test-agent-validation-gates.sh
           .github/scripts/test-classify-ack-research-job.sh
+          bash .github/scripts/test-ack-preflight-relay.sh
+          bash .github/scripts/test-preflight-workflow-gate.sh
+          .github/scripts/test-research-image-release-artifact.sh
 
   rust_shell_scripts:
     name: Rust shell scripts

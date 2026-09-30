@@ -167,6 +167,11 @@ ack_metadata_paths=(
   .github/scripts/test-classify-ack-research-job.sh
   .github/scripts/wait-ack-research-receipt.sh
   .github/ack-ci/receipt-public-key.pub
+  .github/ack-ci/PREFLIGHT.md
+  .github/scripts/verify-ack-preflight.sh
+  .github/scripts/test-ack-preflight-relay.sh
+  .github/scripts/test-preflight-workflow-gate.sh
+  .github/workflows/ack-flow-contracts.yml
 )
 release_metadata_paths=(
   .github/workflows/acr-publish.yml
@@ -198,12 +203,29 @@ for kind in ack release; do
       # no unrelated root research/runtime Clippy profile may be selected.
       if [[ $event == push && $kind == release ]]; then
         assert_security_jobs "$scoped" 'security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/cargo-machete,security/container-scan,security/secret-detection'
+      elif [[ $path == *.md ]]; then
+        assert_security_jobs "$scoped" 'security/secret-detection'
       else
         assert_security_jobs "$scoped" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
       fi
     done
   done
 done
+# The complete initial PR 1266 file set exercises interaction between ACK,
+# release policy and workflow metadata. Each leaf's cheap scope must compose.
+ack_flow_pr=$(run_case ack-flow-pr-1266 pull_request ack-flow-pr-1266.txt)
+assert_jobs "$ack_flow_pr" 'ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
+assert_security_jobs "$ack_flow_pr" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_owning_packages "$ack_flow_pr" ''
+for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff; do
+  assert_flag "$ack_flow_pr" "$flag" false
+done
+# A real collector edit alongside all 19 metadata paths still uses Cargo impact.
+cat "$fixtures/ack-flow-pr-1266.txt" "$fixtures/collector.txt" >"$tmp_dir/ack-flow-pr-with-collector.txt"
+ack_flow_mixed=$(run_case ack-flow-pr-with-collector pull_request ack-flow-pr-with-collector.txt)
+assert_jobs "$ack_flow_mixed" 'ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
+for flag in loop collector control toolchain; do assert_flag "$ack_flow_mixed" "$flag" true; done
+
 printf '%s\n' deployment/aliyun/research/Dockerfile.research-data >"$tmp_dir/research-data-dockerfile.txt"
 for event in pull_request push; do
   image_scope=$(run_case research-data-dockerfile "$event" research-data-dockerfile.txt)

@@ -318,7 +318,10 @@ for path in "${paths[@]}"; do
       continue
       ;;
     .github/scripts/classify-ack-research-job.sh|.github/scripts/test-classify-ack-research-job.sh|\
-    .github/scripts/wait-ack-research-receipt.sh|.github/ack-ci/receipt-public-key.pub)
+    .github/scripts/wait-ack-research-receipt.sh|.github/scripts/verify-ack-preflight.sh|\
+    .github/scripts/test-ack-preflight-relay.sh|.github/scripts/test-preflight-workflow-gate.sh|\
+    .github/ack-ci/receipt-public-key.pub|.github/ack-ci/PREFLIGHT.md|\
+    .github/workflows/ack-flow-contracts.yml)
       # Public ACK routing/signature checks are control metadata. They have no
       # Cargo dependency impact; unknown future helpers retain the broad fallback.
       select_job ci/ci-contracts
