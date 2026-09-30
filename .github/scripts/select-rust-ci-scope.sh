@@ -242,7 +242,14 @@ for path in "${paths[@]}"; do
       ;;
     .github/workflows/acr-publish.yml|.github/scripts/test-acr-publish-workflow.sh|\
     .github/scripts/read-release-required-checks.sh|.github/scripts/wait-release-required-checks.sh|\
-    .github/scripts/test-research-image-release-artifact.sh)
+    .github/scripts/research-image-release-artifact.sh|.github/scripts/test-research-image-release-artifact.sh|\
+    .github/scripts/verify-research-runner-binaries.sh|\
+    .github/scripts/read-acr-publish-source.sh|.github/scripts/select-acr-publish-source.sh|\
+    .github/scripts/test-acr-publish-source-readback.sh)
+      # Release identity/metadata policy is exercised by the workflow contract
+      # lane. Preserve main publication coverage without expanding a PR into
+      # unrelated Rust venues or prediction research feature suites.
+      select_job ci/ci-contracts
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       select_job ploy/workflow-lint
       research_image_relevant=true
@@ -252,7 +259,8 @@ for path in "${paths[@]}"; do
       select_research_image_jobs
       continue
       ;;
-    deployment/aliyun/research/Dockerfile.campaign-cycle-controller)
+    deployment/aliyun/research/Dockerfile.campaign-cycle-controller|\
+    deployment/aliyun/research/Dockerfile.research-data)
       select_research_image_jobs
       continue
       ;;
@@ -307,6 +315,15 @@ for path in "${paths[@]}"; do
       select_all
       select_all_rust_ci_jobs
       select_all_ploy_jobs
+      continue
+      ;;
+    .github/scripts/classify-ack-research-job.sh|.github/scripts/test-classify-ack-research-job.sh|\
+    .github/scripts/wait-ack-research-receipt.sh|.github/ack-ci/receipt-public-key.pub)
+      # Public ACK routing/signature checks are control metadata. They have no
+      # Cargo dependency impact; unknown future helpers retain the broad fallback.
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
     .github/workflows/ci.yml|.github/workflows/ploy-ci.yml|.github/workflows/security-enabled.yml|\
