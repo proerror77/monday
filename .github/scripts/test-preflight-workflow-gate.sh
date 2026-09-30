@@ -3,6 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 ruby -ryaml -e '
   jobs = YAML.load_file(".github/workflows/ci.yml")["jobs"]
+  abort "mutable producer checkout" unless jobs.fetch("research_preflight").fetch("steps").first.fetch("uses") == "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
   abort "producer self dependency" unless jobs.fetch("research_preflight").fetch("needs") == "scope"
   abort "missing Rust edge" unless jobs.fetch("rust").fetch("needs").include?("research_preflight")
   abort "missing aggregate edge" unless jobs.fetch("ci-gate").fetch("needs").include?("research_preflight")
