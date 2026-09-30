@@ -15,6 +15,8 @@ binaries=(
   lob-pit-materializer
   binance-market-tape-slicer
   binance-replay-parquet-materializer
+  research-data-service
+  clickhouse-analytics-materializer
   monday-prediction-research
   monday-prediction-evaluator
   monday-prediction-snapshot
@@ -50,9 +52,11 @@ case "$mode" in
           "prediction-markets/Cargo.lock":$prediction_lock_sha256},
         binaries:$binaries}' >"$manifest"
     ;;
-  verify)
+  verify|verify-metadata)
     test "$(find "$release" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" -eq 2
     test -f "$manifest"
+    # This verifier checks bytes/provenance/file modes only. ELF smoke runs in
+    # the admitted ACK executor, never in a public control-plane job.
     "$script_dir/verify-research-runner-binaries.sh" "$release/research-bin"
     jq -e \
       --arg source_sha "$source_sha" \
