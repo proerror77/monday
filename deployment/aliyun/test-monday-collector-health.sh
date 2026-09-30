@@ -1530,7 +1530,7 @@ run_health --json
 expect "recovery queue fresh stale present: exit 1" "$(rc_is 1; echo $?)"
 expect "recovery queue fresh stale present: unconditional breach" "$(json_query '
   .ok == false and
-  (.breaches | index("binance-lob-recovery[spot]: stale recovery job(s) present (1)")) != null
+  (.breaches | index("binance-lob-recovery[spot]: undisposed stale recovery job(s) present (1 of 1)")) != null
 '; echo $?)"
 expect "recovery queue fresh stale present: count and age" "$(json_query '
   .checks.recovery_queue.spot.stale_count == 1 and
@@ -1791,7 +1791,7 @@ cat >"$stub_dir/monday-rust-lob-retained-check" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 . '$script_dir/test-recovery-retention-fixture.sh'
-retention_fixture_context '$test_root' health
+retention_fixture_context '$test_root' health "\$2"
 EXECUTING_RECOVERY_PROGRAM=\$(readlink -f "\$INSTALLED_RECOVERY")
 secure_release_identity
 RETENTION_DEADLINE=\$((SECONDS + 300))
@@ -1831,6 +1831,49 @@ write_recovery_job usdm untouched failed
 run_health --json --dry-run
 expect 'Spot retention never relieves USD-M failure' "$(json_query '.ok==false and .checks.recovery_queue.usdm.undisposed_failed_count==1'; echo $?)"
 rm -rf "$spool_root/binance-lob-recovery/usdm/untouched.failed"
+
+# A retained USD-M failure and identity rejection are independently validated;
+# their physical counts survive, and a newly arrived stale job still breaches.
+(
+  # shellcheck source-path=SCRIPTDIR
+  # shellcheck source=test-recovery-retention-fixture.sh
+  . "$script_dir/test-recovery-retention-fixture.sh"
+  retention_fixture_context "$test_root" health usdm
+  # The context above rebuilds paths inside this subshell.
+  # shellcheck disable=SC2031
+  EXECUTING_RECOVERY_PROGRAM=$(readlink -f "$INSTALLED_RECOVERY")
+  secure_release_identity
+  RETENTION_FIXTURE_CONTROLLER=$ACTIVE_CONTROLLER_SHA256
+  retention_fixture_job 801 "$(printf '%064d' 41)" v2
+  retention_fixture_retain >"$test_root/retained-usdm-failed.json"
+  retention_fixture_job 802 "$(printf '%064d' 41)" v2 stale
+  retention_fixture_retain >"$test_root/retained-usdm-stale.json"
+)
+run_health --json --dry-run
+expect 'USD-M validated failed/stale custody becomes historical warning' "$(json_query '
+  .ok==true and (.checks.recovery_queue.usdm|.failed_count==1 and .stale_count==1
+    and .retained_failed_count==1 and .retained_stale_count==1
+    and .undisposed_failed_count==0 and .undisposed_stale_count==0
+    and .invalid_retention_count==0 and .historical_data_status=="retained_unrecovered")'; echo $?)"
+write_recovery_job usdm new-stale stale
+run_health --json --dry-run
+expect 'new USD-M stale job still breaches beside retained historical jobs' "$(json_query '
+  .ok==false and (.checks.recovery_queue.usdm|.stale_count==2 and .retained_stale_count==1 and .undisposed_stale_count==1)'; echo $?)"
+rm -rf "$spool_root/binance-lob-recovery/usdm/new-stale.stale"
+usdm_stale_id=$(jq -r .job_id "$test_root/retained-usdm-stale.json")
+usdm_pointer="$test_root/evidence/lob-queue/retained/usdm/$usdm_stale_id.json"
+mv "$usdm_pointer" "$test_root/usdm-pointer.saved"
+run_health --json --dry-run
+expect 'lost USD-M stale pointer reopens breach and preserves physical state' "$(json_query '
+  .ok==false and (.checks.recovery_queue.usdm|.stale_count==1 and .retained_stale_count==0
+    and .undisposed_stale_count==1 and .invalid_retention_count==1)'; echo $?)"
+mv "$test_root/usdm-pointer.saved" "$usdm_pointer"
+# Renaming changes ctime, so do not reuse these custody records after this test.
+for usdm_id in "$(jq -r .job_id "$test_root/retained-usdm-failed.json")" "$usdm_stale_id"; do
+  rm -rf "$spool_root/binance-lob-recovery/usdm/$usdm_id.failed" "$spool_root/binance-lob-recovery/usdm/$usdm_id.stale" \
+    "$test_root/evidence/lob-queue/$usdm_id"
+done
+rm -rf "$test_root/evidence/lob-queue/retained/usdm"
 
 retained_part="$retained_spool/date=2026-09-01/hour=00/part-one.jsonl.part"
 saved_mtime=$(stat -c %y "$retained_part")

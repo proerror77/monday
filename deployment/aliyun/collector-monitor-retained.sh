@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 export LC_ALL=C
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-[[ $EUID == 0 && $# == 2 && $1 == check-retained && $2 == spot ]] || exit 2
+[[ $EUID == 0 && $# == 2 && $1 == check-retained && $2 =~ ^(spot|usdm)$ ]] || exit 2
 [[ -z $(compgen -v MONDAY_ || true) ]] || { printf 'monitor reader refuses control overrides\n' >&2; exit 1; }
 controller_root=/opt/monday/releases/binance-lob-controller
 controller=$(readlink -f -- "$controller_root/active")
@@ -19,7 +19,7 @@ validator="$controller/deployment/host-rust-lob-recovery-queue.sh"
 # shellcheck disable=SC1090
 source "$validator"
 configure_paths /
-MARKET=spot
+MARKET=$2
 canonical_paths_safe
 market_paths
 EXECUTING_RECOVERY_PROGRAM=$(readlink -f -- "$INSTALLED_RECOVERY")

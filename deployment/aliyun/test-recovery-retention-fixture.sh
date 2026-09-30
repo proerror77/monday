@@ -30,11 +30,11 @@ retention_fixture_context() {
     QUEUE_ROOT="$fixture_root/spool/binance-lob-recovery"
     EVIDENCE_ROOT="$fixture_root/evidence/lob-queue"
   fi
-  MARKET=spot; market_paths
+  MARKET=${3:-spot}; market_paths
 }
 
 setup_retention_fixture() {
-  local fixture_root=$1 asset runtime controller deployment
+  local fixture_root=$1 asset runtime controller deployment fixture_market
   retention_fixture_context "$@"
   mkdir -p "$BIN_DIR" "$RELEASE_ROOT" "$CONTROLLER_RELEASE_ROOT" "$CONFIG_ROOT" \
     "$QUEUE_MARKET_ROOT" "$CANONICAL_SPOOL" "$EVIDENCE_ROOT" "$LOCK_ROOT" "$ROOT_PREFIX/tmp"
@@ -47,9 +47,12 @@ setup_retention_fixture() {
   deployment="$fixture_root/controller/deployment"; mkdir -p "$deployment"
   while IFS= read -r asset; do cp "$RETENTION_FIXTURE_SCRIPT_DIR/$asset" "$deployment/$asset"; done \
     < <(printf '%s\n' "$(monday_runtime_assets)" "$(monday_controller_assets)" | sort -u)
-  sed "s|^SPOOL_DIR=.*|SPOOL_DIR=$CANONICAL_SPOOL|" \
-    "$deployment/binance-lob-archiver-production-spot.env" >"$fixture_root/spot.env"
-  mv "$fixture_root/spot.env" "$deployment/binance-lob-archiver-production-spot.env"
+  for fixture_market in spot usdm; do
+    mkdir -p "$CANONICAL_ROOT/$fixture_market" "$QUEUE_ROOT/$fixture_market"
+    sed "s|^SPOOL_DIR=.*|SPOOL_DIR=$CANONICAL_ROOT/$fixture_market|" \
+      "$deployment/binance-lob-archiver-production-$fixture_market.env" >"$fixture_root/market.env"
+    mv "$fixture_root/market.env" "$deployment/binance-lob-archiver-production-$fixture_market.env"
+  done
   runtime=$(monday_rust_lob_runtime_contract_sha256 "$deployment")
   jq -cnS --arg payload "$RETENTION_FIXTURE_PAYLOAD" --arg runtime "$runtime" \
     --arg source "$(printf '%040d' 21)" --arg bundle "$(printf '%064d' 22)" \
@@ -67,7 +70,10 @@ setup_retention_fixture() {
   ln -s "$CONTROLLER_RELEASE_ROOT/$controller" "$ACTIVE_CONTROLLER"
   ln -s "$ACTIVE_CONTROLLER/binance-lob-archiver" "$PRODUCTION_LINK"
   ln -s "$ACTIVE_CONTROLLER/deployment/host-rust-lob-recovery-queue.sh" "$INSTALLED_RECOVERY"
-  ln -s "$ACTIVE_CONTROLLER/deployment/binance-lob-archiver-production-spot.env" "$ENV_FILE"
+  for fixture_market in spot usdm; do
+    ln -s "$ACTIVE_CONTROLLER/deployment/binance-lob-archiver-production-$fixture_market.env" \
+      "$CONFIG_ROOT/binance-lob-archiver-production-$fixture_market.env"
+  done
   EXECUTING_RECOVERY_PROGRAM=$(readlink -f "$INSTALLED_RECOVERY")
   RETENTION_FIXTURE_CONTROLLER=$controller
   secure_release_identity
@@ -76,9 +82,9 @@ setup_retention_fixture() {
 }
 
 retention_fixture_job() {
-  local number=$1 payload=${2:-$(printf '%064d' 41)} version=${3:-v1} env_sha bundle source job_sha
-  RETAIN_JOB_ID="20260901T000000Z-spot-${payload:0:12}-$number"
-  RETENTION_FIXTURE_JOB_DIR="$QUEUE_MARKET_ROOT/$RETAIN_JOB_ID.failed"
+  local number=$1 payload=${2:-$(printf '%064d' 41)} version=${3:-v1} state=${4:-failed} env_sha bundle source job_sha
+  RETAIN_JOB_ID="20260901T000000Z-$MARKET-${payload:0:12}-$number"
+  RETENTION_FIXTURE_JOB_DIR="$QUEUE_MARKET_ROOT/$RETAIN_JOB_ID.$state"
   RETENTION_FIXTURE_SEGMENT_DIR="$RETENTION_FIXTURE_JOB_DIR/date=2026-09-01/hour=00"
   RETENTION_FIXTURE_EVIDENCE="$EVIDENCE_ROOT/$RETAIN_JOB_ID"
   mkdir -m 0750 "$RETENTION_FIXTURE_JOB_DIR" "$RETENTION_FIXTURE_EVIDENCE"
@@ -88,13 +94,13 @@ retention_fixture_job() {
   env_sha=$(sha256sum "$RETENTION_FIXTURE_JOB_DIR/recovery.env" | awk '{print $1}')
   bundle=$(printf '%064d' 42); source=$(printf '%040d' 43)
   jq -cnS --arg job "$RETAIN_JOB_ID" --arg canonical "$CANONICAL_SPOOL" --arg p "$payload" \
-    --arg env "$env_sha" --arg bundle "$bundle" --arg source "$source" \
-    '{schema:"monday.rust_lob_recovery_queue.v1",job_id:$job,market:"spot",queued_at:"2026-09-01T00:00:00Z",
-      canonical_spool:$canonical,recovery_unit:"binance-lob-archiver-recovery@spot.service",
+    --arg env "$env_sha" --arg bundle "$bundle" --arg source "$source" --arg market "$MARKET" \
+    '{schema:"monday.rust_lob_recovery_queue.v1",job_id:$job,market:$market,queued_at:"2026-09-01T00:00:00Z",
+      canonical_spool:$canonical,recovery_unit:("binance-lob-archiver-recovery@"+$market+".service"),
       release_sha256:$p,deployment_bundle_sha256:$bundle,deployment_source_revision:$source,
       env_sha256:$env,release_env:"recovery.env"}' >"$RETENTION_FIXTURE_JOB_DIR/job.json"
-  jq -cnS --arg job "$RETAIN_JOB_ID" --arg p "$payload" --arg env "$env_sha" --arg bundle "$bundle" --arg source "$source" \
-    '{schema:"monday.rust_lob_recovery_queue_result.v1",job_id:$job,market:"spot",release_sha256:$p,
+  jq -cnS --arg job "$RETAIN_JOB_ID" --arg p "$payload" --arg env "$env_sha" --arg bundle "$bundle" --arg source "$source" --arg market "$MARKET" \
+    '{schema:"monday.rust_lob_recovery_queue_result.v1",job_id:$job,market:$market,release_sha256:$p,
       deployment_bundle_sha256:$bundle,deployment_source_revision:$source,env_sha256:$env,
       started_at:"2026-09-01T00:00:01Z",completed_at:"2026-09-01T00:00:02Z",result:"failed",step:"drain",message:"fixture"}' \
       >"$RETENTION_FIXTURE_EVIDENCE/result.json"
@@ -112,6 +118,13 @@ retention_fixture_job() {
         executing_deployment_bundle_sha256:$bundle,executing_deployment_source_revision:$source,
         minimum_upload_success_at:.started_at,upload_triplet_readback:{}}' \
       "$RETENTION_FIXTURE_EVIDENCE/result.json" >"$RETENTION_FIXTURE_EVIDENCE/result.new"
+    mv "$RETENTION_FIXTURE_EVIDENCE/result.new" "$RETENTION_FIXTURE_EVIDENCE/result.json"
+  fi
+  if [[ $state == stale ]]; then
+    jq --arg controller "$RETENTION_FIXTURE_CONTROLLER" --arg bundle "$RELEASE_BUNDLE_SHA256" --arg source "$RELEASE_SOURCE_REVISION" \
+      '.result="stale"|.step="stale-identity"|.message="queued recovery identity is not the active ControllerRelease"
+       |.executing_controller_sha256=$controller|.executing_deployment_bundle_sha256=$bundle
+       |.executing_deployment_source_revision=$source' "$RETENTION_FIXTURE_EVIDENCE/result.json" >"$RETENTION_FIXTURE_EVIDENCE/result.new"
     mv "$RETENTION_FIXTURE_EVIDENCE/result.new" "$RETENTION_FIXTURE_EVIDENCE/result.json"
   fi
   printf 'lock-evidence\n' >"$RETENTION_FIXTURE_JOB_DIR/.binance-lob-archiver.lock"
