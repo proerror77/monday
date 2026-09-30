@@ -30,4 +30,11 @@ sha256sum "$fixture/assets/collector-monitor-retained.sh" | sed "s|$fixture/asse
 if monitor_root="$fixture/assets" sh -e "$fixture/verify.sh" >"$fixture/output" 2>&1; then
   echo 'manifest mismatch was accepted' >&2; exit 1
 fi
+# A publisher's workstation UID must not become the owner of host assets.
+mkdir "$fixture/extract"
+printf 'monitor payload\n' >"$fixture/payload"
+COPYFILE_DISABLE=1 tar --format=ustar -C "$fixture" -cf "$fixture/package.tar" payload
+tar --no-same-owner -xf "$fixture/package.tar" -C "$fixture/extract"
+cmp "$fixture/payload" "$fixture/extract/payload"
+[[ $(stat -c %u "$fixture/extract/payload") == "$(id -u)" ]]
 printf 'Monitor write-mode refusal, immutable-path refusal and manifest checksum binding passed\n'

@@ -31,7 +31,7 @@ assets=$(jq -Rn '[inputs | split("  ") | {(.[1]):.[0]}] | add' <"$work/assets.sh
 jq -cnS --arg source "$source_revision" --argjson assets "$assets" \
   '{schema:"monday.collector_monitor_release.v1",source_revision:$source,assets:$assets}' >"$work/release.json"
 monitor=$(sha256sum "$work/release.json" | awk '{print $1}')
-tar -C "$work" -cf "$work/package.tar" release.json assets.sha256 "${asset_names[@]}"
+COPYFILE_DISABLE=1 tar --format=ustar -C "$work" -cf "$work/package.tar" release.json assets.sha256 "${asset_names[@]}"
 package_sha=$(sha256sum "$work/package.tar" | awk '{print $1}')
 uri="oss://monday-lob-apne1-1045353359/releases/collector-monitor/$source_revision/$monitor/package.tar"
 aliyun ossutil cp "$work/package.tar" "$uri" --endpoint oss-ap-northeast-1.aliyuncs.com \
@@ -42,7 +42,7 @@ set -Eeuo pipefail
 stage=\$(mktemp -d /root/monday-monitor-stage.XXXXXX)
 aliyun ossutil cp '$uri' "\$stage/package.tar" --endpoint oss-ap-northeast-1-internal.aliyuncs.com --region ap-northeast-1 --profile ecs-role
 [[ \$(sha256sum "\$stage/package.tar" | awk '{print \$1}') == '$package_sha' ]]
-tar -xf "\$stage/package.tar" -C "\$stage"
+tar --no-same-owner -xf "\$stage/package.tar" -C "\$stage"
 [[ \$(sha256sum "\$stage/release.json" | awk '{print \$1}') == '$monitor' ]]
 (cd "\$stage"; sha256sum --check --strict assets.sha256 >/dev/null)
 bash "\$stage/host-collector-monitor-install.sh" "\$stage" '$monitor' '$preimage' '$controller'
