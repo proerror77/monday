@@ -246,13 +246,11 @@ for path in "${paths[@]}"; do
     .github/scripts/verify-research-runner-binaries.sh|\
     .github/scripts/read-acr-publish-source.sh|.github/scripts/select-acr-publish-source.sh|\
     .github/scripts/test-acr-publish-source-readback.sh)
-      # Release identity/metadata policy is exercised by the workflow contract
-      # lane. Preserve main publication coverage without expanding a PR into
-      # unrelated Rust venues or prediction research feature suites.
+      # Release policy changes run source/signature/manifest contracts on both
+      # PR and main push. Only actual image/source/dependency inputs rebuild.
       select_job ci/ci-contracts
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       select_job ploy/workflow-lint
-      research_image_relevant=true
       continue
       ;;
     rust_hft/deployment/docker/Dockerfile.research)
@@ -323,7 +321,7 @@ for path in "${paths[@]}"; do
     .github/ack-ci/receipt-public-key.pub|.github/ack-ci/PREFLIGHT.md|\
     .github/workflows/ack-flow-contracts.yml)
       # Public ACK routing/signature checks are control metadata. They have no
-      # Cargo dependency impact; unknown future helpers retain the broad fallback.
+      # Cargo dependency impact; unknown future helpers block scope planning.
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
@@ -366,11 +364,8 @@ for path in "${paths[@]}"; do
       continue
       ;;
     .github/workflows/*|.github/actions/*|.github/scripts/*)
-      select_all
-      select_all_ci_jobs
-      select_job ploy/workflow-lint
-      select_all_ploy_jobs
-      continue
+      printf 'unmapped CI path: %s; add its owning contract mapping before dispatch\n' "$path" >&2
+      exit 2
       ;;
     rust_hft/deployment/k8s/*|deployment/aliyun/research/k8s/*)
       select_job ci/deployment-artifacts

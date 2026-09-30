@@ -133,7 +133,6 @@ job_cases=(
   'agent-instructions|pull_request|agent-instructions.txt|ploy/commit-hygiene'
   'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
   'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
-  'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'unknown-nested|pull_request|unknown-nested.txt|'
   'rust-docs|pull_request|rust-docs.txt|'
@@ -148,7 +147,7 @@ job_cases=(
   'live-push|push|live.txt|ci/rust,ci/deployment-artifacts'
   'trading-dockerfile-push|push|trading-dockerfile.txt|ci/deployment-artifacts'
   'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts,ploy/research-image-binaries,ploy/research-image-smoke'
-  'acr-workflow-push|push|acr-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke'
+  'acr-workflow-push|push|acr-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
   'full|push|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ploy/research-image-binaries,ploy/research-image-smoke,ci/deployment-artifacts'
 )
 for job_case in "${job_cases[@]}"; do
@@ -160,8 +159,8 @@ for job_case in "${job_cases[@]}"; do
 done
 
 # Known ACK metadata helpers must select their owning shell/workflow contracts
-# without setting Cargo-impact flags. Release-policy helpers retain main image
-# publication; receipt routing alone never requests a research rebuild.
+# without setting Cargo-impact flags or selecting images on main push. The
+# production image/dependency inputs retain their own build coverage.
 ack_metadata_paths=(
   .github/scripts/classify-ack-research-job.sh
   .github/scripts/test-classify-ack-research-job.sh
@@ -193,17 +192,14 @@ for kind in ack release; do
       scoped=$(run_case infrastructure "$event" infrastructure.txt)
       expected='ci/ci-contracts,ploy/workflow-lint'
       [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
-      [[ $event == push && $kind == release ]] && expected+=',ploy/research-image-binaries,ploy/research-image-smoke'
       assert_jobs "$scoped" "$expected"
       assert_owning_packages "$scoped" ''
       for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff; do
         assert_flag "$scoped" "$flag" false
       done
-      # Security still scans changes and release images keep dependency audits;
-      # no unrelated root research/runtime Clippy profile may be selected.
-      if [[ $event == push && $kind == release ]]; then
-        assert_security_jobs "$scoped" 'security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/cargo-machete,security/container-scan,security/secret-detection'
-      elif [[ $path == *.md ]]; then
+      # Policy-only source still receives repository security scans; it has no
+      # dependency/toolchain impact and must not trigger Cargo or image audits.
+      if [[ $path == *.md ]]; then
         assert_security_jobs "$scoped" 'security/secret-detection'
       else
         assert_security_jobs "$scoped" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
@@ -211,20 +207,31 @@ for kind in ack release; do
     done
   done
 done
-# The complete initial PR 1266 file set exercises interaction between ACK,
-# release policy and workflow metadata. Each leaf's cheap scope must compose.
-ack_flow_pr=$(run_case ack-flow-pr-1266 pull_request ack-flow-pr-1266.txt)
-assert_jobs "$ack_flow_pr" 'ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
-assert_security_jobs "$ack_flow_pr" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
-assert_owning_packages "$ack_flow_pr" ''
-for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff; do
-  assert_flag "$ack_flow_pr" "$flag" false
+# All 20 actual PR 1266 paths, including this fixture, must remain policy-only
+# on both PR and main push. Mixed source/image inputs retain their own gates.
+for event in pull_request push; do
+  ack_flow_pr=$(run_case "ack-flow-pr-$event" "$event" ack-flow-pr-1266.txt)
+  expected='ci/ci-contracts,ploy/workflow-lint'
+  [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+  assert_jobs "$ack_flow_pr" "$expected"
+  assert_security_jobs "$ack_flow_pr" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+  assert_owning_packages "$ack_flow_pr" ''
+  for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff; do
+    assert_flag "$ack_flow_pr" "$flag" false
+  done
+  cat "$fixtures/ack-flow-pr-1266.txt" "$fixtures/collector.txt" >"$tmp_dir/ack-flow-pr-with-collector.txt"
+  ack_flow_mixed=$(run_case "ack-flow-collector-$event" "$event" ack-flow-pr-with-collector.txt)
+  expected='ci/ci-contracts,ploy/workflow-lint,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
+  if [[ $event == pull_request ]]; then expected+=',ploy/commit-hygiene';
+  else expected+=',ploy/research-image-binaries,ploy/research-image-smoke'; fi
+  assert_jobs "$ack_flow_mixed" "$expected"
+  for flag in loop collector control toolchain; do assert_flag "$ack_flow_mixed" "$flag" true; done
+  cat "$fixtures/ack-flow-pr-1266.txt" "$fixtures/research-dockerfile.txt" >"$tmp_dir/ack-flow-pr-with-image.txt"
+  ack_flow_image=$(run_case "ack-flow-image-$event" "$event" ack-flow-pr-with-image.txt)
+  expected='ci/ci-contracts,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
+  [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+  assert_jobs "$ack_flow_image" "$expected"
 done
-# A real collector edit alongside all 19 metadata paths still uses Cargo impact.
-cat "$fixtures/ack-flow-pr-1266.txt" "$fixtures/collector.txt" >"$tmp_dir/ack-flow-pr-with-collector.txt"
-ack_flow_mixed=$(run_case ack-flow-pr-with-collector pull_request ack-flow-pr-with-collector.txt)
-assert_jobs "$ack_flow_mixed" 'ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
-for flag in loop collector control toolchain; do assert_flag "$ack_flow_mixed" "$flag" true; done
 
 printf '%s\n' deployment/aliyun/research/Dockerfile.research-data >"$tmp_dir/research-data-dockerfile.txt"
 for event in pull_request push; do
@@ -241,12 +248,25 @@ cat "$fixtures/collector.txt" >>"$tmp_dir/ack-with-collector.txt"
 mixed_ack=$(run_case ack-with-collector pull_request ack-with-collector.txt)
 assert_jobs "$mixed_ack" 'ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
 for flag in loop collector control toolchain; do assert_flag "$mixed_ack" "$flag" true; done
-printf '%s\n' .github/scripts/future-ack-unreviewed.sh >"$tmp_dir/unknown-ack-script.txt"
-unknown_ack=$(run_case unknown-ack-script pull_request unknown-ack-script.txt)
-# Same conservative fallback as an unknown workflow; an ACK-looking name is
-# not authority to remove compiler, venue or research coverage.
-assert_jobs "$unknown_ack" "$(sed -n 's/^jobs=,\(.*\),$/\1/p' "$tmp_dir/unknown-workflow.out" | sed 's/,ci\/control-contracts//')"
-for flag in loop handoff json ondo collector control focused toolchain; do assert_flag "$unknown_ack" "$flag" true; done
+# Unknown infrastructure is an incomplete plan, even alongside known source.
+# It must emit no successful selection or compiler dispatch plan.
+for unknown in .github/scripts/future-ack-unreviewed.sh .github/workflows/security.yml .github/actions/future/action.yml; do
+  for event in pull_request push; do
+    for mixed in false true; do
+      printf '%s\n' "$unknown" >"$tmp_dir/unmapped-ci.txt"
+      [[ $mixed == false ]] || cat "$fixtures/collector.txt" >>"$tmp_dir/unmapped-ci.txt"
+      : >"$tmp_dir/unmapped.out"
+      status=0
+      "$selector" --event "$event" --changed-files "$tmp_dir/unmapped-ci.txt" \
+        --metadata "$fixtures/metadata.fixture" --output "$tmp_dir/unmapped.out" \
+        >"$tmp_dir/unmapped.stdout" 2>"$tmp_dir/unmapped.error" || status=$?
+      [[ $status == 2 && ! -s $tmp_dir/unmapped.out && ! -s $tmp_dir/unmapped.stdout ]] || {
+        echo 'unknown CI path emitted a successful/full dispatch plan' >&2; exit 1;
+      }
+      grep -Fq "unmapped CI path: $unknown; add its owning contract mapping before dispatch" "$tmp_dir/unmapped.error"
+    done
+  done
+done
 
 printf '%s\n' \
   .github/scripts/agent-worktree-preflight.sh \
@@ -354,7 +374,7 @@ GITHUB_REF=refs/heads/develop "$selector" --event push \
 assert_jobs "$security_workflow_develop" 'ci/ci-contracts,ploy/workflow-lint'
 assert_security_jobs "$security_workflow_develop" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/collector.out" "$all_security_jobs"
-assert_security_jobs "$tmp_dir/unknown-workflow.out" "$all_security_jobs"
+assert_security_jobs "$tmp_dir/unknown-root.out" "$all_security_jobs"
 security_schedule="$tmp_dir/security-schedule.out"
 "$selector" --event schedule --output "$security_schedule"
 assert_jobs "$security_schedule" ''

@@ -17,3 +17,4 @@
 .github/workflows/ci.yml
 .github/workflows/ploy-ci.yml
 .github/workflows/security-enabled.yml
+.github/scripts/fixtures/rust-ci-scope/ack-flow-pr-1266.txt
