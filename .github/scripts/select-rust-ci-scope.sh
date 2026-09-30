@@ -336,6 +336,8 @@ for path in "${paths[@]}"; do
       continue
       ;;
     .github/workflows/monitor-collector-host.yml|.github/scripts/test-monitor-collector-host.sh|\
+    deployment/aliyun/collector-monitor-*|deployment/aliyun/collector-monitor.*|\
+    deployment/aliyun/test-collector-monitor-*|deployment/aliyun/host-collector-monitor-*|\
     deployment/aliyun/monday-collector-health.*|deployment/aliyun/test-monday-collector-health.sh|\
     deployment/aliyun/host-collector-health-unit-release.sh|deployment/aliyun/test-collector-health-unit-release.sh)
       select_job ci/monitor-contracts

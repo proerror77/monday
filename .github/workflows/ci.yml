@@ -177,6 +177,7 @@ jobs:
           deployment/aliyun/test-monday-collector-health.sh
           deployment/aliyun/test-collector-health-unit-release.sh
           .github/scripts/test-monitor-collector-host.sh
+          deployment/aliyun/test-collector-monitor-release.sh
 
   ci_contracts:
     name: CI policy contracts

@@ -79,7 +79,7 @@
 # and is also invoked on demand by the monitor-collector-host GitHub Actions
 # workflow through Aliyun Cloud Assistant.
 #
-# Usage: monday-collector-health.sh [--json] [--dry-run]
+# Usage: monday-collector-health.sh [--json] [--dry-run] [--monitor-release]
 #   --json     emit a single JSON object to stdout (nothing else on stdout)
 #   --dry-run  do not read or write the persistent upload-failure/restart state
 #
@@ -209,16 +209,30 @@ fi
 
 JSON_MODE=0
 DRY_RUN=0
+MONITOR_RELEASE=0
 for arg in "$@"; do
   case "$arg" in
     --json) JSON_MODE=1 ;;
     --dry-run) DRY_RUN=1 ;;
+    --monitor-release) MONITOR_RELEASE=1 ;;
     *)
-      printf 'usage: %s [--json] [--dry-run]\n' "$0" >&2
+      printf 'usage: %s [--json] [--dry-run] [--monitor-release]\n' "$0" >&2
       exit 2
       ;;
   esac
 done
+
+if [ "$MONITOR_RELEASE" = 1 ]; then
+  monitor_root=$(dirname -- "$(readlink -f -- "$0")")
+  monitor_sha=${monitor_root##*/}
+  case "$monitor_sha" in *[!a-f0-9]*|'') exit 2 ;; esac
+  [ "${#monitor_sha}" -eq 64 ] && [ "$monitor_root" = "/opt/monday/monitor/releases/$monitor_sha" ] || exit 2
+  [ "$(sha256sum "$monitor_root/release.json" | awk '{print $1}')" = "$monitor_sha" ] || exit 1
+  expected_monitor_checks=$(jq -r '.assets|to_entries|sort_by(.key)[]|.value+"  "+.key' "$monitor_root/release.json")
+  [ "$expected_monitor_checks" = "$(sort -k2 "$monitor_root/assets.sha256")" ] || exit 1
+  (cd "$monitor_root" && sha256sum --check --strict assets.sha256 >/dev/null) || exit 1
+  RETENTION_READER="$monitor_root/collector-monitor-retained.sh"
+fi
 
 # The local monday-collector-health.timer must not consume a sequence-gap
 # increase. The GitHub monitor-collector-host workflow invokes this script
