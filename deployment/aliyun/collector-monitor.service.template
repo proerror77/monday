@@ -1,0 +1,28 @@
+[Unit]
+Description=Run the Monday collector-host health check (read-only)
+# Deliberately NO ConditionPathIsMountPoint=/data and NO RequiresMountsFor=/data:
+# this monitor must DETECT and alert on a missing /data mount, not gate on it.
+
+[Service]
+Type=oneshot
+# Latch sequence-gap increases so the 15-minute GitHub Cloud Assistant poll
+# still observes the breach. The alerting command must not set this.
+Environment=MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1
+ExecStart=__MONITOR_ROOT__/monday-collector-health.sh --json --monitor-release
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+StateDirectory=monday-collector-health
+UMask=0027
+Nice=10
+MemoryHigh=128M
+MemoryMax=256M
+TimeoutStartSec=480

@@ -1571,3 +1571,34 @@ prevents a retry from racing an earlier operation.
 Full-catalog symbol discovery has a 15-second HTTP request timeout, so a stalled
 Binance `exchangeInfo` response fails startup instead of leaving an active but
 idle service until the systemd runtime limit.
+
+### Independent read-only collector monitor release
+
+`collector-monitor-release.sh INSTANCE UNIT_PREIMAGE CONTROLLER_SHA` publishes
+only the health program, read-only custody entrypoint, and monitor unit. It
+requires a clean exact source with the three authenticated CI summaries, builds
+a hash-addressed manifest/package, and installs under
+`/opt/monday/monitor/releases/<monitor-sha>/`. The existing active collector
+controller, binary, producer PID and invocation identities must stay unchanged.
+No collector Shadow Gate or producer stop belongs to this operation.
+
+The monitor program accepts `--monitor-release` only from that verified immutable
+path. Its custody entrypoint uses the active controller's byte-verified pure
+validator functions with a 300-second monitoring budget. It cannot invoke
+isolate, drain, resume or retain; their code and writer authority remain owned
+by the collector controller. Original retention hashes, fingerprints, membership
+and unrecovered/replay semantics are still checked.
+
+The existing atomic health-unit installer owns monitor stop/reload and automatic
+failure rollback. Its receipt preserves the exact previous unit. Independently
+read the new program/manifest hashes, effective unit timeout, timer, unchanged
+producer identities and actual report before calling the update complete.
+Global health can remain false for separately scoped problems; do not hide them.
+
+The release command returns its Cloud Assistant InvokeId. Use
+`collector-monitor-release.sh status INVOKE_ID` to query the same operation;
+pending is not a failed attempt and must not cause a second install. The GitHub
+OIDC monitor uses a new immutable fixed command addressed to the monitor
+release; replace the role's exact command ARN and repository CommandId together,
+retaining the same host/actions/trust scope. Record the previous policy version,
+command and variable for rollback.
