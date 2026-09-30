@@ -258,12 +258,44 @@ fn levels(value: Option<&Value>, line: usize) -> Result<&[Value]> {
     }
 }
 
+fn quote_level(level: &Value, side: &str, index: usize, line: usize) -> Result<(Decimal, Decimal)> {
+    let Some(level) = level.as_object() else {
+        return invalid(line, format!("{side}[{index}] must be an object"));
+    };
+    let Some(price) = decimal(level.get("price"), "level.price", line)? else {
+        return invalid(line, format!("{side}[{index}] requires price and size"));
+    };
+    let Some(size) = decimal(level.get("size"), "level.size", line)? else {
+        return invalid(line, format!("{side}[{index}] requires price and size"));
+    };
+    Ok((price, size))
+}
+
 fn increment(counts: &mut BTreeMap<String, BTreeMap<String, u64>>, kind: &str, field: &str) {
-    *counts
-        .entry(kind.to_owned())
-        .or_default()
-        .entry(field.to_owned())
-        .or_default() += 1;
+    let fields = if counts.contains_key(kind) {
+        counts.get_mut(kind).expect("existing kind")
+    } else {
+        counts.entry(kind.to_owned()).or_default()
+    };
+    if let Some(count) = fields.get_mut(field) {
+        *count += 1;
+    } else {
+        fields.insert(field.to_owned(), 1);
+    }
+}
+
+/// Borrowed quote metadata for the typed recorder. Depth remains an iterator
+/// over the original Decimal levels, so validation need not build a JSON tree
+/// and parse those same levels back from strings.
+#[derive(Clone, Copy)]
+pub struct TapeQuote<'a> {
+    pub token_id: &'a str,
+    pub source_at: DateTime<Utc>,
+    pub bid: Option<Decimal>,
+    pub ask: Option<Decimal>,
+    pub bid_size: Option<Decimal>,
+    pub ask_size: Option<Decimal>,
+    pub collection_result: &'a str,
 }
 
 #[derive(Debug, Default)]
@@ -329,26 +361,8 @@ impl MarketTapeManifestBuilder {
         let Some(sequence) = record.get("sequence").and_then(Value::as_u64) else {
             return invalid(line, "sequence must be a non-negative integer");
         };
-        let expected = self.expected_sequence.get_or_insert(sequence);
-        if sequence != *expected {
-            return invalid(
-                line,
-                format!("sequence gap expected={} actual={sequence}", *expected),
-            );
-        }
         let recorded_at = timestamp(record.get("recorded_at"), "recorded_at", line)?;
-        if recorded_at > validation_time + TimeDelta::seconds(MAX_FUTURE_RECORDING_SKEW_SECS) {
-            return invalid(
-                line,
-                format!("recorded_at is more than {MAX_FUTURE_RECORDING_SKEW_SECS}s in the future"),
-            );
-        }
-        if self
-            .previous_recorded_at
-            .is_some_and(|previous| recorded_at < previous)
-        {
-            return invalid(line, "recorded_at moved backwards");
-        }
+        self.observe_header(sequence, recorded_at, validation_time)?;
         let Some(update) = record.get("update").and_then(Value::as_object) else {
             return invalid(line, "update must be an object");
         };
@@ -405,11 +419,52 @@ impl MarketTapeManifestBuilder {
             _ => {}
         }
 
-        let recorded_at_text = record
-            .get("recorded_at")
-            .and_then(Value::as_str)
-            .expect("recorded_at was validated")
-            .to_owned();
+        self.finish_record(
+            sequence,
+            recorded_at,
+            record["recorded_at"]
+                .as_str()
+                .expect("validated timestamp")
+                .to_owned(),
+        )
+    }
+
+    fn observe_header(
+        &mut self,
+        sequence: u64,
+        recorded_at: DateTime<Utc>,
+        validation_time: DateTime<Utc>,
+    ) -> Result<()> {
+        let line = self.observed_records.saturating_add(1);
+        let expected = self.expected_sequence.get_or_insert(sequence);
+        if sequence != *expected {
+            return invalid(
+                line,
+                format!("sequence gap expected={} actual={sequence}", *expected),
+            );
+        }
+        if recorded_at > validation_time + TimeDelta::seconds(MAX_FUTURE_RECORDING_SKEW_SECS) {
+            return invalid(
+                line,
+                format!("recorded_at is more than {MAX_FUTURE_RECORDING_SKEW_SECS}s in the future"),
+            );
+        }
+        if self
+            .previous_recorded_at
+            .is_some_and(|previous| recorded_at < previous)
+        {
+            return invalid(line, "recorded_at moved backwards");
+        }
+        Ok(())
+    }
+
+    fn finish_record(
+        &mut self,
+        sequence: u64,
+        recorded_at: DateTime<Utc>,
+        recorded_at_text: String,
+    ) -> Result<()> {
+        let line = self.observed_records.saturating_add(1);
         self.first_recorded_at
             .get_or_insert_with(|| recorded_at_text.clone());
         self.last_recorded_at = Some(recorded_at_text);
@@ -422,6 +477,58 @@ impl MarketTapeManifestBuilder {
         }
         self.previous_recorded_at = Some(recorded_at);
         Ok(())
+    }
+
+    /// Observe exactly the quote schema emitted by the recorder, borrowing all
+    /// levels. JSON import and this path share the same quote-quality checks.
+    pub fn observe_typed_quote<I, J>(
+        &mut self,
+        sequence: u64,
+        recorded_at: DateTime<Utc>,
+        validation_time: DateTime<Utc>,
+        quote: TapeQuote<'_>,
+        bids: I,
+        asks: J,
+    ) -> Result<()>
+    where
+        I: ExactSizeIterator<Item = (Decimal, Decimal)>,
+        J: ExactSizeIterator<Item = (Decimal, Decimal)>,
+    {
+        self.observe_header(sequence, recorded_at, validation_time)?;
+        if let Some(count) = self.event_types.get_mut("quote") {
+            *count += 1;
+        } else {
+            self.event_types.insert("quote".to_owned(), 1);
+        }
+        for (field, non_null) in [
+            ("kind", true),
+            ("token_id", true),
+            ("ts", true),
+            ("bid", quote.bid.is_some()),
+            ("ask", quote.ask.is_some()),
+            ("bid_size", quote.bid_size.is_some()),
+            ("ask_size", quote.ask_size.is_some()),
+            ("bid_levels", true),
+            ("ask_levels", true),
+            ("request_status", true),
+            ("collection_result", true),
+        ] {
+            increment(&mut self.present_fields, "quote", field);
+            if non_null {
+                increment(&mut self.non_null_fields, "quote", field);
+            }
+        }
+        if !quote.token_id.is_empty() && !self.token_ids.contains(quote.token_id) {
+            self.token_ids.insert(quote.token_id.to_owned());
+        }
+        let line = self.observed_records.saturating_add(1);
+        self.observe_quote_attempt_token(quote.token_id, line)?;
+        self.observe_quote_values(quote, recorded_at, line, bids.map(Ok), asks.map(Ok))?;
+        self.finish_record(
+            sequence,
+            recorded_at,
+            recorded_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+        )
     }
 
     fn observe_lifecycle(
@@ -522,7 +629,50 @@ impl MarketTapeManifestBuilder {
         if update.get("request_status").and_then(Value::as_str) != Some("success") {
             return invalid(line, "quote requires request_status=success");
         }
-        let source_at = timestamp(update.get("ts"), "ts", line)?;
+        let quote = TapeQuote {
+            token_id: text(update, "token_id", line)?,
+            source_at: timestamp(update.get("ts"), "ts", line)?,
+            bid: decimal(update.get("bid"), "bid", line)?,
+            ask: decimal(update.get("ask"), "ask", line)?,
+            bid_size: decimal(update.get("bid_size"), "bid_size", line)?,
+            ask_size: decimal(update.get("ask_size"), "ask_size", line)?,
+            collection_result: update
+                .get("collection_result")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        };
+        let bids = levels(update.get("bid_levels"), line)?
+            .iter()
+            .enumerate()
+            .map(|(index, level)| quote_level(level, "bid_levels", index, line));
+        let asks = levels(update.get("ask_levels"), line)?
+            .iter()
+            .enumerate()
+            .map(|(index, level)| quote_level(level, "ask_levels", index, line));
+        self.observe_quote_values(quote, recorded_at, line, bids, asks)
+    }
+
+    fn observe_quote_values<I, J>(
+        &mut self,
+        quote: TapeQuote<'_>,
+        recorded_at: DateTime<Utc>,
+        line: usize,
+        bids: I,
+        asks: J,
+    ) -> Result<()>
+    where
+        I: ExactSizeIterator<Item = Result<(Decimal, Decimal)>>,
+        J: ExactSizeIterator<Item = Result<(Decimal, Decimal)>>,
+    {
+        let TapeQuote {
+            token_id: token,
+            source_at,
+            bid,
+            ask,
+            bid_size,
+            ask_size,
+            collection_result,
+        } = quote;
         let latency = recorded_at
             .signed_duration_since(source_at)
             .num_milliseconds();
@@ -530,7 +680,6 @@ impl MarketTapeManifestBuilder {
             return invalid(line, "quote source time is after received time");
         }
         self.max_quote_latency_ms = self.max_quote_latency_ms.max(latency);
-        let token = text(update, "token_id", line)?;
         match self.last_quote_source_at.get_mut(token) {
             Some(previous) if source_at < *previous => {
                 let regression = *previous - source_at;
@@ -551,48 +700,23 @@ impl MarketTapeManifestBuilder {
                     .insert(token.to_owned(), source_at);
             }
         }
-        self.quoted_token_ids.insert(token.to_owned());
+        if !self.quoted_token_ids.contains(token) {
+            self.quoted_token_ids.insert(token.to_owned());
+        }
         self.pending_transport_reconnects.remove(token);
-
-        let bid = decimal(update.get("bid"), "bid", line)?;
-        let ask = decimal(update.get("ask"), "ask", line)?;
-        let bid_size = decimal(update.get("bid_size"), "bid_size", line)?;
-        let ask_size = decimal(update.get("ask_size"), "ask_size", line)?;
-        let bid_levels = levels(update.get("bid_levels"), line)?;
-        let ask_levels = levels(update.get("ask_levels"), line)?;
         if bid.is_some() && bid_size.is_none() {
             self.missing_bid_size += 1;
         }
         if ask.is_some() && ask_size.is_none() {
             self.missing_ask_size += 1;
         }
-        self.max_bid_levels = self.max_bid_levels.max(bid_levels.len());
-        self.max_ask_levels = self.max_ask_levels.max(ask_levels.len());
-        let mut all_levels_non_executable = true;
-        for (side, values) in [("bid_levels", bid_levels), ("ask_levels", ask_levels)] {
-            for (index, level) in values.iter().enumerate() {
-                let Some(level) = level.as_object() else {
-                    return invalid(line, format!("{side}[{index}] must be an object"));
-                };
-                let Some(price) = decimal(level.get("price"), "level.price", line)? else {
-                    return invalid(line, format!("{side}[{index}] requires price and size"));
-                };
-                let Some(size) = decimal(level.get("size"), "level.size", line)? else {
-                    return invalid(line, format!("{side}[{index}] requires price and size"));
-                };
-                if !(Decimal::ZERO..=Decimal::ONE).contains(&price) {
-                    self.out_of_range_prices += 1;
-                    all_levels_non_executable = false;
-                }
-                if size <= Decimal::ZERO {
-                    self.negative_sizes += 1;
-                    all_levels_non_executable = false;
-                }
-                if tradeable(price) {
-                    all_levels_non_executable = false;
-                }
-            }
-        }
+        let bid_count = bids.len();
+        let ask_count = asks.len();
+        self.max_bid_levels = self.max_bid_levels.max(bid_count);
+        self.max_ask_levels = self.max_ask_levels.max(ask_count);
+        let bids_non_executable = self.observe_level_values(bids)?;
+        let asks_non_executable = self.observe_level_values(asks)?;
+        let all_levels_non_executable = bids_non_executable && asks_non_executable;
         if matches!((bid, ask), (Some(bid), Some(ask)) if bid > ask) {
             self.crossed_quotes += 1;
         }
@@ -607,7 +731,7 @@ impl MarketTapeManifestBuilder {
             }
         }
         let result = match (bid, ask, bid_size, ask_size) {
-            (None, None, None, None) if bid_levels.is_empty() && ask_levels.is_empty() => "empty",
+            (None, None, None, None) if bid_count == 0 && ask_count == 0 => "empty",
             (None, None, None, None) if all_levels_non_executable => "non_executable",
             (Some(bid), Some(ask), Some(bid_size), Some(ask_size))
                 if bid <= ask
@@ -625,7 +749,7 @@ impl MarketTapeManifestBuilder {
             }
             _ => "incomplete",
         };
-        if update.get("collection_result").and_then(Value::as_str) != Some(result) {
+        if collection_result != result {
             return invalid(
                 line,
                 format!("quote collection_result does not match {result}"),
@@ -641,13 +765,46 @@ impl MarketTapeManifestBuilder {
         Ok(())
     }
 
+    fn observe_level_values(
+        &mut self,
+        levels: impl Iterator<Item = Result<(Decimal, Decimal)>>,
+    ) -> Result<bool> {
+        let mut all_non_executable = true;
+        for level in levels {
+            let (price, size) = level?;
+            if !(Decimal::ZERO..=Decimal::ONE).contains(&price) {
+                self.out_of_range_prices += 1;
+                all_non_executable = false;
+            }
+            if size <= Decimal::ZERO {
+                self.negative_sizes += 1;
+                all_non_executable = false;
+            }
+            if tradeable(price) {
+                all_non_executable = false;
+            }
+        }
+        Ok(all_non_executable)
+    }
+
     fn observe_quote_attempt(&mut self, update: &Map<String, Value>, line: usize) -> Result<()> {
         let token = text(update, "token_id", line)?;
-        self.attempted_quote_token_ids.insert(token.to_owned());
+        self.observe_quote_attempt_token(token, line)
+    }
+
+    fn observe_quote_attempt_token(&mut self, token: &str, line: usize) -> Result<()> {
+        if token.is_empty() {
+            return invalid(line, "token_id must be a non-empty string");
+        }
+        if !self.attempted_quote_token_ids.contains(token) {
+            self.attempted_quote_token_ids.insert(token.to_owned());
+        }
         self.request_attempts += 1;
         if !self.known_event_tokens.contains(token) {
             self.contextless_quotes += 1;
-            self.contextless_quote_tokens.insert(token.to_owned());
+            if !self.contextless_quote_tokens.contains(token) {
+                self.contextless_quote_tokens.insert(token.to_owned());
+            }
         }
         Ok(())
     }
@@ -939,6 +1096,213 @@ fn validate_l2(update: &Map<String, Value>, line: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quote_json(
+        sequence: u64,
+        recorded_at: DateTime<Utc>,
+        quote: TapeQuote<'_>,
+        bids: &[(Decimal, Decimal)],
+        asks: &[(Decimal, Decimal)],
+    ) -> Value {
+        json!({"sequence":sequence,"recorded_at":recorded_at,"update":{
+            "kind":"quote","token_id":quote.token_id,"ts":quote.source_at,
+            "bid":quote.bid,"ask":quote.ask,"bid_size":quote.bid_size,"ask_size":quote.ask_size,
+            "bid_levels":bids.iter().map(|(price,size)|json!({"price":price,"size":size})).collect::<Vec<_>>(),
+            "ask_levels":asks.iter().map(|(price,size)|json!({"price":price,"size":size})).collect::<Vec<_>>(),
+            "request_status":"success","collection_result":quote.collection_result}})
+    }
+
+    fn initialized(recorded_at: DateTime<Utc>) -> MarketTapeManifestBuilder {
+        let mut builder = MarketTapeManifestBuilder::new();
+        builder
+            .observe(
+                &json!({"sequence":0,"recorded_at":recorded_at,"update":{
+            "kind":"event_discovered","event_id":"event","up_token":"up","down_token":"down",
+            "end_time":recorded_at+TimeDelta::minutes(5),"symbol":"BTCUSDT"}}),
+                recorded_at,
+            )
+            .unwrap();
+        builder
+    }
+
+    #[test]
+    fn typed_quote_manifest_matches_json_for_full_depth_and_quality_cases() {
+        let time = DateTime::parse_from_rfc3339("2026-09-30T09:00:00.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let one = Some(Decimal::ONE);
+        let cases = [
+            (
+                Some(Decimal::new(49, 2)),
+                Some(Decimal::new(51, 2)),
+                one,
+                one,
+                "executable",
+            ),
+            (Some(Decimal::new(49, 2)), None, one, None, "one_sided"),
+            (None, None, None, None, "empty"),
+            (None, None, None, None, "non_executable"),
+            (
+                Some(Decimal::new(55, 2)),
+                Some(Decimal::new(51, 2)),
+                one,
+                one,
+                "incomplete",
+            ),
+            (
+                Some(Decimal::new(49, 2)),
+                Some(Decimal::new(51, 2)),
+                Some(-Decimal::ONE),
+                one,
+                "incomplete",
+            ),
+        ];
+        let mut json_builder = initialized(time);
+        let mut typed_builder = initialized(time);
+        for (index, (bid, ask, bid_size, ask_size, result)) in cases.into_iter().enumerate() {
+            let recorded_at = time + TimeDelta::milliseconds(index as i64);
+            let quote = TapeQuote {
+                token_id: "up",
+                source_at: time,
+                bid,
+                ask,
+                bid_size,
+                ask_size,
+                collection_result: result,
+            };
+            let bids = match result {
+                "empty" => vec![],
+                "non_executable" => vec![(Decimal::ZERO, Decimal::ONE)],
+                _ => (0..99)
+                    .map(|i| (Decimal::new(490 - i, 3), Decimal::ONE))
+                    .collect(),
+            };
+            let asks = if result == "empty" || result == "one_sided" {
+                vec![]
+            } else if result == "non_executable" {
+                vec![(Decimal::ONE, Decimal::ONE)]
+            } else {
+                (0..99)
+                    .map(|i| (Decimal::new(510 + i, 3), Decimal::ONE))
+                    .collect()
+            };
+            let sequence = index as u64 + 1;
+            json_builder
+                .observe(
+                    &quote_json(sequence, recorded_at, quote, &bids, &asks),
+                    recorded_at,
+                )
+                .unwrap();
+            typed_builder
+                .observe_typed_quote(
+                    sequence,
+                    recorded_at,
+                    recorded_at,
+                    quote,
+                    bids.iter().copied(),
+                    asks.iter().copied(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            json_builder
+                .finish("crypto_expiry", 0, 0, "test.ndjson", 100)
+                .unwrap(),
+            typed_builder
+                .finish("crypto_expiry", 0, 0, "test.ndjson", 100)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn typed_quote_rejects_the_same_clock_sequence_and_status_errors() {
+        let now = Utc::now();
+        for (sequence, recorded_at, source_at, token, result) in [
+            (2, now, now, "up", "empty"),
+            (1, now - TimeDelta::seconds(1), now, "up", "empty"),
+            (1, now + TimeDelta::seconds(301), now, "up", "empty"),
+            (1, now, now + TimeDelta::milliseconds(1), "up", "empty"),
+            (1, now, now, "", "empty"),
+            (1, now, now, "up", "executable"),
+            (u64::MAX, now, now, "up", "empty"),
+        ] {
+            let quote = TapeQuote {
+                token_id: token,
+                source_at,
+                bid: None,
+                ask: None,
+                bid_size: None,
+                ask_size: None,
+                collection_result: result,
+            };
+            let record = quote_json(sequence, recorded_at, quote, &[], &[]);
+            let mut a = initialized(now);
+            let mut b = initialized(now);
+            assert!(a.observe(&record, now).is_err());
+            assert!(b
+                .observe_typed_quote(
+                    sequence,
+                    recorded_at,
+                    now,
+                    quote,
+                    std::iter::empty(),
+                    std::iter::empty()
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "bounded full-depth validation throughput benchmark"]
+    fn full_depth_quote_validation_throughput() {
+        let now = Utc::now();
+        let quote = TapeQuote {
+            token_id: "up",
+            source_at: now,
+            bid: Some(Decimal::new(49, 2)),
+            ask: Some(Decimal::new(51, 2)),
+            bid_size: Some(Decimal::ONE),
+            ask_size: Some(Decimal::ONE),
+            collection_result: "executable",
+        };
+        let bids = (0..99)
+            .map(|i| (Decimal::new(490 - i, 3), Decimal::ONE))
+            .collect::<Vec<_>>();
+        let asks = (0..99)
+            .map(|i| (Decimal::new(510 + i, 3), Decimal::ONE))
+            .collect::<Vec<_>>();
+        const RECORDS: u64 = 20_000;
+        let mut old = initialized(now);
+        let start = std::time::Instant::now();
+        for n in 1..=RECORDS {
+            let record = quote_json(n, now, quote, &bids, &asks);
+            old.observe(std::hint::black_box(&record), now).unwrap();
+        }
+        let json_elapsed = start.elapsed();
+        let mut typed = initialized(now);
+        let start = std::time::Instant::now();
+        for n in 1..=RECORDS {
+            typed
+                .observe_typed_quote(
+                    n,
+                    now,
+                    now,
+                    quote,
+                    std::hint::black_box(&bids).iter().copied(),
+                    std::hint::black_box(&asks).iter().copied(),
+                )
+                .unwrap();
+        }
+        let typed_elapsed = start.elapsed();
+        assert_eq!(
+            old.finish("crypto_expiry", 0, 0, "test.ndjson", 100)
+                .unwrap(),
+            typed
+                .finish("crypto_expiry", 0, 0, "test.ndjson", 100)
+                .unwrap()
+        );
+        eprintln!("full_depth_validation records={RECORDS} levels_per_side=99 json_ms={} typed_ms={} speedup={:.2}",json_elapsed.as_millis(),typed_elapsed.as_millis(),json_elapsed.as_secs_f64()/typed_elapsed.as_secs_f64());
+    }
 
     #[test]
     fn decimal_accepts_scientific_json_numbers_without_weakening_invalid_rejection() {

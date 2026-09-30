@@ -4,6 +4,7 @@
 //! NDJSON log. `RecordedFeed` replays the exact same update sequence back into
 //! the strategy runtime.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -17,7 +18,7 @@ use tracing::{error, info, warn};
 
 use crate::traits::{Feed, MarketUpdate};
 use polymarket_tape_contract::{
-    tape_seal_path, MarketTapeManifestBuilder, PolymarketTapeSeal, TapeFileIdentity,
+    tape_seal_path, MarketTapeManifestBuilder, PolymarketTapeSeal, TapeFileIdentity, TapeQuote,
     POLYMARKET_MARKET_TAPE_DATASET, POLYMARKET_MARKET_TAPE_QUOTE_DEPTH_LEVELS,
     POLYMARKET_MARKET_TAPE_QUOTE_SAMPLE_MS, POLYMARKET_TAPE_SEAL_SCHEMA,
 };
@@ -120,6 +121,23 @@ pub struct RecordedMarketUpdate {
     pub update: MarketUpdate,
 }
 
+#[derive(Serialize)]
+struct BorrowedRecord<'a> {
+    sequence: u64,
+    recorded_at: DateTime<Utc>,
+    update: BorrowedUpdate<'a>,
+}
+
+#[derive(Serialize)]
+struct BorrowedUpdate<'a> {
+    #[serde(flatten)]
+    update: &'a MarketUpdate,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection_result: Option<&'static str>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppendOutcome {
     Written,
@@ -161,6 +179,7 @@ struct MarketUpdateLogWriter {
     rotation_retry_after: Option<DateTime<Utc>>,
     seal_policy: Option<TapeSealPolicy>,
     seal_builder: Option<MarketTapeManifestBuilder>,
+    line_buffer: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -317,7 +336,7 @@ impl MarketUpdateLogWriter {
 
         Ok(Self {
             path,
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(64 * 1024, file),
             next_sequence: 0,
             pending_records: 0,
             bytes_written: 0,
@@ -327,6 +346,7 @@ impl MarketUpdateLogWriter {
             rotation_retry_after: None,
             seal_policy,
             seal_builder: seal_policy.map(|_| MarketTapeManifestBuilder::new()),
+            line_buffer: Vec::with_capacity(4096),
         })
     }
 
@@ -341,38 +361,66 @@ impl MarketUpdateLogWriter {
         }
 
         let collection_result = quote_collection_result(update);
-        let mut serialized_update = serde_json::to_value(update).map_err(io::Error::other)?;
-        if let Some((request_status, collection_result)) = collection_result {
-            let update = serialized_update.as_object_mut().ok_or_else(|| {
-                io::Error::other("serialized market update must be a JSON object")
-            })?;
-            update.insert("request_status".to_owned(), request_status.into());
-            update.insert("collection_result".to_owned(), collection_result.into());
-        }
         let recorded_at = Utc::now();
-        let record = serde_json::json!({
-            "sequence": self.next_sequence,
-            "recorded_at": recorded_at,
-            "update": serialized_update,
-        });
-        let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
-        line.push(b'\n');
+        let record = BorrowedRecord {
+            sequence: self.next_sequence,
+            recorded_at,
+            update: BorrowedUpdate {
+                update,
+                request_status: collection_result.map(|value| value.0),
+                collection_result: collection_result.map(|value| value.1),
+            },
+        };
+        self.line_buffer.clear();
+        serde_json::to_writer(&mut self.line_buffer, &record).map_err(io::Error::other)?;
+        self.line_buffer.push(b'\n');
 
         if self.bytes_written > 0
             && self.limits.max_bytes.is_some_and(|max_bytes| {
-                self.bytes_written + u64::try_from(line.len()).unwrap_or(u64::MAX) > max_bytes
+                self.bytes_written + u64::try_from(self.line_buffer.len()).unwrap_or(u64::MAX)
+                    > max_bytes
             })
         {
             self.flush()?;
             return Ok(AppendOutcome::LimitReached);
         }
 
-        self.next_sequence += 1;
-        self.writer.write_all(&line)?;
-        self.bytes_written += u64::try_from(line.len()).unwrap_or(u64::MAX);
+        self.writer.write_all(&self.line_buffer)?;
+        self.bytes_written += u64::try_from(self.line_buffer.len()).unwrap_or(u64::MAX);
         self.pending_records += 1;
         if let Some(mut builder) = self.seal_builder.take() {
-            if let Err(error) = builder.observe(&record, recorded_at) {
+            let observed = match update {
+                MarketUpdate::Quote {
+                    token_id,
+                    bid,
+                    ask,
+                    bid_size,
+                    ask_size,
+                    bid_levels,
+                    ask_levels,
+                    ts,
+                } => builder.observe_typed_quote(
+                    self.next_sequence,
+                    recorded_at,
+                    recorded_at,
+                    TapeQuote {
+                        token_id,
+                        source_at: *ts,
+                        bid: *bid,
+                        ask: *ask,
+                        bid_size: *bid_size,
+                        ask_size: *ask_size,
+                        collection_result: collection_result.expect("quote collection status").1,
+                    },
+                    bid_levels.iter().map(|level| (level.price, level.size)),
+                    ask_levels.iter().map(|level| (level.price, level.size)),
+                ),
+                _ => {
+                    let value = serde_json::to_value(&record).map_err(io::Error::other)?;
+                    builder.observe(&value, recorded_at)
+                }
+            };
+            if let Err(error) = observed {
                 warn!(
                     path = %self.path.display(),
                     error = %error,
@@ -382,6 +430,7 @@ impl MarketUpdateLogWriter {
                 self.seal_builder = Some(builder);
             }
         }
+        self.next_sequence += 1;
 
         let is_lifecycle = matches!(
             update,
@@ -562,7 +611,10 @@ impl<F> RecordingFeed<F> {
         })
     }
 
-    fn prepare_recorded_update(&mut self, update: &MarketUpdate) -> Option<MarketUpdate> {
+    fn prepare_recorded_update<'a>(
+        &mut self,
+        update: &'a MarketUpdate,
+    ) -> Option<Cow<'a, MarketUpdate>> {
         match update {
             MarketUpdate::EventDiscovered { event_id, .. } => {
                 self.active_event_updates
@@ -653,15 +705,7 @@ impl<F> RecordingFeed<F> {
             _ => {}
         }
 
-        let mut recorded = update.clone();
-        if let MarketUpdate::Quote {
-            token_id,
-            bid_levels,
-            ask_levels,
-            ts,
-            ..
-        } = &mut recorded
-        {
+        if let MarketUpdate::Quote { token_id, ts, .. } = update {
             if let Some(sample_ms) = self.policy.quote_sample_ms.filter(|value| *value > 0) {
                 let sample_ms = i64::try_from(sample_ms).unwrap_or(i64::MAX);
                 if self
@@ -674,14 +718,32 @@ impl<F> RecordingFeed<F> {
                 self.last_quote_recorded_at
                     .insert(token_id.to_string(), *ts);
             }
-
-            if let Some(depth) = self.policy.quote_depth_levels {
+        }
+        if let Some(depth) = self.policy.quote_depth_levels {
+            if let MarketUpdate::Quote {
+                bid_levels,
+                ask_levels,
+                ..
+            } = update
+            {
+                if bid_levels.len() <= depth && ask_levels.len() <= depth {
+                    return Some(Cow::Borrowed(update));
+                }
+                let mut recorded = update.clone();
+                let MarketUpdate::Quote {
+                    bid_levels,
+                    ask_levels,
+                    ..
+                } = &mut recorded
+                else {
+                    unreachable!()
+                };
                 bid_levels.truncate(depth);
                 ask_levels.truncate(depth);
+                return Some(Cow::Owned(recorded));
             }
         }
-
-        Some(recorded)
+        Some(Cow::Borrowed(update))
     }
 }
 
@@ -933,6 +995,240 @@ mod tests {
     use chrono::Duration;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn borrowed_encoding_preserves_quote_and_failure_status_and_replay() {
+        use ploy_market_contracts::BookLevel;
+        let now = Utc::now();
+        let updates = [
+            MarketUpdate::Quote {
+                token_id: "up".into(),
+                bid: Some(dec!(0.49)),
+                ask: Some(dec!(0.51)),
+                bid_size: Some(dec!(2)),
+                ask_size: Some(dec!(3)),
+                bid_levels: vec![BookLevel {
+                    price: dec!(0.49),
+                    size: dec!(2),
+                }],
+                ask_levels: vec![BookLevel {
+                    price: dec!(0.51),
+                    size: dec!(3),
+                }],
+                ts: now,
+            },
+            MarketUpdate::Quote {
+                token_id: "empty".into(),
+                bid: None,
+                ask: None,
+                bid_size: None,
+                ask_size: None,
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: now,
+            },
+            MarketUpdate::QuoteCollectionFailure {
+                token_id: "up".into(),
+                request_started_at: now,
+                http_status: None,
+                error_kind: "transport".into(),
+                ts: now,
+            },
+            MarketUpdate::SpotPrice {
+                symbol: "BTCUSDT".into(),
+                price: dec!(100000),
+                ts: now,
+            },
+        ];
+        for (sequence, update) in updates.iter().enumerate() {
+            let status = quote_collection_result(update);
+            let mut legacy = serde_json::to_value(update).unwrap();
+            if let Some((request, result)) = status {
+                legacy["request_status"] = request.into();
+                legacy["collection_result"] = result.into();
+            }
+            let expected =
+                serde_json::json!({"sequence":sequence,"recorded_at":now,"update":legacy});
+            let record = BorrowedRecord {
+                sequence: sequence as u64,
+                recorded_at: now,
+                update: BorrowedUpdate {
+                    update,
+                    request_status: status.map(|v| v.0),
+                    collection_result: status.map(|v| v.1),
+                },
+            };
+            let bytes = serde_json::to_vec(&record).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                expected
+            );
+            assert_eq!(
+                serde_json::from_slice::<RecordedMarketUpdate>(&bytes)
+                    .unwrap()
+                    .update,
+                *update
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsampled_full_depth_policy_borrows_and_only_copies_for_truncation() {
+        use ploy_market_contracts::BookLevel;
+        let dir = tempfile::tempdir().unwrap();
+        let update = MarketUpdate::Quote {
+            token_id: "up".into(),
+            bid: Some(dec!(0.49)),
+            ask: Some(dec!(0.51)),
+            bid_size: Some(dec!(1)),
+            ask_size: Some(dec!(1)),
+            bid_levels: vec![
+                BookLevel {
+                    price: dec!(0.49),
+                    size: dec!(1)
+                };
+                99
+            ],
+            ask_levels: vec![
+                BookLevel {
+                    price: dec!(0.51),
+                    size: dec!(1)
+                };
+                99
+            ],
+            ts: Utc::now(),
+        };
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(vec![]),
+            dir.path().join("tape.ndjson"),
+            RecordingPolicy::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            feed.prepare_recorded_update(&update),
+            Some(Cow::Borrowed(_))
+        ));
+        feed.policy.quote_depth_levels = Some(5);
+        let Some(Cow::Owned(MarketUpdate::Quote {
+            bid_levels,
+            ask_levels,
+            ..
+        })) = feed.prepare_recorded_update(&update)
+        else {
+            panic!("depth policy must copy only its truncated view")
+        };
+        assert_eq!((bid_levels.len(), ask_levels.len()), (5, 5));
+        let MarketUpdate::Quote {
+            bid_levels,
+            ask_levels,
+            ..
+        } = update
+        else {
+            unreachable!()
+        };
+        assert_eq!((bid_levels.len(), ask_levels.len()), (99, 99));
+    }
+
+    #[test]
+    #[ignore = "bounded full-depth serialization and recording benchmark"]
+    fn full_depth_recording_throughput() {
+        use ploy_market_contracts::BookLevel;
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let update = MarketUpdate::Quote {
+            token_id: "up".into(),
+            bid: Some(dec!(0.49)),
+            ask: Some(dec!(0.51)),
+            bid_size: Some(dec!(1)),
+            ask_size: Some(dec!(1)),
+            bid_levels: (0..99)
+                .map(|i| BookLevel {
+                    price: Decimal::new(490 - i, 3),
+                    size: dec!(1),
+                })
+                .collect(),
+            ask_levels: (0..99)
+                .map(|i| BookLevel {
+                    price: Decimal::new(510 + i, 3),
+                    size: dec!(1),
+                })
+                .collect(),
+            ts: now,
+        };
+        const RECORDS: u64 = 20_000;
+        let status = quote_collection_result(&update).unwrap();
+        let mut legacy_file =
+            BufWriter::new(File::create(dir.path().join("legacy.ndjson")).unwrap());
+        let mut legacy_builder = MarketTapeManifestBuilder::new();
+        let start = std::time::Instant::now();
+        let mut old_bytes = 0;
+        for sequence in 0..RECORDS {
+            let recorded = update.clone();
+            let mut value = serde_json::to_value(&recorded).unwrap();
+            value["request_status"] = status.0.into();
+            value["collection_result"] = status.1.into();
+            let record = serde_json::json!({"sequence":sequence,"recorded_at":now,"update":value});
+            let mut line = serde_json::to_vec(&record).unwrap();
+            line.push(b'\n');
+            old_bytes += line.len();
+            legacy_file.write_all(&line).unwrap();
+            legacy_builder.observe(&record, now).unwrap();
+        }
+        legacy_file.flush().unwrap();
+        let old_elapsed = start.elapsed();
+        let mut writer = MarketUpdateLogWriter::create_with_policy(
+            dir.path().join("optimized.ndjson"),
+            RecordingLimits::default(),
+            None,
+            Some(TapeSealPolicy),
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..RECORDS {
+            assert_eq!(
+                writer.append(std::hint::black_box(&update)).unwrap(),
+                AppendOutcome::Written
+            );
+        }
+        writer.flush().unwrap();
+        let new_elapsed = start.elapsed();
+        assert!(writer.seal_builder.is_some());
+        assert_eq!(writer.next_sequence, RECORDS);
+        let old_manifest = legacy_builder
+            .finish("crypto_expiry", 0, 0, "tape.ndjson", 100)
+            .unwrap();
+        let new_manifest = writer
+            .seal_builder
+            .take()
+            .unwrap()
+            .finish("crypto_expiry", 0, 0, "tape.ndjson", 100)
+            .unwrap();
+        for field in [
+            "events",
+            "event_types",
+            "field_presence",
+            "field_non_null",
+            "quote_quality_complete",
+            "quote_coverage_complete",
+            "contextless_quote_tokens",
+        ] {
+            assert_eq!(old_manifest[field], new_manifest[field], "{field}");
+        }
+        // The old fixture fixes received time; append uses its real clock.
+        // Compare every quality counter except that intentional latency delta.
+        let mut old_quality = old_manifest["quality"].clone();
+        let mut new_quality = new_manifest["quality"].clone();
+        old_quality
+            .as_object_mut()
+            .unwrap()
+            .remove("max_quote_latency_ms");
+        new_quality
+            .as_object_mut()
+            .unwrap()
+            .remove("max_quote_latency_ms");
+        assert_eq!(old_quality, new_quality);
+        eprintln!("full_depth_recording records={RECORDS} levels_per_side=99 legacy_ms={} optimized_ms={} speedup={:.2} legacy_MBps={:.2} optimized_MBps={:.2}",old_elapsed.as_millis(),new_elapsed.as_millis(),old_elapsed.as_secs_f64()/new_elapsed.as_secs_f64(),old_bytes as f64/old_elapsed.as_secs_f64()/1e6,writer.bytes_written as f64/new_elapsed.as_secs_f64()/1e6);
+    }
 
     fn temp_log_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
