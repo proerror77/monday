@@ -309,7 +309,9 @@ for workflow in \
   pinned_toolchains=$(grep -Fxc '          toolchain: 1.98.1' "$workflow")
   test "$stable_uses" -eq "$pinned_toolchains"
 done
-grep -Fqx '    container: rust:1.98.1-bookworm' "$script_dir/../workflows/ploy-ci.yml"
+# Research software runs under the private ACK profile, so public metadata
+# jobs carry neither a compiler container nor its cache/toolchain setup.
+grep -Fq 'wait-ack-research-receipt.sh research-image-binaries "$(git rev-parse HEAD)"' "$script_dir/../workflows/ploy-ci.yml"
 # shellcheck disable=SC2016
 always_condition='    if: ${{ always() }}'
 grep -Fqx '    needs: selector' "$ci_workflow"
@@ -392,7 +394,7 @@ recorder_block=$(job_block market_recorder_contract)
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
+grep -Fq "if: \${{ (always() && needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}" <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
@@ -458,12 +460,10 @@ ploy_job_block() {
   awk -v job="^  $1:" '$0 ~ job {found=1; next} /^  [a-z0-9-]+:/ {found=0} found' "$ploy_workflow"
 }
 for ploy_rust_job in \
-  research-image-binaries \
   rust-control-plane \
   rust-runner-lean \
   rust-runner-full \
   rust-market-data \
-  rust-research-heavy \
   integration-regressions; do
   ploy_block=$(ploy_job_block "$ploy_rust_job")
   [ -n "$ploy_block" ]
@@ -476,9 +476,43 @@ for ploy_rust_job in \
   grep -Fq 'steps.cache-info.outputs.sccache' <<<"$ploy_block"
   if grep -Fq -- '}}-${{ github.sha }}' <<<"$ploy_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 done
-research_image_block=$(ploy_job_block research-image-binaries)
-grep -Fqx '    timeout-minutes: 45' <<<"$research_image_block"
-if grep -Fq 'SCCACHE_GHA_RW_MODE' <<<"$research_image_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+# Fixed ACK profiles preserve the selected public job identities while
+# rejecting hosted execution. Scope and selected-job Gate cases above/below
+# remain unchanged: a failed/missing receipt fails the same selected job.
+for mapping in \
+  research-image-binaries:research-image-binaries \
+  research-image-smoke:research-image-smoke \
+  rust-format:prediction-research-format \
+  rust-research-heavy:prediction-research-heavy; do
+  job=${mapping%%:*}
+  profile=${mapping#*:}
+  relay_block=$(ploy_job_block "$job")
+  grep -Fqx '    runs-on: ubuntu-latest' <<<"$relay_block"
+  grep -Fqx '    timeout-minutes: 360' <<<"$relay_block"
+  grep -Fq "wait-ack-research-receipt.sh $profile \"\$(git rev-parse HEAD)\"" <<<"$relay_block"
+  if grep -Eq 'container:|RUSTC_WRAPPER:|SCCACHE_GHA_ENABLED:|uses: (docker/|dtolnay/rust-toolchain|Swatinem/rust-cache|mozilla-actions/sccache)|(^|[[:space:]])(cargo|docker) (build|test|run|check|clippy|fmt)' <<<"$relay_block"; then
+    echo "selected research job $job still executes on a public hosted runner" >&2
+    exit 1
+  fi
+done
+for mapping in rust:ci-rust rust_fast_gates:ci-rust-fast-gates; do
+  job=${mapping%%:*}
+  profile=${mapping#*:}
+  mixed_block=$(job_block "$job")
+  grep -Fq "wait-ack-research-receipt.sh $profile \"\$(git rev-parse HEAD)\"" <<<"$mixed_block"
+  grep -Fq "if: needs.scope.outputs.ack_research == 'true'" <<<"$mixed_block"
+done
+# Verify every native mixed-lane action keeps its non-research guard; a
+# newly-added unguarded compiler/setup step must fail this contract.
+ruby -ryaml - "$ci_workflow" <<'RUBY'
+ci=YAML.safe_load(File.read(ARGV.fetch(0)))
+%w[rust rust_fast_gates].each do |id|
+  ci.fetch('jobs').fetch(id).fetch('steps').each do |step|
+    next if step.fetch('uses','').include?('actions/checkout@') || step.fetch('run','').include?('wait-ack-research-receipt.sh')
+    abort "unguarded native research action in #{id}" unless step.fetch('if','').include?("needs.scope.outputs.ack_research != 'true'")
+  end
+end
+RUBY
 
 deletion_repo="$tmp_dir/deletion-repo"
 mkdir -p "$deletion_repo/rust_hft/tools/collector/src"
