@@ -1630,8 +1630,9 @@ retention_terminal_spool() {
       count=$((count + 1)); selected="$QUEUE_MARKET_ROOT/$job_id.$suffix"
     fi
   done
-  (( count == 1 )) && [[ $selected == *.failed || $selected == *.stale ]] \
-    || fail 'retain requires exactly one terminal failed or stale state'
+  if (( count != 1 )) || [[ $selected != *.failed && $selected != *.stale ]]; then
+    fail 'retain requires exactly one terminal failed or stale state'
+  fi
   printf '%s\n' "$selected"
 }
 
