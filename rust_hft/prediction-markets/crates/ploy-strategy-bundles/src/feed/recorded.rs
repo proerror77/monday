@@ -24,10 +24,32 @@ use polymarket_tape_contract::{
 };
 
 const FLUSH_EVERY_RECORDS: usize = 256;
+// Keep the recent write window cached. Revisit the complete older prefix so
+// pages still dirty at the previous advisory call can be reclaimed later.
+const TAPE_CACHE_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 // Snapshot lifecycle state for ordinary updates only once the writer is this
 // close to max_bytes. Lifecycle boundary updates bypass the margin because
 // preparing them mutates the state that must be replayed after rotation.
 const SIZE_ROTATION_SNAPSHOT_MARGIN_BYTES: u64 = 1024 * 1024;
+
+fn discard_tape_cache(file: &File, length: u64) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let length = i64::try_from(length).map_err(io::Error::other)?;
+        // SAFETY: File owns this live descriptor. fadvise takes no pointers and
+        // only advises cache eviction; it does not delete file bytes or discard
+        // dirty data. Length zero covers the whole closed, synced file.
+        let code =
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, length, libc::POSIX_FADV_DONTNEED) };
+        if code != 0 {
+            return Err(io::Error::from_raw_os_error(code));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, length);
+    Ok(())
+}
 
 fn rotation_path(path: &Path) -> PathBuf {
     let ts = Utc::now().format("%Y%m%dT%H%M%S%6f");
@@ -180,6 +202,7 @@ struct MarketUpdateLogWriter {
     seal_policy: Option<TapeSealPolicy>,
     seal_builder: Option<MarketTapeManifestBuilder>,
     line_buffer: Vec<u8>,
+    last_cache_advice_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -347,6 +370,7 @@ impl MarketUpdateLogWriter {
             seal_policy,
             seal_builder: seal_policy.map(|_| MarketTapeManifestBuilder::new()),
             line_buffer: Vec::with_capacity(4096),
+            last_cache_advice_bytes: 0,
         })
     }
 
@@ -454,6 +478,18 @@ impl MarketUpdateLogWriter {
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()?;
         self.pending_records = 0;
+        let cold_bytes = self.bytes_written.saturating_sub(TAPE_CACHE_WINDOW_BYTES);
+        if cold_bytes > 0
+            && self
+                .bytes_written
+                .saturating_sub(self.last_cache_advice_bytes)
+                >= TAPE_CACHE_WINDOW_BYTES
+        {
+            if let Err(error) = discard_tape_cache(self.writer.get_ref(), cold_bytes) {
+                warn!(error = %error, "Could not release cold tape cache pages");
+            }
+            self.last_cache_advice_bytes = self.bytes_written;
+        }
         Ok(())
     }
 
@@ -510,10 +546,14 @@ impl MarketUpdateLogWriter {
             );
             return Ok(None);
         }
-        self.writer = BufWriter::new(file);
+        if let Err(error) = discard_tape_cache(self.writer.get_ref(), 0) {
+            warn!(error = %error, "Could not release closed tape cache pages");
+        }
+        self.writer = BufWriter::with_capacity(64 * 1024, file);
         self.next_sequence = 0;
         self.pending_records = 0;
         self.bytes_written = 0;
+        self.last_cache_advice_bytes = 0;
         self.rotation_bucket = rotation_bucket(self.rotate_seconds);
         self.rotation_retry_after = None;
         if let (Some(builder), Some(policy)) = (self.seal_builder.take(), self.seal_policy) {
@@ -1234,6 +1274,26 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("ploy-{name}-{}.ndjson", uuid::Uuid::new_v4()));
         path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cache_advice_preserves_dirty_and_synced_tape_bytes_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tape.ndjson");
+        let mut file = File::create(&path).unwrap();
+        let payload = vec![b'x'; 1024 * 1024];
+        file.write_all(&payload).unwrap();
+        let identity = TapeFileIdentity::from_metadata(&file.metadata().unwrap());
+        discard_tape_cache(&file, payload.len() as u64).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), payload);
+        file.sync_all().unwrap();
+        discard_tape_cache(&file, 0).unwrap();
+        assert_eq!(
+            TapeFileIdentity::from_metadata(&file.metadata().unwrap()),
+            identity
+        );
+        assert_eq!(fs::read(&path).unwrap(), payload);
     }
 
     #[tokio::test]
