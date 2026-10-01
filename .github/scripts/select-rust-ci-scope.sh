@@ -225,6 +225,13 @@ else
 fi
 
 needs_metadata=false
+lock_packages='[]'
+lock_base=
+lock_head=
+if [[ -n $base ]]; then
+  lock_base=$(git merge-base "$base" "$head")
+  lock_head=$(git rev-parse "$head^{commit}")
+fi
 for path in "${paths[@]}"; do
   # workspace_runtime_retirement reads files directly, beyond Cargo's dependency
   # graph. Include the whole prediction tree (also its operational docs), retired
@@ -291,7 +298,20 @@ for path in "${paths[@]}"; do
     rust_hft/prediction-markets/*.md)
       continue
       ;;
-    rust_hft/prediction-markets/Cargo.toml|rust_hft/prediction-markets/Cargo.lock)
+    rust_hft/Cargo.lock|rust_hft/prediction-markets/Cargo.lock)
+      if [[ -n $lock_base ]] && narrowed=$(bash "$(dirname "${BASH_SOURCE[0]}")/local-lock-impact.sh" "$lock_base" "$lock_head" "$path"); then
+        lock_packages=$(jq -cn --argjson prior "$lock_packages" --argjson names "$narrowed" --arg workspace "${path%/Cargo.lock}" '$prior + [$names[] | {name:.,workspace:$workspace}]')
+        needs_metadata=true
+      elif [[ $path == rust_hft/prediction-markets/Cargo.lock ]]; then
+        select_all_ploy_jobs
+      else
+        select_all
+        select_all_rust_ci_jobs
+        select_research_image_jobs
+      fi
+      continue
+      ;;
+    rust_hft/prediction-markets/Cargo.toml)
       select_all_ploy_jobs
       continue
       ;;
@@ -303,7 +323,7 @@ for path in "${paths[@]}"; do
     rust_hft/*/Cargo.toml)
       needs_metadata=true
       ;;
-    rust_hft/Cargo.toml|rust_hft/Cargo.lock)
+    rust_hft/Cargo.toml)
       select_all
       select_all_rust_ci_jobs
       select_research_image_jobs
@@ -329,6 +349,7 @@ for path in "${paths[@]}"; do
       ;;
     .github/workflows/ci.yml|.github/workflows/ploy-ci.yml|.github/workflows/security-enabled.yml|\
     .github/scripts/select-rust-ci-scope.sh|\
+    .github/scripts/local-lock-impact.sh|.github/scripts/test-local-lock-impact.mjs|\
     .github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*|\
     .github/scripts/verify-ci-gate.sh|.github/scripts/test-ci-monitor-scope.sh|\
     .github/scripts/test-agent-validation-gates.sh|.github/scripts/test-workflow-queue-lint.sh)
@@ -463,6 +484,27 @@ if [[ -z $metadata ]]; then
   jq -s '{packages: [.[].packages[]]}' \
     "$metadata_dir/rust-hft.json" "$metadata_dir/prediction-markets.json" >"$metadata"
 fi
+
+# Turn proven local lock edits into owning manifest paths, then use the same
+# reverse-dependency traversal as source changes. Unknown ownership fails closed.
+while IFS=$'\t' read -r lock_package lock_workspace; do
+  [[ -n $lock_package ]] || continue
+  manifests=$(jq -c --arg name "$lock_package" --arg root "$repo_root/" \
+    '[.packages[] | select(.name==$name) | .manifest_path | ltrimstr($root) | select(startswith("rust_hft/"))] | unique' "$metadata")
+  # A path dependency may belong to the other workspace. Root packages are
+  # deliberately skipped by ordinary ownership, so preserve their broad lane.
+  if [[ $(jq length <<<"$manifests") != 1 || $lock_package == rust-hft-workspace || $lock_package == ploy ]]; then
+    if [[ $lock_workspace == rust_hft/prediction-markets ]]; then
+      select_all_ploy_jobs
+    else
+      select_all
+      select_all_rust_ci_jobs
+      select_research_image_jobs
+    fi
+  else
+    paths+=("$(jq -r '.[0]' <<<"$manifests")")
+  fi
+done < <(jq -r '.[] | [.name,.workspace] | @tsv' <<<"$lock_packages")
 
 declare -a package_names=() package_dirs=() package_dependencies=()
 while IFS=$'\t' read -r name manifest dependencies; do

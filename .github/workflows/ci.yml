@@ -45,7 +45,6 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          .github/scripts/test-select-rust-ci-scope.sh
           .github/scripts/select-rust-ci-scope.sh \
             --event "${{ github.event_name }}" \
             --base "${BASE_SHA}" \
@@ -200,6 +199,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Verify selection, cancellation and aggregate admission
         run: |
+          node .github/scripts/test-local-lock-impact.mjs
           .github/scripts/test-select-rust-ci-scope.sh
           .github/scripts/test-ci-monitor-scope.sh
           .github/scripts/test-agent-validation-gates.sh
