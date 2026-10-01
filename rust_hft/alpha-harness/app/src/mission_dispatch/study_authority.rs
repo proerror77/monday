@@ -144,6 +144,13 @@ fn retain<T: Serialize + DeserializeOwned + PartialEq>(
         return Ok(());
     }
     let parent = path.parent().context("authority output parent")?;
+    // A bare relative filename has an empty parent. Sync the current directory
+    // after persistence instead of failing after the signed file already exists.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(&bytes)?;
     file.as_file().sync_all()?;
@@ -673,6 +680,22 @@ mod tests {
             trusted_keys: f.args.trusted_keys.clone(),
             output: f.root.path().join("signed-root-output.json"),
         }
+    }
+    #[test]
+    fn study_authority_retains_bare_relative_output_without_a_false_failure() {
+        let cleanup = tempfile::NamedTempFile::new_in(".")
+            .unwrap()
+            .into_temp_path();
+        let output = PathBuf::from(cleanup.file_name().unwrap());
+        std::fs::remove_file(&cleanup).unwrap();
+        let value = json!({"fixture": "relative-authority-output"});
+        retain(&output, &value).unwrap();
+        retain(&output, &value).unwrap();
+        assert_eq!(read::<Value>(&output).unwrap(), value);
+        assert!(retain(&output, &json!({"fixture": "different"})).is_err());
+        assert_eq!(read::<Value>(&output).unwrap(), value);
+        // TempPath cleans the recreated file even if an assertion fails.
+        drop(cleanup);
     }
     #[test]
     fn study_authority_signatures_are_native_pinned_and_create_once() {
