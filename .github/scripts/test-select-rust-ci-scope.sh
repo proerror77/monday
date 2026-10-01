@@ -626,6 +626,44 @@ ci=YAML.safe_load(File.read(ARGV.fetch(0)))
 end
 RUBY
 
+# The relay derives its own ACK scope for these profiles by resolving
+# `git diff "$base...$head"` and `git merge-base "$base" "$head"` from the PR
+# event's base/head SHAs, so the checked-out object database must contain both
+# commits. A default depth-1 checkout keeps only the PR merge commit and the
+# relay dies with `Not a valid commit name`. Every relay job for a derived
+# profile therefore needs a full-history checkout; the expected job map keeps
+# this scan from passing vacuously if a command shape or file drifts.
+ruby -ryaml - \
+  "$ci_workflow" \
+  "$script_dir/../workflows/security-enabled.yml" \
+  "$script_dir/../workflows/ploy-ci.yml" <<'RUBY'
+derived = %w[ci-rust security-clippy-research research-image-binaries]
+expected = {
+  'ci.yml' => %w[rust],
+  'security-enabled.yml' => %w[clippy-strict],
+  'ploy-ci.yml' => %w[research-image-binaries]
+}
+relays = Hash.new { |hash, key| hash[key] = [] }
+ARGV.each do |path|
+  name = File.basename(path)
+  YAML.safe_load(File.read(path)).fetch('jobs').each do |id, job|
+    steps = job.fetch('steps', [])
+    profiles = steps.map { |step| step.fetch('run', '')[/wait-ack-research-receipt\.sh\s+(\S+)/, 1] }.compact
+                    .select { |profile| derived.include?(profile) }
+    next if profiles.empty?
+    relays[name] << id
+    checkouts = steps.select { |step| step.fetch('uses', '').include?('actions/checkout@') }
+    abort "derived ACK relay in #{name}:#{id} has no checkout step" if checkouts.empty?
+    next if checkouts.any? { |step| (step['with'] || {}).fetch('fetch-depth', nil).to_s == '0' }
+
+    abort "#{name}:#{id} relays #{profiles.uniq.join(',')} without a full-history checkout"
+  end
+end
+expected.each do |name, ids|
+  abort "derived ACK relay jobs drifted in #{name}: expected #{ids.sort}, got #{relays[name].sort}" unless relays[name].sort == ids.sort
+end
+RUBY
+
 deletion_repo="$tmp_dir/deletion-repo"
 mkdir -p "$deletion_repo/rust_hft/tools/collector/src"
 git -C "$deletion_repo" init -q
