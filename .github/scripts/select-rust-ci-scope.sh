@@ -353,6 +353,13 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
+    .github/scripts/run-collector-control-contracts.py|.github/scripts/test-collector-control-scheduling.py)
+      control=true
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
     .github/workflows/ci.yml|.github/workflows/ploy-ci.yml|.github/workflows/security-enabled.yml|\
     .github/scripts/select-rust-ci-scope.sh|\
     .github/scripts/local-lock-impact.sh|.github/scripts/test-local-lock-impact.mjs|\
