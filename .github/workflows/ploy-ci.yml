@@ -212,6 +212,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Wait for signed ACK execution receipt
         id: ack
         working-directory: .

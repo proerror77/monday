@@ -241,6 +241,8 @@ jobs:
         working-directory: rust_hft
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         if: needs.security-scope.outputs.ack_research != 'true'
