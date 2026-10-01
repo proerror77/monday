@@ -28,5 +28,8 @@ RestrictAddressFamilies=AF_INET AF_INET6
 UMask=0027
 CPUQuota=200%
 Nice=10
+# Bound physical reads across the uploader and all compression/readback children.
+IOAccounting=true
+IOReadBandwidthMax=/data 67108864
 MemoryHigh=2G
 MemoryMax=3G

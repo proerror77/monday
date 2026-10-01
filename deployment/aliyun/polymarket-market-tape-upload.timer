@@ -3,7 +3,8 @@ Description=Retry closed Monday Polymarket tape uploads after the prior run
 
 [Timer]
 OnBootSec=5min
-OnUnitInactiveSec=5min
+OnUnitInactiveSec=1min
+AccuracySec=1s
 Unit=polymarket-market-tape-upload.service
 
 [Install]
