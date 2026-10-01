@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import tempfile
@@ -118,6 +119,53 @@ class Scheduling(unittest.TestCase):
             stat = Path(f"/proc/{pid}/stat")
             self.assertTrue(not stat.exists() or stat.read_text().split(") ", 1)[1][0] == "Z",
                             f"descendant {pid} survived cancellation")
+
+
+class FeeAdmission(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="fee-ci-admission-test-")
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        source = RUNNER.resolve().parents[2]
+        self.script = root / "deployment/aliyun/test-binance-fee-cutover.sh"
+        self.workflow = root / ".github/workflows/ci.yml"
+        self.runner = root / ".github/scripts/run-collector-control-contracts.py"
+        for target, original in ((self.script, source / "deployment/aliyun/test-binance-fee-cutover.sh"),
+                                 (self.workflow, source / ".github/workflows/ci.yml"),
+                                 (self.runner, RUNNER)):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(original.read_text())
+
+    def check(self):
+        return subprocess.run(["bash", str(self.script), "--check-ci-registration"],
+                              text=True, capture_output=True, timeout=5)
+
+    def test_live_workflow_and_registration(self):
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_missing_workflow_invocation_is_rejected(self):
+        text, count = re.subn(r'^ +python3 \.\./\.github/scripts/run-collector-control-contracts\.py *\n',
+                             '', self.workflow.read_text(), flags=re.MULTILINE)
+        self.assertEqual(count, 1)
+        self.workflow.write_text(text)
+        result = self.check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('workflow must invoke', result.stderr)
+
+    def test_missing_registration_is_rejected(self):
+        self.runner.write_text(self.runner.read_text().replace(
+            '    "test-binance-fee-cutover.sh",\n', ''))
+        result = self.check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('register the fee cutover contract', result.stderr)
+
+    def test_comment_is_not_a_registration(self):
+        self.runner.write_text(self.runner.read_text().replace(
+            '    "test-binance-fee-cutover.sh",', '    # "test-binance-fee-cutover.sh",'))
+        result = self.check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('register the fee cutover contract', result.stderr)
 
 
 if __name__ == "__main__":
