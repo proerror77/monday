@@ -762,7 +762,7 @@ assert_docker_publish_triggers() {
   local trigger_block
   trigger_block=$(sed -n '/^  workflow_run:$/,/^  workflow_dispatch:$/p' "$1")
   [[ $trigger_block == "$expected_docker_publish_triggers" ]] || return 1
-  grep -Fq '.github/scripts/select-rust-ci-scope.sh --event push --base "${SOURCE_SHA}^" --head "$SOURCE_SHA"' "$1" &&
+  grep -Fq 'bash .github/scripts/select-main-image-scope.sh "$SOURCE_SHA" "$plan"' "$1" &&
     grep -Fq 'any(.include[]; .name=="hft-core")' "$1"
 }
 assert_docker_publish_triggers "$docker_publish_workflow"

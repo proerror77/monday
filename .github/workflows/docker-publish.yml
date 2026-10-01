@@ -39,7 +39,7 @@ jobs:
           # Admission code always comes from trusted main, before any source
           # from the triggering workflow is considered for a privileged build.
           ref: refs/heads/main
-          fetch-depth: 2
+          fetch-depth: 0
       - name: Verify exact-source release admission
         id: admission
         env:
@@ -67,7 +67,7 @@ jobs:
             fi
             # Reuse the same artifact dependency plan as smoke/security CI.
             plan=$(mktemp)
-            .github/scripts/select-rust-ci-scope.sh --event push --base "${SOURCE_SHA}^" --head "$SOURCE_SHA" --output "$plan"
+            bash .github/scripts/select-main-image-scope.sh "$SOURCE_SHA" "$plan"
             matrix=$(sed -n 's/^image_matrix=//p' "$plan")
             rm "$plan"
             if ! jq -e 'any(.include[]; .name=="hft-core")' <<<"$matrix" >/dev/null; then
@@ -191,6 +191,8 @@ jobs:
             [[ -n "$tag" ]] || continue
             docker tag "$image_id" "$tag"
             docker push "$tag"
+            # Buildx formatted Manifest JSON includes its descriptor digest;
+            # raw OCI JSON (--raw) does not. See Docker inspect JSON-output docs.
             digest=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -er '.digest|select(test("^sha256:[0-9a-f]{64}$"))')
             immutable="${tag%:*}@$digest"
             docker pull "$immutable"

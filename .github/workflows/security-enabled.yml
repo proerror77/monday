@@ -11,7 +11,7 @@ on:
 
 concurrency:
   group: security-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,9 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      image_matrix: ${{ steps.scope.outputs.image_matrix }}
+      image_matrix: ${{ steps.images.outputs.image_matrix || steps.scope.outputs.image_matrix }}
       ack_research: ${{ steps.ack.outputs.ack_research }}
-      jobs: ${{ steps.scope.outputs.security_jobs }}
+      jobs: ${{ steps.images.outputs.security_jobs || steps.scope.outputs.security_jobs }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
       clippy_loop: ${{ steps.scope.outputs.clippy_loop }}
       clippy_handoff: ${{ steps.scope.outputs.clippy_handoff }}
@@ -42,6 +42,14 @@ jobs:
           --event "${GITHUB_EVENT_NAME}"
           --base "${BASE_SHA}"
           --head "${HEAD_SHA}"
+
+      - name: Carry unpublished image changes forward on main
+        id: images
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          SELECTED_SECURITY_JOBS: ${{ steps.scope.outputs.security_jobs }}
+          SELECTED_IMAGE_MATRIX: ${{ steps.scope.outputs.image_matrix }}
+        run: bash .github/scripts/select-main-image-scope.sh "$GITHUB_SHA" "$GITHUB_OUTPUT"
 
       - name: Classify research execution scope
         id: ack

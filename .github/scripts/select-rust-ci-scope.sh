@@ -271,6 +271,10 @@ for path in "${paths[@]}"; do
       select_research_image_jobs
       continue
       ;;
+    .dockerignore)
+      select_job ci/deployment-artifacts
+      continue
+      ;;
     rust_hft/.dockerignore)
       select_job ci/deployment-artifacts
       select_job ci/polymarket-evidence-compiler-image
@@ -354,6 +358,8 @@ for path in "${paths[@]}"; do
     .github/scripts/local-lock-impact.sh|.github/scripts/test-local-lock-impact.mjs|\
     .github/scripts/image-build-plan.sh|.github/scripts/test-image-build-plan.sh|\
     .github/scripts/read-tested-image.sh|.github/scripts/test-tested-image.sh|\
+    .github/scripts/read-published-image-source.sh|.github/scripts/select-main-image-scope.sh|\
+    .github/scripts/test-main-image-scope.sh|\
     .github/workflows/docker-smoke.yml|.github/workflows/docker-publish.yml|\
     .github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*|\
     .github/scripts/verify-ci-gate.sh|.github/scripts/test-ci-monitor-scope.sh|\
