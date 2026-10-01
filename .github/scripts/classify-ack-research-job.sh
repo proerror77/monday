@@ -48,12 +48,17 @@ if [[ $detect == true ]]; then
       esac
     done < "$changed_paths"
   fi
-  printf 'ack_research=%s\n' "$research" >> "${GITHUB_OUTPUT:-/dev/stdout}"
+  if [[ -n ${GITHUB_OUTPUT:-} ]]; then
+    printf 'ack_research=%s\n' "$research" >> "$GITHUB_OUTPUT"
+  else
+    printf 'ack_research=%s\n' "$research"
+  fi
   exit 0
 fi
 
 backend=github profile=
 case "$job" in
+  ci/research-preflight) [[ $research == false ]] || { backend=ack; profile=ci-research-preflight; } ;;
   ci/rust) [[ $research == false ]] || { backend=ack; profile=ci-rust; } ;;
   ci/rust-fast-gates) [[ $research == false ]] || { backend=ack; profile=ci-rust-fast-gates; } ;;
   security/clippy-strict) [[ $research == false ]] || { backend=ack; profile=security-clippy-research; } ;;

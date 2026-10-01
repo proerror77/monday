@@ -10,7 +10,7 @@ classify() {
   bash "$classifier" --repository proerror77/monday --event pull_request \
     --head-repository proerror77/monday "$@"
 }
-for job in ci/rust ci/rust-fast-gates security/clippy-strict; do
+for job in ci/research-preflight ci/rust ci/rust-fast-gates security/clippy-strict; do
   result=$(classify --job "$job" --research true)
   [[ $result == backend=ack$'\n'profile=* ]] || { echo "research job used another backend: $job" >&2; exit 1; }
   result=$(classify --job "$job" --research false)
@@ -57,10 +57,15 @@ printf 'research\n' > "$temporary/repo/rust_hft/tools/collector/src/bin/research
 git -C "$temporary/repo" add .
 git -C "$temporary/repo" commit -qm research
 head=$(git -C "$temporary/repo" rev-parse HEAD)
-result=$(cd "$temporary/repo"; GITHUB_OUTPUT=/dev/stdout bash "$classifier" --detect-scope --repository proerror77/monday --event push --loop false --base "$base" --head "$head")
+detect() {
+  : > "$temporary/detect-output"
+  (cd "$temporary/repo"; GITHUB_OUTPUT="$temporary/detect-output" bash "$classifier" --detect-scope --repository proerror77/monday --event push "$@")
+  cat "$temporary/detect-output"
+}
+result=$(detect --loop false --base "$base" --head "$head")
 [[ $result == ack_research=true ]]
-result=$(cd "$temporary/repo"; GITHUB_OUTPUT=/dev/stdout bash "$classifier" --detect-scope --repository proerror77/monday --event push --loop false --base "$head" --head "$head")
+result=$(detect --loop false --base "$head" --head "$head")
 [[ $result == ack_research=false ]]
-result=$(cd "$temporary/repo"; GITHUB_OUTPUT=/dev/stdout bash "$classifier" --detect-scope --repository proerror77/monday --event push --loop true --base "$head" --head "$head")
+result=$(detect --loop true --base "$head" --head "$head")
 [[ $result == ack_research=true ]]
 echo 'ACK research routing metadata contracts passed'
