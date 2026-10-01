@@ -28,5 +28,9 @@ RestrictAddressFamilies=AF_INET AF_INET6
 UMask=0027
 CPUQuota=200%
 Nice=10
+# Bound physical reads across the uploader and all compression/readback children.
+# A single 4 GiB compression pass saturated /data while recorders entered D-state.
+IOAccounting=true
+IOReadBandwidthMax=/data 33554432
 MemoryHigh=2G
 MemoryMax=3G
