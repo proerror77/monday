@@ -393,9 +393,19 @@ for path in "${paths[@]}"; do
       printf 'unmapped CI path: %s; add its owning contract mapping before dispatch\n' "$path" >&2
       exit 2
       ;;
+    deployment/aliyun/research/scripts/cex-materialization-entrypoint.sh|\
+    deployment/aliyun/research/scripts/campaign-cycle-controller.sh|\
+    deployment/aliyun/research/scripts/campaign-job-watch.sh|\
+    deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml)
+      # These files are copied into the controller image. Other experiment/job
+      # configuration is supplied at runtime and cannot change its binaries.
+      research_image_relevant=true
+      control=true
+      select_job ci/deployment-artifacts
+      continue
+      ;;
     rust_hft/deployment/k8s/*|deployment/aliyun/research/k8s/*)
       select_job ci/deployment-artifacts
-      [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
       continue
       ;;
     deployment/aliyun/polymarket-market-recorder-deploy.sh|\
@@ -437,7 +447,6 @@ for path in "${paths[@]}"; do
       ;;
     deployment/aliyun/*)
       control=true
-      [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
       ;;
     docs/*|*.md|LICENSE*)
       continue

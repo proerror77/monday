@@ -146,7 +146,7 @@ job_cases=(
   'backtest|pull_request|backtest.txt|ploy/research-image-binaries,ci/rust|hft-backtest'
   'live-push|push|live.txt|ci/rust,ci/deployment-artifacts'
   'trading-dockerfile-push|push|trading-dockerfile.txt|ci/deployment-artifacts'
-  'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts,ploy/research-image-binaries,ploy/research-image-smoke'
+  'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts'
   'acr-workflow-push|push|acr-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
   'full|push|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ploy/research-image-binaries,ploy/research-image-smoke,ci/deployment-artifacts'
 )

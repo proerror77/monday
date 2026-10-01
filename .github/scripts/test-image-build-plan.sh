@@ -31,3 +31,13 @@ for scenario in research policy; do
   if grep '^security_jobs=' "$tmp/$scenario" | grep -q 'container-scan'; then exit 1; fi
 done
 printf 'PASS: source dependencies and recipe paths choose individual images; research/policy changes do not build unrelated runtime images\n'
+
+for scenario in experiment-config embedded-controller; do
+  if [[ $scenario == experiment-config ]]; then path=deployment/aliyun/research/backtest/default.yaml
+  else path=deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml; fi
+  printf '%s\n' "$path" >"$tmp/paths"
+  GITHUB_REF=refs/heads/main bash "$root/select-rust-ci-scope.sh" --event push --changed-files "$tmp/paths" --metadata "$root/fixtures/rust-ci-scope/metadata.fixture" --output "$tmp/$scenario"
+done
+if grep '^jobs=' "$tmp/experiment-config" | grep -q 'research-image'; then exit 1; fi
+grep '^jobs=' "$tmp/embedded-controller" | grep -q 'research-image-binaries'
+printf 'PASS: runtime experiment config does not rebuild research software; embedded image input still does\n'
