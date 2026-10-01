@@ -103,7 +103,7 @@ jobs:
           ref: ${{ needs.release-admission.outputs.source_sha }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Retrieve and verify the tested image
         id: tested
@@ -128,7 +128,7 @@ jobs:
       # when no retained artifact exists. Automatic publication never rebuilds.
       - name: Build explicit release image when no retained artifact exists
         if: steps.tested.outputs.build == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: rust_hft
           file: rust_hft/docker/Dockerfile
@@ -141,7 +141,7 @@ jobs:
 
       - name: Scan explicitly built release image
         if: steps.tested.outputs.build == 'true'
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@d2a0b60797ff03db6132bd4e2b293f9b37081297 # master resolved 2026-10-01
         with:
           image-ref: monday-tested:hft-core-${{ needs.release-admission.outputs.source_sha }}
           severity: 'CRITICAL,HIGH'
