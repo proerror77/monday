@@ -442,11 +442,17 @@ for path in "${paths[@]}"; do
       select_job ploy/integration-regressions
       select_job ci/rust
       ;;
+    deployment/aliyun/research/backtest/*|deployment/aliyun/research/examples/*|\
+    deployment/aliyun/research/builder/*)
+      control=true
+      continue
+      ;;
     deployment/aliyun/*.md)
       continue
       ;;
     deployment/aliyun/*)
       control=true
+      [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
       ;;
     docs/*|*.md|LICENSE*)
       continue
