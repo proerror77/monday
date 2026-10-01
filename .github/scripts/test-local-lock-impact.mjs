@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
-import {mkdtempSync, writeFileSync, rmSync, mkdirSync} from 'node:fs';
+import {mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {fileURLToPath} from 'node:url';
 const script = fileURLToPath(new URL('./local-lock-impact.sh', import.meta.url));
@@ -58,7 +58,9 @@ try {
   const selector = fileURLToPath(new URL('./select-rust-ci-scope.sh',import.meta.url));
   const metadata = fileURLToPath(new URL('./fixtures/rust-ci-scope/metadata.fixture',import.meta.url));
   for (const event of ['pull_request','push']) {
-    const out = execFileSync('bash',[selector,'--base',base,'--head',head,'--event',event,'--metadata',metadata,'--output','/dev/stdout'],{cwd:repo,encoding:'utf8'});
+    writeFileSync(`${repo}/scope.out`, '');
+    execFileSync('bash',[selector,'--base',base,'--head',head,'--event',event,'--metadata',metadata,'--output',`${repo}/scope.out`],{cwd:repo,encoding:'utf8'});
+    const out = readFileSync(`${repo}/scope.out`, 'utf8');
     assert.match(out,/ci\/rust-hft-engine-fast-lane/);
     assert.match(out,/owning_packages=,hft-core,/);
     assert.match(out,/collector=false/); assert.match(out,/handoff=false/);
@@ -66,7 +68,9 @@ try {
   }
   writeFileSync(`${repo}/rust_hft/Cargo.lock`, lock.replace('checksum = "abc"','checksum = "def"'));
   git('commit','-am','external package');
-  const out = execFileSync('bash',[selector,'--base',base,'--head',git('rev-parse','HEAD'),'--event','pull_request','--metadata',metadata,'--output','/dev/stdout'],{cwd:repo,encoding:'utf8',stdio:['ignore','pipe','pipe']});
+  writeFileSync(`${repo}/scope.out`, '');
+  execFileSync('bash',[selector,'--base',base,'--head',git('rev-parse','HEAD'),'--event','pull_request','--metadata',metadata,'--output',`${repo}/scope.out`],{cwd:repo,encoding:'utf8',stdio:['ignore','pipe','pipe']});
+  const out = readFileSync(`${repo}/scope.out`, 'utf8');
   assert.match(out,/collector=true/); assert.match(out,/research-image-binaries/);
 } finally { rmSync(repo,{recursive:true,force:true}); }
 console.log('lock-only Git diff: owning package + reverse dependents; PR/push verified');
