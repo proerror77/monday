@@ -1,0 +1,32 @@
+name: ACK flow contracts
+
+on:
+  pull_request:
+    paths:
+      - .github/ack-ci/**
+      - .github/scripts/*ack*
+      - .github/scripts/*preflight*
+      - .github/workflows/ack-flow-contracts.yml
+      - .github/workflows/ci.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ack-flow-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: ACK relay and preflight contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Verify source-bound relay and workflow gates
+        run: |
+          bash .github/scripts/test-classify-ack-research-job.sh
+          bash .github/scripts/test-ack-preflight-relay.sh
+          bash .github/scripts/test-preflight-workflow-gate.sh

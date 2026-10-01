@@ -8,6 +8,8 @@ expected=(
   lob-pit-materializer
   binance-market-tape-slicer
   binance-replay-parquet-materializer
+  research-data-service
+  clickhouse-analytics-materializer
   monday-prediction-research
   monday-prediction-evaluator
   monday-prediction-snapshot

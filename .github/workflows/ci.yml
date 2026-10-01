@@ -21,6 +21,7 @@ jobs:
     name: CI job selector
     runs-on: ubuntu-latest
     outputs:
+      ack_research: ${{ steps.ack.outputs.ack_research }}
       jobs: ${{ steps.scope.outputs.jobs }}
       owning_packages: ${{ steps.scope.outputs.owning_packages }}
       loop: ${{ steps.scope.outputs.loop }}
@@ -50,6 +51,15 @@ jobs:
             --base "${BASE_SHA}" \
             --head "${HEAD_SHA}"
 
+      - name: Classify research execution scope
+        id: ack
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SELECTED_LOOP: ${{ steps.scope.outputs.loop }}
+        run: |
+          .github/scripts/classify-ack-research-job.sh --detect-scope --repository "$GITHUB_REPOSITORY" --event "$GITHUB_EVENT_NAME" --base "$BASE_SHA" --head "$HEAD_SHA" --loop "$SELECTED_LOOP"
+
   scope:
     name: CI job scope
     needs: selector
@@ -57,6 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      ack_research: ${{ needs.selector.outputs.ack_research }}
       jobs: ${{ steps.scope.outputs.jobs }}
       owning_packages: ${{ steps.scope.outputs.owning_packages }}
       loop: ${{ steps.scope.outputs.loop }}
@@ -192,6 +203,10 @@ jobs:
           .github/scripts/test-select-rust-ci-scope.sh
           .github/scripts/test-ci-monitor-scope.sh
           .github/scripts/test-agent-validation-gates.sh
+          .github/scripts/test-classify-ack-research-job.sh
+          bash .github/scripts/test-ack-preflight-relay.sh
+          bash .github/scripts/test-preflight-workflow-gate.sh
+          .github/scripts/test-research-image-release-artifact.sh
 
   rust_shell_scripts:
     name: Rust shell scripts
@@ -205,11 +220,25 @@ jobs:
       - name: Check shell syntax
         run: find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \;
 
+  research_preflight:
+    name: Research preflight
+    needs: scope
+    if: ${{ needs.scope.outputs.ack_research == 'true' && needs.scope.outputs.collector == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+      - name: Wait for signed preflight receipt
+        run: .github/scripts/wait-ack-research-receipt.sh ci-research-preflight "$(git rev-parse HEAD)"
+
   rust:
     name: Rust Workspace
-    needs: scope
-    if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}
+    needs: [scope, research_preflight]
+    if: ${{ always() && !cancelled() && needs.scope.result == 'success' && contains(needs.scope.outputs.jobs, ',ci/rust,') && (needs.scope.outputs.ack_research != 'true' || needs.scope.outputs.collector != 'true' || needs.research_preflight.result == 'success') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
@@ -227,31 +256,31 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Rust toolchain
-        if: needs.scope.outputs.toolchain == 'true'
+        if: ${{ (needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
 
       - name: Install Linux build tools
-        if: needs.scope.outputs.toolchain == 'true'
+        if: ${{ (needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" clang mold protobuf-compiler
 
       - name: Setup sccache
-        if: needs.scope.outputs.toolchain == 'true'
+        if: ${{ (needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         id: sccache
         continue-on-error: true
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Disable sccache on setup failure
-        if: needs.scope.outputs.toolchain == 'true' && steps.sccache.outcome == 'failure'
+        if: ${{ (needs.scope.outputs.toolchain == 'true' && steps.sccache.outcome == 'failure') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
           echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
 
       - name: Record cache dimensions
-        if: needs.scope.outputs.toolchain == 'true'
+        if: ${{ (needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         id: cache-info
         shell: bash
         run: |
@@ -259,7 +288,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
-        if: needs.scope.outputs.toolchain == 'true'
+        if: ${{ (needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -269,11 +298,11 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
       - name: Test Loop Engineer packages
-        if: needs.scope.outputs.loop == 'true'
+        if: ${{ (needs.scope.outputs.loop == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-onnx-evaluator -p alpha-harness -p hft-harnessctl -p hft-research-ml --locked
 
       - name: Test directly changed Rust packages
-        if: needs.scope.outputs.owning_packages != ',,'
+        if: ${{ (needs.scope.outputs.owning_packages != ',,') && needs.scope.outputs.ack_research != 'true' }}
         env:
           OWNING_PACKAGES: ${{ needs.scope.outputs.owning_packages }}
         run: |
@@ -288,7 +317,7 @@ jobs:
           cargo clippy "${args[@]}" --all-targets --locked --no-deps -- -D warnings
 
       - name: Verify signed runtime handoff
-        if: needs.scope.outputs.handoff == 'true'
+        if: ${{ (needs.scope.outputs.handoff == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           cargo test -p hft-live --no-default-features --test deployment_envelope --locked
           cargo test -p hft-live --no-default-features --test deployment_artifacts --locked
@@ -296,7 +325,7 @@ jobs:
           cargo test -p hft-live --no-default-features --features formula-strategy,bitget --test deployment_artifacts --locked
 
       - name: Check JSON feature matrix
-        if: needs.scope.outputs.json == 'true'
+        if: ${{ (needs.scope.outputs.json == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           cargo test -p hft-integration --no-default-features --locked
           cargo test -p hft-integration --no-default-features --features json-simd --locked
@@ -306,31 +335,31 @@ jobs:
           cargo check -p hft-live --features clickhouse,redis,grpc,polymarket --locked
 
       - name: Verify Ondo Perps feature boundary
-        if: needs.scope.outputs.ondo == 'true'
+        if: ${{ (needs.scope.outputs.ondo == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           cargo test -p hft-data-adapter-ondo-perps -p hft-execution-adapter-ondo-perps --locked
           cargo clippy -p hft-data-adapter-ondo-perps -p hft-execution-adapter-ondo-perps --all-targets --no-deps --locked -- -D warnings
           cargo check -p hft-live --features ondo-perps --locked
 
       - name: Verify governed data collector
-        if: needs.scope.outputs.collector == 'true'
+        if: ${{ (needs.scope.outputs.collector == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           cargo check -p hft-collector --locked
           cargo clippy -p hft-collector --all-targets --features collector-binance --no-deps --locked -- -D warnings
           cargo test -p hft-collector --features collector-binance --locked
 
       - name: Verify collector release control plane
-        if: needs.scope.outputs.control == 'true'
+        if: ${{ (needs.scope.outputs.control == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
           cargo test -p hft-collector --lib systemd_reference_resource_envelope_is_pinned --locked
 
       - name: Build focused packages
-        if: needs.scope.outputs.focused == 'true'
+        if: ${{ (needs.scope.outputs.focused == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p alpha-harness -p hft-harnessctl --locked
 
       - name: Package binaries (if present)
-        if: github.event_name == 'push'
+        if: ${{ (github.event_name == 'push') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           mkdir -p dist
           for bin in hft-live hft-paper hft-all-in-one hft-replay; do
@@ -341,7 +370,7 @@ jobs:
           ls -la dist || true
 
       - name: Upload artifacts
-        if: success() && github.event_name == 'push'
+        if: ${{ (success() && github.event_name == 'push') && needs.scope.outputs.ack_research != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: rust-dev-binaries-${{ github.sha }}
@@ -349,14 +378,23 @@ jobs:
           if-no-files-found: ignore
 
       - name: sccache stats
-        if: always() && needs.scope.outputs.toolchain == 'true'
+        if: ${{ (always() && needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: ${SCCACHE_PATH:-sccache} --show-stats || true
 
+      - name: Wait for signed ACK execution receipt
+        if: needs.scope.outputs.ack_research == 'true'
+        id: ack
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/wait-ack-research-receipt.sh ci-rust "$(git rev-parse HEAD)"
   rust_fast_gates:
     name: Rust Fast Gates
     needs: scope
     if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -366,6 +404,7 @@ jobs:
           fetch-depth: 0
 
       - name: Enforce Monday module layout
+        if: needs.scope.outputs.ack_research != 'true'
         working-directory: .
         run: |
           set -euo pipefail
@@ -375,6 +414,7 @@ jobs:
           test -f rust_hft/execution-gateway/adapters/adapter-polymarket/Cargo.toml
 
       - name: Enforce Rust-only research and runtime source
+        if: needs.scope.outputs.ack_research != 'true'
         working-directory: .
         run: |
           set -euo pipefail
@@ -507,14 +547,14 @@ jobs:
           fi
 
       - name: Setup Rust toolchain (fmt)
-        if: needs.scope.outputs.loop == 'true'
+        if: ${{ (needs.scope.outputs.loop == 'true') && needs.scope.outputs.ack_research != 'true' }}
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
           components: rustfmt
 
       - name: Format Loop Engineer packages
-        if: needs.scope.outputs.loop == 'true'
+        if: ${{ (needs.scope.outputs.loop == 'true') && needs.scope.outputs.ack_research != 'true' }}
         working-directory: rust_hft
         run: |
           cargo fmt --check --package alpha-domain
@@ -525,6 +565,14 @@ jobs:
           cargo fmt --check --package hft-harnessctl
           cargo fmt --check --package hft-research-ml
 
+      - name: Wait for signed ACK execution receipt
+        if: needs.scope.outputs.ack_research == 'true'
+        id: ack
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/wait-ack-research-receipt.sh ci-rust-fast-gates "$(git rev-parse HEAD)"
   market_recorder_contract:
     name: Market Recorder Release Contract
     needs: scope
@@ -793,6 +841,7 @@ jobs:
       - ci_contracts
       - rust_shell_scripts
       - rust
+      - research_preflight
       - rust_fast_gates
       - market_recorder_contract
       - deployment_artifacts

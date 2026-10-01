@@ -15,6 +15,8 @@ run_case() {
   local changed_file="$fixtures/$changed"
   [[ -f $changed_file ]] || changed_file="$tmp_dir/$changed"
   [[ $event == push ]] && ref=refs/heads/main
+  # Each scenario is a fresh workflow output file, including repeated paths.
+  : > "$output"
   GITHUB_REF=$ref "$selector" --event "$event" --changed-files "$changed_file" \
     --metadata "$fixtures/metadata.fixture" --output "$output"
   printf '%s\n' "$output"
@@ -131,7 +133,6 @@ job_cases=(
   'agent-instructions|pull_request|agent-instructions.txt|ploy/commit-hygiene'
   'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
   'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
-  'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'unknown-nested|pull_request|unknown-nested.txt|'
   'rust-docs|pull_request|rust-docs.txt|'
@@ -146,7 +147,7 @@ job_cases=(
   'live-push|push|live.txt|ci/rust,ci/deployment-artifacts'
   'trading-dockerfile-push|push|trading-dockerfile.txt|ci/deployment-artifacts'
   'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts,ploy/research-image-binaries,ploy/research-image-smoke'
-  'acr-workflow-push|push|acr-workflow.txt|ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke'
+  'acr-workflow-push|push|acr-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
   'full|push|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ploy/research-image-binaries,ploy/research-image-smoke,ci/deployment-artifacts'
 )
 for job_case in "${job_cases[@]}"; do
@@ -155,6 +156,116 @@ for job_case in "${job_cases[@]}"; do
   assert_jobs "$output" "$expected"
   assert_owning_packages "$output" "${expected_owning:-}"
   assert_flag "$output" selection_complete true
+done
+
+# Known ACK metadata helpers must select their owning shell/workflow contracts
+# without setting Cargo-impact flags or selecting images on main push. The
+# production image/dependency inputs retain their own build coverage.
+ack_metadata_paths=(
+  .github/scripts/classify-ack-research-job.sh
+  .github/scripts/test-classify-ack-research-job.sh
+  .github/scripts/wait-ack-research-receipt.sh
+  .github/ack-ci/receipt-public-key.pub
+  .github/ack-ci/PREFLIGHT.md
+  .github/scripts/verify-ack-preflight.sh
+  .github/scripts/test-ack-preflight-relay.sh
+  .github/scripts/test-preflight-workflow-gate.sh
+  .github/workflows/ack-flow-contracts.yml
+)
+release_metadata_paths=(
+  .github/workflows/acr-publish.yml
+  .github/scripts/test-acr-publish-workflow.sh
+  .github/scripts/read-release-required-checks.sh
+  .github/scripts/wait-release-required-checks.sh
+  .github/scripts/research-image-release-artifact.sh
+  .github/scripts/test-research-image-release-artifact.sh
+  .github/scripts/verify-research-runner-binaries.sh
+  .github/scripts/read-acr-publish-source.sh
+  .github/scripts/select-acr-publish-source.sh
+  .github/scripts/test-acr-publish-source-readback.sh
+)
+for kind in ack release; do
+  if [[ $kind == ack ]]; then infrastructure_paths=("${ack_metadata_paths[@]}"); else infrastructure_paths=("${release_metadata_paths[@]}"); fi
+  for path in "${infrastructure_paths[@]}"; do
+    printf '%s\n' "$path" >"$tmp_dir/infrastructure.txt"
+    for event in pull_request push; do
+      scoped=$(run_case infrastructure "$event" infrastructure.txt)
+      expected='ci/ci-contracts,ploy/workflow-lint'
+      [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+      assert_jobs "$scoped" "$expected"
+      assert_owning_packages "$scoped" ''
+      for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff; do
+        assert_flag "$scoped" "$flag" false
+      done
+      # Policy-only source still receives repository security scans; it has no
+      # dependency/toolchain impact and must not trigger Cargo or image audits.
+      if [[ $path == *.md ]]; then
+        assert_security_jobs "$scoped" 'security/secret-detection'
+      else
+        assert_security_jobs "$scoped" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+      fi
+    done
+  done
+done
+# All 20 actual PR 1266 paths, including this fixture, must remain policy-only
+# on both PR and main push. Mixed source/image inputs retain their own gates.
+for event in pull_request push; do
+  ack_flow_pr=$(run_case "ack-flow-pr-$event" "$event" ack-flow-pr-1266.txt)
+  expected='ci/ci-contracts,ploy/workflow-lint'
+  [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+  assert_jobs "$ack_flow_pr" "$expected"
+  assert_security_jobs "$ack_flow_pr" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+  assert_owning_packages "$ack_flow_pr" ''
+  for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff; do
+    assert_flag "$ack_flow_pr" "$flag" false
+  done
+  cat "$fixtures/ack-flow-pr-1266.txt" "$fixtures/collector.txt" >"$tmp_dir/ack-flow-pr-with-collector.txt"
+  ack_flow_mixed=$(run_case "ack-flow-collector-$event" "$event" ack-flow-pr-with-collector.txt)
+  expected='ci/ci-contracts,ploy/workflow-lint,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
+  if [[ $event == pull_request ]]; then expected+=',ploy/commit-hygiene';
+  else expected+=',ploy/research-image-binaries,ploy/research-image-smoke'; fi
+  assert_jobs "$ack_flow_mixed" "$expected"
+  for flag in loop collector control toolchain; do assert_flag "$ack_flow_mixed" "$flag" true; done
+  cat "$fixtures/ack-flow-pr-1266.txt" "$fixtures/research-dockerfile.txt" >"$tmp_dir/ack-flow-pr-with-image.txt"
+  ack_flow_image=$(run_case "ack-flow-image-$event" "$event" ack-flow-pr-with-image.txt)
+  expected='ci/ci-contracts,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
+  [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+  assert_jobs "$ack_flow_image" "$expected"
+done
+
+printf '%s\n' deployment/aliyun/research/Dockerfile.research-data >"$tmp_dir/research-data-dockerfile.txt"
+for event in pull_request push; do
+  image_scope=$(run_case research-data-dockerfile "$event" research-data-dockerfile.txt)
+  expected='ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
+  [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+  assert_jobs "$image_scope" "$expected"
+  for flag in loop handoff json ondo collector control focused toolchain; do assert_flag "$image_scope" "$flag" false; done
+done
+# Adding an infrastructure helper to real Rust work must preserve the same
+# source-graph suites; the cheap path is not a short circuit for mixed changes.
+printf '%s\n' .github/scripts/wait-ack-research-receipt.sh >"$tmp_dir/ack-with-collector.txt"
+cat "$fixtures/collector.txt" >>"$tmp_dir/ack-with-collector.txt"
+mixed_ack=$(run_case ack-with-collector pull_request ack-with-collector.txt)
+assert_jobs "$mixed_ack" 'ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
+for flag in loop collector control toolchain; do assert_flag "$mixed_ack" "$flag" true; done
+# Unknown infrastructure is an incomplete plan, even alongside known source.
+# It must emit no successful selection or compiler dispatch plan.
+for unknown in .github/scripts/future-ack-unreviewed.sh .github/workflows/security.yml .github/actions/future/action.yml; do
+  for event in pull_request push; do
+    for mixed in false true; do
+      printf '%s\n' "$unknown" >"$tmp_dir/unmapped-ci.txt"
+      [[ $mixed == false ]] || cat "$fixtures/collector.txt" >>"$tmp_dir/unmapped-ci.txt"
+      : >"$tmp_dir/unmapped.out"
+      status=0
+      "$selector" --event "$event" --changed-files "$tmp_dir/unmapped-ci.txt" \
+        --metadata "$fixtures/metadata.fixture" --output "$tmp_dir/unmapped.out" \
+        >"$tmp_dir/unmapped.stdout" 2>"$tmp_dir/unmapped.error" || status=$?
+      [[ $status == 2 && ! -s $tmp_dir/unmapped.out && ! -s $tmp_dir/unmapped.stdout ]] || {
+        echo 'unknown CI path emitted a successful/full dispatch plan' >&2; exit 1;
+      }
+      grep -Fq "unmapped CI path: $unknown; add its owning contract mapping before dispatch" "$tmp_dir/unmapped.error"
+    done
+  done
 done
 
 printf '%s\n' \
@@ -263,7 +374,7 @@ GITHUB_REF=refs/heads/develop "$selector" --event push \
 assert_jobs "$security_workflow_develop" 'ci/ci-contracts,ploy/workflow-lint'
 assert_security_jobs "$security_workflow_develop" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/collector.out" "$all_security_jobs"
-assert_security_jobs "$tmp_dir/unknown-workflow.out" "$all_security_jobs"
+assert_security_jobs "$tmp_dir/unknown-root.out" "$all_security_jobs"
 security_schedule="$tmp_dir/security-schedule.out"
 "$selector" --event schedule --output "$security_schedule"
 assert_jobs "$security_schedule" ''
@@ -309,7 +420,9 @@ for workflow in \
   pinned_toolchains=$(grep -Fxc '          toolchain: 1.98.1' "$workflow")
   test "$stable_uses" -eq "$pinned_toolchains"
 done
-grep -Fqx '    container: rust:1.98.1-bookworm' "$script_dir/../workflows/ploy-ci.yml"
+# Research software runs under the private ACK profile, so public metadata
+# jobs carry neither a compiler container nor its cache/toolchain setup.
+grep -Fq 'wait-ack-research-receipt.sh research-image-binaries "$(git rev-parse HEAD)"' "$script_dir/../workflows/ploy-ci.yml"
 # shellcheck disable=SC2016
 always_condition='    if: ${{ always() }}'
 grep -Fqx '    needs: selector' "$ci_workflow"
@@ -347,7 +460,8 @@ control_job_block=$(job_block control_contracts)
 # rust_fast_gates must preserve repository policy checks for both compiled
 # Rust changes and lightweight Rust shell changes.
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$fast_gates_block"
-grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}" <<<"$rust_job_block"
+grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" <<<"$rust_job_block"
+grep -Fq "needs.research_preflight.result == 'success'" <<<"$rust_job_block"
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$rust_shell_scripts_block"
 grep -Fq "uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1" <<<"$rust_shell_scripts_block"
 grep -Fq "find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \\;" <<<"$rust_shell_scripts_block"
@@ -392,7 +506,7 @@ recorder_block=$(job_block market_recorder_contract)
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
+grep -Fq "if: \${{ (always() && needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}" <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
@@ -458,12 +572,10 @@ ploy_job_block() {
   awk -v job="^  $1:" '$0 ~ job {found=1; next} /^  [a-z0-9-]+:/ {found=0} found' "$ploy_workflow"
 }
 for ploy_rust_job in \
-  research-image-binaries \
   rust-control-plane \
   rust-runner-lean \
   rust-runner-full \
   rust-market-data \
-  rust-research-heavy \
   integration-regressions; do
   ploy_block=$(ploy_job_block "$ploy_rust_job")
   [ -n "$ploy_block" ]
@@ -476,9 +588,43 @@ for ploy_rust_job in \
   grep -Fq 'steps.cache-info.outputs.sccache' <<<"$ploy_block"
   if grep -Fq -- '}}-${{ github.sha }}' <<<"$ploy_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 done
-research_image_block=$(ploy_job_block research-image-binaries)
-grep -Fqx '    timeout-minutes: 45' <<<"$research_image_block"
-if grep -Fq 'SCCACHE_GHA_RW_MODE' <<<"$research_image_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+# Fixed ACK profiles preserve the selected public job identities while
+# rejecting hosted execution. Scope and selected-job Gate cases above/below
+# remain unchanged: a failed/missing receipt fails the same selected job.
+for mapping in \
+  research-image-binaries:research-image-binaries \
+  research-image-smoke:research-image-smoke \
+  rust-format:prediction-research-format \
+  rust-research-heavy:prediction-research-heavy; do
+  job=${mapping%%:*}
+  profile=${mapping#*:}
+  relay_block=$(ploy_job_block "$job")
+  grep -Fqx '    runs-on: ubuntu-latest' <<<"$relay_block"
+  grep -Fqx '    timeout-minutes: 360' <<<"$relay_block"
+  grep -Fq "wait-ack-research-receipt.sh $profile \"\$(git rev-parse HEAD)\"" <<<"$relay_block"
+  if grep -Eq 'container:|RUSTC_WRAPPER:|SCCACHE_GHA_ENABLED:|uses: (docker/|dtolnay/rust-toolchain|Swatinem/rust-cache|mozilla-actions/sccache)|(^|[[:space:]])(cargo|docker) (build|test|run|check|clippy|fmt)' <<<"$relay_block"; then
+    echo "selected research job $job still executes on a public hosted runner" >&2
+    exit 1
+  fi
+done
+for mapping in rust:ci-rust rust_fast_gates:ci-rust-fast-gates; do
+  job=${mapping%%:*}
+  profile=${mapping#*:}
+  mixed_block=$(job_block "$job")
+  grep -Fq "wait-ack-research-receipt.sh $profile \"\$(git rev-parse HEAD)\"" <<<"$mixed_block"
+  grep -Fq "if: needs.scope.outputs.ack_research == 'true'" <<<"$mixed_block"
+done
+# Verify every native mixed-lane action keeps its non-research guard; a
+# newly-added unguarded compiler/setup step must fail this contract.
+ruby -ryaml - "$ci_workflow" <<'RUBY'
+ci=YAML.safe_load(File.read(ARGV.fetch(0)))
+%w[rust rust_fast_gates].each do |id|
+  ci.fetch('jobs').fetch(id).fetch('steps').each do |step|
+    next if step.fetch('uses','').include?('actions/checkout@') || step.fetch('run','').include?('wait-ack-research-receipt.sh')
+    abort "unguarded native research action in #{id}" unless step.fetch('if','').include?("needs.scope.outputs.ack_research != 'true'")
+  end
+end
+RUBY
 
 deletion_repo="$tmp_dir/deletion-repo"
 mkdir -p "$deletion_repo/rust_hft/tools/collector/src"
