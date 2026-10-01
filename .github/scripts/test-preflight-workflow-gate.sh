@@ -11,6 +11,20 @@ ruby -ryaml -e '
   abort "missing non-ACK bypass" unless condition.include?("needs.scope.outputs.ack_research !=")
   abort "missing successful prerequisite" unless condition.include?("needs.research_preflight.result ==")
 '
+# These profiles derive v2 admission from the event base/head, rather than an
+# unsigned caller flag. A default shallow checkout cannot resolve that tuple.
+ruby -ryaml -e '
+  scoped_profiles = /wait-ack-research-receipt\.sh (ci-rust|security-clippy-research|research-image-binaries)(?:\s|$)/
+  %w[ci.yml ploy-ci.yml security-enabled.yml].each do |workflow|
+    YAML.load_file(".github/workflows/#{workflow}").fetch("jobs").each do |id, job|
+      steps = job.fetch("steps", [])
+      next unless steps.any? { |step| step.fetch("run", "").match?(scoped_profiles) }
+      checkout = steps.find { |step| step.fetch("uses", "").start_with?("actions/checkout@") }
+      abort "#{workflow}:#{id} cannot resolve the source tuple from a shallow checkout" unless
+        checkout && checkout.fetch("with", {}).fetch("fetch-depth", nil) == 0
+    end
+  end
+'
 for prerequisite in success skipped failure cancelled; do
   rust=success
   [[ $prerequisite == failure || $prerequisite == cancelled ]] && rust=skipped
