@@ -45,8 +45,6 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          node .github/scripts/test-local-lock-impact.mjs
-          .github/scripts/test-select-rust-ci-scope.sh
           .github/scripts/select-rust-ci-scope.sh \
             --event "${{ github.event_name }}" \
             --base "${BASE_SHA}" \

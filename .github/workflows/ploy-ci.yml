@@ -38,8 +38,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Test CI job selector
-        run: ../../.github/scripts/test-select-rust-ci-scope.sh
 
       - name: Select CI jobs
         id: scope

@@ -489,10 +489,21 @@ fi
 # reverse-dependency traversal as source changes. Unknown ownership fails closed.
 while IFS=$'\t' read -r lock_package lock_workspace; do
   [[ -n $lock_package ]] || continue
-  manifests=$(jq -c --arg name "$lock_package" --arg workspace "$lock_workspace/" --arg root "$repo_root/" \
-    '[.packages[] | select(.name==$name) | .manifest_path | ltrimstr($root) | select(startswith($workspace))]' "$metadata")
-  [[ $(jq length <<<"$manifests") == 1 ]] || { echo "ambiguous lock package ownership: $lock_package" >&2; exit 2; }
-  paths+=("$(jq -r '.[0]' <<<"$manifests")")
+  manifests=$(jq -c --arg name "$lock_package" --arg root "$repo_root/" \
+    '[.packages[] | select(.name==$name) | .manifest_path | ltrimstr($root) | select(startswith("rust_hft/"))] | unique' "$metadata")
+  # A path dependency may belong to the other workspace. Root packages are
+  # deliberately skipped by ordinary ownership, so preserve their broad lane.
+  if [[ $(jq length <<<"$manifests") != 1 || $lock_package == rust-hft-workspace || $lock_package == ploy ]]; then
+    if [[ $lock_workspace == rust_hft/prediction-markets ]]; then
+      select_all_ploy_jobs
+    else
+      select_all
+      select_all_rust_ci_jobs
+      select_research_image_jobs
+    fi
+  else
+    paths+=("$(jq -r '.[0]' <<<"$manifests")")
+  fi
 done < <(jq -r '.[] | [.name,.workspace] | @tsv' <<<"$lock_packages")
 
 declare -a package_names=() package_dirs=() package_dependencies=()

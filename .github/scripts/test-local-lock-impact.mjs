@@ -72,5 +72,24 @@ try {
   execFileSync('bash',[selector,'--base',base,'--head',git('rev-parse','HEAD'),'--event','pull_request','--metadata',metadata,'--output',`${repo}/scope.out`],{cwd:repo,encoding:'utf8',stdio:['ignore','pipe','pipe']});
   const out = readFileSync(`${repo}/scope.out`, 'utf8');
   assert.match(out,/collector=true/); assert.match(out,/research-image-binaries/);
+  for (const [workspace,name,broad] of [
+    ['rust_hft','rust-hft-workspace',true],
+    ['rust_hft/prediction-markets','ploy',true],
+    ['rust_hft/prediction-markets','hft-core',false],
+    ['rust_hft/prediction-markets','unknown-owner',true],
+  ]) {
+    mkdirSync(`${repo}/${workspace}`,{recursive:true});
+    const path = `${repo}/${workspace}/Cargo.lock`;
+    const value = before.replace('name = "manifest"',`name = "${name}"`);
+    writeFileSync(path,value); git('add',`${workspace}/Cargo.lock`); git('commit','-m','scenario base');
+    const scenarioBase=git('rev-parse','HEAD');
+    writeFileSync(path,value.replace(' "bytes",',' "bytes",\n "existing-dep",'));
+    git('add',`${workspace}/Cargo.lock`); git('commit','-m','scenario head');
+    writeFileSync(`${repo}/scope.out`,'');
+    execFileSync('bash',[selector,'--base',scenarioBase,'--head',git('rev-parse','HEAD'),'--event','pull_request','--metadata',metadata,'--output',`${repo}/scope.out`],{cwd:repo,encoding:'utf8'});
+    const out=readFileSync(`${repo}/scope.out`,'utf8');
+    if(broad) assert.match(out,/research-image-binaries/);
+    else { assert.match(out,/ci\/rust-hft-engine-fast-lane/); assert.match(out,/owning_packages=,hft-core,/); }
+  }
 } finally { rmSync(repo,{recursive:true,force:true}); }
 console.log('lock-only Git diff: owning package + reverse dependents; PR/push verified');

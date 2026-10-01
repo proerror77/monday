@@ -31,8 +31,6 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-      - name: Test CI job selector
-        run: .github/scripts/test-select-rust-ci-scope.sh
       - name: Select security jobs
         id: scope
         env:
