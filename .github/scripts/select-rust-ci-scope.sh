@@ -35,6 +35,9 @@ architecture=false
 owning_packages=
 clippy_loop=false
 clippy_handoff=false
+image_live=false
+image_paper=false
+declare -a paths=()
 
 select_job() {
   local job=$1
@@ -61,7 +64,7 @@ select_all_security_jobs() {
 select_security_scope() {
   [[ $loop == true ]] && clippy_loop=true
   [[ $handoff == true ]] && clippy_handoff=true
-  local scan_repository=false rust_relevant=false container_relevant=false
+  local scan_repository=false rust_relevant=false
 
   if [[ $event == schedule || $event == workflow_dispatch ]]; then
     select_all_security_jobs
@@ -73,12 +76,7 @@ select_security_scope() {
       docs/*|*.md|LICENSE*|rust_hft/docs/*|rust_hft/README*|rust_hft/*/README*) ;;
       *) scan_repository=true ;;
     esac
-    case "$path" in
-      rust_hft/docker/Dockerfile|\
-      rust_hft/deployment/docker/Dockerfile.trading|rust_hft/.dockerignore)
-        container_relevant=true
-        ;;
-    esac
+
   done
 
   case ",$jobs," in
@@ -99,7 +97,7 @@ select_security_scope() {
     select_security_job security/cargo-machete
   fi
   if [[ $event == push && ${GITHUB_REF:-} == refs/heads/main && \
-        ($rust_relevant == true || $container_relevant == true) ]]; then
+        $(jq ".include|length" <<<"$image_matrix") != 0 ]]; then
     select_security_job security/container-scan
   fi
   select_security_job security/secret-detection
@@ -157,6 +155,8 @@ select_main_research_image_jobs() {
 }
 
 select_all() {
+  image_live=true
+  image_paper=true
   loop=true
   handoff=true
   json=true
@@ -173,6 +173,7 @@ emit() {
   [[ $control == true ]] && select_job ci/control-contracts
   # Every path that selects collector verification must exercise its production image.
   if [[ $collector == true ]]; then select_job ci/deployment-artifacts; fi
+  image_matrix=$(printf '%s\n' "${paths[@]}" | bash "$(dirname "${BASH_SOURCE[0]}")/image-build-plan.sh" "$image_live" "$image_paper" "$collector" "$event")
   select_security_scope
   for value in "$loop" "$handoff" "$json" "$ondo" "$collector" "$control" "$focused" "$toolchain"; do
     [[ $value == true || $value == false ]] || { printf 'invalid boolean selector output: %s\n' "$value" >&2; exit 1; }
@@ -181,6 +182,7 @@ emit() {
   [[ $security_jobs =~ ^(security/[a-z0-9/-]+(,security/[a-z0-9/-]+)*)?$ ]] || { printf 'invalid security job selector output: %s\n' "$security_jobs" >&2; exit 1; }
   [[ $owning_packages =~ ^([A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]] || { printf 'invalid owning package selector output: %s\n' "$owning_packages" >&2; exit 1; }
   printf '%s\n' \
+    "image_matrix=$image_matrix" \
     "jobs=,$jobs," \
     "security_jobs=,$security_jobs," \
     "owning_packages=,$owning_packages," \
@@ -215,7 +217,7 @@ if [[ $event == schedule ]]; then
 fi
 
 repo_root=$(git rev-parse --show-toplevel)
-declare -a paths=()
+paths=()
 if [[ -n $changed_files ]]; then
   while IFS= read -r path; do paths+=("$path"); done <"$changed_files"
 else
@@ -269,13 +271,17 @@ for path in "${paths[@]}"; do
       select_research_image_jobs
       continue
       ;;
+    .dockerignore)
+      select_job ci/deployment-artifacts
+      continue
+      ;;
     rust_hft/.dockerignore)
       select_job ci/deployment-artifacts
       select_job ci/polymarket-evidence-compiler-image
       select_research_image_jobs
       continue
       ;;
-    rust_hft/deployment/docker/Dockerfile.trading)
+    rust_hft/docker/Dockerfile|rust_hft/deployment/docker/Dockerfile.trading)
       select_job ci/deployment-artifacts
       continue
       ;;
@@ -350,6 +356,11 @@ for path in "${paths[@]}"; do
     .github/workflows/ci.yml|.github/workflows/ploy-ci.yml|.github/workflows/security-enabled.yml|\
     .github/scripts/select-rust-ci-scope.sh|\
     .github/scripts/local-lock-impact.sh|.github/scripts/test-local-lock-impact.mjs|\
+    .github/scripts/image-build-plan.sh|.github/scripts/test-image-build-plan.sh|\
+    .github/scripts/read-tested-image.sh|.github/scripts/test-tested-image.sh|\
+    .github/scripts/read-published-image-source.sh|.github/scripts/select-main-image-scope.sh|\
+    .github/scripts/test-main-image-scope.sh|\
+    .github/workflows/docker-smoke.yml|.github/workflows/docker-publish.yml|\
     .github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*|\
     .github/scripts/verify-ci-gate.sh|.github/scripts/test-ci-monitor-scope.sh|\
     .github/scripts/test-agent-validation-gates.sh|.github/scripts/test-workflow-queue-lint.sh)
@@ -388,9 +399,19 @@ for path in "${paths[@]}"; do
       printf 'unmapped CI path: %s; add its owning contract mapping before dispatch\n' "$path" >&2
       exit 2
       ;;
+    deployment/aliyun/research/scripts/cex-materialization-entrypoint.sh|\
+    deployment/aliyun/research/scripts/campaign-cycle-controller.sh|\
+    deployment/aliyun/research/scripts/campaign-job-watch.sh|\
+    deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml)
+      # These files are copied into the controller image. Other experiment/job
+      # configuration is supplied at runtime and cannot change its binaries.
+      research_image_relevant=true
+      control=true
+      select_job ci/deployment-artifacts
+      continue
+      ;;
     rust_hft/deployment/k8s/*|deployment/aliyun/research/k8s/*)
       select_job ci/deployment-artifacts
-      [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
       continue
       ;;
     deployment/aliyun/polymarket-market-recorder-deploy.sh|\
@@ -426,6 +447,11 @@ for path in "${paths[@]}"; do
       toolchain=true
       select_job ploy/integration-regressions
       select_job ci/rust
+      ;;
+    deployment/aliyun/research/backtest/*|deployment/aliyun/research/examples/*|\
+    deployment/aliyun/research/builder/*)
+      control=true
+      continue
       ;;
     deployment/aliyun/*.md)
       continue
@@ -630,6 +656,9 @@ select_if_affected json hft-integration hft-data-adapter-binance hft-infra-redis
 select_if_affected ondo hft-data-adapter-ondo-perps hft-execution-adapter-ondo-perps hft-live
 select_if_affected collector hft-collector
 select_if_affected focused hft-live hft-paper hft-all-in-one
+
+is_affected hft-live && image_live=true
+is_affected hft-paper && image_paper=true
 
 # Collector source and its host controls are one release boundary.
 if [[ $collector == true ]]; then control=true; fi
