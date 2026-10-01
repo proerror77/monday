@@ -12,8 +12,9 @@ plan() { printf '%s\n' "$4" | bash "$root/image-build-plan.sh" "$1" "$2" "$3" "$
 [[ $(plan false false false '' workflow_dispatch | jq '.include|length') == 5 ]]
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-for scenario in collector live research policy; do
+for scenario in collector live research policy core; do
   case $scenario in
+    core) path=rust_hft/docker/Dockerfile ;;
     collector) path=rust_hft/tools/collector/src/lib.rs ;;
     live) path=rust_hft/apps/live/src/main.rs ;;
     research) path=rust_hft/alpha-harness/app/src/main.rs ;;
@@ -24,6 +25,7 @@ for scenario in collector live research policy; do
 done
 [[ $(sed -n 's/^image_matrix=//p' "$tmp/collector" | jq -r '.include[].name') == deploy-collector ]]
 [[ $(sed -n 's/^image_matrix=//p' "$tmp/live" | jq '.include|length') == 3 ]]
+[[ $(sed -n 's/^image_matrix=//p' "$tmp/core" | jq -r '.include[].name') == hft-core ]]
 for scenario in research policy; do
   [[ $(sed -n 's/^image_matrix=//p' "$tmp/$scenario" | jq '.include|length') == 0 ]]
   if grep '^security_jobs=' "$tmp/$scenario" | grep -q 'container-scan'; then exit 1; fi

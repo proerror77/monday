@@ -277,7 +277,7 @@ for path in "${paths[@]}"; do
       select_research_image_jobs
       continue
       ;;
-    rust_hft/deployment/docker/Dockerfile.trading)
+    rust_hft/docker/Dockerfile|rust_hft/deployment/docker/Dockerfile.trading)
       select_job ci/deployment-artifacts
       continue
       ;;
