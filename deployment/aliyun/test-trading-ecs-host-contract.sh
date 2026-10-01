@@ -1352,12 +1352,49 @@ if grep -Eq \
 fi
 grep -Fq 'docker logout "$ACR_REGISTRY"' "$WORKFLOW"
 grep -Fq 'rm -f -- "$docker_config_root/config.json"' "$WORKFLOW"
+# ACR credentials must be cleared even when the job fails, and only for the matrix
+# legs that actually logged in. Compare the cleanup narrowing with the
+# docker/login-action narrowing instead of matching a literal condition, and leave
+# a diagnosis behind instead of exiting silently.
 awk '
-  /- name: Remove ACR credentials/ {
-    if (getline <= 0 || $0 !~ /^[[:space:]]+if: always\(\)$/) exit 1
-    found = 1
+  function norm(c,   p) { gsub(/[$][{][{]|[}][}]|[[:space:]]/, "", c); sub(/^if:/, "", c)
+    while (c != p) { p = c; if (c ~ /^[(].*[)]$/) c = substr(c, 2, length(c) - 2) }
+    return c }
+  # && clauses of a step condition joined back with &&; one clause equal to drop is
+  # removed and counted in dropped.
+  function scope(e, drop,   n, i, a, c, o) {
+    n = split(e, a, "&&")
+    for (i = 1; i <= n; i++) { c = norm(a[i]); if (drop != "" && c == drop) { dropped++; continue }
+      o = (o == "") ? c : o " && " c }
+    return o }
+  function bad(m) { printf "acr publish credential cleanup contract: %s\n", m > "/dev/stderr"; exit 1 }
+  # Steps start at a "- name:"/"- uses:" dash and their own keys share that column,
+  # so run:/with: content never counts as the step condition.
+  /^[[:space:]]*-[[:space:]]+(name|uses):/ {
+    match($0, /^[[:space:]]*-[[:space:]]+/); col = RLENGTH; step++
+    if ($0 ~ /^[[:space:]]*-[[:space:]]+name:[[:space:]]*Remove ACR credentials[[:space:]]*$/) { cleanup = step; cleanup_count++ }
+    if (index($0, "docker/login-action@") > 0) login = step
+    next
   }
-  END { if (!found) exit 1 }
+  {
+    if (step == 0) next
+    match($0, /^[[:space:]]*/)
+    if (RLENGTH != col) next
+    if (!(step in cond) && $0 ~ /^[[:space:]]*if:/) cond[step] = $0
+    else if (index($0, "docker/login-action@") > 0) login = step
+  }
+  END {
+    if (cleanup_count != 1) bad("expected exactly one \"- name: Remove ACR credentials\" step in " FILENAME ", found " cleanup_count)
+    if (!(cleanup in cond)) bad("the \"Remove ACR credentials\" step has no if:; a failed job would keep the ACR credentials")
+    if (!login) bad("no docker/login-action step in " FILENAME " to compare the credential cleanup scope with")
+    if (index(norm(cond[cleanup]), "success()") > 0 || index(norm(cond[cleanup]), "cancelled()") > 0) bad("the \"Remove ACR credentials\" step must not be gated on success() or cancelled() (if: " norm(cond[cleanup]) "); it has to clear credentials when the job fails")
+    dropped = 0
+    narrowed = scope(cond[cleanup], "always()")
+    if (dropped != 1) bad("the \"Remove ACR credentials\" step needs exactly one always() clause (if: " norm(cond[cleanup]) "); a missing or negated always() keeps the ACR credentials when the job fails")
+    if (!(login in cond)) bad("the docker/login-action step has no if:, so every matrix leg logs in while cleanup covers only \"" narrowed "\"")
+    login_scope = scope(cond[login], "")
+    if (login_scope != narrowed) bad("credential cleanup scope \"" narrowed "\" is not the ACR login scope \"" login_scope "\" (login if: " norm(cond[login]) "); clean up for exactly the matrix legs that logged in")
+  }
 ' "$WORKFLOW"
 grep -Fq 'hft-trading-ecs-linux-amd64-${{ github.sha }}' "$WORKFLOW"
 grep -Fq 'IMAGE_DIGEST: ${{ steps.build.outputs.digest }}' "$WORKFLOW"
