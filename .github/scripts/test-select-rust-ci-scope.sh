@@ -762,12 +762,13 @@ assert_docker_publish_triggers() {
   local trigger_block
   trigger_block=$(sed -n '/^  workflow_run:$/,/^  workflow_dispatch:$/p' "$1")
   [[ $trigger_block == "$expected_docker_publish_triggers" ]] || return 1
-  grep -Fqx '            git diff --quiet "${SOURCE_SHA}^" "$SOURCE_SHA" -- rust_hft/ .github/workflows/docker-publish.yml || changed=$?' "$1"
+  grep -Fq '.github/scripts/select-rust-ci-scope.sh --event push --base "${SOURCE_SHA}^" --head "$SOURCE_SHA"' "$1" &&
+    grep -Fq 'any(.include[]; .name=="hft-core")' "$1"
 }
 assert_docker_publish_triggers "$docker_publish_workflow"
 
 docker_publish_counterexample="$tmp_dir/docker-publish-extra-path.yml"
-sed 's@-- rust_hft/ .github/workflows/docker-publish.yml@-- rust_hft/ docs/ .github/workflows/docker-publish.yml@' \
+sed 's@.name=="hft-core"@.name=="research-runner"@' \
   "$docker_publish_workflow" >"$docker_publish_counterexample"
 if assert_docker_publish_triggers "$docker_publish_counterexample"; then
   echo 'Docker Publish trigger contract accepted an unrelated path' >&2

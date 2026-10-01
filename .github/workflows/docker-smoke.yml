@@ -2,61 +2,46 @@ name: Docker Smoke Build
 
 on:
   push:
-    branches: [main, develop]
-    paths:
-      - '.github/workflows/docker-smoke.yml'
-      - 'deploy/**'
-      - 'rust_hft/Cargo.toml'
-      - 'rust_hft/Cargo.lock'
-      - 'rust_hft/docker/**'
-      - 'rust_hft/deployment/docker/**'
-      - 'rust_hft/deployment/k8s/**'
+    branches: [develop]
   pull_request:
     branches: [main, develop]
-    paths:
-      - '.github/workflows/docker-smoke.yml'
-      - 'deploy/**'
-      - 'rust_hft/Cargo.toml'
-      - 'rust_hft/Cargo.lock'
-      - 'rust_hft/docker/**'
-      - 'rust_hft/deployment/docker/**'
-      - 'rust_hft/deployment/k8s/**'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.image_matrix }}
+      selected: ${{ steps.plan.outputs.selected }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+      - id: plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          plan=$(mktemp)
+          .github/scripts/select-rust-ci-scope.sh --event "$GITHUB_EVENT_NAME" --base "$BASE_SHA" --head "$HEAD_SHA" --output "$plan"
+          matrix=$(sed -n 's/^image_matrix=//p' "$plan")
+          printf 'image_matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          printf 'selected=%s\n' "$(jq '.include|length>0' <<<"$matrix")" >> "$GITHUB_OUTPUT"
+          rm "$plan"
   docker_build:
     name: Build selected Dockerfiles
+    needs: plan
+    if: needs.plan.outputs.selected == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - dockerfile: rust_hft/docker/Dockerfile
-            context: rust_hft
-          - dockerfile: rust_hft/deployment/docker/Dockerfile.trading
-            context: rust_hft
-          - dockerfile: deploy/Dockerfile.hft
-            context: .
-            build_args: TARGET=live
-          - dockerfile: deploy/Dockerfile.hft
-            context: .
-            build_args: TARGET=collector
-          - dockerfile: deploy/Dockerfile.hft
-            context: .
-            build_args: TARGET=paper
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: docker/setup-buildx-action@v3
       - name: Build image (no push)
         uses: docker/build-push-action@v6
         with:
@@ -67,3 +52,5 @@ jobs:
           provenance: false
           sbom: false
           build-args: ${{ matrix.build_args }}
+          cache-from: type=gha,scope=image-${{ matrix.name }}
+          cache-to: type=gha,scope=image-${{ matrix.name }},mode=max

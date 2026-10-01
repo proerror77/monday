@@ -199,6 +199,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Verify selection, cancellation and aggregate admission
         run: |
+          bash .github/scripts/test-image-build-plan.sh
+          bash .github/scripts/test-tested-image.sh
           node .github/scripts/test-local-lock-impact.mjs
           .github/scripts/test-select-rust-ci-scope.sh
           .github/scripts/test-ci-monitor-scope.sh
