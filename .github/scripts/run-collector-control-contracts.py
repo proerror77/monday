@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run all collector release contracts, with two isolated slow fixtures at a time."""
+"""Run fast contracts first, isolate timed recovery, then parallelize two fixtures."""
 import argparse
 from collections import deque
 import os
@@ -24,11 +24,14 @@ FAST = (
     "test-bybit-options-release-contract.sh",
     "test-bybit-options-shadow-gate.sh",
 )
-# Longest first, using the successful 36833622104 log's marker intervals.
-# Each suite has its own mktemp root, mocks and fixture-local locks. Retention
-# remains inside recovery-queue, once; no production service or port is used.
-SLOW = (
+# Recovery contains a real 25s metadata-reader guard. Run 36843851896 showed
+# that competing with control-plane on the same runner exhausted that guard.
+# Keep the guard and all nested retention checks; give this suite the runner.
+ISOLATED = (
     "test-rust-lob-recovery-queue.sh",
+)
+# These suites have independent mktemp roots, mocks and fixture-local locks.
+SLOW = (
     "test-rust-lob-control-plane.sh",
     "test-monday-collector-health.sh",
 )
@@ -78,6 +81,13 @@ def run(root):
                 finish(process)
                 if failed:
                     return 1  # Do not spend minutes after a fast contract failure.
+            print("contract_phase name=recovery_isolated", flush=True)
+            for name in ISOLATED:
+                start(name, logs)
+                process = next(iter(active))
+                process.wait()
+                finish(process)
+            print("contract_phase name=parallel_health_control", flush=True)
             pending = deque(SLOW)
             while pending or active:
                 while pending and len(active) < 2:

@@ -31,7 +31,7 @@ def event(action):
         fcntl.flock(f, fcntl.LOCK_EX)
         f.write(json.dumps([action, name, slow]) + "\\n")
 event("start")
-if slow and os.environ.get("HOLD"):
+if slow and name != "test-rust-lob-recovery-queue.sh" and os.environ.get("HOLD"):
     child = subprocess.Popen([sys.executable, "-c",
         "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
     (root / (name + ".pid")).write_text(str(child.pid))
@@ -81,10 +81,17 @@ class Scheduling(unittest.TestCase):
         first_slow = next(i for i, (_, _, slow) in enumerate(events) if slow)
         self.assertEqual(sum(event == "end" for event, _, _ in events[:first_slow]), 12)
         active = peak = 0
-        for event, _, slow in events:
+        running = set()
+        for event, name, slow in events:
             if slow:
                 active += 1 if event == "start" else -1
                 peak = max(peak, active)
+                if event == "start":
+                    running.add(name)
+                else:
+                    running.remove(name)
+                if "test-rust-lob-recovery-queue.sh" in running:
+                    self.assertEqual(len(running), 1, "timed recovery must have no competing suite")
         self.assertEqual(peak, 2)
         self.assertEqual(active, 0)
         self.assertEqual(output.count("contract_result script="), 15)
