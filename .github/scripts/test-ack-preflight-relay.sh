@@ -71,3 +71,13 @@ openssl pkeyutl -sign -inkey "$fixture/key" -rawin -in "$fixture/legacy.json" -o
 FIXTURE_COLLECTOR=false GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=3 GITHUB_JOB=research-image-binaries bash .github/scripts/wait-ack-research-receipt.sh research-image-binaries "$source_sha" "$fixture/legacy-out"
 printf 'PASS: non-collector keeps existing v1 receipt and binary download without preflight\n'
 printf 'PASS: actual public v2 relay accepts quick/heavy proof, downloads verified software, rejects producer rerun and bounded missing-receipt timeout\n'
+
+# Signed failures have no success-only phase or software requirements and end
+# immediately even when the producer proof is no longer usable.
+jq '.terminal_result="failure"|.phase_results=null|.preflight=null|.software_bundle=null' "$fixture/heavy.json" >"$fixture/failed.json"
+mv "$fixture/failed.json" "$fixture/heavy.json"
+openssl pkeyutl -sign -inkey "$fixture/key" -rawin -in "$fixture/heavy.json" -out "$fixture/heavy.sig"
+if GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=3 GITHUB_JOB=research-image-binaries bash .github/scripts/wait-ack-research-receipt.sh research-image-binaries "$source_sha" "$fixture/failed-out" >"$fixture/failure.log"; then exit 1; fi
+grep -Fq '"terminal_result": "failure"' "$fixture/failure.log"
+[[ ! -e $fixture/failed-out/preflight.json && ! -e $fixture/failed-out/software.tar.gz ]]
+printf 'PASS: a signed negative terminal ends the public wait without success-only proof or artifact lookups\n'

@@ -1,15 +1,19 @@
-# Cross-lane preflight proposal
+# ACK validation and receipt contract
 
-This change is local and has not been activated. Private executor changes are
-required together with the public relay patch. Keep existing executions paused
-until the controller owner accepts the protocol and scoped validation results.
+The public reader and private executor are deployed together. New requests must
+use their reviewed source, command manifest and exact run/attempt/job identities.
 
 Monorepo's `Research preflight` relay consumes `ci-research-preflight` success.
-Rust depends on that job for ACK scope. Cross-workflow Clippy and research binaries
-are guarded by private admission, execution revalidation and public receipt
+Rust depends on that job for collector ACK scope. Tests and strict Clippy run
+in one `ci-rust` batch, using the selected `loop_packages` rather than always
+testing all seven Loop packages. Security verifies that same signed batch and
+its Monorepo producer attempt/job; it does not request another compiler. The
+weekly Security audit has no Monorepo sibling and retains its fixed Clippy-only
+profile. Research binaries remain guarded by private admission and proof
 consumption; public workflows do not dispatch private work.
 
-Collector-scoped instances of these four profiles use `monday.ack_execution_receipt.v2` at the existing receipt
+The `ci-rust` batch always binds a run attempt. Collector preflight and
+collector-scoped binary/weekly-Clippy profiles also use `monday.ack_execution_receipt.v2` at the existing receipt
 branch's `<run>/<attempt>/<job>/<checkout>/receipt.json` and `.sig` path. The
 controller must commit the producer's exact run attempt and numeric job ID, sign
 its independently verified terminal, wait for its public job success, then commit
@@ -23,12 +27,15 @@ and unexpired evidence. A producer workflow can remain running after its quick
 job succeeds, avoiding a dependency cycle with Rust. Cancelled/failed/rerun
 producers and changed source fail closed. Public metadata GETs require no additional
 token permission; API errors/rate limits prevent acceptance. Existing full gates
-remain required. Other profiles keep v1. Binary v2 receipts retain the independently
+remain required. Other profiles keep v1. Static layout, source-policy and `cargo fmt` checks
+run on GitHub without compiling research code or waiting on an ACK receipt. Binary v2 receipts retain the independently
 verified software download descriptor consumed by the existing download checks.
 
-The approved quick recipe and v2 migration cover collector scope only. Other
-research scope does not schedule preflight and retains existing v1 receipts and
-full gates. The relay derives scope from source; private compiler recipes recheck
+The quick preflight recipe covers collector scope only. Other research scope
+does not schedule preflight, but its batch still binds the exact attempt and
+lists all selected test and Clippy stage results. A missing, duplicated or failed
+stage cannot satisfy either consumer. Trusted negative receipts terminate the
+wait before success-only preflight/artifact requirements. The relay derives scope from source; private compiler recipes recheck
 committed scope before compilation, with no control-plane credentials available. There is no cross-commit compiled target reuse: only workspace registry/git
 downloads and immutable toolchain image layers are reused; targets retain exact SHA
 isolation. No runner, storage, permission or budget change is included.
@@ -40,6 +47,8 @@ Local checks (no compilation/network dispatch):
 - `.github/scripts/test-preflight-workflow-gate.sh`: dependency edges, non-ACK skip,
   failed/cancelled prerequisite rejection and required full Rust gate.
 - `.github/scripts/test-classify-ack-research-job.sh`: profile routing.
+- `.github/scripts/test-ack-rust-batch.sh`: stage/package coverage, producer
+  attempt/job drift and public static checks.
 
 Private matching contracts additionally cover signature tampering, missing/expired
 proof, source/base/manifest/scope mismatch, API failure, cancellation, timeout,
