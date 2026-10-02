@@ -231,7 +231,7 @@ jobs:
           name: research-image-release-${{ github.sha }}
           path: ${{ runner.temp }}/ack-receipt/software/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
   research-image-smoke:
     name: Research image smoke
