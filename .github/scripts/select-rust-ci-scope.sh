@@ -365,6 +365,19 @@ for path in "${paths[@]}"; do
       continue
       ;;
     .github/scripts/run-collector-control-contracts.py|.github/scripts/test-collector-control-scheduling.py)
+      # A deletion still appears in the Git diff. Never admit a reintroduced
+      # tracked obsolete scheduler as executable CI code.
+      if git -C "$repo_root" ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+        printf 'obsolete CI scheduler remains tracked: %s\n' "$path" >&2
+        exit 2
+      fi
+      control=true
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
+    .github/scripts/run-collector-control-contracts.sh|.github/scripts/test-collector-control-scheduling.sh)
       control=true
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
