@@ -378,7 +378,38 @@ printf 'Real global/spool ownership, released market during hashing, nonblocking
   started=$SECONDS
   retention_fixture_check >"$root/batch.json"
   jq -e '.retained_failed_count==23 and (.failed_job_ids|length)==23 and .invalid_retention_count==0' "$root/batch.json" >/dev/null
-  printf '23-job metadata-only reader completed in %ss (25s deadline)\n' "$((SECONDS - started))"
+  printf '23-job metadata-only reader completed in %ss (production 300s deadline)\n' "$((SECONDS - started))"
   retention_fixture_job 24
   retention_fixture_check | jq -e '.retained_failed_count==23 and (.failed_job_ids|length)==24 and .invalid_retention_count==0' >/dev/null
 )
+
+# Error classes follow observed read outcomes; elapsed time alone is not
+# evidence that an immutable index changed. These cases need no wall-clock wait.
+for failure in deadline unavailable index-drift membership-drift; do
+  reader_failure_case() (
+    local calls="$fixture/snapshot-calls-$failure"
+    RETENTION_DEADLINE=$((SECONDS + 300))
+    retention_failed_ids() {
+      if [[ $failure == membership-drift && -f $calls ]]; then printf '["new-job"]\n'; else printf '[]\n'; fi
+    }
+    retention_claim_snapshot() { printf '[]\n'; }
+    retention_index_snapshot() {
+      if [[ ! -f $calls ]]; then : >"$calls"; printf '[]\n'; return; fi
+      case "$failure" in
+        deadline) return 124 ;;
+        unavailable) return 74 ;;
+        index-drift) printf '[{"name":"changed"}]\n' ;;
+        membership-drift) printf '[]\n' ;;
+      esac
+    }
+    check_retained_market
+  )
+  rejected "reader-$failure" reader_failure_case
+  case "$failure" in
+    deadline) expected=retention-read-deadline ;;
+    unavailable) expected=retention-read-unavailable ;;
+    *) expected=retention-read-drift ;;
+  esac
+  grep -Fq "$expected:" "$fixture/rejected.err"
+done
+printf 'Reader deadline, unavailable snapshot, index drift and membership drift are distinct fail-closed outcomes\n'
