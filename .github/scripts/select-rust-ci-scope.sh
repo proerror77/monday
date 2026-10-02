@@ -38,6 +38,7 @@ clippy_loop=false
 clippy_handoff=false
 image_live=false
 image_paper=false
+production_collector_image=false
 declare -a paths=()
 
 select_job() {
@@ -177,6 +178,8 @@ emit() {
   # Every path that selects collector verification must exercise its production image.
   if [[ $collector == true ]]; then select_job ci/deployment-artifacts; fi
   image_matrix=$(printf '%s\n' "${paths[@]}" | bash "$(dirname "${BASH_SOURCE[0]}")/image-build-plan.sh" "$image_live" "$image_paper" "$collector" "$event")
+  production_trading_image=$(jq -r 'any(.include[]; .name=="hft-trading")' <<<"$image_matrix")
+  [[ $collector != true ]] || production_collector_image=true
   select_security_scope
   for value in "$loop" "$handoff" "$json" "$ondo" "$collector" "$control" "$focused" "$toolchain"; do
     [[ $value == true || $value == false ]] || { printf 'invalid boolean selector output: %s\n' "$value" >&2; exit 1; }
@@ -186,6 +189,8 @@ emit() {
   [[ $owning_packages =~ ^([A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]] || { printf 'invalid owning package selector output: %s\n' "$owning_packages" >&2; exit 1; }
   printf '%s\n' \
     "image_matrix=$image_matrix" \
+    "production_trading_image=$production_trading_image" \
+    "production_collector_image=$production_collector_image" \
     "jobs=,$jobs," \
     "security_jobs=,$security_jobs," \
     "owning_packages=,$owning_packages," \
@@ -280,6 +285,7 @@ for path in "${paths[@]}"; do
       continue
       ;;
     rust_hft/.dockerignore)
+      production_collector_image=true
       select_job ci/deployment-artifacts
       select_job ci/polymarket-evidence-compiler-image
       select_research_image_jobs
