@@ -236,6 +236,9 @@ jobs:
     if: ${{ contains(needs.security-scope.outputs.jobs, ',security/clippy-strict,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
     defaults:
       run:
         working-directory: rust_hft
@@ -292,14 +295,18 @@ jobs:
   # ============================================================================
   # Unused Dependencies
   # ============================================================================
-      - name: Wait for signed ACK execution receipt
+      - name: Verify strict Clippy from the signed Monorepo batch
         if: needs.security-scope.outputs.ack_research == 'true'
         id: ack
         working-directory: .
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          .github/scripts/wait-ack-research-receipt.sh security-clippy-research "$(git rev-parse HEAD)"
+          if [[ $GITHUB_EVENT_NAME == schedule ]]; then
+            .github/scripts/wait-ack-research-receipt.sh security-clippy-research "$(git rev-parse HEAD)"
+          else
+            bash .github/scripts/wait-ack-rust-batch.sh "$(git rev-parse HEAD)"
+          fi
   cargo-machete:
     name: Code Quality - Unused Dependencies
     needs: security-scope

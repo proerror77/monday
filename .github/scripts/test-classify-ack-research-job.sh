@@ -10,12 +10,15 @@ classify() {
   bash "$classifier" --repository proerror77/monday --event pull_request \
     --head-repository proerror77/monday "$@"
 }
-for job in ci/research-preflight ci/rust ci/rust-fast-gates security/clippy-strict; do
+for job in ci/research-preflight ci/rust security/clippy-strict; do
   result=$(classify --job "$job" --research true)
   [[ $result == backend=ack$'\n'profile=* ]] || { echo "research job used another backend: $job" >&2; exit 1; }
   result=$(classify --job "$job" --research false)
   [[ $result == backend=github$'\n'profile= ]] || { echo "runtime-only job moved to ACK: $job" >&2; exit 1; }
 done
+[[ $(classify --job ci/rust-fast-gates --research true) == backend=github$'\n'profile= ]]
+[[ $(classify --job security/clippy-strict --research true) == backend=ack$'\n'profile=ci-rust ]]
+[[ $(bash "$classifier" --repository proerror77/monday --event schedule --job security/clippy-strict --research true) == backend=ack$'\n'profile=security-clippy-research ]]
 for job in ploy/research-image-binaries ploy/research-image-smoke ploy/rust-format \
   ploy/rust-research-heavy acr/research-runner-binaries acr/research-publish acr/research-source-test; do
   [[ $(classify --job "$job") == backend=ack$'\n'profile=* ]]

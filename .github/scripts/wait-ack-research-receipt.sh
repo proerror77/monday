@@ -6,7 +6,7 @@ profile=${1:?fixed ACK profile required}
 source_sha=${2:?actual checkout SHA required}
 destination=${3:-${RUNNER_TEMP:?}/ack-receipt}
 case "$profile" in
-  ci-research-preflight|ci-rust|ci-rust-fast-gates|security-clippy-research|research-image-binaries|research-image-smoke|prediction-research-format|prediction-research-heavy|research-release-binaries|research-release-publish|research-source-test) ;;
+  ci-research-preflight|ci-rust|security-clippy-research|research-image-binaries|research-image-smoke|prediction-research-format|prediction-research-heavy|research-release-binaries|research-release-publish|research-source-test) ;;
   *) echo 'Unknown private ACK execution profile' >&2; exit 2 ;;
 esac
 [[ $source_sha =~ ^[0-9a-f]{40}$ && ${GITHUB_RUN_ID:-} =~ ^[0-9]+$ && ${GITHUB_JOB:-} =~ ^[a-zA-Z0-9_-]+$ ]] || exit 2
@@ -27,10 +27,11 @@ case "$profile" in
     selected_base=$(jq -r '.pull_request.base.sha // .before // empty' "$GITHUB_EVENT_PATH")
     selected_head=$(jq -r '.pull_request.head.sha // .after // empty' "$GITHUB_EVENT_PATH")
     [[ -n $selected_head ]] || selected_head=$source_sha
+    : >"$destination/derived-scope.txt"
     GITHUB_OUTPUT="$destination/derived-scope.txt" bash .github/scripts/select-rust-ci-scope.sh --event "$GITHUB_EVENT_NAME" --base "$selected_base" --head "$selected_head"
     selected_collector=$(awk -F= '$1=="collector" {print $2}' "$destination/derived-scope.txt")
     [[ $selected_collector == true || $selected_collector == false ]] || exit 1
-    [[ $selected_collector != true ]] || v2=true ;;
+    [[ $selected_collector != true && $profile != ci-rust ]] || v2=true ;;
 esac
 attempt=${GITHUB_RUN_ATTEMPT:-0}
 if [[ $v2 == true ]]; then [[ $attempt =~ ^[1-9][0-9]*$ ]] || exit 2; fi
@@ -68,7 +69,9 @@ while (( $(date +%s) < deadline )); do
     jq -e --arg source "$source_sha" --arg profile "$profile" --arg run "$GITHUB_RUN_ID" --arg job "$GITHUB_JOB" --arg schema "$schema" '
       .schema_version == $schema and
       .public_repo == "proerror77/monday" and .public_run_id == $run and .public_job == $job and
-      .checkout_sha == $source and .profile == $profile and .execution_host == "ack" and
+      .checkout_sha == $source and .profile == $profile and
+      (.execution_host == "ack" or (.terminal_result=="failure" and .execution_host=="unverified" and
+        (.execution_state|IN("unverified","not_admitted")))) and
       (.private_run_id | type == "string" and test("^[0-9]+$")) and
       (.command_manifest_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
       (.terminal_result == "success" or .terminal_result == "failure")
@@ -82,9 +85,15 @@ while (( $(date +%s) < deadline )); do
       finished=$(date -u -d "$(jq -er .finished_at "$destination/receipt.json")" +%s) || exit 1
       expires=$(date -u -d "$(jq -er .expires_at "$destination/receipt.json")" +%s) || exit 1
       (( finished <= $(date +%s) && $(date +%s) < expires && expires - finished <= 28800 )) || exit 1
+      # A trusted negative result must end the wait before success-only proof
+      # and artifact requirements. It can never satisfy either public gate.
+      if [[ $(jq -r .terminal_result "$destination/receipt.json") != success ]]; then
+        cat "$destination/receipt.json"
+        exit 1
+      fi
       if [[ $profile == ci-research-preflight ]]; then
         jq -e '.phase_results=={preflight:"success",quick:"success"}' "$destination/receipt.json" >/dev/null || exit 1
-      else
+      elif [[ $selected_collector == true ]]; then
         # Public GETs only: no runner credential, dispatch or added permissions.
         jq -e '.preflight | (.public_run_id|type=="number" and .>0 and floor==.) and (.public_run_attempt|type=="number" and .>0 and floor==.) and (.public_job_id|type=="number" and .>0 and floor==.) and (.receipt_sha256|test("^[0-9a-f]{64}$"))' "$destination/receipt.json" >/dev/null || exit 1
         producer=$(jq -r .preflight.public_run_id "$destination/receipt.json")
@@ -105,6 +114,19 @@ while (( $(date +%s) < deadline )); do
     fi
     cat "$destination/receipt.json"
     [[ $(jq -r .terminal_result "$destination/receipt.json") == success ]] || exit 1
+    if [[ $profile == ci-rust ]]; then
+      source "$repo_root/.github/scripts/verify-ack-rust-batch.sh"
+      ack_verify_rust_batch "$destination/receipt.json" "$destination/derived-scope.txt" || {
+        echo 'ACK batch does not cover the source-selected test and strict Clippy stages' >&2
+        exit 1
+      }
+      gh api "repos/proerror77/monday/actions/runs/$GITHUB_RUN_ID" >"$destination/current-rust-run.json"
+      gh api "repos/proerror77/monday/actions/runs/$GITHUB_RUN_ID/attempts/$attempt/jobs?per_page=100" >"$destination/current-rust-jobs.json"
+      ack_verify_rust_job "$destination/receipt.json" "$destination/current-rust-run.json" "$destination/current-rust-jobs.json" || {
+        echo 'ACK batch does not match the current Rust Workspace job and attempt' >&2
+        exit 1
+      }
+    fi
     if jq -e '.software_bundle != null' "$destination/receipt.json" >/dev/null; then
       bundle_url=$(jq -er '.software_bundle.url | select(startswith("https://"))' "$destination/receipt.json")
       bundle_sha=$(jq -er '.software_bundle.sha256 | select(test("^[0-9a-f]{64}$"))' "$destination/receipt.json")

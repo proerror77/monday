@@ -70,14 +70,15 @@ jobs:
         with:
           ref: refs/heads/main
 
-      - name: Read authenticated automatic release source
+      - name: Read authenticated reusable research source
         id: source-jobs
-        if: github.event_name == 'workflow_run'
+        if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && (inputs.target == 'research-runner' || inputs.target == 'all') && inputs.rebuild_research_runner != true)
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          SOURCE_MODE: ${{ github.event_name == 'workflow_dispatch' && 'reuse' || 'automatic' }}
         run: |
-          .github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID"
+          .github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID" "$GITHUB_OUTPUT" "$SOURCE_MODE"
 
       - name: Read authenticated release admission
         id: admission
@@ -192,7 +193,7 @@ jobs:
           name: research-image-release-${{ needs.selector.outputs.source_sha }}
           path: ${{ runner.temp }}/ack-receipt/software/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
   publish:
     needs: [selector, research-runner-binaries]

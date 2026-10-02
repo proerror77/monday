@@ -7,6 +7,36 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 CUTOVER="$SCRIPT_DIR/binance-fee-cutover.sh"
 WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
+CI_RUNNER="$SCRIPT_DIR/../../.github/scripts/run-collector-control-contracts.sh"
+
+check_ci_registration() {
+  if ! awk '
+    /^  control_contracts:/ {inside=1; next}
+    /^  [[:alnum:]_]+:/ {inside=0}
+    inside && /^[[:space:]]+bash \.\.\/\.github\/scripts\/run-collector-control-contracts\.sh[[:space:]]*$/ {found=1}
+    END {exit !found}
+  ' "$CI_WORKFLOW"; then
+    printf 'collector control workflow must invoke the release contract runner\n' >&2
+    return 1
+  fi
+  if ! awk '
+    /^FAST=\(/ {inside=1; next}
+    inside && /^\)/ {inside=0}
+    inside && /^[[:space:]]*test-binance-fee-cutover\.sh[[:space:]]*$/ {count++}
+    END {exit count!=1}
+  ' "$CI_RUNNER"; then
+    printf 'release runner must register the fee cutover contract exactly once in FAST\n' >&2
+    return 1
+  fi
+}
+
+# Exercise the actual admission assertion against isolated mutated fixtures
+# without starting the cutover behavior suite or changing repository files.
+if [[ ${1:-} == --check-ci-registration ]]; then
+  check_ci_registration
+  exit 0
+fi
+
 TAR_BIN=$(command -v gtar || command -v tar)
 if "$TAR_BIN" --help 2>/dev/null | grep -q -- '--sort'; then
   TAR_CREATE_OPTS=(--sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner)
@@ -31,7 +61,7 @@ grep -Fq 'binance-fee-production-control-assets.sha256' "$CUTOVER"
 grep -Fq 'FAILED.sha256' "$CUTOVER"
 grep -Fq 'credential JSON must contain exactly runtime_account_id/api_key/secret' "$CUTOVER"
 grep -Fq 'binance-fee-cutover.sh' "$WORKFLOW"
-grep -Fq 'test-binance-fee-cutover.sh' "$CI_WORKFLOW"
+check_ci_registration
 
 sha_file() {
   sha256sum "$1" | awk '{print $1}'

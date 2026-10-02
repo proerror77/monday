@@ -12,8 +12,8 @@ permissions:
 
 concurrency:
   group: monorepo-${{ github.ref }}
-  # PR runs may be superseded; main runs must finish so the shared Rust target
-  # cache remains warm for everyone else.
+  # PR runs may be superseded; main runs must finish their exact-source
+  # validation and publication handoff.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
@@ -32,6 +32,8 @@ jobs:
       control: ${{ steps.scope.outputs.control }}
       focused: ${{ steps.scope.outputs.focused }}
       toolchain: ${{ steps.scope.outputs.toolchain }}
+      production_trading_image: ${{ steps.scope.outputs.production_trading_image }}
+      production_collector_image: ${{ steps.scope.outputs.production_collector_image }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
     steps:
       - name: Checkout
@@ -77,6 +79,8 @@ jobs:
       control: ${{ steps.scope.outputs.control }}
       focused: ${{ steps.scope.outputs.focused }}
       toolchain: ${{ steps.scope.outputs.toolchain }}
+      production_trading_image: ${{ steps.scope.outputs.production_trading_image }}
+      production_collector_image: ${{ steps.scope.outputs.production_collector_image }}
     steps:
       - name: Resolve selector result
         id: scope
@@ -92,12 +96,14 @@ jobs:
           SELECTED_CONTROL: ${{ needs.selector.outputs.control }}
           SELECTED_FOCUSED: ${{ needs.selector.outputs.focused }}
           SELECTED_TOOLCHAIN: ${{ needs.selector.outputs.toolchain }}
+          SELECTED_PRODUCTION_TRADING_IMAGE: ${{ needs.selector.outputs.production_trading_image }}
+          SELECTED_PRODUCTION_COLLECTOR_IMAGE: ${{ needs.selector.outputs.production_collector_image }}
           SELECTED_COMPLETE: ${{ needs.selector.outputs.selection_complete }}
         run: |
           if [[ "$SELECTOR_RESULT" == success && "$SELECTED_COMPLETE" == true ]] &&
              [[ "$SELECTED_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]] &&
              [[ "$SELECTED_OWNING_PACKAGES" =~ ^,[A-Za-z0-9_-]*(,[A-Za-z0-9_-]+)*,$ ]] &&
-             [[ "$SELECTED_LOOP,$SELECTED_HANDOFF,$SELECTED_JSON,$SELECTED_ONDO,$SELECTED_COLLECTOR,$SELECTED_CONTROL,$SELECTED_FOCUSED,$SELECTED_TOOLCHAIN" =~ ^(true|false)(,(true|false)){7}$ ]]; then
+             [[ "$SELECTED_LOOP,$SELECTED_HANDOFF,$SELECTED_JSON,$SELECTED_ONDO,$SELECTED_COLLECTOR,$SELECTED_CONTROL,$SELECTED_FOCUSED,$SELECTED_TOOLCHAIN,$SELECTED_PRODUCTION_TRADING_IMAGE,$SELECTED_PRODUCTION_COLLECTOR_IMAGE" =~ ^(true|false)(,(true|false)){9}$ ]]; then
             printf '%s\n' \
               "jobs=$SELECTED_JOBS" \
               "owning_packages=$SELECTED_OWNING_PACKAGES" \
@@ -108,7 +114,9 @@ jobs:
               "collector=$SELECTED_COLLECTOR" \
               "control=$SELECTED_CONTROL" \
               "focused=$SELECTED_FOCUSED" \
-              "toolchain=$SELECTED_TOOLCHAIN"
+              "toolchain=$SELECTED_TOOLCHAIN" \
+              "production_trading_image=$SELECTED_PRODUCTION_TRADING_IMAGE" \
+              "production_collector_image=$SELECTED_PRODUCTION_COLLECTOR_IMAGE"
           else
             echo 'CI selection failed or returned an invalid plan; no work is dispatched' >&2
             exit 1
@@ -155,21 +163,7 @@ jobs:
             bash -n "$script"
           done
           shellcheck ../deployment/aliyun/*.sh
-          ../deployment/aliyun/test-polymarket-market-tape-upload-contract.sh
-          ../deployment/aliyun/test-polymarket-reference-upload-contract.sh
-          ../deployment/aliyun/test-monday-collector-health.sh
-          ../deployment/aliyun/test-collector-health-unit-release.sh
-          ../deployment/aliyun/test-rust-lob-control-plane.sh
-          ../deployment/aliyun/test-rust-lob-controller-release.sh
-          ../deployment/aliyun/test-rust-lob-recovery-queue.sh
-          ../deployment/aliyun/test-rust-lob-restore.sh
-          ../deployment/aliyun/test-polymarket-raw-ops-stage.sh
-          ../deployment/aliyun/test-trading-ecs-host-contract.sh
-          ../deployment/aliyun/test-binance-fee-release-contract.sh
-          ../deployment/aliyun/test-binance-usdm-account-release-contract.sh
-          ../deployment/aliyun/test-binance-fee-cutover.sh
-          ../deployment/aliyun/test-bybit-options-release-contract.sh
-          ../deployment/aliyun/test-bybit-options-shadow-gate.sh
+          bash ../.github/scripts/run-collector-control-contracts.sh
 
   monitor_contracts:
     name: Collector monitor contracts
@@ -199,10 +193,12 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Verify selection, cancellation and aggregate admission
         run: |
+          bash .github/scripts/test-collector-control-scheduling.sh
           bash .github/scripts/test-main-image-scope.sh
           bash .github/scripts/test-image-build-plan.sh
           bash .github/scripts/test-tested-image.sh
           node .github/scripts/test-local-lock-impact.mjs
+          bash .github/scripts/test-ack-rust-batch.sh
           .github/scripts/test-select-rust-ci-scope.sh
           .github/scripts/test-ci-monitor-scope.sh
           .github/scripts/test-agent-validation-gates.sh
@@ -238,6 +234,9 @@ jobs:
 
   rust:
     name: Rust Workspace
+    permissions:
+      contents: read
+      actions: read
     needs: [scope, research_preflight]
     if: ${{ always() && !cancelled() && needs.scope.result == 'success' && contains(needs.scope.outputs.jobs, ',ci/rust,') && (needs.scope.outputs.ack_research != 'true' || needs.scope.outputs.collector != 'true' || needs.research_preflight.result == 'success') }}
     runs-on: ubuntu-latest
@@ -397,7 +396,7 @@ jobs:
     needs: scope
     if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 10
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -407,7 +406,6 @@ jobs:
           fetch-depth: 0
 
       - name: Enforce Monday module layout
-        if: needs.scope.outputs.ack_research != 'true'
         working-directory: .
         run: |
           set -euo pipefail
@@ -417,7 +415,6 @@ jobs:
           test -f rust_hft/execution-gateway/adapters/adapter-polymarket/Cargo.toml
 
       - name: Enforce Rust-only research and runtime source
-        if: needs.scope.outputs.ack_research != 'true'
         working-directory: .
         run: |
           set -euo pipefail
@@ -550,14 +547,14 @@ jobs:
           fi
 
       - name: Setup Rust toolchain (fmt)
-        if: ${{ (needs.scope.outputs.loop == 'true') && needs.scope.outputs.ack_research != 'true' }}
+        if: ${{ (needs.scope.outputs.loop == 'true') }}
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
           components: rustfmt
 
       - name: Format Loop Engineer packages
-        if: ${{ (needs.scope.outputs.loop == 'true') && needs.scope.outputs.ack_research != 'true' }}
+        if: ${{ (needs.scope.outputs.loop == 'true') }}
         working-directory: rust_hft
         run: |
           cargo fmt --check --package alpha-domain
@@ -568,14 +565,6 @@ jobs:
           cargo fmt --check --package hft-harnessctl
           cargo fmt --check --package hft-research-ml
 
-      - name: Wait for signed ACK execution receipt
-        if: needs.scope.outputs.ack_research == 'true'
-        id: ack
-        working-directory: .
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          .github/scripts/wait-ack-research-receipt.sh ci-rust-fast-gates "$(git rev-parse HEAD)"
   market_recorder_contract:
     name: Market Recorder Release Contract
     needs: scope
@@ -606,9 +595,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
+        if: needs.scope.outputs.production_trading_image == 'true' || needs.scope.outputs.production_collector_image == 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Build production trading image
+        if: needs.scope.outputs.production_trading_image == 'true'
         uses: docker/build-push-action@v7
         with:
           context: rust_hft
@@ -621,6 +612,7 @@ jobs:
       # This is the same production collector Dockerfile and cache used by ACR.
       # A build-dependency failure must fail the required CI gate before release.
       - name: Build production collector image
+        if: needs.scope.outputs.production_collector_image == 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: rust_hft
@@ -640,6 +632,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Verify production collector binary source and self-test
+        if: needs.scope.outputs.production_collector_image == 'true'
         env:
           SOURCE_REVISION: ${{ github.sha }}
         run: |

@@ -33,10 +33,12 @@ security_jobs=
 research_image_relevant=false
 architecture=false
 owning_packages=
+loop_packages=
 clippy_loop=false
 clippy_handoff=false
 image_live=false
 image_paper=false
+production_collector_image=false
 declare -a paths=()
 
 select_job() {
@@ -52,6 +54,7 @@ select_security_job() {
 select_all_security_jobs() {
   clippy_loop=true
   clippy_handoff=true
+  loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-harnessctl,hft-research-ml
   select_security_job security/sast-semgrep
   select_security_job security/cargo-audit
   select_security_job security/secret-presence
@@ -158,6 +161,7 @@ select_all() {
   image_live=true
   image_paper=true
   loop=true
+  loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-harnessctl,hft-research-ml
   handoff=true
   json=true
   ondo=true
@@ -174,6 +178,8 @@ emit() {
   # Every path that selects collector verification must exercise its production image.
   if [[ $collector == true ]]; then select_job ci/deployment-artifacts; fi
   image_matrix=$(printf '%s\n' "${paths[@]}" | bash "$(dirname "${BASH_SOURCE[0]}")/image-build-plan.sh" "$image_live" "$image_paper" "$collector" "$event")
+  production_trading_image=$(jq -r 'any(.include[]; .name=="hft-trading")' <<<"$image_matrix")
+  [[ $collector != true ]] || production_collector_image=true
   select_security_scope
   for value in "$loop" "$handoff" "$json" "$ondo" "$collector" "$control" "$focused" "$toolchain"; do
     [[ $value == true || $value == false ]] || { printf 'invalid boolean selector output: %s\n' "$value" >&2; exit 1; }
@@ -183,9 +189,12 @@ emit() {
   [[ $owning_packages =~ ^([A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]] || { printf 'invalid owning package selector output: %s\n' "$owning_packages" >&2; exit 1; }
   printf '%s\n' \
     "image_matrix=$image_matrix" \
+    "production_trading_image=$production_trading_image" \
+    "production_collector_image=$production_collector_image" \
     "jobs=,$jobs," \
     "security_jobs=,$security_jobs," \
     "owning_packages=,$owning_packages," \
+    "loop_packages=,$loop_packages," \
     "clippy_loop=$clippy_loop" \
     "clippy_handoff=$clippy_handoff" \
     "loop=$loop" \
@@ -276,6 +285,7 @@ for path in "${paths[@]}"; do
       continue
       ;;
     rust_hft/.dockerignore)
+      production_collector_image=true
       select_job ci/deployment-artifacts
       select_job ci/polymarket-evidence-compiler-image
       select_research_image_jobs
@@ -343,11 +353,32 @@ for path in "${paths[@]}"; do
       ;;
     .github/scripts/classify-ack-research-job.sh|.github/scripts/test-classify-ack-research-job.sh|\
     .github/scripts/wait-ack-research-receipt.sh|.github/scripts/verify-ack-preflight.sh|\
+    .github/scripts/wait-ack-rust-batch.sh|.github/scripts/verify-ack-rust-batch.sh|.github/scripts/test-ack-rust-batch.sh|\
     .github/scripts/test-ack-preflight-relay.sh|.github/scripts/test-preflight-workflow-gate.sh|\
     .github/ack-ci/receipt-public-key.pub|.github/ack-ci/PREFLIGHT.md|\
     .github/workflows/ack-flow-contracts.yml)
       # Public ACK routing/signature checks are control metadata. They have no
       # Cargo dependency impact; unknown future helpers block scope planning.
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
+    .github/scripts/run-collector-control-contracts.py|.github/scripts/test-collector-control-scheduling.py)
+      # A deletion still appears in the Git diff. Never admit a reintroduced
+      # tracked obsolete scheduler as executable CI code.
+      if git -C "$repo_root" ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+        printf 'obsolete CI scheduler remains tracked: %s\n' "$path" >&2
+        exit 2
+      fi
+      control=true
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
+    .github/scripts/run-collector-control-contracts.sh|.github/scripts/test-collector-control-scheduling.sh)
+      control=true
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
@@ -620,6 +651,9 @@ select_if_affected() {
   for package in "$@"; do
     if is_affected "$package"; then
       mark_checked_direct_package "$package"
+      if [[ $flag == loop ]]; then
+        [[ ,$loop_packages, == *,$package,* ]] || loop_packages=${loop_packages:+$loop_packages,}$package
+      fi
       selected=true
     fi
   done

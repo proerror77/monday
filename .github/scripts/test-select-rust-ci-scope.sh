@@ -25,6 +25,9 @@ run_case() {
 printf '%s\n' package-lock.json >"$tmp_dir/root-node.txt"
 printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
+printf '%s\n' .github/scripts/run-collector-control-contracts.sh >"$tmp_dir/control-scheduling.txt"
+printf '%s\n' .github/scripts/test-collector-control-scheduling.sh >"$tmp_dir/control-scheduling-test.txt"
+printf '%s\n' .github/scripts/run-collector-control-contracts.py .github/scripts/test-collector-control-scheduling.py >"$tmp_dir/control-scheduling-deletions.txt"
 printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
 printf '%s\n' docs/agents/issue-tracker.md >"$tmp_dir/governance-doc.txt"
 printf '%s\n' .agents/skills/monday-research-evidence-audit/SKILL.md >"$tmp_dir/skill.txt"
@@ -125,6 +128,9 @@ job_cases=(
   'root-node|pull_request|root-node.txt|ci/node-install'
   'security-workflow|pull_request|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'security-workflow-push|push|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
+  'control-scheduling|pull_request|control-scheduling.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
+  'control-scheduling-test|pull_request|control-scheduling-test.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
+  'control-scheduling-deletions|pull_request|control-scheduling-deletions.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'skill|pull_request|skill.txt|ploy/commit-hygiene,ploy/workflow-lint'
@@ -165,6 +171,9 @@ ack_metadata_paths=(
   .github/scripts/classify-ack-research-job.sh
   .github/scripts/test-classify-ack-research-job.sh
   .github/scripts/wait-ack-research-receipt.sh
+  .github/scripts/verify-ack-rust-batch.sh
+  .github/scripts/wait-ack-rust-batch.sh
+  .github/scripts/test-ack-rust-batch.sh
   .github/ack-ci/receipt-public-key.pub
   .github/ack-ci/PREFLIGHT.md
   .github/scripts/verify-ack-preflight.sh
@@ -487,10 +496,11 @@ if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block";
 if grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'shellcheck' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fq 'test-rust-lob-control-plane.sh' <<<"$control_job_block"
-grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$control_job_block"
+grep -Fq 'bash ../.github/scripts/run-collector-control-contracts.sh' <<<"$control_job_block"
+grep -Fq 'test-rust-lob-control-plane.sh' "$script_dir/run-collector-control-contracts.sh"
+grep -Fq 'test-rust-lob-recovery-queue.sh' "$script_dir/run-collector-control-contracts.sh"
 [[ $scope_job_block != *test-* && $scope_job_block != *shellcheck* ]]
-grep -Fq 'test-monday-collector-health.sh' <<<"$control_job_block"
+grep -Fq 'test-monday-collector-health.sh' "$script_dir/run-collector-control-contracts.sh"
 grep -Fq 'shellcheck' <<<"$control_job_block"
 grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
 grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
@@ -607,7 +617,7 @@ for mapping in \
     exit 1
   fi
 done
-for mapping in rust:ci-rust rust_fast_gates:ci-rust-fast-gates; do
+for mapping in rust:ci-rust; do
   job=${mapping%%:*}
   profile=${mapping#*:}
   mixed_block=$(job_block "$job")
@@ -618,7 +628,7 @@ done
 # newly-added unguarded compiler/setup step must fail this contract.
 ruby -ryaml - "$ci_workflow" <<'RUBY'
 ci=YAML.safe_load(File.read(ARGV.fetch(0)))
-%w[rust rust_fast_gates].each do |id|
+%w[rust].each do |id|
   ci.fetch('jobs').fetch(id).fetch('steps').each do |step|
     next if step.fetch('uses','').include?('actions/checkout@') || step.fetch('run','').include?('wait-ack-research-receipt.sh')
     abort "unguarded native research action in #{id}" unless step.fetch('if','').include?("needs.scope.outputs.ack_research != 'true'")
@@ -846,3 +856,12 @@ assert_flag "$security_schedule" clippy_handoff true
 assert_flag "$live" clippy_loop false
 assert_flag "$live" clippy_handoff true
 assert_flag "$collector" clippy_loop true
+
+# Leaf research changes select the affected package, while shared-domain changes
+# retain reverse-dependency coverage. The same list feeds tests and Clippy.
+printf '%s\n' rust_hft/alpha-harness/app/src/main.rs >"$tmp_dir/alpha-leaf.txt"
+output=$(run_case alpha-leaf pull_request alpha-leaf.txt)
+assert_flag "$output" loop_packages ',alpha-harness,'
+assert_flag "$output" clippy_loop true
+output=$(run_case schedule schedule alpha-leaf.txt)
+assert_flag "$output" loop_packages ',alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-harnessctl,hft-research-ml,'
