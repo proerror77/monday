@@ -40,12 +40,15 @@ end
     end
   end
 end
-[[ci,'rust'],[ci,'rust_fast_gates'],[security,'clippy-strict']].each do |doc,id|
+[[ci,'rust'],[security,'clippy-strict']].each do |doc,id|
   doc.fetch('jobs').fetch(id).fetch('steps').each do |step|
     next if step.fetch('uses','').include?('actions/checkout@') || step.fetch('run','').include?('wait-ack-research-receipt.sh')
     abort "unguarded mixed research job #{id}" unless step.fetch('if','').include?("outputs.ack_research != 'true'")
   end
 end
+fast=ci.fetch('jobs').fetch('rust_fast_gates')
+abort 'static Fast dispatches ACK' if fast.to_s.include?('wait-ack') || fast.to_s.include?('ack_research')
+abort 'static Fast compiles research' if fast.to_s.match?(/\bcargo\s+(build|test|check|clippy)\b/)
 acr.fetch('jobs').fetch('publish').fetch('steps').each do |step|
   next unless step.fetch('run','').match?(/\bdocker\s/) || step.fetch('uses','').match?(/docker\//)
   abort 'public research image build, smoke or publication' unless step.fetch('if','').include?('!matrix.research_artifact')
