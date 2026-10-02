@@ -83,6 +83,13 @@ mod tests {
         assert!(!output.contains(&private));
     }
 
+    // Temporary rollout probe: verify that a real failed Cargo stage is signed
+    // and ends both public consumers. This branch is never merged.
+    #[test]
+    fn ack_batch_failure_propagation_probe() {
+        panic!("intentional ACK CI rollout failure probe");
+    }
+
     #[test]
     fn rejects_invalid_feedback_key_inputs() {
         assert!(feedback_public_key_json("", &hex::encode([7_u8; 32])).is_err());
