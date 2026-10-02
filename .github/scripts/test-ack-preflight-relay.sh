@@ -81,3 +81,11 @@ if GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=3 GITHUB_JOB=research-image-binaries bas
 grep -Fq '"terminal_result": "failure"' "$fixture/failure.log"
 [[ ! -e $fixture/failed-out/preflight.json && ! -e $fixture/failed-out/software.tar.gz ]]
 printf 'PASS: a signed negative terminal ends the public wait without success-only proof or artifact lookups\n'
+for state in rejected cancelled interrupted expired; do
+  jq --arg state "$state" '.execution_host="unverified"|.execution_state="unverified"|.terminal_state=$state' "$fixture/heavy.json" >"$fixture/negative.json"
+  mv "$fixture/negative.json" "$fixture/heavy.json"
+  openssl pkeyutl -sign -inkey "$fixture/key" -rawin -in "$fixture/heavy.json" -out "$fixture/heavy.sig"
+  if GITHUB_RUN_ID=202 GITHUB_RUN_ATTEMPT=3 GITHUB_JOB=research-image-binaries bash .github/scripts/wait-ack-research-receipt.sh research-image-binaries "$source_sha" "$fixture/negative-$state" >"$fixture/negative.log"; then exit 1; fi
+  grep -Fq "\"terminal_state\": \"$state\"" "$fixture/negative.log"
+done
+printf 'PASS: signed unverified execution states terminate as failures without claiming ACK validation\n'

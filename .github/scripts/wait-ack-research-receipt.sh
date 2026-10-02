@@ -69,7 +69,9 @@ while (( $(date +%s) < deadline )); do
     jq -e --arg source "$source_sha" --arg profile "$profile" --arg run "$GITHUB_RUN_ID" --arg job "$GITHUB_JOB" --arg schema "$schema" '
       .schema_version == $schema and
       .public_repo == "proerror77/monday" and .public_run_id == $run and .public_job == $job and
-      .checkout_sha == $source and .profile == $profile and .execution_host == "ack" and
+      .checkout_sha == $source and .profile == $profile and
+      (.execution_host == "ack" or (.terminal_result=="failure" and .execution_host=="unverified" and
+        (.execution_state|IN("unverified","not_admitted")))) and
       (.private_run_id | type == "string" and test("^[0-9]+$")) and
       (.command_manifest_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
       (.terminal_result == "success" or .terminal_result == "failure")
