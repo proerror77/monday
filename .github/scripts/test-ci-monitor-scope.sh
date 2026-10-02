@@ -43,6 +43,7 @@ for file in ci.yml ploy-ci.yml security-enabled.yml; do
       SELECTED_SECURITY_JOBS=',security/secret-presence,' SELECTED_OWNING_PACKAGES=',,' \
       SELECTED_LOOP=false SELECTED_HANDOFF=false SELECTED_JSON=false SELECTED_ONDO=false \
       SELECTED_COLLECTOR=false SELECTED_CONTROL=false SELECTED_FOCUSED=false SELECTED_TOOLCHAIN=false \
+      SELECTED_PRODUCTION_TRADING_IMAGE=false SELECTED_PRODUCTION_COLLECTOR_IMAGE=false \
       CLIPPY_LOOP=false CLIPPY_HANDOFF=false GITHUB_OUTPUT="$output" \
       bash -e "$work/$file.sh" >"$work/stdout" 2>"$work/stderr" || code=$?
     if [[ $result == success ]]; then [[ $code == 0 && -s $output ]];
