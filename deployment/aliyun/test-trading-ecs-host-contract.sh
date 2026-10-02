@@ -1245,7 +1245,8 @@ fi
 
 rollback_second_evidence=$tmp_dir/rollback-second-recheck
 rollback_second_current=$tmp_dir/rollback-second-current.env
-cp -R "$rollback_evidence" "$rollback_second_evidence"
+# Preserve the immutable 0444 evidence contract even under umask 077.
+cp -pR "$rollback_evidence" "$rollback_second_evidence"
 cp "$rollback_current" "$rollback_second_current"
 chmod 0700 "$rollback_second_evidence"
 chmod 0600 "$rollback_second_current"
@@ -1290,7 +1291,7 @@ fi
 rollback_success_evidence=$tmp_dir/rollback-success
 rollback_success_current=$tmp_dir/rollback-success-current.env
 rollback_runtime=$tmp_dir/rollback-runtime
-cp -R "$rollback_evidence" "$rollback_success_evidence"
+cp -pR "$rollback_evidence" "$rollback_success_evidence"
 cp "$rollback_current" "$rollback_success_current"
 chmod 0700 "$rollback_success_evidence"
 chmod 0600 "$rollback_success_current"
@@ -1354,10 +1355,20 @@ grep -Fq 'docker logout "$ACR_REGISTRY"' "$WORKFLOW"
 grep -Fq 'rm -f -- "$docker_config_root/config.json"' "$WORKFLOW"
 awk '
   /- name: Remove ACR credentials/ {
-    if (getline <= 0 || $0 !~ /^[[:space:]]+if: always\(\)$/) exit 1
+    if (getline <= 0) exit 1
+    sub(/^[[:space:]]+/, "")
+    if ($0 != "if: ${{ (always()) && !matrix.research_artifact }}") {
+      print "native ACR credential cleanup must run always and exclude ACK research artifacts" > "/dev/stderr"
+      exit 1
+    }
     found = 1
   }
-  END { if (!found) exit 1 }
+  END {
+    if (!found) {
+      print "native ACR credential cleanup contract was not found" > "/dev/stderr"
+      exit 1
+    }
+  }
 ' "$WORKFLOW"
 grep -Fq 'hft-trading-ecs-linux-amd64-${{ github.sha }}' "$WORKFLOW"
 grep -Fq 'IMAGE_DIGEST: ${{ steps.build.outputs.digest }}' "$WORKFLOW"

@@ -155,21 +155,7 @@ jobs:
             bash -n "$script"
           done
           shellcheck ../deployment/aliyun/*.sh
-          ../deployment/aliyun/test-polymarket-market-tape-upload-contract.sh
-          ../deployment/aliyun/test-polymarket-reference-upload-contract.sh
-          ../deployment/aliyun/test-monday-collector-health.sh
-          ../deployment/aliyun/test-collector-health-unit-release.sh
-          ../deployment/aliyun/test-rust-lob-control-plane.sh
-          ../deployment/aliyun/test-rust-lob-controller-release.sh
-          ../deployment/aliyun/test-rust-lob-recovery-queue.sh
-          ../deployment/aliyun/test-rust-lob-restore.sh
-          ../deployment/aliyun/test-polymarket-raw-ops-stage.sh
-          ../deployment/aliyun/test-trading-ecs-host-contract.sh
-          ../deployment/aliyun/test-binance-fee-release-contract.sh
-          ../deployment/aliyun/test-binance-usdm-account-release-contract.sh
-          ../deployment/aliyun/test-binance-fee-cutover.sh
-          ../deployment/aliyun/test-bybit-options-release-contract.sh
-          ../deployment/aliyun/test-bybit-options-shadow-gate.sh
+          python3 ../.github/scripts/run-collector-control-contracts.py
 
   monitor_contracts:
     name: Collector monitor contracts
@@ -199,6 +185,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Verify selection, cancellation and aggregate admission
         run: |
+          python3 .github/scripts/test-collector-control-scheduling.py
           bash .github/scripts/test-main-image-scope.sh
           bash .github/scripts/test-image-build-plan.sh
           bash .github/scripts/test-tested-image.sh
