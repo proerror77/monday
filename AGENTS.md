@@ -103,8 +103,11 @@
   identity and the properties or relationships required by that request. Do not
   require later delivery states unless requested. For an asynchronous job whose
   result is requested, verify its terminal result and output, not just submission.
-- Remote build or validation tasks must use `monday-remote-build`; never place a
-  workspace, toolchain, Cargo cache, or target directory on an `ack-system` node.
+- Remote build or validation tasks use `monday-remote-build` to select the existing
+  managed ACK executor or a disposable Cloud Assistant task. Managed CI follows
+  its reviewed request, cache, and receipt contract; do not apply disposable
+  fresh-cache isolation to that executor. Neither path may place a workspace,
+  toolchain, Cargo cache, or target directory on an `ack-system` node.
 - For CEX cloud research, follow the
   [ACK-only evidence and recovery boundary](deployment/aliyun/research/README.md#data-flow-review-and-host-lifetime)
   during preparation, verification, reporting, recovery, and resource cleanup.
