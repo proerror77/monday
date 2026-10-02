@@ -149,11 +149,16 @@ case "$event" in
         exit 1
       }
       if [[ $target == all || $target == research-runner ]]; then
-        [[ $rebuild == true ]] || {
-          printf 'manual research publication requires rebuild_research_runner=true\n' >&2
-          exit 1
-        }
-        research_mode=rebuild
+        if [[ $rebuild == true ]]; then
+          research_mode=rebuild
+        else
+          [[ $rebuild == false && $automation_state == ready && $binaries_conclusion == success && $smoke_conclusion == success && $run_id =~ ^[1-9][0-9]*$ ]] || {
+            printf 'manual research publication needs a verified exact-source binary/smoke artifact; missing or expired artifacts require an explicitly planned producer\n' >&2
+            exit 1
+          }
+          research_mode=artifact
+          artifact_run_id=$run_id
+        fi
       else
         research_mode=none
       fi
@@ -161,7 +166,7 @@ case "$event" in
       require_green_main "$source_sha"
     fi
     publish_target=$target
-    artifact_run_id=$current_run_id
+    [[ $research_mode == artifact ]] || artifact_run_id=$current_run_id
     ;;
   *) printf 'unsupported event: %s\n' "$event" >&2; exit 1 ;;
 esac
