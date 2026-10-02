@@ -148,7 +148,10 @@ grep -Fqx '            --source-test-profile "$SOURCE_TEST_PROFILE" \' "$workflo
 relay_script="$script_dir/wait-ack-research-receipt.sh"
 grep -Fq 'openssl pkeyutl -verify -pubin' "$relay_script"
 grep -Fq '.public_run_id == $run and .public_job == $job' "$relay_script"
-grep -Fq '.checkout_sha == $source and .profile == $profile and .execution_host == "ack"' "$relay_script"
+grep -Fq '.checkout_sha == $source and .profile == $profile and' "$relay_script"
+# Success requires ACK; signed negative results may terminate an unverified wait.
+grep -Fq '(.execution_host == "ack" or (.terminal_result=="failure" and .execution_host=="unverified" and' "$relay_script"
+grep -Fq '(.execution_state|IN("unverified","not_admitted")))) and' "$relay_script"
 grep -Fq 'Unknown private ACK execution profile' "$relay_script"
 grep -Fq 'Fork research jobs require independent source admission' "$relay_script"
 grep -Fq 'sha256sum -c -' "$relay_script"
