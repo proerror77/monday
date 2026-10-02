@@ -60,8 +60,13 @@ backend=github profile=
 case "$job" in
   ci/research-preflight) [[ $research == false ]] || { backend=ack; profile=ci-research-preflight; } ;;
   ci/rust) [[ $research == false ]] || { backend=ack; profile=ci-rust; } ;;
-  ci/rust-fast-gates) [[ $research == false ]] || { backend=ack; profile=ci-rust-fast-gates; } ;;
-  security/clippy-strict) [[ $research == false ]] || { backend=ack; profile=security-clippy-research; } ;;
+  ci/rust-fast-gates) ;;
+  security/clippy-strict)
+    if [[ $research == true ]]; then
+      backend=ack; profile=ci-rust
+      # The weekly audit is independent of a Monorepo source-change run.
+      [[ $event != schedule ]] || profile=security-clippy-research
+    fi ;;
   ploy/research-image-binaries) backend=ack; profile=research-image-binaries ;;
   ploy/research-image-smoke) backend=ack; profile=research-image-smoke ;;
   ploy/rust-format) backend=ack; profile=prediction-research-format ;;

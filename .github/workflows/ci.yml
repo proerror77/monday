@@ -12,8 +12,8 @@ permissions:
 
 concurrency:
   group: monorepo-${{ github.ref }}
-  # PR runs may be superseded; main runs must finish so the shared Rust target
-  # cache remains warm for everyone else.
+  # PR runs may be superseded; main runs must finish their exact-source
+  # validation and publication handoff.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
@@ -190,6 +190,7 @@ jobs:
           bash .github/scripts/test-image-build-plan.sh
           bash .github/scripts/test-tested-image.sh
           node .github/scripts/test-local-lock-impact.mjs
+          bash .github/scripts/test-ack-rust-batch.sh
           .github/scripts/test-select-rust-ci-scope.sh
           .github/scripts/test-ci-monitor-scope.sh
           .github/scripts/test-agent-validation-gates.sh
@@ -225,6 +226,9 @@ jobs:
 
   rust:
     name: Rust Workspace
+    permissions:
+      contents: read
+      actions: read
     needs: [scope, research_preflight]
     if: ${{ always() && !cancelled() && needs.scope.result == 'success' && contains(needs.scope.outputs.jobs, ',ci/rust,') && (needs.scope.outputs.ack_research != 'true' || needs.scope.outputs.collector != 'true' || needs.research_preflight.result == 'success') }}
     runs-on: ubuntu-latest
@@ -384,7 +388,7 @@ jobs:
     needs: scope
     if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 10
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -394,7 +398,6 @@ jobs:
           fetch-depth: 0
 
       - name: Enforce Monday module layout
-        if: needs.scope.outputs.ack_research != 'true'
         working-directory: .
         run: |
           set -euo pipefail
@@ -404,7 +407,6 @@ jobs:
           test -f rust_hft/execution-gateway/adapters/adapter-polymarket/Cargo.toml
 
       - name: Enforce Rust-only research and runtime source
-        if: needs.scope.outputs.ack_research != 'true'
         working-directory: .
         run: |
           set -euo pipefail
@@ -537,14 +539,14 @@ jobs:
           fi
 
       - name: Setup Rust toolchain (fmt)
-        if: ${{ (needs.scope.outputs.loop == 'true') && needs.scope.outputs.ack_research != 'true' }}
+        if: ${{ (needs.scope.outputs.loop == 'true') }}
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
           components: rustfmt
 
       - name: Format Loop Engineer packages
-        if: ${{ (needs.scope.outputs.loop == 'true') && needs.scope.outputs.ack_research != 'true' }}
+        if: ${{ (needs.scope.outputs.loop == 'true') }}
         working-directory: rust_hft
         run: |
           cargo fmt --check --package alpha-domain
@@ -555,14 +557,6 @@ jobs:
           cargo fmt --check --package hft-harnessctl
           cargo fmt --check --package hft-research-ml
 
-      - name: Wait for signed ACK execution receipt
-        if: needs.scope.outputs.ack_research == 'true'
-        id: ack
-        working-directory: .
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          .github/scripts/wait-ack-research-receipt.sh ci-rust-fast-gates "$(git rev-parse HEAD)"
   market_recorder_contract:
     name: Market Recorder Release Contract
     needs: scope

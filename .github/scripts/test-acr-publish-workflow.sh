@@ -40,12 +40,15 @@ end
     end
   end
 end
-[[ci,'rust'],[ci,'rust_fast_gates'],[security,'clippy-strict']].each do |doc,id|
+[[ci,'rust'],[security,'clippy-strict']].each do |doc,id|
   doc.fetch('jobs').fetch(id).fetch('steps').each do |step|
     next if step.fetch('uses','').include?('actions/checkout@') || step.fetch('run','').include?('wait-ack-research-receipt.sh')
     abort "unguarded mixed research job #{id}" unless step.fetch('if','').include?("outputs.ack_research != 'true'")
   end
 end
+fast=ci.fetch('jobs').fetch('rust_fast_gates')
+abort 'static Fast dispatches ACK' if fast.to_s.include?('wait-ack') || fast.to_s.include?('ack_research')
+abort 'static Fast compiles research' if fast.to_s.match?(/\bcargo\s+(build|test|check|clippy)\b/)
 acr.fetch('jobs').fetch('publish').fetch('steps').each do |step|
   next unless step.fetch('run','').match?(/\bdocker\s/) || step.fetch('uses','').match?(/docker\//)
   abort 'public research image build, smoke or publication' unless step.fetch('if','').include?('!matrix.research_artifact')
@@ -145,7 +148,10 @@ grep -Fqx '            --source-test-profile "$SOURCE_TEST_PROFILE" \' "$workflo
 relay_script="$script_dir/wait-ack-research-receipt.sh"
 grep -Fq 'openssl pkeyutl -verify -pubin' "$relay_script"
 grep -Fq '.public_run_id == $run and .public_job == $job' "$relay_script"
-grep -Fq '.checkout_sha == $source and .profile == $profile and .execution_host == "ack"' "$relay_script"
+grep -Fq '.checkout_sha == $source and .profile == $profile and' "$relay_script"
+# Success requires ACK; signed negative results may terminate an unverified wait.
+grep -Fq '(.execution_host == "ack" or (.terminal_result=="failure" and .execution_host=="unverified" and' "$relay_script"
+grep -Fq '(.execution_state|IN("unverified","not_admitted")))) and' "$relay_script"
 grep -Fq 'Unknown private ACK execution profile' "$relay_script"
 grep -Fq 'Fork research jobs require independent source admission' "$relay_script"
 grep -Fq 'sha256sum -c -' "$relay_script"

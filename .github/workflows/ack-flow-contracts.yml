@@ -28,5 +28,6 @@ jobs:
       - name: Verify source-bound relay and workflow gates
         run: |
           bash .github/scripts/test-classify-ack-research-job.sh
+          bash .github/scripts/test-ack-rust-batch.sh
           bash .github/scripts/test-ack-preflight-relay.sh
           bash .github/scripts/test-preflight-workflow-gate.sh
