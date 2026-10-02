@@ -33,6 +33,7 @@ security_jobs=
 research_image_relevant=false
 architecture=false
 owning_packages=
+loop_packages=
 clippy_loop=false
 clippy_handoff=false
 image_live=false
@@ -52,6 +53,7 @@ select_security_job() {
 select_all_security_jobs() {
   clippy_loop=true
   clippy_handoff=true
+  loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-harnessctl,hft-research-ml
   select_security_job security/sast-semgrep
   select_security_job security/cargo-audit
   select_security_job security/secret-presence
@@ -158,6 +160,7 @@ select_all() {
   image_live=true
   image_paper=true
   loop=true
+  loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-harnessctl,hft-research-ml
   handoff=true
   json=true
   ondo=true
@@ -186,6 +189,7 @@ emit() {
     "jobs=,$jobs," \
     "security_jobs=,$security_jobs," \
     "owning_packages=,$owning_packages," \
+    "loop_packages=,$loop_packages," \
     "clippy_loop=$clippy_loop" \
     "clippy_handoff=$clippy_handoff" \
     "loop=$loop" \
@@ -343,6 +347,7 @@ for path in "${paths[@]}"; do
       ;;
     .github/scripts/classify-ack-research-job.sh|.github/scripts/test-classify-ack-research-job.sh|\
     .github/scripts/wait-ack-research-receipt.sh|.github/scripts/verify-ack-preflight.sh|\
+    .github/scripts/wait-ack-rust-batch.sh|.github/scripts/verify-ack-rust-batch.sh|.github/scripts/test-ack-rust-batch.sh|\
     .github/scripts/test-ack-preflight-relay.sh|.github/scripts/test-preflight-workflow-gate.sh|\
     .github/ack-ci/receipt-public-key.pub|.github/ack-ci/PREFLIGHT.md|\
     .github/workflows/ack-flow-contracts.yml)
@@ -620,6 +625,9 @@ select_if_affected() {
   for package in "$@"; do
     if is_affected "$package"; then
       mark_checked_direct_package "$package"
+      if [[ $flag == loop ]]; then
+        [[ ,$loop_packages, == *,$package,* ]] || loop_packages=${loop_packages:+$loop_packages,}$package
+      fi
       selected=true
     fi
   done
