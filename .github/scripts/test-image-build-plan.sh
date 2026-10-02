@@ -43,3 +43,35 @@ done
 if grep '^jobs=' "$tmp/experiment-config" | grep -q 'research-image'; then exit 1; fi
 grep '^jobs=' "$tmp/embedded-controller" | grep -q 'research-image-binaries'
 printf 'PASS: runtime experiment config does not rebuild research software; embedded image input still does\n'
+
+# The Monorepo image/Kubernetes job must honor the same source-derived plan.
+# A selected manifest check is not an instruction to compile both images.
+for scenario in job-yaml trading collector docker-ignore; do
+  case "$scenario" in
+    job-yaml) path=deployment/aliyun/research/k8s/research-data-request-job.example.yaml; trading=false; collector=false ;;
+    trading) path=rust_hft/deployment/docker/Dockerfile.trading; trading=true; collector=false ;;
+    collector) path=rust_hft/tools/collector/src/lib.rs; trading=false; collector=true ;;
+    docker-ignore) path=rust_hft/.dockerignore; trading=true; collector=true ;;
+  esac
+  printf '%s\n' "$path" >"$tmp/paths"
+  bash "$root/select-rust-ci-scope.sh" --event pull_request --changed-files "$tmp/paths" --metadata "$root/fixtures/rust-ci-scope/metadata.fixture" --output "$tmp/production-$scenario"
+  grep -Fqx "production_trading_image=$trading" "$tmp/production-$scenario"
+  grep -Fqx "production_collector_image=$collector" "$tmp/production-$scenario"
+  if [[ $scenario == job-yaml ]]; then
+    grep -Fqx 'toolchain=false' "$tmp/production-$scenario"
+    [[ $(sed -n 's/^image_matrix=//p' "$tmp/production-$scenario" | jq '.include|length') == 0 ]]
+  fi
+done
+ruby -ryaml - "$root/../workflows/ci.yml" <<'RUBY'
+jobs=YAML.load_file(ARGV[0]).fetch('jobs')
+steps=jobs.fetch('deployment_artifacts').fetch('steps')
+{'Build production trading image'=>'production_trading_image',
+ 'Build production collector image'=>'production_collector_image',
+ 'Verify production collector binary source and self-test'=>'production_collector_image'}.each do |name, flag|
+  step=steps.find { |s| s['name']==name }
+  abort "#{name} ignores source scope" unless step && step['if']=="needs.scope.outputs.#{flag} == 'true'"
+  %w[selector scope].each { |job| abort "#{job} does not expose #{flag}" unless jobs[job]['outputs'].key?(flag) }
+end
+abort 'manifest verification disappeared' unless steps.any? { |s| s['name']=='Validate Kubernetes manifests without a cluster' && !s.key?('if') }
+RUBY
+printf 'PASS: ordinary Job manifests compile zero images; actual production image inputs retain their builds\n'

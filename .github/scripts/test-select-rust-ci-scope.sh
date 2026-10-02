@@ -25,6 +25,8 @@ run_case() {
 printf '%s\n' package-lock.json >"$tmp_dir/root-node.txt"
 printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
+printf '%s\n' .github/scripts/run-collector-control-contracts.py >"$tmp_dir/control-scheduling.txt"
+printf '%s\n' .github/scripts/test-collector-control-scheduling.py >"$tmp_dir/control-scheduling-test.txt"
 printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
 printf '%s\n' docs/agents/issue-tracker.md >"$tmp_dir/governance-doc.txt"
 printf '%s\n' .agents/skills/monday-research-evidence-audit/SKILL.md >"$tmp_dir/skill.txt"
@@ -125,6 +127,8 @@ job_cases=(
   'root-node|pull_request|root-node.txt|ci/node-install'
   'security-workflow|pull_request|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'security-workflow-push|push|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
+  'control-scheduling|pull_request|control-scheduling.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
+  'control-scheduling-test|pull_request|control-scheduling-test.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'skill|pull_request|skill.txt|ploy/commit-hygiene,ploy/workflow-lint'
@@ -490,10 +494,11 @@ if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block";
 if grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'shellcheck' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fq 'test-rust-lob-control-plane.sh' <<<"$control_job_block"
-grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$control_job_block"
+grep -Fq 'python3 ../.github/scripts/run-collector-control-contracts.py' <<<"$control_job_block"
+grep -Fq 'test-rust-lob-control-plane.sh' "$script_dir/run-collector-control-contracts.py"
+grep -Fq 'test-rust-lob-recovery-queue.sh' "$script_dir/run-collector-control-contracts.py"
 [[ $scope_job_block != *test-* && $scope_job_block != *shellcheck* ]]
-grep -Fq 'test-monday-collector-health.sh' <<<"$control_job_block"
+grep -Fq 'test-monday-collector-health.sh' "$script_dir/run-collector-control-contracts.py"
 grep -Fq 'shellcheck' <<<"$control_job_block"
 grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
 grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"

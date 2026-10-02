@@ -1510,14 +1510,22 @@ RETENTION_DEADLINE=0
 
 retention_remaining() {
   local remaining=$((RETENTION_DEADLINE - SECONDS))
-  (( remaining > 0 )) || return 1
+  (( remaining > 0 )) || return 124
   printf '%s\n' "$remaining"
 }
 
 retention_bounded() {
   local remaining
-  remaining=$(retention_remaining) || return 1
+  remaining=$(retention_remaining) || return 124
   timeout --signal=TERM --kill-after=2s "$remaining" "$@"
+}
+
+retention_read_failure() {
+  local operation=$1 status=$2
+  if (( status == 124 || SECONDS >= RETENTION_DEADLINE )); then
+    fail "retention-read-deadline: $operation"
+  fi
+  fail "retention-read-unavailable: $operation"
 }
 
 retention_small_sha() {
@@ -2079,12 +2087,13 @@ retention_claim_snapshot() (
 
 check_retained_market() {
   local failed_before stale_before index_before index_after claims_before pointer summary name job_id record rows='' invalid=0 count=0
+  local failed_after stale_after claims_after status
   local current_controller=$ACTIVE_CONTROLLER_SHA256
   [[ $MARKET =~ ^(spot|usdm)$ ]] || fail 'unsupported historical retention market'
-  failed_before=$(retention_failed_ids) || fail 'retention failed-state scan is unavailable'
-  stale_before=$(retention_failed_ids stale) || fail 'retention stale-state scan is unavailable'
-  index_before=$(retention_index_snapshot) || fail 'retention index is not inspectable'
-  claims_before=$(retention_claim_snapshot) || fail 'retention evidence claims are not inspectable'
+  failed_before=$(retention_failed_ids) || retention_read_failure 'initial failed-state scan' "$?"
+  stale_before=$(retention_failed_ids stale) || retention_read_failure 'initial stale-state scan' "$?"
+  index_before=$(retention_index_snapshot) || retention_read_failure 'initial index snapshot' "$?"
+  claims_before=$(retention_claim_snapshot) || retention_read_failure 'initial evidence claims' "$?"
   while IFS= read -r name; do
     [[ -n $name ]] || continue
     count=$((count + 1)); (( count <= RETENTION_MAX_JOBS )) || fail 'retention index exceeds the read budget'
@@ -2092,6 +2101,8 @@ check_retained_market() {
     if summary=$(retention_check_pointer "$pointer" 2>/dev/null); then
       rows+="$summary"$'\n'
     else
+      status=$?
+      (( status != 124 && SECONDS < RETENTION_DEADLINE )) || retention_read_failure 'retention pointer verification' "$status"
       invalid=$((invalid + 1))
     fi
   done < <(jq -r '.[].name' <<<"$index_before")
@@ -2104,11 +2115,13 @@ check_retained_market() {
       invalid=$((invalid + 1))
     fi
   done < <(jq -r '.[].job_id' <<<"$claims_before")
-  index_after=$(retention_index_snapshot) || fail 'retention index changed during readback'
-  [[ $index_after == "$index_before" && $(retention_failed_ids) == "$failed_before" \
-    && $(retention_failed_ids stale) == "$stale_before" \
-    && $(retention_claim_snapshot) == "$claims_before" ]] \
-    || fail 'retention queue membership changed during readback'
+  index_after=$(retention_index_snapshot) || retention_read_failure 'final index snapshot' "$?"
+  failed_after=$(retention_failed_ids) || retention_read_failure 'final failed-state scan' "$?"
+  stale_after=$(retention_failed_ids stale) || retention_read_failure 'final stale-state scan' "$?"
+  claims_after=$(retention_claim_snapshot) || retention_read_failure 'final evidence claims' "$?"
+  [[ $index_after == "$index_before" ]] || fail 'retention-read-drift: index changed during readback'
+  [[ $failed_after == "$failed_before" && $stale_after == "$stale_before" && $claims_after == "$claims_before" ]] \
+    || fail 'retention-read-drift: queue membership or evidence claims changed during readback'
   secure_release_identity
   [[ $ACTIVE_CONTROLLER_SHA256 == "$current_controller" ]] || fail 'active controller changed during retention readback'
   record=$(jq -csS --arg market "$MARKET" --argjson failed "$failed_before" --argjson stale "$stale_before" --argjson invalid "$invalid" \

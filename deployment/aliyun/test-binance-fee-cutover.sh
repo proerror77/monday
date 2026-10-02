@@ -7,6 +7,39 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 CUTOVER="$SCRIPT_DIR/binance-fee-cutover.sh"
 WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
+CI_RUNNER="$SCRIPT_DIR/../../.github/scripts/run-collector-control-contracts.py"
+
+check_ci_registration() {
+  python3 - "$CI_WORKFLOW" "$CI_RUNNER" <<'PY'
+import ast
+from pathlib import Path
+import re
+import sys
+
+workflow, runner = (Path(path) for path in sys.argv[1:])
+block = re.search(r'^  control_contracts:\n(.*?)(?=^  \S|\Z)',
+                  workflow.read_text(), re.MULTILINE | re.DOTALL)
+if not block or not re.search(
+        r'^ +python3 \.\./\.github/scripts/run-collector-control-contracts\.py *$',
+        block.group(1), re.MULTILINE):
+    sys.exit('collector control workflow must invoke the release contract runner')
+module = ast.parse(runner.read_text())
+fast = next((ast.literal_eval(node.value) for node in module.body
+             if isinstance(node, ast.Assign) and any(
+                 isinstance(target, ast.Name) and target.id == 'FAST'
+                 for target in node.targets)), ())
+if fast.count('test-binance-fee-cutover.sh') != 1:
+    sys.exit('release runner must register the fee cutover contract exactly once in FAST')
+PY
+}
+
+# Exercise the actual admission assertion against isolated mutated fixtures
+# without starting the cutover behavior suite or changing repository files.
+if [[ ${1:-} == --check-ci-registration ]]; then
+  check_ci_registration
+  exit 0
+fi
+
 TAR_BIN=$(command -v gtar || command -v tar)
 if "$TAR_BIN" --help 2>/dev/null | grep -q -- '--sort'; then
   TAR_CREATE_OPTS=(--sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner)
@@ -14,7 +47,7 @@ else
   TAR_CREATE_OPTS=()
 fi
 
-for command in awk bash cmp date find grep id install jq mktemp readlink rm sed sha256sum stat tar; do
+for command in awk bash cmp date find grep id install jq mktemp python3 readlink rm sed sha256sum stat tar; do
   command -v "$command" >/dev/null 2>&1 \
     || { printf 'missing test dependency: %s\n' "$command" >&2; exit 2; }
 done
@@ -31,7 +64,7 @@ grep -Fq 'binance-fee-production-control-assets.sha256' "$CUTOVER"
 grep -Fq 'FAILED.sha256' "$CUTOVER"
 grep -Fq 'credential JSON must contain exactly runtime_account_id/api_key/secret' "$CUTOVER"
 grep -Fq 'binance-fee-cutover.sh' "$WORKFLOW"
-grep -Fq 'test-binance-fee-cutover.sh' "$CI_WORKFLOW"
+check_ci_registration
 
 sha_file() {
   sha256sum "$1" | awk '{print $1}'

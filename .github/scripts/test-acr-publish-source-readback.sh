@@ -179,3 +179,38 @@ reset_fixtures
 grep -Fqx "main_sha=$source_sha" "$work/diagnostic-output"
 [[ $(wc -l < "$work/calls" | tr -d ' ') == 1 ]]
 printf 'ACR event-driven source readback tests passed\n'
+
+# Manual research publication reuses the independently verified producer, never
+# the current publisher's run ID and never an implicit compilation fallback.
+reset_fixtures
+"$script_dir/read-acr-publish-source.sh" "$source_sha" 200 "$work/reusable" reuse
+grep -Fqx automation_state=ready "$work/reusable"
+grep -Fqx artifact_run_id=100 "$work/reusable"
+if grep -Fq '/workflows/acr-publish.yml/runs' "$work/calls"; then exit 1; fi
+manual_reuse() {
+  "$script_dir/select-acr-publish-source.sh" --event workflow_dispatch --target research-runner \
+    --rebuild false --current-ref refs/heads/main --current-sha "$source_sha" --current-run-id 200 \
+    --main-sha "$source_sha" --monorepo-conclusion success --prediction-conclusion success \
+    --security-conclusion success --run-id 100 --automation-state "$1" \
+    --binaries-conclusion success --smoke-conclusion "$2" --output "$work/manual-reuse"
+}
+manual_reuse ready success
+grep -Fqx research_mode=artifact "$work/manual-reuse"
+grep -Fqx artifact_run_id=100 "$work/manual-reuse"
+for state in deferred stale out_of_scope; do
+  if manual_reuse "$state" success; then exit 1; fi
+done
+if manual_reuse ready failure; then exit 1; fi
+reset_fixtures
+edit_fixture artifacts '.[0].artifacts[0].expired=true'
+if "$script_dir/read-acr-publish-source.sh" "$source_sha" 200 "$work/expired-reuse" reuse; then exit 1; fi
+ruby -ryaml - "$script_dir/../workflows/acr-publish.yml" "$script_dir/../workflows/ploy-ci.yml" <<'RUBY'
+acr,ploy=ARGV.map { |p| YAML.load_file(p) }
+reader=acr['jobs']['selector']['steps'].find { |s| s['id']=='source-jobs' }
+abort 'manual reuse skips authenticated readback' unless reader['if'].include?("github.event_name == 'workflow_dispatch'") && reader['if'].include?("inputs.rebuild_research_runner != true")
+[[acr,'research-runner-binaries'],[ploy,'research-image-binaries']].each do |doc,id|
+  upload=doc['jobs'][id]['steps'].find { |s| s.fetch('uses','').include?('actions/upload-artifact@') }
+  abort 'software retention is shorter than the release window' unless upload['with']['retention-days']==7
+end
+RUBY
+printf 'PASS: manual publication reuses current verified software, rejects missing/expired proof, and retains it for seven days\n'

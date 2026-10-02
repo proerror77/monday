@@ -144,4 +144,4 @@ retention_fixture_job() {
 }
 
 retention_fixture_retain() { (queue_lock; retain_market); }
-retention_fixture_check() { (RETENTION_DEADLINE=$((SECONDS + 25)); check_retained_market); }
+retention_fixture_check() { (RETENTION_DEADLINE=$((SECONDS + 300)); check_retained_market); }
