@@ -2493,6 +2493,65 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_native_sign_root_binds_the_finalized_request_and_budget() {
+        use alpha_domain::campaign_control::SignedCampaignRootGrantV1;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = AdmissionFixture::with_job_budget(600, chrono::TimeDelta::hours(1));
+        let control = admission::read_control(&fixture.control).unwrap();
+        let signed: SignedCampaignRootGrantV1 =
+            admission::read_json(&control.signed_root_grant_path).unwrap();
+        let grant_path = fixture
+            .inputs
+            ._root
+            .path()
+            .join("native-unsigned-root.json");
+        let key_path = fixture
+            .inputs
+            ._root
+            .path()
+            .join("native-public-fixture.key");
+        std::fs::write(&grant_path, serde_json::to_vec(&signed.grant).unwrap()).unwrap();
+        // The existing admission fixture uses this public deterministic test seed.
+        std::fs::write(&key_path, [19_u8; 32]).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&control.signed_root_grant_path).unwrap();
+        study_authority::sign_root(study_authority::RootSignArgs {
+            grant: grant_path,
+            key_id: "operator".into(),
+            signing_key: key_path,
+            trusted_keys: control.trusted_keys_path.clone(),
+            output: control.signed_root_grant_path.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            admission::read_json::<SignedCampaignRootGrantV1>(&control.signed_root_grant_path)
+                .unwrap(),
+            signed
+        );
+        let mut gate = fixture.open();
+        assert_eq!(
+            gate.reservation.request_sha256,
+            fixture.validated.request_sha256
+        );
+        assert_eq!(gate.reservation.execution, signed.grant.execution);
+        assert_eq!(gate.reservation.reserved_job_seconds, 600);
+        gate.prepare().unwrap();
+        gate.prepare().unwrap();
+        drop(gate);
+        assert_eq!(fixture.usage().job_attempts, 1);
+        assert_eq!(fixture.usage().reserved_job_seconds, 600);
+
+        // A new inspection changes the reservation bytes at the same operation
+        // identity; the authenticated ledger must reject it without more spending.
+        fixture.validated.request_sha256 = "f".repeat(64);
+        let mut changed = fixture.open();
+        assert!(changed.prepare().is_err());
+        drop(changed);
+        assert_eq!(fixture.usage().job_attempts, 1);
+        assert_eq!(fixture.usage().reserved_job_seconds, 600);
+    }
+    #[test]
     fn dispatch_root_deadline_fits_short_authority_and_reserves_actual_job_seconds() {
         let fixture = AdmissionFixture::with_job_budget(600, chrono::TimeDelta::hours(1));
         let mut gate = fixture.open();
