@@ -4,7 +4,7 @@ use crate::{
     binance_usdm_reference_artifact::{
         verify_reference_artifact_read_only_current_batch, PublishedReferenceArtifact,
     },
-    lob_archiver::files_with_suffix_bounded,
+    research_discovery::{discover_manifests, DiscoveryBounds},
 };
 use anyhow::{bail, Context, Result};
 pub use data::binance_lob_replay::Market;
@@ -62,6 +62,8 @@ pub struct FreshWindowRequest {
     pub max_scan_entries: usize,
     pub max_inputs: usize,
     pub max_input_bytes: u64,
+    /// Directory of reusable partition listings. Absent scans are not cached.
+    pub discovery_index: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -325,6 +327,8 @@ pub struct InventoryRequest {
     pub max_scan_entries: usize,
     pub max_inputs: usize,
     pub max_input_bytes: u64,
+    /// Directory of reusable partition listings. Absent scans are not cached.
+    pub discovery_index: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -636,10 +640,11 @@ fn scan_raw_window_candidates(
     request: &FreshWindowRequest,
     cutoff_received_at_ns: u64,
 ) -> Result<Vec<RawWindowCandidate>> {
-    let manifests = files_with_suffix_bounded(
+    let manifests = discover_manifests(
         &request.raw_root,
-        ".manifest.json",
         request.max_scan_entries,
+        None,
+        request.discovery_index.as_deref(),
     )?;
     let mut candidates = Vec::new();
     for path in manifests {
@@ -853,10 +858,11 @@ fn choose_latest_raw_windows(
 fn scan_reference_window_candidates(
     request: &FreshWindowRequest,
 ) -> Result<Vec<ReferenceWindowCandidate>> {
-    let manifests = files_with_suffix_bounded(
+    let manifests = discover_manifests(
         &request.reference_root,
-        ".manifest.json",
         request.max_scan_entries,
+        None,
+        request.discovery_index.as_deref(),
     )?;
     let mut candidates = Vec::new();
     for path in manifests {
@@ -1042,6 +1048,7 @@ pub fn select_fresh_window(request: &FreshWindowRequest) -> Result<FreshWindowSe
                 max_scan_entries: request.max_scan_entries,
                 max_inputs: request.max_inputs,
                 max_input_bytes: request.max_input_bytes,
+                discovery_index: request.discovery_index.clone(),
             })?;
             Ok(FreshWindowSelection {
                 schema_version: FRESH_WINDOW_SELECTION_SCHEMA.to_string(),
@@ -1281,10 +1288,27 @@ pub fn freeze_inventory(request: &InventoryRequest) -> Result<FrozenInventory> {
     let reference_root = request.reference_root.canonicalize()?;
     // The same conservative scan rejects partial symlink views and bounds tree
     // traversal independently of the number of selected inputs.
-    let raw_manifests =
-        files_with_suffix_bounded(&raw_root, ".manifest.json", request.max_scan_entries)?;
-    let reference_manifests =
-        files_with_suffix_bounded(&reference_root, ".manifest.json", request.max_scan_entries)?;
+    let raw_manifests = discover_manifests(
+        &raw_root,
+        request.max_scan_entries,
+        Some(DiscoveryBounds::raw(
+            request.start_received_at_ns,
+            request.end_received_at_ns,
+        )),
+        request.discovery_index.as_deref(),
+    )?;
+    let reference_manifests = discover_manifests(
+        &reference_root,
+        request.max_scan_entries,
+        Some(DiscoveryBounds::reference(
+            request.start_received_at_ns,
+            request.end_received_at_ns,
+            request.bucket_ms,
+            request.label_horizon_buckets,
+            hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS,
+        )?),
+        request.discovery_index.as_deref(),
+    )?;
     let mut remaining_bytes = request.max_input_bytes;
     let mut raw = Vec::new();
     let mut raw_scope: Option<(String, String)> = None;
@@ -1540,6 +1564,7 @@ mod tests {
         publish_reference_batch, ReferenceArtifactConfig,
     };
     use crate::binance_usdm_reference_collector::OFFICIAL_USDM_SOURCE_ORIGIN;
+    use crate::lob_archiver::files_with_suffix_bounded;
     use data::binance_spot_reference::{
         SpotInstrumentRules, SpotNotionalFilter, SpotPriceFilter, SpotQuantityFilter,
         SpotReferenceBatch, EXCHANGE_INFO_ENDPOINT as SPOT_EXCHANGE_INFO_ENDPOINT,
@@ -1880,6 +1905,7 @@ mod tests {
                 max_scan_entries: 100,
                 max_inputs: 10,
                 max_input_bytes: 1_000_000,
+                discovery_index: None,
             },
         )
     }
@@ -2015,6 +2041,7 @@ mod tests {
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes: request.max_input_bytes,
+            discovery_index: request.discovery_index.clone(),
         }
     }
 
@@ -2357,6 +2384,7 @@ mod tests {
             max_scan_entries: 100,
             max_inputs: 10,
             max_input_bytes: 1_000_000,
+            discovery_index: None,
         };
         let candidates = scan_reference_window_candidates(&request).unwrap();
         assert_eq!(candidates.len(), 2);
@@ -2446,6 +2474,7 @@ mod tests {
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes: request.max_input_bytes,
+            discovery_index: None,
         })
         .unwrap();
         assert_eq!(selection.selected_end_received_at_ns, RECEIVED_NS + 2_000);
@@ -2478,6 +2507,7 @@ mod tests {
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes: request.max_input_bytes,
+            discovery_index: None,
         })
         .unwrap();
         assert_eq!(selection.raw.len(), 1);
@@ -2510,6 +2540,7 @@ mod tests {
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes: request.max_input_bytes,
+            discovery_index: None,
         })
         .unwrap();
         assert_eq!(selection.raw.len(), 2);
@@ -2552,6 +2583,7 @@ mod tests {
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes: request.max_input_bytes,
+            discovery_index: None,
         })
         .unwrap();
         assert_eq!(selection.selected_end_received_at_ns, RECEIVED_NS + 1_000);
@@ -2582,6 +2614,7 @@ mod tests {
             max_scan_entries: request.max_scan_entries,
             max_inputs: request.max_inputs,
             max_input_bytes,
+            discovery_index: None,
         };
         assert!(select_fresh_window(&latest(2_000, 1_000_000)).is_err());
         assert!(select_fresh_window(&latest(1, 1)).is_err());
@@ -2686,5 +2719,208 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("symlink"));
+    }
+
+    #[test]
+    fn hive_discovery_skips_distant_partitions_and_reuses_the_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let raw_root = root.join("raw");
+        let reference_root = root.join("reference");
+        let index = root.join("index");
+        fs::create_dir_all(&raw_root).unwrap();
+        fs::create_dir_all(&reference_root).unwrap();
+        let window_start = RECEIVED_NS;
+        let window_end = RECEIVED_NS + 2_000_000_000;
+        write_hive_segment(&raw_root, window_start, window_start + 1_000_000_000, true);
+        write_hive_segment(
+            &raw_root,
+            window_start - 300_000_000_000,
+            window_start + 10,
+            true,
+        );
+        let (date, hour) = crate::lob_archiver::segment_partition(window_start).unwrap();
+        let date_dir = raw_root.join(format!("date={date}"));
+        let distant_hour = if hour == "00" { "12" } else { "00" };
+        std::os::unix::fs::symlink(
+            raw_root.join("missing-hour"),
+            date_dir.join(format!("hour={distant_hour}")),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            raw_root.join("missing-date"),
+            raw_root.join("date=2020-01-01"),
+        )
+        .unwrap();
+        publish_reference_batch(
+            &ReferenceArtifactConfig {
+                output_root: reference_root.clone(),
+                observed_at_ns: window_start + 100,
+                max_staleness_ms: 1000,
+            },
+            OFFICIAL_USDM_SOURCE_ORIGIN,
+            &fixture_reference_batch(),
+        )
+        .unwrap();
+        let mut request = fixture().1;
+        request.raw_root = raw_root.clone();
+        request.reference_root = reference_root;
+        request.start_received_at_ns = window_start;
+        request.end_received_at_ns = window_end;
+        request.discovery_index = Some(index);
+        let first = freeze_inventory(&request).unwrap();
+        assert_eq!(first.raw.len(), 2);
+        assert_eq!(first.references.len(), 1);
+
+        write_hive_segment(&raw_root, window_start + 20, window_start + 30, false);
+        let second = freeze_inventory(&request).unwrap();
+        assert_eq!(second.raw.len(), 2);
+        assert_eq!(
+            second.input_fingerprint_sha256,
+            first.input_fingerprint_sha256
+        );
+    }
+
+    #[test]
+    fn hive_discovery_refreshes_when_the_archive_generation_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let raw_root = root.join("raw");
+        let reference_root = root.join("reference");
+        let index = root.join("index");
+        fs::create_dir_all(&raw_root).unwrap();
+        fs::create_dir_all(&reference_root).unwrap();
+        fs::create_dir_all(&index).unwrap();
+        fs::write(index.join("archive-generation"), "seal-1\n").unwrap();
+        let window_start = RECEIVED_NS;
+        let window_end = RECEIVED_NS + 2_000_000_000;
+        write_hive_segment(&raw_root, window_start, window_start + 1_000_000_000, true);
+        write_hive_segment(
+            &raw_root,
+            window_start - 300_000_000_000,
+            window_start + 10,
+            true,
+        );
+        publish_reference_batch(
+            &ReferenceArtifactConfig {
+                output_root: reference_root.clone(),
+                observed_at_ns: window_start + 100,
+                max_staleness_ms: 1000,
+            },
+            OFFICIAL_USDM_SOURCE_ORIGIN,
+            &fixture_reference_batch(),
+        )
+        .unwrap();
+        let mut request = fixture().1;
+        request.raw_root = raw_root.clone();
+        request.reference_root = reference_root;
+        request.start_received_at_ns = window_start;
+        request.end_received_at_ns = window_end;
+        request.discovery_index = Some(index.clone());
+        let first = freeze_inventory(&request).unwrap();
+        assert_eq!(first.raw.len(), 2);
+
+        write_hive_segment(&raw_root, window_start + 40, window_start + 50, true);
+        let cached = freeze_inventory(&request).unwrap();
+        assert_eq!(cached.raw.len(), 2);
+        assert_eq!(
+            cached.input_fingerprint_sha256,
+            first.input_fingerprint_sha256
+        );
+
+        fs::write(index.join("archive-generation"), "seal-2\n").unwrap();
+        let refreshed = freeze_inventory(&request).unwrap();
+        assert_eq!(refreshed.raw.len(), 3);
+        assert_ne!(
+            refreshed.input_fingerprint_sha256,
+            first.input_fingerprint_sha256
+        );
+    }
+
+    fn write_hive_segment(raw_root: &Path, start: u64, end: u64, replay_safe: bool) {
+        let (date, hour) = crate::lob_archiver::segment_partition(start).unwrap();
+        let dir = raw_root
+            .join(format!("date={date}"))
+            .join(format!("hour={hour}"));
+        fs::create_dir_all(&dir).unwrap();
+        let name = format!("part-{start}.jsonl.zst");
+        let data = format!("hive-segment-{start}").into_bytes();
+        let sha = hex::encode(Sha256::digest(&data));
+        fs::write(dir.join(&name), &data).unwrap();
+        fs::write(dir.join(format!("{name}._SUCCESS")), format!("{sha}\n")).unwrap();
+        let manifest = json!({
+            "schema": MARKET_TAPE_SCHEMA_V2,
+            "venue": "binance",
+            "market": "usdm",
+            "dataset": USDM_LOB_DATASET,
+            "shard_id": "test",
+            "date": date,
+            "hour": hour,
+            "symbols": ["BTCUSDT"],
+            "stream_types": ["depth@100ms"],
+            "has_replay_safe_checkpoint": replay_safe,
+            "all_symbols_bridged": true,
+            "all_stream_coverage_verified": true,
+            "venue_depth_complete": false,
+            "snapshot_limit": 100,
+            "start_received_at_ns": start,
+            "end_received_at_ns": end,
+            "file": name,
+            "bytes": data.len(),
+            "sha256": sha
+        });
+        fs::write(
+            dir.join(format!("{name}.manifest.json")),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn fixture_reference_batch() -> CompleteReferenceBatch {
+        CompleteReferenceBatch::new(
+            vec![ActivePerpetualContract {
+                schema: REFERENCE_SCHEMA.into(),
+                symbol: "BTCUSDT".into(),
+                pair: "BTCUSDT".into(),
+                base_asset: "BTC".into(),
+                quote_asset: "USDT".into(),
+                margin_asset: "USDT".into(),
+                tick_size: Decimal::new(1, 1),
+                step_size: Decimal::new(1, 3),
+                min_notional: Decimal::from(5),
+                contract_type: "PERPETUAL".into(),
+                status: "TRADING".into(),
+                onboard_date_ms: 1,
+                delivery_date_ms: 4_133_404_800_000,
+                source_time_ms: SOURCE_MS,
+                source_clock_received_at_ns: RECEIVED_NS - 100,
+                received_at_ns: RECEIVED_NS,
+                source_endpoint: EXCHANGE_INFO_ENDPOINT.into(),
+                source_clock_endpoint: SERVER_TIME_ENDPOINT.into(),
+            }],
+            vec![MarkIndexFundingObservation {
+                schema: REFERENCE_SCHEMA.into(),
+                symbol: "BTCUSDT".into(),
+                mark_price: Decimal::from(101),
+                index_price: Decimal::from(100),
+                basis: Decimal::ONE,
+                basis_rate: Decimal::new(1, 2),
+                last_funding_rate: Decimal::new(1, 4),
+                interest_rate: Decimal::new(1, 4),
+                next_funding_time_ms: SOURCE_MS + 28_800_000,
+                source_time_ms: SOURCE_MS,
+                received_at_ns: RECEIVED_NS,
+                source_endpoint: PREMIUM_INDEX_ENDPOINT.into(),
+            }],
+            vec![OpenInterestObservation {
+                schema: REFERENCE_SCHEMA.into(),
+                symbol: "BTCUSDT".into(),
+                open_interest: Decimal::new(12345, 3),
+                source_time_ms: SOURCE_MS,
+                received_at_ns: RECEIVED_NS + 50,
+                source_endpoint: OPEN_INTEREST_ENDPOINT.into(),
+            }],
+        )
+        .unwrap()
     }
 }

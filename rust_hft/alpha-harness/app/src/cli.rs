@@ -606,6 +606,9 @@ pub struct PrepareFreshInputsArgs {
     /// Maximum total source bytes verified by the collector freezer.
     #[arg(long)]
     pub max_input_bytes: u64,
+    /// Directory that reuses partition listings across hourly preparations.
+    #[arg(long)]
+    pub discovery_index: Option<PathBuf>,
     /// Create-once frozen.env output retained as the preparation identity.
     #[arg(long)]
     pub inventory_out: PathBuf,
@@ -1156,6 +1159,9 @@ pub struct FreezeInventoryArgs {
     /// Explicit maximum total source bytes to verify; no source payload is copied.
     #[arg(long)]
     pub max_input_bytes: u64,
+    /// Directory that reuses partition listings across hourly preparations.
+    #[arg(long)]
+    pub discovery_index: Option<PathBuf>,
     /// New private frozen.env file; an existing inventory is never overwritten.
     #[arg(long)]
     pub output: PathBuf,

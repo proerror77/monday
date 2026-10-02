@@ -1458,6 +1458,29 @@ signing metadata, bounded logs, and report receipts/summaries within their
 declared byte limits. Signed root keys remain in the established signing
 boundary; the active ledger stays on its single-writer cloud volume.
 
+**DevPod access policy**: The research DevPod StatefulSet
+(`k8s/research-devpod-statefulset.yaml`) is a code development and compilation
+tool, not a research execution environment. It must not mount production
+research data PVCs (`sol-market-*`, campaign output volumes, or ledger volumes).
+DevPod keeps workspace and cargo-cache on node-local emptyDir while postpaid
+disk orders are rejected for insufficient balance. Those volumes disappear with
+the Pod. It may use small synthetic test datasets in `/tmp`. Production research
+must use dedicated Campaign Jobs with frozen inventory, signed grants, and
+audit trails. DevPod may compile binaries and run unit tests; it may not access
+raw market data, run backtests against production datasets, or write to
+campaign result directories.
+
+Relaxed variants are separate objects in `monday-research-dev`
+(`k8s/dev-namespace.yaml`, privileged Pod Security). They run as root so
+image packages can be installed. Their names are `research-devpod-permissive`,
+`research-dev-simple`, and `research-devpod-warm`. They are not applied with
+the `monday-research` DevPod, and they do not mount campaign volumes. The
+2026-09-28 review notes (`CRITICAL_FIXES_APPLIED.md`,
+`COST_OPTIMIZATION_GUIDE.md`, `REVIEW_SUMMARY.md`) and
+`scripts/cleanup-temp-nodes.sh` record that review. The script resolves the
+ECS instance to its node name and refuses to drain a node that still has a
+non-DaemonSet workload.
+
 Independent readback means checking the actual cloud object against its bound
 identity, not downloading the full dataset, model bundle, ledger, or archive to
 a workstation. Use existing authenticated ACK caches for subsequent verification

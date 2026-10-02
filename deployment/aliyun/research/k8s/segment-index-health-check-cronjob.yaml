@@ -1,0 +1,222 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: segment-index-health-check
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/name: segment-index-health-check
+    app.kubernetes.io/part-of: monday
+    research.monday/contract: segment-index-monitoring-v1
+spec:
+  # 每小时运行一次健康检查
+  schedule: "0 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300  # 5 minutes
+      ttlSecondsAfterFinished: 86400  # 1 day
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: segment-index-health-check
+        spec:
+          restartPolicy: OnFailure
+          automountServiceAccountToken: false
+          imagePullSecrets:
+            - name: monday-acr
+          nodeSelector:
+            kubernetes.io/arch: amd64
+            workload: backtest
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: health-check
+              image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_DIGEST
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash"]
+              args:
+                - /scripts/segment_index_monitor.sh
+                - --index
+                - /lake/output/metadata/segments.parquet
+                - --alert-threshold
+                - "95"
+                - --output-dir
+                - /tmp
+              env:
+                - name: TZ
+                  value: "UTC"
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: 256Mi
+                limits:
+                  cpu: "500m"
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+                readOnlyRootFilesystem: true
+              volumeMounts:
+                - name: output
+                  mountPath: /lake/output
+                  readOnly: true
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: output
+              persistentVolumeClaim:
+                claimName: REPLACE_WITH_OUTPUT_PVC_NAME
+                readOnly: true
+            - name: scripts
+              configMap:
+                name: segment-index-scripts
+                defaultMode: 0555
+            - name: tmp
+              emptyDir:
+                sizeLimit: 100Mi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: segment-index-scripts
+  namespace: monday-research
+data:
+  segment_index_monitor.sh: |
+    # Script content will be populated from scripts/segment_index_monitor.sh
+    # Use: kubectl create configmap segment-index-scripts \
+    #        --from-file=segment_index_monitor.sh=scripts/segment_index_monitor.sh \
+    #        --dry-run=client -o yaml | kubectl apply -f -
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: segment-index-health-check-instructions
+  namespace: monday-research
+data:
+  README.md: |
+    # Segment Index Health Check CronJob
+
+    ## Purpose
+    Runs hourly health checks on the Parquet segment index to detect:
+    - Low safety rates (< 95%)
+    - Stale index (no updates in 2+ hours)
+    - Recent spikes in problematic segments
+
+    ## Setup
+
+    1. Create the scripts ConfigMap:
+       ```bash
+       kubectl create configmap segment-index-scripts -n monday-research \
+         --from-file=segment_index_monitor.sh=scripts/segment_index_monitor.sh \
+         --dry-run=client -o yaml | kubectl apply -f -
+       ```
+
+    2. Apply the CronJob:
+       ```bash
+       kubectl apply -f segment-index-health-check-cronjob.yaml
+       ```
+
+    ## Monitoring
+
+    ### View recent runs:
+    ```bash
+    kubectl get jobs -n monday-research -l app.kubernetes.io/name=segment-index-health-check
+    ```
+
+    ### Check latest logs:
+    ```bash
+    kubectl logs -n monday-research \
+      -l app.kubernetes.io/name=segment-index-health-check \
+      --tail=100
+    ```
+
+    ### Manual trigger:
+    ```bash
+    kubectl create job -n monday-research \
+      --from=cronjob/segment-index-health-check \
+      manual-health-check-$(date +%s)
+    ```
+
+    ## Alerts
+
+    The job exits with:
+    - Exit code 0: Healthy
+    - Exit code 1: Warnings detected
+
+    You can configure alerting based on job failure:
+
+    ### Prometheus Alert Example:
+    ```yaml
+    - alert: SegmentIndexUnhealthy
+      expr: |
+        kube_job_status_failed{job_name=~"segment-index-health-check.*"} > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Segment index health check failed"
+        description: "Index safety rate may be below threshold or index is stale"
+    ```
+
+    ### Integration with monitoring systems:
+
+    For JSON output (e.g., push to monitoring API):
+    ```bash
+    kubectl exec -n monday-research deployment/some-pod -- \
+      /scripts/segment_index_monitor.sh --json | \
+      curl -X POST https://monitoring.example.com/api/metrics -d @-
+    ```
+
+    ## Troubleshooting
+
+    ### Job keeps failing
+    - Check if index file exists and is readable
+    - Verify duckdb is installed in the container
+    - Check PVC mount permissions
+
+    ### False alerts
+    - Adjust --alert-threshold if 95% is too strict for your use case
+    - Review the specific alerts in job logs
+
+    ### Stale index warnings
+    - Verify collector is running and SEGMENT_INDEX_PATH is set
+    - Check collector logs for write failures
+    - Ensure output PVC is writable by collector
+
+    ## Customization
+
+    ### Change schedule:
+    ```bash
+    # Run every 30 minutes instead of hourly
+    kubectl patch cronjob segment-index-health-check -n monday-research \
+      --type=json -p='[{"op":"replace","path":"/spec/schedule","value":"*/30 * * * *"}]'
+    ```
+
+    ### Change alert threshold:
+    ```bash
+    # Adjust threshold to 90%
+    kubectl patch cronjob segment-index-health-check -n monday-research \
+      --type=json -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/args/3","value":"90"}]'
+    ```
+
+    ## Cleanup
+
+    To remove the health check:
+    ```bash
+    kubectl delete cronjob segment-index-health-check -n monday-research
+    kubectl delete configmap segment-index-scripts -n monday-research
+    kubectl delete configmap segment-index-health-check-instructions -n monday-research
+    ```
