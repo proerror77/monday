@@ -89,4 +89,13 @@ mod tests {
         assert!(feedback_public_key_json("runtime-feedback-1", "not-hex").is_err());
         assert!(feedback_public_key_json("runtime-feedback-1", "00").is_err());
     }
+
+    #[test]
+    fn invalid_boundary_lengths_do_not_expose_private_material() {
+        for length in [31, 33] {
+            let encoded = hex::encode(vec![0xa7; length]);
+            let error = feedback_public_key_json("runtime-feedback-1", &encoded).unwrap_err();
+            assert!(!error.to_string().contains(&encoded));
+        }
+    }
 }
