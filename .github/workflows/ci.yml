@@ -239,6 +239,9 @@ jobs:
 
   rust:
     name: Rust Workspace
+    permissions:
+      contents: read
+      actions: read
     needs: [scope, research_preflight]
     if: ${{ always() && !cancelled() && needs.scope.result == 'success' && contains(needs.scope.outputs.jobs, ',ci/rust,') && (needs.scope.outputs.ack_research != 'true' || needs.scope.outputs.collector != 'true' || needs.research_preflight.result == 'success') }}
     runs-on: ubuntu-latest

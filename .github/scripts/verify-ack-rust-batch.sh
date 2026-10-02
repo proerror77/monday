@@ -16,6 +16,7 @@ ack_verify_rust_batch() {
     map(. as $stage | select(if $stage=="owning" then $scope.owning_packages!=",," else $scope[$stage]==true end))' --argjson scope "$expected" <<<null)
   jq -e --argjson expected "$expected" --argjson required "$required" '
     .profile=="ci-rust" and .terminal_result=="success" and
+    (.public_job_id|type=="number" and .>0 and floor==.) and
     .validation.schema_version=="monday.ack_rust_batch.v1" and
     .validation.scope==$expected and ($required|length)>0 and
     ([.validation.stages[].stage]|sort)==($required|sort) and
@@ -23,5 +24,24 @@ ack_verify_rust_batch() {
       (.input_sha256|type=="string" and test("^[0-9a-f]{64}$")) and
       (.private_run_id|type=="string" and test("^[0-9]+$")) and
       (.completed_epoch|type=="number" and floor==.) and (.reused|type=="boolean"))
+  ' "$receipt" >/dev/null
+}
+
+# Metadata is fetched independently of the signed receipt. Both public
+# consumers bind success to the exact producing attempt and numeric job.
+ack_verify_rust_job() {
+  local receipt=$1 run=$2 jobs=$3
+  jq -e --slurpfile run "$run" --slurpfile jobs "$jobs" '
+    . as $r | $run[0] as $run |
+    ($r.public_job_id|type=="number" and .>0 and floor==.) and
+    ($r.public_run_attempt|type=="number" and .>0 and floor==.) and
+    $run.id==($r.public_run_id|tonumber) and $run.run_attempt==$r.public_run_attempt and
+    $run.head_sha==$r.head_sha and $run.event==$r.event and
+    $run.head_repository.full_name=="proerror77/monday" and $run.path==".github/workflows/ci.yml" and
+    (($run.status=="in_progress" and $run.conclusion==null) or
+      ($run.status=="completed" and $run.conclusion=="success")) and
+    ([$jobs[0].jobs[]|select(.id==$r.public_job_id and .run_id==$run.id and
+      .head_sha==$r.head_sha and .name=="Rust Workspace" and
+      ((.status=="in_progress" and .conclusion==null) or (.status=="completed" and .conclusion=="success")))]|length==1)
   ' "$receipt" >/dev/null
 }

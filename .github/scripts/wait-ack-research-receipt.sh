@@ -118,6 +118,12 @@ while (( $(date +%s) < deadline )); do
         echo 'ACK batch does not cover the source-selected test and strict Clippy stages' >&2
         exit 1
       }
+      gh api "repos/proerror77/monday/actions/runs/$GITHUB_RUN_ID" >"$destination/current-rust-run.json"
+      gh api "repos/proerror77/monday/actions/runs/$GITHUB_RUN_ID/attempts/$attempt/jobs?per_page=100" >"$destination/current-rust-jobs.json"
+      ack_verify_rust_job "$destination/receipt.json" "$destination/current-rust-run.json" "$destination/current-rust-jobs.json" || {
+        echo 'ACK batch does not match the current Rust Workspace job and attempt' >&2
+        exit 1
+      }
     fi
     if jq -e '.software_bundle != null' "$destination/receipt.json" >/dev/null; then
       bundle_url=$(jq -er '.software_bundle.url | select(startswith("https://"))' "$destination/receipt.json")
