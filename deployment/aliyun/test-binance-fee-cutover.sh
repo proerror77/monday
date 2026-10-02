@@ -7,30 +7,27 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 CUTOVER="$SCRIPT_DIR/binance-fee-cutover.sh"
 WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
-CI_RUNNER="$SCRIPT_DIR/../../.github/scripts/run-collector-control-contracts.py"
+CI_RUNNER="$SCRIPT_DIR/../../.github/scripts/run-collector-control-contracts.sh"
 
 check_ci_registration() {
-  python3 - "$CI_WORKFLOW" "$CI_RUNNER" <<'PY'
-import ast
-from pathlib import Path
-import re
-import sys
-
-workflow, runner = (Path(path) for path in sys.argv[1:])
-block = re.search(r'^  control_contracts:\n(.*?)(?=^  \S|\Z)',
-                  workflow.read_text(), re.MULTILINE | re.DOTALL)
-if not block or not re.search(
-        r'^ +python3 \.\./\.github/scripts/run-collector-control-contracts\.py *$',
-        block.group(1), re.MULTILINE):
-    sys.exit('collector control workflow must invoke the release contract runner')
-module = ast.parse(runner.read_text())
-fast = next((ast.literal_eval(node.value) for node in module.body
-             if isinstance(node, ast.Assign) and any(
-                 isinstance(target, ast.Name) and target.id == 'FAST'
-                 for target in node.targets)), ())
-if fast.count('test-binance-fee-cutover.sh') != 1:
-    sys.exit('release runner must register the fee cutover contract exactly once in FAST')
-PY
+  if ! awk '
+    /^  control_contracts:/ {inside=1; next}
+    /^  [[:alnum:]_]+:/ {inside=0}
+    inside && /^[[:space:]]+bash \.\.\/\.github\/scripts\/run-collector-control-contracts\.sh[[:space:]]*$/ {found=1}
+    END {exit !found}
+  ' "$CI_WORKFLOW"; then
+    printf 'collector control workflow must invoke the release contract runner\n' >&2
+    return 1
+  fi
+  if ! awk '
+    /^FAST=\(/ {inside=1; next}
+    inside && /^\)/ {inside=0}
+    inside && /^[[:space:]]*test-binance-fee-cutover\.sh[[:space:]]*$/ {count++}
+    END {exit count!=1}
+  ' "$CI_RUNNER"; then
+    printf 'release runner must register the fee cutover contract exactly once in FAST\n' >&2
+    return 1
+  fi
 }
 
 # Exercise the actual admission assertion against isolated mutated fixtures
