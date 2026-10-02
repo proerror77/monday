@@ -163,7 +163,7 @@ jobs:
             bash -n "$script"
           done
           shellcheck ../deployment/aliyun/*.sh
-          python3 ../.github/scripts/run-collector-control-contracts.py
+          bash ../.github/scripts/run-collector-control-contracts.sh
 
   monitor_contracts:
     name: Collector monitor contracts
@@ -193,7 +193,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Verify selection, cancellation and aggregate admission
         run: |
-          python3 .github/scripts/test-collector-control-scheduling.py
+          bash .github/scripts/test-collector-control-scheduling.sh
           bash .github/scripts/test-main-image-scope.sh
           bash .github/scripts/test-image-build-plan.sh
           bash .github/scripts/test-tested-image.sh
