@@ -8,6 +8,8 @@ artifact="$script_dir/research-image-release-artifact.sh"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+export GITHUB_RUN_ATTEMPT=2 MONDAY_RELEASE_JOB_ID=567
+
 main_sha=1111111111111111111111111111111111111111
 other_sha=2222222222222222222222222222222222222222
 green_admission=(
@@ -150,11 +152,13 @@ release="$tmp_dir/release"
 mkdir -p "$repo/prediction-markets" "$release/research-bin"
 printf 'root lock\n' >"$repo/Cargo.lock"
 printf 'prediction lock\n' >"$repo/prediction-markets/Cargo.lock"
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer research-data-service clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
+for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer research-orchestrator researchctl research-prepare clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
   printf '%s\n' "$binary" >"$release/research-bin/$binary"
   chmod 0755 "$release/research-bin/$binary"
 done
 
+export MONDAY_BUILD_INPUTS_FILE="$tmp_dir/build-inputs.json"
+jq -n --arg h "$(printf a%.0s {1..64})" --arg root "$(sha256sum "$repo/Cargo.lock" | awk '{print $1}')" --arg prediction "$(sha256sum "$repo/prediction-markets/Cargo.lock" | awk '{print $1}')" '{schema:"monday.compilation-inputs.v1",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:{root:$root,prediction:$prediction}}' >"$MONDAY_BUILD_INPUTS_FILE"
 "$artifact" create "$release" "$main_sha" 1234 "$repo"
 "$artifact" verify "$release" "$main_sha" 1234 "$repo"
 

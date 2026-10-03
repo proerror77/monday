@@ -34,6 +34,11 @@ The repository provides durable research coordinators and CLIs. External event
 routing is a separate responsibility. LLMs never receive order, credential,
 wallet, risk-increase, resume, or artifact-loading authority.
 
+The new [research foundation](docs/architecture/RESEARCH_FOUNDATION.md) separates
+Build, Run, Session and compute Attempts with PG/CH contracts. It defaults to
+paused and is not a production Campaign or ledger cutover. Its implementation
+and pending worker/provider acceptance are documented separately.
+
 ## Capability Truth
 
 | Capability | State | Boundary |

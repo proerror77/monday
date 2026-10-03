@@ -8,7 +8,9 @@ expected=(
   lob-pit-materializer
   binance-market-tape-slicer
   binance-replay-parquet-materializer
-  research-data-service
+  research-orchestrator
+  researchctl
+  research-prepare
   clickhouse-analytics-materializer
   monday-prediction-research
   monday-prediction-evaluator

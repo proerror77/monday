@@ -40,7 +40,7 @@ for file in ci.yml ploy-ci.yml security-enabled.yml; do
     output="$work/$file-$result.out"
     code=0
     SELECTOR_RESULT=$result SELECTED_COMPLETE=true SELECTED_JOBS=',ci/monitor-contracts,' \
-      SELECTED_SECURITY_JOBS=',security/secret-presence,' SELECTED_OWNING_PACKAGES=',,' \
+      SELECTED_SECURITY_JOBS=',security/secret-presence,' SELECTED_OWNING_PACKAGES=',,' SELECTED_LOOP_PACKAGES=',,' \
       SELECTED_LOOP=false SELECTED_HANDOFF=false SELECTED_JSON=false SELECTED_ONDO=false \
       SELECTED_COLLECTOR=false SELECTED_CONTROL=false SELECTED_FOCUSED=false SELECTED_TOOLCHAIN=false \
       SELECTED_PRODUCTION_TRADING_IMAGE=false SELECTED_PRODUCTION_COLLECTOR_IMAGE=false \

@@ -431,7 +431,7 @@ for workflow in \
 done
 # Research software runs under the private ACK profile, so public metadata
 # jobs carry neither a compiler container nor its cache/toolchain setup.
-grep -Fq 'wait-ack-research-receipt.sh research-image-binaries "$(git rev-parse HEAD)"' "$script_dir/../workflows/ploy-ci.yml"
+grep -Fq 'bash .github/scripts/build-research-release.sh' "$script_dir/../workflows/ploy-ci.yml"
 # shellcheck disable=SC2016
 always_condition='    if: ${{ always() }}'
 grep -Fqx '    needs: selector' "$ci_workflow"
@@ -470,7 +470,7 @@ control_job_block=$(job_block control_contracts)
 # Rust changes and lightweight Rust shell changes.
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$fast_gates_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" <<<"$rust_job_block"
-grep -Fq "needs.research_preflight.result == 'success'" <<<"$rust_job_block"
+grep -Fq 'check-collector-test-presence.sh' <<<"$rust_job_block"
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$rust_shell_scripts_block"
 grep -Fq "uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1" <<<"$rust_shell_scripts_block"
 grep -Fq "find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \\;" <<<"$rust_shell_scripts_block"
@@ -516,7 +516,7 @@ recorder_block=$(job_block market_recorder_contract)
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fq "if: \${{ (always() && needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}" <<<"$rust_job_block"
+grep -Fq "if: \${{ (always() && needs.scope.outputs.toolchain == 'true') }}" <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
@@ -598,79 +598,19 @@ for ploy_rust_job in \
   grep -Fq 'steps.cache-info.outputs.sccache' <<<"$ploy_block"
   if grep -Fq -- '}}-${{ github.sha }}' <<<"$ploy_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 done
-# Fixed ACK profiles preserve the selected public job identities while
-# rejecting hosted execution. Scope and selected-job Gate cases above/below
-# remain unchanged: a failed/missing receipt fails the same selected job.
-for mapping in \
-  research-image-binaries:research-image-binaries \
-  research-image-smoke:research-image-smoke \
-  rust-format:prediction-research-format \
-  rust-research-heavy:prediction-research-heavy; do
-  job=${mapping%%:*}
-  profile=${mapping#*:}
-  relay_block=$(ploy_job_block "$job")
-  grep -Fqx '    runs-on: ubuntu-latest' <<<"$relay_block"
-  grep -Fqx '    timeout-minutes: 360' <<<"$relay_block"
-  grep -Fq "wait-ack-research-receipt.sh $profile \"\$(git rev-parse HEAD)\"" <<<"$relay_block"
-  if grep -Eq 'container:|RUSTC_WRAPPER:|SCCACHE_GHA_ENABLED:|uses: (docker/|dtolnay/rust-toolchain|Swatinem/rust-cache|mozilla-actions/sccache)|(^|[[:space:]])(cargo|docker) (build|test|run|check|clippy|fmt)' <<<"$relay_block"; then
-    echo "selected research job $job still executes on a public hosted runner" >&2
-    exit 1
-  fi
-done
-for mapping in rust:ci-rust; do
-  job=${mapping%%:*}
-  profile=${mapping#*:}
-  mixed_block=$(job_block "$job")
-  grep -Fq "wait-ack-research-receipt.sh $profile \"\$(git rev-parse HEAD)\"" <<<"$mixed_block"
-  grep -Fq "if: needs.scope.outputs.ack_research == 'true'" <<<"$mixed_block"
-done
-# Verify every native mixed-lane action keeps its non-research guard; a
-# newly-added unguarded compiler/setup step must fail this contract.
-ruby -ryaml - "$ci_workflow" <<'RUBY'
-ci=YAML.safe_load(File.read(ARGV.fetch(0)))
-%w[rust].each do |id|
-  ci.fetch('jobs').fetch(id).fetch('steps').each do |step|
-    next if step.fetch('uses','').include?('actions/checkout@') || step.fetch('run','').include?('wait-ack-research-receipt.sh')
-    abort "unguarded native research action in #{id}" unless step.fetch('if','').include?("needs.scope.outputs.ack_research != 'true'")
-  end
+# Native test/build jobs preserve domain coverage and have no resource relay.
+ruby -ryaml - "$ci_workflow" "$script_dir/../workflows/security-enabled.yml" "$ploy_workflow" <<'RUBY'
+ci,security,ploy=ARGV.map{|p| YAML.safe_load(File.read(p)).fetch('jobs')}
+[ci,security,ploy].each do |jobs|
+  abort 'active cloud execution relay' if jobs.to_s.include?('wait-ack-') || jobs.to_s.include?('ack_research')
 end
-RUBY
-
-# The relay derives its own ACK scope for these profiles by resolving
-# `git diff "$base...$head"` and `git merge-base "$base" "$head"` from the PR
-# event's base/head SHAs, so the checked-out object database must contain both
-# commits. A default depth-1 checkout keeps only the PR merge commit and the
-# relay dies with `Not a valid commit name`. Every relay job for a derived
-# profile therefore needs a full-history checkout; the expected job map keeps
-# this scan from passing vacuously if a command shape or file drifts.
-ruby -ryaml - \
-  "$ci_workflow" \
-  "$script_dir/../workflows/security-enabled.yml" \
-  "$script_dir/../workflows/ploy-ci.yml" <<'RUBY'
-derived = %w[ci-rust security-clippy-research research-image-binaries]
-expected = {
-  'ci.yml' => %w[rust],
-  'security-enabled.yml' => %w[clippy-strict],
-  'ploy-ci.yml' => %w[research-image-binaries]
-}
-relays = Hash.new { |hash, key| hash[key] = [] }
-ARGV.each do |path|
-  name = File.basename(path)
-  YAML.safe_load(File.read(path)).fetch('jobs').each do |id, job|
-    steps = job.fetch('steps', [])
-    profiles = steps.map { |step| step.fetch('run', '')[/wait-ack-research-receipt\.sh\s+(\S+)/, 1] }.compact
-                    .select { |profile| derived.include?(profile) }
-    next if profiles.empty?
-    relays[name] << id
-    checkouts = steps.select { |step| step.fetch('uses', '').include?('actions/checkout@') }
-    abort "derived ACK relay in #{name}:#{id} has no checkout step" if checkouts.empty?
-    next if checkouts.any? { |step| (step['with'] || {}).fetch('fetch-depth', nil).to_s == '0' }
-
-    abort "#{name}:#{id} relays #{profiles.uniq.join(',')} without a full-history checkout"
-  end
-end
-expected.each do |name, ids|
-  abort "derived ACK relay jobs drifted in #{name}: expected #{ids.sort}, got #{relays[name].sort}" unless relays[name].sort == ids.sort
+abort 'missing selected Rust domain tests' unless %w[loop owning handoff json ondo collector control focused clippy_loop clippy_handoff].all?{|id|ci.fetch('rust').fetch('steps').any?{|s|s['id']==id}}
+abort 'missing shared producer evidence' unless ci.fetch('rust').to_s.include?('write-ci-rust-evidence.sh')
+abort 'Security duplicates Clippy on PR/push' unless security.fetch('clippy-strict').fetch('steps').select{|s|s.fetch('run','').include?('cargo clippy')}.all?{|s|s.fetch('if','').include?("github.event_name == 'schedule'")}
+abort 'Security bypasses producing attempt' unless security.fetch('clippy-strict').to_s.include?('wait-ci-rust-evidence.sh')
+abort 'smoke does not reuse binary job' unless ploy.fetch('research-image-smoke').fetch('needs').include?('research-image-binaries')
+%w[research-image-binaries rust-format rust-research-heavy].each do |id|
+  abort "native compiler absent #{id}" unless ploy.fetch(id).to_s.include?('dtolnay/rust-toolchain@')
 end
 RUBY
 

@@ -31,28 +31,17 @@ abort 'ACR queue changed' unless acr.fetch('concurrency') == {'group'=>'acr-publ
     abort "public ACK runner exposure: #{id}" if job.fetch('runs-on','').to_s.match?(/self-hosted|monday-ack-research/)
   end
 end
-[[ploy,%w[research-image-binaries research-image-smoke rust-format rust-research-heavy]], [acr,%w[research-runner-binaries publish-source-test]]].each do |doc,ids|
-  ids.each do |id|
-    steps=doc.fetch('jobs').fetch(id).fetch('steps')
-    abort "missing signed ACK relay: #{id}" unless steps.any? { |step| step.fetch('run','').include?('wait-ack-research-receipt.sh') }
-    steps.each do |step|
-      abort "hosted research execution: #{id}" if step.fetch('run','').match?(/\bcargo\s|\bdocker\s/) || step.fetch('uses','').match?(/docker\/|rust-toolchain|rust-cache|sccache/)
-    end
-  end
-end
-[[ci,'rust'],[security,'clippy-strict']].each do |doc,id|
-  doc.fetch('jobs').fetch(id).fetch('steps').each do |step|
-    next if step.fetch('uses','').include?('actions/checkout@') || step.fetch('run','').include?('wait-ack-research-receipt.sh')
-    abort "unguarded mixed research job #{id}" unless step.fetch('if','').include?("outputs.ack_research != 'true'")
-  end
+[acr,ploy,ci,security].each do |doc|
+  abort 'retired private ACK wait remains in active CI' if doc.to_s.include?('wait-ack-research-receipt.sh')
 end
 fast=ci.fetch('jobs').fetch('rust_fast_gates')
-abort 'static Fast dispatches ACK' if fast.to_s.include?('wait-ack') || fast.to_s.include?('ack_research')
+abort 'static Fast dispatches compute' if fast.to_s.include?('wait-ack') || fast.to_s.include?('ack_research')
 abort 'static Fast compiles research' if fast.to_s.match?(/\bcargo\s+(build|test|check|clippy)\b/)
-acr.fetch('jobs').fetch('publish').fetch('steps').each do |step|
-  next unless step.fetch('run','').match?(/\bdocker\s/) || step.fetch('uses','').match?(/docker\//)
-  abort 'public research image build, smoke or publication' unless step.fetch('if','').include?('!matrix.research_artifact')
+[ploy.fetch('jobs').fetch('research-image-binaries'),acr.fetch('jobs').fetch('research-runner-binaries')].each do |job|
+  abort 'release compiles whole workspace' if job.to_s.include?('--workspace') || job.to_s.include?('--all-features')
+  abort 'release lost bounded native builder' unless job.fetch('steps').any? { |s|s.fetch('run','').include?('build-research-release.sh') }
 end
+abort 'cross-run source readback missing' unless acr.fetch('jobs').fetch('publish').fetch('steps').any? { |s|s.fetch('run','').include?('download-research-release.sh') }
 abort 'release relationship changed' unless acr.fetch('jobs').fetch('research-release-complete').fetch('needs') == ['selector','publish']
 RUBY
 # Preserve authenticated exact-source native three-workflow admission.
@@ -63,8 +52,8 @@ grep -Fq -- '--prediction-conclusion "$PREDICTION_CONCLUSION"' "$workflow"
 grep -Fq -- '--security-conclusion "$SECURITY_CONCLUSION"' "$workflow"
 grep -Fq 'Revalidate current main before publication' "$workflow"
 grep -Fq '.github/scripts/wait-release-required-checks.sh "$SOURCE_REVISION" current-main' "$workflow"
-grep -Fq 'research-data-service' "$workflow"
-grep -Fq 'verify-metadata' "$ploy_workflow"
+if grep -Fq 'research-data-service' "$workflow"; then echo 'release refers to unimplemented data service image' >&2; exit 1; fi
+grep -Fq 'research-image-smoke.sh' "$ploy_workflow"
 grep -Fqx 'FROM rust:1.98.1-bookworm AS builder' "$market_data_dockerfile"
 grep -Fqx 'FROM rust:1.98.1-bookworm AS builder' "$sentinel_dockerfile"
 grep -Fqx 'FROM rust:1.98.1-slim-bookworm AS builder' "$hft_live_dockerfile"
@@ -92,48 +81,23 @@ if grep -Eq '^[[:space:]]+command:' <<<"$controller_container_block"; then
   printf 'ACK controller Job bypasses the image entrypoint\n' >&2
   exit 1
 fi
-# Research build/smoke/publication commands belong to fixed private profiles.
-# Public checks bind each terminal receipt to the actual checkout; binary
-# software metadata stays bound to the public producer run before upload.
+# A native producer owns immutable bytes once; smoke and publication consume it.
 ruby -ryaml - "$workflow" "$ploy_workflow" <<'RUBY'
 acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
-profiles={
-  'research-image-binaries'=>'research-image-binaries',
-  'research-image-smoke'=>'research-image-smoke',
-  'rust-format'=>'prediction-research-format',
-  'rust-research-heavy'=>'prediction-research-heavy'
-}
-[[ploy,profiles],[acr,{'research-runner-binaries'=>'research-release-binaries','publish-source-test'=>'research-source-test','publish'=>'research-release-publish'}]].each do |doc,mapping|
-  mapping.each do |id,profile|
-    job=doc.fetch('jobs').fetch(id)
-    relay=job.fetch('steps').select { |s| s.fetch('run','').include?('wait-ack-research-receipt.sh') }
-    abort "ambiguous relay #{id}" unless relay.length==1
-    command=relay.first.fetch('run')
-    abort "wrong private profile or source #{id}" unless command.include?("wait-ack-research-receipt.sh #{profile} \"$(git rev-parse HEAD)\"")
-    if doc.equal?(acr)
-      checkout=job.fetch('steps').find { |s| s.fetch('uses','').include?('actions/checkout@') }
-      abort "unbound publication source #{id}" unless checkout.fetch('with').fetch('ref')=='${{ needs.selector.outputs.source_sha }}'
-    end
-  end
-end
 [[ploy,'research-image-binaries','github.sha'],[acr,'research-runner-binaries','needs.selector.outputs.source_sha']].each do |doc,id,sha|
   steps=doc.fetch('jobs').fetch(id).fetch('steps')
-  verify=steps.find { |s| s.fetch('run','').include?('verify-metadata') }
-  abort "unbound software producer #{id}" unless verify && verify.fetch('run').include?('"$(git rev-parse HEAD)" "$GITHUB_RUN_ID" rust_hft')
-  upload=steps.find { |s| s.fetch('uses','').include?('actions/upload-artifact@') }
-  abort "missing public release upload #{id}" unless upload
-  with=upload.fetch('with')
-  abort "wrong release artifact identity #{id}" unless with.fetch('name')=="research-image-release-${{ #{sha} }}"
-  abort "software boundary changed #{id}" unless with.fetch('path')=='${{ runner.temp }}/ack-receipt/software/' && with.fetch('if-no-files-found')=='error'
+  upload=steps.find { |s|s.fetch('uses','').include?('actions/upload-artifact@') }
+  abort 'missing immutable software upload' unless upload && upload.fetch('with').fetch('name')=="research-image-release-${{ #{sha} }}"
+  abort 'incorrect release boundary' unless upload.fetch('with').fetch('path')=='${{ runner.temp }}/research-release/' && upload.fetch('with').fetch('if-no-files-found')=='error'
 end
 publication=acr.fetch('jobs').fetch('publish')
 abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']
-readback=publication.fetch('steps').find { |s| s.fetch('name','')=='Read back signed research image identity' }
-abort 'research publication readback absent' unless readback && readback.fetch('if')=='matrix.research_artifact'
-%w[.repository .source_sha .smoke_result .digest .image_ref].each do |field|
-  abort "publication proof omits #{field}" unless readback.fetch('run').include?(field)
-end
-abort 'publication proof allows ambiguous images' unless readback.fetch('run').include?('length == 1')
+readback=publication.fetch('steps').find { |s|s.fetch('name','')=='Read back research image source and executable bytes' }
+abort 'independent executable readback missing' unless readback && readback.fetch('if')=='matrix.research_artifact' && readback.fetch('run').include?('docker pull') && readback.fetch('run').include?('cmp ')
+logout=publication.fetch('steps').index { |s|s.fetch('name','')=='Remove ACR credentials' }
+abort 'registry identity removed before image readback' unless logout && logout>publication.fetch('steps').index(readback)
+source=acr.fetch('jobs').fetch('publish-source-test')
+abort 'source test lost offline fixed profile' unless source.fetch('steps').any? { |s|s.fetch('run','').include?('docker run --rm --network none') }
 RUBY
 # Selector still owns approved source-test SHA/profile/tag; no public job may
 # accept a free-form compiler command or recreate a hosted source-test build.
@@ -143,20 +107,6 @@ grep -Fqx '          SOURCE_TEST_SOURCE_SHA: ${{ inputs.source_test_source_sha }
 grep -Fqx '          SOURCE_TEST_PROFILE: ${{ inputs.source_test_profile }}' "$workflow"
 grep -Fqx '            --source-test-sha "$SOURCE_TEST_SOURCE_SHA" \' "$workflow"
 grep -Fqx '            --source-test-profile "$SOURCE_TEST_PROFILE" \' "$workflow"
-# Signed bridge refuses forks, unapproved profiles and unverifiable receipts;
-# source identity includes run/job/profile, not just a success status string.
-relay_script="$script_dir/wait-ack-research-receipt.sh"
-grep -Fq 'openssl pkeyutl -verify -pubin' "$relay_script"
-grep -Fq '.public_run_id == $run and .public_job == $job' "$relay_script"
-grep -Fq '.checkout_sha == $source and .profile == $profile and' "$relay_script"
-# Success requires ACK; signed negative results may terminate an unverified wait.
-grep -Fq '(.execution_host == "ack" or (.terminal_result=="failure" and .execution_host=="unverified" and' "$relay_script"
-grep -Fq '(.execution_state|IN("unverified","not_admitted")))) and' "$relay_script"
-grep -Fq 'Unknown private ACK execution profile' "$relay_script"
-grep -Fq 'Fork research jobs require independent source admission' "$relay_script"
-grep -Fq 'sha256sum -c -' "$relay_script"
-grep -Fq 'Selected' "$script_dir/classify-ack-research-job.sh"
-
 grep -Fqx 'FROM rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS source-test' "$source_test_dockerfile"
 grep -Fq 'groupadd --gid 1000 research' "$source_test_dockerfile"
 grep -Fqx '    && useradd --create-home --uid 1000 --gid 1000 research' "$source_test_dockerfile"
@@ -241,5 +191,5 @@ fi
 
 "$script_dir/test-research-image-release-artifact.sh"
 "$script_dir/test-acr-publish-source-readback.sh"
-"$script_dir/test-classify-ack-research-job.sh"
-printf 'ACR ACK execution and release metadata contracts passed\n'
+"$script_dir/test-download-research-release.sh"
+printf 'ACR native build, fixed domain tests and release metadata contracts passed\n'

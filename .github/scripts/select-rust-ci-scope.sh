@@ -173,6 +173,7 @@ select_all() {
 
 emit() {
   local value
+  [[ ,$owning_packages, != *",hft-research-platform,"* ]] || select_job ci/research-foundation
   [[ $architecture == true ]] && select_job ploy/architecture-contracts
   [[ $control == true ]] && select_job ci/control-contracts
   # Every path that selects collector verification must exercise its production image.
@@ -349,6 +350,28 @@ for path in "${paths[@]}"; do
       select_all
       select_all_rust_ci_jobs
       select_all_ploy_jobs
+      continue
+      ;;
+    .github/scripts/test-clickhouse-preparation.sh)
+      select_job ci/research-foundation
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      continue
+      ;;
+    .github/scripts/build-research-release.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
+      select_research_image_jobs
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      continue
+      ;;
+    .github/scripts/run-prediction-research-contracts.sh)
+      select_job ploy/rust-research-heavy
+      select_job ploy/workflow-lint
+      continue
+      ;;
+    .github/scripts/write-ci-rust-evidence.sh|.github/scripts/verify-ci-rust-evidence.sh|.github/scripts/wait-ci-rust-evidence.sh|.github/scripts/test-ci-rust-evidence.sh|.github/scripts/check-collector-test-presence.sh)
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
       continue
       ;;
     .github/scripts/classify-ack-research-job.sh|.github/scripts/test-classify-ack-research-job.sh|\

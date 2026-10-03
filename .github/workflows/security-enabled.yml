@@ -23,7 +23,6 @@ jobs:
     timeout-minutes: 5
     outputs:
       image_matrix: ${{ steps.images.outputs.image_matrix || steps.scope.outputs.image_matrix }}
-      ack_research: ${{ steps.ack.outputs.ack_research }}
       jobs: ${{ steps.images.outputs.security_jobs || steps.scope.outputs.security_jobs }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
       clippy_loop: ${{ steps.scope.outputs.clippy_loop }}
@@ -51,14 +50,6 @@ jobs:
           SELECTED_IMAGE_MATRIX: ${{ steps.scope.outputs.image_matrix }}
         run: bash .github/scripts/select-main-image-scope.sh "$GITHUB_SHA" "$GITHUB_OUTPUT"
 
-      - name: Classify research execution scope
-        id: ack
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          SELECTED_LOOP: ${{ steps.scope.outputs.clippy_loop }}
-        run: |
-          .github/scripts/classify-ack-research-job.sh --detect-scope --repository "$GITHUB_REPOSITORY" --event "$GITHUB_EVENT_NAME" --base "$BASE_SHA" --head "$HEAD_SHA" --loop "$SELECTED_LOOP"
 
   security-scope:
     name: Security job scope
@@ -68,7 +59,6 @@ jobs:
     timeout-minutes: 5
     outputs:
       image_matrix: ${{ needs.security-selector.outputs.image_matrix }}
-      ack_research: ${{ needs.security-selector.outputs.ack_research }}
       jobs: ${{ steps.scope.outputs.jobs }}
       clippy_loop: ${{ steps.scope.outputs.clippy_loop }}
       clippy_handoff: ${{ steps.scope.outputs.clippy_handoff }}
@@ -248,20 +238,20 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
-        if: needs.security-scope.outputs.ack_research != 'true'
+        if: github.event_name == 'schedule'
         with:
           toolchain: 1.98.1
           components: clippy
 
       - name: Cache
-        if: needs.security-scope.outputs.ack_research != 'true'
+        if: github.event_name == 'schedule'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft
           shared-key: strict-alpha-research-ml-v1
 
       - name: Run research Clippy (strict)
-        if: ${{ (needs.security-scope.outputs.clippy_loop == 'true') && needs.security-scope.outputs.ack_research != 'true' }}
+        if: ${{ (needs.security-scope.outputs.clippy_loop == 'true') && github.event_name == 'schedule' }}
         run: |
           cargo clippy \
             -p alpha-domain \
@@ -279,7 +269,7 @@ jobs:
             -D clippy::suspicious
 
       - name: Run runtime handoff Clippy (strict)
-        if: ${{ (needs.security-scope.outputs.clippy_handoff == 'true') && needs.security-scope.outputs.ack_research != 'true' }}
+        if: ${{ (needs.security-scope.outputs.clippy_handoff == 'true') && github.event_name == 'schedule' }}
         run: |
           cargo clippy \
             -p hft-live \
@@ -295,18 +285,12 @@ jobs:
   # ============================================================================
   # Unused Dependencies
   # ============================================================================
-      - name: Verify strict Clippy from the signed Monorepo batch
-        if: needs.security-scope.outputs.ack_research == 'true'
-        id: ack
+      - name: Verify strict Clippy from native Monorepo CI
+        if: github.event_name != 'schedule'
         working-directory: .
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          if [[ $GITHUB_EVENT_NAME == schedule ]]; then
-            .github/scripts/wait-ack-research-receipt.sh security-clippy-research "$(git rev-parse HEAD)"
-          else
-            bash .github/scripts/wait-ack-rust-batch.sh "$(git rev-parse HEAD)"
-          fi
+        run: bash .github/scripts/wait-ci-rust-evidence.sh "$(git rev-parse HEAD)"
   cargo-machete:
     name: Code Quality - Unused Dependencies
     needs: security-scope

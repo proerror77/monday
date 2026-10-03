@@ -40,6 +40,16 @@ flowchart TB
 | Governance | Promotion records, approvals, bundle/envelope binding and signing | Market connectivity or direct execution |
 | Runtime | Trusted keys, policy caps, nonce/audit state, account truth, risk, OMS, cancel, reconciliation, execution | LLM-driven decisions or unverified artifacts |
 
+## Research foundation migration boundary
+
+`research-core/platform` adds typed DataViews, PG task/result authority, fixed
+Job lifecycle and distinct Build/Run/Session contracts. It starts paused, has no
+DuckDB fallback, and does not activate a provider. The DuckDB research path above
+remains legacy production code until a separately verified quiescence/migration
+Gate; there is no dual-active authority. Native grants, scientific worker inputs
+and Session transport still require integration before cutover. See
+[the implementation and acceptance boundaries](../docs/architecture/RESEARCH_FOUNDATION.md).
+
 ## Durable Packages
 
 - `alpha-harness/domain`: Campaign/family, mission, LoopRun, candidate, evaluation, learning, approval, bundle, and signed deployment contracts.

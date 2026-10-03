@@ -508,7 +508,7 @@ fn default_market() -> String {
     "usdm".to_string()
 }
 
-fn validate_market_identity(configured: &str, manifest: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_market_identity(configured: &str, manifest: &str) -> anyhow::Result<()> {
     let configured = configured.parse::<Market>().map_err(anyhow::Error::msg)?;
     let manifest = manifest.parse::<Market>().map_err(anyhow::Error::msg)?;
     if configured != manifest {
