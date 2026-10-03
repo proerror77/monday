@@ -32,6 +32,7 @@ toolchain=false
 jobs=
 security_jobs=
 research_image_relevant=false
+research_product=none
 architecture=false
 owning_packages=
 loop_packages=
@@ -127,6 +128,7 @@ select_all_rust_ci_jobs() {
 }
 
 select_all_ploy_jobs() {
+  research_product=paired
   architecture=true
   research_image_relevant=true
   [[ $event == pull_request ]] && select_job ploy/commit-hygiene
@@ -145,6 +147,7 @@ select_all_ploy_jobs() {
 }
 
 select_research_image_jobs() {
+  if [[ ${1:-paired} == paired || $research_product == paired ]]; then research_product=paired; else research_product=controller; fi
   research_image_relevant=true
   [[ $event == pull_request ]] && select_job ploy/commit-hygiene
   select_job ploy/research-image-binaries
@@ -154,6 +157,7 @@ select_research_image_jobs() {
 
 select_main_research_image_jobs() {
   if [[ $event == push && $research_image_relevant == true ]]; then
+    [[ $research_product != none ]] || research_product=paired
     select_job ploy/research-image-binaries
     select_job ploy/research-image-smoke
   fi
@@ -176,6 +180,7 @@ select_all() {
 
 emit() {
   local value
+  if [[ ,$jobs, == *,ploy/research-image-binaries,* && $research_product == none ]]; then research_product=paired; fi
   [[ ,$owning_packages, != *",hft-research-platform,"* ]] || select_job ci/research-foundation
   [[ $architecture == true ]] && select_job ploy/architecture-contracts
   [[ $control == true ]] && select_job ci/control-contracts
@@ -193,6 +198,7 @@ emit() {
   [[ $security_jobs =~ ^(security/[a-z0-9/-]+(,security/[a-z0-9/-]+)*)?$ ]] || { printf 'invalid security job selector output: %s\n' "$security_jobs" >&2; exit 1; }
   [[ $owning_packages =~ ^([A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]] || { printf 'invalid owning package selector output: %s\n' "$owning_packages" >&2; exit 1; }
   printf '%s\n' \
+    "research_product=$research_product" \
     "image_matrix=$image_matrix" \
     "production_trading_image=$production_trading_image" \
     "production_collector_image=$production_collector_image" \
@@ -281,7 +287,10 @@ for path in "${paths[@]}"; do
       select_research_image_jobs
       continue
       ;;
-    deployment/aliyun/research/Dockerfile.campaign-cycle-controller|\
+    deployment/aliyun/research/Dockerfile.campaign-cycle-controller)
+      select_research_image_jobs controller
+      continue
+      ;;
     deployment/aliyun/research/Dockerfile.research-data)
       select_research_image_jobs
       continue
@@ -371,10 +380,14 @@ for path in "${paths[@]}"; do
       select_job ploy/workflow-lint
       continue
       ;;
-    .github/scripts/research-release-bundle.rb|.github/scripts/research-release-source-sha.sh|.github/scripts/test-research-checkout-ownership.sh|.github/scripts/verify-research-runtime-abi.sh|.github/scripts/test-research-runtime-abi.sh|.github/scripts/build-research-release.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/verify-research-controller-image.sh|.github/scripts/test-research-controller-image.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
+    .github/scripts/research-release-products.sh|.github/scripts/research-release-products.json|.github/scripts/test-research-release-products.sh|.github/scripts/research-release-bundle.rb|.github/scripts/research-release-source-sha.sh|.github/scripts/test-research-checkout-ownership.sh|.github/scripts/verify-research-runtime-abi.sh|.github/scripts/test-research-runtime-abi.sh|.github/scripts/build-research-release.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/verify-research-controller-image.sh|.github/scripts/test-research-controller-image.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
       select_research_image_jobs
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
+      continue
+      ;;
+    deployment/aliyun/research/scripts/campaign-cycle-controller.sh|deployment/aliyun/research/scripts/campaign-job-watch.sh|deployment/aliyun/research/scripts/cex-materialization-entrypoint.sh|deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml)
+      select_research_image_jobs controller
       continue
       ;;
     .github/scripts/run-prediction-research-contracts.sh)
@@ -425,9 +438,9 @@ for path in "${paths[@]}"; do
     .github/scripts/select-rust-ci-scope.sh|.github/scripts/research-workspace-locks.sh|.github/scripts/check-rust-workspace-reports.sh|.github/scripts/verify-ci-rust-same-run.sh|.github/scripts/test-ci-rust-same-run.sh|\
     .github/scripts/local-lock-impact.sh|.github/scripts/test-local-lock-impact.mjs|\
     .github/scripts/image-build-plan.sh|.github/scripts/test-image-build-plan.sh|\
-    .github/scripts/read-tested-image.sh|.github/scripts/test-tested-image.sh|\
+    .github/scripts/save-tested-image.sh|.github/scripts/read-tested-image.sh|.github/scripts/test-tested-image.sh|\
     .github/scripts/read-published-image-source.sh|.github/scripts/select-main-image-scope.sh|\
-    .github/scripts/test-main-image-scope.sh|\
+    .github/scripts/test-main-image-scope.sh|.github/scripts/read-research-publish-baseline.sh|.github/scripts/select-main-research-scope.sh|.github/scripts/test-main-research-scope.sh|\
     .github/workflows/docker-smoke.yml|.github/workflows/docker-publish.yml|\
     .github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*|\
     .github/scripts/verify-ci-gate.sh|.github/scripts/test-ci-monitor-scope.sh|\
@@ -756,6 +769,7 @@ for ((index = 0; index < ${#package_names[@]}; index++)); do
   fi
 done
 if [[ $prediction_package_affected == true ]]; then
+  research_product=paired
   research_image_relevant=true
   [[ $event == pull_request ]] && select_job ploy/commit-hygiene
   select_job ploy/rust-format
@@ -774,6 +788,7 @@ select_job_if_affected ploy/frontend ploy-operator-contracts
 select_job_if_affected ploy/integration-regressions ploy
 
 if is_affected hft-collector || is_affected alpha-harness || is_affected hft-backtest; then
+  research_product=paired
   research_image_relevant=true
 fi
 if [[ $event == pull_request ]] && is_affected hft-backtest; then

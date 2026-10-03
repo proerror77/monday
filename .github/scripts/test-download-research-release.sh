@@ -8,7 +8,6 @@ source_sha=1111111111111111111111111111111111111111
 mkdir -p "$work/release/research-bin" "$work/bin"
 for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer \
   binance-replay-parquet-materializer clickhouse-analytics-materializer \
-  research-orchestrator researchctl research-prepare \
   monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
   printf 'fixture %s\n' "$binary" >"$work/release/research-bin/$binary"
   chmod 0755 "$work/release/research-bin/$binary"
@@ -39,7 +38,7 @@ case "$endpoint" in
     jq -n --arg conclusion "$conclusion" '[{jobs:[{id:567,name:"Research image binaries",run_id:1234,run_attempt:2,status:"completed",conclusion:$conclusion}]}]' ;;
   */runs/1234/artifacts\?*)
     expired=false; if [[ $mode == expired ]]; then expired=true; fi
-    jq -n --arg sha "$sha" --argjson expired "$expired" '[{artifacts:[{id:987,name:("research-image-release-"+$sha),expired:$expired,workflow_run:{id:1234,head_sha:$sha},size_in_bytes:4096}]}]' ;;
+    jq -n --arg sha "$sha" --argjson expired "$expired" '[{artifacts:[{id:987,name:("research-image-release-"+$sha+"-paired"),expired:$expired,workflow_run:{id:1234,head_sha:$sha},size_in_bytes:4096}]}]' ;;
   */artifacts/987/zip) cat "$MOCK_WORK/release.zip" ;;
   */jobs/567) printf '%s\n' '{run_id:1234,run_attempt:2,status:"completed",conclusion:"success"}' | jq -R 'fromjson' ;;
   *) echo 'unexpected mock API endpoint' >&2; exit 1 ;;

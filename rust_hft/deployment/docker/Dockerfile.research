@@ -35,8 +35,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --bin binance-market-tape-slicer \
     --bin binance-replay-parquet-materializer \
     --bin clickhouse-analytics-materializer \
-    && cargo --config 'build.rustc-wrapper=""' build --manifest-path research-core/platform/Cargo.toml --release --locked \
-    -p hft-research-platform --features control --bins \
     && CARGO_TARGET_DIR=/work/target/prediction-markets \
     cargo --config 'build.rustc-wrapper=""' build \
     --manifest-path prediction-markets/Cargo.toml \
@@ -53,9 +51,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && install -D -m 0755 /work/target/release/binance-market-tape-slicer /out/bin/binance-market-tape-slicer \
     && install -D -m 0755 /work/target/release/binance-replay-parquet-materializer /out/bin/binance-replay-parquet-materializer \
     && install -D -m 0755 /work/target/release/clickhouse-analytics-materializer /out/bin/clickhouse-analytics-materializer \
-    && install -D -m 0755 /work/target/release/research-orchestrator /out/bin/research-orchestrator \
-    && install -D -m 0755 /work/target/release/researchctl /out/bin/researchctl \
-    && install -D -m 0755 /work/target/release/research-prepare /out/bin/research-prepare \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-research /out/bin/monday-prediction-research \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-evaluator /out/bin/monday-prediction-evaluator \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-snapshot /out/bin/monday-prediction-snapshot

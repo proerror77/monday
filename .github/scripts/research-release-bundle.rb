@@ -2,11 +2,12 @@
 # CI archive transport only. Scientific/runtime implementation remains Rust.
 require 'rubygems/package'
 require 'fileutils'
+require 'json'
 
-BINARIES = %w[hft-backtest alpha-harness lob-pit-materializer
-  binance-market-tape-slicer binance-replay-parquet-materializer
-  research-orchestrator researchctl research-prepare clickhouse-analytics-materializer
-  monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot].freeze
+PRODUCT = ARGV[3] || 'paired'
+CATALOG = JSON.parse(File.read(File.join(__dir__, 'research-release-products.json'))).fetch('products')
+abort 'invalid research release product' unless %w[runner controller paired].include?(PRODUCT)
+BINARIES = (PRODUCT == 'paired' ? CATALOG.values.flatten : CATALOG.fetch(PRODUCT)).uniq.sort.freeze
 FILES = { 'research-image-release.json' => [0o644, 1024 * 1024] }.merge(
   BINARIES.to_h { |name| ["research-bin/#{name}", [0o755, 512 * 1024 * 1024]] }
 ).freeze
@@ -91,7 +92,7 @@ end
 
 begin
   mode, archive, directory = ARGV
-  check(ARGV.length == 3, 'expected pack/unpack ARCHIVE DIRECTORY')
+  check([3, 4].include?(ARGV.length), 'expected pack/unpack ARCHIVE DIRECTORY PRODUCT')
   case mode
   when 'pack' then pack(archive, directory)
   when 'unpack' then unpack(archive, directory)

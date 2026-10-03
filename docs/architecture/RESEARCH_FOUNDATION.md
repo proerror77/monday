@@ -48,7 +48,7 @@ flowchart LR
 
 CI selector 汇总真实 metadata，包括跨域 path dependencies 和 integration/dev edges。`cargo-scoped.sh` 把显式包集合分到各 owner；跨 workspace features 或命名 target 组合拒绝模糊执行。CI 单 runner 可复用自己的 target cache；多个 Cargo invocation 仍各自解析所属 workspace 的 features。共享可写多租户 cache 不属于此合同。
 
-保留的耦合仍有 collector 的 `BookSync`/engine、Alpha Data Mission 和 ONNX/formula 跨域兼容测试。本轮没有改成远端 RPC，也未宣称整个研究图已解耦。共享十二二进制 release bundle 仍保留既有消费者；功能拆分本身不提供编译耗时或加速倍数证据。
+保留的耦合仍有 collector 的 `BookSync`/engine、Alpha Data Mission 和 ONNX/formula 跨域兼容测试。本轮没有改成远端 RPC，也未宣称整个研究图已解耦。发布按已有真实镜像选择程序：runner 九项，Campaign controller 四项。两者共享的程序只编译一次。功能拆分本身不提供编译耗时或加速倍数证据。
 
 ## Build → Run → Attempt，不在训练 Pod cold build
 
@@ -69,7 +69,7 @@ Run 是固定科学调用：Experiment、BuildArtifact、配置摘要、命令�
 
 计算 Pod 直接调用 `/usr/local/bin/<已发布二进制>`；PG Run admission 拒绝 `cargo` 或任意 shell 作为直接入口。reconciler 每次 launch（包括 retry）读取已注册 Build，并从受控 artifact gateway 流式核验二进制大小/摘要，再检查租期、截止时间和撤销状态。缺失或错误产物不能触发 launch。OCI digest 与内含二进制的绑定来自独立的 trusted release verifier；通用 Agent API 无权出具这个证明。
 
-`.github/scripts/build-research-release.sh` 使用精确 `-p` / `--bin` / `--features`，没有默认 `--workspace` / `--all-features`。共享发布 bundle 兼顾已有 CEX、Prediction 和新控制二进制；不同科学变异的 BuildSpec 可以缩小到实际科学 crate/binary。Cargo 依赖图重建受影响 crate，链接仍有成本。本分支没有编译耗时基准，不承诺加速倍数。
+`.github/scripts/build-research-release.sh` 使用精确 `-p` / `--bin` / `--features`，没有默认 `--workspace` / `--all-features`。一份产品清单绑定已有 runner 与 Campaign controller。controller 资产单改时只构建所需四项。新平台控制程序仍由 owning CI 验证；它们没有生产发布合同，不进入这两个镜像。不同科学变异的 BuildSpec 可以缩小到实际科学 crate/binary。Cargo 依赖图重建受影响 crate，链接仍有成本。本分支没有编译耗时基准，不承诺加速倍数。
 
 发布保留原 `release` profile（opt-level 3、thin LTO、codegen-units 1）。另提供显式 `research` profile（opt-level 2、无 LTO、16 codegen units）；它的身份与 release 分开，不能把不同优化产物当同一科学执行。`researchctl plan-build BUILD` 仅输出经过校验的 scoped Cargo 参数，不执行编译或配置云端 builder。
 
@@ -161,6 +161,6 @@ OpenResearch [chat delivery](https://github.com/alphaXiv/OpenResearch/blob/f4cec
 7. 灰度启用：只开放一个 tenant，concurrency=1，使用明确批准的预算。重新读回旧 writer 已停的证明，再启用 PG。旧、新 ledger 不能同时写入。
 8. 回滚：先 pause 新 authority，再 cancel/drain 所有任务。独立证明新进程树全部停止后，以当前恢复/迁移证明恢复旧 authority。保留新 ledger 与 append-only 证据。
 
-旧 CI/private control 链的退役必须同时满足 exact-head required checks 已通过、共享发布证据可读、独立新资源生命周期/回读已真实验收、旧请求队列和 lease 已 drain、private signer 与旧 receipt 发布不再被消费，以及恢复路径验证。仅草稿 PR、unit tests 或 CRD Ready 不满足退役条件。
+CI 的私有 ACK 回执等待已由 native jobs 取代。默认分支切换须验证当前 source 的 required checks 和实际发布字节。ACK 资源租期、队列、停止、恢复和 signer 属于独立运行合同。退役这些生产控制前，必须 drain 原队列与 lease，独立证明停止和恢复，并确认旧 receipt 不再被消费。CI 合并或镜像发布不能代替这些运行验收。
 
 本次无需新的费用或安全授权即可评审代码。未来东京 Pro/ACS/Sandbox 资源、RAM/network/credential 和部署切换均须先提供具体 Gate/成本/权限/回滚结果，再在用户已限定的范围内申请下一阶段授权。本分支不会自动完成这些动作。

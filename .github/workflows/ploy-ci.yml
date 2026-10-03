@@ -28,10 +28,14 @@ jobs:
   image-smoke-selector:
     name: CI job selector
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
     outputs:
-      jobs: ${{ steps.scope.outputs.jobs }}
+      jobs: ${{ steps.cumulative.outputs.jobs || steps.scope.outputs.jobs }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
+      research_product: ${{ steps.cumulative.outputs.research_product || steps.scope.outputs.research_product }}
     steps:
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -50,6 +54,16 @@ jobs:
           --base "${BASE_SHA}"
           --head "${HEAD_SHA}"
 
+      - name: Carry unpublished research image impact
+        id: cumulative
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
+          SELECTED_RESEARCH_PRODUCT: ${{ steps.scope.outputs.research_product }}
+        run: bash .github/scripts/select-main-research-scope.sh "$GITHUB_SHA" "$GITHUB_OUTPUT"
+
   image-smoke-scope:
     name: Research image smoke scope
     needs: image-smoke-selector
@@ -58,6 +72,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       jobs: ${{ steps.scope.outputs.jobs }}
+      research_product: ${{ needs.image-smoke-selector.outputs.research_product }}
     steps:
       - name: Resolve selector result
         id: scope
@@ -243,11 +258,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MONDAY_BUILD_INPUTS_FILE: ${{ runner.temp }}/research-build-inputs.json
-        run: bash .github/scripts/build-research-release.sh
+        run: bash .github/scripts/build-research-release.sh "${{ needs.image-smoke-scope.outputs.research_product }}"
       - name: Upload research image release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: research-image-release-${{ github.sha }}
+          name: research-image-release-${{ github.sha }}-${{ needs.image-smoke-scope.outputs.research_product }}
           path: ${{ runner.temp }}/research-image-release.tar
           if-no-files-found: error
           retention-days: 7
@@ -262,13 +277,13 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: research-image-release-${{ github.sha }}
+          name: research-image-release-${{ github.sha }}-${{ needs.image-smoke-scope.outputs.research_product }}
           path: ${{ runner.temp }}/research-release-download
       - name: Smoke the same release binaries without network
         working-directory: .
         run: |
-          ruby .github/scripts/research-release-bundle.rb unpack "${RUNNER_TEMP}/research-release-download/research-image-release.tar" "${RUNNER_TEMP}/research-release"
-          bash .github/scripts/research-image-smoke.sh "${RUNNER_TEMP}/research-release"
+          ruby .github/scripts/research-release-bundle.rb unpack "${RUNNER_TEMP}/research-release-download/research-image-release.tar" "${RUNNER_TEMP}/research-release" "${{ needs.image-smoke-scope.outputs.research_product }}"
+          bash .github/scripts/research-image-smoke.sh "${RUNNER_TEMP}/research-release" "${{ needs.image-smoke-scope.outputs.research_product }}"
 
   rust-format:
     name: Rust formatting

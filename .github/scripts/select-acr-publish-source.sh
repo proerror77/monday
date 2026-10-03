@@ -3,6 +3,7 @@ set -euo pipefail
 
 event=
 automation_state=ready
+research_product=paired
 conclusion=
 source_event=
 head_branch=
@@ -26,6 +27,7 @@ output=${GITHUB_OUTPUT:-/dev/stdout}
 
 while (($#)); do
   case "$1" in
+    --product) research_product=$2; shift 2 ;;
     --event) event=$2; shift 2 ;;
     --automation-state) automation_state=${2:-ready}; shift 2 ;;
     --conclusion) conclusion=$2; shift 2 ;;
@@ -79,6 +81,7 @@ require_green_main() {
   done
 }
 
+[[ $research_product == paired || $research_product == runner || $research_product == controller ]] || exit 2
 case "$event" in
   workflow_run)
     [[ -z $source_test_sha ]] || {
@@ -102,7 +105,7 @@ case "$event" in
       case "$binaries_conclusion/$smoke_conclusion" in
         success/success)
           require_green_main "$source_sha"
-          publish_target=research-runner
+          if [[ $research_product == controller ]]; then publish_target=campaign-cycle-controller; else publish_target=research-runner; fi
           research_mode=artifact
           ;;
         skipped/skipped) publish_target=none; research_mode=none ;;
@@ -119,7 +122,7 @@ case "$event" in
     }
     case "$target" in
       polymarket-raw-ops) target=binance-lob-archiver ;;
-      all|research-runner|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder|research-source-test) ;;
+      all|research-runner|campaign-cycle-controller|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder|research-source-test) ;;
       *) printf 'unsupported publish target: %s\n' "$target" >&2; exit 1 ;;
     esac
     if [[ $target == research-source-test ]]; then
@@ -148,14 +151,18 @@ case "$event" in
         printf 'source-test SHA is only valid for research-source-test\n' >&2
         exit 1
       }
-      if [[ $target == all || $target == research-runner ]]; then
+      if [[ $target == all || $target == research-runner || $target == campaign-cycle-controller ]]; then
         if [[ $rebuild == true ]]; then
           research_mode=rebuild
+          if [[ $target == campaign-cycle-controller ]]; then research_product=controller; else research_product=paired; fi
         else
           [[ $rebuild == false && $automation_state == ready && $binaries_conclusion == success && $smoke_conclusion == success && $run_id =~ ^[1-9][0-9]*$ ]] || {
             printf 'manual research publication needs a verified exact-source binary/smoke artifact; missing or expired artifacts require an explicitly planned producer\n' >&2
             exit 1
           }
+          if [[ $target != campaign-cycle-controller && $research_product == controller ]]; then
+            echo 'runner publication requires its full verified product' >&2; exit 1
+          fi
           research_mode=artifact
           artifact_run_id=$run_id
         fi
@@ -183,3 +190,5 @@ if [[ $publish_target == research-source-test ]]; then
     "source_test_profile=$source_test_profile" \
     "source_test_tag=$source_test_tag" >>"$output"
 fi
+
+printf "research_product=%s\n" "$research_product" >>"$output"

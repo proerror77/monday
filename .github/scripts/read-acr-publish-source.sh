@@ -16,10 +16,11 @@ main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sh
 artifact_run_id=$current_run_id
 binaries_conclusion=missing
 smoke_conclusion=missing
+research_product=paired
 finish() {
   printf '%s\n' "automation_state=$1" "main_sha=$main_sha" \
     "artifact_run_id=$artifact_run_id" "binaries_conclusion=$binaries_conclusion" \
-    "smoke_conclusion=$smoke_conclusion" >> "$output"
+    "smoke_conclusion=$smoke_conclusion" "research_product=$research_product" >> "$output"
   if [[ -f $work/states ]]; then cat "$work/states" >> "$output"; fi
   printf 'automatic ACR source %s: %s\n' "$source_sha" "$1" >&2
   exit 0
@@ -90,17 +91,22 @@ while IFS=$'\t' read -r prior_id prior_attempt; do
   [[ $prior_id =~ ^[1-9][0-9]*$ && $prior_attempt =~ ^[1-9][0-9]*$ ]] || exit 1
   gh api --paginate --slurp \
     "repos/$GITHUB_REPOSITORY/actions/runs/$prior_id/attempts/$prior_attempt/jobs?per_page=100" > "$work/prior-jobs.json"
-  if jq -e --arg marker "Research release complete ($source_sha)" --argjson run "$prior_id" --argjson attempt "$prior_attempt" '[.[].jobs[]? | select(.name == $marker and .run_id == $run and .run_attempt == $attempt and .status == "completed" and .conclusion == "success")] | length == 1' "$work/prior-jobs.json" >/dev/null; then
-    finish already_published
-  fi
+  marker=$(jq -er --arg source "$source_sha" --argjson run "$prior_id" --argjson attempt "$prior_attempt" '
+    [.[].jobs[]? | select(.run_id==$run and .run_attempt==$attempt and .status=="completed" and .conclusion=="success" and
+      (.name==("Research release complete [paired] ("+$source+")") or
+       .name==("Research release complete [runner] ("+$source+")") or
+       .name==("Research release complete [controller] ("+$source+")")))] |
+    if length==0 then "none" elif length==1 then .[0].name else error("ambiguous completed release") end' "$work/prior-jobs.json")
+  if [[ $marker != none ]]; then finish already_published; fi
 done < "$work/prior.tsv"
 fi
 
 # Do not silently rebuild when the admitted producer artifact has expired.
 gh api --paginate --slurp \
   "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_run_id/artifacts?per_page=100" > "$work/artifacts.json"
-jq -e --arg name "research-image-release-$source_sha" --arg source "$source_sha" --argjson run "$artifact_run_id" '
-  [.[].artifacts[]? | select(.name == $name)] | length == 1 and
-  (.[0] | .expired == false and .workflow_run.id == $run and .workflow_run.head_sha == $source)' \
-  "$work/artifacts.json" >/dev/null || { echo 'exact-source research release artifact is missing, ambiguous or expired' >&2; exit 1; }
+research_product=$(jq -er --arg prefix "research-image-release-$source_sha-" --arg source "$source_sha" --argjson run "$artifact_run_id" '
+  [.[].artifacts[]? | select(.name | startswith($prefix))] | if length == 1 and
+  (.[0] | .expired == false and .workflow_run.id == $run and .workflow_run.head_sha == $source)
+  then .[0].name | ltrimstr($prefix) else error("missing/expired/ambiguous release") end |
+  if . == "paired" or . == "controller" or . == "runner" then . else error("unknown release product") end' "$work/artifacts.json")
 finish ready

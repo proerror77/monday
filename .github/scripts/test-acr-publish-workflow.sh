@@ -100,7 +100,7 @@ acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
 [[ploy,'research-image-binaries','github.sha'],[acr,'research-runner-binaries','needs.selector.outputs.source_sha']].each do |doc,id,sha|
   steps=doc.fetch('jobs').fetch(id).fetch('steps')
   upload=steps.find { |s|s.fetch('uses','').include?('actions/upload-artifact@') }
-  abort 'missing immutable software upload' unless upload && upload.fetch('with').fetch('name')=="research-image-release-${{ #{sha} }}"
+  abort 'missing immutable software upload' unless upload && upload.fetch('with').fetch('name')=="research-image-release-${{ #{sha} }}-${{ #{id=='research-image-binaries' ? 'needs.image-smoke-scope' : 'needs.selector'}.outputs.research_product }}"
   abort 'incorrect release boundary' unless upload.fetch('with').fetch('path')=='${{ runner.temp }}/research-image-release.tar' && upload.fetch('with').fetch('if-no-files-found')=='error'
 end
 publication=acr.fetch('jobs').fetch('publish')

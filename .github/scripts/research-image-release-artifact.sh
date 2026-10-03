@@ -11,20 +11,10 @@ job_id=${7:-${MONDAY_RELEASE_JOB_ID:-}}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 manifest="$release/research-image-release.json"
 target=x86_64-unknown-linux-gnu
-binaries=(
-  hft-backtest
-  alpha-harness
-  lob-pit-materializer
-  binance-market-tape-slicer
-  binance-replay-parquet-materializer
-  research-orchestrator
-  researchctl
-  research-prepare
-  clickhouse-analytics-materializer
-  monday-prediction-research
-  monday-prediction-evaluator
-  monday-prediction-snapshot
-)
+product=${8:-paired}
+binaries=()
+while IFS= read -r binary; do binaries+=("$binary"); done < <(bash "$script_dir/research-release-products.sh" binaries "$product")
+[[ ${#binaries[@]} -gt 0 ]] || exit 2
 
 [[ $source_sha =~ ^[0-9a-f]{40}$ ]] || { printf 'invalid source SHA: %s\n' "$source_sha" >&2; exit 1; }
 [[ $run_id =~ ^[1-9][0-9]*$ ]] || { printf 'invalid workflow run id: %s\n' "$run_id" >&2; exit 1; }
@@ -39,7 +29,7 @@ locks=$("$script_dir/research-workspace-locks.sh" "$repo_root")
 case "$mode" in
   create)
     test ! -e "$manifest"
-    "$script_dir/verify-research-runner-binaries.sh" "$release/research-bin"
+    "$script_dir/verify-research-runner-binaries.sh" "$release/research-bin" "$product"
     binary_manifest='[]'
     for binary in "${binaries[@]}"; do
       digest=$(sha256sum "$release/research-bin/$binary" | awk '{print $1}')
@@ -55,9 +45,11 @@ case "$mode" in
       --argjson workflow_run_attempt "$attempt" \
       --argjson workflow_job_id "$job_id" \
       --arg target "$target" \
+      --arg product "$product" \
       --argjson locks "$locks" \
       --argjson binaries "$binary_manifest" \
-      '{schema:"monday.research-image-release.v3",
+      '{schema:"monday.research-image-release.v4",
+        product:$product,
         source_sha:$source_sha,
         workflow_run_id:$workflow_run_id,
         workflow_run_attempt:$workflow_run_attempt,
@@ -71,16 +63,18 @@ case "$mode" in
     test "$(find "$release" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" -eq 2
     test -f "$manifest"
     # Verify bytes/provenance/file modes; the CI smoke job checks the same ELF files.
-    "$script_dir/verify-research-runner-binaries.sh" "$release/research-bin"
+    "$script_dir/verify-research-runner-binaries.sh" "$release/research-bin" "$product"
     jq -e \
       --arg source_sha "$source_sha" \
       --arg workflow_run_id "$run_id" \
       --argjson workflow_run_attempt "$attempt" \
       --argjson workflow_job_id "$job_id" \
       --arg target "$target" \
+      --arg product "$product" \
       --argjson binary_count "${#binaries[@]}" \
       --argjson locks "$locks" \
-      '.schema == "monday.research-image-release.v3" and
+      '.schema == "monday.research-image-release.v4" and
+       .product == $product and
        .source_sha == $source_sha and
        .workflow_run_id == $workflow_run_id and
        .workflow_run_attempt == $workflow_run_attempt and

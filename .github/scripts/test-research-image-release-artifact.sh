@@ -25,7 +25,7 @@ assert_source() {
   shift 2
   local output="$tmp_dir/$name.out"
   "$selector" "$@" --output "$output"
-  diff -u <(printf '%s\n' "$expected") "$output"
+  diff -u <(printf '%s\n' "$expected" 'research_product=paired') "$output"
 }
 
 assert_source automated $'publish_target=research-runner\nresearch_mode=artifact\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=1234' \
@@ -153,7 +153,7 @@ release="$tmp_dir/release"
 mkdir -p "$repo/prediction-markets" "$release/research-bin"
 printf 'root lock\n' >"$repo/Cargo.lock"
 printf 'prediction lock\n' >"$repo/prediction-markets/Cargo.lock"
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer research-orchestrator researchctl research-prepare clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
+for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
   printf '%s\n' "$binary" >"$release/research-bin/$binary"
   chmod 0755 "$release/research-bin/$binary"
 done
@@ -176,7 +176,7 @@ chmod 0644 "$tmp_dir/flattened"/research-bin/*
 if "$artifact" verify "$tmp_dir/flattened" "$main_sha" 1234 "$repo" >"$tmp_dir/mode-error" 2>&1; then
   echo 'flattened executable modes unexpectedly verified' >&2; exit 1
 fi
-grep -Fq 'executable mode lost: hft-backtest' "$tmp_dir/mode-error"
+grep -Fq 'executable mode lost:' "$tmp_dir/mode-error"
 ruby "$script_dir/research-release-bundle.rb" pack "$tmp_dir/research-image-release.tar" "$release"
 chmod 0644 "$tmp_dir/research-image-release.tar"
 ruby "$script_dir/research-release-bundle.rb" unpack "$tmp_dir/research-image-release.tar" "$tmp_dir/roundtrip"

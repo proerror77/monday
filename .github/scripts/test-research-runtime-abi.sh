@@ -4,7 +4,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin" "$work/release"
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer research-orchestrator researchctl research-prepare clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
+for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
   printf 'ELF fixture\n' > "$work/release/$binary"
   chmod 0755 "$work/release/$binary"
 done

@@ -43,7 +43,7 @@ reset_fixtures() {
   jq -n '[{jobs:[{run_id:100,run_attempt:2,name:"Research image binaries",status:"completed",conclusion:"success"},
     {run_id:100,run_attempt:2,name:"Research image smoke",status:"completed",conclusion:"success"}]}]' > "$work/jobs"
   jq -n '[{workflow_runs:[]}]' > "$work/publishers"
-  jq -n --arg sha "$source_sha" '[{artifacts:[{name:("research-image-release-"+$sha),expired:false,workflow_run:{id:100,head_sha:$sha}}]}]' > "$work/artifacts"
+  jq -n --arg sha "$source_sha" '[{artifacts:[{name:("research-image-release-"+$sha+"-paired"),expired:false,workflow_run:{id:100,head_sha:$sha}}]}]' > "$work/artifacts"
 }
 edit_fixture() {
   jq "$2" "$work/$1" > "$work/edited"
@@ -123,12 +123,11 @@ reject wrong-producer-artifact
 reset_fixtures
 jq -n --arg sha "$source_sha" '[{workflow_runs:[{id:80,run_attempt:3,head_sha:$sha,head_branch:"main",event:"workflow_run",path:".github/workflows/acr-publish.yml",head_repository:{full_name:"owner/repo"},status:"completed",conclusion:"success"}]}]' > "$work/publishers"
 cp "$work/publishers" "$work/publisher-base"
-jq -n --arg sha "$source_sha" '[{jobs:[{run_id:80,run_attempt:3,name:("Research release complete ("+$sha+")"),status:"completed",conclusion:"success"}]}]' > "$work/prior-jobs"
+jq -n --arg sha "$source_sha" '[{jobs:[{run_id:80,run_attempt:3,name:("Research release complete [paired] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' > "$work/prior-jobs"
 cp "$work/prior-jobs" "$work/marker-base"
 read_state already_published
 if grep -Fq /artifacts "$work/calls"; then
-  echo 'completed publication needlessly revisited binary artifacts' >&2
-  exit 1
+  echo 'completed publication needlessly revisited binary artifacts' >&2; exit 1
 fi
 # Rerunning an older publisher must still recognize a newer completed run.
 edit_fixture publishers '.[0].workflow_runs[0].id=300'

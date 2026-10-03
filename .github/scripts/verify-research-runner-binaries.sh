@@ -2,20 +2,10 @@
 set -euo pipefail
 
 directory=${1:?expected research-runner binary directory}
-expected=(
-  hft-backtest
-  alpha-harness
-  lob-pit-materializer
-  binance-market-tape-slicer
-  binance-replay-parquet-materializer
-  research-orchestrator
-  researchctl
-  research-prepare
-  clickhouse-analytics-materializer
-  monday-prediction-research
-  monday-prediction-evaluator
-  monday-prediction-snapshot
-)
+product=${2:-paired}
+expected=()
+while IFS= read -r binary; do expected+=("$binary"); done < <(bash "$(dirname "${BASH_SOURCE[0]}")/research-release-products.sh" binaries "$product")
+[[ ${#expected[@]} -gt 0 ]] || exit 2
 
 fail() { printf 'research release validation: %s\n' "$*" >&2; exit 1; }
 test -d "$directory" || fail "binary directory missing: $directory"

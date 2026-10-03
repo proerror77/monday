@@ -321,12 +321,13 @@ jobs:
   # Container Image Scanning
   # ============================================================================
   container-scan:
-    name: Container Security - Image Scan
+    name: Container Security - Image Scan (${{ matrix.name }})
     needs: security-scope
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(needs.security-scope.outputs.jobs, ',security/container-scan,')
     permissions:
       contents: read
+      actions: read
       security-events: write
     strategy:
       fail-fast: false
@@ -368,16 +369,10 @@ jobs:
         if: matrix.name == 'hft-core'
         env:
           IMAGE_NAME: ${{ matrix.name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p tested-image
           image="monday-tested:$IMAGE_NAME-$GITHUB_SHA"
-          docker save "$image" --output tested-image/image.tar
-          jq -n --arg source "$GITHUB_SHA" --arg name "$IMAGE_NAME" \
-            --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg image_id "$(docker image inspect --format '{{.Id}}' "$image")" \
-            --arg archive "$(sha256sum tested-image/image.tar | awk '{print $1}')" \
-            '{schema_version:"monday.tested_image.v1",source_sha:$source,image:$name,run_id:$run,run_attempt:$attempt,image_id:$image_id,archive_sha256:$archive}' \
-            > tested-image/image.json
+          bash .github/scripts/save-tested-image.sh "$image" hft-core 'Container Security - Image Scan (hft-core)' tested-image
 
       - name: Preserve the tested image
         if: matrix.name == 'hft-core'

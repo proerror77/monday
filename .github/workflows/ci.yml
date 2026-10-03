@@ -203,6 +203,8 @@ jobs:
         run: |
           bash .github/scripts/test-collector-control-scheduling.sh
           bash .github/scripts/test-main-image-scope.sh
+          bash .github/scripts/test-main-research-scope.sh
+          bash .github/scripts/test-research-release-products.sh
           bash .github/scripts/test-image-build-plan.sh
           ruby .github/scripts/test-rust-docker-workspaces.rb --self-test
           bash .github/scripts/test-tested-image.sh
@@ -719,6 +721,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -773,6 +776,21 @@ jobs:
           docker run --rm --network none --read-only --cap-drop ALL \
             --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777 \
             --entrypoint /usr/local/bin/binance-lob-archiver "$image" --self-test
+
+      - name: Preserve the tested collector image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.scope.outputs.production_collector_image == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/save-tested-image.sh "monday-collector-check:$GITHUB_SHA" binance-lob-archiver 'Production Image And Kubernetes Contract' tested-collector
+
+      - name: Upload the tested collector image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.scope.outputs.production_collector_image == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tested-image-binance-lob-archiver-${{ github.sha }}-${{ github.run_attempt }}
+          path: tested-collector/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Validate Kubernetes manifests without a cluster
         run: |

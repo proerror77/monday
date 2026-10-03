@@ -3,7 +3,7 @@
 set -euo pipefail
 directory=${1:?release binary directory required}
 script_dir=$(cd "$(dirname "$0")" && pwd)
-bash "$script_dir/verify-research-runner-binaries.sh" "$directory"
+bash "$script_dir/verify-research-runner-binaries.sh" "$directory" "${2:-paired}"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 export LC_ALL=C

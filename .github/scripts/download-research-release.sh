@@ -4,6 +4,7 @@ set -euo pipefail
 run=${1:?producer run required}
 source_sha=${2:?source SHA required}
 release=${3:?empty output directory required}
+product=${4:-paired}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 : "${GITHUB_REPOSITORY:?repository required}"
 [[ $run =~ ^[1-9][0-9]*$ && $source_sha =~ ^[0-9a-f]{40}$ ]]
@@ -25,7 +26,7 @@ job=$(jq -er --arg name "$name" --argjson run "$run" --argjson attempt "$attempt
   | if length==1 then .[0].id else error("missing/ambiguous successful software producer") end' "$work/jobs.json")
 [[ $job =~ ^[1-9][0-9]*$ ]]
 gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?per_page=100" >"$work/artifacts.json"
-artifact=$(jq -er --arg name "research-image-release-$source_sha" --arg sha "$source_sha" --argjson run "$run" '
+artifact=$(jq -er --arg name "research-image-release-$source_sha-$product" --arg sha "$source_sha" --argjson run "$run" '
   [.[].artifacts[]?|select(.name==$name)] | if length==1 and (.[0]|.expired==false and .workflow_run.id==$run and .workflow_run.head_sha==$sha and .size_in_bytes>0 and .size_in_bytes<=1073741824)
   then .[0].id else error("missing/expired/ambiguous release artifact") end' "$work/artifacts.json")
 [[ $artifact =~ ^[1-9][0-9]*$ ]]
@@ -36,8 +37,8 @@ diff -u "$work/expected" "$work/entries"
 # ZIP transport changes modes to 0644. The fixed tar preserves executable modes.
 unzip -p "$work/release.zip" research-image-release.tar | head -c 1073774593 >"$work/research-image-release.tar"
 test "$(wc -c <"$work/research-image-release.tar")" -le 1073774592
-ruby "$root/.github/scripts/research-release-bundle.rb" unpack "$work/research-image-release.tar" "$release"
-"$root/.github/scripts/research-image-release-artifact.sh" verify "$release" "$source_sha" "$run" "$root/rust_hft" "$attempt" "$job"
+ruby "$root/.github/scripts/research-release-bundle.rb" unpack "$work/research-image-release.tar" "$release" "$product"
+"$root/.github/scripts/research-image-release-artifact.sh" verify "$release" "$source_sha" "$run" "$root/rust_hft" "$attempt" "$job" "$product"
 # Fail closed if the producer was rerun or changed while we downloaded bytes.
 gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" >"$work/reread.json"
 jq -e --slurpfile before "$work/run.json" '.id==$before[0].id and .run_attempt==$before[0].run_attempt and .head_sha==$before[0].head_sha and .head_repository.full_name==$before[0].head_repository.full_name and .path==$before[0].path and .event==$before[0].event' "$work/reread.json" >/dev/null

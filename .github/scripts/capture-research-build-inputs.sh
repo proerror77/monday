@@ -32,6 +32,8 @@ while IFS= read -r manifest; do
 done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
 cat "$root/.github/scripts/build-research-release.sh" \
+  "$root/.github/scripts/research-release-products.sh" \
+  "$root/.github/scripts/research-release-products.json" \
   "$root/.github/scripts/research-release-source-sha.sh" \
   "$root/.github/scripts/research-workspace-locks.sh" \
   "$root/.github/scripts/verify-research-runtime-abi.sh" \
