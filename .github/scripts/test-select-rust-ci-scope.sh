@@ -263,6 +263,20 @@ for helper in verify-research-controller-image.sh test-research-controller-image
     assert_flag "$helper_scope" toolchain false
   done
 done
+# Controller assets retain their operational contracts when selecting only the
+# controller image. Every copied script and template must exercise this boundary.
+for asset in scripts/campaign-cycle-controller.sh scripts/campaign-job-watch.sh scripts/cex-materialization-entrypoint.sh k8s/campaign-cycle-controller-job.example.yaml; do
+  printf '%s\n' "deployment/aliyun/research/$asset" >"$tmp_dir/controller-asset.txt"
+  for event in pull_request push; do
+    asset_scope=$(run_case "controller-asset-$event" "$event" controller-asset.txt)
+    expected='ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans,ci/deployment-artifacts'
+    [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+    assert_jobs "$asset_scope" "$expected"
+    assert_flag "$asset_scope" control true
+    grep -qx 'research_product=controller' "$asset_scope"
+    assert_flag "$asset_scope" toolchain false
+  done
+done
 # Adding an infrastructure helper to real Rust work must preserve the same
 # source-graph suites; the cheap path is not a short circuit for mixed changes.
 printf '%s\n' .github/scripts/wait-ack-research-receipt.sh >"$tmp_dir/ack-with-collector.txt"
