@@ -58,6 +58,7 @@ abort 'cross-run source readback missing' unless acr.fetch('jobs').fetch('publis
 abort 'release relationship changed' unless acr.fetch('jobs').fetch('research-release-complete').fetch('needs') == ['selector','publish']
 RUBY
 bash "$script_dir/test-research-runtime-abi.sh"
+bash "$script_dir/test-research-checkout-ownership.sh"
 # Preserve authenticated exact-source native three-workflow admission.
 grep -Fq 'Read authenticated release admission' "$workflow"
 grep -Fq '.github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID"' "$workflow"

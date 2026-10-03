@@ -27,6 +27,7 @@ for config in "$root/.cargo/config.toml" "$root/rust_hft/.cargo/config.toml" "$r
 done
 cat "$root/rust_hft/Cargo.toml" "$root/rust_hft/prediction-markets/Cargo.toml" >"$work/profiles"
 cat "$root/.github/scripts/build-research-release.sh" \
+  "$root/.github/scripts/research-release-source-sha.sh" \
   "$root/.github/scripts/verify-research-runtime-abi.sh" \
   "$root/.github/scripts/verify-research-runner-binaries.sh" >"$work/recipe"
 jq -S -n --arg compiler "$(sha256sum "$work/compiler" | awk '{print $1}')" \

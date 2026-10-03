@@ -3,7 +3,7 @@
 # Campaign. Release admission and authorized deployment remain separate.
 set -euo pipefail
 cd "$(dirname "$0")/../../rust_hft"
-source_sha=$(git rev-parse HEAD)
+source_sha=$(../.github/scripts/research-release-source-sha.sh)
 export MONDAY_RELEASE_JOB_ID
 MONDAY_RELEASE_JOB_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '.jobs|map(select(.name=="Research image binaries" or .name=="Research release binaries"))|if length==1 then .[0].id else error("ambiguous release producer") end')
 export MONDAY_SOURCE_REVISION=$source_sha
