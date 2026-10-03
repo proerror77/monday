@@ -33,7 +33,7 @@ WITH anchors AS (
   -- ASOF ties are collapsed deterministically before joining. MergeTree ORDER
   -- BY is not a uniqueness guarantee and cannot choose a label tie for us.
   SELECT segment,event_ns,
-         argMin(n.available_ns,tuple(n.available_ns,n.ordinal,n.source_sha256)) AS available_ns,
+         argMin(n.available_ns,tuple(n.available_ns,n.ordinal,n.source_sha256)) AS target_available_ns,
          argMin((n.bids_price[1]+n.asks_price[1])/2,tuple(n.available_ns,n.ordinal,n.source_sha256)) AS target_mid
   FROM research.normalized_books n
   WHERE venue={venue:String} AND instrument={instrument:String} AND market={market:String}
@@ -43,10 +43,10 @@ WITH anchors AS (
   GROUP BY segment,event_ns
   ORDER BY segment,event_ns
 )
-SELECT a.view_id,a.segment,a.ordinal,a.horizon_ns,f.event_ns,f.available_ns,
+SELECT a.view_id,a.segment,a.ordinal,a.horizon_ns,f.event_ns,f.target_available_ns,
        f.target_mid/a.anchor_mid-1
 FROM anchors a ASOF INNER JOIN future f
  ON a.segment=f.segment AND a.available_ns+a.horizon_ns <= f.event_ns
 WHERE f.event_ns <= a.available_ns+a.horizon_ns+{label_tolerance_ns:Int64}
-  AND f.available_ns >= f.event_ns
+  AND f.target_available_ns >= f.event_ns
 ORDER BY a.segment,a.ordinal,a.horizon_ns;
