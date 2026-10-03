@@ -25,4 +25,4 @@ for binary in monday-prediction-research monday-prediction-evaluator monday-pred
   install -m 0755 "prediction-markets/target/release/$binary" "$release/research-bin/$binary"
 done
 ../.github/scripts/research-image-release-artifact.sh create "$release" "$source_sha" "$GITHUB_RUN_ID" .
-python3 ../.github/scripts/research-release-bundle.py pack "${RUNNER_TEMP}/research-image-release.tar" "$release"
+ruby ../.github/scripts/research-release-bundle.rb pack "${RUNNER_TEMP}/research-image-release.tar" "$release"

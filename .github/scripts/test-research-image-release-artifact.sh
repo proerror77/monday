@@ -170,28 +170,40 @@ if "$artifact" verify "$tmp_dir/flattened" "$main_sha" 1234 "$repo" >"$tmp_dir/m
   echo 'flattened executable modes unexpectedly verified' >&2; exit 1
 fi
 grep -Fq 'executable mode lost: hft-backtest' "$tmp_dir/mode-error"
-python3 "$script_dir/research-release-bundle.py" pack "$tmp_dir/research-image-release.tar" "$release"
+ruby "$script_dir/research-release-bundle.rb" pack "$tmp_dir/research-image-release.tar" "$release"
 chmod 0644 "$tmp_dir/research-image-release.tar"
-python3 "$script_dir/research-release-bundle.py" unpack "$tmp_dir/research-image-release.tar" "$tmp_dir/roundtrip"
+ruby "$script_dir/research-release-bundle.rb" unpack "$tmp_dir/research-image-release.tar" "$tmp_dir/roundtrip"
 "$artifact" verify "$tmp_dir/roundtrip" "$main_sha" 1234 "$repo"
-BUNDLE_SCRIPT="$script_dir/research-release-bundle.py" python3 - "$tmp_dir/research-image-release.tar" "$tmp_dir" <<'PYTEST'
-import pathlib, subprocess, sys, tarfile
-source, root = sys.argv[1], pathlib.Path(sys.argv[2])
-for kind in ("link", "path", "duplicate", "mode"):
-    bad = root / (kind + ".tar")
-    with tarfile.open(source) as original, tarfile.open(bad, "w") as output:
-        for i, member in enumerate(original.getmembers()):
-            stream = original.extractfile(member)
-            if i == 1:
-                if kind == "link": member.type, member.linkname = tarfile.SYMTYPE, "/tmp/escape"
-                if kind == "path": member.name = "../escape"
-                if kind == "duplicate": member.name = "research-image-release.json"
-                if kind == "mode": member.mode = 0o777
-            output.addfile(member, stream if member.isreg() else None)
-    result = subprocess.run([sys.executable, str(pathlib.Path(__import__("os").environ["BUNDLE_SCRIPT"])), "unpack", str(bad), str(root / (kind + "-out"))], capture_output=True)
-    if result.returncode == 0 or b"research release bundle rejected" not in result.stderr:
-        raise SystemExit("unsafe tar accepted: " + kind)
-PYTEST
+BUNDLE_SCRIPT="$script_dir/research-release-bundle.rb" ruby -ropen3 -rrubygems/package - "$tmp_dir/research-image-release.tar" "$tmp_dir" <<'RUBYTEST'
+source, root = ARGV
+members = []
+File.open(source, 'rb') do |file|
+  Gem::Package::TarReader.new(file) do |reader|
+    reader.each { |entry| members << [entry.full_name, entry.header.mode, entry.read] }
+  end
+end
+%w[link path duplicate mode].each do |kind|
+  bad = File.join(root, "#{kind}.tar")
+  File.open(bad, 'wb') do |file|
+    Gem::Package::TarWriter.new(file) do |output|
+      members.each_with_index do |(name, mode, bytes), index|
+        if index == 1
+          if kind == 'link'
+            output.add_symlink(name, '/tmp/escape', mode)
+            next
+          end
+          name = '../escape' if kind == 'path'
+          name = 'research-image-release.json' if kind == 'duplicate'
+          mode = 0o777 if kind == 'mode'
+        end
+        output.add_file_simple(name, mode, bytes.bytesize) { |entry| entry.write(bytes) }
+      end
+    end
+  end
+  _out, error, status = Open3.capture3('ruby', ENV.fetch('BUNDLE_SCRIPT'), 'unpack', bad, File.join(root, "#{kind}-out"))
+  abort "unsafe tar accepted: #{kind}" if status.success? || !error.include?('research release bundle rejected')
+end
+RUBYTEST
 
 assert_rejected() {
   local name=$1 expected_sha=${2:-$main_sha} expected_run=${3:-1234}

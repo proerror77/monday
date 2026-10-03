@@ -358,7 +358,7 @@ for path in "${paths[@]}"; do
       select_job ploy/workflow-lint
       continue
       ;;
-    .github/scripts/research-release-bundle.py|.github/scripts/build-research-release.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
+    .github/scripts/research-release-bundle.rb|.github/scripts/build-research-release.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
       select_research_image_jobs
       select_job ci/ci-contracts
       select_job ploy/workflow-lint

@@ -263,7 +263,7 @@ jobs:
       - name: Smoke the same release binaries without network
         working-directory: .
         run: |
-          python3 .github/scripts/research-release-bundle.py unpack "${RUNNER_TEMP}/research-release-download/research-image-release.tar" "${RUNNER_TEMP}/research-release"
+          ruby .github/scripts/research-release-bundle.rb unpack "${RUNNER_TEMP}/research-release-download/research-image-release.tar" "${RUNNER_TEMP}/research-release"
           bash .github/scripts/research-image-smoke.sh "${RUNNER_TEMP}/research-release"
 
   rust-format:

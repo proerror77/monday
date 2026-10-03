@@ -36,7 +36,7 @@ diff -u "$work/expected" "$work/entries"
 # ZIP transport changes modes to 0644. The fixed tar preserves executable modes.
 unzip -p "$work/release.zip" research-image-release.tar | head -c 1073774593 >"$work/research-image-release.tar"
 test "$(wc -c <"$work/research-image-release.tar")" -le 1073774592
-python3 "$root/.github/scripts/research-release-bundle.py" unpack "$work/research-image-release.tar" "$release"
+ruby "$root/.github/scripts/research-release-bundle.rb" unpack "$work/research-image-release.tar" "$release"
 "$root/.github/scripts/research-image-release-artifact.sh" verify "$release" "$source_sha" "$run" "$root/rust_hft" "$attempt" "$job"
 # Fail closed if the producer was rerun or changed while we downloaded bytes.
 gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" >"$work/reread.json"
