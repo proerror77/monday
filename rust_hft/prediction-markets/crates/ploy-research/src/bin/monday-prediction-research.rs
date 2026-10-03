@@ -410,6 +410,16 @@ fn terminate_evaluator_group(child: &mut Child) -> Option<std::process::ExitStat
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.as_slice() == ["--help"] || args.as_slice() == ["-h"] {
+        println!(
+            "monday-prediction-research: admitted prediction research\n\
+          --print-policy-snapshot-id\n\
+          --explore-trades <history-dir> <manifest-sha256>\n\
+          --pipeline-smoke <mission.json> <snapshot-dir> <output-dir> <admitted identity flags>\n\
+          --research-trial <mission.json> <snapshot-dir> <output-dir> <admitted identity flags>"
+        );
+        return;
+    }
     if let [mode, directory, manifest_sha256] = args.as_slice() {
         if mode == "--explore-trades" {
             let result = ploy_research::polymarket_history::explore_historical_trades(
