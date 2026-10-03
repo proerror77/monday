@@ -4026,13 +4026,15 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let started = Instant::now();
-            let mut last_request_at = None::<Instant>;
             let mut trade_requests = 0_u64;
-            while started.elapsed() < Duration::from_secs(10)
-                && last_request_at.is_none_or(|at| at.elapsed() < Duration::from_millis(500))
-            {
+            while started.elapsed() < Duration::from_secs(30) {
+                match finished_rx.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
                 let (mut connection, _) = match listener.accept() {
                     Ok(accepted) => accepted,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4050,7 +4052,6 @@ mod tests {
                 } else {
                     panic!("unexpected test request: {path}");
                 };
-                last_request_at = Some(Instant::now());
                 write!(
                     connection,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -4067,6 +4068,9 @@ mod tests {
         let config = ReferenceConfig {
             spool_dir: temp.path().to_owned(),
             symbols: vec!["BTCUSDT".to_owned()],
+            // Keep a legitimate request gap longer than the old 500ms
+            // mock-server idle cutoff, even on an otherwise idle worker.
+            per_market_delay: Duration::from_millis(750),
             ..ReferenceConfig::default()
         };
         let mut collector = ReferenceCollector::new(config).unwrap();
@@ -4078,11 +4082,11 @@ mod tests {
         };
         collector.clock = Box::new(move || now);
 
-        let health = collector
-            .collect_once()
-            .await
-            .expect("API offset limit must defer the market, not fail the cycle");
+        let result = collector.collect_once().await;
+        // Client completion, rather than JSON parsing speed, ends the server.
+        let _ = finished_tx.send(());
         let trade_requests = server.join().unwrap();
+        let health = result.expect("API offset limit must defer the market, not fail the cycle");
 
         assert_eq!(
             trade_requests, 2,
