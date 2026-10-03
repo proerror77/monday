@@ -225,6 +225,7 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" clang cmake mold pkg-config protobuf-compiler
       - name: Capture compiler, native environment and scoped recipe
         id: build-inputs
+        working-directory: .
         run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json"
       - uses: Swatinem/rust-cache@v2
         with:

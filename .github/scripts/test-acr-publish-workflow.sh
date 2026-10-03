@@ -37,9 +37,18 @@ end
 fast=ci.fetch('jobs').fetch('rust_fast_gates')
 abort 'static Fast dispatches compute' if fast.to_s.include?('wait-ack') || fast.to_s.include?('ack_research')
 abort 'static Fast compiles research' if fast.to_s.match?(/\bcargo\s+(build|test|check|clippy)\b/)
-[ploy.fetch('jobs').fetch('research-image-binaries'),acr.fetch('jobs').fetch('research-runner-binaries')].each do |job|
+repo_root = File.expand_path('../..', File.dirname(ARGV[0]))
+[[ploy,'research-image-binaries'],[acr,'research-runner-binaries']].each do |doc,id|
+  job = doc.fetch('jobs').fetch(id)
   abort 'release compiles whole workspace' if job.to_s.include?('--workspace') || job.to_s.include?('--all-features')
   abort 'release lost bounded native builder' unless job.fetch('steps').any? { |s|s.fetch('run','').include?('build-research-release.sh') }
+  job.fetch('steps').each do |step|
+    cwd = step['working-directory'] || job.dig('defaults','run','working-directory') || doc.dig('defaults','run','working-directory') || '.'
+    step.fetch('run','').scan(/^\s*(?:bash\s+)?((?:\.\.\/)*\.github\/scripts\/[a-zA-Z0-9._-]+\.sh)\b/).flatten.each do |script|
+      path = File.expand_path(script, File.expand_path(cwd, repo_root))
+      abort "native producer script missing in effective working directory: #{id} #{cwd} #{script}" unless File.file?(path)
+    end
+  end
 end
 abort 'cross-run source readback missing' unless acr.fetch('jobs').fetch('publish').fetch('steps').any? { |s|s.fetch('run','').include?('download-research-release.sh') }
 abort 'release relationship changed' unless acr.fetch('jobs').fetch('research-release-complete').fetch('needs') == ['selector','publish']

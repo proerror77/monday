@@ -19,7 +19,14 @@ File.write("#{work}/url", "#{endpoint}/?#{URI.encode_www_form(params)}")
   end
 end
 RUBY
-query() { curl --fail --silent --show-error --max-time 30 --user "fixture:${MONDAY_TEST_CH_PASSWORD:?}" --data-binary @- "$(cat "$work/url")"; }
+query() {
+  local status=0
+  curl --fail-with-body --silent --show-error --max-time 30 \
+    --user "fixture:${MONDAY_TEST_CH_PASSWORD:?}" --data-binary @- \
+    --output "$work/response" "$(cat "$work/url")" || status=$?
+  if ((status != 0)); then cat "$work/response" >&2; return "$status"; fi
+  cat "$work/response"
+}
 for file in "$work"/clickhouse-*.sql; do query <"$file" >/dev/null; done
 source_sha=$(printf a%.0s {1..64})
 cat <<SQL | query >/dev/null
