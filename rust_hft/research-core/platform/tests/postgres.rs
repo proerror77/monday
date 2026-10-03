@@ -118,7 +118,8 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     };
     let experiment_sha = ledger.register_experiment("fixture", &experiment).await?;
     let build = hft_research_platform::build::BuildSpec {
-        schema: 1,
+        schema: 2,
+        workspace_manifest: "research-core/Cargo.toml".into(),
         code_commit: "a".repeat(40),
         source_manifest_sha256: spec.source_sha256.clone(),
         cargo_lock_sha256: hash('a'),

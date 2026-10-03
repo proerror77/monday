@@ -7,7 +7,7 @@ ruby -ryaml -e '
   abort "research resource prerequisite remains" if jobs.key?("research_preflight") || rust.to_s.include?("wait-ack")
   collector=rust.fetch("steps").find{|s|s["id"]=="collector"}.fetch("run")
   abort "missing exact nonignored-test check" unless collector.include?("check-collector-test-presence.sh")
-  abort "missing full owning suite" unless collector.include?("cargo test -p hft-collector --features collector-binance --locked")
+  abort "missing full owning suite" unless collector.include?("cargo-scoped.sh\" test -p hft-collector --features collector-binance --locked")
   abort "missing full aggregate edge" unless jobs.fetch("ci-gate").fetch("needs").include?("rust")
 '
 for result in success skipped failure cancelled; do

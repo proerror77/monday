@@ -17,6 +17,7 @@ clippy_loop=true
 clippy_handoff=false
 owning_packages=,,
 loop_packages=,alpha-harness,
+focused_packages=,,
 SCOPE
 jq -n --argjson scope "$(ci_expected_scope "$work/scope")" '{schema:"monday.ci_rust_evidence.v1",scope:$scope,stages:[{stage:"loop",outcome:"success"},{stage:"clippy_loop",outcome:"success"}],checkout_sha:("c"*40),command_sha256:("d"*64),repository:"proerror77/monday",source_repository:"proerror77/monday",event:"pull_request",head_sha:("a"*40),base_sha:("b"*40),run_id:"123",run_attempt:3,job_id:789}' >"$work/receipt"
 jq -n '{pull_request:{number:42,head:{sha:("a"*40),repo:{full_name:"proerror77/monday"}},base:{sha:("b"*40)}}}' >"$work/event"

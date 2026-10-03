@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd "$script_dir/../.." && pwd)
 selector="$script_dir/select-acr-publish-source.sh"
 check_reader="$script_dir/read-release-required-checks.sh"
 artifact="$script_dir/research-image-release-artifact.sh"
@@ -157,8 +158,14 @@ for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tap
   chmod 0755 "$release/research-bin/$binary"
 done
 
+cp "$root/rust_hft/workspaces.json" "$repo/workspaces.json"
+while IFS= read -r manifest; do
+  directory=${manifest%/Cargo.toml}; mkdir -p "$repo/$directory"
+  cp "$root/rust_hft/$directory/Cargo.lock" "$repo/$directory/Cargo.lock"
+done < <(jq -r '.workspaces[].manifest' "$repo/workspaces.json")
 export MONDAY_BUILD_INPUTS_FILE="$tmp_dir/build-inputs.json"
-jq -n --arg h "$(printf a%.0s {1..64})" --arg root "$(sha256sum "$repo/Cargo.lock" | awk '{print $1}')" --arg prediction "$(sha256sum "$repo/prediction-markets/Cargo.lock" | awk '{print $1}')" '{schema:"monday.compilation-inputs.v1",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:{root:$root,prediction:$prediction}}' >"$MONDAY_BUILD_INPUTS_FILE"
+locks=$("$root/.github/scripts/research-workspace-locks.sh" "$repo")
+jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" '{schema:"monday.compilation-inputs.v2",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks}' >"$MONDAY_BUILD_INPUTS_FILE"
 "$artifact" create "$release" "$main_sha" 1234 "$repo"
 "$artifact" verify "$release" "$main_sha" 1234 "$repo"
 
@@ -226,7 +233,7 @@ assert_rejected extra
 assert_rejected digest
 assert_rejected source-mismatch "$other_sha"
 assert_rejected run-mismatch "$main_sha" 9999
-printf 'changed lock\n' >>"$repo/Cargo.lock"
+printf 'changed lock\n' >>"$repo/research-core/platform/Cargo.lock"
 assert_rejected lock-mismatch
 
 printf 'research image release artifact tests passed\n'

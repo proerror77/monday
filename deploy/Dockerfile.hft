@@ -19,7 +19,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 複製 workspace 配置
-COPY rust_hft/Cargo.toml rust_hft/Cargo.lock ./
 COPY rust_hft/ ./
 
 # 構建參數
@@ -28,7 +27,7 @@ ARG TARGET=live
 # 構建指定的目標
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo --config 'build.rustc-wrapper=""' build --release --locked -p hft-${TARGET} && \
+    CARGO_TARGET_DIR=/app/target ./scripts/cargo-scoped.sh build --release --locked -p hft-${TARGET} && \
     cp /app/target/release/hft-${TARGET} /app/hft-binary
 
 # ============================================

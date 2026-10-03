@@ -45,16 +45,29 @@ Do not create root-level `common`, `shared`, `utils`, `misc`, `new`, or
 exchange-branded product trees. A new root requires an architecture change that
 names its interface, callers, invariants, failure modes, and owner.
 
-## Transitional build seam
+## Cargo build boundaries
 
-`rust_hft/prediction-markets` temporarily keeps its own Cargo workspace and
-explicit Rust 1.98.1 toolchain so the imported code remains independently
-verifiable during migration.
-That build separation does not grant product or execution authority. Existing
-`ploy-*` package names are compatibility identifiers; new packages use functional
-Monday names, and every migrated implementation deletes its superseded copy.
-Legacy order/risk/reconciliation contracts inside that workspace are explicit
-migration debt: they may only shrink and cannot gain a concrete venue Adapter.
+`rust_hft/workspaces.json` registers six functional Cargo workspaces. Each owns a
+lockfile and resolves features independently with Rust 1.98.1 and resolver 2.
+Source paths remain stable. Each package declares exactly one workspace owner.
+
+| Workspace manifest below `rust_hft` | Responsibility |
+| --- | --- |
+| `shared/Cargo.toml` | Shared market, governance, configuration, and research contracts |
+| `data-pipelines/Cargo.toml` | Protocols, adapters, acquisition tools, and the independent market conversion/import pipeline |
+| `research-core/Cargo.toml` | Scientific search, training, backtest, and Alpha harness |
+| `research-core/platform/Cargo.toml` | Thin PG/CH research control and compute lifecycle |
+| `runtime/Cargo.toml` | Live composition, strategy runtime, risk, OMS, execution, and runtime infrastructure |
+| `prediction-markets/Cargo.toml` | Existing event-settlement research and operator tooling |
+
+Use the owning manifest for feature matrices. `scripts/cargo-scoped.sh` routes
+explicit package lists to their owners. No default command builds all workspaces.
+Cross-domain path dependencies and their contract tests remain explicit.
+
+The build boundary does not grant product or execution authority. Existing
+`ploy-*` names remain compatibility identifiers. New packages use functional
+Monday names. Legacy prediction risk and execution contracts remain migration
+debt; they cannot gain another concrete venue adapter.
 
 ## Enforced invariants
 

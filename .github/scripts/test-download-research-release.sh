@@ -14,7 +14,8 @@ for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tap
   chmod 0755 "$work/release/research-bin/$binary"
 done
 export MONDAY_BUILD_INPUTS_FILE="$work/build-inputs.json"
-jq -n --arg h "$(printf a%.0s {1..64})" --arg root "$(sha256sum "$root/rust_hft/Cargo.lock" | awk '{print $1}')" --arg prediction "$(sha256sum "$root/rust_hft/prediction-markets/Cargo.lock" | awk '{print $1}')" '{schema:"monday.compilation-inputs.v1",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:{root:$root,prediction:$prediction}}' >"$MONDAY_BUILD_INPUTS_FILE"
+locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
+jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" '{schema:"monday.compilation-inputs.v2",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks}' >"$MONDAY_BUILD_INPUTS_FILE"
 "$root/.github/scripts/research-image-release-artifact.sh" create "$work/release" "$source_sha" 1234 "$root/rust_hft"
 ruby "$root/.github/scripts/research-release-bundle.rb" pack "$work/research-image-release.tar" "$work/release"
 (cd "$work" && zip -q "$work/release.zip" research-image-release.tar)

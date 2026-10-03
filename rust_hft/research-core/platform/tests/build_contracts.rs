@@ -10,7 +10,8 @@ fn hash(c: char) -> String {
 }
 fn artifact() -> BuildArtifact {
     let build = BuildSpec {
-        schema: 1,
+        schema: 2,
+        workspace_manifest: "research-core/Cargo.toml".into(),
         code_commit: "a".repeat(40),
         source_manifest_sha256: hash('a'),
         cargo_lock_sha256: hash('b'),
@@ -124,6 +125,11 @@ fn compiler_inputs_invalidate_build_and_cache_never_proves_executable_bytes() {
     let variants = [
         {
             let mut b = artifact.build.clone();
+            b.workspace_manifest = "data-pipelines/Cargo.toml".into();
+            b
+        },
+        {
+            let mut b = artifact.build.clone();
             b.code_commit = "b".repeat(40);
             b
         },
@@ -156,6 +162,14 @@ fn compiler_inputs_invalidate_build_and_cache_never_proves_executable_bytes() {
     for changed in variants {
         assert_ne!(base, changed.id().unwrap());
     }
+    let args = artifact.build.cargo_arguments().unwrap();
+    assert_eq!(
+        &args[1..3],
+        &["--manifest-path", "research-core/Cargo.toml"]
+    );
+    let mut invalid = artifact.build.clone();
+    invalid.workspace_manifest = "../untrusted/Cargo.toml".into();
+    assert!(invalid.cargo_arguments().is_err());
     assert!(artifact
         .verify_bytes(|_| anyhow::bail!("missing executable"))
         .is_err());

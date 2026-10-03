@@ -73,12 +73,17 @@ struct ReplaySequenceDiff {
     session_id: String,
     diff: ReplayDepthDiff,
     received_at_ns: u64,
+    clock: ReplayClock,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReplayDepthDiff {
     #[serde(rename = "s")]
     symbol: String,
+    #[serde(rename = "E", default)]
+    event_time_ms: Option<u64>,
+    #[serde(rename = "T", default)]
+    transaction_time_ms: Option<u64>,
     #[serde(rename = "U")]
     first_update_id: u64,
     #[serde(rename = "u")]
@@ -91,15 +96,38 @@ struct ReplayDepthDiff {
     asks: Vec<[String; 2]>,
 }
 
+/// Source location belongs to the sealed raw object, not to an experiment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRowIdentity {
+    pub content_sha256: String,
+    pub row: u64,
+}
+
+/// Retain venue clocks and sequence IDs before replay availability adjustment.
+/// A REST/checkpoint seed has no fabricated exchange event timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayClock {
+    pub raw_received_at_ns: u64,
+    pub exchange_event_time_ms: Option<u64>,
+    pub transaction_time_ms: Option<u64>,
+    pub first_update_id: Option<u64>,
+    pub final_update_id: u64,
+    pub previous_update_id: Option<u64>,
+    pub checkpoint_seed: bool,
+    pub source: Option<SourceRowIdentity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplaySequenceEvent {
     Snapshot {
         received_at_ns: u64,
+        clock: Option<ReplayClock>,
         bids: Vec<[String; 2]>,
         asks: Vec<[String; 2]>,
     },
     Diff {
         received_at_ns: u64,
+        clock: Option<ReplayClock>,
         bids: Vec<[String; 2]>,
         asks: Vec<[String; 2]>,
     },
@@ -132,7 +160,7 @@ impl ReplaySequenceValidator {
         raw: &serde_json::Map<String, Value>,
         received_at_ns: u64,
     ) -> Result<Vec<ReplaySequenceEvent>> {
-        self.observe_inner(event_type, raw, received_at_ns, false)
+        self.observe_inner(event_type, raw, received_at_ns, false, None)
     }
 
     pub fn observe_verified_stream_coverage_checkpoint(
@@ -143,7 +171,25 @@ impl ReplaySequenceValidator {
         if raw.get("stream_coverage_verified").and_then(Value::as_bool) != Some(true) {
             anyhow::bail!("checkpoint has no verified stream coverage");
         }
-        self.observe_inner("checkpoint", raw, received_at_ns, true)
+        self.observe_inner("checkpoint", raw, received_at_ns, true, None)
+    }
+
+    /// Called by the artifact verifier after source hash and row identity checks.
+    pub fn observe_source_row(
+        &mut self,
+        event_type: &str,
+        raw: &serde_json::Map<String, Value>,
+        received_at_ns: u64,
+        verified_checkpoint: bool,
+        source: SourceRowIdentity,
+    ) -> Result<Vec<ReplaySequenceEvent>> {
+        self.observe_inner(
+            event_type,
+            raw,
+            received_at_ns,
+            verified_checkpoint,
+            Some(source),
+        )
     }
 
     fn observe_inner(
@@ -152,6 +198,7 @@ impl ReplaySequenceValidator {
         raw: &serde_json::Map<String, Value>,
         received_at_ns: u64,
         allow_verified_static_checkpoint: bool,
+        source: Option<SourceRowIdentity>,
     ) -> Result<Vec<ReplaySequenceEvent>> {
         let mut events = Vec::new();
         match event_type {
@@ -180,6 +227,20 @@ impl ReplaySequenceValidator {
                 });
                 events.push(ReplaySequenceEvent::Snapshot {
                     received_at_ns,
+                    clock: Some(ReplayClock {
+                        raw_received_at_ns: received_at_ns,
+                        exchange_event_time_ms: None,
+                        transaction_time_ms: None,
+                        first_update_id: None,
+                        final_update_id: self
+                            .state
+                            .as_ref()
+                            .expect("snapshot initialized")
+                            .last_update_id,
+                        previous_update_id: None,
+                        checkpoint_seed: false,
+                        source,
+                    }),
                     bids: parse_replay_levels(snapshot.get("bids"), "snapshot bids")?,
                     asks: parse_replay_levels(snapshot.get("asks"), "snapshot asks")?,
                 });
@@ -188,6 +249,7 @@ impl ReplaySequenceValidator {
                     if self.apply_diff(&pending)? {
                         events.push(ReplaySequenceEvent::Diff {
                             received_at_ns: effective_time,
+                            clock: Some(pending.clock),
                             bids: pending.diff.bids,
                             asks: pending.diff.asks,
                         });
@@ -204,6 +266,16 @@ impl ReplaySequenceValidator {
                 }
                 let diff = ReplaySequenceDiff {
                     session_id: required_string(raw, "session_id")?.to_string(),
+                    clock: ReplayClock {
+                        raw_received_at_ns: received_at_ns,
+                        exchange_event_time_ms: diff.event_time_ms,
+                        transaction_time_ms: diff.transaction_time_ms,
+                        first_update_id: Some(diff.first_update_id),
+                        final_update_id: diff.final_update_id,
+                        previous_update_id: diff.previous_update_id,
+                        checkpoint_seed: false,
+                        source,
+                    },
                     diff,
                     received_at_ns,
                 };
@@ -224,6 +296,7 @@ impl ReplaySequenceValidator {
                 } else if self.apply_diff(&diff)? {
                     events.push(ReplaySequenceEvent::Diff {
                         received_at_ns,
+                        clock: Some(diff.clock),
                         bids: diff.diff.bids,
                         asks: diff.diff.asks,
                     });
@@ -255,14 +328,14 @@ impl ReplaySequenceValidator {
                     }
                     None => {
                         self.state = Some(checkpoint);
-                        events.push(replay_checkpoint_seed(raw, received_at_ns)?);
+                        events.push(replay_checkpoint_seed(raw, received_at_ns, source)?);
                     }
                     Some(state) if state.session_id != checkpoint.session_id => {
                         if !state.continuity_complete {
                             anyhow::bail!("checkpoint replaced an unbridged replay series");
                         }
                         self.state = Some(checkpoint);
-                        events.push(replay_checkpoint_seed(raw, received_at_ns)?);
+                        events.push(replay_checkpoint_seed(raw, received_at_ns, source)?);
                     }
                     Some(state)
                         if allow_verified_static_checkpoint
@@ -383,9 +456,23 @@ impl ReplayDepthDiff {
 fn replay_checkpoint_seed(
     raw: &serde_json::Map<String, Value>,
     received_at_ns: u64,
+    source: Option<SourceRowIdentity>,
 ) -> Result<ReplaySequenceEvent> {
     Ok(ReplaySequenceEvent::Snapshot {
         received_at_ns,
+        clock: Some(ReplayClock {
+            raw_received_at_ns: received_at_ns,
+            exchange_event_time_ms: None,
+            transaction_time_ms: None,
+            first_update_id: None,
+            final_update_id: raw
+                .get("last_update_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("checkpoint has no last update id"))?,
+            previous_update_id: None,
+            checkpoint_seed: true,
+            source,
+        }),
         bids: parse_replay_levels(raw.get("bids"), "checkpoint bids")?,
         asks: parse_replay_levels(raw.get("asks"), "checkpoint asks")?,
     })
@@ -459,6 +546,65 @@ mod tests {
     use serde_json::json;
 
     use super::{Market, ReplayBookSnapshot, ReplaySequenceEvent, ReplaySequenceValidator};
+
+    #[test]
+    fn buffered_delta_keeps_original_clock_sequence_and_source_row() {
+        use super::SourceRowIdentity;
+        let mut replay = ReplaySequenceValidator::new(Market::Spot, "BTCUSDT").unwrap();
+        let delta = json!({"session_id":"session-1","frame":{"data":{
+            "s":"BTCUSDT","E":7,"U":101,"u":101,"b":[["100","2"]],"a":[]}}});
+        let source = SourceRowIdentity {
+            content_sha256: "a".repeat(64),
+            row: 3,
+        };
+        assert!(replay
+            .observe_source_row(
+                "diff",
+                delta.as_object().unwrap(),
+                8_000_000,
+                false,
+                source.clone()
+            )
+            .unwrap()
+            .is_empty());
+        let snapshot = json!({"symbol":"BTCUSDT","session_id":"session-1",
+            "snapshot":{"lastUpdateId":100,"bids":[["100","1"]],"asks":[["101","1"]]}});
+        let rows = replay
+            .observe_source_row(
+                "snapshot",
+                snapshot.as_object().unwrap(),
+                10_000_000,
+                false,
+                SourceRowIdentity {
+                    content_sha256: "b".repeat(64),
+                    row: 4,
+                },
+            )
+            .unwrap();
+        let ReplaySequenceEvent::Snapshot {
+            clock: Some(seed), ..
+        } = &rows[0]
+        else {
+            panic!("seed missing")
+        };
+        assert_eq!(seed.exchange_event_time_ms, None);
+        assert_eq!(seed.final_update_id, 100);
+        let ReplaySequenceEvent::Diff {
+            received_at_ns,
+            clock: Some(clock),
+            ..
+        } = &rows[1]
+        else {
+            panic!("delta missing")
+        };
+        assert_eq!(*received_at_ns, 10_000_000);
+        assert_eq!(clock.raw_received_at_ns, 8_000_000);
+        assert_eq!(clock.exchange_event_time_ms, Some(7));
+        assert_eq!(clock.first_update_id, Some(101));
+        assert_eq!(clock.final_update_id, 101);
+        assert_eq!(clock.source.as_ref(), Some(&source));
+        replay.finish().unwrap();
+    }
 
     #[test]
     fn replay_requires_a_bridged_sequence_before_completion() {

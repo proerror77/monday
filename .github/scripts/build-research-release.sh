@@ -7,12 +7,13 @@ source_sha=$(../.github/scripts/research-release-source-sha.sh)
 export MONDAY_RELEASE_JOB_ID
 MONDAY_RELEASE_JOB_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '.jobs|map(select(.name=="Research image binaries" or .name=="Research release binaries"))|if length==1 then .[0].id else error("ambiguous release producer") end')
 export MONDAY_SOURCE_REVISION=$source_sha
-cargo build --release --locked -p hft-backtest -p alpha-harness
-cargo build --release --locked -p hft-collector \
+export CARGO_TARGET_DIR="$PWD/target"
+cargo build --manifest-path research-core/Cargo.toml --release --locked -p hft-backtest -p alpha-harness
+cargo build --manifest-path data-pipelines/Cargo.toml --release --locked -p hft-collector \
   --bin lob-pit-materializer --bin binance-market-tape-slicer \
   --bin binance-replay-parquet-materializer --bin clickhouse-analytics-materializer
-cargo build --release --locked -p hft-research-platform --features control --bins
-cargo build --manifest-path prediction-markets/Cargo.toml --release --locked \
+cargo build --manifest-path research-core/platform/Cargo.toml --release --locked -p hft-research-platform --features control --bins
+CARGO_TARGET_DIR="$PWD/prediction-markets/target" cargo build --manifest-path prediction-markets/Cargo.toml --release --locked \
   -p ploy-research --features db --bin monday-prediction-research \
   --bin monday-prediction-evaluator --bin monday-prediction-snapshot
 release=${RUNNER_TEMP:?}/research-release

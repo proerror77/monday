@@ -1,4 +1,5 @@
 [package]
+workspace = "../../shared"
 name = "hft-factor-dsl"
 version = "0.1.0"
 edition = "2021"

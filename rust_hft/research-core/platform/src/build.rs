@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub struct BuildSpec {
     pub schema: u32,
     pub code_commit: String,
+    /// One owning workspace; its lock, profile and package selection are bound.
+    pub workspace_manifest: String,
     pub source_manifest_sha256: String,
     pub cargo_lock_sha256: String,
     /// Includes the pinned compiler distribution and rustc -Vv, not just a label.
@@ -44,7 +46,7 @@ pub fn pinned_image(value: &str) -> bool {
 impl BuildSpec {
     pub fn id(&self) -> Result<String> {
         ensure!(
-            self.schema == 1
+            self.schema == 2
                 && self.code_commit.len() == 40
                 && self
                     .code_commit
@@ -64,6 +66,14 @@ impl BuildSpec {
         );
         ensure!(
             matches!(
+                self.workspace_manifest.as_str(),
+                "runtime/Cargo.toml"
+                    | "shared/Cargo.toml"
+                    | "data-pipelines/Cargo.toml"
+                    | "research-core/Cargo.toml"
+                    | "research-core/platform/Cargo.toml"
+                    | "prediction-markets/Cargo.toml"
+            ) && matches!(
                 self.target.as_str(),
                 "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
             ) && sorted_names(&self.packages, true)
@@ -83,6 +93,8 @@ impl BuildSpec {
         self.id()?;
         let mut args = vec![
             "build".into(),
+            "--manifest-path".into(),
+            self.workspace_manifest.clone(),
             "--locked".into(),
             "--target".into(),
             self.target.clone(),

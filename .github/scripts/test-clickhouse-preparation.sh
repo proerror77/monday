@@ -48,5 +48,5 @@ count=$(printf '%s' "SELECT count() FROM research.prepared_labels WHERE view_id=
 # Native typed output exists: this is neither a JSONL spool nor an OSS s3 scan.
 printf '%s' "SELECT segment,ordinal,event_ns,available_ns,values FROM research.prepared_features WHERE view_id={view_id:String} ORDER BY available_ns,segment,ordinal FORMAT RowBinary" | query >"$work/features.rowbinary"
 test -s "$work/features.rowbinary"
-MONDAY_TEST_CH_ROWBINARY="$work/features.rowbinary" cargo test --manifest-path rust_hft/Cargo.toml -p hft-research-platform --features control --lib --locked clickhouse::tests::actual_clickhouse_rowbinary_preserves_typed_feature_contract -- --ignored --exact
+MONDAY_TEST_CH_ROWBINARY="$work/features.rowbinary" cargo test --manifest-path rust_hft/research-core/platform/Cargo.toml -p hft-research-platform --features control --lib --locked clickhouse::tests::actual_clickhouse_rowbinary_preserves_typed_feature_contract -- --ignored --exact
 printf 'PASS: CH SQL multi-horizon time join, deterministic ties, gap and split isolation\n'

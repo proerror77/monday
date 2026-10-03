@@ -36,7 +36,7 @@ export RUSTFLAGS
 mkdir -p "$RUN_DIR"
 
 echo "Building Bitget latency audit with RUSTFLAGS=${RUSTFLAGS}"
-cargo build -p hft-data-adapter-bitget --example latency_audit --release --locked
+CARGO_TARGET_DIR="$ROOT_DIR/target" cargo build --manifest-path "$ROOT_DIR/data-pipelines/Cargo.toml" -p hft-data-adapter-bitget --example latency_audit --release --locked
 
 {
   echo "run_id=${RUN_ID}"

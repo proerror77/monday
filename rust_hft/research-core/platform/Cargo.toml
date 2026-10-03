@@ -38,3 +38,46 @@ required-features = ["control"]
 
 [dev-dependencies]
 tempfile = "3"
+
+[workspace]
+resolver = "2"
+members = ["."]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive", "rc"] }
+sha2 = "0.10"
+tokio = { version = "1.0", default-features = false }
+reqwest = { version = "0.12", default-features = false }
+axum = "0.7"
+serde_json = "1.0"
+
+[profile.dev]
+# 開發模式：編譯快優先
+opt-level = 0
+debug = true
+incremental = true
+lto = false
+
+[profile.release]
+# 發布模式：執行快優先，並保持可分發產物精簡
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+split-debuginfo = "packed"
+
+# Admitted research builds trade cross-crate LTO for shorter edit/build loops.
+# Profile bytes are part of BuildSpec; production release behavior stays separate.
+[profile.research]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+
+[profile.bench]
+# 基準測試：最高優化
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false

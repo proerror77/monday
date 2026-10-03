@@ -182,3 +182,29 @@
 
 - Lead with the result in concise Chinese unless the user requests another
   language. Use plain paragraphs; use lists or tables when they aid comparison.
+
+- Use [Karpathy's explanation method](https://x.com/karpathy/status/2105819303471976479)
+  for new or edited technical explanations, documentation, PR descriptions,
+  and code comments. Use approximately 80% of ASD-STE100 by default.
+  Write short, direct sentences. Use active voice and one term per concept.
+- For English prose, aim for at most 20 words per instruction and 25 words per
+  descriptive sentence. Give one action per instruction. Keep each paragraph
+  on one topic, usually within six sentences. Explain necessary technical names.
+  Apply these clarity principles to Chinese without imposing English word counts.
+- Preserve exact identifiers, commands, scientific constraints, and evidence.
+  The 80% target describes writing style, not a measured compliance score.
+  Do not claim formal STE compliance without checking the rules and dictionary.
+- Choose the form that makes the explanation easiest to understand.
+  Use short prose for simple results. Use diagrams for relationships, boundaries,
+  or sequences. Use a self-contained interactive HTML explainer when controls,
+  scenarios, or animation make a complex idea clearer.
+- Use a focused 3b1b-style video when a narrated sequence materially improves
+  understanding. Start with a concrete example. Build the visual model step by
+  step, then introduce the definition or formula. Each visual change must explain
+  a specific point. Apply the same sequence to diagrams and interactive explainers.
+- Keep the written technical contract as the source of truth. Link each visual
+  or interactive explainer to its source. Distinguish implemented behavior,
+  proposed interfaces, and verified deployments in every format.
+- Create explanation artifacts within the assigned outcome and existing budget.
+  Use already-authorized audio tools or suitable local alternatives. Do not
+  assume an API key or a paid narration service is available.

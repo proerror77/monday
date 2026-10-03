@@ -2,7 +2,7 @@
 # Pure validators; API metadata must be fetched independently by the consumer.
 ci_expected_scope() {
   local selected=$1 result='{}' flag value
-  for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff owning_packages loop_packages; do
+  for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff owning_packages loop_packages focused_packages; do
     value=$(awk -F= -v key="$flag" '$1==key {print $2}' "$selected")
     if [[ $flag == *_packages ]]; then
       [[ $value =~ ^(,,|,([A-Za-z0-9_-]+,)+)$ ]] || return 1

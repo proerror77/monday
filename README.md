@@ -39,6 +39,12 @@ Build, Run, Session and compute Attempts with PG/CH contracts. It defaults to
 paused and is not a production Campaign or ledger cutover. Its implementation
 and pending worker/provider acceptance are documented separately.
 
+Cargo builds have six independent functional workspaces and lockfiles. The
+[workspace registry](rust_hft/workspaces.json) selects shared, data, research,
+control, runtime, and prediction owners. Use an owning manifest or
+`rust_hft/scripts/cargo-scoped.sh` with explicit packages. See the
+[repository layout](docs/architecture/REPOSITORY_LAYOUT.md) for dependencies.
+
 ## Capability Truth
 
 | Capability | State | Boundary |

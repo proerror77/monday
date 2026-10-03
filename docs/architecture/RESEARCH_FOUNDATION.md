@@ -40,9 +40,30 @@ flowchart LR
 | CI / CD | 验证、构建、发布证据与 admission | 不负责研究资源租期、启动、准入、停止、回执桥 |
 | 运维 | 保留独立流程 | 真实资源、网络、RAM、发布或切换仍由单独授权和 Gate 控制 |
 
+## 独立 Cargo 构建边界
+
+`rust_hft/workspaces.json` 登记六个真实入口：shared、data、research、control、runtime、prediction。每个入口拥有独立 lockfile、resolver 2 和 Rust 1.98.1。源码路径保持原位置，package 显式声明唯一 owner；原 root package 属于 runtime workspace。
+
+轻量 control workspace 只含 `hft-research-platform`。其依赖树没有 collector、Burn、ONNX 或 Parquet。Data 的协议库不反向依赖采集运行时；`hft-market-pipeline` 也不依赖训练或执行。科学 research workspace 默认选择 search kernel，实际训练与 harness 由明确 package/build recipe 选择。
+
+CI selector 汇总真实 metadata，包括跨域 path dependencies 和 integration/dev edges。`cargo-scoped.sh` 把显式包集合分到各 owner；跨 workspace features 或命名 target 组合拒绝模糊执行。CI 单 runner 可复用自己的 target cache；多个 Cargo invocation 仍各自解析所属 workspace 的 features。共享可写多租户 cache 不属于此合同。
+
+保留的耦合仍有 collector 的 `BookSync`/engine、Alpha Data Mission 和 ONNX/formula 跨域兼容测试。本轮没有改成远端 RPC，也未宣称整个研究图已解耦。共享十二二进制 release bundle 仍保留既有消费者；功能拆分本身不提供编译耗时或加速倍数证据。
+
 ## Build → Run → Attempt，不在训练 Pod cold build
 
-`src/build.rs` 定义 `BuildSpec` 和 `BuildArtifact`。Build 身份包含源码 commit 与 source manifest、Cargo.lock、工具链 distribution/compiler manifest、target、精确包/二进制/features/default-features、profile 和 profile bytes、Rust 编译参数、原生编译器/链接器/库环境、builder image。它不包含数据窗口、研究参数、seed、task ID 或 attempt。
+例如，两个 CPU MLP 试验只改变参数：Run A 使用 `learning_rate=0.001`、seed 7；Run B 使用 `learning_rate=0.003`、seed 11。二者引用同一个 Build，因为源码、所属 workspace、features、工具链和镜像都未改变。若 Run A 遇到已允许重试的基础设施故障，控制器先确认旧进程树停止，再创建 Attempt 2。重试保留 Run A 的参数、Build、预算约束和原截止时间。修改 Rust 解码或训练实现时，才需要另一个 Build。
+
+```mermaid
+flowchart LR
+  B[已验证的 Build] --> A[Run A：一组参数]
+  B --> C[Run B：另一组参数]
+  A --> A1[Attempt 1]
+  A1 -->|允许重试且确认停止| A2[Attempt 2：同一 Run 与产物]
+  C --> C1[Attempt 1]
+```
+
+`src/build.rs` 定义 `BuildSpec` 和 `BuildArtifact`。BuildSpec schema 2 显式选择一个所属 workspace。Build 身份包含源码 commit 与 source manifest、该 workspace 的 Cargo.lock、工具链 distribution/compiler manifest、target、精确包/二进制/features/default-features、profile 和 profile bytes、Rust 编译参数、原生编译器/链接器/库环境、builder image。它不包含数据窗口、研究参数、seed、task ID 或 attempt。
 
 Run 是固定科学调用：Experiment、BuildArtifact、配置摘要、命令、数据 manifest、seed、evaluator、evaluation protocol、fit identity。Run 同时验证其源码和镜像与引用的 Build 一致。Task 必须引用已注册 Run；同一 Run 最多一个计算 Task，Attempt 只重试原请求，不能变更产物或参数。多个参数 Run 可以引用同一 Build。
 
@@ -66,11 +87,19 @@ CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生�
 
 `src/clickhouse.rs` 使用参数绑定的固定 SQL，输出有界 RowBinary；Training / Features / Replay 是三个 typed 出口，不产生 JSONL spool。每次 preparation 有独立 physical generation，由 PG lease/fence 和 DataView advisory lock 准入。旧 attempt 不能覆盖已发布 generation。`research-prepare` worker 在每个 CH 阶段前复查 lease/deadline/撤销，将内容寻址 block 上传后最后写 receipt。
 
-`src/prepared.rs` 使用带版本、大小上限的 bincode；本地文件和对象读取核验 manifest/block digest。Transport 只能提供字节，不能自行替换解码结果；一次性 acquired buffers 在解码后释放。`VerifiedCache` 对缺页进行读/解码/时钟/split 验证，cache hit 仍执行当前 view 的合同检查。一个 bounded batch 可复用 readonly `Arc`，模型、试验、optimizer/checkpoint 状态各自独立。batch owner 还要计入外部持有 Arc 的内存，不能声称 LRU 本身限制了所有引用的总驻留量。
+`src/prepared.rs` 使用带版本和大小上限的 bincode。读取本地文件或对象时，调用方必须核验 manifest 和 block digest。Transport 只提供字节，不能替换解码结果。解码后释放一次性 acquired buffers。
+
+`VerifiedCache` 对缺页执行读取、解码、时钟和 split 验证。cache hit 仍检查当前 view 的合同。多个试验可以复用一个只读 `Arc` batch；模型、optimizer 和 checkpoint 状态分别保存。batch owner 必须计入外部持有 Arc 的内存。LRU 不能单独限制这些引用的总驻留量。
 
 `apps/backtest::engine::replay_shared_target_positions` 已消费这些 shared typed 输入，复用现有 IOC target-position engine，每个试验新建状态。它拒绝错误 manifest、market、instrument、多 gap segment 和 split 外决策；availability ns 向上取整到 us，避免提前看数据。这里没有新增被动排队成交或 live 交易声明。
 
-现有 collector → 新 normalized CH tables 的独立验证/ingestion 接口、新 trainer 的 shared-input 接入、科学 CLI 的 Run/config 下载和最终 manifest 写入、原生 evaluation/Campaign settlement 的投影仍未完成。不能把 schema、prepare worker 或 tiny replay fixture 当作真实生产数据、训练或终态科学成果。
+`hft-market-pipeline` 是独立的转换/导入 crate，属于 data workspace。默认仅做已经封印的 Binance raw triplet → 原协议与序列验证 → typed Decimal/LIST Parquet；`import` feature 才引入 PG/CH driver。它不依赖 collector、训练、控制服务或执行 adapter。`monday-market-pipeline --help` 不连接数据库或转换数据。
+
+导入使用不可变批次 manifest、私有 generation、PG 单 writer/fence 和 CH 完整列回读。先验证 staging，再原子替换 batch partition，最后同事务写 PG receipt 与水位。若 CH 已发布但 PG 尚未提交，恢复先独立回读既有目标；未知传输不重发旧 generation 的 INSERT。重复请求仍核对真实 CH 内容。
+
+该链目前是 bounded pilot：100,000 行、128 MiB Parquet、64 staging tables/target partitions。它仅接受录制边界严格相接的来源；一般连续文件的时间与序列边界、跨 session/gap 标记仍需生产合同。不能据此宣称已导入滚动一月、全部资产或完整交易所深度。原始 OSS 继续现有 30 天生命周期，不补缺口或延长保留；实验与模型审计记录独立保留。
+
+新 trainer 的 shared-input 接入、科学 CLI 的 Run/config 下载和最终 manifest 写入、normalized ingestion 到 research preparation tables 的版本化投影、原生 evaluation/Campaign settlement 投影仍未完成。prepare、tiny fixture 或转换回执均不是训练或终态科学成果。
 
 ## PG 单权威、任务和终态
 
@@ -78,7 +107,11 @@ CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生�
 
 trusted native governance verifier 必须预先导入 exact TaskSpec 的科学 grant、预算/资源 reservation 和 release-admission receipts。服务与 Agent 没有 issuance/revocation 写权限。当前只实现投影合同与读取校验，尚未接入原生签名/grant verifier、预算扣账或 closed-family evaluator。Holdout 在通用 submit 中始终拒绝。SHA 引用本身不等于已验证签名或已扣预算。
 
-claim 使用 PG 事务、行锁、revision/fence 和全局 quota；Launching/Running/Stopping 都占并发，过期但未确认停止的资源仍占位。先提交 durable claim 再调用 provider；重新连接用同名资源 GET + UID + 标签/完整 annotations readback，不能因超时另造 resource identity。总 timeout 在首次 claim 设定并跨 retry 保留，queued retry 也不能重置截止时间。当前实现短事务认领，但 provider reconciliation 仍持有 task/global authority 锁；这会串行化 I/O，属于明确的吞吐限制，扩容前需拆为基于 revision 的 outbox reconciliation。
+claim 使用 PG 事务、行锁、revision/fence 和全局 quota。Launching、Running 和 Stopping 都占用并发额度。资源过期后，额度仍保留到进程停止得到确认。
+
+控制器先提交 durable claim，再调用 provider。重连时读取同名资源，并核对 UID、标签和完整 annotations。超时不能产生另一个 resource identity。首次 claim 确定总截止时间，retry 和 queued retry 都不能重置它。
+
+当前认领使用短事务，provider reconciliation 仍持有 task/global authority 锁。这会串行化 I/O，是明确的吞吐限制。扩容前需要实现基于 revision 的 outbox reconciliation。
 
 取消/超时/重试经过 Stopping。provider foreground delete 绑定 UID，资源不存在且对应 task/attempt/fence 的 Pod 列表为空后才能确认 process-tree stop。TTL、Job 消失或 Session turn interrupt 不是科学 cancel 成功。receipt 必须绑定 task、attempt、fence、输入、source、image、fit，实际 artifacts 和 checkpoint 经独立字节验证；只有停止确认后 PG 才落终态 result，Prepare 同事务发布 view。checkpoint 对当前 attempt 单调，retry 保留已验证 checkpoint，旧 fence 和晚到结果拒绝。
 
@@ -105,7 +138,7 @@ OpenResearch [chat delivery](https://github.com/alphaXiv/OpenResearch/blob/f4cec
 ## CI/CD 与退役顺序
 
 - `ci.yml` 保留 actual affected-package 选择和原域合同测试，新增 PG/CH ephemeral fixture job。Collector pagination 合同的存在/非 ignored 检查与完整 owning suite 结合，避免空 filter 冒充通过。
-- Monorepo Rust Workspace 运行共享 strict Clippy，并上传经过选择的 stage outcomes；Security 校验 exact source/fork/base/checkout/run/attempt/numeric job、最新 producer 和 scoped command digest。weekly schedule 没有普通 producer，保留自己的 strict Clippy。
+- Monorepo Rust Workspace 运行共享 strict Clippy，并输出经过选择的 stage outcomes。同一 workflow 的 `needs.rust` 消费回执，校验 exact source/fork/base/checkout/run/attempt/numeric job 和 scoped command digest；不再跨 workflow 轮询。Security 的 weekly/manual 路径保留自己的 strict Clippy。
 - Prediction CI 构建共享 release 一次，smoke 下载同一 artifact；原来的格式、研究/ml/db/三事件 sidecar 合同迁回 native CI。没有删去这些实际测试或用 selector 输出充当测试通过。
 - ACR 保留三个 required checks、当前 main、exact Prediction producer 与 artifact 来源。软件读取校验 latest attempt/job 和实际 binary bytes，发布后拉取 OCI digest、核验 source label 和 contained executables。Campaign controller 镜像继续保留既有 Ops；不存在的 research-data-service Dockerfile 目标移除。
 - ACR source-test 仍只有审核过的两个离线测试 profile、可信当前 main 和确定 source-test tag。native runner 构建/测试该镜像，不把测试生命周期塞回 ACK private executor。
@@ -125,7 +158,8 @@ OpenResearch [chat delivery](https://github.com/alphaXiv/OpenResearch/blob/f4cec
 4. Build 的源码归档、scoped 编译、contained binaries/OCI 验证和发布证明投影；两组参数 Run 引用同一 Build，强制基础设施 retry 仍保留同一 Build、总 deadline、fit/checkpoint provenance。
 5. 接入一条真实原生科学 worker 的 typed input、固定 Run/config、native scientific terminal manifest / Campaign settlement；prepare 或退出码 0 不算科学成功。先 CPU Job，验收 stale receipt、取消/retry、controller 重启/幂等及实际 artifact 丢失。
 6. 再接 Coding Agent app-server 的持久 Session、native-state恢复、审批与受控工具/完成 wake；Session turn interrupt 与 Job cancel 分别验证。
-7. 单 tenant / concurrency=1 / 明确预算灰度，读回旧 writer 已停再启 PG，禁止双活。回滚先 pause、cancel/drain 并证明新资源全部停，再以当前恢复/迁移证明恢复旧 authority；不能同时启用旧/新 ledger。
+7. 灰度启用：只开放一个 tenant，concurrency=1，使用明确批准的预算。重新读回旧 writer 已停的证明，再启用 PG。旧、新 ledger 不能同时写入。
+8. 回滚：先 pause 新 authority，再 cancel/drain 所有任务。独立证明新进程树全部停止后，以当前恢复/迁移证明恢复旧 authority。保留新 ledger 与 append-only 证据。
 
 旧 CI/private control 链的退役必须同时满足 exact-head required checks 已通过、共享发布证据可读、独立新资源生命周期/回读已真实验收、旧请求队列和 lease 已 drain、private signer 与旧 receipt 发布不再被消费，以及恢复路径验证。仅草稿 PR、unit tests 或 CRD Ready 不满足退役条件。
 

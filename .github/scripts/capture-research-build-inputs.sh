@@ -25,9 +25,15 @@ printf '%s\n' "${RUSTFLAGS:-}" "${CARGO_ENCODED_RUSTFLAGS:-}" "${RUSTC_WRAPPER:-
 for config in "$root/.cargo/config.toml" "$root/rust_hft/.cargo/config.toml" "$root/rust_hft/prediction-markets/.cargo/config.toml"; do
   if [[ -f $config ]]; then cat "$config" >>"$work/flags"; fi
 done
-cat "$root/rust_hft/Cargo.toml" "$root/rust_hft/prediction-markets/Cargo.toml" >"$work/profiles"
+cat "$root/rust_hft/Cargo.toml" "$root/rust_hft/workspaces.json" >"$work/profiles"
+while IFS= read -r manifest; do
+  printf '%s\n' "$manifest" >>"$work/profiles"
+  cat "$root/rust_hft/$manifest" >>"$work/profiles"
+done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
+locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
 cat "$root/.github/scripts/build-research-release.sh" \
   "$root/.github/scripts/research-release-source-sha.sh" \
+  "$root/.github/scripts/research-workspace-locks.sh" \
   "$root/.github/scripts/verify-research-runtime-abi.sh" \
   "$root/.github/scripts/verify-research-runner-binaries.sh" >"$work/recipe"
 jq -S -n --arg compiler "$(sha256sum "$work/compiler" | awk '{print $1}')" \
@@ -35,7 +41,6 @@ jq -S -n --arg compiler "$(sha256sum "$work/compiler" | awk '{print $1}')" \
   --arg flags "$(sha256sum "$work/flags" | awk '{print $1}')" \
   --arg profiles "$(sha256sum "$work/profiles" | awk '{print $1}')" \
   --arg recipe "$(sha256sum "$work/recipe" | awk '{print $1}')" \
-  --arg root_lock "$(sha256sum "$root/rust_hft/Cargo.lock" | awk '{print $1}')" \
-  --arg prediction_lock "$(sha256sum "$root/rust_hft/prediction-markets/Cargo.lock" | awk '{print $1}')" \
-  '{schema:"monday.compilation-inputs.v1",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$compiler,native:$native,flags:$flags,profiles:$profiles,recipe:$recipe,locks:{root:$root_lock,prediction:$prediction_lock}}' >"$output"
+  --argjson locks "$locks" \
+  '{schema:"monday.compilation-inputs.v2",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$compiler,native:$native,flags:$flags,profiles:$profiles,recipe:$recipe,locks:$locks}'  >"$output"
 if [[ -n ${GITHUB_OUTPUT:-} ]]; then printf 'cache_sha256=%s\n' "$(sha256sum "$output" | awk '{print $1}')" >>"$GITHUB_OUTPUT"; fi

@@ -62,6 +62,7 @@ assert_flag() {
 assert_jobs() {
   local output=$1 expected=$2
   local actual
+  if grep -Eq '^clippy_(loop|handoff)=true$' "$output" && ! grep -Fqx 'jobs=,,' "$output"; then expected="${expected:+$expected,}ci/clippy-strict"; fi
   if grep -Fqx 'control=true' "$output"; then
     expected="${expected:+$expected,}ci/control-contracts"
   fi
@@ -95,6 +96,7 @@ assert_owning_packages() {
 
 assert_security_jobs() {
   local output=$1 expected=$2 actual
+  if grep -q '^jobs=.*ci/clippy-strict' "$output" && ! grep -q '^security_jobs=.*security/clippy-strict' "$output"; then expected=${expected/,security\/clippy-strict/}; fi
   actual=$(sed -n 's/^security_jobs=//p' "$output")
   [[ $actual == ,*, ]] || {
     printf '%s: security_jobs output must use exact comma-delimited membership: %s\n' "$output" "$actual" >&2
@@ -123,7 +125,7 @@ job_cases=(
   'prediction-lock|pull_request|prediction-lock.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'research-dockerfile|pull_request|research-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
   'campaign-controller-dockerfile|pull_request|campaign-controller-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
-  'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
+  'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/research-foundation,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'prediction-workflow|pull_request|prediction-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'root-node|pull_request|root-node.txt|ci/node-install'
   'security-workflow|pull_request|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
@@ -139,7 +141,7 @@ job_cases=(
   'agent-instructions|pull_request|agent-instructions.txt|ploy/commit-hygiene'
   'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
   'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
-  'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
+  'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/research-foundation,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'unknown-nested|pull_request|unknown-nested.txt|'
   'rust-docs|pull_request|rust-docs.txt|'
   'package-readme|pull_request|package-readme.txt|'
@@ -355,6 +357,16 @@ assert_owning_packages "$known_and_future" 'future-rust-tool'
 
 printf '%s\n' rust_hft/apps/live/src/lib.rs rust_hft/apps/paper/src/main.rs \
   >"$tmp_dir/same-suite.txt"
+printf '%s\n' rust_hft/data-pipelines/market-pipeline/src/market_import.rs >"$tmp_dir/market-pipeline.txt"
+pipeline=$(run_case market-pipeline pull_request market-pipeline.txt)
+assert_jobs "$pipeline" 'ci/research-foundation'
+assert_flag "$pipeline" collector false
+assert_flag "$pipeline" loop false
+assert_flag "$pipeline" handoff false
+printf '%s\n' .github/scripts/test-market-import.sh >"$tmp_dir/market-import-driver.txt"
+import_driver=$(run_case market-import-driver pull_request market-import-driver.txt)
+assert_jobs "$import_driver" 'ci/research-foundation,ci/ci-contracts,ploy/workflow-lint'
+
 same_suite=$(run_case same-suite pull_request same-suite.txt)
 assert_jobs "$same_suite" 'ci/rust,ci/deployment-artifacts'
 assert_owning_packages "$same_suite" ''
@@ -491,7 +503,7 @@ grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$fast_lane_block"
 
 # Suite placement is pinned both ways: fast-only work stays out of the heavy
 # job, and each suite's required home is asserted positively.
-if grep -Fq 'cargo fmt --check' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+if grep -Fq 'cargo-scoped.sh" fmt --check' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'shellcheck' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'test-rust-lob-control-plane.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
@@ -504,10 +516,10 @@ grep -Fq 'test-rust-lob-recovery-queue.sh' "$script_dir/run-collector-control-co
 [[ $scope_job_block != *test-* && $scope_job_block != *shellcheck* ]]
 grep -Fq 'test-monday-collector-health.sh' "$script_dir/run-collector-control-contracts.sh"
 grep -Fq 'shellcheck' <<<"$control_job_block"
-grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
+grep -Fq 'cargo-scoped.sh" fmt --check' <<<"$fast_gates_block"
 grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
 grep -Fqx '      - name: Test directly changed Rust packages' "$ci_workflow"
-grep -Fq 'cargo test "${args[@]}" --locked' <<<"$rust_job_block"
+grep -Fq 'cargo-scoped.sh" test "${args[@]}" --locked' <<<"$rust_job_block"
 
 # The market-recorder release contract runs as its own parallel job (#568).
 ci_gate_block=$(job_block ci-gate)
@@ -608,8 +620,9 @@ ci,security,ploy=ARGV.map{|p| YAML.safe_load(File.read(p)).fetch('jobs')}
 end
 abort 'missing selected Rust domain tests' unless %w[loop owning handoff json ondo collector control focused clippy_loop clippy_handoff].all?{|id|ci.fetch('rust').fetch('steps').any?{|s|s['id']==id}}
 abort 'missing shared producer evidence' unless ci.fetch('rust').to_s.include?('write-ci-rust-evidence.sh')
-abort 'Security duplicates Clippy on PR/push' unless security.fetch('clippy-strict').fetch('steps').select{|s|s.fetch('run','').include?('cargo clippy')}.all?{|s|s.fetch('if','').include?("github.event_name == 'schedule'")}
-abort 'Security bypasses producing attempt' unless security.fetch('clippy-strict').to_s.include?('wait-ci-rust-evidence.sh')
+abort 'Security duplicates Clippy on PR/push' unless security.fetch('clippy-strict').fetch('steps').select{|s|s.fetch('run','').include?('cargo-scoped.sh" clippy')}.all?{|s|s.fetch('if','').include?("github.event_name == 'schedule'")}
+abort 'Clippy lacks same-run dependency' unless ci.fetch('clippy_strict').fetch('needs').include?('rust') && ci.fetch('clippy_strict').to_s.include?('verify-ci-rust-same-run.sh')
+abort 'Security still polls native Clippy' if security.fetch('clippy-strict').to_s.include?('wait-ci-rust-evidence.sh')
 abort 'smoke does not reuse binary job' unless ploy.fetch('research-image-smoke').fetch('needs').include?('research-image-binaries')
 %w[research-image-binaries rust-format rust-research-heavy].each do |id|
   abort "native compiler absent #{id}" unless ploy.fetch(id).to_s.include?('dtolnay/rust-toolchain@')

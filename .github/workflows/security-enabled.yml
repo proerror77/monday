@@ -147,7 +147,7 @@ jobs:
       - name: Run security audit
         run: |
           set -euo pipefail
-          cargo audit --json > audit-results.json
+          bash ../.github/scripts/check-rust-workspace-reports.sh audit > audit-results.json
           jq -e '.vulnerabilities.list? // [] | arrays' audit-results.json > /dev/null
 
       - name: Upload audit results
@@ -199,7 +199,7 @@ jobs:
 
       - name: Check licenses
         run: |
-          cargo license --json > licenses.json
+          bash ../.github/scripts/check-rust-workspace-reports.sh license > licenses.json
 
           # Fail on incompatible licenses
           INCOMPATIBLE_LICENSES="GPL-2.0|GPL-3.0|AGPL-3.0|LGPL-3.0"
@@ -221,7 +221,7 @@ jobs:
   # Code Quality - Strict Clippy
   # ============================================================================
   clippy-strict:
-    name: Code Quality - Clippy (STRICT)
+    name: Code Quality - Clippy (PERIODIC)
     needs: security-scope
     if: ${{ contains(needs.security-scope.outputs.jobs, ',security/clippy-strict,') }}
     runs-on: ubuntu-latest
@@ -238,22 +238,22 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-        if: github.event_name == 'schedule'
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         with:
           toolchain: 1.98.1
           components: clippy
 
       - name: Cache
-        if: github.event_name == 'schedule'
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft
           shared-key: strict-alpha-research-ml-v1
 
       - name: Run research Clippy (strict)
-        if: ${{ (needs.security-scope.outputs.clippy_loop == 'true') && github.event_name == 'schedule' }}
+        if: ${{ (needs.security-scope.outputs.clippy_loop == 'true') && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         run: |
-          cargo clippy \
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy \
             -p alpha-domain \
             -p alpha-store \
             -p alpha-engine \
@@ -269,9 +269,9 @@ jobs:
             -D clippy::suspicious
 
       - name: Run runtime handoff Clippy (strict)
-        if: ${{ (needs.security-scope.outputs.clippy_handoff == 'true') && github.event_name == 'schedule' }}
+        if: ${{ (needs.security-scope.outputs.clippy_handoff == 'true') && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         run: |
-          cargo clippy \
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy \
             -p hft-live \
             --no-default-features \
             --test deployment_envelope \
@@ -285,12 +285,6 @@ jobs:
   # ============================================================================
   # Unused Dependencies
   # ============================================================================
-      - name: Verify strict Clippy from native Monorepo CI
-        if: github.event_name != 'schedule'
-        working-directory: .
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/wait-ci-rust-evidence.sh "$(git rev-parse HEAD)"
   cargo-machete:
     name: Code Quality - Unused Dependencies
     needs: security-scope
