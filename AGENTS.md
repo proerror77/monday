@@ -103,11 +103,13 @@
   identity and the properties or relationships required by that request. Do not
   require later delivery states unless requested. For an asynchronous job whose
   result is requested, verify its terminal result and output, not just submission.
-- Remote build or validation tasks use `monday-remote-build` to select the existing
-  managed ACK executor or a disposable Cloud Assistant task. Managed CI follows
-  its reviewed request, cache, and receipt contract; do not apply disposable
-  fresh-cache isolation to that executor. Neither path may place a workspace,
-  toolchain, Cargo cache, or target directory on an `ack-system` node.
+- Rust validation follows the current workflow and the package's owning
+  workspace. Use `monday-remote-build` when selecting a build execution path;
+  native CI is not redirected to historical private ACK receipt dispatch.
+  Remote compilation uses only an explicitly assigned executor/profile and its
+  admitted source, cache and cleanup contract. Scientific compute consumes a
+  verified Build; neither caches nor Agent sessions grant compute authority.
+  Keep build workspaces, toolchains and targets off `ack-system` nodes.
 - For CEX cloud research, follow the
   [ACK-only evidence and recovery boundary](deployment/aliyun/research/README.md#data-flow-review-and-host-lifetime)
   during preparation, verification, reporting, recovery, and resource cleanup.
