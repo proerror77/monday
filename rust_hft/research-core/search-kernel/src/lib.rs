@@ -539,9 +539,11 @@ mod tests {
         let nodes = (0..depth)
             .map(|node_id| Node {
                 parent: (node_id > 0).then(|| node_id - 1),
-                children: (node_id + 1 < depth)
-                    .then(|| vec![node_id + 1])
-                    .unwrap_or_default(),
+                children: if node_id + 1 < depth {
+                    vec![node_id + 1]
+                } else {
+                    Vec::new()
+                },
                 expandable: node_id + 1 == depth,
                 subtree_expandable: true,
                 depth: node_id,
