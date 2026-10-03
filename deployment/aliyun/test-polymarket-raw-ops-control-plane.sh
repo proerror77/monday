@@ -4941,11 +4941,16 @@ fi
 jq -e '.passed == false and .comparison_mode == "rust_self"
   and .checks.settlement_parity == false' \
   "$tmp_dir/bad-rust-self-parity.json" >/dev/null
-jq -e 'select(.update.transaction_hash == "0xlate")
-  | .update.trade_ts_unix == 319
-    and .update.trade.timestamp == 319
-    and .update.received_at == "1970-01-01T00:05:21Z"' \
-  "$legacy_tape" "$rust_closed" >/dev/null
+# Evaluate one boolean per tape. With jq 1.6, a trailing nonmatching NDJSON
+# record makes a streaming select return exit 4 even after a matching row.
+for late_trade_tape in "$legacy_tape" "$rust_closed"; do
+  jq -es '[.[] | select(.update.transaction_hash == "0xlate")]
+    | length == 1 and all(.[];
+      .update.trade_ts_unix == 319
+      and .update.trade.timestamp == 319
+      and .update.received_at == "1970-01-01T00:05:21Z")' \
+    "$late_trade_tape" >/dev/null
+done
 
 rust_bad="$tmp_dir/rust-bad"
 cp -R "$rust" "$rust_bad"
