@@ -2,11 +2,14 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd "$script_dir/../.." && pwd)
 selector="$script_dir/select-acr-publish-source.sh"
 check_reader="$script_dir/read-release-required-checks.sh"
 artifact="$script_dir/research-image-release-artifact.sh"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
+
+export GITHUB_RUN_ATTEMPT=2 MONDAY_RELEASE_JOB_ID=567
 
 main_sha=1111111111111111111111111111111111111111
 other_sha=2222222222222222222222222222222222222222
@@ -22,7 +25,7 @@ assert_source() {
   shift 2
   local output="$tmp_dir/$name.out"
   "$selector" "$@" --output "$output"
-  diff -u <(printf '%s\n' "$expected") "$output"
+  diff -u <(printf '%s\n' "$expected" 'research_product=paired') "$output"
 }
 
 assert_source automated $'publish_target=research-runner\nresearch_mode=artifact\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=1234' \
@@ -150,13 +153,64 @@ release="$tmp_dir/release"
 mkdir -p "$repo/prediction-markets" "$release/research-bin"
 printf 'root lock\n' >"$repo/Cargo.lock"
 printf 'prediction lock\n' >"$repo/prediction-markets/Cargo.lock"
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer research-data-service clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
+for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
   printf '%s\n' "$binary" >"$release/research-bin/$binary"
   chmod 0755 "$release/research-bin/$binary"
 done
 
+cp "$root/rust_hft/workspaces.json" "$repo/workspaces.json"
+while IFS= read -r manifest; do
+  directory=${manifest%/Cargo.toml}; mkdir -p "$repo/$directory"
+  cp "$root/rust_hft/$directory/Cargo.lock" "$repo/$directory/Cargo.lock"
+done < <(jq -r '.workspaces[].manifest' "$repo/workspaces.json")
+export MONDAY_BUILD_INPUTS_FILE="$tmp_dir/build-inputs.json"
+locks=$("$root/.github/scripts/research-workspace-locks.sh" "$repo")
+jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" '{schema:"monday.compilation-inputs.v2",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks}' >"$MONDAY_BUILD_INPUTS_FILE"
 "$artifact" create "$release" "$main_sha" 1234 "$repo"
 "$artifact" verify "$release" "$main_sha" 1234 "$repo"
+
+# Reproduce upload/download-artifact's flattened 0644 file modes: direct
+# directory transport must fail, whereas the fixed tar survives that roundtrip.
+cp -R "$release" "$tmp_dir/flattened"
+chmod 0644 "$tmp_dir/flattened"/research-bin/*
+if "$artifact" verify "$tmp_dir/flattened" "$main_sha" 1234 "$repo" >"$tmp_dir/mode-error" 2>&1; then
+  echo 'flattened executable modes unexpectedly verified' >&2; exit 1
+fi
+grep -Fq 'executable mode lost:' "$tmp_dir/mode-error"
+ruby "$script_dir/research-release-bundle.rb" pack "$tmp_dir/research-image-release.tar" "$release"
+chmod 0644 "$tmp_dir/research-image-release.tar"
+ruby "$script_dir/research-release-bundle.rb" unpack "$tmp_dir/research-image-release.tar" "$tmp_dir/roundtrip"
+"$artifact" verify "$tmp_dir/roundtrip" "$main_sha" 1234 "$repo"
+BUNDLE_SCRIPT="$script_dir/research-release-bundle.rb" ruby -ropen3 -rrubygems/package - "$tmp_dir/research-image-release.tar" "$tmp_dir" <<'RUBYTEST'
+source, root = ARGV
+members = []
+File.open(source, 'rb') do |file|
+  Gem::Package::TarReader.new(file) do |reader|
+    reader.each { |entry| members << [entry.full_name, entry.header.mode, entry.read] }
+  end
+end
+%w[link path duplicate mode].each do |kind|
+  bad = File.join(root, "#{kind}.tar")
+  File.open(bad, 'wb') do |file|
+    Gem::Package::TarWriter.new(file) do |output|
+      members.each_with_index do |(name, mode, bytes), index|
+        if index == 1
+          if kind == 'link'
+            output.add_symlink(name, '/tmp/escape', mode)
+            next
+          end
+          name = '../escape' if kind == 'path'
+          name = 'research-image-release.json' if kind == 'duplicate'
+          mode = 0o777 if kind == 'mode'
+        end
+        output.add_file_simple(name, mode, bytes.bytesize) { |entry| entry.write(bytes) }
+      end
+    end
+  end
+  _out, error, status = Open3.capture3('ruby', ENV.fetch('BUNDLE_SCRIPT'), 'unpack', bad, File.join(root, "#{kind}-out"))
+  abort "unsafe tar accepted: #{kind}" if status.success? || !error.include?('research release bundle rejected')
+end
+RUBYTEST
 
 assert_rejected() {
   local name=$1 expected_sha=${2:-$main_sha} expected_run=${3:-1234}
@@ -179,7 +233,7 @@ assert_rejected extra
 assert_rejected digest
 assert_rejected source-mismatch "$other_sha"
 assert_rejected run-mismatch "$main_sha" 9999
-printf 'changed lock\n' >>"$repo/Cargo.lock"
+printf 'changed lock\n' >>"$repo/research-core/platform/Cargo.lock"
 assert_rejected lock-mismatch
 
 printf 'research image release artifact tests passed\n'

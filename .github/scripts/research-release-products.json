@@ -1,0 +1,12 @@
+{
+  "products": {
+    "runner": ["hft-backtest", "alpha-harness", "lob-pit-materializer", "binance-market-tape-slicer", "binance-replay-parquet-materializer", "clickhouse-analytics-materializer", "monday-prediction-research", "monday-prediction-evaluator", "monday-prediction-snapshot"],
+    "controller": ["alpha-harness", "lob-pit-materializer", "binance-market-tape-slicer", "binance-replay-parquet-materializer"]
+  },
+  "recipes": [
+    {"manifest": "research-core/Cargo.toml", "package": "hft-backtest", "features": "", "binaries": ["hft-backtest"]},
+    {"manifest": "research-core/Cargo.toml", "package": "alpha-harness", "features": "", "binaries": ["alpha-harness"]},
+    {"manifest": "data-pipelines/Cargo.toml", "package": "hft-collector", "features": "", "binaries": ["lob-pit-materializer", "binance-market-tape-slicer", "binance-replay-parquet-materializer", "clickhouse-analytics-materializer"]},
+    {"manifest": "prediction-markets/Cargo.toml", "package": "ploy-research", "features": "db", "binaries": ["monday-prediction-research", "monday-prediction-evaluator", "monday-prediction-snapshot"]}
+  ]
+}

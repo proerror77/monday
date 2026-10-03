@@ -5,10 +5,10 @@ use std::{
 };
 
 const POLICY_TARGET: &str = "x86_64-unknown-linux-gnu";
-const POLICY_GRAPH_SCHEMA: &str = "prediction-policy-dependencies.v5";
+const POLICY_GRAPH_SCHEMA: &str = "prediction-policy-dependencies.v6";
 const POLICY_GRAPH_FILE: &str = "prediction-policy-dependencies.linux.txt";
 const CANONICAL_POLICY_DEPENDENCY_HASH_FILE: &str = "prediction-policy-dependencies.linux.sha256";
-const POLICY_INPUTS: [(&str, &str); 13] = [
+const POLICY_INPUTS: [(&str, &str); 18] = [
     ("Cargo.lock", "Cargo.lock"),
     ("Cargo.toml", "Cargo.toml"),
     (
@@ -54,6 +54,17 @@ const POLICY_INPUTS: [(&str, &str); 13] = [
     (
         "../risk-control/portfolio-core/Cargo.toml",
         "../risk-control/portfolio-core/Cargo.toml",
+    ),
+    ("../shared/Cargo.toml", "../shared/Cargo.toml"),
+    (
+        "../data-pipelines/Cargo.toml",
+        "../data-pipelines/Cargo.toml",
+    ),
+    ("../research-core/Cargo.toml", "../research-core/Cargo.toml"),
+    ("../runtime/Cargo.toml", "../runtime/Cargo.toml"),
+    (
+        "../research-core/search-kernel/Cargo.toml",
+        "../research-core/search-kernel/Cargo.toml",
     ),
 ];
 const FORBIDDEN_RUNTIME_PACKAGES: [&str; 7] = [

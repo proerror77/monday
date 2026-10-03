@@ -503,6 +503,7 @@ fn canonical_event(
             received_at_ns,
             bids,
             asks,
+            ..
         } => {
             // The shared validator may seed replay from a verified raw checkpoint;
             // it is an L2 replay state, not a PIT feature row.
@@ -517,6 +518,7 @@ fn canonical_event(
             received_at_ns,
             bids,
             asks,
+            ..
         } => (
             "l2_update",
             *received_at_ns,
@@ -744,11 +746,13 @@ mod tests {
         let path = root.path().join("canonical.parquet");
         let series_one = vec![
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                clock: None,
                 received_at_ns: 1_000,
                 bids: levels("100", "1"),
                 asks: levels("101", "1"),
             }),
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                clock: None,
                 received_at_ns: 2_000,
                 bids: levels("101", "1"),
                 asks: levels("102", "1"),
@@ -756,11 +760,13 @@ mod tests {
         ];
         let series_two = vec![
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                clock: None,
                 received_at_ns: 10_000,
                 bids: levels("90", "1"),
                 asks: levels("91", "1"),
             }),
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                clock: None,
                 received_at_ns: 11_000,
                 bids: levels("91", "1"),
                 asks: levels("92", "1"),
@@ -806,6 +812,7 @@ mod tests {
                 received_at_ns: 1_000,
             },
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                clock: None,
                 received_at_ns: 2_000,
                 bids: levels("101", "1"),
                 asks: levels("102", "1"),

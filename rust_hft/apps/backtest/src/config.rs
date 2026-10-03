@@ -508,7 +508,7 @@ fn default_market() -> String {
     "usdm".to_string()
 }
 
-fn validate_market_identity(configured: &str, manifest: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_market_identity(configured: &str, manifest: &str) -> anyhow::Result<()> {
     let configured = configured.parse::<Market>().map_err(anyhow::Error::msg)?;
     let manifest = manifest.parse::<Market>().map_err(anyhow::Error::msg)?;
     if configured != manifest {
@@ -716,11 +716,13 @@ fn materialize_replay_event(
             received_at_ns,
             bids,
             asks,
+            ..
         } => ("snapshot", received_at_ns, bids, asks),
         ReplaySequenceEvent::Diff {
             received_at_ns,
             bids,
             asks,
+            ..
         } => ("l2_update", received_at_ns, bids, asks),
     };
     let received_at_us = received_at_ns / 1_000 + u64::from(!received_at_ns.is_multiple_of(1_000));
@@ -1461,6 +1463,7 @@ mod tests {
         let materialized = materialize_replay_event(
             ReplaySequenceEvent::Snapshot {
                 received_at_ns,
+                clock: None,
                 bids: vec![["100".to_string(), "1".to_string()]],
                 asks: vec![["101".to_string(), "1".to_string()]],
             },

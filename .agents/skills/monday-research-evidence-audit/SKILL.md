@@ -1,6 +1,6 @@
 ---
 name: monday-research-evidence-audit
-description: Audit an existing Monday research run's input, terminal evidence, publication, and logs. Excludes implementation progress, collector health, and source-delivery status.
+description: Audit existing Monday scientific run evidence and its input, terminal publication and logs. Raw conversion/import alone uses the data contract; excludes implementation progress, collector health and delivery status.
 ---
 
 # Monday Research Evidence Audit
@@ -14,6 +14,13 @@ For CEX cloud audits, follow the
 Use existing cloud read-only access and retained evidence. This audit does not
 launch verification Jobs or restore state; if that is needed to inspect missing
 content, report the observability gap and the required recovery work separately.
+
+A raw-to-Parquet or CH/PG import question uses the
+[existing data contract](../../../docs/architecture/RESEARCH_FOUNDATION.md#数据ch-数值准备版本化出口bounded-共享).
+Check only the requested raw identity, typed Parquet content, CH publication or
+PG receipt/recovery. Do not add Campaign training, trial or holdout stages to a
+conversion-only request. A preparation/import receipt is not scientific terminal
+evidence. Never import or run recovery merely to improve this read-only report.
 
 ## Workflow
 

@@ -30,22 +30,17 @@ echo "== Building collector (cross-compile for Linux) =="
 if command -v docker &> /dev/null; then
   # Use Docker cross-compilation for Linux target
   docker run --rm -v "$(pwd):/workspace" -w /workspace rust:1.98.1-bookworm bash -c "
-    cd tools/collector &&
-    cargo build --release --target x86_64-unknown-linux-gnu
+    CARGO_TARGET_DIR=/workspace/target cargo build --manifest-path data-pipelines/Cargo.toml --locked -p hft-collector --bin hft-collector --release --target x86_64-unknown-linux-gnu
   " || {
     echo "Docker build failed, trying local build..." >&2
-    pushd tools/collector >/dev/null
-    cargo build --release
-    popd >/dev/null
+    CARGO_TARGET_DIR="$PWD/target" cargo build --manifest-path data-pipelines/Cargo.toml --locked -p hft-collector --bin hft-collector --release
   }
-  BIN=tools/collector/target/x86_64-unknown-linux-gnu/release/hft-collector
-  [ -f "$BIN" ] || BIN=tools/collector/target/release/hft-collector
+  BIN=target/x86_64-unknown-linux-gnu/release/hft-collector
+  [ -f "$BIN" ] || BIN=target/release/hft-collector
 else
   # Fallback to local build (may not work on ECS if architecture mismatch)
-  pushd tools/collector >/dev/null
-  cargo build --release
-  popd >/dev/null
-  BIN=tools/collector/target/release/hft-collector
+  CARGO_TARGET_DIR="$PWD/target" cargo build --manifest-path data-pipelines/Cargo.toml --locked -p hft-collector --bin hft-collector --release
+  BIN=target/release/hft-collector
 fi
 [ -f "$BIN" ] || { echo "Build failed: $BIN not found" >&2; exit 1; }
 

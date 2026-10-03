@@ -27,10 +27,12 @@ ondo=false
 collector=false
 control=false
 focused=false
+focused_packages=
 toolchain=false
 jobs=
 security_jobs=
 research_image_relevant=false
+research_product=none
 architecture=false
 owning_packages=
 loop_packages=
@@ -95,7 +97,7 @@ select_security_scope() {
   if [[ $rust_relevant == true ]]; then
     select_security_job security/license-check
     if [[ $clippy_loop == true || $clippy_handoff == true ]]; then
-      select_security_job security/clippy-strict
+      select_job ci/clippy-strict
     fi
     select_security_job security/cargo-machete
   fi
@@ -109,6 +111,7 @@ select_security_scope() {
 select_all_ci_jobs() {
   select_job ci/rust-shell-scripts
   select_job ci/rust
+  select_job ci/research-foundation
   select_job ci/market-recorder-contract
   select_job ci/deployment-artifacts
   select_job ci/polymarket-evidence-compiler-image
@@ -125,6 +128,7 @@ select_all_rust_ci_jobs() {
 }
 
 select_all_ploy_jobs() {
+  research_product=paired
   architecture=true
   research_image_relevant=true
   [[ $event == pull_request ]] && select_job ploy/commit-hygiene
@@ -143,6 +147,7 @@ select_all_ploy_jobs() {
 }
 
 select_research_image_jobs() {
+  if [[ ${1:-paired} == paired || $research_product == paired ]]; then research_product=paired; else research_product=controller; fi
   research_image_relevant=true
   [[ $event == pull_request ]] && select_job ploy/commit-hygiene
   select_job ploy/research-image-binaries
@@ -152,6 +157,7 @@ select_research_image_jobs() {
 
 select_main_research_image_jobs() {
   if [[ $event == push && $research_image_relevant == true ]]; then
+    [[ $research_product != none ]] || research_product=paired
     select_job ploy/research-image-binaries
     select_job ploy/research-image-smoke
   fi
@@ -168,11 +174,14 @@ select_all() {
   collector=true
   control=true
   focused=true
+  focused_packages=hft-live,hft-paper,hft-all-in-one,alpha-harness,hft-harnessctl
   toolchain=true
 }
 
 emit() {
   local value
+  if [[ ,$jobs, == *,ploy/research-image-binaries,* && $research_product == none ]]; then research_product=paired; fi
+  [[ ,$owning_packages, != *",hft-research-platform,"* ]] || select_job ci/research-foundation
   [[ $architecture == true ]] && select_job ploy/architecture-contracts
   [[ $control == true ]] && select_job ci/control-contracts
   # Every path that selects collector verification must exercise its production image.
@@ -181,6 +190,7 @@ emit() {
   production_trading_image=$(jq -r 'any(.include[]; .name=="hft-trading")' <<<"$image_matrix")
   [[ $collector != true ]] || production_collector_image=true
   select_security_scope
+  if [[ $event != schedule && ( $clippy_loop == true || $clippy_handoff == true ) ]]; then select_job ci/clippy-strict; fi
   for value in "$loop" "$handoff" "$json" "$ondo" "$collector" "$control" "$focused" "$toolchain"; do
     [[ $value == true || $value == false ]] || { printf 'invalid boolean selector output: %s\n' "$value" >&2; exit 1; }
   done
@@ -188,6 +198,7 @@ emit() {
   [[ $security_jobs =~ ^(security/[a-z0-9/-]+(,security/[a-z0-9/-]+)*)?$ ]] || { printf 'invalid security job selector output: %s\n' "$security_jobs" >&2; exit 1; }
   [[ $owning_packages =~ ^([A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]] || { printf 'invalid owning package selector output: %s\n' "$owning_packages" >&2; exit 1; }
   printf '%s\n' \
+    "research_product=$research_product" \
     "image_matrix=$image_matrix" \
     "production_trading_image=$production_trading_image" \
     "production_collector_image=$production_collector_image" \
@@ -204,6 +215,7 @@ emit() {
     "collector=$collector" \
     "control=$control" \
     "focused=$focused" \
+    "focused_packages=,$focused_packages," \
     "toolchain=$toolchain" \
     'selection_complete=true' >>"$output"
 }
@@ -275,7 +287,10 @@ for path in "${paths[@]}"; do
       select_research_image_jobs
       continue
       ;;
-    deployment/aliyun/research/Dockerfile.campaign-cycle-controller|\
+    deployment/aliyun/research/Dockerfile.campaign-cycle-controller)
+      select_research_image_jobs controller
+      continue
+      ;;
     deployment/aliyun/research/Dockerfile.research-data)
       select_research_image_jobs
       continue
@@ -314,7 +329,7 @@ for path in "${paths[@]}"; do
     rust_hft/prediction-markets/*.md)
       continue
       ;;
-    rust_hft/Cargo.lock|rust_hft/prediction-markets/Cargo.lock)
+    rust_hft/Cargo.lock|rust_hft/runtime/Cargo.lock|rust_hft/shared/Cargo.lock|rust_hft/data-pipelines/Cargo.lock|rust_hft/research-core/Cargo.lock|rust_hft/research-core/platform/Cargo.lock|rust_hft/prediction-markets/Cargo.lock)
       if [[ -n $lock_base ]] && narrowed=$(bash "$(dirname "${BASH_SOURCE[0]}")/local-lock-impact.sh" "$lock_base" "$lock_head" "$path"); then
         lock_packages=$(jq -cn --argjson prior "$lock_packages" --argjson names "$narrowed" --arg workspace "${path%/Cargo.lock}" '$prior + [$names[] | {name:.,workspace:$workspace}]')
         needs_metadata=true
@@ -329,6 +344,7 @@ for path in "${paths[@]}"; do
       ;;
     rust_hft/prediction-markets/Cargo.toml)
       select_all_ploy_jobs
+      select_job ci/research-foundation
       continue
       ;;
     rust_hft/prediction-markets/*/Cargo.toml)
@@ -336,19 +352,54 @@ for path in "${paths[@]}"; do
       select_job ploy/audit
       needs_metadata=true
       ;;
-    rust_hft/*/Cargo.toml)
-      needs_metadata=true
-      ;;
-    rust_hft/Cargo.toml)
+    rust_hft/Cargo.toml|rust_hft/workspaces.json|rust_hft/runtime/Cargo.toml|rust_hft/shared/Cargo.toml|rust_hft/data-pipelines/Cargo.toml|rust_hft/research-core/Cargo.toml|rust_hft/research-core/platform/Cargo.toml)
       select_all
       select_all_rust_ci_jobs
+      select_job ci/research-foundation
       select_research_image_jobs
       continue
+      ;;
+    rust_hft/*/Cargo.toml)
+      needs_metadata=true
       ;;
     rust_hft/rust-toolchain*|rust_hft/.cargo/*|.cargo/*)
       select_all
       select_all_rust_ci_jobs
       select_all_ploy_jobs
+      continue
+      ;;
+    .github/scripts/test-clickhouse-preparation.sh|.github/scripts/test-rust-workspaces.sh|.github/scripts/test-rust-docker-workspaces.rb)
+      select_job ci/research-foundation
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      continue
+      ;;
+    .github/scripts/test-market-import.sh)
+      select_job ci/research-foundation
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      continue
+      ;;
+    .github/scripts/research-release-products.sh|.github/scripts/research-release-products.json|.github/scripts/test-research-release-products.sh|.github/scripts/research-release-bundle.rb|.github/scripts/research-release-source-sha.sh|.github/scripts/test-research-checkout-ownership.sh|.github/scripts/verify-research-runtime-abi.sh|.github/scripts/test-research-runtime-abi.sh|.github/scripts/build-research-release.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/verify-research-controller-image.sh|.github/scripts/test-research-controller-image.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
+      select_research_image_jobs
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      continue
+      ;;
+    deployment/aliyun/research/scripts/campaign-cycle-controller.sh|deployment/aliyun/research/scripts/campaign-job-watch.sh|deployment/aliyun/research/scripts/cex-materialization-entrypoint.sh|deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml)
+      select_research_image_jobs controller
+      control=true
+      select_job ci/deployment-artifacts
+      continue
+      ;;
+    .github/scripts/run-prediction-research-contracts.sh)
+      select_job ploy/rust-research-heavy
+      select_job ploy/workflow-lint
+      continue
+      ;;
+    .github/scripts/write-ci-rust-evidence.sh|.github/scripts/verify-ci-rust-evidence.sh|.github/scripts/wait-ci-rust-evidence.sh|.github/scripts/test-ci-rust-evidence.sh|.github/scripts/check-collector-test-presence.sh)
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
       continue
       ;;
     .github/scripts/classify-ack-research-job.sh|.github/scripts/test-classify-ack-research-job.sh|\
@@ -384,13 +435,14 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
+    .github/workflows/market-tape-seal-benchmark.yml|.github/workflows/release-rust.yml|\
     .github/workflows/ci.yml|.github/workflows/ploy-ci.yml|.github/workflows/security-enabled.yml|\
-    .github/scripts/select-rust-ci-scope.sh|\
+    .github/scripts/select-rust-ci-scope.sh|.github/scripts/research-workspace-locks.sh|.github/scripts/check-rust-workspace-reports.sh|.github/scripts/verify-ci-rust-same-run.sh|.github/scripts/test-ci-rust-same-run.sh|\
     .github/scripts/local-lock-impact.sh|.github/scripts/test-local-lock-impact.mjs|\
     .github/scripts/image-build-plan.sh|.github/scripts/test-image-build-plan.sh|\
-    .github/scripts/read-tested-image.sh|.github/scripts/test-tested-image.sh|\
+    .github/scripts/save-tested-image.sh|.github/scripts/read-tested-image.sh|.github/scripts/test-tested-image.sh|\
     .github/scripts/read-published-image-source.sh|.github/scripts/select-main-image-scope.sh|\
-    .github/scripts/test-main-image-scope.sh|\
+    .github/scripts/test-main-image-scope.sh|.github/scripts/read-research-publish-baseline.sh|.github/scripts/select-main-research-scope.sh|.github/scripts/test-main-research-scope.sh|\
     .github/workflows/docker-smoke.yml|.github/workflows/docker-publish.yml|\
     .github/scripts/test-select-rust-ci-scope.sh|.github/scripts/fixtures/rust-ci-scope/*|\
     .github/scripts/verify-ci-gate.sh|.github/scripts/test-ci-monitor-scope.sh|\
@@ -429,17 +481,6 @@ for path in "${paths[@]}"; do
     .github/workflows/*|.github/actions/*|.github/scripts/*)
       printf 'unmapped CI path: %s; add its owning contract mapping before dispatch\n' "$path" >&2
       exit 2
-      ;;
-    deployment/aliyun/research/scripts/cex-materialization-entrypoint.sh|\
-    deployment/aliyun/research/scripts/campaign-cycle-controller.sh|\
-    deployment/aliyun/research/scripts/campaign-job-watch.sh|\
-    deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml)
-      # These files are copied into the controller image. Other experiment/job
-      # configuration is supplied at runtime and cannot change its binaries.
-      research_image_relevant=true
-      control=true
-      select_job ci/deployment-artifacts
-      continue
       ;;
     rust_hft/deployment/k8s/*|deployment/aliyun/research/k8s/*)
       select_job ci/deployment-artifacts
@@ -506,6 +547,13 @@ for path in "${paths[@]}"; do
       select_job ci/polymarket-evidence-compiler-image
       continue
       ;;
+    rust_hft/scripts/workspace-metadata.sh|rust_hft/scripts/cargo-scoped.sh)
+      select_all
+      select_all_rust_ci_jobs
+      select_all_ploy_jobs
+      select_job ci/ci-contracts
+      continue
+      ;;
     rust_hft/scripts/*.sh)
       select_job ci/rust-shell-scripts
       continue
@@ -536,10 +584,7 @@ if [[ -z $metadata ]]; then
   metadata_dir=$(mktemp -d)
   metadata="$metadata_dir/combined.json"
   trap 'rm -rf "$metadata_dir"' EXIT
-  (cd "$repo_root/rust_hft" && cargo metadata --format-version 1 --no-deps --locked) >"$metadata_dir/rust-hft.json"
-  (cd "$repo_root/rust_hft/prediction-markets" && cargo metadata --format-version 1 --no-deps --locked) >"$metadata_dir/prediction-markets.json"
-  jq -s '{packages: [.[].packages[]]}' \
-    "$metadata_dir/rust-hft.json" "$metadata_dir/prediction-markets.json" >"$metadata"
+  "$repo_root/rust_hft/scripts/workspace-metadata.sh" >"$metadata"
 fi
 
 # Turn proven local lock edits into owning manifest paths, then use the same
@@ -690,6 +735,11 @@ select_if_affected json hft-integration hft-data-adapter-binance hft-infra-redis
 select_if_affected ondo hft-data-adapter-ondo-perps hft-execution-adapter-ondo-perps hft-live
 select_if_affected collector hft-collector
 select_if_affected focused hft-live hft-paper hft-all-in-one
+if [[ $focused == true && -z $focused_packages ]]; then
+  for package in hft-live hft-paper hft-all-in-one alpha-harness hft-harnessctl; do
+    if is_affected "$package"; then focused_packages=${focused_packages:+$focused_packages,}$package; fi
+  done
+fi
 
 is_affected hft-live && image_live=true
 is_affected hft-paper && image_paper=true
@@ -710,6 +760,7 @@ for ((index = 0; index < ${#package_names[@]}; index++)); do
   fi
 done
 if [[ $prediction_package_affected == true ]]; then
+  research_product=paired
   research_image_relevant=true
   [[ $event == pull_request ]] && select_job ploy/commit-hygiene
   select_job ploy/rust-format
@@ -728,11 +779,14 @@ select_job_if_affected ploy/frontend ploy-operator-contracts
 select_job_if_affected ploy/integration-regressions ploy
 
 if is_affected hft-collector || is_affected alpha-harness || is_affected hft-backtest; then
+  research_product=paired
   research_image_relevant=true
 fi
 if [[ $event == pull_request ]] && is_affected hft-backtest; then
   select_job ploy/research-image-binaries
 fi
+select_job_if_affected ci/research-foundation hft-market-pipeline
+select_job_if_affected ci/research-foundation hft-data
 select_main_research_image_jobs
 
 while IFS= read -r package; do

@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "hft-data-adapter-deribit-reference"
 version = "0.1.0"
 edition = "2021"

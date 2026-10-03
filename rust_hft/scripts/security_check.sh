@@ -58,10 +58,10 @@ run_security_audit() {
     
     # 更新漏洞數據庫
     echo_info "更新漏洞數據庫..."
-    cargo audit --update || echo_warning "無法更新漏洞數據庫"
+    bash ../.github/scripts/check-rust-workspace-reports.sh audit > audit_results.json || echo_warning "依賴審計報告存在錯誤"
     
     # 運行安全審計
-    if cargo audit --json > audit_results.json 2>/dev/null; then
+    if bash ../.github/scripts/check-rust-workspace-reports.sh audit > audit_results.json 2>/dev/null; then
         local vuln_count=$(jq -r '.vulnerabilities.count // 0' audit_results.json 2>/dev/null || echo "0")
         
         if [ "$vuln_count" -eq 0 ]; then
@@ -69,7 +69,7 @@ run_security_audit() {
         else
             echo_error "發現 $vuln_count 個安全漏洞"
             echo_info "詳細信息:"
-            cargo audit --color=always
+            cat audit_results.json
             return 1
         fi
     else
@@ -90,7 +90,7 @@ check_license_compliance() {
     
     # 檢查許可證
     echo_info "生成許可證報告..."
-    cargo license --json > licenses.json
+    bash ../.github/scripts/check-rust-workspace-reports.sh license > licenses.json
     
     # 檢查不兼容的許可證
     local incompatible_licenses=("GPL-3.0" "AGPL-3.0" "LGPL-3.0")
