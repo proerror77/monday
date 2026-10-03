@@ -24,5 +24,6 @@ done
 for binary in monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
   install -m 0755 "prediction-markets/target/release/$binary" "$release/research-bin/$binary"
 done
+../.github/scripts/verify-research-runtime-abi.sh "$release/research-bin"
 ../.github/scripts/research-image-release-artifact.sh create "$release" "$source_sha" "$GITHUB_RUN_ID" .
 ruby ../.github/scripts/research-release-bundle.rb pack "${RUNNER_TEMP}/research-image-release.tar" "$release"

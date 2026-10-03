@@ -40,6 +40,10 @@ abort 'static Fast compiles research' if fast.to_s.match?(/\bcargo\s+(build|test
 repo_root = File.expand_path('../..', File.dirname(ARGV[0]))
 [[ploy,'research-image-binaries'],[acr,'research-runner-binaries']].each do |doc,id|
   job = doc.fetch('jobs').fetch(id)
+  abort 'release builder lost bookworm ABI binding' unless job.fetch('container').fetch('image') == 'rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec'
+  dependencies = job.fetch('steps').find { |step| step.fetch('name','') == 'Install build dependencies' }.fetch('run')
+  abort 'bookworm release uses Ubuntu package sources' if dependencies.include?('install-ubuntu-packages.sh')
+  %w[gh jq ruby binutils].each { |tool| abort "bookworm release dependency missing: #{tool}" unless dependencies.split.include?(tool) }
   abort 'release compiles whole workspace' if job.to_s.include?('--workspace') || job.to_s.include?('--all-features')
   abort 'release lost bounded native builder' unless job.fetch('steps').any? { |s|s.fetch('run','').include?('build-research-release.sh') }
   job.fetch('steps').each do |step|
@@ -53,6 +57,7 @@ end
 abort 'cross-run source readback missing' unless acr.fetch('jobs').fetch('publish').fetch('steps').any? { |s|s.fetch('run','').include?('download-research-release.sh') }
 abort 'release relationship changed' unless acr.fetch('jobs').fetch('research-release-complete').fetch('needs') == ['selector','publish']
 RUBY
+bash "$script_dir/test-research-runtime-abi.sh"
 # Preserve authenticated exact-source native three-workflow admission.
 grep -Fq 'Read authenticated release admission' "$workflow"
 grep -Fq '.github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID"' "$workflow"
