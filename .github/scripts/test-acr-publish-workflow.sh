@@ -13,13 +13,11 @@ controller_job="$script_dir/../../deployment/aliyun/research/k8s/campaign-cycle-
 source_test_dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.source-test"
 source_test_entrypoint="$script_dir/../../rust_hft/deployment/docker/source-test-entrypoint.sh"
 source_test_job="$script_dir/../../deployment/aliyun/research/k8s/source-test-job.example.yaml"
-root_toolchain="$script_dir/../../rust-toolchain.toml"
 binance_lob_dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"
 market_data_dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.market-data"
 sentinel_dockerfile="$script_dir/../../rust_hft/deployment/docker/Dockerfile.sentinel"
 hft_live_dockerfile="$script_dir/../../rust_hft/ops/hft-live.Dockerfile"
 emergency_collector="$script_dir/../../rust_hft/tools/collector/local-emergency-collector.sh"
-verifier="$script_dir/verify-research-runner-binaries.sh"
 tmp_dir=$(mktemp -d)
 source_test_tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir" "$source_test_tmp_dir"' EXIT
@@ -126,13 +124,13 @@ grep -Fqx 'FROM rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6f
 grep -Fq 'groupadd --gid 1000 research' "$source_test_dockerfile"
 grep -Fqx '    && useradd --create-home --uid 1000 --gid 1000 research' "$source_test_dockerfile"
 grep -Fqx 'COPY --chown=research:research source/rust_hft/ /work/' "$source_test_dockerfile"
-grep -Fqx 'RUN cargo fetch --locked && chown -R research:research "$CARGO_HOME"' "$source_test_dockerfile"
+grep -Fqx 'RUN cargo fetch --manifest-path runtime/Cargo.toml --locked && chown -R research:research "$CARGO_HOME"' "$source_test_dockerfile"
 grep -Fqx 'USER 1000:1000' "$source_test_dockerfile"
 grep -Fqx '    CARGO_HOME=/opt/monday-source-test-cargo \' "$source_test_dockerfile"
 grep -Fqx 'ENTRYPOINT ["/usr/local/bin/monday-source-test"]' "$source_test_dockerfile"
 grep -Fqx 'export CARGO_BUILD_JOBS=2' "$source_test_entrypoint"
 grep -Fqx 'export CARGO_TARGET_DIR=/tmp/monday-source-test-target' "$source_test_entrypoint"
-test "$(grep -n -F 'RUN cargo fetch --locked && chown -R research:research "$CARGO_HOME"' "$source_test_dockerfile" | cut -d: -f1)" \
+test "$(grep -n -F 'RUN cargo fetch --manifest-path runtime/Cargo.toml --locked && chown -R research:research "$CARGO_HOME"' "$source_test_dockerfile" | cut -d: -f1)" \
   -lt "$(grep -n '^ENV CARGO_NET_OFFLINE=true$' "$source_test_dockerfile" | cut -d: -f1)"
 grep -Fqx 'source/rust_hft/config/secrets.yaml' "$dockerignore"
 grep -Fqx 'source/rust_hft/clickhouse_credentials.txt' "$dockerignore"
@@ -155,12 +153,12 @@ chmod 0755 "$source_test_tmp_dir/bin/cargo"
 CARGO_HOME="$source_test_tmp_dir/cargo-home" XDG_RUNTIME_DIR="$source_test_tmp_dir" \
   PATH="$source_test_tmp_dir/bin:$PATH" sh "$source_test_entrypoint" binance-bstocks-attestation \
   >"$source_test_tmp_dir/binance-source-test.out"
-diff -u <(printf '%s\n' 'test --offline --locked -p hft-runtime --lib tokenized_security_requires_runtime_owned_attestation') \
+diff -u <(printf '%s\n' 'test --manifest-path runtime/Cargo.toml --offline --locked -p hft-runtime --lib tokenized_security_requires_runtime_owned_attestation') \
   "$source_test_tmp_dir/binance-source-test.out"
 CARGO_HOME="$source_test_tmp_dir/cargo-home" XDG_RUNTIME_DIR="$source_test_tmp_dir" \
   PATH="$source_test_tmp_dir/bin:$PATH" sh "$source_test_entrypoint" bybit-spot \
   >"$source_test_tmp_dir/bybit-source-test.out"
-diff -u <(printf '%s\n' 'test --offline --locked -p hft-execution-adapter-bybit --lib') \
+diff -u <(printf '%s\n' 'test --manifest-path runtime/Cargo.toml --offline --locked -p hft-execution-adapter-bybit --lib') \
   "$source_test_tmp_dir/bybit-source-test.out"
 if SOURCE_TEST_EMPTY_LIST=true CARGO_HOME="$source_test_tmp_dir/cargo-home" XDG_RUNTIME_DIR="$source_test_tmp_dir" \
   PATH="$source_test_tmp_dir/bin:$PATH" sh "$source_test_entrypoint" binance-bstocks-attestation >/dev/null 2>&1; then

@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --create-home --uid 1000 --gid 1000 research
 
 COPY --chown=research:research source/rust_hft/ /work/
-RUN cargo fetch --locked && chown -R research:research "$CARGO_HOME"
+RUN cargo fetch --manifest-path runtime/Cargo.toml --locked && chown -R research:research "$CARGO_HOME"
 
 ENV CARGO_NET_OFFLINE=true
 

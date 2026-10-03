@@ -357,7 +357,7 @@ for path in "${paths[@]}"; do
       select_all_ploy_jobs
       continue
       ;;
-    .github/scripts/test-clickhouse-preparation.sh|.github/scripts/test-rust-workspaces.sh)
+    .github/scripts/test-clickhouse-preparation.sh|.github/scripts/test-rust-workspaces.sh|.github/scripts/test-rust-docker-workspaces.rb)
       select_job ci/research-foundation
       select_job ci/ci-contracts
       select_job ploy/workflow-lint

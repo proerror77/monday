@@ -27,7 +27,13 @@ ARG TARGET=live
 # 構建指定的目標
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    CARGO_TARGET_DIR=/app/target ./scripts/cargo-scoped.sh build --release --locked -p hft-${TARGET} && \
+    case "$TARGET" in \
+      live|paper) owner=runtime/Cargo.toml ;; \
+      collector) owner=data-pipelines/Cargo.toml ;; \
+      *) echo "unsupported HFT target: $TARGET" >&2; exit 2 ;; \
+    esac && \
+    CARGO_TARGET_DIR=/app/target cargo --config 'build.rustc-wrapper=""' build \
+      --manifest-path "$owner" --release --locked -p "hft-${TARGET}" --bin "hft-${TARGET}" && \
     cp /app/target/release/hft-${TARGET} /app/hft-binary
 
 # ============================================

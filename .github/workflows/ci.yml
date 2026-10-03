@@ -204,6 +204,7 @@ jobs:
           bash .github/scripts/test-collector-control-scheduling.sh
           bash .github/scripts/test-main-image-scope.sh
           bash .github/scripts/test-image-build-plan.sh
+          ruby .github/scripts/test-rust-docker-workspaces.rb --self-test
           bash .github/scripts/test-tested-image.sh
           node .github/scripts/test-local-lock-impact.mjs
           bash .github/scripts/test-ack-rust-batch.sh

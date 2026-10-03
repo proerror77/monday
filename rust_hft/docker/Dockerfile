@@ -12,10 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/work/target,sharing=locked \
-    cargo --config 'build.rustc-wrapper=""' build \
+    CARGO_TARGET_DIR=/work/target cargo --config 'build.rustc-wrapper=""' build \
+    --manifest-path runtime/Cargo.toml \
     --release \
     --locked \
     -p hft-live \
+    --bin hft-live \
     --features "clickhouse,redis,grpc,polymarket" \
     && cp /work/target/release/hft-live /work/hft-live
 
