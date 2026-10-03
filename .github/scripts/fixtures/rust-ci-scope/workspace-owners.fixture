@@ -1,0 +1,2479 @@
+{
+  "packages": [
+    {
+      "name": "alpha-domain",
+      "manifest_path": "rust_hft/alpha-harness/domain/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-factor-dsl",
+          "path": "rust_hft/research-core/factor-dsl",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-manifest",
+          "path": "rust_hft/research-core/manifest",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-governance-contracts",
+          "path": "rust_hft/governance-contracts",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "alpha-engine",
+      "manifest_path": "rust_hft/alpha-harness/engine/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "alpha-domain",
+          "path": "rust_hft/alpha-harness/domain",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "alpha-store",
+          "path": "rust_hft/alpha-harness/store",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-factor-dsl",
+          "path": "rust_hft/research-core/factor-dsl",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-manifest",
+          "path": "rust_hft/research-core/manifest",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-ml",
+          "path": "rust_hft/research-core/ml",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-search-kernel",
+          "path": "rust_hft/research-core/search-kernel",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "alpha-store",
+          "path": "rust_hft/alpha-harness/store",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-strategy-formula",
+          "path": "rust_hft/strategy-framework/strategies/formula",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "alpha-harness",
+      "manifest_path": "rust_hft/alpha-harness/app/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "alpha-domain",
+          "path": "rust_hft/alpha-harness/domain",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "alpha-engine",
+          "path": "rust_hft/alpha-harness/engine",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "alpha-onnx-evaluator",
+          "path": "rust_hft/alpha-harness/onnx-evaluator",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "alpha-store",
+          "path": "rust_hft/alpha-harness/store",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-governance-contracts",
+          "path": "rust_hft/governance-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-backtest",
+          "path": "rust_hft/apps/backtest",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-collector",
+          "path": "rust_hft/tools/collector",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-factor-dsl",
+          "path": "rust_hft/research-core/factor-dsl",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-manifest",
+          "path": "rust_hft/research-core/manifest",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-ml",
+          "path": "rust_hft/research-core/ml",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "alpha-onnx-evaluator",
+      "manifest_path": "rust_hft/alpha-harness/onnx-evaluator/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "alpha-domain",
+          "path": "rust_hft/alpha-harness/domain",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "alpha-engine",
+          "path": "rust_hft/alpha-harness/engine",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-infer-onnx",
+          "path": "rust_hft/strategy-framework/infer-onnx",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-manifest",
+          "path": "rust_hft/research-core/manifest",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "alpha-store",
+      "manifest_path": "rust_hft/alpha-harness/store/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "alpha-domain",
+          "path": "rust_hft/alpha-harness/domain",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-governance-contracts",
+          "path": "rust_hft/governance-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-factor-dsl",
+          "path": "rust_hft/research-core/factor-dsl",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-manifest",
+          "path": "rust_hft/research-core/manifest",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-all-in-one",
+      "manifest_path": "rust_hft/apps/all-in-one/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-runtime",
+          "path": "rust_hft/market-core/runtime",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-backtest",
+      "manifest_path": "rust_hft/apps/backtest/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data",
+          "path": "rust_hft/data-pipelines/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-manifest",
+          "path": "rust_hft/research-core/manifest",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-platform",
+          "path": "rust_hft/research-core/platform",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-binance-md",
+      "manifest_path": "rust_hft/apps/binance-md/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data-adapter-binance",
+          "path": "rust_hft/data-pipelines/adapters/adapter-binance",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-engine",
+          "path": "rust_hft/market-core/engine",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-collector",
+      "manifest_path": "rust_hft/tools/collector/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data-adapter-binance",
+          "path": "rust_hft/data-pipelines/adapters/adapter-binance",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-data",
+          "path": "rust_hft/data-pipelines/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-engine",
+          "path": "rust_hft/market-core/engine",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-manifest",
+          "path": "rust_hft/research-core/manifest",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "polymarket-tape-contract",
+          "path": "rust_hft/shared/polymarket-tape",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-core",
+      "manifest_path": "rust_hft/market-core/core/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-data",
+      "manifest_path": "rust_hft/data-pipelines/core/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-asterdex",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-asterdex/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data-adapters-common",
+          "path": "rust_hft/data-pipelines/adapters-common",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-binance",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-binance/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data-adapters-common",
+          "path": "rust_hft/data-pipelines/adapters-common",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-binance-prediction",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-binance-prediction/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-bitget",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-bitget/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data-adapters-common",
+          "path": "rust_hft/data-pipelines/adapters-common",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-bybit",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-bybit/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data-adapters-common",
+          "path": "rust_hft/data-pipelines/adapters-common",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-deribit-reference",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-deribit-reference/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data",
+          "path": "rust_hft/data-pipelines/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-grvt",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-grvt/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data-adapters-common",
+          "path": "rust_hft/data-pipelines/adapters-common",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-mock",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-mock/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-ondo-perps",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-ondo-perps/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-polymarket",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-polymarket/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapter-predict-fun",
+      "manifest_path": "rust_hft/data-pipelines/adapters/adapter-predict-fun/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-data-adapters-common",
+      "manifest_path": "rust_hft/data-pipelines/adapters-common/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-engine",
+      "manifest_path": "rust_hft/market-core/engine/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-infra-metrics",
+          "path": "rust_hft/infra-services/core/metrics",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-snapshot",
+          "path": "rust_hft/market-core/snapshot",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-data-adapter-bitget",
+          "path": "rust_hft/data-pipelines/adapters/adapter-bitget",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-oms-core",
+          "path": "rust_hft/risk-control/oms-core",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-portfolio-core",
+          "path": "rust_hft/risk-control/portfolio-core",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-strategy-arbitrage",
+          "path": "rust_hft/strategy-framework/strategies/arbitrage",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-strategy-imbalance",
+          "path": "rust_hft/strategy-framework/strategies/imbalance",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-strategy-trend",
+          "path": "rust_hft/strategy-framework/strategies/trend",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-execution",
+      "manifest_path": "rust_hft/execution-gateway/execution/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-execution-adapter-asterdex",
+      "manifest_path": "rust_hft/execution-gateway/adapters/adapter-asterdex/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-execution",
+          "path": "rust_hft/execution-gateway/execution",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-execution-adapter-binance",
+      "manifest_path": "rust_hft/execution-gateway/adapters/adapter-binance/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-execution",
+          "path": "rust_hft/execution-gateway/execution",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-execution-adapter-binance-prediction",
+      "manifest_path": "rust_hft/execution-gateway/adapters/adapter-binance-prediction/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-execution",
+          "path": "rust_hft/execution-gateway/execution",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-execution-adapter-bitget",
+      "manifest_path": "rust_hft/execution-gateway/adapters/adapter-bitget/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-execution",
+          "path": "rust_hft/execution-gateway/execution",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-execution-adapter-bybit",
+      "manifest_path": "rust_hft/execution-gateway/adapters/adapter-bybit/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-execution",
+          "path": "rust_hft/execution-gateway/execution",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-execution-adapter-grvt",
+      "manifest_path": "rust_hft/execution-gateway/adapters/adapter-grvt/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-execution-adapter-okx",
+      "manifest_path": "rust_hft/execution-gateway/adapters/adapter-okx/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-execution",
+          "path": "rust_hft/execution-gateway/execution",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-execution-adapter-ondo-perps",
+      "manifest_path": "rust_hft/execution-gateway/adapters/adapter-ondo-perps/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-execution-adapter-polymarket",
+      "manifest_path": "rust_hft/execution-gateway/adapters/adapter-polymarket/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-factor-dsl",
+      "manifest_path": "rust_hft/research-core/factor-dsl/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-research-manifest",
+          "path": "rust_hft/research-core/manifest",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-governance-contracts",
+      "manifest_path": "rust_hft/governance-contracts/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-grpc-server",
+      "manifest_path": "rust_hft/infra-services/core/grpc-server/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-engine",
+          "path": "rust_hft/market-core/engine",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-harnessctl",
+      "manifest_path": "rust_hft/tools/harnessctl/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-infer-onnx",
+      "manifest_path": "rust_hft/strategy-framework/infer-onnx/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-infra-clickhouse",
+      "manifest_path": "rust_hft/infra-services/core/clickhouse/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-infra-metrics",
+      "manifest_path": "rust_hft/infra-services/core/metrics/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-infra-redis",
+      "manifest_path": "rust_hft/infra-services/core/redis/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-infra-secrets",
+      "manifest_path": "rust_hft/infra-services/core/secrets/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-integration",
+      "manifest_path": "rust_hft/market-core/integration/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-ipc",
+      "manifest_path": "rust_hft/infra-services/core/ipc/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-shared-config",
+          "path": "rust_hft/shared/config",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-live",
+      "manifest_path": "rust_hft/apps/live/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "alpha-domain",
+          "path": "rust_hft/alpha-harness/domain",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-data",
+          "path": "rust_hft/data-pipelines/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-engine",
+          "path": "rust_hft/market-core/engine",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-governance-contracts",
+          "path": "rust_hft/governance-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-grpc-server",
+          "path": "rust_hft/infra-services/core/grpc-server",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-infra-metrics",
+          "path": "rust_hft/infra-services/core/metrics",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-risk",
+          "path": "rust_hft/risk-control/risk",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-runtime",
+          "path": "rust_hft/market-core/runtime",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-snapshot",
+          "path": "rust_hft/market-core/snapshot",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-market-pipeline",
+      "manifest_path": "rust_hft/data-pipelines/market-pipeline/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data",
+          "path": "rust_hft/data-pipelines/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-oms-core",
+      "manifest_path": "rust_hft/risk-control/oms-core/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-paper",
+      "manifest_path": "rust_hft/apps/paper/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-infra-metrics",
+          "path": "rust_hft/infra-services/core/metrics",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-runtime",
+          "path": "rust_hft/market-core/runtime",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-portfolio-core",
+      "manifest_path": "rust_hft/risk-control/portfolio-core/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-oms-core",
+          "path": "rust_hft/risk-control/oms-core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-snapshot",
+          "path": "rust_hft/market-core/snapshot",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-ports",
+      "manifest_path": "rust_hft/market-core/ports/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-snapshot",
+          "path": "rust_hft/market-core/snapshot",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-replay",
+      "manifest_path": "rust_hft/apps/replay/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-infra-metrics",
+          "path": "rust_hft/infra-services/core/metrics",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-runtime",
+          "path": "rust_hft/market-core/runtime",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-research-manifest",
+      "manifest_path": "rust_hft/research-core/manifest/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-research-ml",
+      "manifest_path": "rust_hft/research-core/ml/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-research-manifest",
+          "path": "rust_hft/research-core/manifest",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-research-platform",
+      "manifest_path": "rust_hft/research-core/platform/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-risk",
+      "manifest_path": "rust_hft/risk-control/risk/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-runtime",
+      "manifest_path": "rust_hft/market-core/runtime/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data-adapter-asterdex",
+          "path": "rust_hft/data-pipelines/adapters/adapter-asterdex",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-execution-adapter-asterdex",
+          "path": "rust_hft/execution-gateway/adapters/adapter-asterdex",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-binance",
+          "path": "rust_hft/data-pipelines/adapters/adapter-binance",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-execution-adapter-binance",
+          "path": "rust_hft/execution-gateway/adapters/adapter-binance",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-binance-prediction",
+          "path": "rust_hft/data-pipelines/adapters/adapter-binance-prediction",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-execution-adapter-binance-prediction",
+          "path": "rust_hft/execution-gateway/adapters/adapter-binance-prediction",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-bitget",
+          "path": "rust_hft/data-pipelines/adapters/adapter-bitget",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-execution-adapter-bitget",
+          "path": "rust_hft/execution-gateway/adapters/adapter-bitget",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-bybit",
+          "path": "rust_hft/data-pipelines/adapters/adapter-bybit",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-execution-adapter-bybit",
+          "path": "rust_hft/execution-gateway/adapters/adapter-bybit",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-grvt",
+          "path": "rust_hft/data-pipelines/adapters/adapter-grvt",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-execution-adapter-grvt",
+          "path": "rust_hft/execution-gateway/adapters/adapter-grvt",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-mock",
+          "path": "rust_hft/data-pipelines/adapters/adapter-mock",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-execution-adapter-okx",
+          "path": "rust_hft/execution-gateway/adapters/adapter-okx",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-ondo-perps",
+          "path": "rust_hft/data-pipelines/adapters/adapter-ondo-perps",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-execution-adapter-ondo-perps",
+          "path": "rust_hft/execution-gateway/adapters/adapter-ondo-perps",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-polymarket",
+          "path": "rust_hft/data-pipelines/adapters/adapter-polymarket",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-execution-adapter-polymarket",
+          "path": "rust_hft/execution-gateway/adapters/adapter-polymarket",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-engine",
+          "path": "rust_hft/market-core/engine",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-factor-dsl",
+          "path": "rust_hft/research-core/factor-dsl",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-infra-clickhouse",
+          "path": "rust_hft/infra-services/core/clickhouse",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-ipc",
+          "path": "rust_hft/infra-services/core/ipc",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-infra-metrics",
+          "path": "rust_hft/infra-services/core/metrics",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-infra-redis",
+          "path": "rust_hft/infra-services/core/redis",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-infra-secrets",
+          "path": "rust_hft/infra-services/core/secrets",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-integration",
+          "path": "rust_hft/market-core/integration",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-oms-core",
+          "path": "rust_hft/risk-control/oms-core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-portfolio-core",
+          "path": "rust_hft/risk-control/portfolio-core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-risk",
+          "path": "rust_hft/risk-control/risk",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-shared-config",
+          "path": "rust_hft/shared/config",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-shared-instrument",
+          "path": "rust_hft/shared/instrument",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-snapshot",
+          "path": "rust_hft/market-core/snapshot",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-strategy-arbitrage",
+          "path": "rust_hft/strategy-framework/strategies/arbitrage",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-strategy-dl",
+          "path": "rust_hft/strategy-framework/strategy-dl",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-strategy-formula",
+          "path": "rust_hft/strategy-framework/strategies/formula",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-strategy-imbalance",
+          "path": "rust_hft/strategy-framework/strategies/imbalance",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-strategy-lob-flow-grid",
+          "path": "rust_hft/strategy-framework/strategies/lob_flow_grid",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-strategy-trend",
+          "path": "rust_hft/strategy-framework/strategies/trend",
+          "kind": null,
+          "target": null,
+          "optional": true
+        }
+      ]
+    },
+    {
+      "name": "hft-search-kernel",
+      "manifest_path": "rust_hft/research-core/search-kernel/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-shared-config",
+      "manifest_path": "rust_hft/shared/config/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-shared-instrument",
+          "path": "rust_hft/shared/instrument",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-shared-instrument",
+      "manifest_path": "rust_hft/shared/instrument/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-snapshot",
+      "manifest_path": "rust_hft/market-core/snapshot/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-strategy-arbitrage",
+      "manifest_path": "rust_hft/strategy-framework/strategies/arbitrage/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-strategy-dl",
+      "manifest_path": "rust_hft/strategy-framework/strategy-dl/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-infer-onnx",
+          "path": "rust_hft/strategy-framework/infer-onnx",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-strategy-formula",
+      "manifest_path": "rust_hft/strategy-framework/strategies/formula/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-factor-dsl",
+          "path": "rust_hft/research-core/factor-dsl",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-research-manifest",
+          "path": "rust_hft/research-core/manifest",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-strategy-imbalance",
+      "manifest_path": "rust_hft/strategy-framework/strategies/imbalance/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-strategy-lob-flow-grid",
+      "manifest_path": "rust_hft/strategy-framework/strategies/lob_flow_grid/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "hft-strategy-trend",
+      "manifest_path": "rust_hft/strategy-framework/strategies/trend/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "listing-monitor",
+      "manifest_path": "rust_hft/tools/listing-monitor/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "new-ploy-runner",
+      "manifest_path": "rust_hft/prediction-markets/apps/new-ploy-runner/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-runner-host",
+          "path": "rust_hft/prediction-markets/crates/ploy-runner-host",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "new-ployd",
+      "manifest_path": "rust_hft/prediction-markets/apps/new-ployd/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-daemon-host",
+          "path": "rust_hft/prediction-markets/crates/ploy-daemon-host",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy",
+      "manifest_path": "rust_hft/prediction-markets/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-deployments",
+          "path": "rust_hft/prediction-markets/crates/ploy-deployments",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-platform",
+          "path": "rust_hft/prediction-markets/crates/ploy-platform",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-agent-sidecar",
+      "manifest_path": "rust_hft/prediction-markets/apps/ploy-agent-sidecar/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-control-client",
+          "path": "rust_hft/prediction-markets/crates/ploy-control-client",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-research",
+          "path": "rust_hft/prediction-markets/crates/ploy-research",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-backtest",
+      "manifest_path": "rust_hft/prediction-markets/apps/ploy-backtest/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-runner-host",
+          "path": "rust_hft/prediction-markets/crates/ploy-runner-host",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-control-client",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-control-client/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-daemon-host",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-daemon-host/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-deployments",
+          "path": "rust_hft/prediction-markets/crates/ploy-deployments",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-platform",
+          "path": "rust_hft/prediction-markets/crates/ploy-platform",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-platform-runtime",
+          "path": "rust_hft/prediction-markets/crates/ploy-platform-runtime",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-portfolio-core",
+          "path": "rust_hft/risk-control/portfolio-core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-market-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-market-contracts",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-strategy-bundles",
+          "path": "rust_hft/prediction-markets/crates/ploy-strategy-bundles",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-deployments",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-deployments/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-feed-loaders",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-feed-loaders/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-market-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-market-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-market-contracts",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-market-contracts/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "ploy-market-data",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-market-data/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data-adapter-binance",
+          "path": "rust_hft/data-pipelines/adapters/adapter-binance",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-deribit-reference",
+          "path": "rust_hft/data-pipelines/adapters/adapter-deribit-reference",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-polymarket",
+          "path": "rust_hft/data-pipelines/adapters/adapter-polymarket",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data-adapter-predict-fun",
+          "path": "rust_hft/data-pipelines/adapters/adapter-predict-fun",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "hft-data",
+          "path": "rust_hft/data-pipelines/core",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "ploy-market-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-market-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-operator-contracts",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-operator-contracts/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-market-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-market-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-platform",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-platform/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-platform-runtime",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-platform-runtime/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-deployments",
+          "path": "rust_hft/prediction-markets/crates/ploy-deployments",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-platform",
+          "path": "rust_hft/prediction-markets/crates/ploy-platform",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-portfolio-core",
+          "path": "rust_hft/risk-control/portfolio-core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-replay",
+      "manifest_path": "rust_hft/prediction-markets/apps/ploy-replay/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-runner-host",
+          "path": "rust_hft/prediction-markets/crates/ploy-runner-host",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-research",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-research/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-data",
+          "path": "rust_hft/data-pipelines/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-portfolio-core",
+          "path": "rust_hft/risk-control/portfolio-core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-search-kernel",
+          "path": "rust_hft/research-core/search-kernel",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-feed-loaders",
+          "path": "rust_hft/prediction-markets/crates/ploy-feed-loaders",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "ploy-market-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-market-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-market-data",
+          "path": "rust_hft/prediction-markets/crates/ploy-market-data",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-runner-host",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-runner-host/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-deployments",
+          "path": "rust_hft/prediction-markets/crates/ploy-deployments",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-market-data",
+          "path": "rust_hft/prediction-markets/crates/ploy-market-data",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "ploy-strategy-bundles",
+          "path": "rust_hft/prediction-markets/crates/ploy-strategy-bundles",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-strategy-runtime",
+          "path": "rust_hft/prediction-markets/crates/ploy-strategy-runtime",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-strategy-bundles",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-strategy-bundles/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-market-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-market-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "polymarket-tape-contract",
+          "path": "rust_hft/shared/polymarket-tape",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-portfolio-core",
+          "path": "rust_hft/risk-control/portfolio-core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-feed-loaders",
+          "path": "rust_hft/prediction-markets/crates/ploy-feed-loaders",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploy-strategy-runtime",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-strategy-runtime/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-feed-loaders",
+          "path": "rust_hft/prediction-markets/crates/ploy-feed-loaders",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "ploy-market-data",
+          "path": "rust_hft/prediction-markets/crates/ploy-market-data",
+          "kind": null,
+          "target": null,
+          "optional": true
+        },
+        {
+          "name": "ploy-strategy-bundles",
+          "path": "rust_hft/prediction-markets/crates/ploy-strategy-bundles",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-portfolio-core",
+          "path": "rust_hft/risk-control/portfolio-core",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ployctl",
+      "manifest_path": "rust_hft/prediction-markets/apps/ployctl/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-control-client",
+          "path": "rust_hft/prediction-markets/crates/ploy-control-client",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ploytui",
+      "manifest_path": "rust_hft/prediction-markets/apps/ploytui/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "ploy-control-client",
+          "path": "rust_hft/prediction-markets/crates/ploy-control-client",
+          "kind": null,
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "ploy-operator-contracts",
+          "path": "rust_hft/prediction-markets/crates/ploy-operator-contracts",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "polymarket-tape-contract",
+      "manifest_path": "rust_hft/shared/polymarket-tape/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "rust-hft-workspace",
+      "manifest_path": "rust_hft/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "hft-engine",
+          "path": "rust_hft/market-core/engine",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-core",
+          "path": "rust_hft/market-core/core",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        },
+        {
+          "name": "hft-ports",
+          "path": "rust_hft/market-core/ports",
+          "kind": "dev",
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
+      "name": "ws-connection-test",
+      "manifest_path": "rust_hft/tools/ws_test/Cargo.toml",
+      "dependencies": []
+    }
+  ]
+}

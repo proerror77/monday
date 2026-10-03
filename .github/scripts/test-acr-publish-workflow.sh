@@ -112,6 +112,36 @@ abort 'registry identity removed before image readback' unless logout && logout>
 source=acr.fetch('jobs').fetch('publish-source-test')
 abort 'source test lost offline fixed profile' unless source.fetch('steps').any? { |s|s.fetch('run','').include?('docker run --rm --network none') }
 RUBY
+# Exercise the actual target matrix together with the controller step predicate.
+# This catches a valid-looking predicate that is false for every selected row.
+ruby -ryaml - "$workflow" "$tmp_dir" <<'RUBY'
+acr=YAML.safe_load(File.read(ARGV[0]))
+selector=acr.fetch('jobs').fetch('selector').fetch('steps').find { |s|s['id']=='select' }
+File.write(File.join(ARGV[1],'select-matrix.sh'),selector.fetch('run'))
+controller=acr.fetch('jobs').fetch('publish').fetch('steps').find { |s|s['name']=='Verify Campaign cycle controller image' }
+File.write(File.join(ARGV[1],'controller-condition.txt'),controller.fetch('if'))
+abort 'controller verifier is not used by publication' unless controller.fetch('run').include?('verify-research-controller-image.sh')
+complete=acr.fetch('jobs').fetch('research-release-complete')
+abort 'completion marker can bypass failed publication' unless complete.fetch('needs').include?('publish') && complete.fetch('if').include?("needs.publish.result == 'success'")
+RUBY
+for publish_target in all research-runner campaign-cycle-controller; do
+  : >"$tmp_dir/matrix-output"
+  TARGET="$publish_target" GITHUB_OUTPUT="$tmp_dir/matrix-output" bash "$tmp_dir/select-matrix.sh"
+  sed 's/^matrix=//' "$tmp_dir/matrix-output" >"$tmp_dir/matrix.json"
+  ruby -rjson - "$tmp_dir/matrix.json" "$tmp_dir/controller-condition.txt" <<'RUBY'
+rows=JSON.parse(File.read(ARGV[0])).fetch('include')
+controller=rows.find { |row|row['repository']=='campaign-cycle-controller' }
+abort 'actual publish matrix omitted prebuilt controller' unless controller && controller['research_artifact']==true
+condition=File.read(ARGV[1]).strip.sub(/\A\$\{\{\s*/,'').sub(/\s*\}\}\z/,'')
+tokens=condition.scan(/matrix\.(?:repository|research_artifact)|'[^']*'|true|false|==|!=|&&|\|\||[!()]|\s+/)
+abort 'unrecognized controller predicate' unless tokens.join==condition
+expression=condition.gsub('matrix.repository','row.fetch("repository")').gsub('matrix.research_artifact','row.fetch("research_artifact")')
+rows.each do |row|
+  actual=eval(expression,binding)
+  abort "controller verification unreachable or misselected: #{row['repository']}" unless actual==(row['repository']=='campaign-cycle-controller')
+end
+RUBY
+done
 # Selector still owns approved source-test SHA/profile/tag; no public job may
 # accept a free-form compiler command or recreate a hosted source-test build.
 grep -Fqx '      source_test_profile: ${{ steps.source.outputs.source_test_profile }}' "$workflow"
@@ -205,4 +235,5 @@ fi
 "$script_dir/test-research-image-release-artifact.sh"
 "$script_dir/test-acr-publish-source-readback.sh"
 "$script_dir/test-download-research-release.sh"
+bash "$script_dir/test-research-controller-image.sh"
 printf 'ACR native build, fixed domain tests and release metadata contracts passed\n'

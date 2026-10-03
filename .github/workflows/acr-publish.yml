@@ -355,35 +355,15 @@ jobs:
           retention-days: 90
 
       - name: Verify Campaign cycle controller image
-        if: ${{ (matrix.repository == 'campaign-cycle-controller') && !matrix.research_artifact }}
+        if: matrix.repository == 'campaign-cycle-controller'
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           set -euo pipefail
           docker pull "$IMAGE"
-          actual_source_revision=$(docker image inspect \
-            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
-            "$IMAGE")
-          test "$actual_source_revision" = "$SOURCE_REVISION"
-          docker run --rm --entrypoint /bin/bash "$IMAGE" -ceu '
-            command -v jq
-            test -x /usr/local/bin/aliyun
-            test -x /usr/local/bin/kubectl
-            test -x /usr/local/bin/alpha-harness
-            test -x /usr/local/bin/binance-market-tape-slicer
-            test -x /usr/local/bin/lob-pit-materializer
-            test -x /usr/local/bin/binance-replay-parquet-materializer
-            test -x /usr/local/bin/cex-materialization-entrypoint.sh
-            bash -n /usr/local/bin/cex-materialization-entrypoint.sh
-            test -x /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
-            test -r /opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml
-          '
-          docker run --rm --entrypoint /usr/local/bin/alpha-harness "$IMAGE" \
-            --version | grep -Fqx "alpha-harness $SOURCE_REVISION"
-          docker run --rm --entrypoint /usr/local/bin/aliyun "$IMAGE" version
-          docker run --rm --entrypoint /usr/local/bin/kubectl "$IMAGE" \
-            version --client=true
+          bash .github/scripts/verify-research-controller-image.sh \
+            "$IMAGE" "$SOURCE_REVISION" "${RUNNER_TEMP}/research-release/research-bin"
 
       - name: Package bare-metal trading host contract
         if: ${{ (matrix.repository == 'hft-trading') && !matrix.research_artifact }}

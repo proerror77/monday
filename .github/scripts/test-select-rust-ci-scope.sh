@@ -11,6 +11,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 run_case() {
   local name=$1 event=$2 changed=$3 ref=
+  local metadata=${4:-"$fixtures/metadata.fixture"}
   local output="$tmp_dir/$name.out"
   local changed_file="$fixtures/$changed"
   [[ -f $changed_file ]] || changed_file="$tmp_dir/$changed"
@@ -18,7 +19,7 @@ run_case() {
   # Each scenario is a fresh workflow output file, including repeated paths.
   : > "$output"
   GITHUB_REF=$ref "$selector" --event "$event" --changed-files "$changed_file" \
-    --metadata "$fixtures/metadata.fixture" --output "$output"
+    --metadata "$metadata" --output "$output"
   printf '%s\n' "$output"
 }
 
@@ -252,6 +253,16 @@ for event in pull_request push; do
   assert_jobs "$image_scope" "$expected"
   for flag in loop handoff json ondo collector control focused toolchain; do assert_flag "$image_scope" "$flag" false; done
 done
+for helper in verify-research-controller-image.sh test-research-controller-image.sh; do
+  printf '%s\n' ".github/scripts/$helper" >"$tmp_dir/controller-image-helper.txt"
+  for event in pull_request push; do
+    helper_scope=$(run_case "controller-helper-$event" "$event" controller-image-helper.txt)
+    expected='ci/ci-contracts,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
+    [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+    assert_jobs "$helper_scope" "$expected"
+    assert_flag "$helper_scope" toolchain false
+  done
+done
 # Adding an infrastructure helper to real Rust work must preserve the same
 # source-graph suites; the cheap path is not a short circuit for mixed changes.
 printf '%s\n' .github/scripts/wait-ack-research-receipt.sh >"$tmp_dir/ack-with-collector.txt"
@@ -366,6 +377,45 @@ assert_flag "$pipeline" handoff false
 printf '%s\n' .github/scripts/test-market-import.sh >"$tmp_dir/market-import-driver.txt"
 import_driver=$(run_case market-import-driver pull_request market-import-driver.txt)
 assert_jobs "$import_driver" 'ci/research-foundation,ci/ci-contracts,ploy/workflow-lint'
+
+# This graph contains every member and local dependency of the six locked owners,
+# including control -> backtest -> Alpha. Keep the smaller fixture for its existing
+# scenarios, which deliberately model a different dependency graph.
+owners_metadata="$fixtures/workspace-owners.fixture"
+jq -e '.packages | length == 92 and (map(.name) | unique | length == 92)' "$owners_metadata" >/dev/null
+workspace_inputs=(
+  rust_hft/Cargo.toml
+  rust_hft/workspaces.json
+  rust_hft/shared/Cargo.toml
+  rust_hft/data-pipelines/Cargo.toml
+  rust_hft/research-core/Cargo.toml
+  rust_hft/research-core/platform/Cargo.toml
+  rust_hft/runtime/Cargo.toml
+  rust_hft/prediction-markets/Cargo.toml
+)
+for event in pull_request push; do
+  for path in "${workspace_inputs[@]}"; do
+    printf '%s\n' "$path" >"$tmp_dir/owner-config.txt"
+    owner_config=$(run_case "owner-config-$event" "$event" owner-config.txt "$owners_metadata")
+    grep -Eq '^jobs=.*,(ci/research-foundation),' "$owner_config" || {
+      printf 'workspace input omitted foundation: %s %s\n' "$event" "$path" >&2
+      exit 1
+    }
+    assert_flag "$owner_config" selection_complete true
+  done
+  printf '%s\n' rust_hft/research-core/platform/src/build.rs >"$tmp_dir/control-owner.txt"
+  control_owner=$(run_case "control-owner-$event" "$event" control-owner.txt "$owners_metadata")
+  assert_owning_packages "$control_owner" hft-research-platform
+  grep -Fqx 'loop_packages=,alpha-harness,' "$control_owner"
+  grep -Eq '^jobs=.*,(ci/research-foundation),' "$control_owner"
+  grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$control_owner"
+  if [[ $event == push ]]; then grep -Eq '^jobs=.*,(ploy/research-image-smoke),' "$control_owner"; fi
+  owner_docs=$(run_case "owner-docs-$event" "$event" docs.txt "$owners_metadata")
+  assert_flag "$owner_docs" toolchain false
+  if grep -Eq '^jobs=.*,(ci/rust|ci/research-foundation|ploy/research-image-binaries|ploy/research-image-smoke),' "$owner_docs"; then
+    echo 'docs-only owner graph selected compilation' >&2; exit 1
+  fi
+done
 
 same_suite=$(run_case same-suite pull_request same-suite.txt)
 assert_jobs "$same_suite" 'ci/rust,ci/deployment-artifacts'
@@ -668,7 +718,7 @@ if printf '%s' '{"selector":{"result":"success"},"rust":{"result":"skipped"}}' |
 fi
 printf '%s' '{"selector":{"result":"success"},"rust":{"result":"success"}}' | \
   bash "$gate" --expected-jobs ',ci/rust,'
-for selected in ploy/architecture-contracts ci/rust-hft-engine-fast-lane; do
+for selected in ploy/architecture-contracts ci/rust-hft-engine-fast-lane ci/research-foundation; do
   job=${selected#*/}
   [[ $selected == ci/* ]] && job=${job//-/_}
   for state in missing skipped failure cancelled; do

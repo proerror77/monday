@@ -335,6 +335,7 @@ for path in "${paths[@]}"; do
       ;;
     rust_hft/prediction-markets/Cargo.toml)
       select_all_ploy_jobs
+      select_job ci/research-foundation
       continue
       ;;
     rust_hft/prediction-markets/*/Cargo.toml)
@@ -345,6 +346,7 @@ for path in "${paths[@]}"; do
     rust_hft/Cargo.toml|rust_hft/workspaces.json|rust_hft/runtime/Cargo.toml|rust_hft/shared/Cargo.toml|rust_hft/data-pipelines/Cargo.toml|rust_hft/research-core/Cargo.toml|rust_hft/research-core/platform/Cargo.toml)
       select_all
       select_all_rust_ci_jobs
+      select_job ci/research-foundation
       select_research_image_jobs
       continue
       ;;
@@ -369,7 +371,7 @@ for path in "${paths[@]}"; do
       select_job ploy/workflow-lint
       continue
       ;;
-    .github/scripts/research-release-bundle.rb|.github/scripts/research-release-source-sha.sh|.github/scripts/test-research-checkout-ownership.sh|.github/scripts/verify-research-runtime-abi.sh|.github/scripts/test-research-runtime-abi.sh|.github/scripts/build-research-release.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
+    .github/scripts/research-release-bundle.rb|.github/scripts/research-release-source-sha.sh|.github/scripts/test-research-checkout-ownership.sh|.github/scripts/verify-research-runtime-abi.sh|.github/scripts/test-research-runtime-abi.sh|.github/scripts/build-research-release.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/verify-research-controller-image.sh|.github/scripts/test-research-controller-image.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
       select_research_image_jobs
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
