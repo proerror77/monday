@@ -11,7 +11,7 @@ on:
 
 concurrency:
   group: security-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,7 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      jobs: ${{ steps.scope.outputs.security_jobs }}
+      image_matrix: ${{ steps.images.outputs.image_matrix || steps.scope.outputs.image_matrix }}
+      ack_research: ${{ steps.ack.outputs.ack_research }}
+      jobs: ${{ steps.images.outputs.security_jobs || steps.scope.outputs.security_jobs }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
       clippy_loop: ${{ steps.scope.outputs.clippy_loop }}
       clippy_handoff: ${{ steps.scope.outputs.clippy_handoff }}
@@ -30,8 +32,6 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-      - name: Test CI job selector
-        run: .github/scripts/test-select-rust-ci-scope.sh
       - name: Select security jobs
         id: scope
         env:
@@ -43,13 +43,32 @@ jobs:
           --base "${BASE_SHA}"
           --head "${HEAD_SHA}"
 
+      - name: Carry unpublished image changes forward on main
+        id: images
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          SELECTED_SECURITY_JOBS: ${{ steps.scope.outputs.security_jobs }}
+          SELECTED_IMAGE_MATRIX: ${{ steps.scope.outputs.image_matrix }}
+        run: bash .github/scripts/select-main-image-scope.sh "$GITHUB_SHA" "$GITHUB_OUTPUT"
+
+      - name: Classify research execution scope
+        id: ack
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SELECTED_LOOP: ${{ steps.scope.outputs.clippy_loop }}
+        run: |
+          .github/scripts/classify-ack-research-job.sh --detect-scope --repository "$GITHUB_REPOSITORY" --event "$GITHUB_EVENT_NAME" --base "$BASE_SHA" --head "$HEAD_SHA" --loop "$SELECTED_LOOP"
+
   security-scope:
     name: Security job scope
     needs: security-selector
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      image_matrix: ${{ needs.security-selector.outputs.image_matrix }}
+      ack_research: ${{ needs.security-selector.outputs.ack_research }}
       jobs: ${{ steps.scope.outputs.jobs }}
       clippy_loop: ${{ steps.scope.outputs.clippy_loop }}
       clippy_handoff: ${{ steps.scope.outputs.clippy_handoff }}
@@ -69,8 +88,8 @@ jobs:
             printf 'jobs=%s\n' "$SELECTED_SECURITY_JOBS"
             printf 'clippy_loop=%s\nclippy_handoff=%s\n' "$CLIPPY_LOOP" "$CLIPPY_HANDOFF"
           else
-            printf '%s\n' 'clippy_loop=true' 'clippy_handoff=true'
-            printf '%s\n' 'jobs=,security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection,'
+            echo 'CI selection failed or returned an invalid plan; no work is dispatched' >&2
+            exit 1
           fi >> "$GITHUB_OUTPUT"
 
   # ============================================================================
@@ -216,25 +235,33 @@ jobs:
     needs: security-scope
     if: ${{ contains(needs.security-scope.outputs.jobs, ',security/clippy-strict,') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
     defaults:
       run:
         working-directory: rust_hft
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.security-scope.outputs.ack_research != 'true'
         with:
           toolchain: 1.98.1
           components: clippy
 
       - name: Cache
+        if: needs.security-scope.outputs.ack_research != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft
           shared-key: strict-alpha-research-ml-v1
 
       - name: Run research Clippy (strict)
-        if: needs.security-scope.outputs.clippy_loop == 'true'
+        if: ${{ (needs.security-scope.outputs.clippy_loop == 'true') && needs.security-scope.outputs.ack_research != 'true' }}
         run: |
           cargo clippy \
             -p alpha-domain \
@@ -252,7 +279,7 @@ jobs:
             -D clippy::suspicious
 
       - name: Run runtime handoff Clippy (strict)
-        if: needs.security-scope.outputs.clippy_handoff == 'true'
+        if: ${{ (needs.security-scope.outputs.clippy_handoff == 'true') && needs.security-scope.outputs.ack_research != 'true' }}
         run: |
           cargo clippy \
             -p hft-live \
@@ -268,6 +295,18 @@ jobs:
   # ============================================================================
   # Unused Dependencies
   # ============================================================================
+      - name: Verify strict Clippy from the signed Monorepo batch
+        if: needs.security-scope.outputs.ack_research == 'true'
+        id: ack
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ $GITHUB_EVENT_NAME == schedule ]]; then
+            .github/scripts/wait-ack-research-receipt.sh security-clippy-research "$(git rev-parse HEAD)"
+          else
+            bash .github/scripts/wait-ack-rust-batch.sh "$(git rev-parse HEAD)"
+          fi
   cargo-machete:
     name: Code Quality - Unused Dependencies
     needs: security-scope
@@ -312,33 +351,31 @@ jobs:
       contents: read
       security-events: write
     strategy:
-      matrix:
-        include:
-          - name: hft-core
-            dockerfile: rust_hft/docker/Dockerfile
-            context: rust_hft
-          - name: hft-trading
-            dockerfile: rust_hft/deployment/docker/Dockerfile.trading
-            context: rust_hft
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.security-scope.outputs.image_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Build image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           push: false
           load: true
-          tags: hft-${{ matrix.name }}:scan
+          tags: monday-tested:${{ matrix.name }}-${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          build-args: ${{ matrix.build_args }}
+          cache-from: type=gha,scope=image-${{ matrix.name }}
+          cache-to: type=gha,scope=image-${{ matrix.name }},mode=max
 
       - name: Scan with Trivy
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@d2a0b60797ff03db6132bd4e2b293f9b37081297 # master resolved 2026-10-01
         with:
-          image-ref: hft-${{ matrix.name }}:scan
+          image-ref: monday-tested:${{ matrix.name }}-${{ github.sha }}
           format: sarif
           output: trivy-${{ matrix.name }}.sarif
           severity: 'CRITICAL,HIGH'
@@ -349,23 +386,30 @@ jobs:
           sarif_file: trivy-${{ matrix.name }}.sarif
           category: trivy-${{ matrix.name }}
 
-      - name: Comment on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const report = JSON.parse(fs.readFileSync('trivy-${{ matrix.name }}.sarif', 'utf8'));
-            const vulnerabilities = report.runs[0].results || [];
+      - name: Save the scanned core image for exact-source publication
+        if: matrix.name == 'hft-core'
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+        run: |
+          mkdir -p tested-image
+          image="monday-tested:$IMAGE_NAME-$GITHUB_SHA"
+          docker save "$image" --output tested-image/image.tar
+          jq -n --arg source "$GITHUB_SHA" --arg name "$IMAGE_NAME" \
+            --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg image_id "$(docker image inspect --format '{{.Id}}' "$image")" \
+            --arg archive "$(sha256sum tested-image/image.tar | awk '{print $1}')" \
+            '{schema_version:"monday.tested_image.v1",source_sha:$source,image:$name,run_id:$run,run_attempt:$attempt,image_id:$image_id,archive_sha256:$archive}' \
+            > tested-image/image.json
 
-            if (vulnerabilities.length > 0) {
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: `⚠️ Container scan found ${vulnerabilities.length} issues in ${{ matrix.name }}`
-              });
-            }
+      - name: Preserve the tested image
+        if: matrix.name == 'hft-core'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tested-image-${{ matrix.name }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: tested-image/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 1
 
   # ============================================================================
   # Secrets Detection

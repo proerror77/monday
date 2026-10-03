@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Read-only automatic ACR admission. Pending CI is resumed by workflow completion.
+# Read-only exact-source artifact admission. Pending automatic CI resumes later.
 set -euo pipefail
 source_sha=${1:?expected source SHA}
 current_run_id=${2:?expected current publisher run ID}
 output=${3:-${GITHUB_OUTPUT:-/dev/stdout}}
+mode=${4:-automatic}
+[[ $mode == automatic || $mode == reuse ]] || exit 2
 : "${GITHUB_REPOSITORY:?missing repository}"
 [[ $source_sha =~ ^[0-9a-f]{40}$ && $current_run_id =~ ^[1-9][0-9]*$ ]] || exit 1
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -75,6 +77,7 @@ esac
 # Existing workflow concurrency serializes these reads with earlier publishers.
 # A deferred (successful but no-op) workflow is not publication evidence. Only
 # the dedicated marker after both image readbacks suppresses another wakeup.
+if [[ $mode == automatic ]]; then
 gh api --paginate --slurp \
   "repos/$GITHUB_REPOSITORY/actions/workflows/acr-publish.yml/runs?head_sha=$source_sha&branch=main&status=success&per_page=100" > "$work/publishers.json"
 jq -r --arg source "$source_sha" --arg repo "$GITHUB_REPOSITORY" --argjson current "$current_run_id" '
@@ -91,6 +94,7 @@ while IFS=$'\t' read -r prior_id prior_attempt; do
     finish already_published
   fi
 done < "$work/prior.tsv"
+fi
 
 # Do not silently rebuild when the admitted producer artifact has expired.
 gh api --paginate --slurp \

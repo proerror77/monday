@@ -14,6 +14,14 @@ pub struct CampaignDispatchTargetV1 {
     pub namespace: String,
     pub job_name: String,
     pub manifest_sha256: String,
+    /// Bound by native admission for stage-authorized Market Jobs. Omission
+    /// preserves previously recorded claims and their original authority model.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_completion_authority: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl CampaignDispatchTargetV1 {
@@ -57,6 +65,91 @@ pub struct CampaignDispatchSettlementV1 {
     pub job_uid: String,
     pub pod_uid: String,
     pub settlement: CampaignAttemptSettlementV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_provenance: Option<CampaignDispatchCompletionProvenanceV1>,
+}
+
+/// Times from the independently verified bound Kubernetes Job and unique Pod,
+/// never from a worker result. `completed_at` is the authority evaluation time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignDispatchCompletionV1 {
+    pub job_uid: String,
+    pub pod_uid: String,
+    pub job_started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub job_sha256: String,
+    pub pod_sha256: String,
+}
+
+impl CampaignDispatchCompletionV1 {
+    pub(super) fn validate(&self, observed_at: DateTime<Utc>) -> Result<(), StoreError> {
+        validate_job_uid(&self.job_uid)?;
+        validate_job_uid(&self.pod_uid)?;
+        super::final_dispatch::validate_digest(&self.job_sha256)?;
+        super::final_dispatch::validate_digest(&self.pod_sha256)?;
+        if self.completed_at < self.job_started_at || self.completed_at > observed_at {
+            return Err(err(
+                "completion time precedes Job start or is in the future",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The store computes this decision under the same guards as settlement. Its
+/// authenticated receipt keeps the completion-time decision auditable after
+/// Kubernetes TTL cleanup, without replacing the remote model-result digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignDispatchCompletionProvenanceV1 {
+    pub completion: CampaignDispatchCompletionV1,
+    pub authority_active_at_completion: bool,
+}
+
+/// Authenticated evidence that the native controller shortened this exact Job's
+/// deadline. It grants only failed-terminal readback, never a successful result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignDispatchCancellationV1 {
+    pub operation_id: String,
+    pub job_uid: String,
+    pub pod_uid: String,
+    pub original_resource_version: String,
+    pub patched_resource_version: String,
+    pub reason: String,
+    pub requested_at: DateTime<Utc>,
+    pub job_started_at: DateTime<Utc>,
+    pub original_deadline_at: DateTime<Utc>,
+    pub patch_sha256: String,
+    pub patch_result_sha256: String,
+}
+impl CampaignDispatchCancellationV1 {
+    pub(super) fn validate(
+        &self,
+        reservation: &CampaignAttemptReservationV1,
+    ) -> Result<(), StoreError> {
+        validate_job_uid(&self.job_uid)?;
+        validate_job_uid(&self.pod_uid)?;
+        let duration = chrono::TimeDelta::try_seconds(
+            i64::try_from(reservation.reserved_job_seconds).map_err(err)?,
+        )
+        .ok_or_else(|| err("cancellation deadline overflow"))?;
+        if self.operation_id != reservation.operation_id().map_err(err)?
+            || self.original_resource_version.is_empty()
+            || self.patched_resource_version.is_empty()
+            || self.original_resource_version == self.patched_resource_version
+            || self.reason.is_empty()
+            || self.reason.len() > 8192
+            || self.requested_at < self.job_started_at
+            || self.job_started_at.checked_add_signed(duration) != Some(self.original_deadline_at)
+        {
+            return Err(err("invalid bound Job cancellation"));
+        }
+        super::final_dispatch::validate_digest(&self.patch_sha256)?;
+        super::final_dispatch::validate_digest(&self.patch_result_sha256)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +159,8 @@ pub struct CampaignDispatchRecord {
     pub claim: CampaignDispatchClaimV1,
     pub settlement: Option<CampaignAttemptSettlementV1>,
     pub terminal_pod_uid: Option<String>,
+    pub cancellation: Option<CampaignDispatchCancellationV1>,
+    pub completion_provenance: Option<CampaignDispatchCompletionProvenanceV1>,
 }
 
 pub(super) fn validate_job_uid(uid: &str) -> Result<(), StoreError> {
@@ -101,7 +196,49 @@ impl AlphaStore {
                 .ok_or_else(|| err("missing dispatch claim"))?,
             settlement: attempt.settlement.clone(),
             terminal_pod_uid: attempt.terminal_pod_uid.clone(),
+            cancellation: attempt.cancellation.clone(),
+            completion_provenance: attempt.completion_provenance.clone(),
         })
+    }
+
+    pub fn record_campaign_dispatch_cancellation(
+        &mut self,
+        reservation: &CampaignAttemptReservationV1,
+        cancellation: &CampaignDispatchCancellationV1,
+    ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
+        cancellation.validate(reservation)?;
+        let tx = self.connection.transaction().map_err(database_error)?;
+        study::lock_member_settlement_guards(
+            &tx,
+            &self.integrity_key,
+            &reservation.family_id,
+            cancellation.requested_at,
+        )?;
+        let (state, history) = load(&tx, &self.integrity_key, &reservation.family_id)?;
+        let a = state
+            .attempts
+            .get(&cancellation.operation_id)
+            .ok_or_else(|| err("cancellation has no attempt"))?;
+        if a.reservation != *reservation {
+            return Err(err("cancellation reservation changed"));
+        }
+        if let Some(existing) = &a.cancellation {
+            if existing != cancellation {
+                return Err(err("cancellation evidence changed"));
+            }
+            return history.into_iter().find(|r|matches!(&r.receipt.event,CampaignLedgerEventV1::DispatchCancelled{evidence} if evidence==cancellation)).ok_or_else(||err("cancellation receipt missing"));
+        }
+        let receipt = append(
+            &tx,
+            &self.integrity_key,
+            &reservation.family_id,
+            CampaignLedgerEventV1::DispatchCancelled {
+                evidence: cancellation.clone(),
+            },
+            Utc::now(),
+        )?;
+        tx.commit().map_err(database_error)?;
+        Ok(receipt)
     }
 
     pub fn settle_campaign_dispatch(
@@ -110,6 +247,45 @@ impl AlphaStore {
         evidence: &CampaignDispatchSettlementV1,
         at: DateTime<Utc>,
     ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
+        self.settle_dispatch(expected, evidence, None, at)
+    }
+
+    /// Historical authority at actual completion, including later-recorded
+    /// revocations whose effective time precedes completion. This read does not
+    /// authorize settlement: the guarded write below repeats it atomically.
+    pub fn campaign_dispatch_completion_active(
+        &self,
+        expected: &CampaignAttemptReservationV1,
+        completion: &CampaignDispatchCompletionV1,
+        observed_at: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        completion_active(
+            &self.connection,
+            &self.integrity_key,
+            expected,
+            completion,
+            observed_at,
+        )
+    }
+
+    pub fn settle_campaign_dispatch_at_completion(
+        &mut self,
+        expected: &CampaignAttemptReservationV1,
+        evidence: &CampaignDispatchSettlementV1,
+        completion: &CampaignDispatchCompletionV1,
+        at: DateTime<Utc>,
+    ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
+        self.settle_dispatch(expected, evidence, Some(completion), at)
+    }
+
+    fn settle_dispatch(
+        &mut self,
+        expected: &CampaignAttemptReservationV1,
+        evidence: &CampaignDispatchSettlementV1,
+        completion: Option<&CampaignDispatchCompletionV1>,
+        at: DateTime<Utc>,
+    ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
+        let mut evidence = evidence.clone();
         let tx = self.connection.transaction().map_err(database_error)?;
         let (state, _) = load(&tx, &self.integrity_key, &expected.family_id)?;
         let operation_id = expected.operation_id().map_err(err)?;
@@ -121,12 +297,62 @@ impl AlphaStore {
         {
             return Err(err("terminal evidence differs from the reserved request"));
         }
+        let attempt = &state.attempts[&operation_id];
+        if completion.is_none()
+            && (evidence.completion_provenance.is_some()
+                || (attempt
+                    .dispatch
+                    .as_ref()
+                    .is_some_and(|claim| claim.target.require_completion_authority)
+                    && attempt.cancellation.is_none()))
+        {
+            return Err(err(
+                "this native dispatch requires completion authority evidence",
+            ));
+        }
         let study_id = study::lock_member_settlement_guards(
             &tx,
             &self.integrity_key,
             &expected.family_id,
             at,
         )?;
+        if let Some(completion) = completion {
+            let root = state
+                .roots
+                .get(&expected.root_grant_sha256)
+                .ok_or_else(|| err("missing completion Root"))?;
+            // The same approval guards are updated by revoke_approval. The
+            // Study/family heads above also serialize registered revocations.
+            serialize_approval_mutation(&tx, &root.approval.approval_id)?;
+            study::lock_completion_approval(&tx, &self.integrity_key, &expected.family_id)?;
+            if completion.job_uid != evidence.job_uid || completion.pod_uid != evidence.pod_uid {
+                return Err(err("completion provenance differs from settlement"));
+            }
+            let authority_active_at_completion =
+                completion_active(&tx, &self.integrity_key, expected, completion, at)?;
+            if !authority_active_at_completion
+                && (evidence.settlement.outcome != CampaignAttemptOutcomeV1::Failed
+                    || evidence.settlement.consumed_trials != Some(expected.declared_trials))
+            {
+                return Err(err(
+                    "authority at completion requires Failed settlement with full charge",
+                ));
+            }
+            let provenance = CampaignDispatchCompletionProvenanceV1 {
+                completion: completion.clone(),
+                authority_active_at_completion,
+            };
+            if evidence
+                .completion_provenance
+                .as_ref()
+                .is_some_and(|existing| existing != &provenance)
+            {
+                return Err(err(
+                    "completion provenance differs from the guarded authority decision",
+                ));
+            }
+            evidence.completion_provenance = Some(provenance);
+        }
         let prepared_study_id = study::prepare_member_settlement(
             &tx,
             &self.integrity_key,
@@ -283,6 +509,98 @@ impl AlphaStore {
         Ok(())
     }
 
+    /// Issue a bounded stage permission inside the existing approval/family/Study
+    /// serialization boundary. The attempt is already charged; this never reserves
+    /// more time or trials and never interprets the original duration as new time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_running_campaign_admission<T, E: From<StoreError>>(
+        &mut self,
+        verified: &VerifiedCampaignRootGrant,
+        reservation: &CampaignAttemptReservationV1,
+        target: &CampaignDispatchTargetV1,
+        job_uid: &str,
+        job_started_at: DateTime<Utc>,
+        now: impl FnOnce() -> DateTime<Utc>,
+        action: impl FnOnce(DateTime<Utc>, DateTime<Utc>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let operation_id = reservation.operation_id().map_err(err)?;
+        let tx = self.connection.transaction().map_err(database_error)?;
+        let (state, history) = load(&tx, &self.integrity_key, &reservation.family_id)?;
+        let root = state
+            .roots
+            .get(verified.content_sha256())
+            .ok_or_else(|| err("missing root"))?;
+        serialize_approval_mutation(&tx, &root.approval.approval_id)?;
+        let at = now();
+        let study_id = study::lock_campaign_guards(
+            &tx,
+            &self.integrity_key,
+            verified,
+            &reservation.family_id,
+            at,
+            true,
+        )?;
+        if study_id.is_none() {
+            return Err(err("running stages require a cumulative Study").into());
+        }
+        verified.validate_active_at(at).map_err(err)?;
+        let attempt = state
+            .attempts
+            .get(&operation_id)
+            .ok_or_else(|| err("missing reserved attempt"))?;
+        let claim = attempt
+            .dispatch
+            .as_ref()
+            .ok_or_else(|| err("missing dispatch claim"))?;
+        let approval =
+            read_effective_approval(&tx, &self.integrity_key, &root.approval.approval_id)?;
+        let duration = chrono::TimeDelta::try_seconds(
+            i64::try_from(reservation.reserved_job_seconds).map_err(err)?,
+        )
+        .ok_or_else(|| err("running Job duration overflow"))?;
+        let deadline = job_started_at
+            .checked_add_signed(duration)
+            .ok_or_else(|| err("running Job deadline overflow"))?;
+        if state.final_closure.is_some()
+            || attempt.cancellation.is_some()
+            || attempt.settlement.is_some()
+            || attempt.reservation != *reservation
+            || claim.target != *target
+            || claim.job_uid.as_deref() != Some(job_uid)
+            || !approval.is_active_at(at)
+            || root.revoked_at.is_some_and(|when| at >= when)
+            || job_started_at > at
+            || at >= deadline
+            || deadline > verified.grant().expires_at
+        {
+            return Err(err(
+                "running attempt is revoked, expired, settled or has changed identity",
+            )
+            .into());
+        }
+        require_published_receipts(
+            &tx,
+            &self.integrity_key,
+            &reservation.family_id,
+            &history,
+            claim.sequence,
+        )?;
+        let study_deadline =
+            study::check_running_member(&tx, &self.integrity_key, verified, reservation, at)?;
+        let mut authority_deadline = deadline
+            .min(verified.grant().expires_at)
+            .min(study_deadline);
+        for when in [root.revoked_at, approval.revoked_at, approval.expires_at]
+            .into_iter()
+            .flatten()
+        {
+            authority_deadline = authority_deadline.min(when);
+        }
+        let result = action(at, authority_deadline);
+        tx.commit().map_err(database_error)?;
+        result
+    }
+
     /// The caller's clock is sampled after acquiring both serialization guards.
     /// A concurrent revocation or settlement must conflict before the callback
     /// can start a Kubernetes write. Uncertain network outcomes keep the claim
@@ -368,6 +686,7 @@ pub(super) fn checked_reservation(
         .ok_or_else(|| err("missing root"))?;
     if root.revoked_at.is_some_and(|when| at >= when)
         || a.settlement.is_some()
+        || a.cancellation.is_some()
         || !read_effective_approval(conn, key, &root.approval.approval_id)?.is_active_at(at)
     {
         return Err(err("attempt is settled or root is inactive"));
@@ -391,6 +710,58 @@ pub(super) fn checked_reservation(
         .map_or(a.sequence, |dispatch| dispatch.sequence);
     require_published_receipts(conn, key, family, &history, through)?;
     Ok(a.reservation.clone())
+}
+
+fn completion_active(
+    conn: &Connection,
+    key: &[u8; 32],
+    expected: &CampaignAttemptReservationV1,
+    completion: &CampaignDispatchCompletionV1,
+    observed_at: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    completion.validate(observed_at)?;
+    let (state, history) = load(conn, key, &expected.family_id)?;
+    let attempt = state
+        .attempts
+        .get(&expected.operation_id().map_err(err)?)
+        .ok_or_else(|| err("missing completion attempt"))?;
+    let claim = attempt
+        .dispatch
+        .as_ref()
+        .ok_or_else(|| err("missing completion claim"))?;
+    if attempt.reservation != *expected
+        || claim.job_uid.as_deref() != Some(&completion.job_uid)
+        || attempt
+            .terminal_pod_uid
+            .as_ref()
+            .is_some_and(|uid| uid != &completion.pod_uid)
+    {
+        return Err(err("completion differs from the reserved Job identity"));
+    }
+    let root = state
+        .roots
+        .get(&expected.root_grant_sha256)
+        .ok_or_else(|| err("missing completion Root"))?;
+    require_published_receipts(conn, key, &expected.family_id, &history, claim.sequence)?;
+    let approval = read_effective_approval(conn, key, &root.approval.approval_id)?;
+    let duration =
+        chrono::TimeDelta::try_seconds(i64::try_from(expected.reserved_job_seconds).map_err(err)?)
+            .ok_or_else(|| err("completion deadline overflow"))?;
+    let deadline = completion
+        .job_started_at
+        .checked_add_signed(duration)
+        .ok_or_else(|| err("completion deadline overflow"))?;
+    let at = completion.completed_at;
+    // Always verify Study membership/integrity, even when Root authority failed.
+    let study_active = study::completion_member_active(conn, key, &root.grant, expected, at)?;
+    Ok(study_active
+        && attempt.cancellation.is_none()
+        && root.grant.validate_active_at(at).is_ok()
+        && approval.is_active_at(at)
+        && !root.revoked_at.is_some_and(|when| at >= when)
+        && completion.job_started_at >= root.grant.grant().valid_from
+        && at < deadline
+        && deadline <= root.grant.grant().expires_at)
 }
 
 fn lock_dispatch_guards(

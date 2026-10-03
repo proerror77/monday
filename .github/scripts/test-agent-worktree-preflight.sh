@@ -59,7 +59,7 @@ branch: $branch
 writer: $writer
 allowed_files:
   - $files
-deadline: 2026-09-22T00:00:00Z
+deadline: 2199-01-01T00:00:00Z
 pr: $pr
 EOF
 }
@@ -126,7 +126,7 @@ grep -F "worktree=$wt_clean" <<<"$list_out" && {
 "$gate" help | grep -q spawn
 
 write_packet "$fixture/packet-spawn.yml" cursor-cloud cursor/test-spawn docs/spawn.md
-sed -i.bak 's|deadline: 2026-09-22T00:00:00Z|deadline: 2099-01-01T00:00:00Z|' "$fixture/packet-spawn.yml"
+sed -i.bak 's|deadline: 2199-01-01T00:00:00Z|deadline: 2099-01-01T00:00:00Z|' "$fixture/packet-spawn.yml"
 apply_spawn=$(cd "$fixture" && "$gate" apply --packet-file "$fixture/packet-spawn.yml")
 grep -qx 'verdict=ok' <<<"$apply_spawn"
 lease_spawn=$(sed -n 's/^lease_id=//p' <<<"$apply_spawn")
@@ -141,7 +141,7 @@ cmp "$fixture/before-dry-run.yml" "$fixture/after-dry-run.yml"
 [[ ! -d "$fixture/.git/agent-leases/${lease_spawn}.runs" ]]
 
 write_packet "$fixture/packet-expired.yml" codex cursor/test-expired docs/expired.md
-sed -i.bak 's|deadline: 2026-09-22T00:00:00Z|deadline: 2000-01-01T00:00:00Z|' "$fixture/packet-expired.yml"
+sed -i.bak 's|deadline: 2199-01-01T00:00:00Z|deadline: 2000-01-01T00:00:00Z|' "$fixture/packet-expired.yml"
 apply_expired=$(cd "$fixture" && "$gate" apply --packet-file "$fixture/packet-expired.yml")
 lease_expired=$(sed -n 's/^lease_id=//p' <<<"$apply_expired")
 wt_expired=$(sed -n 's/^worktree=//p' <<<"$apply_expired")
@@ -154,7 +154,7 @@ grep -qx 'expired=1' <<<"$sweep_out"
 grep -qx 'status: expired' <<<"$(cd "$fixture" && "$gate" get "$lease_expired")"
 
 write_packet "$fixture/packet-live.yml" human cursor/test-live docs/live.md
-sed -i.bak -e 's|deadline: 2026-09-22T00:00:00Z|deadline: 2099-01-01T00:00:00Z|' \
+sed -i.bak -e 's|deadline: 2199-01-01T00:00:00Z|deadline: 2099-01-01T00:00:00Z|' \
   -e 's|trading_gates: none|trading_gates: live|' "$fixture/packet-live.yml"
 apply_live=$(cd "$fixture" && "$gate" apply --packet-file "$fixture/packet-live.yml")
 lease_live=$(sed -n 's/^lease_id=//p' <<<"$apply_live")
@@ -223,7 +223,7 @@ export PATH="$fixture/fake-bin:$PATH"
 export AGENT_CAPTURE_PROMPT="$fixture/captured-prompt"
 
 write_packet "$fixture/full-packet.yml" cursor-cloud cursor/full-packet docs/evidence.md
-sed -i.bak 's|deadline: 2026-09-22T00:00:00Z|deadline: 2099-01-01T00:00:00Z|' "$fixture/full-packet.yml"
+sed -i.bak 's|deadline: 2199-01-01T00:00:00Z|deadline: 2099-01-01T00:00:00Z|' "$fixture/full-packet.yml"
 { printf '%s\n' '---'; cat "$fixture/full-packet.yml"; } >"$fixture/yaml-document"
 mv "$fixture/yaml-document" "$fixture/full-packet.yml"
 cat >>"$fixture/full-packet.yml" <<'EOF'
@@ -484,7 +484,7 @@ workspace_repo_name: fixture
 workspace_repo_path: $repo_src
 workspace_tool_name: skill
 workspace_tool_endpoint: file:///fixture-skill
-command: bash -c 'x=$(printf "%48000000s" ""); sleep 1'
+command: bash -c 'x=\$(printf "%80000000s" ""); printf "%s" \${#x}'
 EOF
 "$gate" task-declare --file "$fixture/mem-task.yml" >/dev/null
 mem_out=$("$gate" task-invoke mem-agent 2>&1 || true)
@@ -493,6 +493,30 @@ grep -qx 'reason=memory_exceeded' <<<"$mem_out" || {
   exit 1
 }
 ! grep -qx 'verdict=ok' <<<"$mem_out"
+
+cat >"$fixture/sleep-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: sleep-agent
+contract: sleep-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sleep 40
+EOF
+"$gate" task-declare --file "$fixture/sleep-task.yml" >/dev/null
+sleep_out=$("$gate" task-invoke sleep-agent)
+grep -qx 'verdict=ok' <<<"$sleep_out" || {
+  printf 'in-budget sleep failed:\n%s\n' "$sleep_out" >&2
+  exit 1
+}
+grep -qx 'phase=suspended' <<<"$sleep_out"
+grep -qx 'suspended' "$fixture/.git/agent-tasks/sleep-agent/phase"
 
 cat >"$fixture/net-task.yml" <<EOF
 schema: monday.agent_task.v1
@@ -522,6 +546,60 @@ grep -qx 'reason=host_not_allowed' <<<"$net_out" || {
 ! grep -q '200' <<<"$net_out"
 [[ $net_status != 77 ]]
 grep -qx 'example.com' "$fixture/.git/agent-tasks/net-agent/egress-refused"
+! grep -q '200' "$fixture/.git/agent-tasks/net-agent/invocation.log" "$fixture/.git/agent-tasks/net-agent/invocation.err"
+
+if [[ -x /usr/bin/curl ]]; then
+  cat >"$fixture/abs-curl.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: abs-curl-agent
+contract: abs-curl-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: /usr/bin/curl -sS -o /dev/null -w '%{http_code}' --max-time 15 https://example.com
+EOF
+  "$gate" task-declare --file "$fixture/abs-curl.yml" >/dev/null
+  set +e
+  abs_out=$("$gate" task-invoke abs-curl-agent 2>&1)
+  abs_status=$?
+  set -e
+  grep -qx 'reason=host_not_allowed' <<<"$abs_out" || {
+    printf 'absolute curl was not refused status=%s:\n%s\n' "$abs_status" "$abs_out" >&2
+    printf 'log:\n%s\n' "$(cat "$fixture/.git/agent-tasks/abs-curl-agent/invocation.log" "$fixture/.git/agent-tasks/abs-curl-agent/invocation.err" 2>/dev/null)" >&2
+    exit 1
+  }
+  [[ $abs_status != 77 ]]
+  ! grep -q '200' "$fixture/.git/agent-tasks/abs-curl-agent/invocation.log" "$fixture/.git/agent-tasks/abs-curl-agent/invocation.err"
+fi
+
+cat >"$fixture/two-url.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: two-url-agent
+contract: two-url-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: curl -sS -o /dev/null -w '%{url_effective} %{http_code}\\n' --max-time 15 https://example.com https://github.com
+EOF
+"$gate" task-declare --file "$fixture/two-url.yml" >/dev/null
+two_out=$("$gate" task-invoke two-url-agent 2>&1 || true)
+grep -qx 'reason=host_not_allowed' <<<"$two_out" || {
+  printf 'multi-url curl was not refused:\n%s\n' "$two_out" >&2
+  exit 1
+}
+! grep -q 'example.com/ 200' "$fixture/.git/agent-tasks/two-url-agent/invocation.log" "$fixture/.git/agent-tasks/two-url-agent/invocation.err"
 
 cat >"$fixture/leak-task.yml" <<EOF
 schema: monday.agent_task.v1
@@ -587,5 +665,383 @@ EOF
   grep -qx 'verdict=ok' <<<"$missing_out"
   [[ ! -s $fixture/.git/agent-tasks/missing-tool-agent/egress-refused ]]
 fi
+
+cat >"$fixture/shared-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: shared-agent
+contract: shared-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sh -c 'echo start >> "\$MONDAY_AGENT_WORKSPACE/starts"; sleep 15'
+EOF
+"$gate" task-declare --file "$fixture/shared-task.yml" >/dev/null
+"$gate" task-invoke shared-agent >"$fixture/shared.out" 2>&1 &
+shared_pid=$!
+shared_dir="$fixture/.git/agent-tasks/shared-agent"
+for ((i=0; i<200; i++)); do
+  [[ -s $shared_dir/worker.pid && -s $shared_dir/workspace/starts ]] && break
+  sleep 0.05
+done
+[[ -s $shared_dir/worker.pid && -s $shared_dir/workspace/starts ]]
+[[ $(wc -l <"$shared_dir/workspace/starts" | tr -d ' ') == 1 ]]
+same_out=$("$gate" task-invoke shared-agent 2>&1 || true)
+grep -qx 'reason=agent_already_running' <<<"$same_out" || {
+  printf 'second invoke was not refused:\n%s\n' "$same_out" >&2
+  exit 1
+}
+cat >"$fixture/shared-other.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: shared-other
+contract: shared-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: echo other
+EOF
+"$gate" task-declare --file "$fixture/shared-other.yml" >/dev/null
+other_out=$("$gate" task-invoke shared-other 2>&1 || true)
+grep -qx 'reason=writer_already_active' <<<"$other_out" || {
+  printf 'same-contract task was not refused:\n%s\n' "$other_out" >&2
+  exit 1
+}
+write_packet "$fixture/shared-lease.yml" grok cursor/shared-lease docs/shared.md
+sed -i.bak 's|goal: test lease cursor/shared-lease|goal: shared-contract|' "$fixture/shared-lease.yml"
+lease_block=$("$gate" apply --packet-file "$fixture/shared-lease.yml" 2>&1 || true)
+grep -qx 'reason=writer_already_active' <<<"$lease_block" || {
+  printf 'running task did not block lease:\n%s\n' "$lease_block" >&2
+  exit 1
+}
+shared_worker=$(tr -d '[:space:]' <"$shared_dir/worker.pid")
+"$gate" task-suspend shared-agent >"$fixture/shared-suspend.out"
+grep -qx 'phase=suspended' <<<"$(cat "$fixture/shared-suspend.out")"
+[[ $(tr -d '[:space:]' <"$shared_dir/phase") == suspended ]]
+if kill -0 "$shared_worker" 2>/dev/null; then
+  printf 'pause left worker %s running\n' "$shared_worker" >&2
+  exit 1
+fi
+[[ $(wc -l <"$shared_dir/workspace/starts" | tr -d ' ') == 1 ]]
+wait "$shared_pid" || true
+
+cat >"$fixture/crash-task.yml" <<EOF
+schema: monday.agent_task.v1
+agent_id: crash-agent
+contract: crash-contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+command: sh -c 'echo start >> "\$MONDAY_AGENT_WORKSPACE/starts"; sleep 15'
+EOF
+"$gate" task-declare --file "$fixture/crash-task.yml" >/dev/null
+"$gate" task-invoke crash-agent >"$fixture/crash.out" 2>&1 &
+crash_pid=$!
+crash_dir="$fixture/.git/agent-tasks/crash-agent"
+for ((i=0; i<200; i++)); do
+  [[ -s $crash_dir/worker.pid && -s $crash_dir/workspace/starts ]] && break
+  sleep 0.05
+done
+[[ -s $crash_dir/worker.pid && -s $crash_dir/workspace/starts ]]
+crash_worker=$(tr -d '[:space:]' <"$crash_dir/worker.pid")
+crash_pgid=$(ps -o pgid= -p "$crash_worker" 2>/dev/null | tr -d ' ' || true)
+kill -KILL "$crash_pid" 2>/dev/null || true
+if [[ $crash_pgid =~ ^[0-9]+$ && $crash_pgid != 0 ]]; then
+  kill -KILL "-$crash_pgid" 2>/dev/null || true
+fi
+kill -KILL "$crash_worker" 2>/dev/null || true
+for ((i=0; i<40; i++)); do
+  if ! kill -0 "$crash_pid" 2>/dev/null && ! kill -0 "$crash_worker" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+retry_out=$("$gate" task-invoke crash-agent 2>&1 || true)
+grep -qx 'reason=execution_unresolved' <<<"$retry_out" || {
+  printf 'crashed invoke was repeated:\n%s\n' "$retry_out" >&2
+  exit 1
+}
+[[ $(wc -l <"$crash_dir/workspace/starts" | tr -d ' ') == 1 ]] || {
+  printf 'crash starts not 1\n' >&2
+  exit 1
+}
+[[ $(tr -d '[:space:]' <"$crash_dir/phase") == running ]] || {
+  printf 'crash phase is %s\n' "$(cat "$crash_dir/phase" 2>/dev/null || true)" >&2
+  exit 1
+}
+wait "$crash_pid" 2>/dev/null || true
+
+write_slice() {
+  local dest=$1 agent=$2 contract=$3 files=$4 budget=$5 deadline=$6 branch=$7 pr=$8 command=$9
+  cat >"$dest" <<EOF
+schema: monday.agent_task.v1
+agent_id: $agent
+contract: $contract
+cpu: 1
+memory_mb: 256
+allow_hosts: github.com
+model_provider: fixture-provider
+model_secret_file: $secret_file
+workspace_repo_name: fixture
+workspace_repo_path: $repo_src
+workspace_tool_name: skill
+workspace_tool_endpoint: file:///fixture-skill
+deadline: $deadline
+budget: $budget
+branch: $branch
+pr: $pr
+allowed_files: $files
+command: $(printf '%s' "$command")
+EOF
+}
+
+write_slice "$fixture/slice-a.yml" slice-a contract-a docs/a.md 2 2199-01-01T00:00:00Z none none \
+  'echo slice-a > "$MONDAY_AGENT_WORKSPACE/marker"'
+write_slice "$fixture/slice-b.yml" slice-b contract-b docs/b.md 2 2199-01-01T00:00:00Z none none \
+  'echo slice-b > "$MONDAY_AGENT_WORKSPACE/marker"'
+cat >"$fixture/batch-split.yml" <<EOF
+schema: monday.agent_task_batch.v1
+batch_id: split-1
+tasks: $fixture/slice-a.yml,$fixture/slice-b.yml
+EOF
+batch_out=$("$gate" task-batch run --file "$fixture/batch-split.yml") || {
+  printf 'split batch failed:\n%s\n' "$batch_out" >&2
+  exit 1
+}
+grep -qx 'batch_id=split-1' <<<"$batch_out" || {
+  printf 'split batch output:\n%s\n' "$batch_out" >&2
+  exit 1
+}
+for agent in slice-a slice-b; do
+  receipt="$fixture/.git/agent-tasks/$agent/receipt"
+  grep -qx 'verdict=ok' "$receipt"
+  grep -qx 'phase=suspended' "$receipt"
+  grep -qx 'consumed=1' "$receipt"
+  grep -qx 'reserved=0' "$receipt"
+  grep -qx "agent_id=$agent" "$receipt"
+  [[ -s $fixture/.git/agent-tasks/$agent/workspace/marker ]]
+done
+"$gate" task-invoke slice-a >/dev/null
+grep -qx 'consumed=2' "$fixture/.git/agent-tasks/slice-a/receipt"
+exhausted=$("$gate" task-invoke slice-a 2>&1 || true)
+grep -qx 'reason=budget_exhausted' <<<"$exhausted"
+grep -qx 'consumed=2' "$fixture/.git/agent-tasks/slice-a/receipt"
+shown=$("$gate" task-batch show --batch split-1)
+grep -qx 'agent_id=slice-a' <<<"$shown"
+grep -qx 'agent_id=slice-b' <<<"$shown"
+
+write_slice "$fixture/durable-fast.yml" durable-fast contract-durable-fast docs/durable-fast.md 2 2199-01-01T00:00:00Z none none \
+  'echo fast > "$MONDAY_AGENT_WORKSPACE/marker"'
+write_slice "$fixture/durable-slow.yml" durable-slow contract-durable-slow docs/durable-slow.md 2 2199-01-01T00:00:00Z none none \
+  'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"; sleep 20'
+cat >"$fixture/batch-durable.yml" <<EOF
+schema: monday.agent_task_batch.v1
+batch_id: durable-1
+tasks: $fixture/durable-fast.yml,$fixture/durable-slow.yml
+EOF
+"$gate" task-batch run --file "$fixture/batch-durable.yml" >"$fixture/durable-run.out" 2>&1 &
+durable_pid=$!
+durable_slow="$fixture/.git/agent-tasks/durable-slow"
+durable_fast="$fixture/.git/agent-tasks/durable-fast"
+for ((i=0; i<600; i++)); do
+  [[ -s $durable_fast/receipt && -s $durable_slow/worker.pid && -s $durable_slow/workspace/starts ]] && break
+  sleep 0.05
+done
+if [[ ! -s $durable_fast/receipt || ! -s $durable_slow/workspace/starts ]]; then
+  printf 'durable batch did not reach a recoverable point\n' >&2
+  printf 'fast receipt:\n' >&2
+  cat "$durable_fast/receipt" >&2 2>/dev/null || true
+  printf 'slow phase:\n' >&2
+  cat "$durable_slow/phase" >&2 2>/dev/null || true
+  printf 'batch agents:\n' >&2
+  cat "$fixture/.git/agent-task-batches/durable-1/agents" >&2 2>/dev/null || true
+  printf 'run output:\n' >&2
+  cat "$fixture/durable-run.out" >&2 2>/dev/null || true
+  exit 1
+fi
+kill -KILL "$durable_pid" 2>/dev/null || true
+wait "$durable_pid" 2>/dev/null || true
+rm -f "$fixture/.git/agent-task-batches/durable-1/receipt"
+recovered=$("$gate" task-batch show --batch durable-1)
+grep -qx 'verdict=open' <<<"$recovered"
+grep -qx 'reason=still_running' <<<"$recovered"
+grep -qx 'agent_id=durable-fast' <<<"$recovered"
+grep -qx 'consumed=1' "$durable_fast/receipt"
+[[ $(wc -l <"$durable_slow/workspace/starts" | tr -d ' ') == 1 ]]
+"$gate" task-batch run --file "$fixture/batch-durable.yml" >"$fixture/durable-rerun.out"
+[[ $(wc -l <"$durable_slow/workspace/starts" | tr -d ' ') == 1 ]]
+grep -qx 'consumed=1' "$durable_fast/receipt"
+[[ $(tr -d '[:space:]' <"$durable_slow/phase") == running ]]
+"$gate" task-suspend durable-slow >/dev/null
+
+for n in 1 2 3; do
+  write_slice "$fixture/cap-$n.yml" "cap-$n" "contract-cap-$n" "docs/cap-$n.md" 1 2199-01-01T00:00:00Z none none \
+    'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"; sleep 20'
+done
+cat >"$fixture/batch-cap.yml" <<EOF
+schema: monday.agent_task_batch.v1
+batch_id: cap-1
+concurrency: 1
+tasks: $fixture/cap-1.yml,$fixture/cap-2.yml,$fixture/cap-3.yml
+EOF
+"$gate" task-batch run --file "$fixture/batch-cap.yml" >"$fixture/cap-run.out" 2>&1 &
+cap_pid=$!
+for ((i=0; i<600; i++)); do
+  started=0
+  for n in 1 2 3; do
+    [[ -s $fixture/.git/agent-tasks/cap-$n/workspace/starts ]] && started=$((started + 1))
+  done
+  [[ $started -eq 1 ]] && break
+  sleep 0.05
+done
+[[ $started -eq 1 ]]
+pending=0
+for n in 1 2 3; do
+  phase=$(tr -d '[:space:]' <"$fixture/.git/agent-tasks/cap-$n/phase")
+  if [[ $phase == pending ]]; then
+    pending=$((pending + 1))
+  fi
+done
+[[ $pending -eq 2 ]]
+kill -KILL "$cap_pid" 2>/dev/null || true
+wait "$cap_pid" 2>/dev/null || true
+"$gate" task-batch run --file "$fixture/batch-cap.yml" >"$fixture/cap-rerun.out" 2>&1 &
+cap_rerun=$!
+sleep 1
+rerun_started=0
+for n in 1 2 3; do
+  [[ -s $fixture/.git/agent-tasks/cap-$n/workspace/starts ]] && rerun_started=$((rerun_started + 1))
+done
+[[ $rerun_started -eq 1 ]]
+kill -KILL "$cap_rerun" 2>/dev/null || true
+wait "$cap_rerun" 2>/dev/null || true
+for n in 1 2 3; do
+  if [[ -s $fixture/.git/agent-tasks/cap-$n/worker.pid ]]; then
+    cap_worker=$(tr -d '[:space:]' <"$fixture/.git/agent-tasks/cap-$n/worker.pid")
+    if kill -0 "$cap_worker" 2>/dev/null; then
+      "$gate" task-suspend "cap-$n" >/dev/null || true
+    fi
+  fi
+done
+
+write_slice "$fixture/refill-slow.yml" refill-slow contract-refill-slow docs/refill-slow.md 1 2199-01-01T00:00:00Z none none \
+  'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"; sleep 20'
+write_slice "$fixture/refill-fast.yml" refill-fast contract-refill-fast docs/refill-fast.md 1 2199-01-01T00:00:00Z none none \
+  'echo fast > "$MONDAY_AGENT_WORKSPACE/marker"'
+write_slice "$fixture/refill-next.yml" refill-next contract-refill-next docs/refill-next.md 1 2199-01-01T00:00:00Z none none \
+  'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"'
+cat >"$fixture/batch-refill.yml" <<EOF
+schema: monday.agent_task_batch.v1
+batch_id: refill-1
+concurrency: 2
+tasks: $fixture/refill-slow.yml,$fixture/refill-fast.yml,$fixture/refill-next.yml
+EOF
+"$gate" task-batch run --file "$fixture/batch-refill.yml" >"$fixture/refill-run.out" 2>&1 &
+refill_pid=$!
+for ((i=0; i<400; i++)); do
+  slow_phase=
+  if [[ -f $fixture/.git/agent-tasks/refill-slow/phase ]]; then
+    slow_phase=$(tr -d '[:space:]' <"$fixture/.git/agent-tasks/refill-slow/phase")
+  fi
+  [[ -s $fixture/.git/agent-tasks/refill-next/workspace/starts && $slow_phase == running ]] && break
+  sleep 0.05
+done
+[[ -s $fixture/.git/agent-tasks/refill-next/workspace/starts ]]
+[[ $(tr -d '[:space:]' <"$fixture/.git/agent-tasks/refill-slow/phase") == running ]]
+kill -KILL "$refill_pid" 2>/dev/null || true
+wait "$refill_pid" 2>/dev/null || true
+"$gate" task-suspend refill-slow >/dev/null || true
+
+write_slice "$fixture/slice-hold.yml" slice-hold contract-hold docs/hold 2 2199-01-01T00:00:00Z none none \
+  'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"; sleep 15'
+"$gate" task-declare --file "$fixture/slice-hold.yml" >/dev/null
+"$gate" task-invoke slice-hold >"$fixture/hold.out" 2>&1 &
+hold_pid=$!
+hold_dir="$fixture/.git/agent-tasks/slice-hold"
+for ((i=0; i<200; i++)); do
+  [[ -s $hold_dir/worker.pid && -s $hold_dir/workspace/starts ]] && break
+  sleep 0.05
+done
+[[ -s $hold_dir/worker.pid ]]
+write_slice "$fixture/slice-overlap.yml" slice-overlap contract-overlap docs/hold/note.md 1 2199-01-01T00:00:00Z none none echo overlap
+"$gate" task-declare --file "$fixture/slice-overlap.yml" >/dev/null
+overlap_out=$("$gate" task-invoke slice-overlap 2>&1 || true)
+grep -qx 'reason=allowed_files_overlap' <<<"$overlap_out" || {
+  printf 'overlapping files were admitted:\n%s\n' "$overlap_out" >&2
+  exit 1
+}
+write_slice "$fixture/slice-branch.yml" slice-branch contract-branch docs/z.md 1 2199-01-01T00:00:00Z cursor/shared-branch none echo branch
+"$gate" task-declare --file "$fixture/slice-branch.yml" >/dev/null
+# The holding slice has branch none, so start a second sleeper on the shared branch.
+"$gate" task-suspend slice-hold >/dev/null
+wait "$hold_pid" || true
+write_slice "$fixture/slice-branch-live.yml" slice-branch-live contract-branch-live docs/y.md 1 2199-01-01T00:00:00Z cursor/shared-branch none \
+  'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"; sleep 15'
+"$gate" task-declare --file "$fixture/slice-branch-live.yml" >/dev/null
+"$gate" task-invoke slice-branch-live >"$fixture/branch.out" 2>&1 &
+branch_pid=$!
+branch_dir="$fixture/.git/agent-tasks/slice-branch-live"
+for ((i=0; i<200; i++)); do
+  [[ $(tr -d '[:space:]' <"$branch_dir/phase" 2>/dev/null || true) == running ]] && break
+  sleep 0.05
+done
+branch_block=$("$gate" task-invoke slice-branch 2>&1 || true)
+grep -qx 'reason=branch_already_active' <<<"$branch_block" || {
+  printf 'same branch was admitted:\n%s\n' "$branch_block" >&2
+  exit 1
+}
+"$gate" task-suspend slice-branch-live >/dev/null
+wait "$branch_pid" || true
+
+write_slice "$fixture/slice-late.yml" slice-late contract-late docs/late.md 1 2000-01-01T00:00:00Z none none echo late
+"$gate" task-declare --file "$fixture/slice-late.yml" >/dev/null
+late_out=$("$gate" task-invoke slice-late 2>&1 || true)
+grep -qx 'reason=deadline_passed' <<<"$late_out"
+grep -qx 'consumed=0' "$fixture/.git/agent-tasks/slice-late/receipt"
+
+write_slice "$fixture/slice-die.yml" slice-die contract-die docs/die.md 2 2199-01-01T00:00:00Z none none \
+  'echo start >> "$MONDAY_AGENT_WORKSPACE/starts"; sleep 15'
+"$gate" task-declare --file "$fixture/slice-die.yml" >/dev/null
+"$gate" task-invoke slice-die >"$fixture/die.out" 2>&1 &
+die_pid=$!
+die_dir="$fixture/.git/agent-tasks/slice-die"
+for ((i=0; i<200; i++)); do
+  [[ -s $die_dir/worker.pid && -s $die_dir/workspace/starts ]] && break
+  sleep 0.05
+done
+die_worker=$(tr -d '[:space:]' <"$die_dir/worker.pid")
+die_pgid=$(ps -o pgid= -p "$die_worker" 2>/dev/null | tr -d ' ' || true)
+kill -KILL "$die_pid" 2>/dev/null || true
+if [[ $die_pgid =~ ^[0-9]+$ && $die_pgid != 0 ]]; then
+  kill -KILL "-$die_pgid" 2>/dev/null || true
+fi
+for ((i=0; i<40; i++)); do
+  if ! kill -0 "$die_pid" 2>/dev/null && ! kill -0 "$die_worker" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+die_retry=$("$gate" task-invoke slice-die 2>&1 || true)
+grep -qx 'reason=execution_unresolved' <<<"$die_retry"
+[[ $(wc -l <"$die_dir/workspace/starts" | tr -d ' ') == 1 ]]
+grep -qx 'consumed=0' "$die_dir/receipt"
+grep -qx 'reserved=1' "$die_dir/receipt"
+wait "$die_pid" 2>/dev/null || true
 
 printf 'agent worktree preflight tests passed\n'

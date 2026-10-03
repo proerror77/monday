@@ -6,7 +6,9 @@ export LC_ALL=C
 usage() {
   printf '%s\n' \
     "Usage: ${0##*/} <isolate|drain> <spot|usdm>" \
-    "       ${0##*/} resume <spot|usdm> --job-id <id> --job-sha256 <sha> --from-controller <sha> --controller <sha> --transition-receipt <path> --transition-sha256 <sha> --request-id <id>" >&2
+    "       ${0##*/} resume <spot|usdm> --job-id <id> --job-sha256 <sha> --from-controller <sha> --controller <sha> --transition-receipt <path> --transition-sha256 <sha> --request-id <id>" \
+    "       ${0##*/} retain <spot|usdm> --job-id <id> --job-sha256 <sha> --result-sha256 <sha> --controller <sha> --request-id <id> --reason-code retain-unrecovered-historical-evidence" \
+    "       ${0##*/} check-retained <spot|usdm>" >&2
 }
 
 root_join() {
@@ -458,6 +460,22 @@ drain_lock() {
   flock -n 7
 }
 
+# uutils 0.8.0 implements `sync PATH` as global sync(2), so an isolation
+# transaction can exhaust ExecStartPre's deadline waiting for unrelated I/O.
+# Ubuntu ships GNU sync as gnusync alongside uutils. Require its path-scoped
+# fsync semantics; never fall back to a filesystem-wide or global flush.
+recovery_sync_path() {
+  local program version
+  (( $# > 0 )) || return 1
+  program=$(command -v gnusync || command -v sync) || return 1
+  version=$("$program" --version) || return 1
+  [[ $version == 'sync (GNU coreutils)'* ]] || {
+    printf 'recovery durability requires GNU sync (gnusync or sync)\n' >&2
+    return 1
+  }
+  "$program" -- "$@"
+}
+
 write_job_receipt() {
   local job_id=$1 queue_unit=$2 tmp env_copy env_tmp
   CURRENT_ISOLATION_JOB_ID=$job_id
@@ -466,8 +484,7 @@ write_job_receipt() {
   env_tmp="$env_copy.tmp.$$"
   install -m 0640 -o root -g root -- "$RELEASE_ENV_FILE" "$env_tmp"
   mv -Tf "$env_tmp" "$env_copy"
-  # A path operand uses fsync(2); -f uses syncfs(2) and can stall on all of /data.
-  sync "$env_copy"
+  recovery_sync_path "$env_copy"
   tmp="$CANONICAL_SPOOL/job.json.tmp.$$"
   jq -n \
     --arg schema monday.rust_lob_recovery_queue.v1 \
@@ -493,10 +510,10 @@ write_job_receipt() {
       release_env:$release_env,recovery_unit:$recovery_unit}' >"$tmp"
   chmod 0640 "$tmp"
   mv -Tf "$tmp" "$CANONICAL_SPOOL/job.json"
-  sync "$CANONICAL_SPOOL/job.json"
+  recovery_sync_path "$CANONICAL_SPOOL/job.json"
   isolation_phase_done
   isolation_phase_begin receipt-dir
-  sync "$CANONICAL_SPOOL"
+  recovery_sync_path "$CANONICAL_SPOOL"
   isolation_phase_done
 }
 
@@ -530,10 +547,10 @@ write_isolation_marker() {
   chmod 0640 "$tmp"
   mv -Tf "$tmp" "$ISOLATION_MARKER"
   secure_regular_file "$ISOLATION_MARKER" 0
-  sync "$ISOLATION_MARKER"
+  recovery_sync_path "$ISOLATION_MARKER"
   isolation_phase_done
   isolation_phase_begin marker-dir
-  sync "$QUEUE_MARKET_ROOT"
+  recovery_sync_path "$QUEUE_MARKET_ROOT"
   isolation_phase_done
 }
 
@@ -619,10 +636,10 @@ complete_isolation_transaction() {
     mv -T -- "$CANONICAL_SPOOL" "$ISOLATION_READY_DIR"
     isolation_phase_done
     isolation_phase_begin canonical-parent
-    sync "$CANONICAL_ROOT"
+    recovery_sync_path "$CANONICAL_ROOT"
     isolation_phase_done
     isolation_phase_begin queue-parent
-    sync "$QUEUE_MARKET_ROOT"
+    recovery_sync_path "$QUEUE_MARKET_ROOT"
     isolation_phase_done
     isolation_phase_begin canonical-recreate
     install -d -m 0750 -o "$hft_uid" -g "$hft_gid" -- "$CANONICAL_SPOOL"
@@ -631,18 +648,18 @@ complete_isolation_transaction() {
   if [[ -f $prior_upload_status && ! -L $prior_upload_status ]]; then
     install -m 0640 -o "$hft_uid" -g "$hft_gid" -- \
       "$prior_upload_status" "$CANONICAL_SPOOL/upload-status.json"
-    sync "$CANONICAL_SPOOL/upload-status.json"
+    recovery_sync_path "$CANONICAL_SPOOL/upload-status.json"
   fi
-  sync "$CANONICAL_SPOOL"
+  recovery_sync_path "$CANONICAL_SPOOL"
   isolation_phase_done
   isolation_phase_begin canonical-parent
-  sync "$CANONICAL_ROOT"
+  recovery_sync_path "$CANONICAL_ROOT"
   isolation_phase_done
   isolation_phase_begin marker-remove
   rm -f -- "$ISOLATION_MARKER"
   isolation_phase_done
   isolation_phase_begin queue-parent
-  sync "$QUEUE_MARKET_ROOT"
+  recovery_sync_path "$QUEUE_MARKET_ROOT"
   isolation_phase_done
   isolation_phase_begin handoff
   if (( spool_lock_held )); then
@@ -771,10 +788,10 @@ write_result() {
     fail 'could not serialize recovery result'
   fi
   chmod 0440 "$tmp" || fail 'could not protect recovery result'
-  sync "$tmp" || fail 'could not persist recovery result'
+  recovery_sync_path "$tmp" || fail 'could not persist recovery result'
   ln -- "$tmp" "$path" || fail "refusing to replace recovery result: $path"
   rm -f -- "$tmp" || fail 'could not remove committed recovery result temporary'
-  sync "${path%/*}" || fail 'could not persist recovery result directory'
+  recovery_sync_path "${path%/*}" || fail 'could not persist recovery result directory'
 }
 
 load_job() {
@@ -1005,6 +1022,13 @@ resume_market() {
   local request request_sha evidence_root attempt pointer queue_dir='' candidate suffix count=0
   local previous_execution old_request_sha adoption_sha tmp hft_uid hft_gid result
   validate_resume_request
+  [[ ! -e $EVIDENCE_ROOT/retained/$MARKET/$RESUME_JOB_ID.json \
+    && ! -L $EVIDENCE_ROOT/retained/$MARKET/$RESUME_JOB_ID.json \
+    && ! -e $EVIDENCE_ROOT/retained/$MARKET/$RESUME_JOB_ID.json.pending \
+    && ! -L $EVIDENCE_ROOT/retained/$MARKET/$RESUME_JOB_ID.json.pending \
+    && ! -e $EVIDENCE_ROOT/$RESUME_JOB_ID/retention \
+    && ! -L $EVIDENCE_ROOT/$RESUME_JOB_ID/retention ]] \
+    || fail 'a retained or partially retained historical job cannot be resumed'
   drain_lock || fail 'a recovery drain or controller transition is active'
   secure_release_identity
   if [[ -n ${EXECUTING_RECOVERY_PROGRAM:-} ]]; then
@@ -1095,12 +1119,12 @@ resume_market() {
       >"$RESUME_STAGING_DIR/adoption.json" || fail 'could not serialize recovery adoption'
     chmod 0440 "$RESUME_STAGING_DIR"/* || fail 'could not protect recovery adoption evidence'
     for candidate in "$RESUME_STAGING_DIR"/*; do
-      sync "$candidate" || fail 'could not persist recovery adoption evidence'
+      recovery_sync_path "$candidate" || fail 'could not persist recovery adoption evidence'
     done
-    sync "$RESUME_STAGING_DIR" || fail 'could not persist recovery adoption staging directory'
+    recovery_sync_path "$RESUME_STAGING_DIR" || fail 'could not persist recovery adoption staging directory'
     mv -T -- "$RESUME_STAGING_DIR" "$attempt" || fail 'could not commit recovery adoption directory'
     RESUME_STAGING_DIR=
-    sync "$evidence_root/attempts" || fail 'could not persist recovery adoption directory'
+    recovery_sync_path "$evidence_root/attempts" || fail 'could not persist recovery adoption directory'
   fi
   secure_regular_file "$attempt/adoption.json" 0
   secure_regular_file "$attempt/request.json" 0
@@ -1116,12 +1140,12 @@ resume_market() {
       request_sha256:$request_sha,adoption_sha256:$adoption_sha}' >"$tmp" \
     || fail 'could not serialize recovery adoption pointer'
   chmod 0440 "$tmp" || fail 'could not protect recovery adoption pointer'
-  sync "$tmp" || fail 'could not persist recovery adoption pointer'
+  recovery_sync_path "$tmp" || fail 'could not persist recovery adoption pointer'
   if [[ -e $pointer ]] && cmp -s -- "$tmp" "$pointer"; then
     rm -f -- "$tmp" || fail 'could not remove identical adoption pointer temporary'
   else
     mv -Tf -- "$tmp" "$pointer" || fail 'could not commit recovery adoption pointer'
-    sync "$evidence_root" || fail 'could not persist recovery adoption pointer directory'
+    recovery_sync_path "$evidence_root" || fail 'could not persist recovery adoption pointer directory'
   fi
   load_adoption "$queue_dir" || fail 'committed recovery adoption failed readback'
   result="$attempt/result.json"
@@ -1147,7 +1171,7 @@ resume_market() {
     candidate="$QUEUE_MARKET_ROOT/$JOB_ID.ready"
     [[ ! -e $candidate && ! -L $candidate ]] || fail 'resume ready destination already exists'
     mv -T -- "$queue_dir" "$candidate" || fail 'could not requeue explicitly adopted recovery job'
-    sync "$QUEUE_MARKET_ROOT" || fail 'could not persist resumed recovery queue'
+    recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist resumed recovery queue'
   fi
   flock -u 8 || fail 'could not release resumed spool lock'
   exec 8>&-
@@ -1173,10 +1197,10 @@ start_execution() {
         executing_controller_sha256:$controller,started_at:$started}' >"$tmp" \
       || fail 'could not serialize recovery start'
     chmod 0440 "$tmp" || fail 'could not protect recovery start'
-    sync "$tmp" || fail 'could not persist recovery start'
+    recovery_sync_path "$tmp" || fail 'could not persist recovery start'
     ln -- "$tmp" "$path" || fail 'recovery start already exists'
     rm -f -- "$tmp" || fail 'could not remove committed recovery start temporary'
-    sync "$JOB_EXECUTION_ROOT" || fail 'could not persist recovery start directory'
+    recovery_sync_path "$JOB_EXECUTION_ROOT" || fail 'could not persist recovery start directory'
   fi
   secure_regular_file "$path" 0
   jq -e --arg job "$JOB_ID" --arg job_sha "$JOB_RECEIPT_SHA256" \
@@ -1235,8 +1259,8 @@ mark_stale() {
   write_result "$result_path" stale "$step" "$message"
   [[ ! -e $stale_dir && ! -L $stale_dir ]] || fail "refusing to reuse stale recovery path: $stale_dir"
   mv -T -- "$running_dir" "$stale_dir" || fail 'could not commit stale recovery queue state'
-  sync "$QUEUE_MARKET_ROOT" || fail 'could not persist stale recovery queue state'
-  sync "$evidence_root" || fail 'could not persist stale recovery evidence'
+  recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist stale recovery queue state'
+  recovery_sync_path "$evidence_root" || fail 'could not persist stale recovery evidence'
 }
 
 finalize_passed_running() {
@@ -1261,8 +1285,8 @@ finalize_passed_running() {
   [[ ! -e $evidence_root/spool.done && ! -L $evidence_root/spool.done ]] \
     || fail "refusing to reuse evidence spool path: $evidence_root/spool.done"
   mv -T -- "$running_dir" "$evidence_root/spool.done" || fail 'could not archive passed recovery spool'
-  sync "$QUEUE_MARKET_ROOT" || fail 'could not persist archived recovery queue state'
-  sync "$evidence_root" || fail 'could not persist archived recovery evidence'
+  recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist archived recovery queue state'
+  recovery_sync_path "$evidence_root" || fail 'could not persist archived recovery evidence'
 }
 
 check_upload_readback() {
@@ -1272,6 +1296,19 @@ check_upload_readback() {
   jq -e '.last_error == null' "$status" >/dev/null \
     || fail "upload status reports an error: $status"
   require_empty_segment_spool "$spool" || fail "detached spool still contains segment artifacts"
+}
+
+run_logged_recovery_step() {
+  local log=$1 message=$2 status=0
+  shift 2
+  [[ ! -e $log && ! -L $log ]] || fail "refusing to replace recovery stderr: $log"
+  # This directory belongs to the immutable attempt, not the collector. Keep
+  # stderr even when the journal has rotated, without masking the child status.
+  (umask 077; set -o noclobber; "$@" 2>"$log") || status=$?
+  chmod 0440 "$log" || fail 'could not protect recovery stderr'
+  recovery_sync_path "$log" || fail 'could not persist recovery stderr'
+  cat -- "$log" >&2
+  (( status == 0 )) || fail "$message (exit=$status)"
 }
 
 run_drain_job() {
@@ -1308,7 +1345,8 @@ run_drain_job() {
   if has_incomplete_parts "$running_dir"; then
     [[ ! -e $backup_dir && ! -L $backup_dir ]] \
       || fail 'recovery inputs were already backed up; use a new explicit resume request after inspecting the interrupted attempt'
-    env -i \
+    run_logged_recovery_step "$evidence_root/recover.stderr" \
+      'detached recovery of incomplete parts failed' env -i \
       HOME=/root \
       PATH="$SAFE_PATH" \
       RUST_LOG=info \
@@ -1319,8 +1357,7 @@ run_drain_job() {
       RECOVERY_UID="$(id -u hftcollector)" \
       RECOVERY_GID="$(id -g hftcollector)" \
       RECOVERY_BACKUP_DIR="$backup_dir" \
-      "$release_binary" --recover-parts-only \
-      || fail 'detached recovery of incomplete parts failed'
+      "$release_binary" --recover-parts-only
   fi
   if has_cleanup_marker_only_leftover "$running_dir"; then
     fail 'detached spool has leftover uploaded-cleanup markers without local segment artifacts; refusing fresh-upload verify so the marker remains inspectable'
@@ -1329,13 +1366,13 @@ run_drain_job() {
   # interrupted controller may therefore have only metadata left.  Re-running
   # an empty upload cannot refresh its timestamp and is not completion proof.
   if ! require_empty_segment_spool "$running_dir" 2>/dev/null; then
-    runuser --user hftcollector -- env -i \
+    run_logged_recovery_step "$evidence_root/upload.stderr" \
+      'detached recovery upload failed' runuser --user hftcollector -- env -i \
       HOME=/var/lib/hft-collector \
       PATH="$SAFE_PATH" \
       RUST_LOG=info \
       "${env_args[@]}" \
-      "$release_binary" --upload-only \
-      || fail 'detached recovery upload failed'
+      "$release_binary" --upload-only
   fi
   check_upload_readback "$running_dir"
   verify_upload_triplet_readback "$running_dir" "$JOB_MINIMUM_SUCCESS_AT" 0
@@ -1343,12 +1380,12 @@ run_drain_job() {
   [[ ! -e $evidence_root/spool.done && ! -L $evidence_root/spool.done ]] \
     || fail "refusing to reuse evidence spool path: $evidence_root/spool.done"
   mv -T -- "$running_dir" "$evidence_root/spool.done" || fail 'could not archive passed recovery spool'
-  sync "$QUEUE_MARKET_ROOT" || fail 'could not persist archived recovery queue state'
-  sync "$evidence_root" || fail 'could not persist archived recovery evidence'
+  recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist archived recovery queue state'
+  recovery_sync_path "$evidence_root" || fail 'could not persist archived recovery evidence'
 }
 
 mark_failed() {
-  local running_dir=$1 step=$2 message=$3 failed_dir evidence_root result_path
+  local running_dir=$1 step=$2 message=$3 failed_dir evidence_root result_path log
   load_execution_context "$running_dir" \
     || fail 'failed recovery identity is no longer active; preserving unfinished evidence'
   UPLOAD_TRIPLET_READBACK='{}'
@@ -1362,11 +1399,24 @@ mark_failed() {
   [[ ! -e $result_path && ! -L $result_path ]] \
     || fail "recovery already committed a result; preserving it for archival readback: $result_path"
   start_execution
+  if [[ $message == 'drain failed' ]]; then
+    # Prefer the last executed stage; keep the full bytes in the protected log
+    # and bound the receipt so a verbose child cannot balloon every health read.
+    log="$evidence_root/recover.stderr"
+    [[ ! -e $evidence_root/upload.stderr && ! -L $evidence_root/upload.stderr ]] \
+      || log="$evidence_root/upload.stderr"
+    if [[ -e $log || -L $log ]]; then
+      secure_regular_file "$log" 0
+      if [[ -s $log ]]; then
+        message="$message: $(tail -c 8192 -- "$log")"
+      fi
+    fi
+  fi
   write_result "$result_path" failed "$step" "$message"
   if [[ $running_dir != "$failed_dir" ]]; then
     [[ ! -e $failed_dir && ! -L $failed_dir ]] || fail 'failed recovery destination already exists'
     mv -T -- "$running_dir" "$failed_dir" || fail 'could not commit failed recovery queue state'
-    sync "$QUEUE_MARKET_ROOT" || fail 'could not persist failed recovery queue state'
+    recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist failed recovery queue state'
   fi
 }
 
@@ -1387,6 +1437,12 @@ on_signal() {
 drain_market() {
   local ready_dir running_dir hft_gid drain_status
   local -a running=()
+  # The queue lock serializes this check with isolation. A ready directory
+  # is not consumable until its isolation marker has been durably removed.
+  if [[ -e $ISOLATION_MARKER || -L $ISOLATION_MARKER ]]; then
+    printf 'isolation transaction is unfinished; deferred %s drain\n' "$MARKET"
+    return 0
+  fi
   if ! drain_lock; then
     printf 'another market recovery is active; deferred %s drain\n' "$MARKET"
     exit 0
@@ -1420,9 +1476,14 @@ drain_market() {
   load_job "$ready_dir"
   running_dir="${ready_dir%.ready}.running"
   mv -T -- "$ready_dir" "$running_dir" || fail 'could not start queued recovery job'
-  sync "$QUEUE_MARKET_ROOT" || fail 'could not persist running recovery queue state'
+  recovery_sync_path "$QUEUE_MARKET_ROOT" || fail 'could not persist running recovery queue state'
   CURRENT_RUNNING_DIR=$running_dir
   CURRENT_STEP=recover-upload
+  # Only the ready -> running claim needs the per-market queue lock. The
+  # global drain lock still excludes other drain/resume and release cutovers;
+  # production may isolate a different spool while this detached job runs.
+  flock -u 9 || fail 'could not release claimed recovery queue lock'
+  exec 9>&-
   set +e
   (
     set -Eeuo pipefail
@@ -1439,8 +1500,642 @@ drain_market() {
   exit 1
 }
 
+# Retention is custody evidence, not recovery. Large content hashes run only
+# during this explicit operation, never in production pre-start or health.
+RETENTION_MAX_BYTES=17179869184
+RETENTION_MAX_ENTRIES=4096
+RETENTION_MAX_METADATA_BYTES=4194304
+RETENTION_MAX_JOBS=128
+RETENTION_DEADLINE=0
+
+retention_remaining() {
+  local remaining=$((RETENTION_DEADLINE - SECONDS))
+  (( remaining > 0 )) || return 124
+  printf '%s\n' "$remaining"
+}
+
+retention_bounded() {
+  local remaining
+  remaining=$(retention_remaining) || return 124
+  timeout --signal=TERM --kill-after=2s "$remaining" "$@"
+}
+
+retention_read_failure() {
+  local operation=$1 status=$2
+  if (( status == 124 || SECONDS >= RETENTION_DEADLINE )); then
+    fail "retention-read-deadline: $operation"
+  fi
+  fail "retention-read-unavailable: $operation"
+}
+
+retention_small_sha() {
+  local path=$1 size
+  [[ -f $path && ! -L $path ]] || return 1
+  size=$(stat -c %s -- "$path") || return 1
+  (( size <= RETENTION_MAX_METADATA_BYTES )) || return 1
+  retention_bounded sha256sum -- "$path" | awk '{print $1}'
+}
+
+retention_metadata_path() {
+  case "$1" in
+    *.json|*.env|*.log|*.txt|*.sha256|*._SUCCESS|.binance-lob-archiver.lock) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+retention_fingerprint() {
+  local path=$1 record dev inode links size uid gid mode kind mtime ctime
+  [[ ! -L $path ]] || return 1
+  if [[ -f $path ]]; then kind='file'
+  elif [[ -d $path ]]; then kind='directory'
+  else return 1; fi
+  record=$(TZ=UTC stat -c '%d|%i|%h|%s|%u|%g|%a|%y|%z' -- "$path") || return 1
+  IFS='|' read -r dev inode links size uid gid mode mtime ctime <<<"$record"
+  [[ $dev =~ ^[0-9]+$ && $inode =~ ^[0-9]+$ && $links =~ ^[0-9]+$ \
+    && $size =~ ^[0-9]+$ && $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ \
+    && $mode =~ ^[0-7]{3,4}$ \
+    && $mtime =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}\ \+0000$ \
+    && $ctime =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}\ \+0000$ ]] || return 1
+  [[ $kind != file || $links == 1 ]] || return 1
+  (( (8#$mode & 022) == 0 )) || return 1
+  printf '%s|%s\n' "$kind" "$record"
+}
+
+# The evidence root's own fingerprint is retained, but its retention subtree
+# is excluded: that is the only place this operation appends new evidence.
+# All original recovery inputs/backups and logs are otherwise inventoried.
+retention_inventory() (
+  set -o pipefail
+  local spool=$1 evidence=$2 mode=$3 spool_dev evidence_dev
+  spool_dev=$(stat -c %d -- "$spool") || exit 1
+  evidence_dev=$(stat -c %d -- "$evidence") || exit 1
+  [[ $spool_dev == "$evidence_dev" ]] || exit 1
+  {
+    retention_bounded find "$spool" -xdev -print0 || exit 1
+    retention_bounded find "$evidence" -xdev -path "$evidence/retention" -prune -o -print0 || exit 1
+  } | sort -z | (
+    local path scope relative before after digest metadata count=0 bytes=0 size
+    local kind dev inode links uid gid permissions mtime ctime hash_field
+    while IFS= read -r -d '' path; do
+      retention_remaining >/dev/null || exit 1
+      count=$((count + 1)); (( count <= RETENTION_MAX_ENTRIES )) || exit 1
+      case "$path" in
+        "$spool") scope=queue; relative=. ;;
+        "$spool"/*) scope=queue; relative=${path#"$spool/"} ;;
+        "$evidence") scope=evidence; relative=. ;;
+        "$evidence"/*) scope=evidence; relative=${path#"$evidence/"} ;;
+        *) exit 1 ;;
+      esac
+      if [[ $relative != . ]]; then
+        [[ $relative =~ ^[A-Za-z0-9_.=-]+(/[A-Za-z0-9_.=-]+)*$ \
+          && /$relative/ != */../* && /$relative/ != */./* ]] || exit 1
+      fi
+      before=$(retention_fingerprint "$path") || exit 1
+      IFS='|' read -r kind dev inode links size uid gid permissions mtime ctime <<<"$before"
+      [[ $dev == "$spool_dev" ]] || exit 1
+      digest='' metadata=false
+      if [[ $kind == file ]]; then
+        (( size <= RETENTION_MAX_BYTES )) || exit 1
+        bytes=$((bytes + size)); (( bytes <= RETENTION_MAX_BYTES )) || exit 1
+        if retention_metadata_path "$relative"; then
+          metadata=true
+          (( size <= RETENTION_MAX_METADATA_BYTES )) || exit 1
+        fi
+        if [[ $mode == full || ( $mode == fast && $metadata == true ) ]]; then
+          digest=$(retention_bounded sha256sum -- "$path" | awk '{print $1}') || exit 1
+          [[ $digest =~ ^[a-f0-9]{64}$ ]] || exit 1
+        fi
+      fi
+      after=$(retention_fingerprint "$path") || exit 1
+      [[ $before == "$after" ]] || exit 1
+      # Every string above has a restricted alphabet without JSON escapes.
+      hash_field=''; [[ -z $digest ]] || hash_field=",\"sha256\":\"$digest\""
+      printf '{"scope":"%s","path":"%s","fingerprint":{"type":"%s","device":"%s","inode":"%s","links":"%s","size":"%s","uid":"%s","gid":"%s","mode":"%s","mtime":"%s","ctime":"%s"},"hash_on_health":%s%s}\n' \
+        "$scope" "$relative" "$kind" "$dev" "$inode" "$links" "$size" "$uid" "$gid" \
+        "$permissions" "$mtime" "$ctime" "$metadata" "$hash_field" || exit 1
+    done
+  ) | jq -csS '{schema:"monday.rust_lob_recovery_retention_inventory.v1",entries:sort_by(.scope,.path)}'
+)
+
+retention_fast_view() {
+  jq -cS '.entries |= map(if .hash_on_health then . else del(.sha256) end)'
+}
+
+retention_validate_request() {
+  [[ $MARKET =~ ^(spot|usdm)$ && ${RETAIN_JOB_ID:-} =~ ^[0-9]{8}T[0-9]{6}Z-${MARKET}-[a-f0-9]{12}-[0-9]+$ \
+    && ${RETAIN_JOB_SHA256:-} =~ ^[a-f0-9]{64}$ \
+    && ${RETAIN_RESULT_SHA256:-} =~ ^[a-f0-9]{64}$ \
+    && ${RETAIN_CONTROLLER:-} =~ ^[a-f0-9]{64}$ \
+    && ${RETAIN_REQUEST_ID:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$ \
+    && ${RETAIN_REASON_CODE:-} == retain-unrecovered-historical-evidence ]] \
+    || fail 'retain requires one exact terminal job, result, controller and explicit reason/request'
+}
+
+retention_terminal_spool() {
+  local job_id=$1 suffix count=0 selected=''
+  for suffix in ready running failed stale; do
+    if [[ -e $QUEUE_MARKET_ROOT/$job_id.$suffix || -L $QUEUE_MARKET_ROOT/$job_id.$suffix ]]; then
+      count=$((count + 1)); selected="$QUEUE_MARKET_ROOT/$job_id.$suffix"
+    fi
+  done
+  if (( count != 1 )) || [[ $selected != *.failed && $selected != *.stale ]]; then
+    fail 'retain requires exactly one terminal failed or stale state'
+  fi
+  printf '%s\n' "$selected"
+}
+
+# Identity rejection may be recorded by a newer controller than the queued job.
+# Verify the actual executor rather than pretending the original controller ran it.
+retention_stale_executor_valid() {
+  local result=$1 executor manifest
+  executor=$(jq -er '.executing_controller_sha256|select(test("^[a-f0-9]{64}$"))' "$result") \
+    || fail 'stale result has no exact executing controller'
+  monday_verify_controller_release "$ROOT_PREFIX" "$executor" \
+    || fail 'stale executing controller failed immutable verification'
+  manifest="$CONTROLLER_RELEASE_ROOT/$executor/release.json"
+  jq -e --slurpfile manifest "$manifest" '
+    .executing_deployment_bundle_sha256==$manifest[0].deployment_bundle_sha256
+    and .executing_deployment_source_revision==$manifest[0].deployment_source_revision
+    and .step=="stale-identity"
+    and .message=="queued recovery identity is not the active ControllerRelease"
+    and .upload_triplet_readback=={}' "$result" >/dev/null \
+    || fail 'stale result does not bind an immutable identity-rejection executor'
+}
+
+retention_original_identity() {
+  local spool=$1 job_id=$2 state evidence result expected_uid expected_gid actual_env status_sha=''
+  expected_uid=$(id -u hftcollector); expected_gid=$(id -g hftcollector)
+  [[ $spool == "$(retention_terminal_spool "$job_id")" ]] || fail 'retain requires the canonical terminal directory'
+  state=${spool##*.}
+  secure_directory "$QUEUE_MARKET_ROOT" 0 "$expected_gid"
+  path_is_direct_or_absent "$spool" || fail 'indirect retained spool'
+  secure_directory "$spool" "$expected_uid" "$expected_gid"
+  if [[ -e $ISOLATION_MARKER || -L $ISOLATION_MARKER ]]; then
+    secure_regular_file "$ISOLATION_MARKER" 0
+    [[ $(jq -er .job_id "$ISOLATION_MARKER") != "$job_id" ]] || fail 'retain refuses unfinished isolation'
+  fi
+  retention_small_sha "$spool/job.json" >/dev/null || fail 'retention job receipt is too large or unreadable'
+  load_job "$spool" "$job_id"
+  [[ $job_id == *-"${JOB_RELEASE_SHA256:0:12}"-* ]] || fail 'retention job name does not match its original payload'
+  [[ $JOB_PAYLOAD_SHA256 == "$JOB_RELEASE_SHA256" && $JOB_PAYLOAD_SHA256 != "$RELEASE_SHA256" ]] \
+    || fail 'retain is only for a historical payload different from the active payload'
+  evidence=$(job_evidence_root "$job_id")
+  secure_directory "$evidence" 0 0
+  [[ ! -e $evidence/resume.json && ! -L $evidence/resume.json \
+    && ! -e $evidence/attempts && ! -L $evidence/attempts ]] || fail 'retain refuses resumed or ambiguous attempts'
+  secure_regular_file "$spool/recovery.env" 0
+  actual_env=$(retention_small_sha "$spool/recovery.env") || fail 'retention environment is too large or unreadable'
+  [[ $actual_env == "$JOB_ENV_SHA256" ]] || fail 'retention environment digest mismatch'
+  result="$evidence/result.json"
+  secure_regular_file "$result" 0
+  RETENTION_RESULT_SHA256=$(retention_small_sha "$result") || fail 'retention result is too large or unreadable'
+  jq -e --arg job "$JOB_ID" --arg market "$MARKET" --arg payload "$JOB_PAYLOAD_SHA256" \
+    --arg job_sha "$JOB_RECEIPT_SHA256" --arg env "$JOB_ENV_SHA256" --arg bundle "$JOB_BUNDLE_SHA256" \
+    --arg source "$JOB_SOURCE_REVISION" --arg controller "$JOB_CONTROLLER_SHA256" \
+    --arg runtime "$JOB_RUNTIME_CONTRACT_SHA256" --arg queued "$JOB_QUEUED_AT" --arg state "$state" '
+    .result==$state and .job_id==$job and .market==$market and .release_sha256==$payload
+    and .deployment_bundle_sha256==$bundle and .deployment_source_revision==$source and .env_sha256==$env
+    and (if has("payload_sha256") then .payload_sha256==$payload else true end)
+    and (if has("controller_sha256") then (.controller_sha256//"")==$controller else $controller=="" end)
+    and (if has("runtime_contract_sha256") then (.runtime_contract_sha256//"")==$runtime else $runtime=="" end)
+    and (.step|type)=="string" and (.step|length)>0 and (.message|type)=="string"
+    and ([.started_at,.completed_at]|all(.[]; type=="string"
+      and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")))
+    and ($queued|fromdateiso8601) <= (.started_at|fromdateiso8601)
+    and (.started_at|fromdateiso8601) <= (.completed_at|fromdateiso8601)
+    and (.completed_at|fromdateiso8601) <= now
+    and (if .schema=="monday.rust_lob_recovery_queue_result.v2" then
+      .job_receipt_sha256==$job_sha and .adoption_sha256=="" and .request_sha256==""
+      and (if $state=="failed" then .executing_controller_sha256==$controller
+        and .executing_deployment_bundle_sha256==$bundle
+        and .executing_deployment_source_revision==$source else true end)
+    else $state=="failed" and .schema=="monday.rust_lob_recovery_queue_result.v1" end)' "$result" >/dev/null \
+    || fail 'retain requires the matching original terminal result'
+  [[ $state != stale ]] || retention_stale_executor_valid "$result"
+  if [[ -e $spool/upload-status.json || -L $spool/upload-status.json ]]; then
+    secure_regular_file "$spool/upload-status.json" "$expected_uid"
+    status_sha=$(retention_small_sha "$spool/upload-status.json") || fail 'retention upload status is too large or unreadable'
+  fi
+  RETENTION_IDENTITY=$(jq -cnS --arg job "$JOB_ID" --arg market "$MARKET" --arg job_sha "$JOB_RECEIPT_SHA256" \
+    --arg result_sha "$RETENTION_RESULT_SHA256" --arg env "$JOB_ENV_SHA256" --arg status "$status_sha" \
+    --arg payload "$JOB_PAYLOAD_SHA256" --arg controller "$JOB_CONTROLLER_SHA256" \
+    --arg runtime "$JOB_RUNTIME_CONTRACT_SHA256" --arg bundle "$JOB_BUNDLE_SHA256" --arg source "$JOB_SOURCE_REVISION" \
+    --arg state "$state" \
+    '{job_id:$job,market:$market,job_sha256:$job_sha,result_sha256:$result_sha,env_sha256:$env,
+      upload_status_sha256:(if $status=="" then null else $status end),old_payload_sha256:$payload,
+      original_controller_sha256:(if $controller=="" then null else $controller end),
+      original_runtime_contract_sha256:(if $runtime=="" then null else $runtime end),
+      original_bundle_sha256:$bundle,original_source_revision:$source}
+      + (if $state=="stale" then {queue_state:$state} else {} end)') || fail 'could not bind retention identity'
+}
+
+retention_intent_json() {
+  jq -cnS --argjson identity "$RETENTION_IDENTITY" --arg request "$RETAIN_REQUEST_ID" \
+    --arg controller "$ACTIVE_CONTROLLER_SHA256" --arg payload "$RELEASE_SHA256" \
+    --arg bundle "$RELEASE_BUNDLE_SHA256" --arg source "$RELEASE_SOURCE_REVISION" \
+    '{schema:"monday.rust_lob_recovery_retention_intent.v1",identity:$identity,
+      request_id:$request,reason_code:"retain-unrecovered-historical-evidence",
+      recorded_by:{controller_sha256:$controller,payload_sha256:$payload,
+        deployment_bundle_sha256:$bundle,deployment_source_revision:$source}}'
+}
+
+retention_json_file_matches() {
+  local path=$1 expected_sha=$2 phase=$3 mode
+  secure_regular_file "$path" 0
+  path_is_direct_or_absent "$path" || fail 'indirect retention publication path'
+  [[ $(stat -c %h -- "$path") == 1 ]] || fail 'retention publication has unknown hard-link aliases'
+  mode=$(stat -c %a -- "$path") || fail 'cannot inspect retention publication mode'
+  [[ $mode == 440 || ( $phase == pending && $mode == 600 ) ]] || fail 'retention publication mode is invalid'
+  [[ $(retention_small_sha "$path") == "$expected_sha" ]] || fail 'conflicting retention metadata already exists'
+}
+
+retention_write_json() {
+  local path=$1 json=$2 tmp="$1.pending" expected_sha inode
+  secure_directory "${path%/*}" 0 0
+  expected_sha=$(printf '%s\n' "$json" | sha256sum | awk '{print $1}')
+  if [[ -e $path || -L $path ]]; then
+    retention_json_file_matches "$path" "$expected_sha" committed
+    [[ ! -e $tmp && ! -L $tmp ]] || fail 'unexpected pending metadata beside committed retention'
+    # A prior process may have stopped after rename but before the directory
+    # fsync. Repeating the exact request finishes that durability boundary.
+    recovery_sync_path "$path" "${path%/*}" || fail 'cannot persist existing retention metadata'
+    return
+  fi
+  if [[ ! -e $tmp && ! -L $tmp ]]; then
+    (umask 077; set -o noclobber; printf '%s\n' "$json" >"$tmp") || fail 'cannot create retention metadata pending file'
+  fi
+  # The deterministic pending path can be reused only for these exact bytes,
+  # under the existing global/spool locks. Unknown/partial files are preserved.
+  retention_json_file_matches "$tmp" "$expected_sha" pending
+  if [[ $(stat -c %a -- "$tmp") != 440 ]]; then chmod 0440 "$tmp" || fail 'cannot protect retention metadata'; fi
+  inode=$(stat -c '%d:%i' -- "$tmp") || fail 'cannot identify retention pending file'
+  recovery_sync_path "$tmp" || fail 'cannot persist retention metadata'
+  # Same-directory, no-clobber rename has no two-hard-link publication window.
+  # mv -n can report success without moving: verify both names and the inode.
+  mv -nT -- "$tmp" "$path" || fail 'cannot publish retention metadata'
+  [[ ! -e $tmp && ! -L $tmp && $(stat -c '%d:%i' -- "$path") == "$inode" ]] \
+    || fail 'retention metadata destination already exists or publication drifted'
+  retention_json_file_matches "$path" "$expected_sha" committed
+  recovery_sync_path "${path%/*}" || fail 'cannot persist retention metadata directory'
+}
+
+retention_inventory_valid() {
+  jq -e --argjson limit "$RETENTION_MAX_ENTRIES" '
+    .schema=="monday.rust_lob_recovery_retention_inventory.v1"
+    and (.entries|type)=="array" and (.entries|length)>0 and (.entries|length)<=$limit
+    and ([.entries[]|[.scope,.path]]|unique|length)==(.entries|length)
+    and all(.entries[]; (.scope=="queue" or .scope=="evidence")
+      and (.path|type)=="string" and (.hash_on_health|type)=="boolean"
+      and (.fingerprint|type)=="object"
+      and (if .fingerprint.type=="file" then (.sha256|type)=="string"
+        and (.sha256|test("^[a-f0-9]{64}$"))
+        else .fingerprint.type=="directory" and .hash_on_health==false and (has("sha256")|not) end))' "$1" >/dev/null
+}
+
+retention_record_fingerprints() (
+  set -o pipefail
+  local directory=$1 name fingerprint members
+  members=$(retention_bounded find "${directory%/*}" -mindepth 1 -maxdepth 1 -print0 \
+    | while IFS= read -r -d '' name; do printf '%s\n' "${name##*/}"; done | sort) || exit 1
+  [[ $members == "${directory##*/}" ]] || exit 1
+  members=$(find "$directory" -mindepth 1 -maxdepth 1 -print0 \
+    | while IFS= read -r -d '' name; do printf '%s\n' "${name##*/}"; done | sort) || exit 1
+  [[ $members == $'intent.json\ninventory.json\nreceipt.json\nrequest.json' ]] || exit 1
+  for name in . intent.json inventory.json receipt.json request.json; do
+    fingerprint=$(retention_fingerprint "$directory/$name") || exit 1
+    printf '{"path":"%s","fingerprint":"%s"}\n' "$name" "$fingerprint"
+  done | jq -csS .
+)
+
+# Pure validator shared by the writer readback and periodic health. Content is
+# hashed at enrollment; health rehashes only small metadata and compares every
+# object's complete fingerprint, including nanosecond ctime, and membership.
+retention_check_record() {
+  local directory=$1 job_id=$2 request_sha=$3 inventory_sha=$4 receipt_sha=$5
+  local spool evidence request inventory fast observed identity state
+  local controller controller_json receipt_count receipt_bytes name
+  evidence=$(job_evidence_root "$job_id")
+  secure_directory "$evidence/retention" 0 0
+  secure_directory "$directory" 0 0
+  path_is_direct_or_absent "$directory" || fail 'indirect retention record directory'
+  [[ $(stat -c %a -- "$directory") == 750 ]] || fail 'retention record directory mode drifted'
+  for name in intent request inventory receipt; do
+    secure_regular_file "$directory/$name.json" 0
+    [[ $(stat -c %h -- "$directory/$name.json") == 1 ]] || fail 'retention metadata has hard-link aliases'
+    [[ $(stat -c %a -- "$directory/$name.json") == 440 ]] || fail 'retention metadata mode drifted'
+  done
+  [[ $(retention_small_sha "$directory/request.json") == "$request_sha" \
+    && $(retention_small_sha "$directory/inventory.json") == "$inventory_sha" \
+    && $(retention_small_sha "$directory/receipt.json") == "$receipt_sha" ]] || fail 'retention content address mismatch'
+  retention_inventory_valid "$directory/inventory.json" || fail 'invalid complete retention inventory'
+  state=$(jq -er '.identity.queue_state//"failed"|select(.=="failed" or .=="stale")' "$directory/request.json") \
+    || fail 'invalid retained terminal state'
+  spool="$QUEUE_MARKET_ROOT/$job_id.$state"
+  retention_original_identity "$spool" "$job_id"
+  identity=$RETENTION_IDENTITY
+  request=$(jq -cS . "$directory/request.json") || fail 'invalid retention request'
+  [[ $(retention_small_sha "$directory/intent.json") == "$(jq -cS \
+    'del(.inventory_sha256)|.schema="monday.rust_lob_recovery_retention_intent.v1"' <<<"$request" | sha256sum | awk '{print $1}')" ]] \
+    || fail 'retention intent differs from the canonical request'
+  jq -e --argjson identity "$identity" --arg inventory "$inventory_sha" '
+    .schema=="monday.rust_lob_recovery_retention_request.v1" and .identity==$identity
+    and .inventory_sha256==$inventory and .reason_code=="retain-unrecovered-historical-evidence"
+    and (.request_id|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"))
+    and (.recorded_by.controller_sha256|test("^[a-f0-9]{64}$"))
+    and .recorded_by.payload_sha256 != .identity.old_payload_sha256' <<<"$request" >/dev/null \
+    || fail 'retention request no longer binds the original failure'
+  controller=$(jq -er .recorded_by.controller_sha256 <<<"$request")
+  controller_json="$CONTROLLER_RELEASE_ROOT/$controller/release.json"
+  path_is_direct_or_absent "$CONTROLLER_RELEASE_ROOT/$controller" || fail 'indirect recording controller'
+  secure_regular_file "$controller_json" 0
+  [[ $(retention_small_sha "$controller_json") == "$controller" ]] || fail 'recording controller identity drifted'
+  jq -e --argjson recorded "$(jq -c .recorded_by <<<"$request")" '
+    .schema=="monday.rust_lob_controller_release.v2" and .artifact_sha256==$recorded.payload_sha256
+    and .deployment_bundle_sha256==$recorded.deployment_bundle_sha256
+    and .deployment_source_revision==$recorded.deployment_source_revision' "$controller_json" >/dev/null \
+    || fail 'recording controller source or payload differs from retention'
+  receipt_count=$(jq '[.entries[]|select(.fingerprint.type=="file")]|length' "$directory/inventory.json")
+  receipt_bytes=$(jq '[.entries[]|select(.fingerprint.type=="file")|.fingerprint.size|tonumber]|add//0' "$directory/inventory.json")
+  jq -e --argjson request "$request" --arg request_sha "$request_sha" --arg inventory "$inventory_sha" \
+    --argjson count "$receipt_count" --argjson bytes "$receipt_bytes" --arg state "$state" '
+    .schema=="monday.rust_lob_recovery_retention.v1" and .request==$request
+    and .request_sha256==$request_sha and .inventory_sha256==$inventory
+    and .disposition=="retained_unrecovered" and .recovery_result==$state
+    and .data_recovered==false and .delivery_verified==false and .replay_eligibility=="not_assessed"
+    and .automatic_retry==false and (has("passed")|not)
+    and .inventory_validation=="content_hash_at_commit_with_metadata_drift_checks"
+    and .file_count==$count and .retained_bytes==$bytes
+    and (.retained_at|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))' \
+    "$directory/receipt.json" >/dev/null || fail 'retention receipt semantics or inventory counts are invalid'
+  fast=$(retention_fast_view <"$directory/inventory.json") || fail 'cannot project retained inventory'
+  observed=$(retention_inventory "$spool" "$evidence" fast) || fail 'cannot inspect retained inventory'
+  [[ $observed == "$fast" ]] || fail 'retained file content metadata or membership drifted'
+  retention_original_identity "$spool" "$job_id"
+  [[ $RETENTION_IDENTITY == "$identity" ]] || fail 'original retention metadata changed during readback'
+  observed=$(retention_inventory "$spool" "$evidence" fast) || fail 'cannot recheck retained inventory'
+  [[ $observed == "$fast" ]] || fail 'retained objects changed during readback'
+  [[ $(retention_small_sha "$directory/request.json") == "$request_sha" \
+    && $(retention_small_sha "$directory/inventory.json") == "$inventory_sha" \
+    && $(retention_small_sha "$directory/receipt.json") == "$receipt_sha" ]] || fail 'retention record changed during readback'
+  jq -cnS --argjson identity "$identity" --arg request "$request_sha" --arg inventory "$inventory_sha" \
+    --arg receipt "$receipt_sha" --argjson bytes "$receipt_bytes" --arg state "$state" \
+    '{job_id:$identity.job_id,old_payload_sha256:$identity.old_payload_sha256,
+      result_sha256:$identity.result_sha256,request_sha256:$request,inventory_sha256:$inventory,
+      receipt_sha256:$receipt,retained_bytes:$bytes,disposition:"retained_unrecovered",queue_state:$state,
+      data_recovered:false,delivery_verified:false,replay_eligibility:"not_assessed"}'
+}
+
+retention_check_pointer() {
+  local pointer=$1 job_id pointer_sha request_sha inventory_sha receipt_sha result directory fingerprints
+  secure_regular_file "$pointer" 0
+  [[ $(stat -c %h -- "$pointer") == 1 ]] || fail 'retention pointer has hard-link aliases'
+  [[ $(stat -c %a -- "$pointer") == 440 ]] || fail 'retention pointer mode drifted'
+  pointer_sha=$(retention_small_sha "$pointer") || fail 'invalid retention pointer size'
+  job_id=${pointer##*/}; job_id=${job_id%.json}
+  [[ $job_id =~ ^[0-9]{8}T[0-9]{6}Z-${MARKET}-[a-f0-9]{12}-[0-9]+$ \
+    && $pointer == "$EVIDENCE_ROOT/retained/$MARKET/$job_id.json" ]] || fail 'invalid retention pointer name'
+  jq -e --arg job "$job_id" --arg market "$MARKET" '
+    .schema=="monday.rust_lob_recovery_retention_pointer.v1" and .job_id==$job and .market==$market
+    and (.request_sha256|test("^[a-f0-9]{64}$")) and (.inventory_sha256|test("^[a-f0-9]{64}$"))
+    and (.receipt_sha256|test("^[a-f0-9]{64}$"))' "$pointer" >/dev/null || fail 'invalid retention pointer schema'
+  request_sha=$(jq -er .request_sha256 "$pointer")
+  inventory_sha=$(jq -er .inventory_sha256 "$pointer")
+  receipt_sha=$(jq -er .receipt_sha256 "$pointer")
+  directory="$EVIDENCE_ROOT/$job_id/retention/$request_sha"
+  fingerprints=$(retention_record_fingerprints "$directory") || fail 'incomplete retention record membership'
+  [[ $(jq -cS .record_fingerprints "$pointer") == "$fingerprints" ]] || fail 'retention record metadata drifted'
+  result=$(retention_check_record "$directory" \
+    "$job_id" "$request_sha" "$inventory_sha" "$receipt_sha") || fail 'invalid or drifted retention record'
+  [[ $(retention_record_fingerprints "$directory") == "$fingerprints" ]] || fail 'retention record changed during readback'
+  [[ $(retention_small_sha "$pointer") == "$pointer_sha" ]] || fail 'retention pointer changed during readback'
+  printf '%s\n' "$result"
+}
+
+retain_market() {
+  local spool evidence root stage intent existing request inventory inventory_sha request_sha receipt receipt_sha
+  local before after fast pointer summary hft_uid current_controller destination fingerprints pointer_json retained_at intent_sha
+  retention_validate_request
+  RETENTION_DEADLINE=$((SECONDS + 900))
+  drain_lock || fail 'retain requires exclusive global drain ownership'
+  secure_release_identity
+  [[ $ACTIVE_CONTROLLER_SHA256 == "$RETAIN_CONTROLLER" ]] || fail 'retain controller changed before admission'
+  current_controller=$ACTIVE_CONTROLLER_SHA256
+  active_recovery_program_matches "$EXECUTING_RECOVERY_PROGRAM" || fail 'retain is not the active controller projection'
+  spool=$(retention_terminal_spool "$RETAIN_JOB_ID")
+  retention_original_identity "$spool" "$RETAIN_JOB_ID"
+  [[ $JOB_RECEIPT_SHA256 == "$RETAIN_JOB_SHA256" && $RETENTION_RESULT_SHA256 == "$RETAIN_RESULT_SHA256" ]] \
+    || fail 'retain supplied job or result digest mismatch'
+  hft_uid=$(id -u hftcollector)
+  secure_regular_file "$spool/.binance-lob-archiver.lock" "$hft_uid"
+  exec 8<"$spool/.binance-lob-archiver.lock"
+  flock -n 8 || fail 'retained spool still has a writer'
+  flock -u 9 || fail 'cannot release market lock before retained evidence hashing'
+  intent=$(retention_intent_json)
+  evidence=$(job_evidence_root "$RETAIN_JOB_ID")
+  root="$evidence/retention"
+  pointer="$EVIDENCE_ROOT/retained/$MARKET/$RETAIN_JOB_ID.json"
+  if [[ -e $pointer || -L $pointer ]]; then
+    summary=$(retention_check_pointer "$pointer") || fail 'existing retained disposition is invalid'
+    request_sha=$(jq -er .request_sha256 "$pointer")
+    existing=$(jq -cS 'del(.inventory_sha256)|.schema="monday.rust_lob_recovery_retention_intent.v1"' \
+      "$root/$request_sha/request.json")
+    [[ $existing == "$intent" ]] || fail 'a different retained disposition is already committed'
+    pointer_json=$(cat "$pointer") || fail 'cannot reread committed retention pointer'
+    retention_write_json "$pointer" "$pointer_json"
+    summary=$(retention_check_pointer "$pointer") || fail 'existing retained disposition changed while completing publication'
+    printf '%s\n' "$summary"
+    flock -u 8; flock -u 7
+    return
+  fi
+  ensure_root_directory "$root"
+  stage="$root/.staging-$RETAIN_REQUEST_ID"
+  intent_sha=$(printf '%s\n' "$intent" | sha256sum | awk '{print $1}')
+  for existing in "$root"/* "$root"/.staging-*; do
+    [[ -e $existing || -L $existing ]] || continue
+    secure_directory "$existing" 0 0
+    if [[ -e $existing/intent.json || -L $existing/intent.json ]]; then
+      secure_regular_file "$existing/intent.json" 0
+      request=$(jq -cS . "$existing/intent.json") || fail 'invalid unfinished retention intent'
+    elif [[ $existing == "$root/.staging-$RETAIN_REQUEST_ID" ]]; then
+      retention_json_file_matches "$existing/intent.json.pending" "$intent_sha" pending
+      request=$intent
+    else fail 'unfinished retention record has no committed intent'; fi
+    [[ $request == "$intent" && ( $stage == "$root/.staging-$RETAIN_REQUEST_ID" || $stage == "$existing" ) ]] \
+      || fail 'a conflicting unfinished retention request requires review'
+    stage=$existing
+  done
+  ensure_root_directory "$stage"
+  same_filesystem "$spool" "$stage" || fail 'retention evidence must share the failed spool filesystem'
+  retention_write_json "$stage/intent.json" "$intent"
+  printf 'retention inventory job=%s max_bytes=%s max_entries=%s deadline_seconds=900 market_lock=released\n' \
+    "$RETAIN_JOB_ID" "$RETENTION_MAX_BYTES" "$RETENTION_MAX_ENTRIES" >&2
+  before=$(retention_inventory "$spool" "$evidence" fast) || fail 'cannot fingerprint complete failed evidence'
+  inventory=$(retention_inventory "$spool" "$evidence" full) || fail 'bounded full retention inventory failed'
+  after=$(retention_inventory "$spool" "$evidence" fast) || fail 'cannot recheck failed evidence after hashing'
+  fast=$(retention_fast_view <<<"$inventory")
+  [[ $before == "$after" && $fast == "$before" ]] || fail 'failed evidence changed during retention hashing'
+  retention_write_json "$stage/inventory.json" "$inventory"
+  inventory_sha=$(retention_small_sha "$stage/inventory.json") || fail 'retention inventory exceeds metadata budget'
+  request=$(jq -cS --arg inventory "$inventory_sha" \
+    '.schema="monday.rust_lob_recovery_retention_request.v1"|.inventory_sha256=$inventory' <<<"$intent")
+  request_sha=$(printf '%s\n' "$request" | sha256sum | awk '{print $1}')
+  retention_write_json "$stage/request.json" "$request"
+  if [[ ! -e $stage/receipt.json && ! -L $stage/receipt.json ]]; then
+    retained_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [[ -e $stage/receipt.json.pending || -L $stage/receipt.json.pending ]]; then
+      secure_regular_file "$stage/receipt.json.pending" 0
+      retention_small_sha "$stage/receipt.json.pending" >/dev/null || fail 'invalid pending retention receipt size'
+      retained_at=$(jq -er --arg completed "$(jq -er .completed_at "$evidence/result.json")" '
+        .retained_at | select(type=="string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+        | select((fromdateiso8601)>=($completed|fromdateiso8601) and (fromdateiso8601)<=now)' \
+        "$stage/receipt.json.pending") || fail 'invalid pending retention timestamp'
+    fi
+    receipt=$(jq -cnS --argjson request "$request" --arg request_sha "$request_sha" --arg inventory "$inventory_sha" \
+      --arg now "$retained_at" --arg state "${spool##*.}" \
+      --argjson count "$(jq '[.entries[]|select(.fingerprint.type=="file")]|length' <<<"$inventory")" \
+      --argjson bytes "$(jq '[.entries[]|select(.fingerprint.type=="file")|.fingerprint.size|tonumber]|add//0' <<<"$inventory")" \
+      '{schema:"monday.rust_lob_recovery_retention.v1",request:$request,request_sha256:$request_sha,
+        inventory_sha256:$inventory,retained_at:$now,disposition:"retained_unrecovered",recovery_result:$state,
+        data_recovered:false,delivery_verified:false,replay_eligibility:"not_assessed",automatic_retry:false,
+        inventory_validation:"content_hash_at_commit_with_metadata_drift_checks",file_count:$count,retained_bytes:$bytes,
+        read_budget:{max_bytes:17179869184,max_entries:4096,max_metadata_bytes:4194304,seconds:900}}')
+    retention_write_json "$stage/receipt.json" "$receipt"
+  fi
+  receipt_sha=$(retention_small_sha "$stage/receipt.json") || fail 'invalid retained receipt'
+  # Full validation remains outside the market lock. Commit holds only a short
+  # metadata/fingerprint transaction; no payload bytes are read under fd 9.
+  retention_check_record "$stage" "$RETAIN_JOB_ID" "$request_sha" "$inventory_sha" "$receipt_sha" >/dev/null \
+    || fail 'staged retention readback failed'
+  flock -n 9 || fail 'market queue is busy; retention remains uncommitted'
+  secure_release_identity
+  [[ $ACTIVE_CONTROLLER_SHA256 == "$current_controller" ]] || fail 'controller changed before retention commit'
+  active_recovery_program_matches "$EXECUTING_RECOVERY_PROGRAM" || fail 'active recovery projection changed before retention commit'
+  retention_original_identity "$spool" "$RETAIN_JOB_ID"
+  [[ $(retention_intent_json) == "$intent" ]] || fail 'retention identity changed before commit'
+  after=$(retention_inventory "$spool" "$evidence" stat) || fail 'cannot verify final retained fingerprint'
+  [[ $after == "$(jq -cS '.entries|=map(del(.sha256))' <<<"$inventory")" ]] || fail 'retained objects changed before commit'
+  destination="$root/$request_sha"
+  if [[ $stage != "$destination" ]]; then
+    [[ ! -e $destination && ! -L $destination ]] || fail 'retention destination already exists'
+    mv -T -- "$stage" "$destination" || fail 'cannot finalize immutable retention record'
+    recovery_sync_path "$root" || fail 'cannot persist retention record directory'
+  fi
+  ensure_root_directory "$EVIDENCE_ROOT/retained"
+  ensure_root_directory "$EVIDENCE_ROOT/retained/$MARKET"
+  fingerprints=$(retention_record_fingerprints "$destination") || fail 'retention record membership changed before pointer commit'
+  pointer_json=$(jq -cnS --arg job "$RETAIN_JOB_ID" --arg market "$MARKET" \
+    --arg request "$request_sha" --arg inventory "$inventory_sha" --arg receipt "$receipt_sha" \
+    --argjson fingerprints "$fingerprints" \
+    '{schema:"monday.rust_lob_recovery_retention_pointer.v1",job_id:$job,market:$market,
+      request_sha256:$request,inventory_sha256:$inventory,receipt_sha256:$receipt,record_fingerprints:$fingerprints}') \
+    || fail 'cannot serialize retention commit pointer'
+  retention_write_json "$pointer" "$pointer_json"
+  flock -u 9 || fail 'cannot release committed retention transaction'
+  summary=$(retention_check_pointer "$pointer") || fail 'committed retention readback failed'
+  flock -u 8; flock -u 7
+  printf '%s\n' "$summary"
+}
+
+retention_failed_ids() (
+  set -o pipefail
+  local state=${1:-failed}
+  [[ $state == failed || $state == stale ]] || exit 1
+  [[ -e $QUEUE_MARKET_ROOT || -L $QUEUE_MARKET_ROOT ]] || { printf '[]\n'; exit 0; }
+  retention_bounded find "$QUEUE_MARKET_ROOT" -mindepth 1 -maxdepth 1 -name "*.$state" -print0 \
+    | while IFS= read -r -d '' name; do
+        [[ ${name##*/} =~ ^[A-Za-z0-9._-]+\.${state}$ ]] || exit 1
+        printf '%s\n' "${name##*/}"
+      done \
+    | jq -Rcs --arg suffix ".$state" 'split("\n")|map(select(length>0)|rtrimstr($suffix))|sort'
+)
+
+retention_index_snapshot() (
+  set -o pipefail
+  local index="$EVIDENCE_ROOT/retained/$MARKET" path fingerprint count=0
+  [[ -e $index || -L $index ]] || { printf '[]\n'; exit 0; }
+  secure_directory "$EVIDENCE_ROOT/retained" 0 0
+  secure_directory "$index" 0 0
+  path_is_direct_or_absent "$index" || exit 1
+  retention_bounded find "$index" -mindepth 1 -maxdepth 1 -print0 | sort -z | (
+    while IFS= read -r -d '' path; do
+      count=$((count + 1)); (( count <= RETENTION_MAX_JOBS )) || exit 1
+      fingerprint=$(retention_fingerprint "$path") || exit 1
+      [[ ${path##*/} =~ ^[A-Za-z0-9._-]+$ ]] || exit 1
+      printf '{"name":"%s","fingerprint":"%s"}\n' "${path##*/}" "$fingerprint"
+    done
+  ) | jq -csS .
+)
+
+retention_claim_snapshot() (
+  set -o pipefail
+  local path name fingerprint count=0
+  [[ -e $EVIDENCE_ROOT || -L $EVIDENCE_ROOT ]] || { printf '[]\n'; exit 0; }
+  secure_directory "$EVIDENCE_ROOT" 0 0
+  path_is_direct_or_absent "$EVIDENCE_ROOT" || exit 1
+  retention_bounded find "$EVIDENCE_ROOT" -mindepth 1 -maxdepth 1 -name "*-$MARKET-*" -print0 | sort -z | (
+    while IFS= read -r -d '' path; do
+      count=$((count + 1)); (( count <= RETENTION_MAX_ENTRIES )) || exit 1
+      [[ -e $path/retention || -L $path/retention ]] || continue
+      name=${path##*/}
+      [[ $name =~ ^[0-9]{8}T[0-9]{6}Z-${MARKET}-[a-f0-9]{12}-[0-9]+$ ]] || exit 1
+      secure_directory "$path" 0 0
+      fingerprint=$(retention_fingerprint "$path/retention") || exit 1
+      printf '{"job_id":"%s","fingerprint":"%s"}\n' "$name" "$fingerprint"
+    done
+  ) | jq -csS .
+)
+
+check_retained_market() {
+  local failed_before stale_before index_before index_after claims_before pointer summary name job_id record rows='' invalid=0 count=0
+  local failed_after stale_after claims_after status
+  local current_controller=$ACTIVE_CONTROLLER_SHA256
+  [[ $MARKET =~ ^(spot|usdm)$ ]] || fail 'unsupported historical retention market'
+  failed_before=$(retention_failed_ids) || retention_read_failure 'initial failed-state scan' "$?"
+  stale_before=$(retention_failed_ids stale) || retention_read_failure 'initial stale-state scan' "$?"
+  index_before=$(retention_index_snapshot) || retention_read_failure 'initial index snapshot' "$?"
+  claims_before=$(retention_claim_snapshot) || retention_read_failure 'initial evidence claims' "$?"
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    count=$((count + 1)); (( count <= RETENTION_MAX_JOBS )) || fail 'retention index exceeds the read budget'
+    pointer="$EVIDENCE_ROOT/retained/$MARKET/$name"
+    if summary=$(retention_check_pointer "$pointer" 2>/dev/null); then
+      rows+="$summary"$'\n'
+    else
+      status=$?
+      (( status != 124 && SECONDS < RETENTION_DEADLINE )) || retention_read_failure 'retention pointer verification' "$status"
+      invalid=$((invalid + 1))
+    fi
+  done < <(jq -r '.[].name' <<<"$index_before")
+  # Scan claims independently of the queue and index. Loss of both a pointer
+  # and its physical failed directory must not hide the historical decision.
+  while IFS= read -r job_id; do
+    [[ -n $job_id ]] || continue
+    if [[ ! -e $EVIDENCE_ROOT/retained/$MARKET/$job_id.json \
+      && ! -L $EVIDENCE_ROOT/retained/$MARKET/$job_id.json ]]; then
+      invalid=$((invalid + 1))
+    fi
+  done < <(jq -r '.[].job_id' <<<"$claims_before")
+  index_after=$(retention_index_snapshot) || retention_read_failure 'final index snapshot' "$?"
+  failed_after=$(retention_failed_ids) || retention_read_failure 'final failed-state scan' "$?"
+  stale_after=$(retention_failed_ids stale) || retention_read_failure 'final stale-state scan' "$?"
+  claims_after=$(retention_claim_snapshot) || retention_read_failure 'final evidence claims' "$?"
+  [[ $index_after == "$index_before" ]] || fail 'retention-read-drift: index changed during readback'
+  [[ $failed_after == "$failed_before" && $stale_after == "$stale_before" && $claims_after == "$claims_before" ]] \
+    || fail 'retention-read-drift: queue membership or evidence claims changed during readback'
+  secure_release_identity
+  [[ $ACTIVE_CONTROLLER_SHA256 == "$current_controller" ]] || fail 'active controller changed during retention readback'
+  record=$(jq -csS --arg market "$MARKET" --argjson failed "$failed_before" --argjson stale "$stale_before" --argjson invalid "$invalid" \
+    '{schema:"monday.rust_lob_recovery_retention_check.v1",market:$market,failed_job_ids:$failed,
+      stale_job_ids:$stale,retained:.,retained_failed_count:([.[]|select(.queue_state=="failed")]|length),
+      retained_stale_count:([.[]|select(.queue_state=="stale")]|length),invalid_retention_count:$invalid,
+      retained_bytes:([.[].retained_bytes]|add//0),
+      inventory_validation:"content_hash_at_commit_with_metadata_drift_checks"}' <<<"$rows") || fail 'invalid retention readback output'
+  (( ${#record} <= 262144 )) || fail 'retention readback exceeds output budget'
+  printf '%s\n' "$record"
+}
+
 main() {
-  local action=${1:-} market=${2:-} command
+  local action=${1:-} market=${2:-} command parsed_options=' '
   export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   EXECUTING_RECOVERY_PROGRAM=$(readlink -f -- "${BASH_SOURCE[0]}") \
     || fail 'could not resolve the executing recovery controller'
@@ -1454,8 +2149,8 @@ main() {
     exit 2
   fi
   if [[ ! $market =~ ^(spot|usdm)$ ]] \
-    || { [[ $action =~ ^(isolate|drain)$ ]] && [[ $# -ne 2 ]]; } \
-    || [[ ! $action =~ ^(isolate|drain|resume)$ ]]; then
+    || { [[ $action =~ ^(isolate|drain|check-retained)$ ]] && [[ $# -ne 2 ]]; } \
+    || [[ ! $action =~ ^(isolate|drain|resume|retain|check-retained)$ ]]; then
     usage
     exit 2
   fi
@@ -1476,7 +2171,24 @@ main() {
       shift 2
     done
   fi
-  for command in awk chmod date env find flock grep head id install jq ln mktemp mv readlink rm runuser sed sha256sum sort stat sync systemctl wc; do
+  if [[ $action == retain ]]; then
+    shift 2
+    while (($#)); do
+      [[ $# -ge 2 && $parsed_options != *" $1 "* ]] || { usage; exit 2; }
+      parsed_options+="$1 "
+      case $1 in
+        --job-id) RETAIN_JOB_ID=$2 ;;
+        --job-sha256) RETAIN_JOB_SHA256=$2 ;;
+        --result-sha256) RETAIN_RESULT_SHA256=$2 ;;
+        --controller) RETAIN_CONTROLLER=$2 ;;
+        --request-id) RETAIN_REQUEST_ID=$2 ;;
+        --reason-code) RETAIN_REASON_CODE=$2 ;;
+        *) usage; exit 2 ;;
+      esac
+      shift 2
+    done
+  fi
+  for command in awk cat chmod date env find flock grep head id install jq ln mktemp mv readlink rm runuser sed sha256sum sort stat sync systemctl tail timeout wc; do
     command -v "$command" >/dev/null 2>&1 \
       || fail "missing required command: $command"
   done
@@ -1484,8 +2196,20 @@ main() {
   MARKET=$market
   canonical_paths_safe
   market_paths
+  # Health calls this branch with env -i. It must run before queue_lock or any
+  # writer directory preparation, and cannot create locks or invoke services.
+  if [[ $action == check-retained ]]; then
+    # The complete production 23-job index measured 225 seconds. This
+    # bounds the aggregate read, not each job; outer monitors allow cleanup.
+    RETENTION_DEADLINE=$((SECONDS + 300))
+    secure_release_identity
+    active_recovery_program_matches "$EXECUTING_RECOVERY_PROGRAM" \
+      || fail 'retention reader must be the active immutable controller projection'
+    check_retained_market
+    return
+  fi
   queue_lock
-  if [[ $action == drain || $action == resume ]]; then
+  if [[ $action == drain || $action == resume || $action == retain ]]; then
     secure_release_identity
     active_recovery_program_matches "$EXECUTING_RECOVERY_PROGRAM" \
       || fail 'recovery must execute the active immutable controller projection'
@@ -1498,6 +2222,7 @@ main() {
     isolate) run_isolate ;;
     drain) drain_market ;;
     resume) resume_market ;;
+    retain) retain_market ;;
   esac
 }
 

@@ -39,7 +39,7 @@ jobs:
           # Admission code always comes from trusted main, before any source
           # from the triggering workflow is considered for a privileged build.
           ref: refs/heads/main
-          fetch-depth: 2
+          fetch-depth: 0
       - name: Verify exact-source release admission
         id: admission
         env:
@@ -65,15 +65,14 @@ jobs:
               echo 'admitted=false' >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            # main accepts squash PR merges: inspect that source commit's full
-            # change, retaining the previous publisher's path scope.
-            changed=0
-            git diff --quiet "${SOURCE_SHA}^" "$SOURCE_SHA" -- rust_hft/ .github/workflows/docker-publish.yml || changed=$?
-            if [[ $changed == 0 ]]; then
+            # Reuse the same artifact dependency plan as smoke/security CI.
+            plan=$(mktemp)
+            bash .github/scripts/select-main-image-scope.sh "$SOURCE_SHA" "$plan"
+            matrix=$(sed -n 's/^image_matrix=//p' "$plan")
+            rm "$plan"
+            if ! jq -e 'any(.include[]; .name=="hft-core")' <<<"$matrix" >/dev/null; then
               echo 'admitted=false' >> "$GITHUB_OUTPUT"
               exit 0
-            elif [[ $changed != 1 ]]; then
-              exit "$changed"
             fi
             export RELEASE_DEFER_PENDING=true
           fi
@@ -91,13 +90,11 @@ jobs:
     needs: release-admission
     if: needs.release-admission.outputs.admitted == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: hft
-            context: rust_hft
-            file: rust_hft/docker/Dockerfile
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      packages: write
 
     steps:
       - name: Checkout admitted source
@@ -105,11 +102,56 @@ jobs:
         with:
           ref: ${{ needs.release-admission.outputs.source_sha }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Retrieve and verify the tested image
+        id: tested
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.release-admission.outputs.source_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          mode=required
+          [[ "$EVENT_NAME" == workflow_run ]] || mode=optional
+          status=0
+          bash .github/scripts/read-tested-image.sh "$SOURCE_SHA" "$RUNNER_TEMP/tested-image" "$mode" || status=$?
+          if [[ $status == 75 && "$mode" == optional ]]; then
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          elif [[ $status == 0 ]]; then
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+          else
+            exit "$status"
+          fi
+
+      # Explicit manual/tag publication retains its existing build capability
+      # when no retained artifact exists. Automatic publication never rebuilds.
+      - name: Build explicit release image when no retained artifact exists
+        if: steps.tested.outputs.build == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: rust_hft
+          file: rust_hft/docker/Dockerfile
+          push: false
+          load: true
+          tags: monday-tested:hft-core-${{ needs.release-admission.outputs.source_sha }}
+          labels: org.opencontainers.image.revision=${{ needs.release-admission.outputs.source_sha }}
+          cache-from: type=gha,scope=image-hft-core
+          cache-to: type=gha,scope=image-hft-core,mode=max
+
+      - name: Scan explicitly built release image
+        if: steps.tested.outputs.build == 'true'
+        uses: aquasecurity/trivy-action@d2a0b60797ff03db6132bd4e2b293f9b37081297 # master resolved 2026-10-01
+        with:
+          image-ref: monday-tested:hft-core-${{ needs.release-admission.outputs.source_sha }}
+          severity: 'CRITICAL,HIGH'
+
+      - name: Bind the explicit build identity
+        if: steps.tested.outputs.build == 'true'
+        env:
+          SOURCE_SHA: ${{ needs.release-admission.outputs.source_sha }}
+        run: |
+          docker image inspect --format '{{.Id}}' "monday-tested:hft-core-$SOURCE_SHA" > "$RUNNER_TEMP/tested-image/image-id.txt"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -124,7 +166,7 @@ jobs:
         with:
           context: workflow
           images: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/hft
           tags: |
             type=raw,value=main,enable=${{ github.event_name == 'workflow_run' || github.ref == 'refs/heads/main' }}
             type=ref,event=tag
@@ -132,13 +174,28 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ needs.release-admission.outputs.source_sha }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.file }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Publish the verified image without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.release-admission.outputs.source_sha }}
+          SOURCE_REF: ${{ github.event_name == 'workflow_run' && 'refs/heads/main' || github.ref }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          policy=current-main
+          [[ "$SOURCE_REF" != refs/tags/v* ]] || policy=main-history
+          .github/scripts/wait-release-required-checks.sh "$SOURCE_SHA" "$policy"
+          image_id=$(cat "$RUNNER_TEMP/tested-image/image-id.txt")
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ $(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image_id") == "$SOURCE_SHA" ]]
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            docker tag "$image_id" "$tag"
+            docker push "$tag"
+            # Buildx formatted Manifest JSON includes its descriptor digest;
+            # raw OCI JSON (--raw) does not. See Docker inspect JSON-output docs.
+            digest=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -er '.digest|select(test("^sha256:[0-9a-f]{64}$"))')
+            immutable="${tag%:*}@$digest"
+            docker pull "$immutable"
+            [[ $(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$immutable") == "$SOURCE_SHA" ]]
+            printf '%s %s source=%s\n' "$tag" "$digest" "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$IMAGE_TAGS"

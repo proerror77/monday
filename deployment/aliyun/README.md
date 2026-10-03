@@ -178,7 +178,7 @@ the `monitor-collector-host` workflow issue and blocks `ok:true`.
 | 6. Polymarket upload timers | `polymarket-market-tape-upload.timer` or `polymarket-reference-upload.timer` not active (waiting) while its collector service (`polymarket-market-tape.service` / `polymarket-reference-collector.service`) is active — a stopped timer with a running collector silently strands rotated tapes until the disk fills |
 | 7. Polymarket upload watchdog | `polymarket-market-tape-upload-watchdog.timer` is neither `waiting` nor briefly `running`, or a waiting timer has no finite monotonic next elapse — systemd can otherwise report an enabled, active but elapsed timer that will never run again |
 | 8. `/data` mount | `/data` is not a mount point — otherwise healthy-looking spool paths may write to the root filesystem |
-| 9. Recovery queue | malformed receipts, failed or stale jobs, or ready/running ages over the lane bound |
+| 9. Recovery queue | malformed receipts, undisposed failed or stale jobs, invalid retained evidence, or ready/running ages over the lane bound |
 | 10. Production LOB archivers | `binance-lob-archiver-production@spot/usdm` not active, not enabled, or last systemd `Result` other than `success` |
 | 11. LOB `health.json` | missing, a symlink, unparseable, `updated_at_ns` older than 300s, or `updated_at_ns` missing/non-numeric |
 | 12. LOB sequence gaps | `sequence_gaps > 0`, or `sequence_gap_total` increased since the previous poll. The five-minute host timer latches an increase (`MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1`) so the 15-minute GitHub `monitor-collector-host` poll still observes the breach; that alerting poll then consumes the new baseline |
@@ -258,6 +258,42 @@ systemctl is-active monday-collector-health.timer
 /opt/monday/bin/monday-collector-health.sh --json
 systemctl status monday-collector-health.service --no-pager -n 5
 ```
+
+For an existing host, deploy the monitor unit separately from a LOB controller
+cutover. The controller bundle owns the health executable, but does not carry
+or project this host-wide unit. Use the unit and
+`host-collector-health-unit-release.sh` from the same exact source revision
+whose required release checks passed. Record the SHA-256 of both staged files,
+verify them after transfer, and pass the current installed unit's SHA-256 as
+the preimage:
+
+```bash
+sudo bash /root/health-release/host-collector-health-unit-release.sh \
+  /root/health-release/monday-collector-health.service \
+  "$UNIT_SHA256" "$INSTALLED_UNIT_SHA256" "$SOURCE_REVISION"
+```
+
+The installer takes one monitor transition lock, stops only the monitor units,
+preserves the old unit, installs atomically, reloads systemd, and verifies the
+effective timeout and fragment. Failure restores the old bytes and timer
+state. Receipts and the rollback backup remain under
+`/data/monday/evidence/health-unit-releases/<unit-sha256>/`. Read back that receipt,
+the installed unit hash, `TimeoutStartUSec`, and timer state independently.
+Then run the installed health executable and observe a real timer invocation;
+a successful unit install alone does not establish healthy data collection.
+Rollback uses the receipt's `before.service` with the same stop/install/reload
+and independent readback procedure, without removing historical monitor state.
+
+The measured 23-job retention scan took 225 seconds on the collector. The
+aggregate reader limit is 300 seconds, its health child 360 seconds, and the
+monitor service and GitHub Cloud Assistant invocation 480 seconds. The workflow
+polls for 600 seconds. The invocation explicitly overrides the stored command's
+older timeout; changing the poll window alone is insufficient. Keep all these
+budgets aligned when the retained index or monitor implementation changes.
+JSON output is compact and reports archive span/break counts instead of copying
+the growing archive lists into Cloud Assistant's bounded stdout buffer. The
+collector's original `health.json` retains those complete lists. Breaches,
+warnings, admission status, and recovery custody semantics are unchanged.
 
 The service must NOT add `ConditionPathIsMountPoint=/data`: the whole point of
 the mount check is to detect and alert when `/data` is missing.
@@ -906,9 +942,37 @@ local growth and were fixed in this governed lane:
    candidate uploader, renders and installs the candidate units, clears stale
    health, starts the collector, and requires fresh full-catalog health before
    enabling the unit and the upload timer. Failure after the transition starts
-   restores the previous release (or disables and runtime-masks the lane) and
+   restores the previous release (or disables and masks the local unit fragments) and
    writes `cutover.json` evidence under
    `/data/monday/evidence/bybit-options-cutovers/`.
+
+Upgrade preflight rejects historical `.ndjson.active` orphans before stopping
+production; only files actually open for writing by the verified old MainPID
+are admitted. Unit masks replace the `/etc/systemd/system` fragments after
+verified backups, since `/run` masks cannot override those local files.
+Candidate fragments are installed only after drain succeeds.
+
+For a hash-pinned failed upgrade at `drain-old-production-with-candidate` that
+never started the candidate, the same entrypoint supports:
+
+```bash
+host-bybit-options-cutover.sh resume-rollback \
+  --failed-receipt "$FAILED_RECEIPT" --failed-receipt-sha256 "$FAILED_SHA" \
+  --rollback-snapshot-sha256 "$OLD_SNAPSHOT_SHA" \
+  --orphan-inventory "$INVENTORY" --orphan-inventory-sha256 "$INVENTORY_SHA" \
+  --request-id "$REQUEST_ID"
+```
+
+The explicit `monday.bybit_orphan_inventory.v1` inventory binds the complete
+historical file set, full hashes, filesystem fingerprints and failed host state.
+With every unit inactive, the controller rechecks those bytes and atomically
+moves the unchanged `.active` files into that failed transaction's custody
+directory, then releases the spool lock before real drain and verified old-P
+restoration. The original failure receipt is never overwritten; recovery runs
+append beneath `rollback-recoveries/<request-id>/`. `result=restored` means the
+old production was restored. Custody means retained evidence, not recovered,
+uploaded or replay-eligible data. No `ignore`, forced empty spool, tail deletion,
+or Rust finalization is performed.
 
 The lane is fail-closed: the collector and uploader stop writing when the spool
 mount drops below `MIN_FREE_GB` or pending raw bytes reach
@@ -1242,6 +1306,25 @@ Python instance units must be inactive and disabled before the transition; they
 are included in the transition mask so they cannot become a second canonical
 writer.
 
+On a failed V2 cutover after candidate instances have been enabled, rollback
+rebuilds the two previously enabled production instance links against the
+verified previous controller before restarting them. Switching `active` and
+running `enable` alone is insufficient: systemd can retain concrete instance
+links to the candidate template. Only links owned by this transition's exact
+previous/candidate controllers may be replaced. Rollback checks the loaded
+fragment and effective production lifetime before start; unknown links or
+regular files fail closed. Existing masked, disabled and static snapshot paths
+retain their state-restoration behavior.
+
+The Linux unit-file regression uses an already available local image with
+systemctl, Bash, jq and coreutils. It runs without networking or image pulls;
+all system paths are private container tmpfs mounts:
+
+```bash
+MONDAY_SYSTEMD_FIXTURE_IMAGE=kindest/node:v1.36.1 \
+  ./deployment/aliyun/test-rust-lob-rollback-unit-bindings.sh
+```
+
 The drain is bootstrap-safe: it runs the digest-pinned target binary against
 the previous production env. Any `.jsonl.part`, `.zst.tmp`, or `.part.corrupt`
 enters the recovery path; `.part.corrupt` is deliberately refused and blocks
@@ -1291,6 +1374,57 @@ delivered. The two production instances are each bounded at `CPUQuota=80%` and
 2-vCPU/8-GiB host boundary without increasing the ECS size. A persistent
 pre-start failure is bounded to 120 seconds per start and capped at five
 attempts per two hours instead of restarting forever.
+
+An explicitly reviewed historical Spot or USD-M failure may instead be retained
+without recovery. The active controller accepts one original `.failed` or
+`.stale` job whose full payload digest differs from production, with no
+resume/adopted attempt. A stale result must be a v2 identity rejection bound to
+its actual immutable executing controller, bundle and source:
+
+```bash
+/opt/monday/bin/monday-rust-lob-recovery-queue retain "$market" \
+  --job-id "$job_id" --job-sha256 "$original_job_sha256" \
+  --result-sha256 "$original_terminal_result_sha256" \
+  --controller "$active_controller_sha256" --request-id "$request_id" \
+  --reason-code retain-unrecovered-historical-evidence
+/opt/monday/bin/monday-rust-lob-recovery-queue check-retained "$market"
+```
+
+Retention leaves the `.failed` or `.stale` directory, original metadata, data and failure
+counters intact. It records an append-only request, complete content-hashed
+inventory and `retained_unrecovered` receipt beneath the job's evidence directory,
+then commits the root-owned `retained/<market>/<job>.json` pointer. It never executes
+an uploader or claims recovery, delivery or replay eligibility; a committed
+retained job cannot be resumed. Exact request repetition reuses the receipt;
+conflicting or incomplete evidence cannot acknowledge the failure.
+Missing pointers and unfinished retention declarations also prohibit resume.
+Metadata publishes through a protected, exact-content pending file and a
+same-directory no-clobber rename. Repeating the same request can finish an
+interrupted publication; unknown pending files or hard-link aliases are
+preserved and refused, never cleaned up by the health reader.
+
+The explicit inventory is bounded to 16 GiB, 4,096 entries and 900 seconds per job
+(including original backups); metadata files are at most 4 MiB. Global drain
+and existing spool locks exclude writers. Full hashing releases the market
+queue lock, then a nonblocking short commit rechecks identity and fingerprints.
+No original file is moved, truncated, chmodded or deleted.
+
+Health keeps the physical `failed_count` and `stale_count` and separately reports
+`retained_failed_count`, `retained_stale_count`, `undisposed_failed_count`,
+`undisposed_stale_count`, `invalid_retention_count`,
+retained bytes and historical job identities. Valid retention becomes a visible
+historical-data warning; new failures or invalid/missing evidence still breach.
+Monitor stdout keeps each job's state and receipt digest within the Cloud
+Assistant output budget. `check-retained` and the immutable custody records
+retain the full job/result/request/inventory digests for independent audits.
+Its pure reader rehashes small metadata and checks complete membership plus
+device, inode, links, bytes, owner, mode and nanosecond mtime/ctime. Payload SHA
+was verified at commit: this periodic metadata guard relies on the existing
+single-writer/root trust model and is not a fresh full-payload audit. It does
+not change disk accounting, manifests or data/replay gates. Retention validates
+each market independently and leaves undisposed stale jobs as hard breaches.
+Publish and apply this policy as an immutable controller transition;
+never edit the installed health or queue script in place.
 
 After an authorized controller repair has completed release, Gate, cutover and
 independent transition readback, an operator may explicitly adopt one detached
@@ -1444,3 +1578,34 @@ prevents a retry from racing an earlier operation.
 Full-catalog symbol discovery has a 15-second HTTP request timeout, so a stalled
 Binance `exchangeInfo` response fails startup instead of leaving an active but
 idle service until the systemd runtime limit.
+
+### Independent read-only collector monitor release
+
+`collector-monitor-release.sh INSTANCE UNIT_PREIMAGE CONTROLLER_SHA` publishes
+only the health program, read-only custody entrypoint, and monitor unit. It
+requires a clean exact source with the three authenticated CI summaries, builds
+a hash-addressed manifest/package, and installs under
+`/opt/monday/monitor/releases/<monitor-sha>/`. The existing active collector
+controller, binary, producer PID and invocation identities must stay unchanged.
+No collector Shadow Gate or producer stop belongs to this operation.
+
+The monitor program accepts `--monitor-release` only from that verified immutable
+path. Its custody entrypoint uses the active controller's byte-verified pure
+validator functions with a 300-second monitoring budget. It cannot invoke
+isolate, drain, resume or retain; their code and writer authority remain owned
+by the collector controller. Original retention hashes, fingerprints, membership
+and unrecovered/replay semantics are still checked.
+
+The existing atomic health-unit installer owns monitor stop/reload and automatic
+failure rollback. Its receipt preserves the exact previous unit. Independently
+read the new program/manifest hashes, effective unit timeout, timer, unchanged
+producer identities and actual report before calling the update complete.
+Global health can remain false for separately scoped problems; do not hide them.
+
+The release command returns its Cloud Assistant InvokeId. Use
+`collector-monitor-release.sh status INVOKE_ID` to query the same operation;
+pending is not a failed attempt and must not cause a second install. The GitHub
+OIDC monitor uses a new immutable fixed command addressed to the monitor
+release; replace the role's exact command ARN and repository CommandId together,
+retaining the same host/actions/trust scope. Record the previous policy version,
+command and variable for rollback.

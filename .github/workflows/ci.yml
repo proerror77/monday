@@ -12,8 +12,8 @@ permissions:
 
 concurrency:
   group: monorepo-${{ github.ref }}
-  # PR runs may be superseded; main runs must finish so the shared Rust target
-  # cache remains warm for everyone else.
+  # PR runs may be superseded; main runs must finish their exact-source
+  # validation and publication handoff.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
@@ -21,6 +21,7 @@ jobs:
     name: CI job selector
     runs-on: ubuntu-latest
     outputs:
+      ack_research: ${{ steps.ack.outputs.ack_research }}
       jobs: ${{ steps.scope.outputs.jobs }}
       owning_packages: ${{ steps.scope.outputs.owning_packages }}
       loop: ${{ steps.scope.outputs.loop }}
@@ -31,6 +32,8 @@ jobs:
       control: ${{ steps.scope.outputs.control }}
       focused: ${{ steps.scope.outputs.focused }}
       toolchain: ${{ steps.scope.outputs.toolchain }}
+      production_trading_image: ${{ steps.scope.outputs.production_trading_image }}
+      production_collector_image: ${{ steps.scope.outputs.production_collector_image }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
     steps:
       - name: Checkout
@@ -44,18 +47,28 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          .github/scripts/test-select-rust-ci-scope.sh
           .github/scripts/select-rust-ci-scope.sh \
             --event "${{ github.event_name }}" \
             --base "${BASE_SHA}" \
             --head "${HEAD_SHA}"
 
+      - name: Classify research execution scope
+        id: ack
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SELECTED_LOOP: ${{ steps.scope.outputs.loop }}
+        run: |
+          .github/scripts/classify-ack-research-job.sh --detect-scope --repository "$GITHUB_REPOSITORY" --event "$GITHUB_EVENT_NAME" --base "$BASE_SHA" --head "$HEAD_SHA" --loop "$SELECTED_LOOP"
+
   scope:
     name: CI job scope
     needs: selector
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
+      ack_research: ${{ needs.selector.outputs.ack_research }}
       jobs: ${{ steps.scope.outputs.jobs }}
       owning_packages: ${{ steps.scope.outputs.owning_packages }}
       loop: ${{ steps.scope.outputs.loop }}
@@ -66,6 +79,8 @@ jobs:
       control: ${{ steps.scope.outputs.control }}
       focused: ${{ steps.scope.outputs.focused }}
       toolchain: ${{ steps.scope.outputs.toolchain }}
+      production_trading_image: ${{ steps.scope.outputs.production_trading_image }}
+      production_collector_image: ${{ steps.scope.outputs.production_collector_image }}
     steps:
       - name: Resolve selector result
         id: scope
@@ -81,12 +96,14 @@ jobs:
           SELECTED_CONTROL: ${{ needs.selector.outputs.control }}
           SELECTED_FOCUSED: ${{ needs.selector.outputs.focused }}
           SELECTED_TOOLCHAIN: ${{ needs.selector.outputs.toolchain }}
+          SELECTED_PRODUCTION_TRADING_IMAGE: ${{ needs.selector.outputs.production_trading_image }}
+          SELECTED_PRODUCTION_COLLECTOR_IMAGE: ${{ needs.selector.outputs.production_collector_image }}
           SELECTED_COMPLETE: ${{ needs.selector.outputs.selection_complete }}
         run: |
           if [[ "$SELECTOR_RESULT" == success && "$SELECTED_COMPLETE" == true ]] &&
              [[ "$SELECTED_JOBS" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]] &&
              [[ "$SELECTED_OWNING_PACKAGES" =~ ^,[A-Za-z0-9_-]*(,[A-Za-z0-9_-]+)*,$ ]] &&
-             [[ "$SELECTED_LOOP,$SELECTED_HANDOFF,$SELECTED_JSON,$SELECTED_ONDO,$SELECTED_COLLECTOR,$SELECTED_CONTROL,$SELECTED_FOCUSED,$SELECTED_TOOLCHAIN" =~ ^(true|false)(,(true|false)){7}$ ]]; then
+             [[ "$SELECTED_LOOP,$SELECTED_HANDOFF,$SELECTED_JSON,$SELECTED_ONDO,$SELECTED_COLLECTOR,$SELECTED_CONTROL,$SELECTED_FOCUSED,$SELECTED_TOOLCHAIN,$SELECTED_PRODUCTION_TRADING_IMAGE,$SELECTED_PRODUCTION_COLLECTOR_IMAGE" =~ ^(true|false)(,(true|false)){9}$ ]]; then
             printf '%s\n' \
               "jobs=$SELECTED_JOBS" \
               "owning_packages=$SELECTED_OWNING_PACKAGES" \
@@ -97,31 +114,38 @@ jobs:
               "collector=$SELECTED_COLLECTOR" \
               "control=$SELECTED_CONTROL" \
               "focused=$SELECTED_FOCUSED" \
-              "toolchain=$SELECTED_TOOLCHAIN"
+              "toolchain=$SELECTED_TOOLCHAIN" \
+              "production_trading_image=$SELECTED_PRODUCTION_TRADING_IMAGE" \
+              "production_collector_image=$SELECTED_PRODUCTION_COLLECTOR_IMAGE"
           else
-            printf '%s\n' \
-              'jobs=,ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,' \
-              'owning_packages=,,' \
-              'loop=true' \
-              'handoff=true' \
-              'json=true' \
-              'ondo=true' \
-              'collector=true' \
-              'control=true' \
-              'focused=true' \
-              'toolchain=true'
+            echo 'CI selection failed or returned an invalid plan; no work is dispatched' >&2
+            exit 1
           fi >> "$GITHUB_OUTPUT"
 
+      - name: Summarize check plan
+        env:
+          SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
+          SELECTED_OWNING_PACKAGES: ${{ steps.scope.outputs.owning_packages }}
+          SELECTED_CONTROL: ${{ steps.scope.outputs.control }}
+        run: |
+          printf '### CI check plan\n\n- Jobs: %s\n- Direct Rust package tests: %s\n- Collector control contract: %s\n' \
+            "$SELECTED_JOBS" "$SELECTED_OWNING_PACKAGES" "$SELECTED_CONTROL" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  control_contracts:
+    name: Collector control contracts
+    needs: scope
+    if: ${{ !cancelled() && contains(needs.scope.outputs.jobs, ',ci/control-contracts,') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
       - name: Checkout collector controls
-        if: steps.scope.outputs.control == 'true'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install shellcheck
-        if: steps.scope.outputs.control == 'true'
         run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" shellcheck
 
       - name: Verify Campaign controller recovery
-        if: steps.scope.outputs.control == 'true'
         run: |
           bash -n deployment/aliyun/research/scripts/campaign-cycle-controller.sh \
             deployment/aliyun/research/scripts/campaign-job-watch.sh \
@@ -133,35 +157,55 @@ jobs:
           deployment/aliyun/research/test-campaign-cycle-controller.sh
 
       - name: Verify collector release shell contracts
-        if: steps.scope.outputs.control == 'true'
         working-directory: rust_hft
         run: |
           for script in ../deployment/aliyun/*.sh; do
             bash -n "$script"
           done
           shellcheck ../deployment/aliyun/*.sh
-          ../deployment/aliyun/test-polymarket-market-tape-upload-contract.sh
-          ../deployment/aliyun/test-polymarket-reference-upload-contract.sh
-          ../deployment/aliyun/test-monday-collector-health.sh
-          ../deployment/aliyun/test-rust-lob-control-plane.sh
-          ../deployment/aliyun/test-rust-lob-controller-release.sh
-          ../deployment/aliyun/test-rust-lob-recovery-queue.sh
-          ../deployment/aliyun/test-rust-lob-restore.sh
-          ../deployment/aliyun/test-polymarket-raw-ops-stage.sh
-          ../deployment/aliyun/test-trading-ecs-host-contract.sh
-          ../deployment/aliyun/test-binance-fee-release-contract.sh
-          ../deployment/aliyun/test-binance-usdm-account-release-contract.sh
-          ../deployment/aliyun/test-binance-fee-cutover.sh
+          bash ../.github/scripts/run-collector-control-contracts.sh
 
-      - name: Summarize check plan
-        env:
-          SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
-          SELECTED_OWNING_PACKAGES: ${{ steps.scope.outputs.owning_packages }}
-          SELECTED_CONTROL: ${{ steps.scope.outputs.control }}
+  monitor_contracts:
+    name: Collector monitor contracts
+    needs: scope
+    if: ${{ !cancelled() && contains(needs.scope.outputs.jobs, ',ci/monitor-contracts,') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Install shellcheck
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" shellcheck
+      - name: Verify monitor and atomic unit deployment
         run: |
-          printf '### CI check plan\n\n- Jobs: %s\n- Direct Rust package tests: %s\n- Collector control contract: %s\n' \
-            "$SELECTED_JOBS" "$SELECTED_OWNING_PACKAGES" "$SELECTED_CONTROL" \
-            >> "$GITHUB_STEP_SUMMARY"
+          shellcheck deployment/aliyun/monday-collector-health.sh deployment/aliyun/host-collector-health-unit-release.sh
+          deployment/aliyun/test-monday-collector-health.sh
+          deployment/aliyun/test-collector-health-unit-release.sh
+          .github/scripts/test-monitor-collector-host.sh
+          deployment/aliyun/test-collector-monitor-release.sh
+
+  ci_contracts:
+    name: CI policy contracts
+    needs: scope
+    if: ${{ !cancelled() && contains(needs.scope.outputs.jobs, ',ci/ci-contracts,') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Verify selection, cancellation and aggregate admission
+        run: |
+          bash .github/scripts/test-collector-control-scheduling.sh
+          bash .github/scripts/test-main-image-scope.sh
+          bash .github/scripts/test-image-build-plan.sh
+          bash .github/scripts/test-tested-image.sh
+          node .github/scripts/test-local-lock-impact.mjs
+          bash .github/scripts/test-ack-rust-batch.sh
+          .github/scripts/test-select-rust-ci-scope.sh
+          .github/scripts/test-ci-monitor-scope.sh
+          .github/scripts/test-agent-validation-gates.sh
+          .github/scripts/test-classify-ack-research-job.sh
+          bash .github/scripts/test-ack-preflight-relay.sh
+          bash .github/scripts/test-preflight-workflow-gate.sh
+          .github/scripts/test-research-image-release-artifact.sh
 
   rust_shell_scripts:
     name: Rust shell scripts
@@ -175,11 +219,28 @@ jobs:
       - name: Check shell syntax
         run: find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \;
 
+  research_preflight:
+    name: Research preflight
+    needs: scope
+    if: ${{ needs.scope.outputs.ack_research == 'true' && needs.scope.outputs.collector == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+      - name: Wait for signed preflight receipt
+        run: .github/scripts/wait-ack-research-receipt.sh ci-research-preflight "$(git rev-parse HEAD)"
+
   rust:
     name: Rust Workspace
-    needs: scope
-    if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}
+    permissions:
+      contents: read
+      actions: read
+    needs: [scope, research_preflight]
+    if: ${{ always() && !cancelled() && needs.scope.result == 'success' && contains(needs.scope.outputs.jobs, ',ci/rust,') && (needs.scope.outputs.ack_research != 'true' || needs.scope.outputs.collector != 'true' || needs.research_preflight.result == 'success') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
@@ -197,31 +258,31 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Rust toolchain
-        if: needs.scope.outputs.toolchain == 'true'
+        if: ${{ (needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
 
       - name: Install Linux build tools
-        if: needs.scope.outputs.toolchain == 'true'
+        if: ${{ (needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" clang mold protobuf-compiler
 
       - name: Setup sccache
-        if: needs.scope.outputs.toolchain == 'true'
+        if: ${{ (needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         id: sccache
         continue-on-error: true
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Disable sccache on setup failure
-        if: needs.scope.outputs.toolchain == 'true' && steps.sccache.outcome == 'failure'
+        if: ${{ (needs.scope.outputs.toolchain == 'true' && steps.sccache.outcome == 'failure') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
           echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
 
       - name: Record cache dimensions
-        if: needs.scope.outputs.toolchain == 'true'
+        if: ${{ (needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         id: cache-info
         shell: bash
         run: |
@@ -229,21 +290,21 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
-        if: needs.scope.outputs.toolchain == 'true'
+        if: ${{ (needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             rust_hft
           key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}
           cache-all-crates: false
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
       - name: Test Loop Engineer packages
-        if: needs.scope.outputs.loop == 'true'
+        if: ${{ (needs.scope.outputs.loop == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-onnx-evaluator -p alpha-harness -p hft-harnessctl -p hft-research-ml --locked
 
       - name: Test directly changed Rust packages
-        if: needs.scope.outputs.owning_packages != ',,'
+        if: ${{ (needs.scope.outputs.owning_packages != ',,') && needs.scope.outputs.ack_research != 'true' }}
         env:
           OWNING_PACKAGES: ${{ needs.scope.outputs.owning_packages }}
         run: |
@@ -258,7 +319,7 @@ jobs:
           cargo clippy "${args[@]}" --all-targets --locked --no-deps -- -D warnings
 
       - name: Verify signed runtime handoff
-        if: needs.scope.outputs.handoff == 'true'
+        if: ${{ (needs.scope.outputs.handoff == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           cargo test -p hft-live --no-default-features --test deployment_envelope --locked
           cargo test -p hft-live --no-default-features --test deployment_artifacts --locked
@@ -266,7 +327,7 @@ jobs:
           cargo test -p hft-live --no-default-features --features formula-strategy,bitget --test deployment_artifacts --locked
 
       - name: Check JSON feature matrix
-        if: needs.scope.outputs.json == 'true'
+        if: ${{ (needs.scope.outputs.json == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           cargo test -p hft-integration --no-default-features --locked
           cargo test -p hft-integration --no-default-features --features json-simd --locked
@@ -276,31 +337,31 @@ jobs:
           cargo check -p hft-live --features clickhouse,redis,grpc,polymarket --locked
 
       - name: Verify Ondo Perps feature boundary
-        if: needs.scope.outputs.ondo == 'true'
+        if: ${{ (needs.scope.outputs.ondo == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           cargo test -p hft-data-adapter-ondo-perps -p hft-execution-adapter-ondo-perps --locked
           cargo clippy -p hft-data-adapter-ondo-perps -p hft-execution-adapter-ondo-perps --all-targets --no-deps --locked -- -D warnings
           cargo check -p hft-live --features ondo-perps --locked
 
       - name: Verify governed data collector
-        if: needs.scope.outputs.collector == 'true'
+        if: ${{ (needs.scope.outputs.collector == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           cargo check -p hft-collector --locked
           cargo clippy -p hft-collector --all-targets --features collector-binance --no-deps --locked -- -D warnings
           cargo test -p hft-collector --features collector-binance --locked
 
       - name: Verify collector release control plane
-        if: needs.scope.outputs.control == 'true'
+        if: ${{ (needs.scope.outputs.control == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
           cargo test -p hft-collector --lib systemd_reference_resource_envelope_is_pinned --locked
 
       - name: Build focused packages
-        if: needs.scope.outputs.focused == 'true'
+        if: ${{ (needs.scope.outputs.focused == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p alpha-harness -p hft-harnessctl --locked
 
       - name: Package binaries (if present)
-        if: github.event_name == 'push'
+        if: ${{ (github.event_name == 'push') && needs.scope.outputs.ack_research != 'true' }}
         run: |
           mkdir -p dist
           for bin in hft-live hft-paper hft-all-in-one hft-replay; do
@@ -311,7 +372,7 @@ jobs:
           ls -la dist || true
 
       - name: Upload artifacts
-        if: success() && github.event_name == 'push'
+        if: ${{ (success() && github.event_name == 'push') && needs.scope.outputs.ack_research != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: rust-dev-binaries-${{ github.sha }}
@@ -319,14 +380,23 @@ jobs:
           if-no-files-found: ignore
 
       - name: sccache stats
-        if: always() && needs.scope.outputs.toolchain == 'true'
+        if: ${{ (always() && needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}
         run: ${SCCACHE_PATH:-sccache} --show-stats || true
 
+      - name: Wait for signed ACK execution receipt
+        if: needs.scope.outputs.ack_research == 'true'
+        id: ack
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/wait-ack-research-receipt.sh ci-rust "$(git rev-parse HEAD)"
   rust_fast_gates:
     name: Rust Fast Gates
     needs: scope
     if: ${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -477,14 +547,14 @@ jobs:
           fi
 
       - name: Setup Rust toolchain (fmt)
-        if: needs.scope.outputs.loop == 'true'
+        if: ${{ (needs.scope.outputs.loop == 'true') }}
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
           components: rustfmt
 
       - name: Format Loop Engineer packages
-        if: needs.scope.outputs.loop == 'true'
+        if: ${{ (needs.scope.outputs.loop == 'true') }}
         working-directory: rust_hft
         run: |
           cargo fmt --check --package alpha-domain
@@ -525,9 +595,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
+        if: needs.scope.outputs.production_trading_image == 'true' || needs.scope.outputs.production_collector_image == 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Build production trading image
+        if: needs.scope.outputs.production_trading_image == 'true'
         uses: docker/build-push-action@v7
         with:
           context: rust_hft
@@ -540,6 +612,7 @@ jobs:
       # This is the same production collector Dockerfile and cache used by ACR.
       # A build-dependency failure must fail the required CI gate before release.
       - name: Build production collector image
+        if: needs.scope.outputs.production_collector_image == 'true'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: rust_hft
@@ -559,6 +632,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Verify production collector binary source and self-test
+        if: needs.scope.outputs.production_collector_image == 'true'
         env:
           SOURCE_REVISION: ${{ github.sha }}
         run: |
@@ -664,7 +738,7 @@ jobs:
             rust_hft
           key: hft-engine-fast-lane-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/Cargo.lock') }}
           cache-all-crates: false
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
       - name: Audit unbounded channels
         run: cargo test -p hft-engine --test queue_topology_contract --locked
@@ -758,8 +832,12 @@ jobs:
     needs:
       - selector
       - scope
+      - control_contracts
+      - monitor_contracts
+      - ci_contracts
       - rust_shell_scripts
       - rust
+      - research_preflight
       - rust_fast_gates
       - market_recorder_contract
       - deployment_artifacts

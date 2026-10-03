@@ -86,18 +86,20 @@ reject '.spool_drained=false' not-drained
 # a stale/unauthorized one.
 healthy_sample=$(jq -cn '{schema:"monday.bybit_options_quote.v1",venue:"bybit",category:"option",
   disk_warning:false,spool_warning:false,upload_failure_count:0,
-  upload_warning:false,connected_workers:1,symbols_expected:1500,
+  upload_warning:false,last_upload_error_at:null,connected_workers:1,symbols_expected:1500,
   symbols_seen:1450,active_segment_bytes:0,last_event_at_ms:1750000000000,
   updated_at_ms:1750000001000}')
 printf '%s\n' "$healthy_sample" | jq -e \
   --argjson minimum_symbols 500 \
   --argjson minimum_updated_ms 1749999999000 \
   --argjson old_updated_ms 0 \
+  --argjson upload_failure_baseline 0 \
   -f "$runtime_policy" >/dev/null
 if printf '%s\n' "$healthy_sample" | jq -e \
   --argjson minimum_symbols 500 \
   --argjson minimum_updated_ms 1750000002000 \
   --argjson old_updated_ms 0 \
+  --argjson upload_failure_baseline 0 \
   -f "$runtime_policy" >/dev/null; then
   printf '%s\n' 'runtime health policy accepted a stale updated_at_ms' >&2
   exit 1
@@ -106,6 +108,169 @@ fi
 # Control-plane freshness transition.
 # shellcheck disable=SC1090,SC1091
 . "$control_lib"
+
+runtime_sample_passes() {
+  jq -e --argjson minimum_symbols 500 \
+    --argjson minimum_updated_ms 1749999999000 \
+    --argjson old_updated_ms 0 \
+    --argjson upload_failure_baseline "$1" \
+    -f "$runtime_policy" >/dev/null
+}
+resolved_sample=$(jq '.upload_failure_count=28' <<<"$healthy_sample")
+runtime_sample_passes 28 <<<"$resolved_sample"
+for filter in \
+  '.upload_failure_count=29' \
+  '.upload_failure_count=27' \
+  '.upload_failure_count=28.5' \
+  '.upload_failure_count="28"' \
+  '.upload_warning=true' \
+  '.last_upload_error_at=1750000000500' \
+  'del(.last_upload_error_at)'; do
+  if jq "$filter" <<<"$resolved_sample" | runtime_sample_passes 28; then
+    printf 'runtime policy accepted an unsafe production sample: %s\n' "$filter" >&2
+    exit 1
+  fi
+done
+if runtime_sample_passes 0 <<<"$resolved_sample"; then
+  printf 'fresh shadow runtime policy accepted historical failures\n' >&2
+  exit 1
+fi
+
+# Exercise the actual host drain function with a bounded fake uploader. The
+# policy must inspect the post-drain file, not only trust command exit zero.
+eval "$(sed -n '/^run_candidate_drain() {/,/^}/p' "$cutover")"
+CANONICAL_SPOOL="$tmp_dir/drain-spool"
+# shellcheck disable=SC2034 # consumed by the actual host functions loaded above
+{
+  CANDIDATE_BINARY=/candidate/bybit-options-archiver
+  SAFE_PATH=/usr/bin:/bin
+  UPLOAD_FAILURE_BASELINE=28
+  DRAIN_ENV_KEYS=()
+  BOOTSTRAP_DEADLINE=0
+}
+mkdir "$CANONICAL_SPOOL"
+canonical_spool_paths_safe() { return 0; }
+require_empty_segment_spool() { [[ $spool_empty == true ]]; }
+runuser() { cp "$tmp_dir/drain-result.json" "$CANONICAL_SPOOL/upload-status.json"; }
+timeout() {
+  [[ $1 == --signal=TERM && $2 == --kill-after=10s && $3 =~ ^[1-9][0-9]*$ ]] || return 1
+  shift 3
+  "$@"
+}
+spool_empty=true
+jq -n '{failure_count:28,last_success_at:20,last_error_at:null,last_error:null}' \
+  >"$tmp_dir/resolved-status.json"
+cp "$tmp_dir/resolved-status.json" "$tmp_dir/drain-result.json"
+run_candidate_drain "$tmp_dir"
+[[ $(bybit_options_upload_failure_count "$CANONICAL_SPOOL/upload-status.json") == 28 ]]
+for filter in \
+  '.failure_count=29' \
+  '.failure_count=27' \
+  '.failure_count=28.5' \
+  'del(.failure_count)' \
+  '.last_error_at=10' \
+  '.last_error="current failure"' \
+  'del(.last_error_at)' \
+  'del(.last_error)'; do
+  jq "$filter" "$tmp_dir/resolved-status.json" >"$tmp_dir/drain-result.json"
+  if run_candidate_drain "$tmp_dir"; then
+    printf 'candidate drain accepted unresolved/new upload failures: %s\n' "$filter" >&2
+    exit 1
+  fi
+done
+cp "$tmp_dir/resolved-status.json" "$tmp_dir/drain-result.json"
+spool_empty=false
+if run_candidate_drain "$tmp_dir"; then
+  printf 'candidate drain accepted a nonempty raw spool\n' >&2
+  exit 1
+fi
+if bybit_options_upload_status_ready "$tmp_dir/missing-status.json" 28; then
+  printf 'production status disappearance erased historical failures\n' >&2
+  exit 1
+fi
+if bybit_options_upload_status_ready "$tmp_dir/missing-status.json" 0; then
+  printf 'zero-baseline readiness accepted missing persisted status\n' >&2
+  exit 1
+fi
+printf '{bad json' >"$tmp_dir/bad-status.json"
+if bybit_options_upload_failure_count "$tmp_dir/bad-status.json" >/dev/null 2>&1; then
+  printf 'malformed production status erased historical failures\n' >&2
+  exit 1
+fi
+
+# The host runtime readback must also inspect current persisted upload status:
+# a cached healthy sample cannot hide an upload failure after that sample.
+eval "$(sed -n '/^health_ready_for_release() {/,/^}/p' "$cutover")"
+# shellcheck disable=SC2034 # consumed by the actual host function loaded above
+RUNTIME_HEALTH_POLICY=$runtime_policy
+printf '%s\n' "$resolved_sample" >"$CANONICAL_SPOOL/health.json"
+cp "$tmp_dir/resolved-status.json" "$CANONICAL_SPOOL/upload-status.json"
+health_ready_for_release 500 1749999999000
+for filter in '.failure_count=29' '.last_error="current failure"'; do
+  jq "$filter" "$tmp_dir/resolved-status.json" >"$CANONICAL_SPOOL/upload-status.json"
+  if health_ready_for_release 500 1749999999000; then
+    printf 'cached health hid a new persisted upload failure: %s\n' "$filter" >&2
+    exit 1
+  fi
+done
+
+# Only an explicitly new, empty host can capture an absent status as baseline
+# zero. Its candidate uploader must still write status before readiness passes.
+eval "$(sed -n '/^capture_upload_failure_baseline() {/,/^}/p' "$cutover")"
+CANONICAL_SPOOL="$tmp_dir/bootstrap-spool"
+mkdir "$CANONICAL_SPOOL"
+# shellcheck disable=SC2034 # consumed by the actual host function loaded above
+OLD_MODE=upgrade
+if capture_upload_failure_baseline; then
+  printf 'upgrade accepted missing cumulative upload history\n' >&2
+  exit 1
+fi
+# shellcheck disable=SC2034 # consumed by the actual host function loaded above
+OLD_MODE=new-host
+spool_empty=false
+if capture_upload_failure_baseline; then
+  printf 'new host accepted missing history with a nonempty spool\n' >&2
+  exit 1
+fi
+spool_empty=true
+UPLOAD_FAILURE_BASELINE=$(capture_upload_failure_baseline)
+[[ $UPLOAD_FAILURE_BASELINE == 0 ]]
+if bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" 0; then
+  printf 'new host became ready before the candidate persisted status\n' >&2
+  exit 1
+fi
+jq '.failure_count=0 | .last_success_at=null' "$tmp_dir/resolved-status.json" >"$tmp_dir/drain-result.json"
+run_candidate_drain "$tmp_dir"
+bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" 0
+rm "$CANONICAL_SPOOL/upload-status.json"
+if bybit_options_upload_status_ready "$CANONICAL_SPOOL/upload-status.json" 0; then
+  printf 'new host remained ready after persisted status disappeared\n' >&2
+  exit 1
+fi
+
+# Render the real unit template with a digest, then validate exact command
+# identity. A bare release-root prefix was previously compared as a whole line.
+old_binary="/opt/monday/releases/bybit-options-archiver/$candidate/bybit-options-archiver"
+rendered_unit=$(sed "s/@BYBIT_OPTIONS_ARCHIVER_SHA256@/$candidate/g" \
+  "$script_dir/bybit-options-archiver.service")
+bybit_options_unit_exec_start_matches "$old_binary" "$rendered_unit"
+for invalid_unit in \
+  'ExecStart=/opt/monday/releases/bybit-options-archiver/' \
+  "ExecStart=$old_binary --upload-only" \
+  "ExecStart=/opt/monday/releases/bybit-options-archiver/$bundle/bybit-options-archiver" \
+  "${rendered_unit}"$'\n''ExecStart=/untrusted/binary' \
+  "${rendered_unit}"$'\n'' ExecStart = /untrusted/binary' \
+  "${rendered_unit}"$'\n''ExecStart=' \
+  "${rendered_unit}"$'\n'' ExecStart =  ' \
+  "ExecStart="$'\n'"${rendered_unit}" \
+  "${rendered_unit}"$'\n'"ExecStart=$old_binary" \
+  'ExecStart='; do
+  if bybit_options_unit_exec_start_matches "$old_binary" "$invalid_unit"; then
+    printf 'collector unit accepted a mismatched/duplicate ExecStart\n' >&2
+    exit 1
+  fi
+done
+
 advance=$(bybit_options_observe_health_freshness \
   100 10 0 200 20 120)
 [[ $advance == '200 20 10 1' ]] || {
@@ -174,4 +339,6 @@ grep -Fq 'BYBIT_OPTIONS_SPOOL_MAX_BYTES 53687091200' "$cutover" \
 grep -Fq 'AssertPathIsMountPoint=/data' "$script_dir/bybit-options-archiver.service"
 grep -Fq 'AssertPathIsMountPoint=/data' "$script_dir/bybit-options-upload.service"
 
+bash "$script_dir/test-bybit-options-cutover.sh"
+bash "$script_dir/test-host-bybit-options-cutover.sh"
 printf '%s\n' 'Bybit Options shadow gate tests passed'

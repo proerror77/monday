@@ -1,8 +1,10 @@
 //! Manifest contracts for reproducible research, evaluation, promotion, and live rollout.
 
+pub mod market_encoder;
 pub mod mlp_training;
 pub mod model;
 pub mod sec_orderflow;
+pub mod sequence;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;

@@ -113,13 +113,21 @@ dry-run does not start a process or change the execution count. It requires an
 active unexpired lease, verifies the admitted packet and current worktree/
 branch/base, and refuses `grok`/`human` seats or trading gates other than `none`
 or `fail-closed`. It does not call Cursor Cloud or Codex HTTP APIs, and it does
-not schedule ACK Jobs. `task-declare`, `task-invoke`, `task-suspend`,
-`task-status`, and `task-egress` are the on-demand actor path: the
-workspace is materialized before the command, suspend checkpoints that
-workspace, and a later invoke of the same agent id restores it. Egress
-is an allowlist. Model secrets stay in `model.secret`, not in the task
-body, command, or logs. An active lease on the same contract refuses
-the invoke. This path does not submit orders or change risk limits.
+not schedule ACK Jobs.
+
+`task-declare`, `task-invoke`, `task-suspend`, `task-status`, `task-egress`,
+and `task-batch` are the current local task path. Invoke materializes workspace
+files and executes a command. Suspend stops the recorded worker and then
+checkpoints files. Admission refuses an overlapping contract, branch, pull
+request, or file range. A checkpoint restores files; it does not restore
+process memory or an LLM session. Egress wrappers and RSS checks are not a
+portable sandbox. Model secrets belong outside task text, commands, logs and
+checkpoints.
+
+AX adoption stopped on 2026-09-25. The [ADR](../architecture/ADR-0003-ax-agent-execution.md)
+and [plan](../plans/2026-09-23-ax-adoption.md) are historical and are not a
+contract for replacing this helper. Keep engineering task execution separate
+from Campaign admission and trading authority.
 
 ### Machine packet and execution evidence
 

@@ -24,6 +24,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
 alpha-store = { path = "../store", features = ["test-support"] }
 hft-core = { path = "../../market-core/core" }
 hft-strategy-formula = { path = "../../strategy-framework/strategies/formula" }

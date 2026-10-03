@@ -2,6 +2,9 @@ mod admission;
 pub(crate) mod controller;
 pub(crate) mod final_admission;
 pub(crate) mod final_authority;
+pub(crate) mod sequence_admission;
+pub(crate) mod stage_controller;
+pub(crate) mod study_authority;
 mod terminal;
 
 use crate::{
@@ -84,6 +87,9 @@ enum SubmissionObjectState {
 }
 
 pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
+    if sequence_admission::is_study_submission(&args.submission)? {
+        return sequence_admission::inspect(args);
+    }
     if final_admission::is_final_submission(&args.submission)? {
         return final_admission::inspect(args);
     }
@@ -111,6 +117,9 @@ pub fn status(args: crate::cli::MissionDispatchStatusArgs) -> anyhow::Result<()>
 
 fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> anyhow::Result<Value> {
     validate_cluster_target(&args.context, &args.namespace)?;
+    if sequence_admission::is_study_submission(&args.submission)? {
+        return sequence_admission::status_report(args);
+    }
     if final_admission::is_final_submission(&args.submission)? {
         bail!("Campaign workflow status is limited to pre-holdout dispatch");
     }
@@ -145,6 +154,9 @@ fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> anyhow::Result
 }
 
 pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
+    if sequence_admission::is_study_submission(&args.submission)? {
+        return sequence_admission::settle(args);
+    }
     if final_admission::is_final_submission(&args.submission)? {
         if args.readback_cache.is_some() || args.model_report.is_some() {
             anyhow::bail!(
@@ -159,6 +171,9 @@ pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
 pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     if args.readback_cache.is_some() || args.model_report.is_some() {
         anyhow::bail!("readback cache and model report options are settlement-only");
+    }
+    if sequence_admission::is_study_submission(&args.submission)? {
+        return sequence_admission::submit(args);
     }
     if final_admission::is_final_submission(&args.submission)? {
         return final_admission::submit(args);
@@ -830,6 +845,10 @@ fn job_execution_projection(job: &Value) -> Value {
                 "emptyDir": volume["emptyDir"].clone(),
                 "secretName": volume["secret"]["secretName"].clone(),
                 "secretItems": volume["secret"]["items"].clone(),
+                "persistentVolumeClaim": volume["persistentVolumeClaim"].clone(),
+                "otherSources": volume.as_object().into_iter().flatten().filter(|(key, _)|
+                    !matches!(key.as_str(), "name" | "emptyDir" | "secret" | "persistentVolumeClaim"))
+                    .map(|(key,value)| (key.clone(), value.clone())).collect::<serde_json::Map<String, Value>>(),
             })
         })
         .collect::<Vec<_>>();
@@ -852,6 +871,7 @@ fn job_execution_projection(job: &Value) -> Value {
                     "nodeName": pod["nodeName"].as_str().unwrap_or(""),
                     "imagePullSecrets": pod["imagePullSecrets"].clone(),
                     "nodeSelector": pod["nodeSelector"].clone(),
+                    "affinity": if container["env"].as_array().is_some_and(|items|items.iter().any(|item|item["name"]=="MONDAY_CAMPAIGN_POD_UID")) {pod["affinity"].clone()} else {Value::Null},
                     "securityContext": pod["securityContext"].clone(),
                     "initContainers": pod["initContainers"].clone(),
                     "containerCount": containers.map_or(0, Vec::len),
@@ -1698,6 +1718,7 @@ mod tests {
                 namespace: "monday-research".into(),
                 job_name: validated.job_name.clone(),
                 manifest_sha256: "a".repeat(64),
+                require_completion_authority: false,
             },
             job_uid: Some("original".into()),
             sequence: 4,
@@ -1821,6 +1842,34 @@ mod tests {
                 "accepted changed {pointer}"
             );
         }
+        // Market completion authority uses the bound Kubernetes timestamps,
+        // including the unique successful Pod; worker result times are unused.
+        let mut timed = terminal::TerminalJobReadback {
+            job_uid: "bound-job".into(),
+            pod_uid: "pod-1".into(),
+            job,
+            pod,
+        };
+        timed.job["status"]["startTime"] = json!("2026-09-27T01:00:00Z");
+        timed.job["status"]["completionTime"] = json!("2026-09-27T01:00:03Z");
+        timed.pod["status"]["containerStatuses"][0]["state"]["terminated"]["startedAt"] =
+            json!("2026-09-27T01:00:01Z");
+        timed.pod["status"]["containerStatuses"][0]["state"]["terminated"]["finishedAt"] =
+            json!("2026-09-27T01:00:02Z");
+        let observed = "2026-09-27T01:00:04Z".parse().unwrap();
+        timed.completion(observed).unwrap();
+        for invalid in [
+            Value::Null,
+            json!("2026-09-27T00:59:59Z"),
+            json!("2026-09-27T01:00:05Z"),
+            json!("2026-09-27T01:00:01Z"),
+        ] {
+            timed.job["status"]["completionTime"] = invalid;
+            assert!(timed.completion(observed).is_err());
+        }
+        timed.job["status"]["completionTime"] = json!("2026-09-27T01:00:03Z");
+        timed.pod["metadata"]["uid"] = json!("replacement-pod");
+        assert!(timed.completion(observed).is_err());
     }
 
     struct AdmissionFixture {
@@ -2444,6 +2493,65 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_native_sign_root_binds_the_finalized_request_and_budget() {
+        use alpha_domain::campaign_control::SignedCampaignRootGrantV1;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = AdmissionFixture::with_job_budget(600, chrono::TimeDelta::hours(1));
+        let control = admission::read_control(&fixture.control).unwrap();
+        let signed: SignedCampaignRootGrantV1 =
+            admission::read_json(&control.signed_root_grant_path).unwrap();
+        let grant_path = fixture
+            .inputs
+            ._root
+            .path()
+            .join("native-unsigned-root.json");
+        let key_path = fixture
+            .inputs
+            ._root
+            .path()
+            .join("native-public-fixture.key");
+        std::fs::write(&grant_path, serde_json::to_vec(&signed.grant).unwrap()).unwrap();
+        // The existing admission fixture uses this public deterministic test seed.
+        std::fs::write(&key_path, [19_u8; 32]).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&control.signed_root_grant_path).unwrap();
+        study_authority::sign_root(study_authority::RootSignArgs {
+            grant: grant_path,
+            key_id: "operator".into(),
+            signing_key: key_path,
+            trusted_keys: control.trusted_keys_path.clone(),
+            output: control.signed_root_grant_path.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            admission::read_json::<SignedCampaignRootGrantV1>(&control.signed_root_grant_path)
+                .unwrap(),
+            signed
+        );
+        let mut gate = fixture.open();
+        assert_eq!(
+            gate.reservation.request_sha256,
+            fixture.validated.request_sha256
+        );
+        assert_eq!(gate.reservation.execution, signed.grant.execution);
+        assert_eq!(gate.reservation.reserved_job_seconds, 600);
+        gate.prepare().unwrap();
+        gate.prepare().unwrap();
+        drop(gate);
+        assert_eq!(fixture.usage().job_attempts, 1);
+        assert_eq!(fixture.usage().reserved_job_seconds, 600);
+
+        // A new inspection changes the reservation bytes at the same operation
+        // identity; the authenticated ledger must reject it without more spending.
+        fixture.validated.request_sha256 = "f".repeat(64);
+        let mut changed = fixture.open();
+        assert!(changed.prepare().is_err());
+        drop(changed);
+        assert_eq!(fixture.usage().job_attempts, 1);
+        assert_eq!(fixture.usage().reserved_job_seconds, 600);
+    }
+    #[test]
     fn dispatch_root_deadline_fits_short_authority_and_reserves_actual_job_seconds() {
         let fixture = AdmissionFixture::with_job_budget(600, chrono::TimeDelta::hours(1));
         let mut gate = fixture.open();
@@ -2847,6 +2955,7 @@ mod tests {
         )
         .unwrap();
         let evidence = CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "job-uid-1".into(),
             pod_uid: "pod-uid-1".into(),
             settlement: CampaignAttemptSettlementV1 {
@@ -2959,6 +3068,7 @@ mod tests {
             namespace: "monday-research".into(),
             job_name: fixture.validated.job_name.clone(),
             manifest_sha256: alpha_domain::canonical_json_hash(&fixture.manifest).unwrap(),
+            require_completion_authority: false,
         };
         let origin = reqwest::Url::parse(
             &fixture
@@ -3019,6 +3129,7 @@ mod tests {
         assert!(gate.claim().is_err());
         assert!(gate.bind_job("another-job").is_err());
         gate.settle(&CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "historical-job".into(),
             pod_uid: "historical-pod".into(),
             settlement: CampaignAttemptSettlementV1 {
@@ -3085,6 +3196,7 @@ mod tests {
         )
         .unwrap();
         gate.settle(&CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "job-uid-1".into(),
             pod_uid: "pod-uid-1".into(),
             settlement: CampaignAttemptSettlementV1 {
@@ -3329,6 +3441,7 @@ mod tests {
         .unwrap();
         parent_settlement
             .settle(&CampaignDispatchSettlementV1 {
+                completion_provenance: None,
                 job_uid: "parent-job".into(),
                 pod_uid: "parent-pod".into(),
                 settlement: CampaignAttemptSettlementV1 {
@@ -3565,6 +3678,7 @@ mod tests {
         .unwrap();
         target_parent_settlement
             .settle(&CampaignDispatchSettlementV1 {
+                completion_provenance: None,
                 job_uid: "target-parent-job".into(),
                 pod_uid: "target-parent-pod".into(),
                 settlement: CampaignAttemptSettlementV1 {
@@ -3658,6 +3772,7 @@ mod tests {
         .unwrap();
         target_settlement
             .settle(&CampaignDispatchSettlementV1 {
+                completion_provenance: None,
                 job_uid: "target-job".into(),
                 pod_uid: "target-pod".into(),
                 settlement: CampaignAttemptSettlementV1 {

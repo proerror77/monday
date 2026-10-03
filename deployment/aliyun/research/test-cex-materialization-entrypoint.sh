@@ -144,8 +144,16 @@ artifact_dir=
 window_start=
 window_end=
 feature_family=
+sequence_output=0
+market_output=0
+market_feature_end=
+market_feature_start=
 while [ $# -gt 0 ]; do
   case "$1" in
+    --sequence-output) sequence_output=1; shift ;;
+    --market-encoder-output) market_output=1; shift ;;
+    --market-feature-start-received-at-ns) market_feature_start=$2; shift 2 ;;
+    --market-feature-end-received-at-ns) market_feature_end=$2; shift 2 ;;
     --artifact-dir) artifact_dir=$2; shift 2 ;;
     --output-start-received-at-ns) window_start=$2; shift 2 ;;
     --output-end-received-at-ns) window_end=$2; shift 2 ;;
@@ -175,6 +183,27 @@ cat >"$report" <<JSON
   "artifact_sha256": "$feature_sha"
 }
 JSON
+if [ "$sequence_output" -eq 1 ]; then
+  printf 'sequence-row\n' >"$artifact_dir/sequence-row"
+  shard_sha=$(sha256sum "$artifact_dir/sequence-row" | awk '{print $1}')
+  mv "$artifact_dir/sequence-row" "$artifact_dir/$shard_sha.sequence.jsonl"
+  printf '{"shard":"%s"}\n' "$shard_sha" >"$artifact_dir/sequence-manifest"
+  sequence_sha=$(sha256sum "$artifact_dir/sequence-manifest" | awk '{print $1}')
+  mv "$artifact_dir/sequence-manifest" "$artifact_dir/$sequence_sha.sequence.json"
+  sed '$d' "$report" >"$report.tmp"
+  printf ',\n  "sequence_manifest_sha256": "%s"\n}\n' "$sequence_sha" >>"$report.tmp"
+  mv "$report.tmp" "$report"
+fi
+if [ "$market_output" -eq 1 ]; then
+  for suffix in market-feature-sources.json market-features.jsonl market-features.json market-targets.jsonl market-targets.json; do
+    printf '%s|%s|%s\n' "$suffix" "$market_feature_start" "$market_feature_end" >"$artifact_dir/market-part"
+    part_sha=$(sha256sum "$artifact_dir/market-part" | awk '{print $1}')
+    mv "$artifact_dir/market-part" "$artifact_dir/$part_sha.$suffix"
+  done
+  sed '$d' "$report" >"$report.tmp"
+  printf ',\n  "market_encoder": {"feature_start_received_at_ns": %s, "feature_end_received_at_ns": %s}\n}\n' "${market_feature_start:-null}" "${market_feature_end:-null}" >>"$report.tmp"
+  mv "$report.tmp" "$report"
+fi
 report_sha=$(sha256sum "$report" | awk '{print $1}')
 cat <<JSON
 {
@@ -502,6 +531,57 @@ if sh "$ENTRYPOINT" \
   exit 1
 fi
 grep -q 'recovery artifact SHA differs' "$tamper_root/retry.err"
+
+# Sequence mode publishes the CAS manifest and shards, and preserves their
+# identities on a same-request retry. This is a transfer-contract double, not
+# synthetic evidence for a real research run.
+sequence_root="$ROOT/sequence"
+mkdir -p "$sequence_root/output" "$sequence_root/work"
+sed -e 's/RUN_ID=test-run-1/RUN_ID=sequence-test/' -e 's/OUTPUT_PREFIX=test-run-1/OUTPUT_PREFIX=sequence-test/' \
+  -e 's/SYMBOL=BTCUSDT/SYMBOL=SOLUSDT/' -e 's/LABEL_HORIZON_BUCKETS=5/LABEL_HORIZON_BUCKETS=30/' \
+  "$ROOT/inventory.env" >"$sequence_root/inventory.env"
+for attempt in first resumed; do
+  sh "$ENTRYPOINT" --inventory "$sequence_root/inventory.env" --raw-root "$RAW_ROOT" --reference-root "$REF_ROOT" \
+    --output-root "$sequence_root/output" --work-dir "$sequence_root/work" --binary-dir "$BIN_DIR" --sequence-output \
+    >"$sequence_root/$attempt.stdout" 2>"$sequence_root/$attempt.log" || { cat "$sequence_root/$attempt.log" >&2; exit 1; }
+done
+sequence_materialization="$sequence_root/output/sequence-test/artifacts/materialization"
+[ "$(find "$sequence_materialization" -name '*.sequence.json*' -type f | wc -l | tr -d ' ')" -eq 2 ]
+for sequence_file in "$sequence_materialization"/*.sequence.json*; do
+  sequence_name=${sequence_file##*/}
+  [ "$(sha256sum "$sequence_file" | awk '{print $1}')" = "${sequence_name%%.*}" ]
+done
+if sh "$ENTRYPOINT" --inventory "$sequence_root/inventory.env" --raw-root "$RAW_ROOT" --reference-root "$REF_ROOT" \
+  --output-root "$sequence_root/output" --work-dir "$sequence_root/work" --binary-dir "$BIN_DIR" \
+  >"$sequence_root/mode.stdout" 2>"$sequence_root/mode.log"; then
+  printf 'expected sequence mode drift to be rejected\n' >&2; exit 1
+fi
+grep -q 'sequence output differs from requested preparation mode' "$sequence_root/mode.log"
+
+# Market publication includes the complete feature source identity, independent
+# feature/target manifests and shards. The double checks transfer and recovery.
+market_root="$ROOT/market"
+mkdir -p "$market_root/output" "$market_root/work"
+sed -e 's/sequence-test/market-test/g' "$sequence_root/inventory.env" >"$market_root/inventory.env"
+for attempt in first resumed; do
+  sh "$ENTRYPOINT" --inventory "$market_root/inventory.env" --raw-root "$RAW_ROOT" --reference-root "$REF_ROOT" \
+    --output-root "$market_root/output" --work-dir "$market_root/work" --binary-dir "$BIN_DIR" \
+    --market-encoder-output --market-feature-start-received-at-ns 30000000000 --market-feature-end-received-at-ns 90000000000 \
+    >"$market_root/$attempt.stdout" 2>"$market_root/$attempt.log" || { cat "$market_root/$attempt.log" >&2; exit 1; }
+done
+market_materialization="$market_root/output/market-test/artifacts/materialization"
+[ "$(find "$market_materialization" -name '*.market-*' -type f | wc -l | tr -d ' ')" -eq 5 ]
+for market_file in "$market_materialization"/*.market-*; do
+  market_name=${market_file##*/}
+  [ "$(sha256sum "$market_file" | awk '{print $1}')" = "${market_name%%.*}" ]
+  grep -q '|30000000000|90000000000$' "$market_file"
+done
+if sh "$ENTRYPOINT" --inventory "$market_root/inventory.env" --raw-root "$RAW_ROOT" --reference-root "$REF_ROOT" \
+  --output-root "$market_root/output" --work-dir "$market_root/work" --binary-dir "$BIN_DIR" \
+  >"$market_root/mode.stdout" 2>"$market_root/mode.log"; then
+  printf 'expected market mode drift to be rejected\n' >&2; exit 1
+fi
+grep -q 'market encoder output differs from requested preparation mode' "$market_root/mode.log"
 
 # A receipt from another run cannot claim an existing prefix. This fails
 # before creating a staged work directory or running any materializer.

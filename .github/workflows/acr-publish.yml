@@ -70,14 +70,15 @@ jobs:
         with:
           ref: refs/heads/main
 
-      - name: Read authenticated automatic release source
+      - name: Read authenticated reusable research source
         id: source-jobs
-        if: github.event_name == 'workflow_run'
+        if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && (inputs.target == 'research-runner' || inputs.target == 'all') && inputs.rebuild_research_runner != true)
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          SOURCE_MODE: ${{ github.event_name == 'workflow_dispatch' && 'reuse' || 'automatic' }}
         run: |
-          .github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID"
+          .github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID" "$GITHUB_OUTPUT" "$SOURCE_MODE"
 
       - name: Read authenticated release admission
         id: admission
@@ -153,6 +154,7 @@ jobs:
           matrix=$(jq -cn --arg target "$TARGET" '
             [{repository:"research-runner",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt",research_artifact:true},
              {repository:"campaign-cycle-controller",context:".",file:"deployment/aliyun/research/Dockerfile.campaign-cycle-controller",target:"prebuilt",research_artifact:true},
+             {repository:"research-data-service",context:".",file:"deployment/aliyun/research/Dockerfile.research-data",target:"prebuilt",research_artifact:true},
              {repository:"hft-trading",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.trading",target:"runtime",research_artifact:false},
              {repository:"binance-lob-archiver",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.binance-lob-archiver",target:"runtime",research_artifact:false},
              {repository:"polymarket-evidence-compiler",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler",target:"runtime",research_artifact:false},
@@ -160,6 +162,7 @@ jobs:
             | {include: map(select(
                 $target == "all" or .repository == $target
                 or ($target == "research-runner" and .repository == "campaign-cycle-controller")
+                or ($target == "research-runner" and .repository == "research-data-service")
               ))}')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
@@ -167,101 +170,30 @@ jobs:
     needs: selector
     if: needs.selector.outputs.research_mode == 'rebuild'
     runs-on: ubuntu-latest
-    container: rust:1.98.1-bookworm
-    defaults:
-      run:
-        working-directory: rust_hft
-        shell: bash
-    env:
-      CARGO_INCREMENTAL: "0"
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "false"
+    timeout-minutes: 360
     steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.selector.outputs.source_sha }}
-
-      - name: Install build dependencies
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            clang \
-            cmake \
-            jq \
-            mold \
-            pkg-config \
-            protobuf-compiler
-          rm -rf /var/lib/apt/lists/*
-
-      - name: Setup sccache
-        id: sccache
-        continue-on-error: true
-        uses: mozilla-actions/sccache-action@v0.0.10
-
-      - name: Disable sccache on setup failure
-        if: steps.sccache.outcome == 'failure'
-        run: |
-          echo 'sccache setup failed; building without the wrapper (see 92991a3e fragility note)'
-          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
-
-      - name: Record cache dimensions
-        id: cache-info
-        shell: bash
-        run: |
-          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
-          echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust_hft
-          key: research-image-bookworm-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}
-          cache-all-crates: true
-
-      - name: Build research runner binaries
+      - name: Wait for signed ACK execution receipt
+        id: ack
+        working-directory: .
         env:
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          MONDAY_SOURCE_REVISION="$SOURCE_REVISION" \
-            cargo build --release --locked -p hft-backtest -p alpha-harness
-          test "$(target/release/alpha-harness --version)" = "alpha-harness $SOURCE_REVISION"
-          cargo build --release --locked -p hft-collector --bin lob-pit-materializer --bin binance-market-tape-slicer --bin binance-replay-parquet-materializer
-          CARGO_TARGET_DIR=target/prediction-markets \
-            cargo build \
-              --manifest-path prediction-markets/Cargo.toml \
-              --release \
-              --locked \
-              -p ploy-research \
-              --features db \
-              --bin monday-prediction-research \
-              --bin monday-prediction-evaluator \
-              --bin monday-prediction-snapshot
-          install -D -m 0755 target/release/hft-backtest research-release/research-bin/hft-backtest
-          install -D -m 0755 target/release/alpha-harness research-release/research-bin/alpha-harness
-          install -D -m 0755 target/release/lob-pit-materializer research-release/research-bin/lob-pit-materializer
-          install -D -m 0755 target/release/binance-market-tape-slicer research-release/research-bin/binance-market-tape-slicer
-          install -D -m 0755 target/release/binance-replay-parquet-materializer research-release/research-bin/binance-replay-parquet-materializer
-          install -D -m 0755 target/prediction-markets/release/monday-prediction-research research-release/research-bin/monday-prediction-research
-          install -D -m 0755 target/prediction-markets/release/monday-prediction-evaluator research-release/research-bin/monday-prediction-evaluator
-          install -D -m 0755 target/prediction-markets/release/monday-prediction-snapshot research-release/research-bin/monday-prediction-snapshot
-          ../.github/scripts/research-image-release-artifact.sh create research-release \
-            "${{ needs.selector.outputs.source_sha }}" \
-            "${{ needs.selector.outputs.artifact_run_id }}" .
-
-      - name: Show sccache stats
-        if: always()
-        run: ${SCCACHE_PATH:-sccache} --show-stats || true
-
-      - name: Upload manual research image release
+          .github/scripts/wait-ack-research-receipt.sh research-release-binaries "$(git rev-parse HEAD)" "${RUNNER_TEMP}/ack-receipt"
+      - name: Verify software release metadata
+        working-directory: .
+        run: |
+          .github/scripts/research-image-release-artifact.sh verify-metadata "${RUNNER_TEMP}/ack-receipt/software" "$(git rev-parse HEAD)" "$GITHUB_RUN_ID" rust_hft
+      - name: Upload research image release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: research-image-release-${{ needs.selector.outputs.source_sha }}
-          path: rust_hft/research-release/
+          path: ${{ runner.temp }}/ack-receipt/software/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
   publish:
     needs: [selector, research-runner-binaries]
@@ -287,43 +219,15 @@ jobs:
             [[ "$RESEARCH_MODE" == rebuild && "$REBUILD_RESULT" == success ]]
 
       - name: Verify Binance fee release contract
-        if: matrix.repository == 'binance-lob-archiver'
+        if: ${{ (matrix.repository == 'binance-lob-archiver') && !matrix.research_artifact }}
         run: deployment/aliyun/test-binance-fee-release-contract.sh
 
-      - name: Download research runner binaries
-        if: matrix.research_artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: research-image-release-${{ needs.selector.outputs.source_sha }}
-          path: research-release/
-          run-id: ${{ needs.selector.outputs.artifact_run_id }}
-          github-token: ${{ github.token }}
-
-      - name: Restore research runner binary modes
-        if: matrix.research_artifact
-        run: |
-          chmod 0755 \
-            research-release/research-bin/hft-backtest \
-            research-release/research-bin/alpha-harness \
-            research-release/research-bin/lob-pit-materializer \
-            research-release/research-bin/binance-market-tape-slicer \
-            research-release/research-bin/binance-replay-parquet-materializer \
-            research-release/research-bin/monday-prediction-research \
-            research-release/research-bin/monday-prediction-evaluator \
-            research-release/research-bin/monday-prediction-snapshot
-
-      - name: Verify research runner binary artifact
-        if: matrix.research_artifact
-        run: |
-          .github/scripts/research-image-release-artifact.sh verify research-release \
-            "${{ needs.selector.outputs.source_sha }}" \
-            "${{ needs.selector.outputs.artifact_run_id }}" rust_hft
-          mv research-release/research-bin rust_hft/research-bin
-
       - name: Set up Docker Buildx
+        if: ${{ !matrix.research_artifact }}
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to ACR
+        if: ${{ !matrix.research_artifact }}
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ vars.ACR_REGISTRY }}
@@ -341,6 +245,7 @@ jobs:
           .github/scripts/wait-release-required-checks.sh "$SOURCE_REVISION" current-main
 
       - name: Build and push
+        if: ${{ !matrix.research_artifact }}
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
@@ -364,11 +269,12 @@ jobs:
             org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}
 
       - name: Record immutable image
+        if: ${{ !matrix.research_artifact }}
         run: |
           echo '${{ matrix.repository }}=${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify Polymarket compiler source binding
-        if: matrix.repository == 'polymarket-evidence-compiler'
+        if: ${{ (matrix.repository == 'polymarket-evidence-compiler') && !matrix.research_artifact }}
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
@@ -382,7 +288,7 @@ jobs:
             --version | grep -Fqx "polymarket-raw-ops $SOURCE_REVISION"
 
       - name: Verify Polymarket market recorder image
-        if: matrix.repository == 'polymarket-market-recorder'
+        if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
@@ -401,7 +307,7 @@ jobs:
             | grep -Fq -- '--dry-run'
 
       - name: Extract bare-metal Polymarket market recorder
-        if: matrix.repository == 'polymarket-market-recorder'
+        if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
@@ -422,7 +328,7 @@ jobs:
             -C polymarket-market-recorder-artifact .
 
       - name: Upload bare-metal Polymarket market recorder
-        if: matrix.repository == 'polymarket-market-recorder'
+        if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: polymarket-market-recorder-linux-amd64-${{ needs.selector.outputs.source_sha }}
@@ -430,40 +336,8 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Verify research runner image
-        if: matrix.repository == 'research-runner'
-        env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-        run: |
-          set -euo pipefail
-          docker pull "$IMAGE"
-          actual_source_revision=$(docker image inspect \
-            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
-            "$IMAGE")
-          test "$actual_source_revision" = "$SOURCE_REVISION"
-          docker run --rm --entrypoint /bin/sh "$IMAGE" -ceu '
-            for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
-              test -x "/usr/local/bin/$binary"
-            done
-          '
-          docker run --rm --entrypoint /usr/local/bin/alpha-harness "$IMAGE" \
-            --version | grep -Fqx "alpha-harness $SOURCE_REVISION"
-          docker run --rm \
-            --entrypoint /usr/local/bin/monday-prediction-research \
-            "$IMAGE" \
-            --print-policy-snapshot-id | grep -Eq '^sha256:[0-9a-f]{64}$'
-          docker run --rm \
-            --entrypoint /usr/local/bin/binance-market-tape-slicer \
-            "$IMAGE" \
-            --help >/dev/null
-          docker run --rm \
-            --entrypoint /usr/local/bin/binance-replay-parquet-materializer \
-            "$IMAGE" \
-            --help >/dev/null
-
       - name: Verify Campaign cycle controller image
-        if: matrix.repository == 'campaign-cycle-controller'
+        if: ${{ (matrix.repository == 'campaign-cycle-controller') && !matrix.research_artifact }}
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
@@ -494,7 +368,7 @@ jobs:
             version --client=true
 
       - name: Package bare-metal trading host contract
-        if: matrix.repository == 'hft-trading'
+        if: ${{ (matrix.repository == 'hft-trading') && !matrix.research_artifact }}
         env:
           IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/hft-trading
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
@@ -565,7 +439,7 @@ jobs:
           )
 
       - name: Upload bare-metal trading host contract
-        if: matrix.repository == 'hft-trading'
+        if: ${{ (matrix.repository == 'hft-trading') && !matrix.research_artifact }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hft-trading-ecs-linux-amd64-${{ github.sha }}
@@ -574,7 +448,7 @@ jobs:
           retention-days: 90
 
       - name: Extract collector binaries for bare-metal ECS
-        if: matrix.repository == 'binance-lob-archiver'
+        if: ${{ (matrix.repository == 'binance-lob-archiver') && !matrix.research_artifact }}
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
         run: |
@@ -824,7 +698,7 @@ jobs:
           )
 
       - name: Upload collector binary artifact bundle
-        if: matrix.repository == 'binance-lob-archiver'
+        if: ${{ (matrix.repository == 'binance-lob-archiver') && !matrix.research_artifact }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binance-lob-archiver-linux-amd64-${{ github.sha }}
@@ -833,13 +707,32 @@ jobs:
           retention-days: 7
 
       - name: Remove ACR credentials
-        if: always()
+        if: ${{ (always()) && !matrix.research_artifact }}
         env:
           ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
         run: |
           docker logout "$ACR_REGISTRY" >/dev/null 2>&1 || true
           docker_config_root=${DOCKER_CONFIG:-$HOME/.docker}
           rm -f -- "$docker_config_root/config.json"
+
+      - name: Wait for signed ACK execution receipt
+        if: matrix.research_artifact
+        id: ack
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/wait-ack-research-receipt.sh research-release-publish "$(git rev-parse HEAD)" "${RUNNER_TEMP}/ack-receipt"
+      - name: Read back signed research image identity
+        if: matrix.research_artifact
+        env:
+          IMAGE_REPOSITORY: ${{ matrix.repository }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+        run: |
+          jq -e --arg repository "$IMAGE_REPOSITORY" --arg source "$SOURCE_REVISION" '
+            [.images[] | select(.repository == $repository and .source_sha == $source and .smoke_result == "success" and
+              (.digest | test("^sha256:[0-9a-f]{64}$")) and (.digest as $digest | .image_ref | endswith("@" + $digest)))] | length == 1
+          ' "${RUNNER_TEMP}/ack-receipt/receipt.json"
 
   research-release-complete:
     name: Research release complete (${{ needs.selector.outputs.source_sha }})
@@ -859,135 +752,16 @@ jobs:
     needs: selector
     if: needs.selector.outputs.publish_target == 'research-source-test'
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
-      - name: Checkout trusted source-test image contract
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Checkout exact source revision
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.selector.outputs.source_sha }}
-          path: source
-          fetch-depth: 1
-          sparse-checkout: rust_hft
-          persist-credentials: false
-
-      - name: Remove source checkout metadata
-        run: rm -rf -- source/.git
-
-      - name: Validate source-test profile
+      - name: Wait for signed ACK execution receipt
+        id: ack
+        working-directory: .
         env:
-          TEST_PROFILE: ${{ needs.selector.outputs.source_test_profile }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          case "$TEST_PROFILE" in
-            binance-bstocks-attestation|bybit-spot) ;;
-            *) echo "unsupported source-test profile: $TEST_PROFILE" >&2; exit 1 ;;
-          esac
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - name: Log in to ACR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ${{ vars.ACR_REGISTRY }}
-          username: ${{ vars.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Refuse source-test tag overwrite
-        env:
-          IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}
-        run: |
-          if probe_output=$(docker manifest inspect "$IMAGE_TAG" 2>&1); then
-            echo "source-test image tag already exists: $IMAGE_TAG" >&2
-            exit 1
-          fi
-          case "${probe_output,,}" in
-            *"manifest unknown"*|*"no such manifest"*) ;;
-            *) echo 'could not prove source-test image tag is absent' >&2; exit 1 ;;
-          esac
-
-      - name: Build source-test image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-        with:
-          context: .
-          file: rust_hft/deployment/docker/Dockerfile.source-test
-          platforms: linux/amd64
-          load: true
-          push: false
-          provenance: false
-          build-args: |
-            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}
-          tags: |
-            ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}
-            com.monday.image.purpose=non-production-source-test
-            com.monday.image.retention=single-ack-test
-            com.monday.image.source-test-profile=${{ needs.selector.outputs.source_test_profile }}
-            com.monday.image.source-test-identity=${{ needs.selector.outputs.source_test_tag }}
-
-      - name: Verify source-test image before publication
-        env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-          TEST_PROFILE: ${{ needs.selector.outputs.source_test_profile }}
-          SOURCE_TEST_TAG: ${{ needs.selector.outputs.source_test_tag }}
-        run: |
-          set -euo pipefail
-          actual_source_revision=$(docker image inspect \
-            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
-            "$IMAGE")
-          actual_source_test_profile=$(docker image inspect \
-            --format '{{ index .Config.Labels "com.monday.image.source-test-profile" }}' \
-            "$IMAGE")
-          actual_source_test_identity=$(docker image inspect \
-            --format '{{ index .Config.Labels "com.monday.image.source-test-identity" }}' \
-            "$IMAGE")
-          test "$actual_source_revision" = "$SOURCE_REVISION"
-          test "$actual_source_test_profile" = "$TEST_PROFILE"
-          test "$actual_source_test_identity" = "$SOURCE_TEST_TAG"
-          docker run --rm --network none --read-only \
-            --tmpfs /tmp:rw,nosuid,nodev,size=16g \
-            --tmpfs /tmp/monday-source-test-target:rw,exec,nosuid,nodev,mode=0700,uid=1000,gid=1000,size=16g \
-            "$IMAGE" "$TEST_PROFILE"
-
-      - name: Push verified source-test image
-        id: push
-        env:
-          IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}
-        run: |
-          set -euo pipefail
-          docker push "$IMAGE_TAG"
-          digest=$(docker buildx imagetools inspect "$IMAGE_TAG" --format '{{json .Manifest}}' | jq -r '.digest')
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
-      - name: Record immutable source-test image
-        env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test@${{ steps.push.outputs.digest }}
-          IMAGE_TAG: ${{ vars.ACR_REGISTRY }}/wildcard0923/research-source-test:${{ needs.selector.outputs.source_test_tag }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-          TEST_PROFILE: ${{ needs.selector.outputs.source_test_profile }}
-        run: |
-          {
-            echo "research-source-test=$IMAGE"
-            echo "source_revision=$SOURCE_REVISION"
-            echo "verified_profile=$TEST_PROFILE"
-            echo "publication_identity=$SOURCE_REVISION/$TEST_PROFILE"
-            echo "publication_tag=$IMAGE_TAG"
-            echo "retention=single ACK source-test Job; no runtime deployment"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Remove ACR credentials
-        if: always()
-        env:
-          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
-        run: |
-          docker logout "$ACR_REGISTRY" >/dev/null 2>&1 || true
-          docker_config_root=${DOCKER_CONFIG:-$HOME/.docker}
-          rm -f -- "$docker_config_root/config.json"
+          .github/scripts/wait-ack-research-receipt.sh research-source-test "$(git rev-parse HEAD)" "${RUNNER_TEMP}/ack-receipt"

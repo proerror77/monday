@@ -8,8 +8,6 @@ fixtures="$script_dir/fixtures/rust-ci-scope"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
-bash "$script_dir/test-agent-worktree-preflight.sh"
-bash "$script_dir/test-agent-validation-gates.sh"
 
 run_case() {
   local name=$1 event=$2 changed=$3 ref=
@@ -17,6 +15,8 @@ run_case() {
   local changed_file="$fixtures/$changed"
   [[ -f $changed_file ]] || changed_file="$tmp_dir/$changed"
   [[ $event == push ]] && ref=refs/heads/main
+  # Each scenario is a fresh workflow output file, including repeated paths.
+  : > "$output"
   GITHUB_REF=$ref "$selector" --event "$event" --changed-files "$changed_file" \
     --metadata "$fixtures/metadata.fixture" --output "$output"
   printf '%s\n' "$output"
@@ -25,6 +25,9 @@ run_case() {
 printf '%s\n' package-lock.json >"$tmp_dir/root-node.txt"
 printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
+printf '%s\n' .github/scripts/run-collector-control-contracts.sh >"$tmp_dir/control-scheduling.txt"
+printf '%s\n' .github/scripts/test-collector-control-scheduling.sh >"$tmp_dir/control-scheduling-test.txt"
+printf '%s\n' .github/scripts/run-collector-control-contracts.py .github/scripts/test-collector-control-scheduling.py >"$tmp_dir/control-scheduling-deletions.txt"
 printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
 printf '%s\n' docs/agents/issue-tracker.md >"$tmp_dir/governance-doc.txt"
 printf '%s\n' .agents/skills/monday-research-evidence-audit/SKILL.md >"$tmp_dir/skill.txt"
@@ -59,6 +62,9 @@ assert_flag() {
 assert_jobs() {
   local output=$1 expected=$2
   local actual
+  if grep -Fqx 'control=true' "$output"; then
+    expected="${expected:+$expected,}ci/control-contracts"
+  fi
   actual=$(sed -n 's/^jobs=//p' "$output")
   [[ $actual == ,*, ]] || {
     printf '%s: jobs output must use exact comma-delimited membership: %s\n' "$output" "$actual" >&2
@@ -66,7 +72,7 @@ assert_jobs() {
   }
   actual=${actual#,}
   actual=${actual%,}
-  [[ $actual == "$expected" ]] || {
+  [[ $(printf '%s' "$actual" | tr ',' '\n' | sort) == "$(printf '%s' "$expected" | tr ',' '\n' | sort)" ]] || {
     printf '%s: expected jobs=%s, got jobs=%s\n' "$output" "$expected" "$actual" >&2
     exit 1
   }
@@ -118,10 +124,13 @@ job_cases=(
   'research-dockerfile|pull_request|research-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
   'campaign-controller-dockerfile|pull_request|campaign-controller-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
   'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
-  'prediction-workflow|pull_request|prediction-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
+  'prediction-workflow|pull_request|prediction-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'root-node|pull_request|root-node.txt|ci/node-install'
-  'security-workflow|pull_request|security-workflow.txt|ploy/commit-hygiene,ploy/workflow-lint'
-  'security-workflow-push|push|security-workflow.txt|ploy/workflow-lint'
+  'security-workflow|pull_request|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
+  'security-workflow-push|push|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
+  'control-scheduling|pull_request|control-scheduling.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
+  'control-scheduling-test|pull_request|control-scheduling-test.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
+  'control-scheduling-deletions|pull_request|control-scheduling-deletions.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'governance-doc|pull_request|governance-doc.txt|ploy/commit-hygiene,ploy/workflow-lint'
   'skill|pull_request|skill.txt|ploy/commit-hygiene,ploy/workflow-lint'
@@ -130,7 +139,6 @@ job_cases=(
   'agent-instructions|pull_request|agent-instructions.txt|ploy/commit-hygiene'
   'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
   'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
-  'unknown-workflow|pull_request|unknown-workflow.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'unknown-nested|pull_request|unknown-nested.txt|'
   'rust-docs|pull_request|rust-docs.txt|'
@@ -144,8 +152,8 @@ job_cases=(
   'backtest|pull_request|backtest.txt|ploy/research-image-binaries,ci/rust|hft-backtest'
   'live-push|push|live.txt|ci/rust,ci/deployment-artifacts'
   'trading-dockerfile-push|push|trading-dockerfile.txt|ci/deployment-artifacts'
-  'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts,ploy/research-image-binaries,ploy/research-image-smoke'
-  'acr-workflow-push|push|acr-workflow.txt|ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke'
+  'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts'
+  'acr-workflow-push|push|acr-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
   'full|push|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ploy/research-image-binaries,ploy/research-image-smoke,ci/deployment-artifacts'
 )
 for job_case in "${job_cases[@]}"; do
@@ -154,6 +162,119 @@ for job_case in "${job_cases[@]}"; do
   assert_jobs "$output" "$expected"
   assert_owning_packages "$output" "${expected_owning:-}"
   assert_flag "$output" selection_complete true
+done
+
+# Known ACK metadata helpers must select their owning shell/workflow contracts
+# without setting Cargo-impact flags or selecting images on main push. The
+# production image/dependency inputs retain their own build coverage.
+ack_metadata_paths=(
+  .github/scripts/classify-ack-research-job.sh
+  .github/scripts/test-classify-ack-research-job.sh
+  .github/scripts/wait-ack-research-receipt.sh
+  .github/scripts/verify-ack-rust-batch.sh
+  .github/scripts/wait-ack-rust-batch.sh
+  .github/scripts/test-ack-rust-batch.sh
+  .github/ack-ci/receipt-public-key.pub
+  .github/ack-ci/PREFLIGHT.md
+  .github/scripts/verify-ack-preflight.sh
+  .github/scripts/test-ack-preflight-relay.sh
+  .github/scripts/test-preflight-workflow-gate.sh
+  .github/workflows/ack-flow-contracts.yml
+)
+release_metadata_paths=(
+  .github/workflows/acr-publish.yml
+  .github/scripts/test-acr-publish-workflow.sh
+  .github/scripts/read-release-required-checks.sh
+  .github/scripts/wait-release-required-checks.sh
+  .github/scripts/research-image-release-artifact.sh
+  .github/scripts/test-research-image-release-artifact.sh
+  .github/scripts/verify-research-runner-binaries.sh
+  .github/scripts/read-acr-publish-source.sh
+  .github/scripts/select-acr-publish-source.sh
+  .github/scripts/test-acr-publish-source-readback.sh
+)
+for kind in ack release; do
+  if [[ $kind == ack ]]; then infrastructure_paths=("${ack_metadata_paths[@]}"); else infrastructure_paths=("${release_metadata_paths[@]}"); fi
+  for path in "${infrastructure_paths[@]}"; do
+    printf '%s\n' "$path" >"$tmp_dir/infrastructure.txt"
+    for event in pull_request push; do
+      scoped=$(run_case infrastructure "$event" infrastructure.txt)
+      expected='ci/ci-contracts,ploy/workflow-lint'
+      [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+      assert_jobs "$scoped" "$expected"
+      assert_owning_packages "$scoped" ''
+      for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff; do
+        assert_flag "$scoped" "$flag" false
+      done
+      # Policy-only source still receives repository security scans; it has no
+      # dependency/toolchain impact and must not trigger Cargo or image audits.
+      if [[ $path == *.md ]]; then
+        assert_security_jobs "$scoped" 'security/secret-detection'
+      else
+        assert_security_jobs "$scoped" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+      fi
+    done
+  done
+done
+# All 20 actual PR 1266 paths, including this fixture, must remain policy-only
+# on both PR and main push. Mixed source/image inputs retain their own gates.
+for event in pull_request push; do
+  ack_flow_pr=$(run_case "ack-flow-pr-$event" "$event" ack-flow-pr-1266.txt)
+  expected='ci/ci-contracts,ploy/workflow-lint'
+  [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+  assert_jobs "$ack_flow_pr" "$expected"
+  assert_security_jobs "$ack_flow_pr" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+  assert_owning_packages "$ack_flow_pr" ''
+  for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff; do
+    assert_flag "$ack_flow_pr" "$flag" false
+  done
+  cat "$fixtures/ack-flow-pr-1266.txt" "$fixtures/collector.txt" >"$tmp_dir/ack-flow-pr-with-collector.txt"
+  ack_flow_mixed=$(run_case "ack-flow-collector-$event" "$event" ack-flow-pr-with-collector.txt)
+  expected='ci/ci-contracts,ploy/workflow-lint,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
+  if [[ $event == pull_request ]]; then expected+=',ploy/commit-hygiene';
+  else expected+=',ploy/research-image-binaries,ploy/research-image-smoke'; fi
+  assert_jobs "$ack_flow_mixed" "$expected"
+  for flag in loop collector control toolchain; do assert_flag "$ack_flow_mixed" "$flag" true; done
+  cat "$fixtures/ack-flow-pr-1266.txt" "$fixtures/research-dockerfile.txt" >"$tmp_dir/ack-flow-pr-with-image.txt"
+  ack_flow_image=$(run_case "ack-flow-image-$event" "$event" ack-flow-pr-with-image.txt)
+  expected='ci/ci-contracts,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
+  [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+  assert_jobs "$ack_flow_image" "$expected"
+done
+
+printf '%s\n' deployment/aliyun/research/Dockerfile.research-data >"$tmp_dir/research-data-dockerfile.txt"
+for event in pull_request push; do
+  image_scope=$(run_case research-data-dockerfile "$event" research-data-dockerfile.txt)
+  expected='ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
+  [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+  assert_jobs "$image_scope" "$expected"
+  for flag in loop handoff json ondo collector control focused toolchain; do assert_flag "$image_scope" "$flag" false; done
+done
+# Adding an infrastructure helper to real Rust work must preserve the same
+# source-graph suites; the cheap path is not a short circuit for mixed changes.
+printf '%s\n' .github/scripts/wait-ack-research-receipt.sh >"$tmp_dir/ack-with-collector.txt"
+cat "$fixtures/collector.txt" >>"$tmp_dir/ack-with-collector.txt"
+mixed_ack=$(run_case ack-with-collector pull_request ack-with-collector.txt)
+assert_jobs "$mixed_ack" 'ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
+for flag in loop collector control toolchain; do assert_flag "$mixed_ack" "$flag" true; done
+# Unknown infrastructure is an incomplete plan, even alongside known source.
+# It must emit no successful selection or compiler dispatch plan.
+for unknown in .github/scripts/future-ack-unreviewed.sh .github/workflows/security.yml .github/actions/future/action.yml; do
+  for event in pull_request push; do
+    for mixed in false true; do
+      printf '%s\n' "$unknown" >"$tmp_dir/unmapped-ci.txt"
+      [[ $mixed == false ]] || cat "$fixtures/collector.txt" >>"$tmp_dir/unmapped-ci.txt"
+      : >"$tmp_dir/unmapped.out"
+      status=0
+      "$selector" --event "$event" --changed-files "$tmp_dir/unmapped-ci.txt" \
+        --metadata "$fixtures/metadata.fixture" --output "$tmp_dir/unmapped.out" \
+        >"$tmp_dir/unmapped.stdout" 2>"$tmp_dir/unmapped.error" || status=$?
+      [[ $status == 2 && ! -s $tmp_dir/unmapped.out && ! -s $tmp_dir/unmapped.stdout ]] || {
+        echo 'unknown CI path emitted a successful/full dispatch plan' >&2; exit 1;
+      }
+      grep -Fq "unmapped CI path: $unknown; add its owning contract mapping before dispatch" "$tmp_dir/unmapped.error"
+    done
+  done
 done
 
 printf '%s\n' \
@@ -241,8 +362,8 @@ assert_flag "$same_suite" focused true
 
 all_security_jobs='security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/clippy-strict,security/cargo-machete,security/secret-detection'
 assert_security_jobs "$tmp_dir/docs.out" 'security/secret-detection'
-assert_security_jobs "$tmp_dir/security-workflow.out" "$all_security_jobs"
-assert_security_jobs "$tmp_dir/security-workflow-push.out" "$all_security_jobs,security/container-scan"
+assert_security_jobs "$tmp_dir/security-workflow.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/security-workflow-push.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/root-node.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/unknown-nested.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/lob-control.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
@@ -259,10 +380,10 @@ security_workflow_develop="$tmp_dir/security-workflow-develop.out"
 GITHUB_REF=refs/heads/develop "$selector" --event push \
   --changed-files "$tmp_dir/security-workflow.txt" \
   --metadata "$fixtures/metadata.fixture" --output "$security_workflow_develop"
-assert_jobs "$security_workflow_develop" 'ploy/workflow-lint'
-assert_security_jobs "$security_workflow_develop" "$all_security_jobs"
+assert_jobs "$security_workflow_develop" 'ci/ci-contracts,ploy/workflow-lint'
+assert_security_jobs "$security_workflow_develop" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/collector.out" "$all_security_jobs"
-assert_security_jobs "$tmp_dir/unknown-workflow.out" "$all_security_jobs"
+assert_security_jobs "$tmp_dir/unknown-root.out" "$all_security_jobs"
 security_schedule="$tmp_dir/security-schedule.out"
 "$selector" --event schedule --output "$security_schedule"
 assert_jobs "$security_schedule" ''
@@ -308,14 +429,16 @@ for workflow in \
   pinned_toolchains=$(grep -Fxc '          toolchain: 1.98.1' "$workflow")
   test "$stable_uses" -eq "$pinned_toolchains"
 done
-grep -Fqx '    container: rust:1.98.1-bookworm' "$script_dir/../workflows/ploy-ci.yml"
+# Research software runs under the private ACK profile, so public metadata
+# jobs carry neither a compiler container nor its cache/toolchain setup.
+grep -Fq 'wait-ack-research-receipt.sh research-image-binaries "$(git rev-parse HEAD)"' "$script_dir/../workflows/ploy-ci.yml"
 # shellcheck disable=SC2016
 always_condition='    if: ${{ always() }}'
 grep -Fqx '    needs: selector' "$ci_workflow"
 grep -Fqx "$always_condition" "$ci_workflow"
 grep -Fqx "          if [[ \"\$SELECTOR_RESULT\" == success && \"\$SELECTED_COMPLETE\" == true ]] &&" "$ci_workflow"
 grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,\$ ]] &&" "$ci_workflow"
-grep -Fq "'jobs=,ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,'" "$ci_workflow"
+grep -Fq 'CI selection failed or returned an invalid plan' "$ci_workflow"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" "$ci_workflow"
 [[ $(grep -Fxc '      owning_packages: ${{ steps.scope.outputs.owning_packages }}' "$ci_workflow") -eq 2 ]]
 grep -Fqx '      - name: Summarize check plan' "$ci_workflow"
@@ -337,6 +460,7 @@ rust_job_block=$(job_block rust)
 rust_shell_scripts_block=$(job_block rust_shell_scripts)
 fast_gates_block=$(job_block rust_fast_gates)
 scope_job_block=$(job_block scope)
+control_job_block=$(job_block control_contracts)
 [ -n "$rust_job_block" ]
 [ -n "$rust_shell_scripts_block" ]
 [ -n "$fast_gates_block" ]
@@ -345,7 +469,8 @@ scope_job_block=$(job_block scope)
 # rust_fast_gates must preserve repository policy checks for both compiled
 # Rust changes and lightweight Rust shell changes.
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$fast_gates_block"
-grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') }}" <<<"$rust_job_block"
+grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" <<<"$rust_job_block"
+grep -Fq "needs.research_preflight.result == 'success'" <<<"$rust_job_block"
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$rust_shell_scripts_block"
 grep -Fq "uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1" <<<"$rust_shell_scripts_block"
 grep -Fq "find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \\;" <<<"$rust_shell_scripts_block"
@@ -371,11 +496,12 @@ if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block";
 if grep -Fq 'test-rust-lob-control-plane.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'shellcheck' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fq 'test-rust-lob-control-plane.sh' <<<"$scope_job_block"
-grep -Fq 'test-rust-lob-recovery-queue.sh' <<<"$scope_job_block"
-[[ $scope_job_block != *test-polymarket-raw-ops-control-plane.sh* ]]
-grep -Fq 'test-monday-collector-health.sh' <<<"$scope_job_block"
-grep -Fq 'shellcheck' <<<"$scope_job_block"
+grep -Fq 'bash ../.github/scripts/run-collector-control-contracts.sh' <<<"$control_job_block"
+grep -Fq 'test-rust-lob-control-plane.sh' "$script_dir/run-collector-control-contracts.sh"
+grep -Fq 'test-rust-lob-recovery-queue.sh' "$script_dir/run-collector-control-contracts.sh"
+[[ $scope_job_block != *test-* && $scope_job_block != *shellcheck* ]]
+grep -Fq 'test-monday-collector-health.sh' "$script_dir/run-collector-control-contracts.sh"
+grep -Fq 'shellcheck' <<<"$control_job_block"
 grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
 grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
 grep -Fqx '      - name: Test directly changed Rust packages' "$ci_workflow"
@@ -390,7 +516,7 @@ recorder_block=$(job_block market_recorder_contract)
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fqx "        if: always() && needs.scope.outputs.toolchain == 'true'" "$ci_workflow"
+grep -Fq "if: \${{ (always() && needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}" <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
@@ -409,7 +535,7 @@ grep -Fqx "             [[ \"\$SELECTED_JOBS\" =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,\
 for invalid_jobs in '' ci/rust; do
   [[ $invalid_jobs =~ ^,[a-z0-9/-]*(,[a-z0-9/-]+)*,$ ]] && exit 1
 done
-grep -Fq "'jobs=,ploy/commit-hygiene,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts,'" "$ploy_workflow"
+grep -Fq 'CI selection failed or returned an invalid plan' "$ploy_workflow"
 grep -Fq "contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-research-heavy,')" "$ploy_workflow"
 grep -Fqx "            mapfile -d '' workflow_files < <(" "$ploy_workflow"
 grep -Fq -- '--diff-filter=ACMR -z' "$ploy_workflow"
@@ -456,12 +582,10 @@ ploy_job_block() {
   awk -v job="^  $1:" '$0 ~ job {found=1; next} /^  [a-z0-9-]+:/ {found=0} found' "$ploy_workflow"
 }
 for ploy_rust_job in \
-  research-image-binaries \
   rust-control-plane \
   rust-runner-lean \
   rust-runner-full \
   rust-market-data \
-  rust-research-heavy \
   integration-regressions; do
   ploy_block=$(ploy_job_block "$ploy_rust_job")
   [ -n "$ploy_block" ]
@@ -474,9 +598,81 @@ for ploy_rust_job in \
   grep -Fq 'steps.cache-info.outputs.sccache' <<<"$ploy_block"
   if grep -Fq -- '}}-${{ github.sha }}' <<<"$ploy_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 done
-research_image_block=$(ploy_job_block research-image-binaries)
-grep -Fqx '    timeout-minutes: 45' <<<"$research_image_block"
-if grep -Fq 'SCCACHE_GHA_RW_MODE' <<<"$research_image_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+# Fixed ACK profiles preserve the selected public job identities while
+# rejecting hosted execution. Scope and selected-job Gate cases above/below
+# remain unchanged: a failed/missing receipt fails the same selected job.
+for mapping in \
+  research-image-binaries:research-image-binaries \
+  research-image-smoke:research-image-smoke \
+  rust-format:prediction-research-format \
+  rust-research-heavy:prediction-research-heavy; do
+  job=${mapping%%:*}
+  profile=${mapping#*:}
+  relay_block=$(ploy_job_block "$job")
+  grep -Fqx '    runs-on: ubuntu-latest' <<<"$relay_block"
+  grep -Fqx '    timeout-minutes: 360' <<<"$relay_block"
+  grep -Fq "wait-ack-research-receipt.sh $profile \"\$(git rev-parse HEAD)\"" <<<"$relay_block"
+  if grep -Eq 'container:|RUSTC_WRAPPER:|SCCACHE_GHA_ENABLED:|uses: (docker/|dtolnay/rust-toolchain|Swatinem/rust-cache|mozilla-actions/sccache)|(^|[[:space:]])(cargo|docker) (build|test|run|check|clippy|fmt)' <<<"$relay_block"; then
+    echo "selected research job $job still executes on a public hosted runner" >&2
+    exit 1
+  fi
+done
+for mapping in rust:ci-rust; do
+  job=${mapping%%:*}
+  profile=${mapping#*:}
+  mixed_block=$(job_block "$job")
+  grep -Fq "wait-ack-research-receipt.sh $profile \"\$(git rev-parse HEAD)\"" <<<"$mixed_block"
+  grep -Fq "if: needs.scope.outputs.ack_research == 'true'" <<<"$mixed_block"
+done
+# Verify every native mixed-lane action keeps its non-research guard; a
+# newly-added unguarded compiler/setup step must fail this contract.
+ruby -ryaml - "$ci_workflow" <<'RUBY'
+ci=YAML.safe_load(File.read(ARGV.fetch(0)))
+%w[rust].each do |id|
+  ci.fetch('jobs').fetch(id).fetch('steps').each do |step|
+    next if step.fetch('uses','').include?('actions/checkout@') || step.fetch('run','').include?('wait-ack-research-receipt.sh')
+    abort "unguarded native research action in #{id}" unless step.fetch('if','').include?("needs.scope.outputs.ack_research != 'true'")
+  end
+end
+RUBY
+
+# The relay derives its own ACK scope for these profiles by resolving
+# `git diff "$base...$head"` and `git merge-base "$base" "$head"` from the PR
+# event's base/head SHAs, so the checked-out object database must contain both
+# commits. A default depth-1 checkout keeps only the PR merge commit and the
+# relay dies with `Not a valid commit name`. Every relay job for a derived
+# profile therefore needs a full-history checkout; the expected job map keeps
+# this scan from passing vacuously if a command shape or file drifts.
+ruby -ryaml - \
+  "$ci_workflow" \
+  "$script_dir/../workflows/security-enabled.yml" \
+  "$script_dir/../workflows/ploy-ci.yml" <<'RUBY'
+derived = %w[ci-rust security-clippy-research research-image-binaries]
+expected = {
+  'ci.yml' => %w[rust],
+  'security-enabled.yml' => %w[clippy-strict],
+  'ploy-ci.yml' => %w[research-image-binaries]
+}
+relays = Hash.new { |hash, key| hash[key] = [] }
+ARGV.each do |path|
+  name = File.basename(path)
+  YAML.safe_load(File.read(path)).fetch('jobs').each do |id, job|
+    steps = job.fetch('steps', [])
+    profiles = steps.map { |step| step.fetch('run', '')[/wait-ack-research-receipt\.sh\s+(\S+)/, 1] }.compact
+                    .select { |profile| derived.include?(profile) }
+    next if profiles.empty?
+    relays[name] << id
+    checkouts = steps.select { |step| step.fetch('uses', '').include?('actions/checkout@') }
+    abort "derived ACK relay in #{name}:#{id} has no checkout step" if checkouts.empty?
+    next if checkouts.any? { |step| (step['with'] || {}).fetch('fetch-depth', nil).to_s == '0' }
+
+    abort "#{name}:#{id} relays #{profiles.uniq.join(',')} without a full-history checkout"
+  end
+end
+expected.each do |name, ids|
+  abort "derived ACK relay jobs drifted in #{name}: expected #{ids.sort}, got #{relays[name].sort}" unless relays[name].sort == ids.sort
+end
+RUBY
 
 deletion_repo="$tmp_dir/deletion-repo"
 mkdir -p "$deletion_repo/rust_hft/tools/collector/src"
@@ -614,12 +810,13 @@ assert_docker_publish_triggers() {
   local trigger_block
   trigger_block=$(sed -n '/^  workflow_run:$/,/^  workflow_dispatch:$/p' "$1")
   [[ $trigger_block == "$expected_docker_publish_triggers" ]] || return 1
-  grep -Fqx '            git diff --quiet "${SOURCE_SHA}^" "$SOURCE_SHA" -- rust_hft/ .github/workflows/docker-publish.yml || changed=$?' "$1"
+  grep -Fq 'bash .github/scripts/select-main-image-scope.sh "$SOURCE_SHA" "$plan"' "$1" &&
+    grep -Fq 'any(.include[]; .name=="hft-core")' "$1"
 }
 assert_docker_publish_triggers "$docker_publish_workflow"
 
 docker_publish_counterexample="$tmp_dir/docker-publish-extra-path.yml"
-sed 's@-- rust_hft/ .github/workflows/docker-publish.yml@-- rust_hft/ docs/ .github/workflows/docker-publish.yml@' \
+sed 's@.name=="hft-core"@.name=="research-runner"@' \
   "$docker_publish_workflow" >"$docker_publish_counterexample"
 if assert_docker_publish_triggers "$docker_publish_counterexample"; then
   echo 'Docker Publish trigger contract accepted an unrelated path' >&2
@@ -659,3 +856,12 @@ assert_flag "$security_schedule" clippy_handoff true
 assert_flag "$live" clippy_loop false
 assert_flag "$live" clippy_handoff true
 assert_flag "$collector" clippy_loop true
+
+# Leaf research changes select the affected package, while shared-domain changes
+# retain reverse-dependency coverage. The same list feeds tests and Clippy.
+printf '%s\n' rust_hft/alpha-harness/app/src/main.rs >"$tmp_dir/alpha-leaf.txt"
+output=$(run_case alpha-leaf pull_request alpha-leaf.txt)
+assert_flag "$output" loop_packages ',alpha-harness,'
+assert_flag "$output" clippy_loop true
+output=$(run_case schedule schedule alpha-leaf.txt)
+assert_flag "$output" loop_packages ',alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-harnessctl,hft-research-ml,'

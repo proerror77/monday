@@ -16,6 +16,10 @@ sealed holdout, trading, risk changes, or resuming a paused runtime.
 All production artifact paths require the same three authenticated GitHub Actions
 checks for the exact source SHA, read by read-release-required-checks.sh. Do not
 accept similarly named checks from another app, skipped checks, or another SHA.
+These checks aggregate the selected validation plan; they do not require every
+product to build for each release. Monitoring and CI-policy changes select their
+own contracts. The current-source aggregate must reject a missing, failed,
+cancelled or skipped selected task; an unrelated task is not a release blocker.
 ACR requires current main and retains its additional binary provenance, smoke and
 artifact readback checks. GHCR main/manual publication requires current main.
 Version-tag publication requires the tagged commit to belong to main history and
@@ -42,3 +46,21 @@ Review rule changes against local-only fixes, a PR-only task, a plan explicitly
 including multiple merges, ambiguous publishing, CI failure, transient GitHub
 failure, and production deployment. Use existing contract tests; do not turn
 wording into brittle string-match tests.
+
+## Image impact and reuse
+
+PR/develop smoke and main security CI share an image dependency plan. On main,
+the published GHCR hft image's OCI revision is the baseline for unpublished core
+image impact, so a later unrelated commit cannot lose a pending publication.
+Other image checks keep their per-change scope. Missing, ambiguous or unrelated
+registry revision metadata fails planning instead of silently skipping work.
+
+Automatic GHCR publication promotes the exact image saved by successful main
+security CI. Producer source/run/attempt, archive hash, image ID and OCI revision
+must match; missing or expired artifacts fail automatic publication. Explicit
+manual/tag publication may build once when no retained artifact exists. Every
+path retains required-check admission and immutable registry readback.
+
+Runtime experiment configuration and ordinary Job manifests do not rebuild
+research binaries. Scripts/templates copied into the controller image remain
+image inputs; changes to that COPY boundary must update the scope mapping.

@@ -485,11 +485,15 @@ run_health --json
 expect "healthy: archive unknown without evidence" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].archive_coverage.status == "not_observed"'; echo $?)"
 jq '.archive_coverage = {schema:"monday.archive_coverage.v1",evidence:"verified_upload_manifests",
   segments:97,longest_candidate_duration_ns:28800000000000,eight_hour_candidate_available:true,
-  native_tape_verification:"pending",calendar_admission:"pending",spans:[],breaks:[]}' \
+  native_tape_verification:"pending",calendar_admission:"pending",
+  spans:[range(0;1000)|{start_ns:.,end_ns:(.+1),objects:["source-manifest-evidence"]}],
+  breaks:[{reason:"source-gap"},{reason:"source-gap"}]}' \
   "$spool_root/binance-lob/usdm/health.json" > "$test_root/coverage.json"
 cp "$test_root/coverage.json" "$spool_root/binance-lob/usdm/health.json"
 run_health --json
 expect "archive candidate does not imply native or calendar admission" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].archive_coverage | .eight_hour_candidate_available == true and .native_tape_verification == "pending" and .calendar_admission == "pending"'; echo $?)"
+expect "monitor summarizes unbounded archive rows for Cloud Assistant" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].archive_coverage | .span_count==1000 and .break_count==2 and (has("spans")|not) and (has("breaks")|not)'; echo $?)"
+expect "monitor summary fits Cloud Assistant output without losing source rows" "$(if [ "$(wc -c <"$out_file")" -lt 24576 ] && jq -e '.archive_coverage.spans|length==1000' "$spool_root/binance-lob/usdm/health.json" >/dev/null; then echo 0; else echo 1; fi)"
 
 # ---------------------------------------------------------------------------
 # 2. Gate 1: missing upload-status.json on a mandated lane is a breach
@@ -1514,7 +1518,7 @@ write_recovery_job usdm job failed
 touch_age "$spool_root/binance-lob-recovery/usdm/job.failed" 30
 run_health
 expect "recovery queue failed present: exit 1" "$(rc_is 1; echo $?)"
-expect "recovery queue failed present: breach" "$(grep_out '^breach: binance-lob-recovery\[usdm\]: failed recovery job(s) present'; echo $?)"
+expect "recovery queue failed present: breach" "$(grep_out '^breach: binance-lob-recovery\[usdm\]: undisposed failed recovery job(s) present'; echo $?)"
 
 reset_env
 reset_state
@@ -1526,7 +1530,7 @@ run_health --json
 expect "recovery queue fresh stale present: exit 1" "$(rc_is 1; echo $?)"
 expect "recovery queue fresh stale present: unconditional breach" "$(json_query '
   .ok == false and
-  (.breaches | index("binance-lob-recovery[spot]: stale recovery job(s) present (1)")) != null
+  (.breaches | index("binance-lob-recovery[spot]: undisposed stale recovery job(s) present (1 of 1)")) != null
 '; echo $?)"
 expect "recovery queue fresh stale present: count and age" "$(json_query '
   .checks.recovery_queue.spot.stale_count == 1 and
@@ -1768,6 +1772,132 @@ printf 'not-a-directory\n' >"$spool_root/binance-lob-recovery"
 run_health
 expect "recovery queue malformed parent: exit 1" "$(rc_is 1; echo $?)"
 expect "recovery queue malformed parent: breach" "$(grep_out '^breach: binance-lob-recovery: recovery queue root is not an inspectable directory'; echo $?)"
+
+# Exercise the real retained reader against native immutable records. Only its
+# filesystem root/fixture ownership are redirected; receipt validation is real.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+(
+  # shellcheck source-path=SCRIPTDIR
+  # shellcheck source=test-recovery-retention-fixture.sh
+  . "$script_dir/test-recovery-retention-fixture.sh"
+  setup_retention_fixture "$test_root" health
+  retention_fixture_job 800 "$(printf '%064d' 41)" v2
+  retention_fixture_retain >"$test_root/retained.json"
+)
+cat >"$stub_dir/monday-rust-lob-retained-check" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+. '$script_dir/test-recovery-retention-fixture.sh'
+retention_fixture_context '$test_root' health "\$2"
+EXECUTING_RECOVERY_PROGRAM=\$(readlink -f "\$INSTALLED_RECOVERY")
+secure_release_identity
+RETENTION_DEADLINE=\$((SECONDS + 300))
+check_retained_market
+EOF
+chmod 0755 "$stub_dir/monday-rust-lob-retained-check"
+retained_id=$(jq -r .job_id "$test_root/retained.json")
+retained_spool="$spool_root/binance-lob-recovery/spot/$retained_id.failed"
+retained_pointer="$test_root/evidence/lob-queue/retained/spot/$retained_id.json"
+run_health --json --dry-run
+expect 'valid retention: healthy with historical warning' "$(json_query '.ok==true and (.warnings|any(contains("retained as unrecovered evidence")))'; echo $?)"
+expect 'valid retention: physical failure and unrecovered semantics remain' "$(json_query '
+  .checks.recovery_queue.spot | .failed_count==1 and .retained_failed_count==1
+    and .undisposed_failed_count==0 and .invalid_retention_count==0 and .retained_bytes>0
+    and .historical_data_status=="retained_unrecovered"
+    and (.retained_jobs[0]|.data_recovered==false and .delivery_verified==false and .replay_eligibility=="not_assessed")'; echo $?)"
+
+# Read-only dry run must not change any original/retention record or create a
+# queue/drain lock. Atime is deliberately excluded from this comparison.
+retention_tree_snapshot() {
+  find "$spool_root/binance-lob-recovery" "$test_root/evidence/lob-queue" "$test_root/run/lock" \
+    -exec stat -c '%n|%d|%i|%h|%s|%u|%g|%a|%y|%z' {} \; | sort
+}
+retention_tree_snapshot >"$test_root/read.before"
+run_health --json --dry-run
+retention_tree_snapshot >"$test_root/read.after"
+snapshot_rc=0
+cmp -s "$test_root/read.before" "$test_root/read.after" || snapshot_rc=$?
+expect 'valid retention: health is read-only toward evidence and locks' "$snapshot_rc"
+
+write_recovery_job spot new-job failed
+run_health --json --dry-run
+expect 'new failed job remains breach beside valid retained evidence' "$(json_query '
+  .ok==false and (.checks.recovery_queue.spot|.failed_count==2 and .retained_failed_count==1 and .undisposed_failed_count==1)'; echo $?)"
+rm -rf "$spool_root/binance-lob-recovery/spot/new-job.failed"
+write_recovery_job usdm untouched failed
+run_health --json --dry-run
+expect 'Spot retention never relieves USD-M failure' "$(json_query '.ok==false and .checks.recovery_queue.usdm.undisposed_failed_count==1'; echo $?)"
+rm -rf "$spool_root/binance-lob-recovery/usdm/untouched.failed"
+
+# A retained USD-M failure and identity rejection are independently validated;
+# their physical counts survive, and a newly arrived stale job still breaches.
+(
+  # shellcheck source-path=SCRIPTDIR
+  # shellcheck source=test-recovery-retention-fixture.sh
+  . "$script_dir/test-recovery-retention-fixture.sh"
+  retention_fixture_context "$test_root" health usdm
+  # The context above rebuilds paths inside this subshell.
+  # shellcheck disable=SC2031
+  EXECUTING_RECOVERY_PROGRAM=$(readlink -f "$INSTALLED_RECOVERY")
+  secure_release_identity
+  RETENTION_FIXTURE_CONTROLLER=$ACTIVE_CONTROLLER_SHA256
+  retention_fixture_job 801 "$(printf '%064d' 41)" v2
+  retention_fixture_retain >"$test_root/retained-usdm-failed.json"
+  retention_fixture_job 802 "$(printf '%064d' 41)" v2 stale
+  retention_fixture_retain >"$test_root/retained-usdm-stale.json"
+)
+run_health --json --dry-run
+expect 'USD-M validated failed/stale custody becomes historical warning' "$(json_query '
+  .ok==true and (.checks.recovery_queue.usdm|.failed_count==1 and .stale_count==1
+    and .retained_failed_count==1 and .retained_stale_count==1
+    and .undisposed_failed_count==0 and .undisposed_stale_count==0
+    and .invalid_retention_count==0 and .historical_data_status=="retained_unrecovered")'; echo $?)"
+write_recovery_job usdm new-stale stale
+run_health --json --dry-run
+expect 'new USD-M stale job still breaches beside retained historical jobs' "$(json_query '
+  .ok==false and (.checks.recovery_queue.usdm|.stale_count==2 and .retained_stale_count==1 and .undisposed_stale_count==1)'; echo $?)"
+rm -rf "$spool_root/binance-lob-recovery/usdm/new-stale.stale"
+usdm_stale_id=$(jq -r .job_id "$test_root/retained-usdm-stale.json")
+usdm_pointer="$test_root/evidence/lob-queue/retained/usdm/$usdm_stale_id.json"
+mv "$usdm_pointer" "$test_root/usdm-pointer.saved"
+run_health --json --dry-run
+expect 'lost USD-M stale pointer reopens breach and preserves physical state' "$(json_query '
+  .ok==false and (.checks.recovery_queue.usdm|.stale_count==1 and .retained_stale_count==0
+    and .undisposed_stale_count==1 and .invalid_retention_count==1)'; echo $?)"
+mv "$test_root/usdm-pointer.saved" "$usdm_pointer"
+# Renaming changes ctime, so do not reuse these custody records after this test.
+for usdm_id in "$(jq -r .job_id "$test_root/retained-usdm-failed.json")" "$usdm_stale_id"; do
+  rm -rf "$spool_root/binance-lob-recovery/usdm/$usdm_id.failed" "$spool_root/binance-lob-recovery/usdm/$usdm_id.stale" \
+    "$test_root/evidence/lob-queue/$usdm_id"
+done
+rm -rf "$test_root/evidence/lob-queue/retained/usdm"
+
+retained_part="$retained_spool/date=2026-09-01/hour=00/part-one.jsonl.part"
+saved_mtime=$(stat -c %y "$retained_part")
+printf 'UNFINISHED-PART\n' >"$retained_part"
+touch -d "$saved_mtime" "$retained_part"
+run_health --json --dry-run
+expect 'same-sized rewrite with restored mtime reopens breach' "$(json_query '
+  .ok==false and (.checks.recovery_queue.spot|.failed_count==1 and .retained_failed_count==0
+    and .undisposed_failed_count==1 and .invalid_retention_count==1)'; echo $?)"
+rm "$retained_pointer"
+run_health --json --dry-run
+expect 'missing retention pointer cannot hide physical failure' "$(json_query '
+  .ok==false and .checks.recovery_queue.spot.undisposed_failed_count==1'; echo $?)"
+rm -rf "$test_root/evidence/lob-queue/retained" "$retained_spool"
+run_health --json --dry-run
+expect 'loss of index and queue still exposes the retained evidence claim' "$(json_query '
+  .ok==false and (.checks.recovery_queue.spot|.failed_count==0 and .invalid_retention_count==1)'; echo $?)"
+printf '#!/bin/sh\nexit 1\n' >"$stub_dir/monday-rust-lob-retained-check"
+run_health --json --dry-run
+expect 'reader failure preserves fail-closed unknown count' "$(json_query '
+  .ok==false and (.checks.recovery_queue.spot|.retained_failed_count==0 and .invalid_retention_count==null and .retention_check_status=="failed")'; echo $?)"
+printf '#!/bin/sh\nprintf "{}\\n"\n' >"$stub_dir/monday-rust-lob-retained-check"
+run_health --json --dry-run
+expect 'incomplete reader response cannot acknowledge failures' "$(json_query '.ok==false and .checks.recovery_queue.spot.retention_check_status=="failed"'; echo $?)"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"

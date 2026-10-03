@@ -73,6 +73,13 @@
   stop rules. Re-read the live target and rollback identities immediately before
   cutover; drift pauses that write until reconciled. Arm automatic failure/exit
   cleanup before the first mutation, scoped to resources owned by the transition.
+- Classify the behavior being changed before selecting CI or a production Gate.
+  Read-only monitoring, report formatting, and monitor scheduling have their own
+  versioned deployment and readback; they do not require a collector Shadow Gate
+  or restarting acquisition when the payload, ingestion contract, production
+  environment and writer behavior are unchanged. Recovery isolation, upload,
+  locks, permissions and other writes retain their affected integrity contracts.
+  Risk, signatures, grant revocation, holdout and trading controls remain mandatory.
 - Keep Governance changes separate from the production transitions they protect.
   Use the canonical Campaign seam for research, preserve the granted resource and
   trial limits, and verify terminal results even when the outcome is negative.
@@ -96,8 +103,11 @@
   identity and the properties or relationships required by that request. Do not
   require later delivery states unless requested. For an asynchronous job whose
   result is requested, verify its terminal result and output, not just submission.
-- Remote build or validation tasks must use `monday-remote-build`; never place a
-  workspace, toolchain, Cargo cache, or target directory on an `ack-system` node.
+- Remote build or validation tasks use `monday-remote-build` to select the existing
+  managed ACK executor or a disposable Cloud Assistant task. Managed CI follows
+  its reviewed request, cache, and receipt contract; do not apply disposable
+  fresh-cache isolation to that executor. Neither path may place a workspace,
+  toolchain, Cargo cache, or target directory on an `ack-system` node.
 - For CEX cloud research, follow the
   [ACK-only evidence and recovery boundary](deployment/aliyun/research/README.md#data-flow-review-and-host-lifetime)
   during preparation, verification, reporting, recovery, and resource cleanup.
@@ -141,6 +151,15 @@
   `cargo metadata --locked --no-deps` only after workspace-graph changes.
 - For instruction, workflow, or shell changes, run `git diff --check` plus the
   closest contract test. Report unrelated or unavailable checks separately.
+- CI scope selection only produces a plan. Run domain contracts in their selected
+  jobs, once per unchanged input set; do not hide tests inside the planner or
+  default every workflow/script edit to all products. Invalid selection blocks
+  dispatch with its cause rather than starting an unrelated full build. Superseded
+  CI work is cancellable; production operations retain their failure cleanup.
+- A pending remote operation retains its identity. Reattach to that operation
+  after a local interruption; do not submit another deployment or Gate merely
+  because a client wait ended. Reuse still-valid checks and restart only stages
+  whose code, tests, dependencies, policy, target or runtime inputs changed.
 - For low-impact instruction edits, use existing contract checks and review
   concrete task scenarios. Add tests for behavior or credible regressions, not
   assertions that mirror implementation or wording.

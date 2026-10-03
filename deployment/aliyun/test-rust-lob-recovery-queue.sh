@@ -49,6 +49,61 @@ fixture=$(readlink -f -- "$(mktemp -d)")
 trap 'rm -rf -- "$fixture"' EXIT
 # shellcheck disable=SC1090,SC1091
 . "$RECOVERY"
+# Model Ubuntu's two installed implementations: an unqualified uutils sync
+# must never receive a durability operation; GNU receives exactly the paths.
+(
+  mkdir -p "$fixture/sync-bin"
+  cat >"$fixture/sync-bin/gnusync" <<'SYNC'
+#!/bin/sh
+if [ "$1" = --version ]; then
+  printf 'sync (GNU coreutils) 9.7\n'
+else
+  printf '%s\n' "$@" >"$SYNC_CALLS"
+fi
+SYNC
+  cat >"$fixture/sync-bin/sync" <<'SYNC'
+#!/bin/sh
+if [ "$1" = --version ]; then
+  printf 'sync (uutils coreutils) 0.8.0\n'
+else
+  : >"$SYNC_GLOBAL_CALLED"
+fi
+SYNC
+  chmod +x "$fixture/sync-bin/gnusync" "$fixture/sync-bin/sync"
+  export SYNC_CALLS="$fixture/sync.calls" SYNC_GLOBAL_CALLED="$fixture/global-sync"
+  # shellcheck disable=SC2123 # Deliberately exclude the host tools for this fixture.
+  PATH="$fixture/sync-bin"
+  recovery_sync_path '/spool with spaces/job.json' /spool
+  [[ ! -e $SYNC_GLOBAL_CALLED ]]
+  PATH_SAVE=$PATH
+  PATH=/usr/bin:/bin
+  printf '%s\n' -- '/spool with spaces/job.json' /spool >"$fixture/expected-sync.calls"
+  cmp "$SYNC_CALLS" "$fixture/expected-sync.calls"
+  rm "$fixture/sync-bin/gnusync"
+  PATH=$PATH_SAVE
+  if recovery_sync_path /spool; then
+    printf 'recovery accepted global uutils sync semantics\n' >&2; exit 1
+  fi
+  [[ ! -e $SYNC_GLOBAL_CALLED ]]
+  if recovery_sync_path; then
+    printf 'recovery accepted a pathless flush\n' >&2; exit 1
+  fi
+)
+# A drain must leave an interrupted isolation untouched, even after its writer
+# has exited and released the queue lock. No recovery subprocess may start.
+(
+  ISOLATION_MARKER="$fixture/isolation.json"
+  MARKET=spot
+  # shellcheck disable=SC2317,SC2329 # Called indirectly by drain_market if the guard regresses.
+  drain_lock() { printf 'drain reached an unfinished isolation\n' >&2; exit 1; }
+  printf '{}\n' >"$ISOLATION_MARKER"
+  drain_market
+  rm "$ISOLATION_MARKER"
+  ln -s "$fixture/missing-marker-target" "$ISOLATION_MARKER"
+  drain_market
+  rm "$ISOLATION_MARKER"
+)
+printf 'Path-scoped durability and unfinished-isolation drain exclusion passed\n'
 JOB_ID='fixture-spot'
 MARKET=spot
 JOB_RELEASE_SHA256=$(printf '%064d' 1)
@@ -160,7 +215,19 @@ set -Eeuo pipefail
 printf '%s %s\n' "$1" "$SPOOL_DIR" >>"$fixture_root/payload.calls"
 case $1 in
   --recover-parts-only)
-    [[ ! -e $SPOOL_DIR/.fixture-fail-recover ]] || exit 71
+    if [[ -e $SPOOL_DIR/.fixture-check-locks ]]; then
+      # A separate process must acquire the production startup queue lock,
+      # while the drain/cutover exclusion remains held for this payload.
+      flock -n "$fixture_root/host/run/lock/monday-rust-lob-recovery-queue-spot.lock" true
+      if flock -n "$fixture_root/host/run/lock/monday-rust-lob-recovery-drain.lock" true; then
+        printf 'drain lost execution exclusion\n' >&2; exit 74
+      fi
+      printf 'queue available; drain excluded\n' >"$fixture_root/lock-check"
+    fi
+    if [[ -e $SPOOL_DIR/.fixture-fail-recover ]]; then
+      printf 'Error: recovery parts contain no complete stream-coverage catalog\n' >&2
+      exit 71
+    fi
     [[ ! -e $RECOVERY_BACKUP_DIR ]] || exit 72
     mkdir "$RECOVERY_BACKUP_DIR"
     find "$SPOOL_DIR" -type f \( -name '*.jsonl.part' -o -name '*.zst.tmp' \) \
@@ -172,7 +239,10 @@ case $1 in
     printf 'success\n' >"$SPOOL_DIR/part-900.jsonl.zst._SUCCESS"
     ;;
   --upload-only)
-    [[ ! -e $SPOOL_DIR/.fixture-fail-upload ]] || exit 73
+    if [[ -e $SPOOL_DIR/.fixture-fail-upload ]]; then
+      printf 'Error: fixture upload failed\n' >&2
+      exit 73
+    fi
     find "$SPOOL_DIR" -type f -name 'part-*' -print >>"$fixture_root/uploaded-files"
     find "$SPOOL_DIR" -type f -name 'part-*' -delete
     cp "$fixture_root/status.after.json" "$SPOOL_DIR/upload-status.json"
@@ -270,7 +340,8 @@ monday_validate_v2_transition() {
   }
   phases='["oss-readback-spot","oss-readback-usdm","preflight","shadow-spot","shadow-usdm","strict-verifier-spot","strict-verifier-usdm","upload-drain-spot","upload-drain-usdm"]'
   runtime_keys=$(monday_runtime_assets | jq -Rsc 'split("\n") | map(select(length>0))')
-  controller_keys=$(monday_controller_projection_assets | jq -Rsc 'split("\n") | map(select(length>0))')
+  controller_keys=$(monday_controller_projection_assets_for_release "$ROOT_PREFIX" "$fixture_new_c" \
+    | jq -Rsc 'split("\n") | map(select(length>0))')
   jq -cn --arg payload "$fixture_payload" --arg runtime "$fixture_runtime" --arg from "$fixture_old_c" \
     --argjson phases "$phases" \
     '{candidate_payload_sha256:$payload,candidate_runtime_contract_sha256:$runtime,
@@ -292,7 +363,9 @@ monday_validate_v2_transition() {
       stable_production_projection:"/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver",
       before:{controller:$from,payload_sha256:$payload,runtime_contract_sha256:$runtime,
         production_projection:"/opt/monday/releases/binance-lob-controller/active/binance-lob-archiver",
+        controller_projections:($controllers|map({key:.,value:{state:"absent",sha256:null,target:null}})|from_entries),
         assets:($assets|map({key:.,value:{state:"absent",sha256:null}})|from_entries)},
+      scheduler_migration_evidence:null,
       installed_assets:($assets|map({key:.,value:$payload})|from_entries),
       installed_projections:($assets|map({key:.,value:"fixture"})|from_entries),
       installed_controller_projections:($controllers|map({key:.,value:{sha256:$payload,
@@ -302,7 +375,10 @@ monday_validate_v2_transition() {
     "$fixture_old_c" "$fixture_new_c" "$fixture/validator-gate.json" "$fixture_transition_sha" \
     || fail 'valid conditional-context transition fixture was rejected'
   for mutation in '.controller_sha256="wrong"' '.active_pair_committed=false' \
-    '.gate_evidence.markets.spot={wrong:true}' '.production_runtime={wrong:true}'; do
+    '.gate_evidence.markets.spot={wrong:true}' '.production_runtime={wrong:true}' \
+    'del(.before.controller_projections)' \
+    'del(.before.controller_projections["binance-lob-archiver-recovery@.timer"])' \
+    'del(.installed_controller_projections["binance-lob-archiver-recovery@.service"])'; do
     jq "$mutation" "$fixture/validator-transition.json" >"$fixture/validator-invalid.json"
     if fixture_real_transition_validator "$ROOT_PREFIX" "$fixture/validator-invalid.json" \
       "$fixture_old_c" "$fixture_new_c" "$fixture/validator-gate.json" "$fixture_transition_sha"; then
@@ -462,6 +538,9 @@ expect_rejected new-request-after-success fixture_resume
 # A mixed spool resumes through the same payload: existing sealed segments are
 # uploaded alongside newly recovered parts, with a fresh attempt-owned backup.
 fixture_job 104 ready
+if command -v flock >/dev/null 2>&1 && ! declare -F flock >/dev/null; then
+  : >"$fixture_job_dir/.fixture-check-locks"
+fi
 printf 'raw input\n' >"$fixture_job_dir/part-2.jsonl.part"
 printf 'interrupted derived output\n' >"$fixture_job_dir/part-2.jsonl.zst.tmp"
 printf 'already sealed\n' >"$fixture_job_dir/part-3.jsonl.zst"
@@ -474,6 +553,27 @@ fixture_drain >/dev/null
 grep -Fq -- '--recover-parts-only' "$fixture/payload.calls"
 grep -Fq 'part-3.jsonl.zst' "$fixture/uploaded-files"
 grep -Fq 'part-900.jsonl.zst' "$fixture/uploaded-files"
+if command -v flock >/dev/null 2>&1 && ! declare -F flock >/dev/null; then
+  grep -Fxq 'queue available; drain excluded' "$fixture/lock-check"
+else
+  printf 'Kernel queue/drain contention check unavailable on this host; Linux CI exercises it\n'
+fi
+
+# The application error and original input survive a failed subprocess. The
+# result embeds the diagnostic so journal retention is not required to triage.
+fixture_job 114 ready
+printf 'raw input\n' >"$fixture_job_dir/part-4.jsonl.part"
+: >"$fixture_job_dir/.fixture-fail-recover"
+fixture_resume >/dev/null
+recover_failed_attempt=$(fixture_attempt)
+expect_rejected recover-failure fixture_drain
+[[ -f $QUEUE_MARKET_ROOT/$RESUME_JOB_ID.failed/part-4.jsonl.part ]]
+[[ $(stat -c %a "$recover_failed_attempt/recover.stderr") == 440 ]]
+jq -e '.result == "failed" and (.message | contains("Error: recovery parts contain no complete stream-coverage catalog"))' \
+  "$recover_failed_attempt/result.json" >/dev/null
+recover_log_sha=$(sha256sum "$recover_failed_attempt/recover.stderr" | awk '{print $1}')
+expect_rejected failed-recovery-request-replay fixture_resume
+[[ $(sha256sum "$recover_failed_attempt/recover.stderr" | awk '{print $1}') == "$recover_log_sha" ]]
 
 # Failure evidence is immutable.  Replaying a failed request reports the same
 # failure; only a new explicit request creates a separate attempt after repair.
@@ -484,6 +584,8 @@ fixture_resume >/dev/null
 failed_attempt=$(fixture_attempt)
 expect_rejected upload-failure fixture_drain
 [[ $(jq -r .result "$failed_attempt/result.json") == failed ]]
+jq -e '.message | contains("Error: fixture upload failed")' "$failed_attempt/result.json" >/dev/null
+[[ $(stat -c %a "$failed_attempt/upload.stderr") == 440 ]]
 failed_sha=$(sha256sum "$failed_attempt/result.json" | awk '{print $1}')
 expect_rejected failed-request-replay fixture_resume
 [[ $(sha256sum "$failed_attempt/result.json" | awk '{print $1}') == "$failed_sha" ]]
@@ -728,3 +830,4 @@ if grep -Fq -- '--upload-only' "$fixture/payload.calls" 2>/dev/null; then
   exit 1
 fi
 printf 'Explicit recovery adoption, historical readback, mixed drain and interruption behavior passed\n'
+bash "$SCRIPT_DIR/test-rust-lob-retention.sh"

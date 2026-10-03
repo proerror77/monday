@@ -14,8 +14,9 @@ pub use final_dispatch::{
 mod state;
 
 pub use dispatch::{
-    CampaignDispatchClaimV1, CampaignDispatchRecord, CampaignDispatchSettlementV1,
-    CampaignDispatchTargetV1,
+    CampaignDispatchCancellationV1, CampaignDispatchClaimV1,
+    CampaignDispatchCompletionProvenanceV1, CampaignDispatchCompletionV1, CampaignDispatchRecord,
+    CampaignDispatchSettlementV1, CampaignDispatchTargetV1,
 };
 pub use study::{
     AuthenticatedCampaignStudyReceiptV1, CampaignStudyLedgerEventV1, CampaignStudyLedgerReceiptV1,
@@ -81,6 +82,9 @@ pub enum CampaignLedgerEventV1 {
     DispatchSettled {
         evidence: CampaignDispatchSettlementV1,
     },
+    DispatchCancelled {
+        evidence: CampaignDispatchCancellationV1,
+    },
     ApprovalRevoked {
         revocation: ApprovalRevocationV1,
     },
@@ -118,6 +122,9 @@ impl CampaignLedgerEventV1 {
                 format!("campaign-dispatch:{operation_id}")
             }
             Self::DispatchJobBound { operation_id, .. } => format!("campaign-job:{operation_id}"),
+            Self::DispatchCancelled { evidence } => {
+                format!("campaign-cancellation:{}", evidence.operation_id)
+            }
             Self::AttemptSettled { settlement } => {
                 format!("campaign-settlement:{}", settlement.operation_id)
             }
@@ -1240,6 +1247,7 @@ mod tests {
             namespace: "monday-research".into(),
             job_name: "campaign-job".into(),
             manifest_sha256: "a".repeat(64),
+            require_completion_authority: false,
         }
     }
 
@@ -1527,6 +1535,7 @@ mod tests {
             .unwrap();
         acknowledge_all(&mut store);
         let evidence = CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "job-uid-1".into(),
             pod_uid: "pod-uid-1".into(),
             settlement: settlement(&attempt, CampaignAttemptOutcomeV1::NoCandidate, Some(31)),
@@ -1609,6 +1618,7 @@ mod tests {
             .unwrap();
         acknowledge_all(&mut store);
         let terminal = CampaignDispatchSettlementV1 {
+            completion_provenance: None,
             job_uid: "job-uid-1".into(),
             pod_uid: "pod-uid-1".into(),
             settlement: settlement(&parent, CampaignAttemptOutcomeV1::NoCandidate, Some(31)),
@@ -1690,6 +1700,7 @@ mod tests {
             .settle_campaign_dispatch(
                 attempt,
                 &CampaignDispatchSettlementV1 {
+                    completion_provenance: None,
                     job_uid: "final-source-job".into(),
                     pod_uid: "final-source-pod".into(),
                     settlement: settlement(
@@ -2174,6 +2185,7 @@ mod tests {
                 CampaignLedgerEventV1::DispatchJobBound { .. } => "dispatch_job_bound",
                 CampaignLedgerEventV1::AttemptSettled { .. } => "attempt_settled",
                 CampaignLedgerEventV1::DispatchSettled { .. } => "dispatch_settled",
+                CampaignLedgerEventV1::DispatchCancelled { .. } => "dispatch_cancelled",
                 CampaignLedgerEventV1::ApprovalRevoked { .. } => "approval_revoked",
                 CampaignLedgerEventV1::FinalDispatchClaimed { .. } => "final_dispatch_claimed",
                 CampaignLedgerEventV1::FinalDispatchJobBound { .. } => "final_dispatch_job_bound",

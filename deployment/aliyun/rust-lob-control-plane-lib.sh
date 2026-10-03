@@ -291,7 +291,128 @@ monday_controller_assets() {
 monday_controller_projection_assets() {
   printf '%s\n' \
     host-rust-lob-recovery-queue.sh \
-    monday-collector-health.sh
+    monday-collector-health.sh \
+    binance-lob-archiver-recovery@.service \
+    binance-lob-archiver-recovery@.timer
+}
+
+# Old immutable controllers/receipts bound only the two executable helpers.
+# The signed timer contract, not the currently installed host files, selects
+# the projection set. This is an audit view, never a regular-file fallback.
+monday_controller_projection_assets_for_release() {
+  [[ $# -eq 2 ]] || return 2
+  local deployment version
+  deployment=$(monday_root_join "$1" "opt/monday/releases/binance-lob-controller/$2/deployment") || return 1
+  version=$(monday_recovery_scheduler_contract_for_release "$1" "$2") || return 1
+  if [[ $version == 2 ]]; then
+    monday_controller_projection_assets
+  else
+    printf '%s\n' host-rust-lob-recovery-queue.sh monday-collector-health.sh
+  fi
+}
+
+monday_recovery_scheduler_contract_version() {
+  [[ $# -eq 1 ]] || return 2
+  local directory=${1%/}
+  if monday_validate_unit_allowlist "$directory/binance-lob-archiver-recovery@.timer" recovery_timer; then
+    monday_validate_unit_allowlist "$directory/binance-lob-archiver-recovery@.service" recovery_service || return 1
+    printf '2\n'
+  elif monday_validate_unit_allowlist "$directory/binance-lob-archiver-recovery@.timer" recovery_timer_v1; then
+    printf '1\n'
+  else
+    return 1
+  fi
+}
+
+monday_recovery_scheduler_contract_for_release() {
+  [[ $# -eq 2 ]] || return 2
+  local release schema
+  release=$(monday_root_join "$1" "opt/monday/releases/binance-lob-controller/$2") || return 1
+  schema=$(monday_manifest_field "$release/release.json" schema) || return 1
+  if [[ $schema == "$(printf '%s%s' monday.rust_lob_controller_release. v1)" ]]; then
+    printf '1\n'
+  elif [[ $schema == monday.rust_lob_controller_release.v2 ]]; then
+    monday_recovery_scheduler_contract_version "$release/deployment"
+  else return 1; fi
+}
+
+monday_validate_scheduler_migration_record() {
+  [[ $# -eq 3 ]] || return 2
+  local root=$1 controller=$2 before=$3 record backup file owner mode sha asset before_manifest
+  monday_sha256_ok "$controller" || return 1
+  record=$(monday_root_join "$root" "data/monday/evidence/cutovers/$controller/recovery-scheduler-before.json") || return 1
+  monday_path_direct "${record%/*}" && monday_file_direct "$record" || return 1
+  # The before identity must come from the validated Gate-bearing intent or
+  # transition; a protected backup is evidence, not transition authority.
+  monday_sha256_ok "$before" || return 1
+  jq -e --arg controller "$controller" --arg before "$before" '
+    .schema == "monday.rust_lob_recovery_scheduler_migration.v1"
+    and .controller == $controller and .from_controller == $before
+    and (keys | sort) == ["before","controller","evidence","from_controller","schema"]
+    and (.before | type == "object"
+      and (keys | sort) == ["binance-lob-archiver-recovery@.service","binance-lob-archiver-recovery@.timer","host-rust-lob-recovery-queue.sh","monday-collector-health.sh"]
+      and all(.[];
+        (keys | sort) == ["gid","mode","sha256","state","target","uid"]
+        and (if .state == "present" then
+          (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+          and (.mode | type == "string" and test("^[0-7]{1,2}[0145][0145]$"))
+          and (.uid | type == "string" and test("^[0-9]+$"))
+          and (.gid | type == "string" and test("^[0-9]+$"))
+          and .target == ""
+        elif .state == "projection" then
+          (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+          and (.target | type == "string" and length > 0)
+        elif .state == "absent" then .sha256 == "" and .target == "" and .uid == "" and .gid == ""
+        else false end)))
+    and (. as $r | (.evidence.files | keys | sort) ==
+      ([.before | to_entries[] | select((.key | startswith("binance-lob-archiver-recovery@.")) and .value.state == "present") | .key] | sort))
+    and (.evidence.files | type == "object" and length > 0 and length <= 2
+      and all(keys[]; . == "binance-lob-archiver-recovery@.service" or . == "binance-lob-archiver-recovery@.timer"))
+    and (. as $r | all(.evidence.files | to_entries[];
+      .value == $r.before[.key].sha256 and (.value | test("^[a-f0-9]{64}$"))
+      and $r.before[.key].state == "present"))' "$record" >/dev/null || return 1
+  backup=$(jq -er '.evidence.path' "$record") || return 1
+  [[ $backup == "${record%/*}/scheduler-before."* ]] && monday_path_direct "$backup" || return 1
+  before_manifest=$(monday_root_join "$root" "opt/monday/releases/binance-lob-controller/$before/release.json") || return 1
+  [[ $(monday_sha256_file "$before_manifest") == "$before" ]] || return 1
+  for file in "${record%/*}" "$backup" "$record" "$backup/before.json"; do
+    owner=$(monday_file_uid "$file") || return 1
+    mode=$(monday_file_mode "$file") || return 1
+    [[ $owner == 0 ]] || monday_control_plane_validate_mode "$root" true || return 1
+    [[ $((8#$mode & 022)) == 0 ]] || return 1
+  done
+  [[ $(monday_file_mode "$record") == 440 && $(monday_file_mode "$backup") == 550 \
+    && $(monday_file_mode "$backup/before.json") == 440 ]] || return 1
+  monday_file_direct "$backup/before.json" || return 1
+  jq -e --slurpfile before "$backup/before.json" '.before == $before[0]' "$record" >/dev/null || return 1
+  while IFS=$'\t' read -r asset sha; do
+    file="$backup/$asset"
+    monday_file_direct "$file" || return 1
+    owner=$(monday_file_uid "$file") || return 1
+    [[ $owner == 0 ]] || monday_control_plane_validate_mode "$root" true || return 1
+    [[ $(monday_file_mode "$file") == 440 && $(monday_sha256_file "$file") == "$sha" ]] || return 1
+  done < <(jq -r '.evidence.files | to_entries[] | [.key,.value] | @tsv' "$record")
+}
+
+monday_verify_scheduler_migration_before() {
+  [[ $# -eq 5 ]] || return 2
+  local root=$1 controller=$2 asset=$3 target=$4 before=$5 record backup sha mode uid gid
+  monday_validate_scheduler_migration_record "$root" "$controller" "$before" || return 1
+  record=$(monday_root_join "$root" "data/monday/evidence/cutovers/$controller/recovery-scheduler-before.json") || return 1
+  monday_file_direct "$record" && monday_file_direct "$target" || return 1
+  jq -e --arg controller "$controller" --arg asset "$asset" \
+    '.controller == $controller and .before[$asset].state == "present"' "$record" >/dev/null || return 1
+  backup=$(jq -er '.evidence.path' "$record") || return 1
+  [[ $backup == "${record%/*}/scheduler-before."* ]] && monday_path_direct "$backup" || return 1
+  sha=$(jq -er --arg asset "$asset" '.before[$asset].sha256' "$record") || return 1
+  mode=$(jq -er --arg asset "$asset" '.before[$asset].mode' "$record") || return 1
+  uid=$(jq -er --arg asset "$asset" '.before[$asset].uid' "$record") || return 1
+  gid=$(jq -er --arg asset "$asset" '.before[$asset].gid' "$record") || return 1
+  [[ $(monday_sha256_file "$backup/$asset") == "$sha" \
+    && $(monday_sha256_file "$target") == "$sha" \
+    && $(monday_file_mode "$target") == "$mode" \
+    && $(monday_file_uid "$target") == "$uid" \
+    && $(stat -c %g -- "$target" 2>/dev/null || stat -f %g -- "$target") == "$gid" ]]
 }
 
 monday_controller_projection_target() {
@@ -302,6 +423,8 @@ monday_controller_projection_target() {
       monday_root_join "$root" opt/monday/bin/monday-rust-lob-recovery-queue ;;
     monday-collector-health.sh)
       monday_root_join "$root" opt/monday/bin/monday-collector-health.sh ;;
+    binance-lob-archiver-recovery@.service|binance-lob-archiver-recovery@.timer)
+      monday_root_join "$root" "etc/systemd/system/$asset" ;;
     *) return 1 ;;
   esac
 }
@@ -371,26 +494,168 @@ monday_rust_lob_verify_recovery_schedulers_contained() {
 }
 
 monday_rust_lob_enable_recovery_schedulers() {
-  local unit failed=0
+  [[ $# -eq 2 ]] || return 2
+  local root=$1 controller=$2
+  local unit failed=0 version market service state
+  version=$(monday_recovery_scheduler_contract_for_release "$root" "$controller") || return 1
+  [[ $version != 1 ]] || monday_rust_lob_require_owned_drain_lock "$root" || return 1
   while IFS= read -r unit; do
     systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
   done < <(monday_rust_lob_recovery_scheduler_units)
+  (( failed == 0 )) || return "$failed"
+  monday_rust_lob_verify_recovery_scheduler_units "$root" "$controller" || return 1
   while IFS= read -r unit; do
     systemctl enable "$unit" >/dev/null 2>&1 || failed=1
   done < <(monday_rust_lob_recovery_timer_units)
   while IFS= read -r unit; do
     systemctl start "$unit" >/dev/null 2>&1 || failed=1
   done < <(monday_rust_lob_recovery_timer_units)
-  monday_rust_lob_verify_recovery_schedulers_active || failed=1
+  (( failed == 0 )) || return "$failed"
+  if [[ $version == 1 ]]; then
+    for market in spot usdm; do
+      unit="binance-lob-archiver-recovery@$market.timer"
+      state=$(systemctl show "$unit" --property=SubState --value) || return 1
+      if [[ $state == elapsed ]]; then
+        service="binance-lob-archiver-recovery@$market.service"
+        monday_rust_lob_require_owned_drain_lock "$root" || return 1
+        if [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]]; then
+          systemctl start "$service" >/dev/null 2>&1 || return 1
+        else
+          timeout --signal=TERM --kill-after=5s 30s systemctl start "$service" >/dev/null 2>&1 || return 1
+        fi
+        [[ $(systemctl show "$service" --property=ActiveState --value) == inactive \
+          && $(systemctl show "$service" --property=Result --value) == success \
+          && $(systemctl show "$service" --property=ExecMainStatus --value) == 0 ]] || return 1
+        printf 'recovery scheduler bootstrap: market=%s native_defer=true timer_trigger=false\n' "$market"
+      fi
+    done
+  fi
+  monday_rust_lob_verify_recovery_schedulers_active "$root" "$controller" || failed=1
   return "$failed"
 }
 
 monday_rust_lob_verify_recovery_schedulers_active() {
-  local unit
-  while IFS= read -r unit; do
-    systemctl is-enabled --quiet "$unit" >/dev/null 2>&1 || return 1
-    systemctl is-active --quiet "$unit" >/dev/null 2>&1 || return 1
-  done < <(monday_rust_lob_recovery_timer_units)
+  monday_rust_lob_recovery_scheduler_state "$@" >/dev/null
+}
+
+monday_rust_lob_verify_recovery_scheduler_units() {
+  [[ $# -eq 2 ]] || return 2
+  local root=$1 controller=$2 deployment version market asset unit service fragment resolved dropins start_timeout stop_timeout
+  local expected_path command native_command timer_values first_trigger
+  deployment=$(monday_root_join "$root" "opt/monday/releases/binance-lob-controller/$controller/deployment") || return 1
+  version=$(monday_recovery_scheduler_contract_for_release "$root" "$controller") || return 1
+  if [[ $version == 2 ]]; then monday_verify_controller_projections "$root" "$controller" || return 1; fi
+  for market in spot usdm; do
+    service="binance-lob-archiver-recovery@$market.service"
+    for asset in binance-lob-archiver-recovery@.service binance-lob-archiver-recovery@.timer; do
+      unit=${asset/@./@$market.}
+      expected_path=$(monday_controller_projection_target "$root" "$asset") || return 1
+      resolved=$(readlink -f -- "$expected_path") || return 1
+      monday_file_direct "$resolved" || return 1
+      fragment=$(systemctl show "$unit" --property=FragmentPath --value) || return 1
+      [[ -n $fragment && $(readlink -f -- "$fragment") == "$resolved" ]] || return 1
+      dropins=$(systemctl show "$unit" --property=DropInPaths --value) || return 1
+      [[ -z $dropins ]] || return 1
+      if [[ $version == 2 ]]; then [[ $resolved == "$deployment/$asset" ]] || return 1; fi
+      if [[ $asset == *.service ]]; then
+        if monday_validate_unit_allowlist "$resolved" recovery_service; then
+          start_timeout=2h; stop_timeout=2min
+        elif [[ $version == 1 ]] && monday_validate_unit_allowlist "$resolved" recovery_service_v1; then
+          start_timeout=infinity; stop_timeout='1min 30s'
+        else return 1; fi
+        [[ $(systemctl show "$service" --property=TimeoutStartUSec --value) == "$start_timeout" \
+          && $(systemctl show "$service" --property=TimeoutStopUSec --value) == "$stop_timeout" ]] || return 1
+        native_command="/opt/monday/bin/monday-rust-lob-recovery-queue drain $market"
+        command=$(systemctl show "$service" --property=ExecStart --value) || return 1
+        [[ $command == *"path=/opt/monday/bin/monday-rust-lob-recovery-queue ;"* \
+          && $command == *"argv[]=$native_command ;"* \
+          && $command != *'} {'* ]] || return 1
+        for command in ExecStartPre ExecStartPost ExecStop ExecStopPost; do
+          [[ -z $(systemctl show "$service" --property="$command" --value) ]] || return 1
+        done
+      else
+        if [[ $version == 2 ]]; then first_trigger='OnActiveUSec=10min'
+        else first_trigger='OnBootUSec=10min'; fi
+        monday_validate_unit_allowlist "$resolved" "$( [[ $version == 2 ]] && printf recovery_timer || printf recovery_timer_v1 )" || return 1
+        timer_values=$(systemctl show "$unit" --property=TimersMonotonic --value) || return 1
+        [[ $(grep -Fc "$first_trigger ;" <<<"$timer_values") == 1 \
+          && $(grep -Fc 'OnUnitInactiveUSec=15min ;' <<<"$timer_values") == 1 \
+          && $(grep -c '^{' <<<"$timer_values") == 2 \
+          && -z $(systemctl show "$unit" --property=TimersCalendar --value) ]] || return 1
+      fi
+    done
+  done
+}
+
+# This is only called inside a canonical transition while its global drain
+# lock remains owned. A manager-spawned service cannot inherit that lock and
+# its native nonblocking drain path must exit before selecting a queue job.
+monday_rust_lob_require_owned_drain_lock() {
+  [[ $# -eq 1 ]] || return 2
+  local root=$1 lock
+  if [[ ${MONDAY_CONTROL_PLANE_TEST:-0} == 1 ]]; then
+    monday_control_plane_validate_mode "$root" true || return 1
+    # Bash 5.2's bare return inside an EXIT trap inherits the trap status.
+    return 0
+  fi
+  lock=$(monday_root_join "$root" run/lock/monday-rust-lob-recovery-drain.lock) || return 1
+  [[ $(readlink -f -- "/proc/$$/fd/8") == "$lock" ]] || return 1
+  flock -n 8
+}
+
+monday_rust_lob_recovery_scheduler_state() {
+  [[ $# -eq 2 ]] || return 2
+  local root=$1 controller=$2 deployment version market timer service substate next service_state service_result service_pid
+  local state='{}' observed attempt coherent substate_after next_after service_state_after service_pid_after
+  deployment=$(monday_root_join "$root" "opt/monday/releases/binance-lob-controller/$controller/deployment") || return 1
+  version=$(monday_recovery_scheduler_contract_for_release "$1" "$2") || return 1
+  monday_rust_lob_verify_recovery_scheduler_units "$root" "$controller" || return 1
+  for market in spot usdm; do
+    timer="binance-lob-archiver-recovery@$market.timer"
+    service="binance-lob-archiver-recovery@$market.service"
+    systemctl is-enabled --quiet "$timer" >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "$timer" >/dev/null 2>&1 || return 1
+    observed=$(jq -cn --arg unit "$timer" '{unit:$unit,active:true,enabled:true}') || return 1
+    # Separate D-Bus reads can straddle a normal timer/service transition.
+    # Require a stable bracket and retry only a bounded number of samples.
+    for attempt in 1 2 3; do
+      coherent=false; service_result=; service_pid=
+      substate=$(systemctl show "$timer" --property=SubState --value) || return 1
+      next=$(systemctl show "$timer" --property=NextElapseUSecMonotonic --value) || return 1
+      service_state=$(systemctl show "$service" --property=ActiveState --value) || return 1
+      case "$substate" in
+        waiting)
+          if [[ $next =~ ^[1-9][0-9]* && $next != infinity ]]; then
+            substate_after=$(systemctl show "$timer" --property=SubState --value) || return 1
+            next_after=$(systemctl show "$timer" --property=NextElapseUSecMonotonic --value) || return 1
+            [[ $substate_after == "$substate" && $next_after == "$next" ]] && coherent=true
+          fi ;;
+        running)
+          service_result=$(systemctl show "$service" --property=Result --value) || return 1
+          service_pid=$(systemctl show "$service" --property=MainPID --value) || return 1
+          if [[ ($service_state == active || $service_state == activating) \
+            && $service_result == success && $service_pid =~ ^[1-9][0-9]*$ ]]; then
+            substate_after=$(systemctl show "$timer" --property=SubState --value) || return 1
+            service_state_after=$(systemctl show "$service" --property=ActiveState --value) || return 1
+            service_pid_after=$(systemctl show "$service" --property=MainPID --value) || return 1
+            [[ $substate_after == "$substate" && $service_state_after == "$service_state" \
+              && $service_pid_after == "$service_pid" ]] && coherent=true
+          fi ;;
+      esac
+      [[ $coherent == true ]] && break
+      (( attempt < 3 )) || return 1
+      sleep 0.05
+    done
+    observed=$(jq -cn --argjson state "$observed" --argjson version "$version" --arg substate "$substate" \
+      --arg next "$next" --arg service_state "$service_state" \
+      --arg service_result "${service_result:-}" --arg service_pid "${service_pid:-}" \
+      '$state + {contract_version:$version,templates_verified:true,
+        substate:$substate,next_elapse_monotonic:$next,service_active_state:$service_state,
+        service_result:$service_result,service_main_pid:$service_pid}') || return 1
+    state=$(jq -cn --argjson state "$state" --arg market "$market" --argjson observed "$observed" \
+      '$state + {($market):$observed}') || return 1
+  done
+  printf '%s\n' "$state"
 }
 
 monday_rust_lob_all_writer_units() {
@@ -491,14 +756,62 @@ monday_rust_lob_verify_writer_state() {
     && $observed_enabled == "$expected_enabled" ]]
 }
 
+# Resolve the exact previous production fragment before touching an instance.
+# A fixed C1 instance link survives an active=C0 rollback: `enable` alone keeps
+# following C1. Only the two production instances and this transition's verified
+# C0/C1 links may be replaced; an unknown link or regular file is not ours.
+monday_rust_lob_rollback_production_fragment() {
+  [[ $# -eq 4 ]] || return 2
+  local root=$1 unit=$2 before=$3 candidate=$4 controller_root asset template instance target previous manifest
+  case "$unit" in binance-lob-archiver-production@spot.service|binance-lob-archiver-production@usdm.service) ;; *) return 1 ;; esac
+  monday_sha256_ok "$before" && monday_sha256_ok "$candidate" || return 1
+  controller_root=$(monday_root_join "$root" opt/monday/releases/binance-lob-controller) || return 1
+  [[ $(monday_active_controller_sha "$root") == "$before" ]] || return 1
+  monday_verify_controller_release "$root" "$before" || return 1
+  # Only C1's signed runtime bytes authorise removing its instance link. A
+  # failed candidate payload must not prevent rollback to a verified good C0.
+  manifest="$controller_root/$candidate/release.json"
+  [[ $(monday_sha256_file "$manifest") == "$candidate" ]] || return 1
+  monday_validate_v2_manifest "$manifest" || return 1
+  monday_path_direct "$controller_root/$candidate/deployment" || return 1
+  [[ $(monday_rust_lob_runtime_contract_sha256 "$controller_root/$candidate/deployment") \
+    == "$(monday_manifest_field "$manifest" runtime_contract_sha256)" ]] || return 1
+  asset=binance-lob-archiver-production@.service
+  previous="$controller_root/$before/deployment/$asset"
+  template=$(monday_root_join "$root" "etc/systemd/system/$asset") || return 1
+  monday_path_direct "${template%/*}" || return 1
+  [[ -L $template && $(readlink -- "$template") == "$controller_root/active/deployment/$asset" \
+    && $(readlink -f -- "$template") == "$previous" ]] || return 1
+  instance=$(monday_root_join "$root" "etc/systemd/system/$unit") || return 1
+  if [[ -e $instance || -L $instance ]]; then
+    [[ -L $instance ]] || return 1
+    target=$(readlink -- "$instance") || return 1
+    [[ $target == "$previous" || $target == "$controller_root/$candidate/deployment/$asset" ]] || return 1
+  fi
+  printf '%s\n' "$previous"
+}
+
+# Check the fragment systemd actually selected after daemon-reload, rather than
+# merely the template or enabled flag. Existing drop-ins remain untouched; the
+# normal signed-runtime/lifetime checks still apply to their effective values.
+monday_rust_lob_verify_rollback_production_fragment() {
+  [[ $# -eq 2 ]] || return 2
+  local unit=$1 expected=$2 fragment
+  fragment=$(systemctl show "$unit" --property=FragmentPath --value) || return 1
+  [[ -n $fragment && $(readlink -f -- "$fragment") == "$expected" ]] || return 1
+  monday_file_direct "$expected" || return 1
+  cmp -s -- "$fragment" "$expected" || return 1
+  [[ $(systemctl show "$unit" --property=RuntimeMaxUSec --value) == infinity ]] || return 1
+}
+
 # Restore a snapshot captured before direct bootstrap.  Passing `legacy` is
 # allowed only for the direct migration; stable V2 rollback/restore must keep
 # all legacy writers masked.  A failed restoration is deliberately reported so
 # the caller can contain the complete allowlist instead of guessing a state.
 monday_rust_lob_restore_writer_snapshot() {
-  [[ $# -eq 2 ]] || return 2
-  local snapshot=$1 restore_legacy=$2
-  local unit load active enabled
+  [[ $# -eq 5 ]] || return 2
+  local snapshot=$1 restore_legacy=$2 root=$3 before=$4 candidate=$5
+  local unit load active enabled previous_fragment instance
   local failed=0
   while IFS=$'\t' read -r unit load active enabled; do
     [[ -n $unit ]] || continue
@@ -512,17 +825,37 @@ monday_rust_lob_restore_writer_snapshot() {
       systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
       continue
     fi
-    systemctl stop "$unit" >/dev/null 2>&1 || failed=1
+    previous_fragment=
+    if [[ $restore_legacy == v2 && $enabled == enabled \
+      && $unit == binance-lob-archiver-production@*.service ]]; then
+      previous_fragment=$(monday_rust_lob_rollback_production_fragment \
+        "$root" "$unit" "$before" "$candidate") || { failed=1; continue; }
+    fi
+    systemctl stop "$unit" >/dev/null 2>&1 || { failed=1; continue; }
+    if [[ -n $previous_fragment ]]; then
+      # disable removes the transition-owned fixed instance and its wants link.
+      # Recreate only the exact allowlisted instance against C0 before enable;
+      # never use --force to overwrite an unrecognised unit binding.
+      systemctl disable "$unit" >/dev/null 2>&1 || { failed=1; continue; }
+      instance=$(monday_root_join "$root" "etc/systemd/system/$unit") || return 1
+      if [[ -e $instance || -L $instance ]]; then failed=1; continue; fi
+      ln -s -- "$previous_fragment" "$instance" || { failed=1; continue; }
+    fi
     case "$enabled" in
       masked|masked-runtime|masked-runtime*)
         systemctl mask --runtime "$unit" >/dev/null 2>&1 || failed=1 ;;
       enabled|enabled-runtime|enabled-presets|indirect|generated|linked|linked-runtime)
-        systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
-        systemctl enable "$unit" >/dev/null 2>&1 || failed=1 ;;
+        systemctl unmask --runtime "$unit" >/dev/null 2>&1 || { failed=1; continue; }
+        systemctl enable "$unit" >/dev/null 2>&1 || { failed=1; continue; } ;;
       *)
         systemctl unmask --runtime "$unit" >/dev/null 2>&1 || failed=1
         systemctl disable "$unit" >/dev/null 2>&1 || failed=1 ;;
     esac
+    if [[ -n $previous_fragment ]]; then
+      systemctl daemon-reload >/dev/null 2>&1 || { failed=1; continue; }
+      monday_rust_lob_verify_rollback_production_fragment "$unit" "$previous_fragment" \
+        || { failed=1; continue; }
+    fi
     if [[ $active == active || $active == activating ]]; then
       systemctl start "$unit" >/dev/null 2>&1 || failed=1
     else
@@ -538,11 +871,13 @@ monday_rust_lob_restore_writer_snapshot() {
 # file fallback once V2 has been bootstrapped.
 monday_verify_controller_projections() {
   [[ $# -eq 2 ]] || return 2
-  local root=$1 sha=$2 controller_root active release asset target expected resolved
+  local root=$1 sha=$2 controller_root active release asset target expected resolved assets
   monday_sha256_ok "$sha" || return 1
   controller_root=$(monday_root_join "$root" opt/monday/releases/binance-lob-controller) || return 1
   active="$controller_root/active"; release="$controller_root/$sha"
   [[ -L $active && $(readlink -f -- "$active") == "$release" ]] || return 1
+  assets=$(monday_controller_projection_assets_for_release "$root" "$sha") || return 1
+  [[ -n $assets ]] || return 1
   while IFS= read -r asset; do
     target=$(monday_controller_projection_target "$root" "$asset") || return 1
     expected="$active/deployment/$asset"
@@ -550,7 +885,7 @@ monday_verify_controller_projections() {
     resolved=$(readlink -f -- "$target") || return 1
     monday_file_direct "$resolved" || return 1
     cmp -s "$release/deployment/$asset" "$resolved" || return 1
-  done < <(monday_controller_projection_assets)
+  done <<<"$assets"
 }
 
 # Read-only verifier for the controller identity left by the pre-V2 apply
@@ -699,6 +1034,48 @@ monday_unit_normalized() {
   local -A seen=() sections=()
   local -a expected=() required_sections=()
   case "$kind" in
+    recovery_service|recovery_service_v1)
+      required_sections=(Unit Service)
+      expected=(
+        'Unit|Description|Rust Binance LOB detached spool recovery (%i)'
+        'Unit|After|network-online.target'
+        'Unit|Wants|network-online.target'
+        'Unit|RequiresMountsFor|/data'
+        'Unit|AssertPathIsMountPoint|/data'
+        'Service|Type|oneshot'
+        'Service|ExecStart|/opt/monday/bin/monday-rust-lob-recovery-queue drain %i'
+        'Service|Nice|10'
+        'Service|IOSchedulingClass|best-effort'
+        'Service|IOSchedulingPriority|7'
+        'Service|NoNewPrivileges|true'
+        'Service|PrivateTmp|true'
+        'Service|ProtectSystem|strict'
+        'Service|ProtectHome|true'
+        'Service|ProtectKernelTunables|true'
+        'Service|ProtectKernelModules|true'
+        'Service|ProtectControlGroups|true'
+        'Service|LockPersonality|true'
+        'Service|RestrictSUIDSGID|true'
+        'Service|ReadWritePaths|-/data/monday/spool/binance-lob-recovery -/data/monday/evidence/recoveries'
+        'Service|CPUQuota|25%'
+        'Service|MemoryHigh|512M'
+        'Service|MemoryMax|768M'
+      )
+      if [[ $kind == recovery_service ]]; then
+        expected+=('Service|TimeoutStartSec|7200' 'Service|TimeoutStopSec|120')
+      else expected+=('Service|TimeoutStartSec|0'); fi ;;
+    recovery_timer|recovery_timer_v1)
+      required_sections=(Unit Timer Install)
+      expected=(
+        'Unit|Description|Schedule Rust Binance LOB detached spool recovery (%i)'
+        'Timer|OnUnitInactiveSec|15min'
+        'Timer|RandomizedDelaySec|60'
+        'Timer|Persistent|true'
+        'Timer|Unit|binance-lob-archiver-recovery@%i.service'
+        'Install|WantedBy|timers.target'
+      )
+      if [[ $kind == recovery_timer ]]; then expected+=('Timer|OnActiveSec|10min')
+      else expected+=('Timer|OnBootSec|10min'); fi ;;
     production)
       required_sections=(Unit Service Install)
       expected=(
@@ -1468,6 +1845,7 @@ monday_verify_controller_release() {
   (cd "$release" && sha256sum --check --strict release.json.sha256 >/dev/null \
     && sha256sum --check --strict deployment.sha256 >/dev/null) || return 1
   monday_validate_v2_manifest "$manifest" || return 1
+  monday_recovery_scheduler_contract_version "$release/deployment" >/dev/null || return 1
   expected=$(cd "$release" && for asset in deployment/*; do
     monday_sha256_checksum_line "$asset"
   done | sort -k2)
@@ -2159,7 +2537,8 @@ monday_validate_v2_transition() {
   gate_runtime=$(jq -er '.candidate_runtime_contract_sha256' "$gate") || return 1
   gate_from=$(jq -er '.from_controller_sha256' "$gate") || return 1
   gate_production_runtime=$(jq -ce '.production_runtime' "$gate") || return 1
-  controller_projection_keys=$(monday_controller_projection_assets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
+  controller_projection_keys=$(monday_controller_projection_assets_for_release "$root" "$to") || return 1
+  controller_projection_keys=$(printf '%s\n' "$controller_projection_keys" | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
   # Capture the receipt's mode before inspecting nested objects.  A scheduler
   # object's fields cannot turn production checks into fixture exceptions.
   jq -e --arg from "$from" --arg to "$to" --arg gate "$gate" --arg gate_sha "$gate_sha" \
@@ -2245,9 +2624,31 @@ monday_validate_v2_transition() {
     and (.installed_controller_projections | type == "object"
       and (keys | sort) == $controller_projection_keys
       and all(.[];
-        (.target | type == "string" and test("^/opt/monday/releases/binance-lob-controller/active/deployment/[A-Za-z0-9._-]+$"))
+        (.target | type == "string" and test("^/opt/monday/releases/binance-lob-controller/active/deployment/[A-Za-z0-9._@-]+$"))
         and (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))))' \
     "$receipt" >/dev/null || return 1
+  if [[ $(monday_recovery_scheduler_contract_for_release "$root" "$to") == 2 ]]; then
+    jq -e --argjson keys "$controller_projection_keys" '
+      (.before.controller_projections | type == "object" and (keys | sort) == $keys)
+      and (.scheduler_migration_evidence == null or (.scheduler_migration_evidence | type == "object"))
+      and (if .test_only then true else all(.recovery_schedulers[];
+        .contract_version == 2 and .templates_verified == true
+        and ((.substate == "waiting" and (.next_elapse_monotonic | type == "string" and test("^[1-9][0-9]*")))
+          or (.substate == "running" and (.service_active_state == "active" or .service_active_state == "activating")
+            and .service_result == "success" and (.service_main_pid | test("^[1-9][0-9]*$"))))) end)
+      and (if any(.before.controller_projections | to_entries[];
+        (.key | startswith("binance-lob-archiver-recovery@.")) and .value.state == "present")
+        then .scheduler_migration_evidence != null else true end)' "$receipt" >/dev/null || return 1
+    if [[ $(jq -c '.scheduler_migration_evidence' "$receipt") != null ]]; then
+      local scheduler_before scheduler_record
+      scheduler_before=$(jq -er '.before.controller' "$receipt") || return 1
+      monday_validate_scheduler_migration_record "$root" "$to" "$scheduler_before" || return 1
+      scheduler_record=$(monday_root_join "$root" "data/monday/evidence/cutovers/$to/recovery-scheduler-before.json") || return 1
+      jq -e --slurpfile original "$scheduler_record" '
+        .before.controller_projections == $original[0].before
+        and .scheduler_migration_evidence == $original[0].evidence' "$receipt" >/dev/null || return 1
+    fi
+  fi
   jq -e --argjson expected "$gate_evidence" \
     '.gate_evidence == $expected' "$receipt" >/dev/null || return 1
   jq -e --argjson expected "$gate_production_runtime" \

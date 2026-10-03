@@ -92,7 +92,8 @@ jobs:
           if ! run_json=$(aliyun ecs InvokeCommand \
             --RegionId "${{ env.REGION_ID }}" \
             --InstanceId.1 "${{ env.INSTANCE_ID }}" \
-            --CommandId "$COMMAND_ID" 2>&1); then
+            --CommandId "$COMMAND_ID" \
+            --Timeout 480 2>&1); then
             printf 'InvokeCommand failed: %s\n' "$run_json" >&2
             {
               echo "ok=unknown"
@@ -116,7 +117,9 @@ jobs:
           invocation_failed=0
           health_json=""
           exit_code=""
-          for _ in $(seq 1 30); do
+          # The read-only retention scan may take 300s; the health child has
+          # a 360s limit. Keep polling past the local unit's 480s budget.
+          for _ in $(seq 1 120); do
             result_json=$(aliyun ecs DescribeInvocationResults \
               --RegionId "${{ env.REGION_ID }}" \
               --InvokeId "$invoke_id" \

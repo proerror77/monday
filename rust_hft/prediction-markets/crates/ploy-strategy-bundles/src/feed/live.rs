@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -33,6 +34,10 @@ pub enum LagPolicy {
 pub struct LiveFeed {
     rx: broadcast::Receiver<MarketUpdate>,
     lag_policy: LagPolicy,
+    skipped_total: u64,
+    lag_events_total: u64,
+    pending_skipped: u64,
+    last_lag_report: Option<Instant>,
 }
 
 impl LiveFeed {
@@ -43,7 +48,33 @@ impl LiveFeed {
 
     /// Create a live feed with an explicit lag policy.
     pub fn with_lag_policy(rx: broadcast::Receiver<MarketUpdate>, lag_policy: LagPolicy) -> Self {
-        Self { rx, lag_policy }
+        Self {
+            rx,
+            lag_policy,
+            skipped_total: 0,
+            lag_events_total: 0,
+            pending_skipped: 0,
+            last_lag_report: None,
+        }
+    }
+
+    fn report_lag(&mut self, force: bool) {
+        if self.pending_skipped == 0
+            || (!force
+                && self
+                    .last_lag_report
+                    .is_some_and(|last| last.elapsed() < Duration::from_secs(1)))
+        {
+            return;
+        }
+        warn!(
+            skipped = self.pending_skipped,
+            skipped_total = self.skipped_total,
+            lag_events_total = self.lag_events_total,
+            "LiveFeed lagged; skipping missed updates and continuing"
+        );
+        self.pending_skipped = 0;
+        self.last_lag_report = Some(Instant::now());
     }
 }
 
@@ -52,22 +83,34 @@ impl Feed for LiveFeed {
     async fn next(&mut self) -> Option<MarketUpdate> {
         loop {
             match self.rx.recv().await {
-                Ok(update) => return Some(update),
+                Ok(update) => {
+                    self.report_lag(false);
+                    return Some(update);
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => match self.lag_policy {
                     LagPolicy::FailClosed => {
                         warn!(skipped = n, "LiveFeed lagged; closing feed fail-closed");
                         return None;
                     }
                     LagPolicy::SkipAndContinue => {
-                        warn!(
-                            skipped = n,
-                            "LiveFeed lagged; skipping missed updates and continuing"
-                        );
+                        self.skipped_total = self.skipped_total.saturating_add(n);
+                        self.lag_events_total = self.lag_events_total.saturating_add(1);
+                        self.pending_skipped = self.pending_skipped.saturating_add(n);
+                        self.report_lag(false);
                     }
                 },
-                Err(broadcast::error::RecvError::Closed) => return None,
+                Err(broadcast::error::RecvError::Closed) => {
+                    self.report_lag(true);
+                    return None;
+                }
             }
         }
+    }
+}
+
+impl Drop for LiveFeed {
+    fn drop(&mut self) {
+        self.report_lag(true);
     }
 }
 
@@ -114,9 +157,31 @@ mod tests {
             panic!("skip-and-continue feed must keep delivering after lag");
         };
         assert_eq!(price, Decimal::from(3));
+        assert_eq!(feed.skipped_total, 2);
+        assert_eq!(feed.lag_events_total, 1);
 
         tx.send(update(Decimal::from(4))).unwrap();
         assert!(feed.next().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn burst_lag_accounting_keeps_all_drops_when_reports_are_coalesced() {
+        let (tx, rx) = broadcast::channel(1);
+        let mut feed = LiveFeed::with_lag_policy(rx, LagPolicy::SkipAndContinue);
+        tx.send(update(Decimal::ONE)).unwrap();
+        tx.send(update(Decimal::from(2))).unwrap();
+        assert!(feed.next().await.is_some());
+        for n in 3..=5 {
+            tx.send(update(Decimal::from(n))).unwrap();
+        }
+        assert!(feed.next().await.is_some());
+        assert_eq!(feed.skipped_total + 2, 5);
+        assert_eq!(feed.lag_events_total, 2);
+        assert_eq!(feed.pending_skipped, 2);
+        drop(tx);
+        assert!(feed.next().await.is_none());
+        assert_eq!(feed.pending_skipped, 0);
+        assert_eq!(feed.skipped_total, 3);
     }
 
     #[test]
