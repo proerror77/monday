@@ -31,26 +31,12 @@ artifact=$(jq -er --arg name "research-image-release-$source_sha" --arg sha "$so
 [[ $artifact =~ ^[1-9][0-9]*$ ]]
 gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" >"$work/release.zip"
 unzip -Z -1 "$work/release.zip" | LC_ALL=C sort >"$work/entries"
-printf '%s\n' research-image-release.json >"$work/expected"
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer \
-  binance-replay-parquet-materializer clickhouse-analytics-materializer \
-  research-orchestrator researchctl research-prepare \
-  monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
-  printf 'research-bin/%s\n' "$binary" >>"$work/expected"
-done
-LC_ALL=C sort "$work/expected" -o "$work/expected"
-sed '/^research-bin\/$/d' "$work/entries" >"$work/files"
-diff -u "$work/expected" "$work/files"
-mkdir -p "$release/research-bin"
-# Extract individually to paths we own; ZIP metadata never creates links/paths.
-unzip -p "$work/release.zip" research-image-release.json | head -c 1048577 >"$release/research-image-release.json"
-test "$(wc -c <"$release/research-image-release.json")" -le 1048576
-while IFS= read -r file; do
-  [[ $file == research-bin/* ]] || continue
-  unzip -p "$work/release.zip" "$file" | head -c 536870913 >"$release/$file"
-  test "$(wc -c <"$release/$file")" -le 536870912
-  chmod 0755 "$release/$file"
-done <"$work/expected"
+printf '%s\n' research-image-release.tar >"$work/expected"
+diff -u "$work/expected" "$work/entries"
+# ZIP transport changes modes to 0644. The fixed tar preserves executable modes.
+unzip -p "$work/release.zip" research-image-release.tar | head -c 1073774593 >"$work/research-image-release.tar"
+test "$(wc -c <"$work/research-image-release.tar")" -le 1073774592
+python3 "$root/.github/scripts/research-release-bundle.py" unpack "$work/research-image-release.tar" "$release"
 "$root/.github/scripts/research-image-release-artifact.sh" verify "$release" "$source_sha" "$run" "$root/rust_hft" "$attempt" "$job"
 # Fail closed if the producer was rerun or changed while we downloaded bytes.
 gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" >"$work/reread.json"

@@ -96,7 +96,7 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Run Semgrep
         # Active root workflows, application code, and the rest of the
@@ -130,14 +130,14 @@ jobs:
       run:
         working-directory: rust_hft
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
 
       - name: Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft
 
@@ -152,7 +152,7 @@ jobs:
 
       - name: Upload audit results
         if: always() && hashFiles('rust_hft/audit-results.json') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cargo-audit-results
           path: rust_hft/audit-results.json
@@ -163,13 +163,13 @@ jobs:
     if: ${{ contains(needs.security-scope.outputs.jobs, ',security/secret-presence,') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft
 
@@ -188,9 +188,9 @@ jobs:
       run:
         working-directory: rust_hft
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
 
@@ -212,7 +212,7 @@ jobs:
           echo "✅ All licenses compatible"
 
       - name: Upload license report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: license-report
           path: rust_hft/licenses.json
@@ -233,11 +233,11 @@ jobs:
       run:
         working-directory: rust_hft
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         if: github.event_name == 'schedule'
         with:
           toolchain: 1.98.1
@@ -245,7 +245,7 @@ jobs:
 
       - name: Cache
         if: github.event_name == 'schedule'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft
           shared-key: strict-alpha-research-ml-v1
@@ -300,9 +300,9 @@ jobs:
       run:
         working-directory: rust_hft
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
 
@@ -338,7 +338,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.security-scope.outputs.image_matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -404,7 +404,7 @@ jobs:
     if: ${{ contains(needs.security-scope.outputs.jobs, ',security/secret-detection,') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -427,7 +427,7 @@ jobs:
       contents: read
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(needs.security-scope.outputs.jobs, ',security/cargo-audit,')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Generate SBOM (CycloneDX)
         uses: anchore/sbom-action@v0
@@ -436,7 +436,7 @@ jobs:
           output-file: sbom.json
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom
           path: sbom.json
@@ -465,7 +465,7 @@ jobs:
       - name: Download cargo audit results
         if: ${{ always() && contains(needs.security-scope.outputs.jobs, ',security/cargo-audit,') }}
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: cargo-audit-results
           path: cargo-audit-results
@@ -473,7 +473,7 @@ jobs:
       - name: Download license report
         if: ${{ always() && contains(needs.security-scope.outputs.jobs, ',security/license-check,') }}
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: license-report
           path: license-report
@@ -481,7 +481,7 @@ jobs:
       - name: Download SBOM
         if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(needs.security-scope.outputs.jobs, ',security/cargo-audit,') }}
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: sbom
           path: sbom
@@ -533,7 +533,7 @@ jobs:
 
       - name: Upload summary
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-summary
           path: security-summary.md

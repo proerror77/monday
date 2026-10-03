@@ -97,7 +97,7 @@ acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
   steps=doc.fetch('jobs').fetch(id).fetch('steps')
   upload=steps.find { |s|s.fetch('uses','').include?('actions/upload-artifact@') }
   abort 'missing immutable software upload' unless upload && upload.fetch('with').fetch('name')=="research-image-release-${{ #{sha} }}"
-  abort 'incorrect release boundary' unless upload.fetch('with').fetch('path')=='${{ runner.temp }}/research-release/' && upload.fetch('with').fetch('if-no-files-found')=='error'
+  abort 'incorrect release boundary' unless upload.fetch('with').fetch('path')=='${{ runner.temp }}/research-image-release.tar' && upload.fetch('with').fetch('if-no-files-found')=='error'
 end
 publication=acr.fetch('jobs').fetch('publish')
 abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']

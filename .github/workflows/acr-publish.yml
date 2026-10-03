@@ -175,7 +175,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.selector.outputs.source_sha }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
       - name: Install build dependencies
@@ -183,7 +183,7 @@ jobs:
       - name: Capture compiler, native environment and scoped recipe
         id: build-inputs
         run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             rust_hft
@@ -198,7 +198,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: research-image-release-${{ needs.selector.outputs.source_sha }}
-          path: ${{ runner.temp }}/research-release/
+          path: ${{ runner.temp }}/research-image-release.tar
           if-no-files-found: error
           retention-days: 7
 

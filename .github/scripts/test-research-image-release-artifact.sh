@@ -162,6 +162,37 @@ jq -n --arg h "$(printf a%.0s {1..64})" --arg root "$(sha256sum "$repo/Cargo.loc
 "$artifact" create "$release" "$main_sha" 1234 "$repo"
 "$artifact" verify "$release" "$main_sha" 1234 "$repo"
 
+# Reproduce upload/download-artifact's flattened 0644 file modes: direct
+# directory transport must fail, whereas the fixed tar survives that roundtrip.
+cp -R "$release" "$tmp_dir/flattened"
+chmod 0644 "$tmp_dir/flattened"/research-bin/*
+if "$artifact" verify "$tmp_dir/flattened" "$main_sha" 1234 "$repo" >"$tmp_dir/mode-error" 2>&1; then
+  echo 'flattened executable modes unexpectedly verified' >&2; exit 1
+fi
+grep -Fq 'executable mode lost: hft-backtest' "$tmp_dir/mode-error"
+python3 "$script_dir/research-release-bundle.py" pack "$tmp_dir/research-image-release.tar" "$release"
+chmod 0644 "$tmp_dir/research-image-release.tar"
+python3 "$script_dir/research-release-bundle.py" unpack "$tmp_dir/research-image-release.tar" "$tmp_dir/roundtrip"
+"$artifact" verify "$tmp_dir/roundtrip" "$main_sha" 1234 "$repo"
+BUNDLE_SCRIPT="$script_dir/research-release-bundle.py" python3 - "$tmp_dir/research-image-release.tar" "$tmp_dir" <<'PYTEST'
+import pathlib, subprocess, sys, tarfile
+source, root = sys.argv[1], pathlib.Path(sys.argv[2])
+for kind in ("link", "path", "duplicate", "mode"):
+    bad = root / (kind + ".tar")
+    with tarfile.open(source) as original, tarfile.open(bad, "w") as output:
+        for i, member in enumerate(original.getmembers()):
+            stream = original.extractfile(member)
+            if i == 1:
+                if kind == "link": member.type, member.linkname = tarfile.SYMTYPE, "/tmp/escape"
+                if kind == "path": member.name = "../escape"
+                if kind == "duplicate": member.name = "research-image-release.json"
+                if kind == "mode": member.mode = 0o777
+            output.addfile(member, stream if member.isreg() else None)
+    result = subprocess.run([sys.executable, str(pathlib.Path(__import__("os").environ["BUNDLE_SCRIPT"])), "unpack", str(bad), str(root / (kind + "-out"))], capture_output=True)
+    if result.returncode == 0 or b"research release bundle rejected" not in result.stderr:
+        raise SystemExit("unsafe tar accepted: " + kind)
+PYTEST
+
 assert_rejected() {
   local name=$1 expected_sha=${2:-$main_sha} expected_run=${3:-1234}
   local candidate="$tmp_dir/$name"

@@ -37,7 +37,7 @@ jobs:
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -236,13 +236,13 @@ jobs:
         working-directory: rust_hft
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       - name: Setup Rust toolchain
         if: ${{ (needs.scope.outputs.toolchain == 'true') }}
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
@@ -274,7 +274,7 @@ jobs:
 
       - name: Cache Rust
         if: ${{ (needs.scope.outputs.toolchain == 'true') }}
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             rust_hft
@@ -375,7 +375,7 @@ jobs:
 
       - name: Upload artifacts
         if: ${{ (success() && github.event_name == 'push') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rust-dev-binaries-${{ github.sha }}
           path: rust_hft/dist/*
@@ -411,7 +411,7 @@ jobs:
 
       - name: Upload native validation evidence
         if: success() && (github.event_name == 'push' || github.event_name == 'pull_request')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ci-rust-evidence-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/rust-batch.json
@@ -445,12 +445,12 @@ jobs:
       MONDAY_TEST_CH_ENDPOINT: http://127.0.0.1:18123
       MONDAY_TEST_CH_PASSWORD: ${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft
           key: research-foundation-contracts
@@ -474,7 +474,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -621,7 +621,7 @@ jobs:
 
       - name: Setup Rust toolchain (fmt)
         if: ${{ (needs.scope.outputs.loop == 'true') }}
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
           components: rustfmt
@@ -646,7 +646,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -665,7 +665,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
         if: needs.scope.outputs.production_trading_image == 'true' || needs.scope.outputs.production_collector_image == 'true'
@@ -736,7 +736,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Build and inspect Polymarket evidence compiler image
         run: |
@@ -774,10 +774,10 @@ jobs:
         working-directory: rust_hft
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
           components: rustfmt
@@ -805,7 +805,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             rust_hft
@@ -852,7 +852,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Detect Node lockfile
         id: node-lock

@@ -425,7 +425,9 @@ for workflow in \
   "$ci_workflow" \
   "$script_dir/../workflows/release-rust.yml" \
   "$script_dir/../workflows/security-enabled.yml"; do
-  stable_uses=$(grep -Fc 'dtolnay/rust-toolchain@stable' "$workflow")
+  # Action refs are immutable SHAs after the supply-chain review. Compiler
+  # version pinning is independent from the action's tag spelling.
+  stable_uses=$(grep -Fc 'dtolnay/rust-toolchain@' "$workflow")
   pinned_toolchains=$(grep -Fxc '          toolchain: 1.98.1' "$workflow")
   test "$stable_uses" -eq "$pinned_toolchains"
 done

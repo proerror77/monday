@@ -16,7 +16,8 @@ done
 export MONDAY_BUILD_INPUTS_FILE="$work/build-inputs.json"
 jq -n --arg h "$(printf a%.0s {1..64})" --arg root "$(sha256sum "$root/rust_hft/Cargo.lock" | awk '{print $1}')" --arg prediction "$(sha256sum "$root/rust_hft/prediction-markets/Cargo.lock" | awk '{print $1}')" '{schema:"monday.compilation-inputs.v1",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:{root:$root,prediction:$prediction}}' >"$MONDAY_BUILD_INPUTS_FILE"
 "$root/.github/scripts/research-image-release-artifact.sh" create "$work/release" "$source_sha" 1234 "$root/rust_hft"
-(cd "$work/release" && zip -rq "$work/release.zip" .)
+python3 "$root/.github/scripts/research-release-bundle.py" pack "$work/research-image-release.tar" "$work/release"
+(cd "$work" && zip -q "$work/release.zip" research-image-release.tar)
 cp "$work/release.zip" "$work/clean.zip"
 cat >"$work/bin/gh" <<'SH'
 #!/usr/bin/env bash
@@ -55,8 +56,8 @@ for mode in wrong-workflow wrong-source failed-job expired rerun extra digest at
   cp "$work/clean.zip" "$work/release.zip"
   case "$mode" in
     extra) (cd "$work/release" && touch unexpected && zip -q "$work/release.zip" unexpected); rm "$work/release/unexpected" ;;
-    digest) cp "$work/release/research-bin/alpha-harness" "$work/original"; printf 'tampered\n' >>"$work/release/research-bin/alpha-harness"; (cd "$work/release" && zip -q "$work/release.zip" research-bin/alpha-harness); cp "$work/original" "$work/release/research-bin/alpha-harness" ;;
-    attempt) cp "$work/release/research-image-release.json" "$work/original.json"; jq '.workflow_run_attempt=1' "$work/original.json" >"$work/release/research-image-release.json"; (cd "$work/release" && zip -q "$work/release.zip" research-image-release.json); cp "$work/original.json" "$work/release/research-image-release.json" ;;
+    digest) cp "$work/release/research-bin/alpha-harness" "$work/original"; printf 'tampered\n' >>"$work/release/research-bin/alpha-harness"; rm "$work/research-image-release.tar"; python3 "$root/.github/scripts/research-release-bundle.py" pack "$work/research-image-release.tar" "$work/release"; (cd "$work" && zip -q "$work/release.zip" research-image-release.tar); cp "$work/original" "$work/release/research-bin/alpha-harness" ;;
+    attempt) cp "$work/release/research-image-release.json" "$work/original.json"; jq '.workflow_run_attempt=1' "$work/original.json" >"$work/release/research-image-release.json"; rm "$work/research-image-release.tar"; python3 "$root/.github/scripts/research-release-bundle.py" pack "$work/research-image-release.tar" "$work/release"; (cd "$work" && zip -q "$work/release.zip" research-image-release.tar); cp "$work/original.json" "$work/release/research-image-release.json" ;;
   esac
   if "$root/.github/scripts/download-research-release.sh" 1234 "$source_sha" "$work/rejected-$mode" >"$work/$mode.log" 2>&1; then
     echo "invalid software provenance accepted: $mode" >&2; exit 1

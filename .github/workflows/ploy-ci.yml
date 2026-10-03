@@ -34,7 +34,7 @@ jobs:
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -82,7 +82,7 @@ jobs:
     if: ${{ github.event_name == 'pull_request' && contains(needs.image-smoke-scope.outputs.jobs, ',ploy/commit-hygiene,') }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -111,7 +111,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -215,10 +215,10 @@ jobs:
     env:
       CARGO_PROFILE_RELEASE_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
       - name: Install build dependencies
@@ -227,7 +227,7 @@ jobs:
         id: build-inputs
         working-directory: .
         run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             rust_hft
@@ -241,10 +241,10 @@ jobs:
           MONDAY_BUILD_INPUTS_FILE: ${{ runner.temp }}/research-build-inputs.json
         run: bash .github/scripts/build-research-release.sh
       - name: Upload research image release
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: research-image-release-${{ github.sha }}
-          path: ${{ runner.temp }}/research-release/
+          path: ${{ runner.temp }}/research-image-release.tar
           if-no-files-found: error
           retention-days: 7
 
@@ -255,14 +255,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: research-image-release-${{ github.sha }}
-          path: ${{ runner.temp }}/research-release
+          path: ${{ runner.temp }}/research-release-download
       - name: Smoke the same release binaries without network
         working-directory: .
-        run: bash .github/scripts/research-image-smoke.sh "${RUNNER_TEMP}/research-release"
+        run: |
+          python3 .github/scripts/research-release-bundle.py unpack "${RUNNER_TEMP}/research-release-download/research-image-release.tar" "${RUNNER_TEMP}/research-release"
+          bash .github/scripts/research-image-smoke.sh "${RUNNER_TEMP}/research-release"
 
   rust-format:
     name: Rust formatting
@@ -271,8 +273,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
           components: rustfmt
@@ -291,7 +293,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Validate frontend route contract
         run: node ploy-frontend/scripts/check-route-contract.mjs
@@ -443,7 +445,7 @@ jobs:
     timeout-minutes: 12
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -485,7 +487,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -516,7 +518,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: rust-control-plane-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
@@ -588,7 +590,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "false"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -618,7 +620,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: rust-runner-lean-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
@@ -656,7 +658,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "false"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -686,7 +688,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: rust-runner-full-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
@@ -740,7 +742,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "false"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -770,7 +772,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: rust-market-data-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
@@ -814,14 +816,14 @@ jobs:
       DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
       PLOY_TEST_DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
           components: clippy
       - name: Install build dependencies
         run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev libpq-dev clang lld
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           key: prediction-research-heavy
@@ -837,7 +839,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -852,7 +854,7 @@ jobs:
           toolchain: 1.98.1
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: frontend-contracts-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
@@ -951,7 +953,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -981,7 +983,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: rust-integration-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
