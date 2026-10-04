@@ -1,8 +1,8 @@
 prediction-policy-dependencies.v6
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:1109bfa7d9315f696d48dbdad47e4e16e561c80dc74314d3eba4abf4902d8e64
-input:Cargo.toml=sha256:a844f776f78a7087501979a1fcd0ca4f90f1e21073fdedc1a04e2bd5d97dc25d
+input:Cargo.lock=sha256:767135b23928a8c6f6b559136cc544b51cfc017a48fe2380f98c1e713d85197b
+input:Cargo.toml=sha256:6512e63424ea763b0dceed0ecc49c2ba63415851925309b97554c1ff4c514d79
 input:crates/ploy-research/Cargo.toml=sha256:3d3cc6e52da9335b915c79d776fa335f21c88cda447daffc097cc9755d6c9291
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
@@ -14,9 +14,9 @@ input:../market-core/ports/Cargo.toml=sha256:b4a14d8c0da7c5db8b536228012587959de
 input:../market-core/snapshot/Cargo.toml=sha256:2531e664d3e1fb98777215393126c0561d949a15fcf9a412ba6efe217e60a31f
 input:../risk-control/oms-core/Cargo.toml=sha256:62ddf714dfdd4870c2dd2b194ebaa61e3a72e01263a1fceea0cef2f50758f7d9
 input:../risk-control/portfolio-core/Cargo.toml=sha256:7aa5c2f8524cf8007bb84733a2d90280915a74f74ba22020a42745360629c2fe
-input:../shared/Cargo.toml=sha256:60dd7b6b6fdf9a65afdeab206f4be0edbfa20195176961ea9a940e0461d3ea77
+input:../shared/Cargo.toml=sha256:9d856f6204659e29f36a6e13ec73904882b84b554b7f7120e3bb12488ac2ff57
 input:../data-pipelines/Cargo.toml=sha256:7771b21350fe2b6fb7ad1588790fa28a4f60a5a0a00874bce897c0f6b4d0442e
-input:../research-core/Cargo.toml=sha256:fe11da8a330ceedcfb31dc2704fcfc827d0805306a0f856450af39266336a265
+input:../research-core/Cargo.toml=sha256:cbd3f67825e15dbc46d82889398b3b40a85405063b2bd2eef8e1983df7ffd739
 input:../runtime/Cargo.toml=sha256:ab8397f33b04d0e7c8ff1a1ed35c436f8e198fa9da9020f70c855894081c4612
 input:../research-core/search-kernel/Cargo.toml=sha256:d5a4731c11fce22c0e358097bd38fb05a674659ac2afbd7c72112285093bdec6
 package:allocator-api2@0.2.21|source=registry+https://github.com/rust-lang/crates.io-index|checksum=683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923|features=alloc
