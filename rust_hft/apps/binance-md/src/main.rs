@@ -2,11 +2,11 @@
 //!
 //! This binary is intentionally narrow: it owns live WebSocket/REST I/O,
 //! replay files, latency summaries, and paper evaluation. The hot lane remains
-//! in `engine::binance_md`.
+//! in `hft-binance-depth`.
 
 use clap::{Parser, Subcommand};
 use data_adapter_binance::BinanceRestClient;
-use engine::binance_md::{
+use hft_binance_depth::{
     normalize_depth_update, parse_fixed_6, read_replay_records, write_replay_batch,
     BinanceDepthUpdate, BookSyncState, FeatureSnapshot, LatencyTrace, MarketDataLane,
     ParsedDepthUpdate, ReplayBatch, ReplayKind, ReplayPayload, ReplayRecord, SequenceDecision,
@@ -1290,7 +1290,7 @@ fn fixed_to_float(value: i64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::binance_md::{ReplayPayload, Signal};
+    use hft_binance_depth::{ReplayPayload, Signal};
 
     #[test]
     fn replay_ndjson_round_trips_records() {
@@ -1467,13 +1467,13 @@ mod tests {
                 last_book_update_id: 101,
                 latency: LatencyTrace::default(),
                 payload: ReplayPayload::Bridge {
-                    result: engine::binance_md::BufferedApplyResult {
+                    result: hft_binance_depth::BufferedApplyResult {
                         applied: 1,
                         ignored_stale: 0,
                         gap: None,
                         decisions: Vec::new(),
                     },
-                    applied_updates: vec![engine::binance_md::ReplayBridgeUpdate {
+                    applied_updates: vec![hft_binance_depth::ReplayBridgeUpdate {
                         symbol_id: BTCUSDT_ID,
                         exchange_ts_ns: 2,
                         receive_ts_ns: 2,

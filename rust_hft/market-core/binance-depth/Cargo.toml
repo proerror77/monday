@@ -1,0 +1,11 @@
+[package]
+workspace = "../../runtime"
+name = "hft-binance-depth"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Binance depth book sync. This crate has no order path."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

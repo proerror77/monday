@@ -6,6 +6,7 @@ edition = "2021"
 description = "單 writer 事件循環：Scheduler/Joiner/BarBuilder/Router"
 
 [dependencies]
+hft-binance-depth = { path = "../binance-depth" }
 hft-core = { package = "hft-core", path = "../core", features = ["histogram"] }
 snapshot = { package = "hft-snapshot", path = "../snapshot" }
 crossbeam = { workspace = true }

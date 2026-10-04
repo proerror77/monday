@@ -295,7 +295,7 @@ dependencies = [
  "rand 0.9.4",
  "rapidhash",
  "ruint",
- "rustc-hash 2.1.2",
+ "rustc-hash",
  "secp256k1 0.31.1",
  "serde",
  "sha3",
@@ -1864,15 +1864,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2932,15 +2923,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-binance-depth"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hft-binance-md"
 version = "0.1.0"
 dependencies = [
  "clap",
  "futures-util",
  "hdrhistogram",
+ "hft-binance-depth",
  "hft-core",
  "hft-data-adapter-binance",
- "hft-engine",
  "rustls",
  "serde",
  "serde_json",
@@ -2967,10 +2966,10 @@ dependencies = [
  "fs4",
  "futures",
  "hex",
+ "hft-binance-depth",
  "hft-core",
  "hft-data",
  "hft-data-adapter-binance",
- "hft-engine",
  "hft-integration",
  "hft-research-manifest",
  "http 0.2.12",
@@ -3002,7 +3001,6 @@ dependencies = [
 name = "hft-core"
 version = "0.1.0"
 dependencies = [
- "hdrhistogram",
  "rust_decimal",
  "serde",
  "thiserror 2.0.18",
@@ -3250,28 +3248,6 @@ dependencies = [
  "serde_json",
  "simd-json",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "hft-engine"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "crossbeam",
- "crossbeam-utils",
- "futures",
- "hdrhistogram",
- "hft-core",
- "hft-ports",
- "hft-snapshot",
- "parking_lot",
- "rust_decimal",
- "rustc-hash 1.1.0",
- "serde",
- "serde_json",
- "smallvec",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4806,7 +4782,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash 2.1.2",
+ "rustc-hash",
  "rustls",
  "socket2",
  "thiserror 2.0.18",
@@ -4828,7 +4804,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_pcg",
  "ring",
- "rustc-hash 2.1.2",
+ "rustc-hash",
  "rustls",
  "rustls-pki-types",
  "slab",
@@ -5329,12 +5305,6 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
-
-[[package]]
-name = "rustc-hash"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
