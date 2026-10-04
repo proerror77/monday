@@ -3,6 +3,7 @@
 # 用途：在本地快速驗證常用 feature 組合是否能編譯通過
 
 set -e
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # 顏色定義
 RED='\033[0;31m'
@@ -52,9 +53,9 @@ check_crate_feature() {
     # 執行檢查，捕獲輸出並檢查是否有錯誤
     local output
     if [ -n "$feature" ]; then
-        output=$(cargo check -p "$crate" --features "$feature" 2>&1)
+        output=$("$SCRIPT_DIR/cargo-scoped.sh" check -p "$crate" --features "$feature" 2>&1)
     else
-        output=$(cargo check -p "$crate" 2>&1)
+        output=$("$SCRIPT_DIR/cargo-scoped.sh" check -p "$crate" 2>&1)
     fi
 
     # 檢查是否編譯成功（查找 "Finished" 而不是 "error"）

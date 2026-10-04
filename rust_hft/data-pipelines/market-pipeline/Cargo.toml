@@ -1,0 +1,26 @@
+[package]
+name = "hft-market-pipeline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+workspace = ".."
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+data = { package = "hft-data", path = "../core", features = ["columnar"] }
+tokio = { version = "1", default-features = false, optional = true, features = ["rt-multi-thread", "macros", "time", "net"] }
+reqwest = { version = "0.12", default-features = false, optional = true, features = ["rustls-tls", "json"] }
+sqlx-core = { version = "=0.8.6", optional = true, default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json"] }
+sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false, features = ["json"] }
+libc = { version = "0.2", optional = true }
+
+[features]
+default = []
+import = ["dep:tokio", "dep:reqwest", "dep:sqlx-core", "dep:sqlx-postgres", "dep:libc"]
+
+[[bin]]
+name = "monday-market-pipeline"
+path = "src/bin/monday-market-pipeline.rs"

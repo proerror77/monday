@@ -21,6 +21,7 @@ env:
   TZ: UTC
   LC_ALL: C
   LANG: C
+  CARGO_TARGET_DIR: ${{ github.workspace }}/rust_hft/target
   RELEASE_PACKAGES: hft-live hft-paper hft-all-in-one hft-replay hft-backtest hft-collector
 
 jobs:
@@ -103,7 +104,7 @@ jobs:
         with:
           workspaces: |
             rust_hft
-          key: release-${{ matrix.target }}-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/Cargo.lock') }}
+          key: release-${{ matrix.target }}-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/**/Cargo.lock') }}
           cache-all-crates: true
 
       - name: Set reproducible build metadata
@@ -114,7 +115,7 @@ jobs:
         run: |
           set -euo pipefail
           for package in ${RELEASE_PACKAGES}; do
-            cargo build --release --locked --target "${{ matrix.target }}" -p "${package}"
+            "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" build --release --locked --target "${{ matrix.target }}" -p "${package}"
           done
 
       - name: Package artifacts

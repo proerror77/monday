@@ -33,7 +33,7 @@ DURATION="${DURATION:-90}"   # seconds
 
 echo "[info] Building collector (release, host target)..." | tee -a "$LOG_FILE"
 HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
-cargo build --release --locked --target "$HOST_TRIPLE" \
+CARGO_TARGET_DIR="$ROOT_DIR/target" cargo build --manifest-path "$ROOT_DIR/data-pipelines/Cargo.toml" --release --locked --target "$HOST_TRIPLE" \
   -p hft-collector --bin hft-collector | tee -a "$LOG_FILE"
 
 BIN=""

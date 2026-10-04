@@ -28,13 +28,17 @@ jobs:
   image-smoke-selector:
     name: CI job selector
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
     outputs:
-      jobs: ${{ steps.scope.outputs.jobs }}
+      jobs: ${{ steps.cumulative.outputs.jobs || steps.scope.outputs.jobs }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
+      research_product: ${{ steps.cumulative.outputs.research_product || steps.scope.outputs.research_product }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -50,6 +54,16 @@ jobs:
           --base "${BASE_SHA}"
           --head "${HEAD_SHA}"
 
+      - name: Carry unpublished research image impact
+        id: cumulative
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
+          SELECTED_RESEARCH_PRODUCT: ${{ steps.scope.outputs.research_product }}
+        run: bash .github/scripts/select-main-research-scope.sh "$GITHUB_SHA" "$GITHUB_OUTPUT"
+
   image-smoke-scope:
     name: Research image smoke scope
     needs: image-smoke-selector
@@ -58,6 +72,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       jobs: ${{ steps.scope.outputs.jobs }}
+      research_product: ${{ needs.image-smoke-selector.outputs.research_product }}
     steps:
       - name: Resolve selector result
         id: scope
@@ -82,7 +97,7 @@ jobs:
     if: ${{ github.event_name == 'pull_request' && contains(needs.image-smoke-scope.outputs.jobs, ',ploy/commit-hygiene,') }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -111,7 +126,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -207,67 +222,87 @@ jobs:
     name: Research image binaries
     needs: image-smoke-scope
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/research-image-binaries,') }}
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    container:
+      image: rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-      - name: Wait for signed ACK execution receipt
-        id: ack
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.98.1
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends clang cmake mold pkg-config protobuf-compiler gh jq ruby binutils
+      - name: Capture compiler, native environment and scoped recipe
+        id: build-inputs
+        working-directory: .
+        run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            rust_hft
+            rust_hft/prediction-markets
+          key: research-release-linux-amd64-${{ steps.build-inputs.outputs.cache_sha256 }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Build immutable research release
         working-directory: .
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          .github/scripts/wait-ack-research-receipt.sh research-image-binaries "$(git rev-parse HEAD)" "${RUNNER_TEMP}/ack-receipt"
-      - name: Verify software release metadata
-        working-directory: .
-        run: |
-          .github/scripts/research-image-release-artifact.sh verify-metadata "${RUNNER_TEMP}/ack-receipt/software" "$(git rev-parse HEAD)" "$GITHUB_RUN_ID" rust_hft
+          MONDAY_BUILD_INPUTS_FILE: ${{ runner.temp }}/research-build-inputs.json
+        run: bash .github/scripts/build-research-release.sh "${{ needs.image-smoke-scope.outputs.research_product }}"
       - name: Upload research image release
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: research-image-release-${{ github.sha }}
-          path: ${{ runner.temp }}/ack-receipt/software/
+          name: research-image-release-${{ github.sha }}-${{ needs.image-smoke-scope.outputs.research_product }}
+          path: ${{ runner.temp }}/research-image-release.tar
           if-no-files-found: error
           retention-days: 7
 
   research-image-smoke:
     name: Research image smoke
-    needs:
-      - image-smoke-scope
-      - research-image-binaries
+    needs: [image-smoke-scope, research-image-binaries]
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/research-image-smoke,') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 15
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-      - name: Wait for signed ACK execution receipt
-        id: ack
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: research-image-release-${{ github.sha }}-${{ needs.image-smoke-scope.outputs.research_product }}
+          path: ${{ runner.temp }}/research-release-download
+      - name: Smoke the same release binaries without network
         working-directory: .
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          .github/scripts/wait-ack-research-receipt.sh research-image-smoke "$(git rev-parse HEAD)" "${RUNNER_TEMP}/ack-receipt"
+          ruby .github/scripts/research-release-bundle.rb unpack "${RUNNER_TEMP}/research-release-download/research-image-release.tar" "${RUNNER_TEMP}/research-release" "${{ needs.image-smoke-scope.outputs.research_product }}"
+          bash .github/scripts/research-image-smoke.sh "${RUNNER_TEMP}/research-release" "${{ needs.image-smoke-scope.outputs.research_product }}"
 
   rust-format:
     name: Rust formatting
     needs: image-smoke-scope
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-format,') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 10
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-      - name: Wait for signed ACK execution receipt
-        id: ack
-        working-directory: .
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt
+      - name: Check selected Rust formatting
         run: |
-          .github/scripts/wait-ack-research-receipt.sh prediction-research-format "$(git rev-parse HEAD)" "${RUNNER_TEMP}/ack-receipt"
+          cargo metadata --locked --no-deps --format-version 1 >/tmp/prediction-metadata.json
+          mapfile -t packages < <(jq -r '.packages[].name' /tmp/prediction-metadata.json)
+          args=(); for package in "${packages[@]}"; do args+=(-p "$package"); done
+          cargo fmt "${args[@]}" -- --check
 
   safety-scans:
     name: Retired route and SSH safety scans
@@ -277,7 +312,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Validate frontend route contract
         run: node ploy-frontend/scripts/check-route-contract.mjs
@@ -429,7 +464,7 @@ jobs:
     timeout-minutes: 12
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -471,7 +506,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -502,7 +537,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: rust-control-plane-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
@@ -574,7 +609,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "false"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -604,7 +639,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: rust-runner-lean-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
@@ -642,7 +677,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "false"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -672,7 +707,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: rust-runner-full-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
@@ -726,7 +761,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "false"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -756,7 +791,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: rust-market-data-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
@@ -786,17 +821,34 @@ jobs:
     needs: image-smoke-scope
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-research-heavy,') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-      - name: Wait for signed ACK execution receipt
-        id: ack
-        working-directory: .
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:15
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          .github/scripts/wait-ack-research-receipt.sh prediction-research-heavy "$(git rev-parse HEAD)" "${RUNNER_TEMP}/ack-receipt"
+          POSTGRES_USER: ploy
+          POSTGRES_PASSWORD: ${{ github.run_id }}
+          POSTGRES_DB: ploy_test
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
+      PLOY_TEST_DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: Install build dependencies
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev libpq-dev clang lld
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rust_hft/prediction-markets
+          key: prediction-research-heavy
+      - name: Verify research and ephemeral database contracts
+        working-directory: .
+        run: bash .github/scripts/run-prediction-research-contracts.sh
 
   frontend:
     name: Frontend
@@ -806,7 +858,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -821,7 +873,7 @@ jobs:
           toolchain: 1.98.1
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: frontend-contracts-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
@@ -920,7 +972,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -950,7 +1002,7 @@ jobs:
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version 2>/dev/null | awk '{print $2}' || true)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft/prediction-markets
           shared-key: rust-integration-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}

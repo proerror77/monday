@@ -1361,8 +1361,8 @@ awk '
   /- name: Remove ACR credentials/ {
     if (getline <= 0) exit 1
     sub(/^[[:space:]]+/, "")
-    if ($0 != "if: ${{ (always()) && !matrix.research_artifact }}") {
-      print "native ACR credential cleanup must run always and exclude ACK research artifacts" > "/dev/stderr"
+    if ($0 != "if: always()") {
+      print "native ACR credential cleanup must run always for every image, including research artifacts" > "/dev/stderr"
       exit 1
     }
     found = 1

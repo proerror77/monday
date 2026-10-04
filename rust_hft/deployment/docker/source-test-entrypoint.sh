@@ -12,12 +12,12 @@ cp -a "$source_cargo_home"/. "$CARGO_HOME"/
 run_profile() {
   package=$1
   shift
-  test_list=$(cargo test --offline --locked -p "$package" --lib "$@" -- --list) || exit $?
+  test_list=$(cargo test --manifest-path runtime/Cargo.toml --offline --locked -p "$package" --lib "$@" -- --list) || exit $?
   if ! printf '%s\n' "$test_list" | grep -q ': test$'; then
     echo 'approved source-test profile selected no library tests' >&2
     exit 1
   fi
-  exec cargo test --offline --locked -p "$package" --lib "$@"
+  exec cargo test --manifest-path runtime/Cargo.toml --offline --locked -p "$package" --lib "$@"
 }
 
 case "${1-}" in

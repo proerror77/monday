@@ -15,6 +15,7 @@ on:
         options:
           - all
           - research-runner
+          - campaign-cycle-controller
           - research-source-test
           - hft-trading
           - binance-lob-archiver
@@ -60,6 +61,7 @@ jobs:
       matrix: ${{ steps.select.outputs.matrix }}
       publish_target: ${{ steps.source.outputs.publish_target }}
       research_mode: ${{ steps.source.outputs.research_mode }}
+      research_product: ${{ steps.source.outputs.research_product }}
       source_sha: ${{ steps.source.outputs.source_sha }}
       artifact_run_id: ${{ steps.source.outputs.artifact_run_id }}
       source_test_profile: ${{ steps.source.outputs.source_test_profile }}
@@ -72,7 +74,7 @@ jobs:
 
       - name: Read authenticated reusable research source
         id: source-jobs
-        if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && (inputs.target == 'research-runner' || inputs.target == 'all') && inputs.rebuild_research_runner != true)
+        if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && (inputs.target == 'research-runner' || inputs.target == 'campaign-cycle-controller' || inputs.target == 'all') && inputs.rebuild_research_runner != true)
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -112,6 +114,7 @@ jobs:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           SOURCE_RUN_ID: ${{ steps.source-jobs.outputs.artifact_run_id }}
           AUTOMATION_STATE: ${{ steps.source-jobs.outputs.automation_state }}
+          RESEARCH_PRODUCT: ${{ steps.source-jobs.outputs.research_product || 'paired' }}
           PUBLISH_TARGET: ${{ inputs.target }}
           REBUILD_RESEARCH_RUNNER: ${{ inputs.rebuild_research_runner }}
           SOURCE_TEST_SOURCE_SHA: ${{ inputs.source_test_source_sha }}
@@ -125,6 +128,7 @@ jobs:
           SECURITY_CONCLUSION: ${{ steps.source-jobs.outputs.security_conclusion || steps.admission.outputs.security_conclusion }}
         run: |
           .github/scripts/select-acr-publish-source.sh \
+            --product "$RESEARCH_PRODUCT" \
             --event "$EVENT_NAME" \
             --conclusion "$SOURCE_CONCLUSION" \
             --source-event "$SOURCE_EVENT" \
@@ -154,7 +158,6 @@ jobs:
           matrix=$(jq -cn --arg target "$TARGET" '
             [{repository:"research-runner",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt",research_artifact:true},
              {repository:"campaign-cycle-controller",context:".",file:"deployment/aliyun/research/Dockerfile.campaign-cycle-controller",target:"prebuilt",research_artifact:true},
-             {repository:"research-data-service",context:".",file:"deployment/aliyun/research/Dockerfile.research-data",target:"prebuilt",research_artifact:true},
              {repository:"hft-trading",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.trading",target:"runtime",research_artifact:false},
              {repository:"binance-lob-archiver",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.binance-lob-archiver",target:"runtime",research_artifact:false},
              {repository:"polymarket-evidence-compiler",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler",target:"runtime",research_artifact:false},
@@ -162,36 +165,48 @@ jobs:
             | {include: map(select(
                 $target == "all" or .repository == $target
                 or ($target == "research-runner" and .repository == "campaign-cycle-controller")
-                or ($target == "research-runner" and .repository == "research-data-service")
               ))}')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   research-runner-binaries:
+    name: Research release binaries
     needs: selector
     if: needs.selector.outputs.research_mode == 'rebuild'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    container:
+      image: rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+    timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.selector.outputs.source_sha }}
-      - name: Wait for signed ACK execution receipt
-        id: ack
-        working-directory: .
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.98.1
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends clang cmake mold pkg-config protobuf-compiler gh jq ruby binutils
+      - name: Capture compiler, native environment and scoped recipe
+        id: build-inputs
+        run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            rust_hft
+            rust_hft/prediction-markets
+          key: research-release-linux-amd64-${{ steps.build-inputs.outputs.cache_sha256 }}
+      - name: Build immutable research release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          .github/scripts/wait-ack-research-receipt.sh research-release-binaries "$(git rev-parse HEAD)" "${RUNNER_TEMP}/ack-receipt"
-      - name: Verify software release metadata
-        working-directory: .
-        run: |
-          .github/scripts/research-image-release-artifact.sh verify-metadata "${RUNNER_TEMP}/ack-receipt/software" "$(git rev-parse HEAD)" "$GITHUB_RUN_ID" rust_hft
+          MONDAY_BUILD_INPUTS_FILE: ${{ runner.temp }}/research-build-inputs.json
+        run: bash .github/scripts/build-research-release.sh "${{ needs.selector.outputs.research_product }}"
       - name: Upload research image release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: research-image-release-${{ needs.selector.outputs.source_sha }}
-          path: ${{ runner.temp }}/ack-receipt/software/
+          name: research-image-release-${{ needs.selector.outputs.source_sha }}-${{ needs.selector.outputs.research_product }}
+          path: ${{ runner.temp }}/research-image-release.tar
           if-no-files-found: error
           retention-days: 7
 
@@ -222,12 +237,28 @@ jobs:
         if: ${{ (matrix.repository == 'binance-lob-archiver') && !matrix.research_artifact }}
         run: deployment/aliyun/test-binance-fee-release-contract.sh
 
+      - name: Download authenticated research release
+        if: matrix.research_artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+        run: |
+          .github/scripts/download-research-release.sh "$PRODUCER_RUN" "$SOURCE_SHA" "${RUNNER_TEMP}/research-release" "${{ needs.selector.outputs.research_product }}"
+          test ! -e rust_hft/research-bin
+          cp -R "${RUNNER_TEMP}/research-release/research-bin" rust_hft/research-bin
+
+      - name: Download verified collector image
+        if: matrix.repository == 'binance-lob-archiver'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+        run: bash .github/scripts/read-tested-image.sh "$SOURCE_SHA" "${RUNNER_TEMP}/tested-collector" required binance-lob-archiver
+
       - name: Set up Docker Buildx
-        if: ${{ !matrix.research_artifact }}
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to ACR
-        if: ${{ !matrix.research_artifact }}
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ vars.ACR_REGISTRY }}
@@ -244,8 +275,24 @@ jobs:
           test "$SOURCE_REVISION" = "$current_main"
           .github/scripts/wait-release-required-checks.sh "$SOURCE_REVISION" current-main
 
+      - name: Promote the tested collector image
+        if: matrix.repository == 'binance-lob-archiver'
+        id: promote
+        env:
+          IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/binance-lob-archiver
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+        run: |
+          image_id=$(cat "${RUNNER_TEMP}/tested-collector/image-id.txt")
+          docker tag "$image_id" "$IMAGE_REPOSITORY:$SOURCE_SHA"
+          docker tag "$image_id" "$IMAGE_REPOSITORY:run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker push "$IMAGE_REPOSITORY:$SOURCE_SHA"
+          docker push "$IMAGE_REPOSITORY:run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          digest=$(docker buildx imagetools inspect "$IMAGE_REPOSITORY:$SOURCE_SHA" --format '{{.Manifest.Digest}}')
+          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
-        if: ${{ !matrix.research_artifact }}
+        if: matrix.repository != 'binance-lob-archiver'
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
@@ -268,10 +315,20 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}
 
-      - name: Record immutable image
-        if: ${{ !matrix.research_artifact }}
+      - name: Read back the tested collector image
+        if: matrix.repository == 'binance-lob-archiver'
+        env:
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/binance-lob-archiver@${{ steps.promote.outputs.digest }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
         run: |
-          echo '${{ matrix.repository }}=${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
+          docker pull "$IMAGE"
+          test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$(cat "${RUNNER_TEMP}/tested-collector/image-id.txt")"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")" = "$SOURCE_SHA"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")" = linux/amd64
+
+      - name: Record immutable image
+        run: |
+          echo '${{ matrix.repository }}=${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify Polymarket compiler source binding
         if: ${{ (matrix.repository == 'polymarket-evidence-compiler') && !matrix.research_artifact }}
@@ -337,35 +394,15 @@ jobs:
           retention-days: 90
 
       - name: Verify Campaign cycle controller image
-        if: ${{ (matrix.repository == 'campaign-cycle-controller') && !matrix.research_artifact }}
+        if: matrix.repository == 'campaign-cycle-controller'
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           set -euo pipefail
           docker pull "$IMAGE"
-          actual_source_revision=$(docker image inspect \
-            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
-            "$IMAGE")
-          test "$actual_source_revision" = "$SOURCE_REVISION"
-          docker run --rm --entrypoint /bin/bash "$IMAGE" -ceu '
-            command -v jq
-            test -x /usr/local/bin/aliyun
-            test -x /usr/local/bin/kubectl
-            test -x /usr/local/bin/alpha-harness
-            test -x /usr/local/bin/binance-market-tape-slicer
-            test -x /usr/local/bin/lob-pit-materializer
-            test -x /usr/local/bin/binance-replay-parquet-materializer
-            test -x /usr/local/bin/cex-materialization-entrypoint.sh
-            bash -n /usr/local/bin/cex-materialization-entrypoint.sh
-            test -x /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
-            test -r /opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml
-          '
-          docker run --rm --entrypoint /usr/local/bin/alpha-harness "$IMAGE" \
-            --version | grep -Fqx "alpha-harness $SOURCE_REVISION"
-          docker run --rm --entrypoint /usr/local/bin/aliyun "$IMAGE" version
-          docker run --rm --entrypoint /usr/local/bin/kubectl "$IMAGE" \
-            version --client=true
+          bash .github/scripts/verify-research-controller-image.sh \
+            "$IMAGE" "$SOURCE_REVISION" "${RUNNER_TEMP}/research-release/research-bin"
 
       - name: Package bare-metal trading host contract
         if: ${{ (matrix.repository == 'hft-trading') && !matrix.research_artifact }}
@@ -450,7 +487,7 @@ jobs:
       - name: Extract collector binaries for bare-metal ECS
         if: ${{ (matrix.repository == 'binance-lob-archiver') && !matrix.research_artifact }}
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
         run: |
           mkdir -p artifact
           docker pull "$IMAGE"
@@ -706,8 +743,28 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Read back research image source and executable bytes
+        if: matrix.research_artifact
+        env:
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          IMAGE_REPOSITORY: ${{ matrix.repository }}
+        run: |
+          docker pull "$IMAGE"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE")" = "$SOURCE_REVISION"
+          container_id=$(docker create "$IMAGE")
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          mkdir -p "${RUNNER_TEMP}/image-readback"
+          if [[ "$IMAGE_REPOSITORY" == research-runner ]]; then product=runner; else product=controller; fi
+          binaries=()
+          while IFS= read -r binary; do binaries+=("$binary"); done < <(bash .github/scripts/research-release-products.sh binaries "$product")
+          for binary in "${binaries[@]}"; do
+            docker cp "$container_id:/usr/local/bin/$binary" "${RUNNER_TEMP}/image-readback/$binary"
+            cmp "${RUNNER_TEMP}/image-readback/$binary" "${RUNNER_TEMP}/research-release/research-bin/$binary"
+          done
+
       - name: Remove ACR credentials
-        if: ${{ (always()) && !matrix.research_artifact }}
+        if: always()
         env:
           ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
         run: |
@@ -715,38 +772,21 @@ jobs:
           docker_config_root=${DOCKER_CONFIG:-$HOME/.docker}
           rm -f -- "$docker_config_root/config.json"
 
-      - name: Wait for signed ACK execution receipt
-        if: matrix.research_artifact
-        id: ack
-        working-directory: .
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          .github/scripts/wait-ack-research-receipt.sh research-release-publish "$(git rev-parse HEAD)" "${RUNNER_TEMP}/ack-receipt"
-      - name: Read back signed research image identity
-        if: matrix.research_artifact
-        env:
-          IMAGE_REPOSITORY: ${{ matrix.repository }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-        run: |
-          jq -e --arg repository "$IMAGE_REPOSITORY" --arg source "$SOURCE_REVISION" '
-            [.images[] | select(.repository == $repository and .source_sha == $source and .smoke_result == "success" and
-              (.digest | test("^sha256:[0-9a-f]{64}$")) and (.digest as $digest | .image_ref | endswith("@" + $digest)))] | length == 1
-          ' "${RUNNER_TEMP}/ack-receipt/receipt.json"
 
   research-release-complete:
-    name: Research release complete (${{ needs.selector.outputs.source_sha }})
+    name: Research release complete [${{ needs.selector.outputs.research_product }}] (${{ needs.selector.outputs.source_sha }})
     needs: [selector, publish]
-    if: always() && needs.selector.result == 'success' && needs.publish.result == 'success' && (needs.selector.outputs.publish_target == 'research-runner' || needs.selector.outputs.publish_target == 'all')
+    if: always() && needs.selector.result == 'success' && needs.publish.result == 'success' && (needs.selector.outputs.publish_target == 'research-runner' || needs.selector.outputs.publish_target == 'campaign-cycle-controller' || needs.selector.outputs.publish_target == 'all')
     runs-on: ubuntu-latest
     steps:
-      - name: Record verified paired publication
+      - name: Record verified product publication
         env:
           SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          PRODUCT: ${{ needs.selector.outputs.research_product }}
           ARTIFACT_RUN_ID: ${{ needs.selector.outputs.artifact_run_id }}
         run: |
           test "$SOURCE_SHA" = "$GITHUB_SHA"
-          printf 'Verified runner and controller: source=%s artifact_run=%s\n' "$SOURCE_SHA" "$ARTIFACT_RUN_ID"
+          printf 'Verified research product=%s source=%s artifact_run=%s\n' "$PRODUCT" "$SOURCE_SHA" "$ARTIFACT_RUN_ID"
 
   publish-source-test:
     needs: selector
@@ -758,10 +798,50 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.selector.outputs.source_sha }}
-      - name: Wait for signed ACK execution receipt
-        id: ack
-        working-directory: .
+      - name: Prepare exact committed source
+        run: |
+          mkdir -p source/rust_hft
+          git archive HEAD rust_hft | tar -x -C source
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ${{ vars.ACR_REGISTRY }}
+          username: ${{ vars.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Build fixed source-test image
+        id: source-build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: rust_hft/deployment/docker/Dockerfile.source-test
+          target: source-test
+          load: true
+          tags: monday-source-test:${{ github.run_id }}
+          build-args: |
+            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}
+      - name: Verify offline domain profile before publication
+        env:
+          PROFILE: ${{ needs.selector.outputs.source_test_profile }}
+        run: docker run --rm --network none monday-source-test:"$GITHUB_RUN_ID" "$PROFILE"
+      - name: Revalidate current main and publish immutable source-test
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          TAG: ${{ needs.selector.outputs.source_test_tag }}
+          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
         run: |
-          .github/scripts/wait-ack-research-receipt.sh research-source-test "$(git rev-parse HEAD)" "${RUNNER_TEMP}/ack-receipt"
+          test "$SOURCE_SHA" = "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          image="$ACR_REGISTRY/wildcard0923/research-source-test:$TAG"
+          docker tag monday-source-test:"$GITHUB_RUN_ID" "$image"
+          docker push "$image"
+          digest=$(docker image inspect --format '{{ index .RepoDigests 0 }}' "$image")
+          docker pull "$digest"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$digest")" = "$SOURCE_SHA"
+          echo "source_test=$digest" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove temporary registry credentials
+        if: always()
+        env:
+          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+        run: docker logout "$ACR_REGISTRY" >/dev/null 2>&1 || true

@@ -1614,6 +1614,14 @@ fn filter_autofactor_reports(
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
+        println!(
+            "monday-prediction-evaluator: evaluate an admitted immutable snapshot\n\
+          --snapshot-dir <directory> --start-date <YYYY-MM-DD> --end-date <YYYY-MM-DD>\n\
+          Evaluation and artifact access require the explicit admission flags."
+        );
+        return;
+    }
     if flag_present(&args, "--pipeline-smoke-task") {
         run_pipeline_smoke(&args).unwrap_or_else(|reason| {
             eprintln!("ERROR: {reason}");

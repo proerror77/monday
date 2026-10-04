@@ -19,7 +19,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
@@ -692,15 +692,17 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
         write_latency_evidence_if_complete(
             bounded_capture_complete && snapshot_bridged,
             path,
-            &symbol,
-            &ws_url,
-            benchmark_context
-                .as_ref()
-                .expect("latency report context validated above"),
-            capture_started_at_micros,
-            now_micros(),
-            &stats,
-            &histograms,
+            &LatencyCapture {
+                symbol: &symbol,
+                websocket_endpoint: &ws_url,
+                benchmark_context: benchmark_context
+                    .as_ref()
+                    .expect("latency report context validated above"),
+                capture_started_at_micros,
+                capture_ended_at_micros: now_micros(),
+                stats: &stats,
+                histograms: &histograms,
+            },
         )?;
     }
     Ok(())
@@ -837,10 +839,8 @@ fn replay_records(
                     summary.parity_mismatches += 1;
                 }
             }
-            ReplayPayload::Signal(signal) => {
-                if pending_signal.take() != Some(*signal) {
-                    summary.parity_mismatches += 1;
-                }
+            ReplayPayload::Signal(signal) if pending_signal.take() != Some(*signal) => {
+                summary.parity_mismatches += 1;
             }
             _ => {}
         }
@@ -1071,28 +1071,33 @@ fn print_histogram(label: &str, stage: &'static str, histogram: &EvidenceHistogr
     );
 }
 
-fn write_latency_evidence(
-    path: &PathBuf,
-    symbol: &str,
-    websocket_endpoint: &str,
-    benchmark_context: &BenchmarkContext,
+struct LatencyCapture<'a> {
+    symbol: &'a str,
+    websocket_endpoint: &'a str,
+    benchmark_context: &'a BenchmarkContext,
     capture_started_at_micros: u64,
     capture_ended_at_micros: u64,
-    stats: &LiveStats,
-    histograms: &LatencyHistograms,
+    stats: &'a LiveStats,
+    histograms: &'a LatencyHistograms,
+}
+
+fn write_latency_evidence(
+    path: &Path,
+    capture: &LatencyCapture<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let stats = capture.stats;
     let artifact = LatencyEvidenceArtifact {
         schema_version: 1,
         evidence_kind: "benchmark",
         generated_at_micros: now_micros(),
-        capture_started_at_micros,
-        capture_ended_at_micros,
+        capture_started_at_micros: capture.capture_started_at_micros,
+        capture_ended_at_micros: capture.capture_ended_at_micros,
         minimum_p999_samples: MIN_P999_SAMPLES,
-        benchmark_context,
+        benchmark_context: capture.benchmark_context,
         capture_provenance: CaptureProvenance {
             venue: "binance_spot",
-            symbol,
-            websocket_endpoint,
+            symbol: capture.symbol,
+            websocket_endpoint: capture.websocket_endpoint,
             protocol: "websocket_tls",
             streams: "diff_depth_100ms_and_book_ticker",
             receive_boundary: "before_websocket_message_to_owned_bytes",
@@ -1145,7 +1150,7 @@ fn write_latency_evidence(
             parser_failures: 0,
         },
         // Context is operator-supplied provenance, not runtime attestation.
-        stages: histograms.reports(false),
+        stages: capture.histograms.reports(false),
     };
     let temporary_path = temporary_evidence_path(path);
     let publish_result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1169,7 +1174,7 @@ fn write_latency_evidence(
     Ok(())
 }
 
-fn temporary_evidence_path(path: &PathBuf) -> PathBuf {
+fn temporary_evidence_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1183,14 +1188,8 @@ fn temporary_evidence_path(path: &PathBuf) -> PathBuf {
 
 fn write_latency_evidence_if_complete(
     bounded_capture_complete: bool,
-    path: &PathBuf,
-    symbol: &str,
-    websocket_endpoint: &str,
-    benchmark_context: &BenchmarkContext,
-    capture_started_at_micros: u64,
-    capture_ended_at_micros: u64,
-    stats: &LiveStats,
-    histograms: &LatencyHistograms,
+    path: &Path,
+    capture: &LatencyCapture<'_>,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     if !bounded_capture_complete {
         invalidate_latency_evidence(path)?;
@@ -1199,20 +1198,11 @@ fn write_latency_evidence_if_complete(
         );
         return Ok(false);
     }
-    write_latency_evidence(
-        path,
-        symbol,
-        websocket_endpoint,
-        benchmark_context,
-        capture_started_at_micros,
-        capture_ended_at_micros,
-        stats,
-        histograms,
-    )?;
+    write_latency_evidence(path, capture)?;
     Ok(true)
 }
 
-fn invalidate_latency_evidence(path: &PathBuf) -> std::io::Result<()> {
+fn invalidate_latency_evidence(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1669,13 +1659,15 @@ mod tests {
         let written = write_latency_evidence_if_complete(
             false,
             &path,
-            "BTCUSDT",
-            BINANCE_SPOT_WS,
-            &benchmark_context(),
-            1,
-            2,
-            &LiveStats::new(),
-            &LatencyHistograms::new(),
+            &LatencyCapture {
+                symbol: "BTCUSDT",
+                websocket_endpoint: BINANCE_SPOT_WS,
+                benchmark_context: &benchmark_context(),
+                capture_started_at_micros: 1,
+                capture_ended_at_micros: 2,
+                stats: &LiveStats::new(),
+                histograms: &LatencyHistograms::new(),
+            },
         )
         .unwrap();
 
@@ -1692,13 +1684,15 @@ mod tests {
         let written = write_latency_evidence_if_complete(
             true,
             &path,
-            "BTCUSDT",
-            BINANCE_SPOT_WS,
-            &benchmark_context(),
-            1,
-            2,
-            &stats,
-            &LatencyHistograms::new(),
+            &LatencyCapture {
+                symbol: "BTCUSDT",
+                websocket_endpoint: BINANCE_SPOT_WS,
+                benchmark_context: &benchmark_context(),
+                capture_started_at_micros: 1,
+                capture_ended_at_micros: 2,
+                stats: &stats,
+                histograms: &LatencyHistograms::new(),
+            },
         )
         .unwrap();
         let artifact: serde_json::Value =
@@ -1727,16 +1721,18 @@ mod tests {
 
         let result = write_latency_evidence(
             &path,
-            "BTCUSDT",
-            BINANCE_SPOT_WS,
-            &benchmark_context(),
-            1,
-            2,
-            &LiveStats {
-                warmup_duration_micros: Some(1),
-                ..LiveStats::new()
+            &LatencyCapture {
+                symbol: "BTCUSDT",
+                websocket_endpoint: BINANCE_SPOT_WS,
+                benchmark_context: &benchmark_context(),
+                capture_started_at_micros: 1,
+                capture_ended_at_micros: 2,
+                stats: &LiveStats {
+                    warmup_duration_micros: Some(1),
+                    ..LiveStats::new()
+                },
+                histograms: &LatencyHistograms::new(),
             },
-            &LatencyHistograms::new(),
         );
         let entries: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
 

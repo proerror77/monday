@@ -7,7 +7,7 @@ set -euo pipefail
 export LC_ALL=C
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 readonly SCRIPT_DIR
-readonly RUST_MANIFEST="$SCRIPT_DIR/../../rust_hft/Cargo.toml"
+readonly RUST_MANIFEST="$SCRIPT_DIR/../../rust_hft/data-pipelines/Cargo.toml"
 readonly VERIFY="$SCRIPT_DIR/../../rust_hft/target/debug/polymarket-raw-ops"
 readonly POLICY="$SCRIPT_DIR/polymarket-shadow-gate-policy.jq"
 readonly LEGACY_HEALTH_POLICY="$SCRIPT_DIR/polymarket-legacy-health-policy.jq"
@@ -1206,7 +1206,7 @@ grep -Fxq 'export TZ=UTC' "$GATE" || {
   printf 'Gate does not force UTC for jq date builtins\n' >&2
   exit 1
 }
-cargo build --quiet --manifest-path "$RUST_MANIFEST" -p hft-collector \
+CARGO_TARGET_DIR="$SCRIPT_DIR/../../rust_hft/target" cargo build --quiet --manifest-path "$RUST_MANIFEST" -p hft-collector \
   --bin polymarket-raw-ops --no-default-features --locked
 "$VERIFY" verify-shadow-parity --help >/dev/null
 

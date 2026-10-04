@@ -1,8 +1,14 @@
 # Rust Workspace
 
 Use the repository-root AGENTS.md for authority, delivery, evidence and validation.
-This is the primary Cargo workspace; prediction-markets currently has a nested
-workspace with its own instructions and pinned toolchain.
+This directory contains six independent Cargo workspaces, registered in
+`workspaces.json`. Each workspace owns its lockfile. Source packages declare one
+owner; the root package belongs to `runtime/Cargo.toml`.
+
+Select packages with `scripts/cargo-scoped.sh` or an explicit owning manifest.
+Keep feature matrices within one owner. The control workspace must not depend
+on acquisition, training, or columnar data conversion. Preserve cross-domain
+contract tests and exact source/attempt/release evidence.
 
 For module ownership and dependency changes, read ARCHITECTURE.md and
 ../docs/architecture/REPOSITORY_LAYOUT.md. Select packages from Cargo manifests;
