@@ -1,12 +1,15 @@
 //! Label-free market representation and explicit supervised adaptation contracts.
 use crate::sequence::{
-    valid_sha256, validate_sequence_shards, SequenceInputSpecV1, SequenceShardV1, SequenceViewV1,
+    valid_sha256, validate_sequence_shards_with_extension, SequenceInputSpecV1, SequenceShardV1,
+    SequenceViewV1,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const FEATURE_SCHEMA: &str = "monday.market_features.v1";
 pub const TARGET_SCHEMA: &str = "monday.market_targets.v1";
+pub const FEATURE_PARQUET_SCHEMA: &str = "monday.market_features.parquet.v1";
+pub const TARGET_PARQUET_SCHEMA: &str = "monday.market_targets.parquet.v1";
 pub const ENCODER_SCHEMA: &str = "monday.market_encoder.v1";
 pub const TASK_SCHEMA: &str = "monday.market_task.v1";
 pub const TASK_HORIZON_MS: i64 = 30_000;
@@ -20,15 +23,27 @@ pub fn bytes_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn validate_market_shards(shards: &[SequenceShardV1]) -> Result<(), String> {
-    validate_sequence_shards(shards)?;
+fn validate_market_shards(shards: &[SequenceShardV1], parquet: bool) -> Result<(), String> {
+    validate_sequence_shards_with_extension(shards, if parquet { ".parquet" } else { ".jsonl" })?;
+    if parquet
+        && shards
+            .iter()
+            .any(|s| s.bytes > crate::prepared_market::MAX_PREPARED_SHARD_BYTES)
+    {
+        return Err("prepared market shard exceeds bounded input buffer".into());
+    }
     let (bytes, rows) = shards
         .iter()
         .try_fold((0_u64, 0_u64), |(bytes, rows), s| {
             Some((bytes.checked_add(s.bytes)?, rows.checked_add(s.rows)?))
         })
         .ok_or("market dataset size overflow")?;
-    if bytes > 8 * 1024 * 1024 * 1024 || rows > 14 * 86_400 {
+    let max_rows = if parquet {
+        crate::prepared_market::MAX_PREPARED_MARKET_ROWS
+    } else {
+        14 * 86_400
+    };
+    if bytes > 8 * 1024 * 1024 * 1024 || rows > max_rows {
         return Err("market dataset exceeds byte or row budget".into());
     }
     Ok(())
@@ -97,14 +112,16 @@ pub struct MarketFeatureDatasetV1 {
 impl MarketFeatureDatasetV1 {
     pub fn validate(&self) -> Result<(), String> {
         self.input.validate()?;
-        if self.schema_version != FEATURE_SCHEMA
-            || self.venue != "binance-usdm"
+        if !matches!(
+            self.schema_version.as_str(),
+            FEATURE_SCHEMA | FEATURE_PARQUET_SCHEMA
+        ) || self.venue != "binance-usdm"
             || self.symbol != "SOLUSDT"
             || !valid_sha256(&self.source_manifest_sha256)
         {
             return Err("invalid market feature dataset identity".into());
         }
-        validate_market_shards(&self.shards)
+        validate_market_shards(&self.shards, self.schema_version == FEATURE_PARQUET_SCHEMA)
     }
     pub fn digest(&self) -> Result<String, String> {
         self.validate()?;
@@ -122,13 +139,15 @@ pub struct MarketTargetDatasetV1 {
 }
 impl MarketTargetDatasetV1 {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != TARGET_SCHEMA
-            || !valid_sha256(&self.feature_dataset_sha256)
+        if !matches!(
+            self.schema_version.as_str(),
+            TARGET_SCHEMA | TARGET_PARQUET_SCHEMA
+        ) || !valid_sha256(&self.feature_dataset_sha256)
             || self.horizon_ms != TASK_HORIZON_MS
         {
             return Err("invalid market target dataset binding".into());
         }
-        validate_market_shards(&self.shards)
+        validate_market_shards(&self.shards, self.schema_version == TARGET_PARQUET_SCHEMA)
     }
     pub fn digest(&self) -> Result<String, String> {
         self.validate()?;
