@@ -111,13 +111,7 @@ impl ArtifactGateway {
                 artifact.bytes <= 4 * 1024 * 1024 * 1024,
                 "artifact exceeds admitted readback limit"
             );
-            if !receipt.prepared_view.as_ref().is_some_and(|v| {
-                v.blocks
-                    .iter()
-                    .any(|b| b.sha256 == artifact.sha256 && b.bytes == artifact.bytes)
-            }) {
-                self.verify_artifact(artifact).await?;
-            }
+            self.verify_artifact(artifact).await?;
         }
         if let Some(view) = &receipt.prepared_view {
             let mut orders =
@@ -220,9 +214,7 @@ impl Reconciler {
         };
         println!("{}", event(&locked.task.id, "reconcile_started"));
         locked.task.expire(locked.now_ms)?;
-        if locked.task.state != State::Stopping
-            && self.ledger.admission(&locked.task.spec).await?.is_none()
-        {
+        if self.ledger.admission(&locked.task.spec).await?.is_none() {
             locked.task.stop(State::Cancelled, false)?;
         }
         if locked.task.state == State::Stopping {
@@ -237,6 +229,9 @@ impl Reconciler {
                 .stop(&locked.task.spec, &lease, locked.task.execution.as_ref())
                 .await?
             {
+                if self.ledger.admission(&locked.task.spec).await?.is_none() {
+                    locked.task.stop(State::Cancelled, false)?;
+                }
                 locked.task.stopped(lease.attempt, lease.fence)?;
             }
             locked.commit("stop_reconciled").await?;
@@ -354,4 +349,153 @@ pub fn event(task_id: &str, stage: &str) -> serde_json::Value {
 
 pub fn config_identity(config: &ServiceConfig) -> Result<String> {
     Ok(sha256(&serde_json::to_vec(config)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        data::{
+            BlockRef, DataViewSpec, Exit, FeatureFrame, PublishedView, Split, TypedBlock, Window,
+        },
+        execution::{Backend, Profile},
+        identity,
+        orchestrator::{Artifact, TaskKind, TaskSpec},
+        prepared,
+    };
+    use std::{collections::BTreeMap, sync::Arc};
+
+    #[tokio::test]
+    async fn prepared_receipt_verifies_each_key_even_when_digests_match() -> Result<()> {
+        let digest = "a".repeat(64);
+        let spec = TaskSpec {
+            schema: 1,
+            kind: TaskKind::Prepare,
+            run_manifest_sha256: digest.clone(),
+            view_manifest_sha256: digest.clone(),
+            source_sha256: digest.clone(),
+            image: format!("fixture@sha256:{digest}"),
+            command: vec!["/app/prepare".into()],
+            profile: Profile {
+                backend: Backend::KubernetesJob,
+                cluster: "fixture".into(),
+                namespace: "research".into(),
+                service_account: "worker".into(),
+                architecture: "amd64".into(),
+                cpu_millis: 1000,
+                memory_mib: 128,
+                scratch_mib: 64,
+                gpu: 0,
+                acceptance_sha256: digest.clone(),
+                prepared_pvc: None,
+                worker_secret: None,
+            },
+            timeout_ms: 5000,
+            max_attempts: 1,
+            output_prefix: "research/fixture".into(),
+            fit_identity_sha256: None,
+        };
+        let mut task = Task::new(spec)?;
+        let lease = task.claim("owner", 1000, 1000)?;
+        let typed = TypedBlock::Features(vec![FeatureFrame {
+            segment: "fixture".into(),
+            ordinal: 0,
+            event_ns: 199,
+            available_ns: 200,
+            values: vec![1.0],
+        }]);
+        let block = prepared::encode(&typed)?;
+        let block_sha = sha256(&block);
+        let prefix = format!("{}/{}/{}/", task.spec.output_prefix, task.id, task.attempt);
+        let artifact = Artifact {
+            key: format!("{prefix}{block_sha}.mondaybin"),
+            sha256: block_sha.clone(),
+            bytes: block.len() as u64,
+        };
+        let missing = Artifact {
+            key: format!("{prefix}missing.mondaybin"),
+            ..artifact.clone()
+        };
+        let receipt = ResultReceipt {
+            task_id: task.id.clone(),
+            attempt: lease.attempt,
+            fence: lease.fence,
+            view_manifest_sha256: task.spec.view_manifest_sha256.clone(),
+            source_sha256: task.spec.source_sha256.clone(),
+            image: task.spec.image.clone(),
+            fit_identity_sha256: None,
+            artifacts: vec![artifact.clone(), missing],
+            checkpoint: None,
+            prepared_view: Some(PublishedView {
+                prepared_id: identity(&(&lease.task_id, lease.attempt, lease.fence))?,
+                spec: DataViewSpec {
+                    schema: 1,
+                    venue: "fixture".into(),
+                    instrument: "fixture".into(),
+                    market: "usdm".into(),
+                    depth: 2,
+                    sources: vec![digest.clone()],
+                    normalizer_sha256: digest.clone(),
+                    feature_sql_sha256: digest.clone(),
+                    feature_names: vec!["x".into()],
+                    window: Window {
+                        start_ns: 100,
+                        end_ns: 1000,
+                    },
+                    lookback_ns: 50,
+                    horizons_ns: vec![100],
+                    label_tolerance_ns: 0,
+                    fit_cutoff_ns: 1000,
+                    split: Split::Train,
+                },
+                blocks: vec![BlockRef {
+                    sha256: block_sha,
+                    bytes: artifact.bytes,
+                    rows: 1,
+                    decoded_bytes: crate::data::memory_bytes(&typed),
+                    exit: Exit::Features,
+                }],
+                producer_image: task.spec.image.clone(),
+                source_receipt_sha256: digest,
+            }),
+        };
+        receipt.validate(&task.spec, &lease)?;
+        let objects = Arc::new(BTreeMap::from([
+            (
+                format!("{prefix}receipt.json"),
+                serde_json::to_vec(&receipt)?,
+            ),
+            (artifact.key, block),
+        ]));
+        let app = axum::Router::new().route(
+            "/*key",
+            axum::routing::get(
+                move |axum::extract::Path(key): axum::extract::Path<String>| {
+                    let objects = objects.clone();
+                    async move {
+                        match objects.get(&key) {
+                            Some(bytes) => (reqwest::StatusCode::OK, bytes.clone()),
+                            None => (reqwest::StatusCode::NOT_FOUND, Vec::new()),
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = reqwest::Url::parse(&format!("http://{}/", listener.local_addr()?))?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        // Production construction still requires HTTPS. Only this fixture uses loopback.
+        let gateway = ArtifactGateway {
+            client: reqwest::Client::new(),
+            base,
+            token: "fixture".into(),
+        };
+        let result = gateway.receipt(&task).await;
+        server.abort();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("artifact readback rejected"));
+        Ok(())
+    }
 }

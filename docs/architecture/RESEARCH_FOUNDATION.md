@@ -87,6 +87,8 @@ CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生�
 
 `src/clickhouse.rs` 使用参数绑定的固定 SQL，输出有界 RowBinary；Training / Features / Replay 是三个 typed 出口，不产生 JSONL spool。每次 preparation 有独立 physical generation，由 PG lease/fence 和 DataView advisory lock 准入。旧 attempt 不能覆盖已发布 generation。`research-prepare` worker 在每个 CH 阶段前复查 lease/deadline/撤销，将内容寻址 block 上传后最后写 receipt。
 
+当前 preparation worker 只支持 Train。plan 登记和任务提交都拒绝 Validation 与 Holdout，避免消耗必然失败的 attempt。通用 DataView schema 保留这些 split，未来 evaluator 仍需独立准入。
+
 `src/prepared.rs` 使用带版本和大小上限的 bincode。读取本地文件或对象时，调用方必须核验 manifest 和 block digest。Transport 只提供字节，不能替换解码结果。解码后释放一次性 acquired buffers。
 
 `VerifiedCache` 对缺页执行读取、解码、时钟和 split 验证。cache hit 仍检查当前 view 的合同。多个试验可以复用一个只读 `Arc` batch；模型、optimizer 和 checkpoint 状态分别保存。batch owner 必须计入外部持有 Arc 的内存。LRU 不能单独限制这些引用的总驻留量。
@@ -114,6 +116,10 @@ claim 使用 PG 事务、行锁、revision/fence 和全局 quota。Launching、R
 当前认领使用短事务，provider reconciliation 仍持有 task/global authority 锁。这会串行化 I/O，是明确的吞吐限制。扩容前需要实现基于 revision 的 outbox reconciliation。
 
 取消/超时/重试经过 Stopping。provider foreground delete 绑定 UID，资源不存在且对应 task/attempt/fence 的 Pod 列表为空后才能确认 process-tree stop。TTL、Job 消失或 Session turn interrupt 不是科学 cancel 成功。receipt 必须绑定 task、attempt、fence、输入、source、image、fit，实际 artifacts 和 checkpoint 经独立字节验证；只有停止确认后 PG 才落终态 result，Prepare 同事务发布 view。checkpoint 对当前 attempt 单调，retry 保留已验证 checkpoint，旧 fence 和晚到结果拒绝。
+
+receipt 中每个 artifact key 都要回读。同摘要与大小不能替代另一个 key 的验证。DataView 仅通过 reconciler 的 receipt 回读和停止确认发布；CLI 没有直接登记 manifest 的入口。
+
+Stopping 仍检查 admission 撤销。撤销清除待提交 receipt，并将停止目标改为 Cancelled。成功提交时再次检查撤销，并锁定 admission 行；现有外键约束将并发撤销写入与终态发布排序。
 
 Backend profile 绑定 exact cluster/namespace/service account、架构、CPU/内存/scratch、接受证明及可选 readonly prepared PVC / worker config secret。GPU 显式拒绝。worker service account token 不自动挂载；控制平面 token 与 worker 凭据分开。新接口使用 `agents.kruise.io/v1alpha1` CRD 模板，但没有假定官方 Rust SDK、E2B 完整日志事件 API、memory snapshot 或 provider command reconnect 已被验证。
 

@@ -490,6 +490,20 @@ fn result_manifest_binds_trial_fit_attempt_and_artifact_prefix() {
 }
 
 #[test]
+fn revocation_while_stopping_discards_staged_success() {
+    let mut task = Task::new(task_spec()).unwrap();
+    let lease = task.claim("owner", 1000, 1000).unwrap();
+    task.launched(&lease, 1001, handle(&task, &lease)).unwrap();
+    task.stage_result(&lease, 1002, receipt(&task)).unwrap();
+    assert_eq!(task.state, State::Stopping);
+    task.stop(State::Cancelled, false).unwrap();
+    assert!(task.receipt.is_none());
+    task.stopped(lease.attempt, lease.fence).unwrap();
+    assert_eq!(task.state, State::Cancelled);
+    assert!(!task.retry_after_stop);
+}
+
+#[test]
 fn verified_checkpoint_is_trial_local_monotonic_and_survives_retry() {
     use hft_research_platform::orchestrator::Checkpoint;
     let mut task = Task::new(task_spec()).unwrap();

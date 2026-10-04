@@ -11,6 +11,19 @@ fn hash(c: char) -> String {
     c.to_string().repeat(64)
 }
 
+#[test]
+fn researchctl_rejects_direct_view_publication() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_researchctl"))
+        .args(["publish-view", "unverified.json"])
+        .env_remove("MONDAY_RESEARCH_DATABASE_URL")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("usage: researchctl"));
+    assert!(!error.contains("publish-view MANIFEST"));
+}
+
 /// Only the explicitly named disposable test database is permitted. This test
 /// never targets production, imports business data, or connects to Kubernetes.
 #[tokio::test]
@@ -59,14 +72,29 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         producer_image: format!("fixture@sha256:{}", hash('e')),
         source_receipt_sha256: hash('f'),
     };
-    assert!(ledger.publish_view(&view).await.is_err());
+    let mut plan = hft_research_platform::data::PreparationPlan {
+        spec: view.spec.clone(),
+        source_receipt_sha256: view.source_receipt_sha256.clone(),
+        producer_image: view.producer_image.clone(),
+        recipe_sql: None,
+    };
+    plan.spec.feature_sql_sha256 =
+        hft_research_platform::sha256(hft_research_platform::data::PREPARE_SQL.as_bytes());
+    assert!(ledger.register_plan(&plan).await.is_err());
     // Test-only activation fixture. No application path performs this UPDATE.
     sqlx_core::query::query("UPDATE research.authority SET mode='postgres',legacy_quiescence_sha256=$1,migration_receipt_sha256=$2").bind(hash('a')).bind(hash('b')).execute(&pool).await?;
-    let view_sha = ledger.publish_view(&view).await?;
-    assert_eq!(view_sha, ledger.publish_view(&view).await?);
-    let mut conflicting = view.clone();
-    conflicting.blocks[0].sha256 = hash('e');
-    assert!(ledger.publish_view(&conflicting).await.is_err());
+    // Ledger fixtures do not claim verified object bytes. Production publication
+    // enters through reconciler receipt readback and successful stop only.
+    let view_sha = identity(&view)?;
+    sqlx_core::query::query(
+        "INSERT INTO research.inputs(manifest_sha256,kind,document) VALUES($1,'prepared',$2)",
+    )
+    .bind(&view_sha)
+    .bind(serde_json::to_value(&view)?)
+    .execute(&pool)
+    .await?;
+    sqlx_core::query::query("INSERT INTO research.views(view_id,manifest_sha256,manifest,source_receipt_sha256) VALUES($1,$2,$3,$4)")
+        .bind(view.spec.id()?).bind(&view_sha).bind(serde_json::to_value(&view)?).bind(&view.source_receipt_sha256).execute(&pool).await?;
     let profile = Profile {
         backend: Backend::KubernetesJob,
         cluster: "fixture".into(),
@@ -191,6 +219,41 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
             Ok::<_, anyhow::Error>(())
         }
     };
+    plan.spec.split = Split::Validation;
+    plan.producer_image = spec.image.clone();
+    let plan_id = plan.id()?;
+    assert!(ledger
+        .register_plan(&plan)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("only the training split"));
+    // An older registered plan must also fail before consuming an attempt.
+    sqlx_core::query::query(
+        "INSERT INTO research.inputs(manifest_sha256,kind,document) VALUES($1,'plan',$2)",
+    )
+    .bind(&plan_id)
+    .bind(serde_json::to_value(&plan)?)
+    .execute(&pool)
+    .await?;
+    let mut preparation = spec.clone();
+    preparation.kind = TaskKind::Prepare;
+    preparation.view_manifest_sha256 = plan_id;
+    let mut preparation_run = run.clone();
+    preparation_run.kind = preparation.kind;
+    preparation_run.data_manifest_sha256 = preparation.view_manifest_sha256.clone();
+    preparation.run_manifest_sha256 = ledger.register_run("fixture", &preparation_run).await?;
+    admit(preparation.clone()).await?;
+    assert!(ledger
+        .submit("fixture", "validation", preparation)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("only the training split"));
+    let count: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.tasks")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 0);
     admit(spec.clone()).await?;
     let id = ledger.submit("fixture", "one", spec.clone()).await?;
     assert_eq!(id, ledger.submit("fixture", "one", spec.clone()).await?);
@@ -283,6 +346,72 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     .fetch_one(&pool)
     .await?;
     assert_eq!(intents, 1);
+
+    sqlx_core::query::query("UPDATE research.authority SET mode='postgres'")
+        .execute(&pool)
+        .await?;
+    let mut result = ledger.lock_next("result-owner", 30000).await?.unwrap();
+    let lease = result.task.lease.clone().unwrap();
+    let handle = hft_research_platform::execution::ExecutionHandle {
+        backend: result.task.spec.profile.backend,
+        cluster: result.task.spec.profile.cluster.clone(),
+        namespace: result.task.spec.profile.namespace.clone(),
+        name: hft_research_platform::execution::resource_name(&lease),
+        uid: "fixture-result".into(),
+        attempt: lease.attempt,
+        fence: lease.fence,
+        task_id: result.task.id.clone(),
+        request_sha256: result.task.id.clone(),
+    };
+    result.task.launched(&lease, result.now_ms, handle)?;
+    let receipt = hft_research_platform::orchestrator::ResultReceipt {
+        task_id: result.task.id.clone(),
+        attempt: lease.attempt,
+        fence: lease.fence,
+        view_manifest_sha256: result.task.spec.view_manifest_sha256.clone(),
+        source_sha256: result.task.spec.source_sha256.clone(),
+        image: result.task.spec.image.clone(),
+        fit_identity_sha256: result.task.spec.fit_identity_sha256.clone(),
+        artifacts: vec![hft_research_platform::orchestrator::Artifact {
+            key: format!(
+                "{}/{}/{}/fixture.bin",
+                result.task.spec.output_prefix, result.task.id, lease.attempt
+            ),
+            sha256: hash('f'),
+            bytes: 1,
+        }],
+        checkpoint: None,
+        prepared_view: None,
+    };
+    result.task.stage_result(&lease, result.now_ms, receipt)?;
+    let result_id = result.task.id.clone();
+    result.commit("fixture_result_staged").await?;
+    sqlx_core::query::query(
+        "INSERT INTO research.revocations(request_sha256,reason_receipt_sha256) VALUES($1,$2)",
+    )
+    .bind(&result_id)
+    .bind(hash('f'))
+    .execute(&pool)
+    .await?;
+    let mut stopped = ledger.lock_next("result-owner", 30000).await?.unwrap();
+    stopped.task.stopped(lease.attempt, lease.fence)?;
+    assert!(stopped
+        .commit("fixture_revoked_success")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("admission was revoked"));
+    assert_eq!(ledger.read(&result_id).await?.state, State::Stopping);
+    let count: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.results")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 0);
+    let mut cancelled = ledger.lock_next("result-owner", 30000).await?.unwrap();
+    cancelled.task.stop(State::Cancelled, false)?;
+    cancelled.task.stopped(lease.attempt, lease.fence)?;
+    cancelled.commit("fixture_revoked_cancelled").await?;
+    assert_eq!(ledger.read(&result_id).await?.state, State::Cancelled);
+    assert!(ledger.read(&result_id).await?.receipt.is_none());
 
     let count: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.events")
         .fetch_one(&pool)

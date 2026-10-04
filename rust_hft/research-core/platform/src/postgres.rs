@@ -154,30 +154,12 @@ impl Ledger {
         Ok(permit)
     }
 
-    pub async fn publish_view(&self, view: &PublishedView) -> Result<String> {
-        let manifest_sha = identity(view)?;
-        view.verify(&manifest_sha)?;
-        let view_id = view.spec.id()?;
-        let mut tx = self.pool.begin().await?;
-        Self::authority(&mut tx, false).await?;
-        query("INSERT INTO research.inputs(manifest_sha256,kind,document) VALUES($1,'prepared',$2) ON CONFLICT DO NOTHING").bind(&manifest_sha).bind(serde_json::to_value(view)?).execute(&mut *tx).await?;
-        query("INSERT INTO research.views(view_id,manifest_sha256,manifest,source_receipt_sha256) VALUES($1,$2,$3,$4) ON CONFLICT(view_id) DO NOTHING")
-            .bind(&view_id).bind(&manifest_sha).bind(serde_json::to_value(view)?).bind(&view.source_receipt_sha256).execute(&mut *tx).await?;
-        let existing: String =
-            query_scalar("SELECT manifest_sha256 FROM research.views WHERE view_id=$1")
-                .bind(&view_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        ensure!(
-            existing == manifest_sha,
-            "same DataView spec produced conflicting bytes"
-        );
-        tx.commit().await?;
-        Ok(manifest_sha)
-    }
-
     pub async fn register_plan(&self, plan: &PreparationPlan) -> Result<String> {
         let id = plan.id()?;
+        ensure!(
+            plan.spec.split == crate::data::Split::Train,
+            "preparation worker supports only the training split"
+        );
         let mut tx = self.pool.begin().await?;
         Self::authority(&mut tx, false).await?;
         query("INSERT INTO research.inputs(manifest_sha256,kind,document) VALUES($1,'plan',$2) ON CONFLICT DO NOTHING").bind(&id).bind(serde_json::to_value(plan)?).execute(&mut *tx).await?;
@@ -466,6 +448,10 @@ impl Ledger {
                     && plan.producer_image == task.spec.image,
                 "plan identity mismatch"
             );
+            ensure!(
+                plan.spec.split == crate::data::Split::Train,
+                "preparation worker supports only the training split"
+            );
             plan.spec.split
         } else {
             ensure!(
@@ -632,6 +618,25 @@ impl LockedTask {
     }
 
     pub async fn commit(mut self, event: &str) -> Result<()> {
+        if self.task.state == State::Succeeded {
+            // Revocation inserts take a foreign-key lock on this admission.
+            // This row lock orders them against terminal publication.
+            let value: Value = query_scalar(
+                "SELECT document FROM research.admissions WHERE request_sha256=$1 FOR UPDATE",
+            )
+            .bind(&self.task.id)
+            .fetch_one(&mut *self.tx)
+            .await?;
+            let admission: crate::orchestrator::Admission = serde_json::from_value(value)?;
+            admission.validate(&self.task.spec)?;
+            let revoked: bool = query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM research.revocations WHERE request_sha256=$1)",
+            )
+            .bind(&self.task.id)
+            .fetch_one(&mut *self.tx)
+            .await?;
+            ensure!(!revoked, "terminal publication admission was revoked");
+        }
         let revision = self.revision.checked_add(1).context("revision overflow")?;
         let document = serde_json::to_value(&self.task)?;
         let updated = query("UPDATE research.tasks SET state=$1,document=$2,revision=$3,updated_at=clock_timestamp() WHERE task_id=$4 AND revision=$5")
