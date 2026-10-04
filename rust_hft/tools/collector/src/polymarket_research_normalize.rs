@@ -741,6 +741,7 @@ fn normalize_raw(
         &mut quote_tokens,
         &mut references,
     )?;
+    validate_causal_event_availability(contracts, &rows)?;
     for contract in contracts.values() {
         if !has_all_surfaces(
             contract,
@@ -783,6 +784,69 @@ fn normalize_raw(
         },
         ndjson,
     })
+}
+
+fn validate_causal_event_availability(
+    contracts: &BTreeMap<String, SelectedContract>,
+    rows: &[Row],
+) -> Result<()> {
+    let mut books = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut references = BTreeSet::new();
+    let freshness = chrono::Duration::seconds(CHAINLINK_OPEN_LOOKBACK_SECS);
+    for row in rows {
+        let contract = &contracts[&row.key.market_id];
+        let fields = row.value.as_object().expect("evidence row is an object");
+        match required(fields, "surface")? {
+            "market_contract"
+                if timestamp(required(fields, "available_at")?, "contract available_at")?
+                    > contract.event_start =>
+            {
+                bail!(
+                    "selected market {} has no causally available contract at event open",
+                    contract.market_id
+                );
+            }
+            surface @ ("orderbook_snapshot" | "chainlink_reference") => {
+                let source = timestamp(required(fields, "ts")?, "source ts")?;
+                let available = timestamp(required(fields, "available_at")?, "available_at")?;
+                if source > available {
+                    bail!("selected market {} has a causally unavailable {surface}: source ts is in the future of available_at", contract.market_id);
+                }
+                // Late rows remain evidence, but cannot establish pre-close availability.
+                if available >= contract.event_end || available - source > freshness {
+                    continue;
+                }
+                if surface == "orderbook_snapshot" {
+                    if !["bid_levels", "ask_levels"].iter().all(|field| {
+                        fields
+                            .get(*field)
+                            .and_then(Value::as_array)
+                            .is_some_and(|levels| !levels.is_empty())
+                    }) {
+                        continue;
+                    }
+                    books
+                        .entry(contract.market_id.clone())
+                        .or_default()
+                        .insert(required(fields, "token_id")?.to_owned());
+                } else if source < contract.event_start
+                    && fields.get("is_carried_forward").and_then(Value::as_bool) == Some(false)
+                {
+                    references.insert(contract.market_id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    for contract in contracts.values() {
+        let expected = BTreeSet::from([contract.up_token.clone(), contract.down_token.clone()]);
+        if books.get(&contract.market_id) != Some(&expected)
+            || !references.contains(&contract.market_id)
+        {
+            bail!("selected market {} is causally unavailable: both token books need nonempty bid and ask depth. A fresh pre-open Chainlink observation is required before event end", contract.market_id);
+        }
+    }
+    Ok(())
 }
 
 fn normalize_candidate_raw(
@@ -891,6 +955,185 @@ mod tests {
                 raw_market: json!({}),
             }),
         }
+    }
+
+    fn causal_availability_cohort() -> (BTreeMap<String, SelectedContract>, Vec<Row>) {
+        let mut contracts = BTreeMap::new();
+        for index in 0..3 {
+            let mut contract = selected_contract();
+            contract.market_id = format!("market-{index}");
+            contract.up_token = format!("up-{index}");
+            contract.down_token = format!("down-{index}");
+            contract.event_start += chrono::Duration::minutes(index * 5);
+            contract.event_end += chrono::Duration::minutes(index * 5);
+            contract.discovery_recorded_at = utc_text(contract.event_start);
+            let metadata = contract.metadata.as_mut().unwrap();
+            metadata.retrieved_at = utc_text(contract.event_start);
+            metadata.recorded_at = utc_text(contract.event_start);
+            metadata.tokens = [contract.up_token.clone(), contract.down_token.clone()];
+            contracts.insert(contract.market_id.clone(), contract);
+        }
+        let mut rows = Vec::new();
+        contract_rows(&contracts, &mut rows).unwrap();
+        for contract in contracts.values() {
+            let clock = utc_text(contract.event_start + chrono::Duration::seconds(1));
+            for token in [&contract.up_token, &contract.down_token] {
+                rows.push(row(
+                    SurfaceOrder::OrderbookSnapshot,
+                    contract,
+                    &clock,
+                    token,
+                    1,
+                    json!({"surface": "orderbook_snapshot", "token_id": token,
+                        "ts": clock, "available_at": clock,
+                        "bid_levels": [{"price": "0.49", "size": "10"}],
+                        "ask_levels": [{"price": "0.51", "size": "11"}]}),
+                ));
+            }
+            let reference_clock = utc_text(contract.event_start - chrono::Duration::seconds(1));
+            rows.push(row(
+                SurfaceOrder::ChainlinkReference,
+                contract,
+                &reference_clock,
+                "",
+                1,
+                json!({"surface": "chainlink_reference", "ts": reference_clock,
+                    "available_at": reference_clock, "is_carried_forward": false}),
+            ));
+        }
+        (contracts, rows)
+    }
+
+    #[test]
+    fn causal_availability_accepts_three_independent_events() {
+        let (contracts, rows) = causal_availability_cohort();
+        validate_causal_event_availability(&contracts, &rows).unwrap();
+    }
+
+    #[test]
+    fn causal_availability_rejects_only_at_or_after_open_references() {
+        for offset in [0, 1, 30] {
+            let (contracts, mut rows) = causal_availability_cohort();
+            let reference = rows
+                .iter_mut()
+                .find(|row| {
+                    row.key.market_id == "market-0" && row.value["surface"] == "chainlink_reference"
+                })
+                .unwrap();
+            let clock =
+                utc_text(contracts["market-0"].event_start + chrono::Duration::seconds(offset));
+            reference.value["ts"] = json!(clock);
+            reference.value["available_at"] = json!(clock);
+            let error = validate_causal_event_availability(&contracts, &rows)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("market-0 is causally unavailable"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn causal_availability_rejects_books_without_usable_depth() {
+        for token in ["up-0", "down-0"] {
+            for field in ["bid_levels", "ask_levels"] {
+                for depth in [Value::Null, json!([])] {
+                    let (contracts, mut rows) = causal_availability_cohort();
+                    let book = rows
+                        .iter_mut()
+                        .find(|row| row.value["token_id"] == token)
+                        .unwrap();
+                    book.value[field] = depth;
+                    let error = validate_causal_event_availability(&contracts, &rows)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        error.contains("market-0 is causally unavailable"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn causal_availability_rejects_contract_discovered_during_event() {
+        for offset in [1, 60, WINDOW_SECS - 1] {
+            let (mut contracts, mut rows) = causal_availability_cohort();
+            contracts.get_mut("market-1").unwrap().discovery_recorded_at =
+                utc_text(contracts["market-1"].event_start + chrono::Duration::seconds(offset));
+            rows.retain(|row| row.key.surface != SurfaceOrder::MarketContract);
+            contract_rows(&contracts, &mut rows).unwrap();
+            let error = validate_causal_event_availability(&contracts, &rows)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("market-1 has no causally available contract"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn causal_availability_rejects_a_future_event_without_dropping_it() {
+        for surface in ["orderbook_snapshot", "chainlink_reference"] {
+            let (contracts, mut rows) = causal_availability_cohort();
+            let row = rows
+                .iter_mut()
+                .find(|row| row.key.market_id == "market-2" && row.value["surface"] == surface)
+                .unwrap();
+            row.value["ts"] = json!(utc_text(
+                contracts["market-2"].event_start + chrono::Duration::seconds(2)
+            ));
+            let error = validate_causal_event_availability(&contracts, &rows)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("market-2"), "{error}");
+            assert!(error.contains("source ts is in the future"), "{error}");
+        }
+    }
+
+    #[test]
+    fn causal_availability_rejects_late_only_or_carried_reference() {
+        for available_at in ["2026-07-17T05:31:00Z", "2026-07-17T05:35:00Z"] {
+            let (contracts, mut rows) = causal_availability_cohort();
+            let row = rows
+                .iter_mut()
+                .find(|row| {
+                    row.key.market_id == "market-0" && row.value["surface"] == "chainlink_reference"
+                })
+                .unwrap();
+            row.value["available_at"] = json!(available_at);
+            assert!(validate_causal_event_availability(&contracts, &rows)
+                .unwrap_err()
+                .to_string()
+                .contains("market-0 is causally unavailable"));
+        }
+        let (contracts, mut rows) = causal_availability_cohort();
+        for row in rows
+            .iter_mut()
+            .filter(|row| row.value["surface"] == "chainlink_reference")
+        {
+            row.value["is_carried_forward"] = json!(true);
+        }
+        assert!(validate_causal_event_availability(&contracts, &rows).is_err());
+    }
+
+    #[test]
+    fn causal_availability_rejects_contract_known_only_after_close() {
+        let (contracts, mut rows) = causal_availability_cohort();
+        let row = rows
+            .iter_mut()
+            .find(|row| {
+                row.key.market_id == "market-1" && row.value["surface"] == "market_contract"
+            })
+            .unwrap();
+        row.value["available_at"] = json!(utc_text(contracts["market-1"].event_end));
+        assert!(validate_causal_event_availability(&contracts, &rows)
+            .unwrap_err()
+            .to_string()
+            .contains("market-1 has no causally available contract"));
     }
 
     fn reference_rows(source_ts: &str) -> (SelectedContract, Vec<Row>, BTreeMap<String, u64>) {
