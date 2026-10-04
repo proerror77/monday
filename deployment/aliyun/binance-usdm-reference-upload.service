@@ -28,5 +28,6 @@ ReadWritePaths=/data/monday/spool/binance-usdm-reference
 RestrictAddressFamilies=AF_INET AF_INET6
 UMask=0027
 CPUQuota=20%
+Nice=10
 MemoryHigh=256M
 MemoryMax=384M
