@@ -11,6 +11,8 @@ pub mod orchestrator;
 #[cfg(feature = "control")]
 pub mod postgres;
 pub mod prepared;
+#[cfg(feature = "control")]
+pub mod release;
 pub mod research;
 #[cfg(feature = "control")]
 pub mod service;

@@ -12,6 +12,7 @@ use crate::{
 };
 
 pub const MIGRATION: &str = include_str!("../sql/postgres.sql");
+pub const BUILD_RELEASE_MIGRATION: &str = include_str!("../sql/verified_build_release.sql");
 
 #[derive(Clone)]
 pub struct Ledger {
@@ -245,24 +246,38 @@ impl Ledger {
         tx.commit().await?;
         Ok(id)
     }
-    /// Trusted release metadata import. Launch independently reads actual bytes;
-    /// no cache hit or operator flag substitutes for that readback.
-    pub async fn register_build(&self, artifact: &crate::build::BuildArtifact) -> Result<String> {
+    /// Import the release verifier's signed proof. This can stage a Build while
+    /// authority is paused; it neither admits a Run nor enables a backend.
+    pub async fn register_build(
+        &self,
+        verified: &crate::release::VerifiedBuildRelease,
+    ) -> Result<String> {
+        let artifact = verified.artifact();
         let id = artifact.id()?;
         let mut tx = self.pool.begin().await?;
-        Self::authority(&mut tx, false).await?;
+        query("SELECT mode FROM research.authority WHERE singleton FOR SHARE")
+            .fetch_one(&mut *tx)
+            .await?;
         query("INSERT INTO research.build_artifacts(artifact_sha256,build_sha256,document) VALUES($1,$2,$3) ON CONFLICT DO NOTHING").bind(&id).bind(artifact.build.id()?).bind(serde_json::to_value(artifact)?).execute(&mut *tx).await?;
+        query("INSERT INTO research.build_releases(artifact_sha256,receipt_sha256,trust_sha256,document) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+            .bind(&id).bind(&artifact.release_receipt_sha256).bind(verified.trust_sha256())
+            .bind(serde_json::to_value(verified.signed())?).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(id)
     }
     pub async fn build_artifact(&self, id: &str) -> Result<crate::build::BuildArtifact> {
-        let value: Value =
-            query_scalar("SELECT document FROM research.build_artifacts WHERE artifact_sha256=$1")
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await?;
+        let row = query("SELECT a.document AS artifact,r.document AS release,r.receipt_sha256 FROM research.build_artifacts a JOIN research.build_releases r USING(artifact_sha256) WHERE artifact_sha256=$1")
+            .bind(id).fetch_one(&self.pool).await?;
+        let value: Value = row.get("artifact");
         let artifact: crate::build::BuildArtifact = serde_json::from_value(value)?;
         ensure!(artifact.id()? == id, "build artifact identity changed");
+        let signed: crate::release::SignedBuildRelease =
+            serde_json::from_value(row.get("release"))?;
+        ensure!(
+            row.get::<String, _>("receipt_sha256") == artifact.release_receipt_sha256,
+            "stored release identity changed"
+        );
+        signed.validate_binding(&artifact)?;
         Ok(artifact)
     }
     pub async fn build_for_task(&self, task: &Task) -> Result<crate::build::BuildArtifact> {
