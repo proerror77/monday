@@ -1,8 +1,7 @@
 use crate::cli::{print_json, PredictionExecuteArgs};
 use anyhow::{bail, Context};
 use hft_research_artifacts::{
-    configured_sibling_binary, create_bundle, fetch_to_file, normalized_sha256, publish_result,
-    sha256_file,
+    configured_binary, create_bundle, fetch_to_file, normalized_sha256, publish_result, sha256_file,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -196,9 +195,9 @@ struct ResearchTrialCompletion {
 }
 
 pub fn execute(args: PredictionExecuteArgs) -> anyhow::Result<()> {
-    let runner = configured_sibling_binary(
+    let runner = configured_binary(
         "MONDAY_PREDICTION_RESEARCH_BIN",
-        "monday-prediction-research",
+        Path::new("/usr/local/bin/monday-prediction-research"),
     )?;
     execute_with_runner(args, &runner)
 }

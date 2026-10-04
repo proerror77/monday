@@ -1,8 +1,6 @@
 use crate::cli::{print_json, PredictionSnapshotArgs};
 use anyhow::{bail, Context};
-use hft_research_artifacts::{
-    configured_sibling_binary, create_bundle, publish_result, sha256_file,
-};
+use hft_research_artifacts::{configured_binary, create_bundle, publish_result, sha256_file};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,9 +34,9 @@ struct SnapshotExecutionReport<'a> {
 }
 
 pub fn snapshot(args: PredictionSnapshotArgs) -> anyhow::Result<()> {
-    let compiler = configured_sibling_binary(
+    let compiler = configured_binary(
         "MONDAY_PREDICTION_SNAPSHOT_BIN",
-        "monday-prediction-snapshot",
+        Path::new("/usr/local/bin/monday-prediction-snapshot"),
     )?;
     snapshot_with_compiler(args, &compiler)
 }

@@ -278,23 +278,26 @@ pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
     Ok(hex::encode(digest.finalize()))
 }
 
-pub fn configured_sibling_binary(environment: &str, name: &str) -> anyhow::Result<PathBuf> {
-    let path = std::env::var_os(environment)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(Ok)
-        .unwrap_or_else(|| {
-            let current = std::env::current_exe().context("resolve research executable")?;
-            let parent = current
-                .parent()
-                .context("research executable has no parent directory")?;
-            Ok::<_, anyhow::Error>(parent.join(name))
-        })?;
+pub fn configured_binary(environment: &str, installed_path: &Path) -> anyhow::Result<PathBuf> {
+    let path = binary_path(
+        std::env::var_os(environment)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        installed_path,
+    )?;
     if !path.is_file() {
         bail!(
-            "configured sibling binary does not exist: {}",
+            "configured research binary does not exist: {}",
             path.display()
         );
+    }
+    Ok(path)
+}
+
+fn binary_path(configured: Option<PathBuf>, installed_path: &Path) -> anyhow::Result<PathBuf> {
+    let path = configured.unwrap_or_else(|| installed_path.to_path_buf());
+    if !path.is_absolute() {
+        bail!("research binary path must be absolute: {}", path.display());
     }
     Ok(path)
 }
@@ -381,6 +384,30 @@ pub fn write_json_atomic_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_default_uses_the_installed_product_path() {
+        let installed = Path::new("/usr/local/bin/monday-prediction-research");
+        assert_eq!(binary_path(None, installed).unwrap(), installed);
+    }
+
+    #[test]
+    fn binary_override_must_be_an_explicit_absolute_path() {
+        let installed = Path::new("/usr/local/bin/monday-prediction-research");
+        let root = tempfile::tempdir().unwrap();
+        let configured = root.path().join("research-fixture");
+        assert_eq!(
+            binary_path(Some(configured.clone()), installed).unwrap(),
+            configured
+        );
+        assert!(
+            binary_path(Some(PathBuf::from("relative-fixture")), installed)
+                .unwrap_err()
+                .to_string()
+                .contains("must be absolute")
+        );
+    }
+
     #[test]
     fn platform_root_aliases_are_explicitly_whitelisted() {
         assert!(!is_platform_root_alias(std::ffi::OsStr::new("evil")));

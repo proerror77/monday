@@ -3,7 +3,7 @@ use crate::cli::{
     PredictionDispatchSubmitArgs,
 };
 use anyhow::{bail, Context};
-use hft_research_artifacts::{configured_sibling_binary, fetch_to_file, normalized_sha256};
+use hft_research_artifacts::{configured_binary, fetch_to_file, normalized_sha256};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -320,9 +320,9 @@ struct PredictionStatus {
 pub fn render(args: PredictionDispatchRenderArgs) -> anyhow::Result<()> {
     let submission = load_submission(&args.submission)?;
     let validated = validate_submission(submission)?;
-    let sibling = configured_sibling_binary(
+    let sibling = configured_binary(
         "MONDAY_PREDICTION_SNAPSHOT_BIN",
-        "monday-prediction-snapshot",
+        Path::new("/usr/local/bin/monday-prediction-snapshot"),
     )?;
     let admitted = match admit_submission(validated, &sibling)? {
         AdmissionDecision::Admitted(admitted) => *admitted,
@@ -341,9 +341,9 @@ pub fn submit(args: PredictionDispatchSubmitArgs) -> anyhow::Result<()> {
     validate_cluster_target(&args.context, &args.namespace)?;
     let submission = load_submission(&args.submission)?;
     let validated = validate_submission(submission)?;
-    let sibling = configured_sibling_binary(
+    let sibling = configured_binary(
         "MONDAY_PREDICTION_SNAPSHOT_BIN",
-        "monday-prediction-snapshot",
+        Path::new("/usr/local/bin/monday-prediction-snapshot"),
     )?;
     submit_validated_submission(args, validated, &sibling, &kubectl_binary())
 }
