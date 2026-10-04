@@ -1726,6 +1726,46 @@ mod tests {
     }
 
     #[test]
+    fn cohort_causal_availability_rejects_future_event_at_compiler_entry() {
+        let mut future_reference = market_rows();
+        future_reference[3]["update"]["ts"] = json!("2026-07-17T05:01:01Z");
+        let error = explicit_normalization_error(&future_reference);
+        assert!(
+            error.contains("causally unavailable chainlink_reference"),
+            "{error}"
+        );
+        assert!(error.contains("source ts is in the future"), "{error}");
+
+        let mut late_reference = market_rows();
+        late_reference[3]["update"]["received_at"] = json!("2026-07-17T05:05:00Z");
+        let error = explicit_normalization_error(&late_reference);
+        assert!(
+            error.contains("market-1 is causally unavailable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cohort_causal_availability_rejects_missing_source_manifest() {
+        for reference in [false, true] {
+            let (_temp, config) = explicit_evidence_fixture(&market_rows());
+            let manifest = if reference {
+                &config.segments.references[0].manifest
+            } else {
+                &config.segments.market.manifest
+            };
+            fs::remove_file(manifest).unwrap();
+            let error =
+                crate::polymarket_research_normalize::normalize_polymarket_evidence(&config)
+                    .expect_err("cohort compilation must fail without either source manifest");
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+    }
+
+    #[test]
     fn explicit_market_normalization_rejects_unbounded_or_missing_selected_token_coverage() {
         let mut unresolved = market_rows();
         unresolved.push(quote_failure(4));
