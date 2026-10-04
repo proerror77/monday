@@ -70,6 +70,53 @@ if [[ $TEST_ONLY == false ]]; then
   flock -n 6 || die 'USD-M operation is active'
 fi
 
+cutover_preflight() {
+  local now_ns market spool health updated incomplete failed=0
+  for market in spot usdm; do
+    spool=$(monday_root_join "$ROOT" "data/monday/spool/binance-lob/$market") || return 1
+    health="$spool/health.json"
+    if ! monday_path_direct "$spool" || [[ ! -d $spool ]]; then
+      printf 'preflight: canonical spool is missing or indirect: %s\n' "$spool" >&2
+      failed=1
+      continue
+    fi
+    updated=
+    if monday_file_direct "$health"; then
+      updated=$(jq -er '.updated_at_ns | select(type == "number" and floor == . and . > 0)' \
+        "$health" 2>/dev/null) || updated=
+    fi
+    now_ns=$(date +%s%N) || return 1
+    [[ $now_ns =~ ^[1-9][0-9]{0,18}$ ]] || {
+      printf 'preflight: current nanosecond timestamp is unavailable\n' >&2
+      return 1
+    }
+    # Capture publishes health every 30 seconds. Match the Gate's 120-second bound.
+    if [[ ! $updated =~ ^[1-9][0-9]{0,18}$ ]] \
+      || ! (( updated > 0 && updated <= now_ns && now_ns - updated <= 120000000000 )); then
+      printf 'preflight: old-production health is missing, invalid, stale or in the future: %s (updated_at_ns=%s, now_ns=%s, max_age_seconds=120)\n' \
+        "$health" "${updated:-invalid}" "$now_ns" >&2
+      failed=1
+    fi
+    # Match Rust's incomplete_segment_artifacts. Keep the later drain fail-closed.
+    if ! incomplete=$(find "$spool" \( -type f -o -type l \) \( \
+      -name '*.jsonl.part' -o -name '*.zst.tmp' -o -name '*.part.corrupt' \
+    \) -print); then
+      printf 'preflight: canonical spool scan failed: %s\n' "$spool" >&2
+      failed=1
+    elif [[ -n $incomplete ]]; then
+      printf 'preflight: incomplete segment artifacts in %s:\n%s\n' "$spool" "$incomplete" >&2
+      failed=1
+    fi
+  done
+  (( failed == 0 ))
+}
+
+# Ordinary fixtures have no old-production health. Opt in to test this boundary.
+# Production always checks before containment or rollback can touch a unit.
+if [[ $TEST_ONLY == false || ${MONDAY_CUTOVER_FIXTURE_PREFLIGHT:-0} == 1 ]]; then
+  cutover_preflight || die 'preflight refused; no units were stopped or masked'
+fi
+
 FIXTURE_SYSTEMD=false
 if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
   FIXTURE_SYSTEMD=true
