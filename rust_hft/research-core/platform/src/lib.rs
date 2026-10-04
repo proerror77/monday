@@ -17,6 +17,8 @@ pub mod release;
 pub mod research;
 #[cfg(feature = "control")]
 pub mod service;
+#[cfg(feature = "control")]
+pub mod session;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
