@@ -32,6 +32,9 @@ const PIT_KIND: &str = "point_in_time_feature_matrix";
 const PIT_SCHEMA: &str = "pit-feature-matrix-v2";
 const RESULT_KIND: &str = "backtest_result_metadata";
 const RESULT_SCHEMA: &str = "backtest-result-metadata-v1";
+const MAX_PLAN_ROW_BYTES: usize = 1024 * 1024;
+const MAX_READBACK_ROWS: usize = 256;
+const MAX_READBACK_BYTES: usize = 4 * MAX_PLAN_ROW_BYTES;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum InputKind {
@@ -61,10 +64,11 @@ struct Args {
     /// Optional ClickHouse HTTP endpoint. No endpoint is contacted by offline tests.
     #[arg(long, requires = "claim_dir")]
     clickhouse_url: Option<String>,
-    /// Shared filesystem directory used to serialize one writer per partition identity.
+    /// Local filesystem guard. Deployment must enforce a single ingestion controller;
+    /// an ACK RWO volume or a pending ClickHouse row is not a distributed writer lease.
     #[arg(long, requires = "clickhouse_url")]
     claim_dir: Option<PathBuf>,
-    #[arg(long, default_value = "default")]
+    #[arg(long, default_value = "monday_analytics")]
     database: String,
     #[arg(long, default_value = "default")]
     user: String,
@@ -820,14 +824,26 @@ async fn send_to_clickhouse(
         if existing_hash != lineage.manifest_sha256 {
             bail!("ClickHouse partition identity conflicts with existing manifest");
         }
-        match row.get("materialization_state").and_then(Value::as_str) {
-            Some("complete") => return Ok("idempotent-hit".to_string()),
-            Some("pending") => {}
-            _ => bail!("ClickHouse partition registry state is unsupported"),
-        }
     }
 
     let complete = read_registry_row(plan_path)?;
+    if let Some(row) = existing.as_ref() {
+        match row.get("materialization_state").and_then(Value::as_str) {
+            Some("complete") => {
+                validate_registry_readback(row, &complete)?;
+                verify_actual_plan_rows(&client, &endpoint, database, user, password, plan_path)
+                    .await?;
+                return Ok("idempotent-hit".to_string());
+            }
+            Some("pending") => {
+                let mut pending = complete.clone();
+                pending["materialization_state"] = "pending".into();
+                pending["materialization_version"] = 1.into();
+                validate_registry_readback(row, &pending)?;
+            }
+            _ => bail!("ClickHouse partition registry state is unsupported"),
+        }
+    }
     if existing.is_none() {
         let mut pending = complete.clone();
         pending["materialization_state"] = "pending".into();
@@ -852,14 +868,13 @@ async fn send_to_clickhouse(
         )
         .await?
         .context("ClickHouse pending claim was not readable after insert")?;
-        if winner.get("manifest_sha256").and_then(Value::as_str)
-            != Some(lineage.manifest_sha256.as_str())
-            || winner.get("materialization_state").and_then(Value::as_str) != Some("pending")
-        {
-            bail!("ClickHouse pending claim lost its identity readback");
-        }
+        validate_registry_readback(&winner, &pending)
+            .context("ClickHouse pending registration lost its identity readback")?;
     }
     send_plan_rows(&client, &endpoint, database, user, password, plan_path).await?;
+    // An accepted INSERT is not proof of a complete dataset. FINAL readback checks
+    // actual typed columns and logical row counts, including resumed partial inserts.
+    verify_actual_plan_rows(&client, &endpoint, database, user, password, plan_path).await?;
     insert_rows(
         &client,
         &endpoint,
@@ -870,7 +885,25 @@ async fn send_to_clickhouse(
         serde_json::to_vec(&complete)?,
     )
     .await?;
+    let published = fetch_partition(
+        &client,
+        &endpoint,
+        database,
+        user,
+        password,
+        &lineage.partition_identity,
+    )
+    .await?
+    .context("ClickHouse completed partition was not readable after insert")?;
+    validate_registry_readback(&published, &complete)?;
     Ok("inserted".to_string())
+}
+
+fn validate_registry_readback(actual: &Value, expected: &Value) -> Result<()> {
+    if actual != expected {
+        bail!("ClickHouse partition registry content does not match the verified plan");
+    }
+    Ok(())
 }
 
 async fn verify_table_contracts(
@@ -882,8 +915,9 @@ async fn verify_table_contracts(
     plan_path: &Path,
 ) -> Result<()> {
     let mut tables = BTreeSet::from(["cex_analytics_partitions".to_string()]);
-    for line in BufReader::new(File::open(plan_path)?).lines().skip(1) {
-        let row: Value = serde_json::from_str(&line?)?;
+    let mut reader = BufReader::new(File::open(plan_path)?);
+    read_bounded_plan_row(&mut reader)?.context("analytics plan is empty")?;
+    while let Some(row) = read_bounded_plan_row(&mut reader)? {
         let table = row
             .get("table")
             .and_then(Value::as_str)
@@ -914,7 +948,7 @@ async fn verify_table_contracts(
                 response.status()
             );
         }
-        let body = response.text().await?;
+        let body = String::from_utf8(bounded_response_body(response).await?)?;
         let mut rows = body.lines().map(serde_json::from_str::<Value>);
         let row = rows
             .next()
@@ -1019,7 +1053,7 @@ async fn fetch_partition(
             response.status()
         );
     }
-    let body = response.text().await?;
+    let body = String::from_utf8(bounded_response_body(response).await?)?;
     let mut rows = body.lines().map(serde_json::from_str::<Value>);
     let first = rows.next().transpose()?;
     if rows.next().is_some() {
@@ -1029,10 +1063,8 @@ async fn fetch_partition(
 }
 
 fn read_registry_row(plan_path: &Path) -> Result<Value> {
-    let mut line = String::new();
-    BufReader::new(File::open(plan_path)?).read_line(&mut line)?;
-    let mut row: Value =
-        serde_json::from_str(&line).context("analytics plan registry row is invalid")?;
+    let mut reader = BufReader::new(File::open(plan_path)?);
+    let mut row = read_bounded_plan_row(&mut reader)?.context("analytics plan registry row is invalid")?;
     let object = row
         .as_object_mut()
         .context("analytics plan registry row is not an object")?;
@@ -1056,23 +1088,12 @@ async fn send_plan_rows(
     plan_path: &Path,
 ) -> Result<()> {
     const MAX_BATCH_BYTES: usize = 1024 * 1024;
-    let mut lines = BufReader::new(File::open(plan_path)?).lines();
-    lines
-        .next()
-        .transpose()?
-        .context("analytics plan is empty")?;
+    let mut reader = BufReader::new(File::open(plan_path)?);
+    read_bounded_plan_row(&mut reader)?.context("analytics plan is empty")?;
     let mut table = String::new();
     let mut batch = Vec::with_capacity(MAX_BATCH_BYTES);
-    for line in lines {
-        let mut row: Value = serde_json::from_str(&line?)?;
-        let object = row
-            .as_object_mut()
-            .context("analytics plan row is not an object")?;
-        let row_table = object
-            .remove("table")
-            .and_then(|value| value.as_str().map(str::to_string))
-            .context("analytics plan row is missing table")?;
-        object.remove("sql");
+    while let Some(row) = read_bounded_plan_row(&mut reader)? {
+        let (row_table, row) = data_row(row)?;
         let mut encoded = serde_json::to_vec(&row)?;
         encoded.push(b'\n');
         if !batch.is_empty()
@@ -1090,6 +1111,191 @@ async fn send_plan_rows(
     Ok(())
 }
 
+fn read_bounded_plan_row(reader: &mut impl BufRead) -> Result<Option<Value>> {
+    let mut bytes = Vec::new();
+    let read = reader
+        .take((MAX_PLAN_ROW_BYTES + 1) as u64)
+        .read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if bytes.len() > MAX_PLAN_ROW_BYTES {
+        bail!("analytics plan row exceeds the bounded readback limit");
+    }
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn data_row(mut row: Value) -> Result<(String, Value)> {
+    let object = row.as_object_mut().context("analytics plan row is not an object")?;
+    let table = object
+        .remove("table")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .context("analytics plan row is missing table")?;
+    data_columns(&table)?;
+    object.remove("sql");
+    Ok((table, row))
+}
+
+fn data_columns(table: &str) -> Result<&'static str> {
+    match table {
+        "cex_replay_events" => Ok("partition_identity, manifest_sha256, artifact_sha256, source_revision, venue, market, symbol, start_time_us, end_time_us, schema_version, row_identity, materialization_version, event_time_us, sequence, event, payload_json"),
+        "cex_pit_features" => Ok("partition_identity, manifest_sha256, artifact_sha256, source_revision, venue, market, symbol, start_time_us, end_time_us, schema_version, row_identity, materialization_version, event_time_us, feature_available_time_us, label_available_time_us, ingestion_time_us, features_json, label"),
+        "cex_backtest_results" => Ok("partition_identity, manifest_sha256, artifact_sha256, source_revision, venue, market, symbol, start_time_us, end_time_us, schema_version, row_identity, materialization_version, result_json"),
+        _ => bail!("analytics plan contains an unsupported table"),
+    }
+}
+
+async fn bounded_response_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if !response.status().is_success() {
+        bail!("ClickHouse readback query failed with {}", response.status());
+    }
+    if response.content_length().is_some_and(|length| length > MAX_READBACK_BYTES as u64) {
+        bail!("ClickHouse readback response exceeds its byte limit");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_READBACK_BYTES {
+            bail!("ClickHouse readback response exceeds its byte limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn verify_actual_plan_rows(
+    client: &reqwest::Client,
+    endpoint: &str,
+    database: &str,
+    user: &str,
+    password: &str,
+    plan_path: &Path,
+) -> Result<()> {
+    let registry = read_registry_row(plan_path)?;
+    let partition_identity = registry["partition_identity"]
+        .as_str()
+        .context("analytics plan registry is missing partition_identity")?;
+    let expected_count = registry["row_count"]
+        .as_u64()
+        .context("analytics plan registry is missing row_count")?;
+    let mut reader = BufReader::new(File::open(plan_path)?);
+    read_bounded_plan_row(&mut reader)?.context("analytics plan is empty")?;
+    let mut counts = BTreeMap::<String, u64>::new();
+    let mut batch = BTreeMap::<String, Value>::new();
+    let mut batch_table = String::new();
+    let mut batch_bytes = 0_usize;
+    while let Some(row) = read_bounded_plan_row(&mut reader)? {
+        let (table, row) = data_row(row)?;
+        if row["partition_identity"].as_str() != Some(partition_identity) {
+            bail!("analytics plan row has a different partition identity");
+        }
+        let row_identity = row["row_identity"]
+            .as_str()
+            .context("analytics plan row is missing row_identity")?
+            .to_string();
+        let encoded_bytes = serde_json::to_vec(&row)?.len();
+        if !batch.is_empty()
+            && (table != batch_table
+                || batch.len() >= MAX_READBACK_ROWS
+                || batch_bytes.saturating_add(encoded_bytes) > MAX_PLAN_ROW_BYTES)
+        {
+            verify_readback_batch(client, endpoint, database, user, password, partition_identity, &batch_table, &batch).await?;
+            batch.clear();
+            batch_bytes = 0;
+        }
+        if batch.insert(row_identity, row).is_some() {
+            bail!("analytics plan repeats a logical row identity");
+        }
+        batch_table = table.clone();
+        batch_bytes += encoded_bytes;
+        *counts.entry(table).or_default() += 1;
+    }
+    if !batch.is_empty() {
+        verify_readback_batch(client, endpoint, database, user, password, partition_identity, &batch_table, &batch).await?;
+    }
+    if counts.values().sum::<u64>() != expected_count || expected_count == 0 {
+        bail!("analytics plan data row count does not match its registry");
+    }
+    for (table, count) in counts {
+        // The verified FINAL sorting key is exactly (partition_identity,
+        // row_identity), so FINAL has one logical row per identity. Avoid a
+        // distinct-identity set proportional to the full partition size.
+        let query = format!(
+            "SELECT count() AS row_count FROM {database}.{table} FINAL WHERE partition_identity = {{partition_identity:String}} SETTINGS output_format_json_quote_64bit_integers = 0 FORMAT JSONEachRow"
+        );
+        let response = client
+            .post(endpoint)
+            .query(&[("query", query.as_str()), ("param_partition_identity", partition_identity)])
+            .basic_auth(user, (!password.is_empty()).then_some(password))
+            .send()
+            .await?;
+        let bytes = bounded_response_body(response).await?;
+        let actual: Value = serde_json::from_slice(&bytes).context("ClickHouse row-count readback is invalid")?;
+        if actual["row_count"].as_u64() != Some(count) {
+            bail!("ClickHouse logical row count does not match the verified plan");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_readback_batch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    database: &str,
+    user: &str,
+    password: &str,
+    partition_identity: &str,
+    table: &str,
+    expected: &BTreeMap<String, Value>,
+) -> Result<()> {
+    let columns = data_columns(table)?;
+    let identities = (0..expected.len())
+        .map(|index| format!("{{row_{index}:String}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(
+        "SELECT {columns} FROM {database}.{table} FINAL WHERE partition_identity = {{partition_identity:String}} AND row_identity IN ({identities}) SETTINGS output_format_json_quote_64bit_integers = 0, max_result_rows = {}, max_result_bytes = {MAX_READBACK_BYTES}, result_overflow_mode = 'throw' FORMAT JSONEachRow",
+        expected.len()
+    );
+    let mut parameters = vec![("query".to_string(), query), ("param_partition_identity".to_string(), partition_identity.to_string())];
+    for (index, identity) in expected.keys().enumerate() {
+        parameters.push((format!("param_row_{index}"), identity.clone()));
+    }
+    let response = client
+        .post(endpoint)
+        .query(&parameters)
+        .basic_auth(user, (!password.is_empty()).then_some(password))
+        .send()
+        .await?;
+    let body = bounded_response_body(response).await?;
+    validate_data_readback(&body, expected)
+}
+
+fn validate_data_readback(body: &[u8], expected: &BTreeMap<String, Value>) -> Result<()> {
+    let mut remaining = expected.clone();
+    for line in body.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+        let actual: Value = serde_json::from_slice(line).context("ClickHouse data readback is invalid")?;
+        let identity = actual["row_identity"].as_str().context("ClickHouse data readback is missing row_identity")?;
+        let expected = remaining.remove(identity).context("ClickHouse data readback contains an unexpected or repeated identity")?;
+        if !equivalent_value(&expected, &actual) {
+            bail!("ClickHouse actual row content differs from the verified plan");
+        }
+    }
+    if !remaining.is_empty() {
+        bail!("ClickHouse actual data readback is missing verified rows");
+    }
+    Ok(())
+}
+
+fn equivalent_value(expected: &Value, actual: &Value) -> bool {
+    match (expected, actual) {
+        (Value::Number(expected), Value::Number(actual)) if expected.is_f64() => expected.as_f64() == actual.as_f64(),
+        (Value::Object(expected), Value::Object(actual)) => expected.len() == actual.len()
+            && expected.iter().all(|(key, value)| actual.get(key).is_some_and(|actual| equivalent_value(value, actual))),
+        _ => expected == actual,
+    }
+}
+
 async fn insert_rows(
     client: &reqwest::Client,
     endpoint: &str,
@@ -1105,23 +1311,23 @@ async fn insert_rows(
     let query = format!("INSERT INTO {database}.{table} FORMAT JSONEachRow");
     let response = client
         .post(endpoint)
-        .query(&[("query", query.as_str())])
+        .query(&[("query", query.as_str()), ("wait_end_of_query", "1")])
         .basic_auth(user, (!password.is_empty()).then_some(password))
         .body(bytes)
         .send()
         .await?;
-    if !response.status().is_success() {
-        bail!(
-            "ClickHouse insert into {table} failed with {}",
-            response.status()
-        );
+    let response = bounded_response_body(response)
+        .await
+        .with_context(|| format!("ClickHouse insert into {table} failed"))?;
+    if response.iter().any(|byte| !byte.is_ascii_whitespace()) {
+        bail!("ClickHouse insert into {table} returned an unexpected response body");
     }
     Ok(())
 }
 
 fn identity_query(database: &str) -> String {
     format!(
-        "SELECT manifest_sha256, materialization_state, materialization_version FROM {database}.cex_analytics_partitions FINAL WHERE partition_identity = {{partition_identity:String}} LIMIT 1 FORMAT JSONEachRow"
+        "SELECT partition_identity, manifest_sha256, artifact_sha256, source_revision, venue, market, symbol, start_time_us, end_time_us, schema_version, dataset_kind, row_count, materialization_state, materialization_version FROM {database}.cex_analytics_partitions FINAL WHERE partition_identity = {{partition_identity:String}} LIMIT 2 SETTINGS output_format_json_quote_64bit_integers = 0 FORMAT JSONEachRow"
     )
 }
 
@@ -1347,11 +1553,15 @@ mod tests {
     fn remote_writer_claims_reads_back_resumes_and_rejects_conflicts() {
         let (plan, lineage) = remote_fixture();
         let claim_dir = tempfile::tempdir().unwrap();
-        let pending = json!({
-            "manifest_sha256": lineage.manifest_sha256,
-            "materialization_state": "pending",
-            "materialization_version": 1,
-        });
+        let complete = read_registry_row(plan.path()).unwrap();
+        let mut pending = complete.clone();
+        pending["materialization_state"] = "pending".into();
+        pending["materialization_version"] = 1.into();
+        let mut reader = BufReader::new(File::open(plan.path()).unwrap());
+        read_bounded_plan_row(&mut reader).unwrap();
+        let (_, data) = data_row(read_bounded_plan_row(&mut reader).unwrap().unwrap()).unwrap();
+        let content_response = format!("{data}\n");
+        let count_response = "{\"row_count\":1}\n".to_string();
         let registry_contract = json!({
             "engine": "ReplacingMergeTree",
             "engine_full": "ReplacingMergeTree(materialization_version)",
@@ -1376,7 +1586,10 @@ mod tests {
                     String::new(),
                     format!("{pending}\n"),
                     String::new(),
+                    content_response.clone(),
+                    count_response.clone(),
                     String::new(),
+                    format!("{complete}\n"),
                 ],
             ]
             .concat(),
@@ -1398,20 +1611,17 @@ mod tests {
         );
         server.join().unwrap();
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 10);
         assert!(requests[2].contains("param_partition_identity="));
         assert!(requests[2].contains("partition_identity%3AString"));
         assert!(requests[3].contains("\"materialization_state\":\"pending\""));
         assert!(requests[5].contains("\"row_identity\""));
-        assert!(requests[6].contains("\"materialization_state\":\"complete\""));
+        assert!(requests[6].contains("param_row_0="));
+        assert!(requests[7].contains("row_count"));
+        assert!(requests[8].contains("\"materialization_state\":\"complete\""));
         drop(requests);
 
-        let complete = json!({
-            "manifest_sha256": lineage.manifest_sha256,
-            "materialization_state": "complete",
-            "materialization_version": 2,
-        });
-        let (url, _, server) = mock_http([contracts(), vec![format!("{complete}\n")]].concat());
+        let (url, _, server) = mock_http([contracts(), vec![format!("{complete}\n"), content_response.clone(), count_response.clone()]].concat());
         assert_eq!(
             runtime
                 .block_on(send_to_clickhouse(
@@ -1426,6 +1636,19 @@ mod tests {
                 .unwrap(),
             "idempotent-hit"
         );
+        server.join().unwrap();
+
+        let (url, _, server) = mock_http([contracts(), vec![
+            format!("{pending}\n"),
+            String::new(),
+            content_response,
+            count_response,
+            String::new(),
+            format!("{complete}\n"),
+        ]].concat());
+        assert_eq!(runtime.block_on(send_to_clickhouse(
+            &url, "default", "default", "", claim_dir.path(), &lineage, plan.path(),
+        )).unwrap(), "inserted");
         server.join().unwrap();
 
         let conflict = json!({
@@ -1449,6 +1672,95 @@ mod tests {
             .to_string()
             .contains("conflicts with existing manifest"));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn actual_readback_rejects_missing_duplicate_extra_and_corrupt_rows() {
+        let expected_row = json!({
+            "row_identity": "1", "payload_json": "{\"bids\":[]}", "sequence": 9007199254740993_u64,
+        });
+        let expected = BTreeMap::from([("1".to_string(), expected_row.clone())]);
+        assert!(validate_data_readback(format!("{expected_row}\n").as_bytes(), &expected).is_ok());
+        assert!(validate_data_readback(b"", &expected).is_err());
+        assert!(validate_data_readback(format!("{expected_row}\n{expected_row}\n").as_bytes(), &expected).is_err());
+        let mut corrupt = expected_row.clone();
+        corrupt["payload_json"] = "{\"asks\":[]}".into();
+        assert!(validate_data_readback(format!("{corrupt}\n").as_bytes(), &expected).is_err());
+        corrupt = expected_row.clone();
+        corrupt["sequence"] = 9007199254740992_u64.into();
+        assert!(validate_data_readback(format!("{corrupt}\n").as_bytes(), &expected).is_err());
+        corrupt = expected_row;
+        corrupt["row_identity"] = "2".into();
+        assert!(validate_data_readback(format!("{corrupt}\n").as_bytes(), &expected).is_err());
+    }
+
+    #[test]
+    fn complete_registry_does_not_hide_missing_actual_data() {
+        let (plan, lineage) = remote_fixture();
+        let complete = read_registry_row(plan.path()).unwrap();
+        let claim_dir = tempfile::tempdir().unwrap();
+        let contracts = vec![
+            "{\"engine\":\"ReplacingMergeTree\",\"engine_full\":\"ReplacingMergeTree(materialization_version)\",\"sorting_key\":\"partition_identity\"}\n".to_string(),
+            "{\"engine\":\"ReplacingMergeTree\",\"engine_full\":\"ReplacingMergeTree(materialization_version)\",\"sorting_key\":\"partition_identity,row_identity\"}\n".to_string(),
+        ];
+        let (url, requests, server) = mock_http([contracts, vec![format!("{complete}\n"), String::new()]].concat());
+        let error = tokio::runtime::Runtime::new().unwrap().block_on(send_to_clickhouse(
+            &url, "default", "default", "", claim_dir.path(), &lineage, plan.path(),
+        )).unwrap_err();
+        assert!(error.to_string().contains("missing verified rows"));
+        server.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn incomplete_insert_cannot_publish_complete_registry() {
+        let (plan, lineage) = remote_fixture();
+        let mut pending = read_registry_row(plan.path()).unwrap();
+        pending["materialization_state"] = "pending".into();
+        pending["materialization_version"] = 1.into();
+        let claim_dir = tempfile::tempdir().unwrap();
+        let responses = vec![
+            "{\"engine\":\"ReplacingMergeTree\",\"engine_full\":\"ReplacingMergeTree(materialization_version)\",\"sorting_key\":\"partition_identity\"}\n".to_string(),
+            "{\"engine\":\"ReplacingMergeTree\",\"engine_full\":\"ReplacingMergeTree(materialization_version)\",\"sorting_key\":\"partition_identity,row_identity\"}\n".to_string(),
+            format!("{pending}\n"), String::new(), String::new(),
+        ];
+        let (url, requests, server) = mock_http(responses);
+        let error = tokio::runtime::Runtime::new().unwrap().block_on(send_to_clickhouse(
+            &url, "default", "default", "", claim_dir.path(), &lineage, plan.path(),
+        )).unwrap_err();
+        assert!(error.to_string().contains("missing verified rows"));
+        server.join().unwrap();
+        assert!(!requests.lock().unwrap().iter().any(|request| request.contains("\"materialization_state\":\"complete\"")));
+    }
+
+    #[test]
+    fn complete_registry_does_not_hide_extra_logical_rows() {
+        let (plan, lineage) = remote_fixture();
+        let complete = read_registry_row(plan.path()).unwrap();
+        let mut reader = BufReader::new(File::open(plan.path()).unwrap());
+        read_bounded_plan_row(&mut reader).unwrap();
+        let (_, data) = data_row(read_bounded_plan_row(&mut reader).unwrap().unwrap()).unwrap();
+        let claim_dir = tempfile::tempdir().unwrap();
+        let responses = vec![
+            "{\"engine\":\"ReplacingMergeTree\",\"engine_full\":\"ReplacingMergeTree(materialization_version)\",\"sorting_key\":\"partition_identity\"}\n".to_string(),
+            "{\"engine\":\"ReplacingMergeTree\",\"engine_full\":\"ReplacingMergeTree(materialization_version)\",\"sorting_key\":\"partition_identity,row_identity\"}\n".to_string(),
+            format!("{complete}\n"), format!("{data}\n"), "{\"row_count\":2}\n".to_string(),
+        ];
+        let (url, requests, server) = mock_http(responses);
+        let error = tokio::runtime::Runtime::new().unwrap().block_on(send_to_clickhouse(
+            &url, "default", "default", "", claim_dir.path(), &lineage, plan.path(),
+        )).unwrap_err();
+        assert!(error.to_string().contains("logical row count does not match"));
+        server.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn readback_memory_and_integer_precision_are_bounded() {
+        let oversized = vec![b'a'; MAX_PLAN_ROW_BYTES + 1];
+        assert!(read_bounded_plan_row(&mut BufReader::new(oversized.as_slice())).is_err());
+        assert!(equivalent_value(&json!(1.0), &json!(1)));
+        assert!(!equivalent_value(&json!(9007199254740993_u64), &json!(9007199254740992_u64)));
     }
 
     #[test]

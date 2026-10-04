@@ -3,6 +3,7 @@
 pub mod market_encoder;
 pub mod mlp_training;
 pub mod model;
+pub mod prepared_market;
 pub mod sec_orderflow;
 pub mod sequence;
 

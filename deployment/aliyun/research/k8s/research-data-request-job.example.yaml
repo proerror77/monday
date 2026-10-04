@@ -1,0 +1,74 @@
+# Agent tools render a request, not SQL, OSS folders, or a new Study budget.
+# Submit to the existing data controller's node and validated internal data root.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: monday-data-request-REPLACE_RUN
+  namespace: monday-research
+  labels:
+    research.monday/contract: research-data-platform-1256
+    research.monday/controller: REPLACE_CONTROLLER
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        research.monday/contract: research-data-platform-1256
+        research.monday/data-access: admitted
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      imagePullSecrets: [{name: monday-acr}]
+      nodeSelector: {kubernetes.io/arch: amd64, workload: research-data}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: request
+          image: REPLACE_IMMUTABLE_DATA_IMAGE
+          args:
+            - --state-root
+            - /work/data-service
+            - --clickhouse-url
+            - http://monday-clickhouse:8123
+            - --database
+            - monday_analytics
+            - --user
+            # Bind this field and the secret together from the admitted request:
+            # label_free -> monday_reader/monday-clickhouse-reader;
+            # pre_holdout_supervised -> monday_task_reader/monday-clickhouse-task-reader.
+            - REPLACE_ADMITTED_READER_USER
+            - request
+            - --request
+            - /request/request.json
+            - --request-sha256
+            - "REPLACE_REQUEST_SHA256"
+          env:
+            - {name: MONDAY_ACK_DATA_PLANE, value: "1"}
+            - {name: MONDAY_DATA_PLATFORM_IMAGE, value: REPLACE_IMMUTABLE_DATA_IMAGE}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: REPLACE_ADMITTED_READER_SECRET, key: password}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - {name: state, mountPath: /work}
+            - {name: request, mountPath: /request, readOnly: true}
+      volumes:
+        - name: state
+          persistentVolumeClaim: {claimName: REPLACE_STATE_PVC}
+        - name: request
+          configMap: {name: REPLACE_IMMUTABLE_REQUEST_CONFIGMAP}
