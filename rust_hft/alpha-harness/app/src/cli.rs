@@ -1,7 +1,6 @@
 use crate::{
     data_mission, governance, loop_control, mission, mission_campaign, mission_dispatch,
-    mission_fresh_inputs, mission_metrics, mission_runner, prediction_dispatch, prediction_runner,
-    prediction_snapshot,
+    mission_fresh_inputs, mission_metrics, mission_runner, prediction_dispatch,
 };
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
@@ -10,7 +9,6 @@ use alpha_store::AlphaStore;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hft_collector::{source_catalog, DataAcquisitionMission, QualityRequirements};
-use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[cfg(test)]
@@ -151,8 +149,6 @@ enum DataCommand {
 
 #[derive(Debug, Subcommand)]
 enum PredictionCommand {
-    Execute(Box<PredictionExecuteArgs>),
-    Snapshot(PredictionSnapshotArgs),
     Dispatch {
         #[command(subcommand)]
         command: PredictionDispatchCommand,
@@ -681,61 +677,6 @@ pub struct PredictionDispatchStatusArgs {
     pub job_name: String,
     #[arg(long)]
     pub evidence: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct PredictionExecuteArgs {
-    #[arg(long)]
-    pub work_dir: PathBuf,
-    #[arg(long)]
-    pub mission_url: String,
-    #[arg(long)]
-    pub mission_sha256: String,
-    #[arg(long)]
-    pub snapshot_url: String,
-    #[arg(long)]
-    pub snapshot_sha256: String,
-    #[arg(long)]
-    pub snapshot_contract_id: String,
-    #[arg(long)]
-    pub snapshot_digest: String,
-    #[arg(long)]
-    pub cohort_manifest_id: String,
-    #[arg(long)]
-    pub partition_digest: String,
-    #[arg(long)]
-    pub policy_identity: String,
-    #[arg(long)]
-    pub task_capability: String,
-    #[arg(long)]
-    pub image_identity: String,
-    #[arg(long)]
-    pub partition_view_json: String,
-    /// Read-only cache directory containing `<snapshot-sha256>.zip` archives.
-    #[arg(long)]
-    pub snapshot_cache_dir: Option<PathBuf>,
-    /// Prior immutable prediction result bundle for a paused LoopRun.
-    #[arg(long, requires = "resume_sha256")]
-    pub resume_url: Option<String>,
-    #[arg(long, requires = "resume_url")]
-    pub resume_sha256: Option<String>,
-    #[arg(long)]
-    pub result_put_url: String,
-    /// Independently authorized read URL for the immutable published result bundle.
-    #[arg(long)]
-    pub result_readback_url: String,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct PredictionSnapshotArgs {
-    #[arg(long)]
-    pub work_dir: PathBuf,
-    #[arg(long)]
-    pub result_put_url: String,
-    /// Arguments forwarded to the governed snapshot compiler. `--output-dir`
-    /// is owned by alpha-harness and must not be supplied here.
-    #[arg(last = true, required = true, allow_hyphen_values = true)]
-    pub compiler_args: Vec<OsString>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1458,7 +1399,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 let output = args
                     .manifest_out
                     .unwrap_or_else(|| data_mission::default_manifest_path(&manifest));
-                data_mission::write_json_atomic(&output, &manifest)?;
+                hft_research_artifacts::write_json_atomic(&output, &manifest)?;
                 print_json(&serde_json::json!({
                     "manifest": manifest,
                     "manifest_path": output,
@@ -1472,7 +1413,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     &args.input,
                     &args.artifact_dir,
                 )?;
-                data_mission::write_json_atomic(&args.manifest_out, &manifest)?;
+                hft_research_artifacts::write_json_atomic(&args.manifest_out, &manifest)?;
                 print_json(&serde_json::json!({
                     "manifest": manifest,
                     "manifest_path": args.manifest_out,
@@ -1480,16 +1421,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         },
         Command::Prediction { command } => match command {
-            PredictionCommand::Execute(args) => {
-                tokio::task::spawn_blocking(move || prediction_runner::execute(*args))
-                    .await
-                    .context("prediction execution worker failed")?
-            }
-            PredictionCommand::Snapshot(args) => {
-                tokio::task::spawn_blocking(move || prediction_snapshot::snapshot(args))
-                    .await
-                    .context("prediction snapshot worker failed")?
-            }
             PredictionCommand::Dispatch { command } => match command {
                 PredictionDispatchCommand::Render(args) => prediction_dispatch::render(args),
                 PredictionDispatchCommand::Status(args) => prediction_dispatch::status(args),
@@ -1589,9 +1520,6 @@ mod tests {
         }
     }
     use clap::CommandFactory;
-    use std::ffi::{OsStr, OsString};
-
-    static PREDICTION_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn help_defaults_to_the_campaign_surface() {
@@ -1642,29 +1570,6 @@ mod tests {
             "dispatch",
         ] {
             assert!(listed(command), "{command} must stay on the Campaign path");
-        }
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
         }
     }
 
@@ -1742,70 +1647,6 @@ mod tests {
         assert!(
             format!("{error:#}")
                 .contains(&format!("failed to open local source {missing_mission}")),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn prediction_execute_runs_blocking_pipeline_outside_async_runtime() {
-        let _lock = PREDICTION_ENV_LOCK.lock().await;
-        let root = tempfile::tempdir().unwrap();
-        let runner = root.path().join("unused-prediction-runner");
-        std::fs::write(&runner, b"unused").unwrap();
-        let _runner = EnvVarGuard::set("MONDAY_PREDICTION_RESEARCH_BIN", &runner);
-        let missing_mission = root.path().join("missing-mission.json");
-        let cli = Cli::try_parse_from([
-            OsString::from("alpha-harness"),
-            OsString::from("prediction"),
-            OsString::from("execute"),
-            OsString::from("--work-dir"),
-            root.path().join("work").into_os_string(),
-            OsString::from("--mission-url"),
-            missing_mission.clone().into_os_string(),
-            OsString::from("--mission-sha256"),
-            OsString::from("a".repeat(64)),
-            OsString::from("--snapshot-url"),
-            root.path().join("missing-snapshot.zip").into_os_string(),
-            OsString::from("--snapshot-sha256"),
-            OsString::from("b".repeat(64)),
-            OsString::from("--snapshot-contract-id"),
-            OsString::from(format!("sha256:{}", "c".repeat(64))),
-            OsString::from("--snapshot-digest"),
-            OsString::from("0123456789abcdef"),
-            OsString::from("--cohort-manifest-id"),
-            OsString::from(format!("sha256:{}", "d".repeat(64))),
-            OsString::from("--partition-digest"),
-            OsString::from(format!("sha256:{}", "e".repeat(64))),
-            OsString::from("--policy-identity"),
-            OsString::from(format!("sha256:{}", "f".repeat(64))),
-            OsString::from("--task-capability"),
-            OsString::from("btc_5m_backtest"),
-            OsString::from("--image-identity"),
-            OsString::from(format!("sha256:{}", "a".repeat(64))),
-            OsString::from("--partition-view-json"),
-            OsString::from(
-                serde_json::json!({
-                    "common_time_boundary_ms": 1,
-                    "train_market_ids": ["train"],
-                    "crossing_excluded_market_ids": [],
-                    "held_out_market_ids": ["held-out"]
-                })
-                .to_string(),
-            ),
-            OsString::from("--result-put-url"),
-            root.path().join("results.zip").into_os_string(),
-            OsString::from("--result-readback-url"),
-            root.path().join("results.zip").into_os_string(),
-        ])
-        .unwrap();
-
-        let error = run(cli).await.unwrap_err();
-
-        assert!(
-            format!("{error:#}").contains(&format!(
-                "failed to open local source {}",
-                missing_mission.display()
-            )),
             "unexpected error: {error:#}"
         );
     }
@@ -2029,54 +1870,11 @@ mod tests {
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn prediction_snapshot_runs_blocking_pipeline_outside_async_runtime() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _lock = PREDICTION_ENV_LOCK.lock().await;
-        let root = tempfile::tempdir().unwrap();
-        let compiler = root.path().join("snapshot-compiler.sh");
-        std::fs::write(
-            &compiler,
-            format!(
-                r#"#!/bin/sh
-set -eu
-test "$1" = "--output-dir"
-mkdir -p "$2"
-printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"0123456789abcdef","snapshot_contract_hash":"sha256:{}"}}' > "$2/manifest.json"
-"#,
-                "1".repeat(64)
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let _compiler = EnvVarGuard::set("MONDAY_PREDICTION_SNAPSHOT_BIN", &compiler);
-        let published = root.path().join("published-snapshot.zip");
-        std::fs::write(&published, b"occupied").unwrap();
-        let cli = Cli::try_parse_from([
-            OsString::from("alpha-harness"),
-            OsString::from("prediction"),
-            OsString::from("snapshot"),
-            OsString::from("--work-dir"),
-            root.path().join("work").into_os_string(),
-            OsString::from("--result-put-url"),
-            published.clone().into_os_string(),
-            OsString::from("--"),
-            OsString::from("--start-date"),
-            OsString::from("2026-07-01"),
-        ])
-        .unwrap();
-
-        let error = run(cli).await.unwrap_err();
-
-        assert!(
-            format!("{error:#}").contains(&format!(
-                "result destination already exists: {}",
-                published.display()
-            )),
-            "unexpected error: {error:#}"
-        );
+    #[test]
+    fn prediction_worker_commands_are_not_cex_execution_paths() {
+        for command in ["execute", "snapshot"] {
+            assert!(Cli::try_parse_from(["alpha-harness", "prediction", command]).is_err());
+        }
     }
 
     #[test]
@@ -2213,25 +2011,29 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "mission-1",
         ])
         .is_ok());
-        assert!(Cli::try_parse_from([
-            "alpha-harness",
-            "prediction",
-            "snapshot",
-            "--work-dir",
-            "work",
-            "--result-put-url",
-            "snapshot.zip",
-            "--",
-            "--start-date",
-            "2026-07-01",
-            "--end-date",
-            "2026-07-02",
-            "--optimizer-data-dir",
-            "optimizer",
-            "--data-audit-report",
-            "audit.json",
-        ])
-        .is_ok());
+        assert_eq!(
+            Cli::try_parse_from([
+                "alpha-harness",
+                "prediction",
+                "snapshot",
+                "--work-dir",
+                "work",
+                "--result-put-url",
+                "snapshot.zip",
+                "--",
+                "--start-date",
+                "2026-07-01",
+                "--end-date",
+                "2026-07-02",
+                "--optimizer-data-dir",
+                "optimizer",
+                "--data-audit-report",
+                "audit.json",
+            ])
+            .unwrap_err()
+            .kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
         assert!(Cli::try_parse_from([
             "alpha-harness",
             "data",
@@ -2246,7 +2048,7 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "artifacts",
         ])
         .is_ok());
-        assert!(Cli::try_parse_from([
+        assert_eq!(Cli::try_parse_from([
             "alpha-harness",
             "prediction",
             "execute",
@@ -2285,7 +2087,7 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "--result-readback-url",
             "results.zip",
         ])
-        .is_ok());
+        .unwrap_err().kind(), clap::error::ErrorKind::InvalidSubcommand);
         assert!(Cli::try_parse_from([
             "alpha-harness",
             "mission",

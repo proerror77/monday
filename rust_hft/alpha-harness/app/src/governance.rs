@@ -1027,7 +1027,7 @@ pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
     let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
     let signed = sign_envelope(envelope, args.key_id, &signing_key)?;
     store.store_deployment(&signed, Utc::now())?;
-    data_mission::write_json_atomic(&args.output, &signed)?;
+    hft_research_artifacts::write_json_atomic(&args.output, &signed)?;
     print_json(&serde_json::json!({
         "deployment_id": signed.envelope.deployment_id,
         "signed_envelope_path": args.output,

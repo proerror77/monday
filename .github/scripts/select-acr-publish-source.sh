@@ -3,7 +3,7 @@ set -euo pipefail
 
 event=
 automation_state=ready
-research_product=paired
+research_product=all
 conclusion=
 source_event=
 head_branch=
@@ -23,6 +23,8 @@ main_sha=
 monorepo_conclusion=
 prediction_conclusion=
 security_conclusion=
+published_products=none
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 output=${GITHUB_OUTPUT:-/dev/stdout}
 
 while (($#)); do
@@ -81,7 +83,7 @@ require_green_main() {
   done
 }
 
-[[ $research_product == paired || $research_product == runner || $research_product == controller ]] || exit 2
+research_product=$(bash "$script_dir/research-release-products.sh" normalize "$research_product")
 case "$event" in
   workflow_run)
     [[ -z $source_test_sha ]] || {
@@ -105,7 +107,8 @@ case "$event" in
       case "$binaries_conclusion/$smoke_conclusion" in
         success/success)
           require_green_main "$source_sha"
-          if [[ $research_product == controller ]]; then publish_target=campaign-cycle-controller; else publish_target=research-runner; fi
+          publish_target=research-products
+          published_products=$research_product
           research_mode=artifact
           ;;
         skipped/skipped) publish_target=none; research_mode=none ;;
@@ -122,7 +125,7 @@ case "$event" in
     }
     case "$target" in
       polymarket-raw-ops) target=binance-lob-archiver ;;
-      all|research-runner|campaign-cycle-controller|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder|research-source-test) ;;
+      all|research-runner|prediction-research-runner|campaign-cycle-controller|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder|research-source-test) ;;
       *) printf 'unsupported publish target: %s\n' "$target" >&2; exit 1 ;;
     esac
     if [[ $target == research-source-test ]]; then
@@ -151,18 +154,25 @@ case "$event" in
         printf 'source-test SHA is only valid for research-source-test\n' >&2
         exit 1
       }
-      if [[ $target == all || $target == research-runner || $target == campaign-cycle-controller ]]; then
+      if [[ $target == all || $target == research-runner || $target == prediction-research-runner || $target == campaign-cycle-controller ]]; then
+        case "$target" in
+          all) published_products=$(bash "$script_dir/research-release-products.sh" normalize all) ;;
+          research-runner) published_products=cex-runner ;;
+          prediction-research-runner) published_products=prediction-runner ;;
+          campaign-cycle-controller) published_products=controller ;;
+        esac
         if [[ $rebuild == true ]]; then
           research_mode=rebuild
-          if [[ $target == campaign-cycle-controller ]]; then research_product=controller; else research_product=paired; fi
+          research_product=$published_products
         else
           [[ $rebuild == false && $automation_state == ready && $binaries_conclusion == success && $smoke_conclusion == success && $run_id =~ ^[1-9][0-9]*$ ]] || {
             printf 'manual research publication needs a verified exact-source binary/smoke artifact; missing or expired artifacts require an explicitly planned producer\n' >&2
             exit 1
           }
-          if [[ $target != campaign-cycle-controller && $research_product == controller ]]; then
-            echo 'runner publication requires its full verified product' >&2; exit 1
-          fi
+          combined=$(bash "$script_dir/research-release-products.sh" merge "$research_product" "$published_products")
+          [[ $combined == "$research_product" ]] || {
+            echo 'publication requires every selected product in the verified producer artifact' >&2; exit 1;
+          }
           research_mode=artifact
           artifact_run_id=$run_id
         fi
@@ -191,4 +201,4 @@ if [[ $publish_target == research-source-test ]]; then
     "source_test_tag=$source_test_tag" >>"$output"
 fi
 
-printf "research_product=%s\n" "$research_product" >>"$output"
+printf 'research_product=%s\npublished_products=%s\n' "$research_product" "$published_products" >>"$output"
