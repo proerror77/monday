@@ -1,8 +1,8 @@
 use crate::cli::{print_json, PredictionExecuteArgs};
 use anyhow::{bail, Context};
 use hft_research_artifacts::{
-    configured_sibling_binary, create_bundle, fetch_to_file, normalized_sha256,
-    publish_result, sha256_file,
+    configured_sibling_binary, create_bundle, fetch_to_file, normalized_sha256, publish_result,
+    sha256_file,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
