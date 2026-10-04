@@ -244,13 +244,13 @@ pub fn replay_target_positions_with_trace_and_spot_rules(
 /// an independent IOC replay state; neither the input nor another trial is mutated.
 /// Multiple gap-separated segments require separate scientific replay tasks.
 pub fn replay_shared_target_positions(
-    input: &hft_research_platform::data::SharedInput,
+    input: &hft_research_input::data::SharedInput,
     expected_manifest_sha256: &str,
     decisions: &[TargetPositionDecision],
     config: &TargetPositionReplayConfig,
     spot_instrument_rules: Option<&CexSpotInstrumentRulesV1>,
 ) -> Result<TargetPositionReplayOutput> {
-    use hft_research_platform::data::{ReplayPayload, TypedBlock};
+    use hft_research_input::data::{ReplayPayload, TypedBlock};
     anyhow::ensure!(
         input.manifest_sha256() == expected_manifest_sha256,
         "wrong shared DataView identity"
@@ -2764,7 +2764,7 @@ mod tests {
 
     #[test]
     fn shared_typed_replay_reuses_input_and_keeps_trial_state_independent() {
-        use hft_research_platform::{
+        use hft_research_input::{
             data::{
                 self, BlockRef, DataViewSpec, Exit, PublishedView, ReplayEvent, ReplayPayload,
                 Split, TypedBlock, VerifiedCache, Window,

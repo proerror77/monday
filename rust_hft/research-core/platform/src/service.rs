@@ -114,8 +114,10 @@ impl ArtifactGateway {
             self.verify_artifact(artifact).await?;
         }
         if let Some(view) = &receipt.prepared_view {
-            let mut orders =
-                std::collections::BTreeMap::<crate::data::Exit, crate::data::BlockOrder>::new();
+            let mut orders = std::collections::BTreeMap::<
+                hft_research_input::data::Exit,
+                hft_research_input::data::BlockOrder,
+            >::new();
             for block in &view.blocks {
                 let artifact = receipt
                     .artifacts
@@ -130,8 +132,8 @@ impl ArtifactGateway {
                     sha256(&bytes) == block.sha256,
                     "prepared block changed during publication"
                 );
-                let typed = crate::prepared::decode(&bytes)?;
-                crate::data::validate_block(&typed, block, &view.spec)?;
+                let typed = hft_research_input::prepared::decode(&bytes)?;
+                hft_research_input::data::validate_block(&typed, block, &view.spec)?;
                 orders
                     .entry(block.exit.clone())
                     .or_default()
@@ -355,13 +357,15 @@ pub fn config_identity(config: &ServiceConfig) -> Result<String> {
 mod tests {
     use super::*;
     use crate::{
+        execution::{Backend, Profile},
+        orchestrator::{Artifact, Task, TaskKind, TaskSpec},
+        sha256,
+    };
+    use hft_research_input::{
         data::{
             BlockRef, DataViewSpec, Exit, FeatureFrame, PublishedView, Split, TypedBlock, Window,
         },
-        execution::{Backend, Profile},
-        identity,
-        orchestrator::{Artifact, TaskKind, TaskSpec},
-        prepared,
+        identity, prepared,
     };
     use std::{collections::BTreeMap, sync::Arc};
 
@@ -452,7 +456,7 @@ mod tests {
                     sha256: block_sha,
                     bytes: artifact.bytes,
                     rows: 1,
-                    decoded_bytes: crate::data::memory_bytes(&typed),
+                    decoded_bytes: hft_research_input::data::memory_bytes(&typed),
                     exit: Exit::Features,
                 }],
                 producer_image: task.spec.image.clone(),

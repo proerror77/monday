@@ -2,12 +2,15 @@
 //! results; the reconciler independently reads artifacts and commits completion.
 use crate::{
     clickhouse::ClickHouse,
-    data::{self, BlockOrder, BlockRef, Exit, PublishedView, TypedBlock},
     orchestrator::{Artifact, ResultReceipt, Task},
     postgres::PreparationPermit,
-    prepared, sha256,
+    sha256,
 };
 use anyhow::{ensure, Context, Result};
+use hft_research_input::{
+    data::{self, BlockOrder, BlockRef, Exit, PublishedView, TypedBlock},
+    prepared,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]

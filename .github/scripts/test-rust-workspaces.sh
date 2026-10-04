@@ -6,14 +6,24 @@ trap 'rm -rf "$work"' EXIT
 "$root/rust_hft/scripts/workspace-metadata.sh" >"$work/metadata.json"
 jq -e '[.packages[].name] | length == (unique | length)' "$work/metadata.json" >/dev/null
 MONDAY_CARGO_DRY_RUN=1 "$root/rust_hft/scripts/cargo-scoped.sh" check \
-  -p hft-data -p hft-research-platform -p hft-live --locked >"$work/plan.jsonl"
-jq -se 'length==3 and all(.[]; index("--locked")!=null) and
-  ([.[] | .[3]] | unique | length)==3' "$work/plan.jsonl" >/dev/null
+  -p hft-data -p hft-research-input -p hft-research-platform -p hft-live --locked >"$work/plan.jsonl"
+jq -se 'length==4 and all(.[]; index("--locked")!=null) and
+  ([.[] | .[3]] | unique | length)==4' "$work/plan.jsonl" >/dev/null
 if "$root/rust_hft/scripts/cargo-scoped.sh" check -p missing-package --locked >"$work/rejected" 2>&1; then
   echo 'unknown owner was admitted' >&2; exit 1
 fi
 if "$root/rust_hft/scripts/cargo-scoped.sh" check -p hft-data -p hft-live --features json-simd >"$work/rejected" 2>&1; then
   echo 'ambiguous cross-workspace feature matrix was admitted' >&2; exit 1
+fi
+cargo tree --manifest-path "$root/rust_hft/shared/Cargo.toml" \
+  -p hft-research-input --locked --edges normal --prefix none >"$work/input.tree"
+if grep -E '^(burn|tract-|ort |sqlx-|axum |reqwest |hft-(collector|research-platform|research-ml|execution-adapter-[a-z-]+) )' "$work/input.tree"; then
+  echo 'scientific input pulls database, transport, control, training or execution' >&2; exit 1
+fi
+cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
+  -p hft-backtest --locked --edges normal --prefix none >"$work/backtest.tree"
+if grep -E '^hft-research-platform ' "$work/backtest.tree"; then
+  echo 'backtest still depends on the control platform' >&2; exit 1
 fi
 cargo tree --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" \
   -p hft-research-platform --features control --locked --edges normal --prefix none >"$work/control.tree"

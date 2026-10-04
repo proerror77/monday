@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
 use hft_research_platform::{
-    data::PreparationPlan,
     orchestrator::TaskSpec,
     postgres::Ledger,
+    preparation::PreparationPlan,
     research::{Experiment, ResearchTool, Run, Session, SessionSnapshot},
 };
 
@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
         ["validate", path] => { let task: TaskSpec = read(path)?; println!("{}", task.id()?); }
         ["submit", tenant, key, path] => { let task: TaskSpec = read(path)?; println!("{}", ledger().await?.submit(tenant, key, task).await?); }
         ["register-plan", path] => { let plan: PreparationPlan = read(path)?; println!("{}", ledger().await?.register_plan(&plan).await?); }
-        ["view",path] => { let spec: hft_research_platform::data::DataViewSpec=read(path)?; println!("{}",serde_json::to_string(&ledger().await?.find_view(&spec).await?.context("view has not been published")?)?); }
+        ["view",path] => { let spec: hft_research_input::data::DataViewSpec=read(path)?; println!("{}",serde_json::to_string(&ledger().await?.find_view(&spec).await?.context("view has not been published")?)?); }
         ["cancel", id] => { ledger().await?.cancel(id).await?; println!("cancel_requested"); }
         ["status", id] => { println!("{}", serde_json::to_string(&ledger().await?.read(id).await?)?); }
         _ => bail!("usage: researchctl plan-build BUILD | register-build ARTIFACT | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID"),

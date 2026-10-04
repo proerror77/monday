@@ -64,6 +64,11 @@ Use the owning manifest for feature matrices. `scripts/cargo-scoped.sh` routes
 explicit package lists to their owners. No default command builds all workspaces.
 Cross-domain path dependencies and their contract tests remain explicit.
 
+The shared owner includes `hft-research-input`: immutable DataView contracts,
+bounded binary decoding, and verified batch reuse. Backtest and control consume
+this crate directly. SQL plans and HTTPS acquisition remain in the control
+implementation; the input crate has no database or provider dependency.
+
 The build boundary does not grant product or execution authority. Existing
 `ploy-*` names remain compatibility identifiers. New packages use functional
 Monday names. Legacy prediction risk and execution contracts remain migration

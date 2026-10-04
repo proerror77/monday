@@ -1,14 +1,15 @@
 //! PostgreSQL is the sole task/result ledger. There is no DuckDB fallback.
 use anyhow::{ensure, Context, Result};
+use hft_research_input::data::PublishedView;
 use serde_json::Value;
 use sqlx_core::{query::query, query_scalar::query_scalar, row::Row, transaction::Transaction};
 use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
 
 use crate::{
-    data::{PreparationPlan, PublishedView},
     execution::Acceptance,
     identity,
     orchestrator::{ResultReceipt, State, Task, TaskKind, TaskSpec},
+    preparation::PreparationPlan,
 };
 
 pub const MIGRATION: &str = include_str!("../sql/postgres.sql");
@@ -157,7 +158,7 @@ impl Ledger {
     pub async fn register_plan(&self, plan: &PreparationPlan) -> Result<String> {
         let id = plan.id()?;
         ensure!(
-            plan.spec.split == crate::data::Split::Train,
+            plan.spec.split == hft_research_input::data::Split::Train,
             "preparation worker supports only the training split"
         );
         let mut tx = self.pool.begin().await?;
@@ -169,7 +170,7 @@ impl Ledger {
 
     pub async fn find_view(
         &self,
-        spec: &crate::data::DataViewSpec,
+        spec: &hft_research_input::data::DataViewSpec,
     ) -> Result<Option<PublishedView>> {
         let manifest: Option<String> =
             query_scalar("SELECT manifest_sha256 FROM research.views WHERE view_id=$1")
@@ -449,7 +450,7 @@ impl Ledger {
                 "plan identity mismatch"
             );
             ensure!(
-                plan.spec.split == crate::data::Split::Train,
+                plan.spec.split == hft_research_input::data::Split::Train,
                 "preparation worker supports only the training split"
             );
             plan.spec.split
@@ -461,9 +462,9 @@ impl Ledger {
             let view: PublishedView = serde_json::from_value(input.get("document"))?;
             view.verify(&task.spec.view_manifest_sha256)?;
             let exit = match task.spec.kind {
-                TaskKind::Train => crate::data::Exit::Training,
-                TaskKind::Backtest => crate::data::Exit::Replay,
-                _ => crate::data::Exit::Features,
+                TaskKind::Train => hft_research_input::data::Exit::Training,
+                TaskKind::Backtest => hft_research_input::data::Exit::Replay,
+                _ => hft_research_input::data::Exit::Features,
             };
             ensure!(
                 view.blocks.iter().any(|b| b.exit == exit),
@@ -474,7 +475,7 @@ impl Ledger {
         // This service has no sealed evaluation grant verifier. Holdout must
         // remain closed, rather than accepting a caller-supplied approval flag.
         ensure!(
-            split != crate::data::Split::Holdout,
+            split != hft_research_input::data::Split::Holdout,
             "sealed holdout requires separate governed evaluator admission"
         );
         query("INSERT INTO research.tasks(task_id,tenant,idempotency_key,request_sha256,view_manifest_sha256,state,document,run_manifest_sha256) VALUES($1,$2,$3,$1,$4,'queued',$5,$6) ON CONFLICT DO NOTHING")
