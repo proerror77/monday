@@ -39,7 +39,14 @@ async fn main() -> Result<()> {
             println!("{}",std::str::from_utf8(&bytes)?);
         }
         ["plan-build",path]=>{let build:hft_research_platform::build::BuildSpec=read(path)?;println!("{}",serde_json::to_string(&build.cargo_arguments()?)?);}
-        ["register-build",path]=>{let value:hft_research_platform::build::BuildArtifact=read(path)?;println!("{}",ledger().await?.register_build(&value).await?);}
+        ["register-build",path,release]=>{
+            let value:hft_research_platform::build::BuildArtifact=read(path)?;
+            let signed:hft_research_platform::release::SignedBuildRelease=read(release)?;
+            let trust_path=std::env::var("MONDAY_RESEARCH_BUILD_TRUST_FILE").context("operator release trust file required")?;
+            let trust:hft_research_platform::release::BuildReleaseTrust=read(&trust_path)?;
+            let verified=trust.verify(&value,&signed)?;
+            println!("{}",ledger().await?.register_build(&verified).await?);
+        }
         ["subscribe",tenant,session,run]=>{ledger().await?.subscribe(tenant,session,run).await?;println!("subscribed");}
         ["register-experiment",tenant,path]=>{let value:Experiment=read(path)?;println!("{}",ledger().await?.register_experiment(tenant,&value).await?);}
         ["register-run",tenant,path]=>{let value:Run=read(path)?;println!("{}",ledger().await?.register_run(tenant,&value).await?);}
@@ -51,7 +58,7 @@ async fn main() -> Result<()> {
         ["view",path] => { let spec: hft_research_platform::data::DataViewSpec=read(path)?; println!("{}",serde_json::to_string(&ledger().await?.find_view(&spec).await?.context("view has not been published")?)?); }
         ["cancel", id] => { ledger().await?.cancel(id).await?; println!("cancel_requested"); }
         ["status", id] => { println!("{}", serde_json::to_string(&ledger().await?.read(id).await?)?); }
-        _ => bail!("usage: researchctl plan-build BUILD | register-build ARTIFACT | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID"),
+        _ => bail!("usage: researchctl plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID"),
     }
     Ok(())
 }
