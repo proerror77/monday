@@ -60,7 +60,7 @@
 #      breach. The five-minute host timer latches an increase until the
 #      GitHub alerting poll observes it; the local timer must not consume
 #      the counter. Session changes and counter regressions rebaseline
-#      instead of fabricating a delta.
+#      instead of fabricating a delta, but never clear a pending breach.
 # The raw-ops Gate template has no [Install] section, so systemd reports it as
 # static. Static is healthy only when no Gate instance, running lock, or
 # residual EnvironmentFile remains on the host. State-persistence failures
@@ -235,9 +235,9 @@ if [ "$MONITOR_RELEASE" = 1 ]; then
 fi
 
 # The local monday-collector-health.timer must not consume a sequence-gap
-# increase. The GitHub monitor-collector-host workflow invokes this script
-# through Cloud Assistant without this env, observes the latched delta, and
-# then persists the new baseline.
+# increase. Pending evidence is independent of the session/counter baseline.
+# The GitHub workflow invokes this script without this env, reports the pending
+# breach once, and consumes it using the existing alerting-poll contract.
 SEQUENCE_GAP_LATCH=0
 case "${MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS:-}" in
   1|true|yes) SEQUENCE_GAP_LATCH=1 ;;
@@ -712,6 +712,8 @@ check_binance_health() {
   sequence_gap_delta_json=null
   sequence_gap_previous_total_json=null
   sequence_gap_session_json=null
+  sequence_gap_pending_json=null
+  sequence_gap_pending_state=''
   sequence_gap_observed=0
   sequence_gap_baseline=missing
   hwarn=false
@@ -725,6 +727,27 @@ check_binance_health() {
     case "$prior_total" in
       '' | *[!0-9]*) prior_total='' ;;
     esac
+    sequence_gap_pending_state=$(read_prior "sequence_gap_pending|$label")
+    if [ -n "$sequence_gap_pending_state" ]; then
+      if sequence_gap_pending_json=$(printf '%s' "$sequence_gap_pending_state" | jq -cse '
+        if length == 1 and (.[0] | type) == "object"
+          and (.[0].session_id | type) == "string"
+          and (.[0].session_id | test("^[A-Za-z0-9._:-]+$"))
+          and (.[0].previous_total | type) == "number"
+          and (.[0].total | type) == "number"
+          and (.[0].previous_total | floor) == .[0].previous_total
+          and (.[0].total | floor) == .[0].total
+          and .[0].previous_total >= 0 and .[0].total > .[0].previous_total
+        then .[0] | {session_id,previous_total,total}
+        else error("invalid pending sequence-gap breach") end' 2>/dev/null); then
+        sequence_gap_pending_state=$sequence_gap_pending_json
+      else
+        # Unknown evidence is not an acknowledgment. Keep the state breached
+        # even on an alerting poll until the malformed record is repaired.
+        sequence_gap_pending_json=null
+        sequence_gap_pending_state=invalid
+      fi
+    fi
   fi
   if [ ! -f "$health_file" ] || [ -L "$health_file" ]; then
     record_breach "$label: health.json missing or a symbolic link ($health_file)"
@@ -818,6 +841,12 @@ check_binance_health() {
           sequence_gap_delta_json=$sequence_gap_delta
           sequence_gap_baseline=increased
           record_breach "$label: sequence_gap_total increased $prior_total -> $sequence_gap_total (delta=$sequence_gap_delta)"
+          if [ -z "$sequence_gap_pending_state" ]; then
+            sequence_gap_pending_json=$(jq -cn --arg s "$session_id" \
+              --argjson p "$prior_total" --argjson t "$sequence_gap_total" \
+              '{session_id:$s,previous_total:$p,total:$t}')
+            sequence_gap_pending_state=$sequence_gap_pending_json
+          fi
         elif [ "$sequence_gap_total" -lt "$prior_total" ]; then
           sequence_gap_baseline=regressed
           record_warning "$label: sequence_gap_total regressed $prior_total -> $sequence_gap_total; baseline reset"
@@ -843,11 +872,22 @@ check_binance_health() {
       preserve_sequence_prior
     fi
   fi
+  if [ -n "$sequence_gap_pending_state" ]; then
+    if [ "$sequence_gap_pending_state" = invalid ]; then
+      record_breach "$label: unacknowledged sequence-gap breach (pending state malformed)"
+    else
+      record_breach "$label: unacknowledged sequence-gap breach $sequence_gap_pending_json"
+    fi
+    if [ "$SEQUENCE_GAP_LATCH" -eq 1 ] || [ "$sequence_gap_pending_state" = invalid ]; then
+      state_lines="$state_lines sequence_gap_pending|$label=$sequence_gap_pending_state"
+    fi
+  fi
   hobj=$(jq -n --argjson age "$age" --argjson gaps "$gaps" \
     --argjson total "$sequence_gap_total_json" \
     --argjson delta "$sequence_gap_delta_json" \
     --argjson previous "$sequence_gap_previous_total_json" \
     --argjson session "$sequence_gap_session_json" \
+    --argjson pending "$sequence_gap_pending_json" \
     --arg baseline "$sequence_gap_baseline" \
     --argjson observed "$sequence_gap_observed" \
     --argjson archive "$archive_coverage" \
@@ -855,6 +895,7 @@ check_binance_health() {
     '{age_seconds: $age, sequence_gaps: $gaps,
       sequence_gap_total: $total, sequence_gap_delta: $delta,
       sequence_gap_previous_total: $previous, session_id: $session,
+      sequence_gap_pending: $pending,
       sequence_gap_observed: ($observed == 1),
       sequence_gap_baseline: $baseline,
       archive_coverage: $archive, disk_warning: ($hw == "true"), status: $s}')

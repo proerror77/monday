@@ -25,8 +25,14 @@
 # health.json session/regression rebaselines stay warnings: reported, never
 # blocking ok:true. journalctl must not be called by this monitor.
 #
-# Usage: ./test-monday-collector-health.sh
+# Usage: ./test-monday-collector-health.sh [--sequence-gap-latch]
 set -euo pipefail
+
+case "${1:-}" in
+  '') test_scope=all ;;
+  --sequence-gap-latch) test_scope=sequence-gap-latch ;;
+  *) printf 'usage: %s [--sequence-gap-latch]\n' "$0" >&2; exit 2 ;;
+esac
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 health_script="$script_dir/monday-collector-health.sh"
@@ -462,6 +468,7 @@ EOF
 
 chmod +x "$stub_dir"/* "$health_script"
 
+if [ "$test_scope" = all ]; then
 # ---------------------------------------------------------------------------
 # 1. Healthy baseline
 # ---------------------------------------------------------------------------
@@ -1031,7 +1038,63 @@ run_health --json
 expect "health gap post-regression: exit 1" "$(rc_is 1; echo $?)"
 expect "health gap post-regression: delta breach" "$(json_query '.breaches | any(contains("sequence_gap_total increased 0 -> 1 (delta=1)"))'; echo $?)"
 expect "health gap post-regression: rebaseline applied" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "increased" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == 1'; echo $?)"
+fi
 
+# A session restart or counter regression can clear the current gap before
+# the GitHub poll. Rebaselining must not acknowledge the timer's durable breach.
+run_sequence_health() {
+  # Refresh only fixture timestamps so slow machines cannot add unrelated
+  # liveness/upload-age breaches to these multi-poll state-machine scenarios.
+  for health in "$spool_root"/binance-lob/*/health.json; do
+    jq '.updated_at_ns = (now * 1000000000 | floor)' "$health" > "$health.tmp"
+    mv "$health.tmp" "$health"
+  done
+  for upload in "$spool_root"/*/upload-status.json "$spool_root"/binance-lob/*/upload-status.json; do
+    jq '.last_success_at = (now | todateiso8601)' "$upload" > "$upload.tmp"
+    mv "$upload.tmp" "$upload"
+  done
+  run_health "$@"
+}
+
+for reset_kind in session regression; do
+  reset_env
+  reset_state
+  healthy_scenario
+  healthy_fixtures
+  write_health usdm 45 0 false synced unacked-session 2
+  run_sequence_health
+  write_health usdm 45 3 false synced unacked-session 5
+  MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+  expect "health unacked $reset_kind: timer detects gap" "$(rc_is 1; echo $?)"
+
+  next_session=unacked-session
+  [ "$reset_kind" != session ] || next_session=reset-session
+  write_health usdm 45 0 false synced "$next_session" 0
+  MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+  expect "health unacked $reset_kind: cleared counter stays breached" "$(rc_is 1; echo $?)"
+  expect "health unacked $reset_kind: original breach survives rebaseline" "$(json_query '
+    .ok == false and (.breaches | any(contains("unacknowledged sequence-gap breach")))
+    and (.checks.health["binance-lob-archiver-production@usdm"] |
+      .sequence_gaps == 0 and .sequence_gap_total == 0
+      and (.sequence_gap_baseline == "session_changed" or .sequence_gap_baseline == "regressed")
+      and .sequence_gap_pending == {session_id:"unacked-session",previous_total:2,total:5})'; echo $?)"
+
+  MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+  expect "health unacked $reset_kind: stable timer still breached" "$(rc_is 1; echo $?)"
+  run_sequence_health --json --dry-run
+  expect "health unacked $reset_kind: dry-run leaves acknowledgment pending" "$(rc_is 0; echo $?)"
+  run_sequence_health --json
+  expect "health unacked $reset_kind: alerting poll still breached" "$(rc_is 1; echo $?)"
+  expect "health unacked $reset_kind: alerting poll observes original breach" "$(json_query '
+    .ok == false and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending
+      == {session_id:"unacked-session",previous_total:2,total:5}'; echo $?)"
+  run_sequence_health --json
+  expect "health unacked $reset_kind: acknowledged poll becomes healthy" "$(rc_is 0; echo $?)"
+  expect "health unacked $reset_kind: acknowledged breach is absent" "$(json_query '
+    .ok == true and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending == null'; echo $?)"
+done
+
+if [ "$test_scope" = all ]; then
 reset_env
 reset_state
 healthy_scenario
@@ -1898,6 +1961,7 @@ expect 'reader failure preserves fail-closed unknown count' "$(json_query '
 printf '#!/bin/sh\nprintf "{}\\n"\n' >"$stub_dir/monday-rust-lob-retained-check"
 run_health --json --dry-run
 expect 'incomplete reader response cannot acknowledge failures' "$(json_query '.ok==false and .checks.recovery_queue.spot.retention_check_status=="failed"'; echo $?)"
+fi
 
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
