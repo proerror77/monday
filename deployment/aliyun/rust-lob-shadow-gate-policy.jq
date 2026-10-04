@@ -187,7 +187,8 @@ and (.production_runtime | type == "object"
     and .type == "oneshot"
     and .exec_start == "/opt/monday/bin/binance-lob-archiver --upload-only"
     and .environment_file == "/etc/monday/binance-lob-archiver-production-%i.env"
-    and .cpu_quota == "80%"
+    and .cpu_quota == "50%"
+    and .nice == 10
     and .memory_high == "384M"
     and .memory_max == "512M"
     and .timeout_start_sec == 0)

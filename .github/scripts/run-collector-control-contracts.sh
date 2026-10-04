@@ -15,6 +15,7 @@ FAST=(
   test-binance-fee-cutover.sh
   test-bybit-options-release-contract.sh
   test-bybit-options-shadow-gate.sh
+  test-upload-cpu-limits.sh
 )
 ISOLATED=(test-rust-lob-recovery-queue.sh)
 SLOW=(test-rust-lob-control-plane.sh test-monday-collector-health.sh)

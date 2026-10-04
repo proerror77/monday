@@ -15,7 +15,7 @@ contracts=(polymarket-market-tape-upload-contract polymarket-reference-upload-co
   rust-lob-controller-release rust-lob-recovery-queue rust-lob-restore
   polymarket-raw-ops-stage trading-ecs-host-contract binance-fee-release-contract
   binance-usdm-account-release-contract binance-fee-cutover bybit-options-release-contract
-  bybit-options-shadow-gate)
+  bybit-options-shadow-gate upload-cpu-limits)
 fixture() {
   root="$temp/$1"
   mkdir -p "$root/rust_hft" "$root/deployment/aliyun"
@@ -53,13 +53,13 @@ cmp "$root/expected" "$root/actual"
 awk '
   $1=="start" {
     active++; if (active>peak) peak=active;
-    if ($2=="test-rust-lob-recovery-queue.sh") {if (ended!=12 || active!=1) exit 1; recovery=1}
+    if ($2=="test-rust-lob-recovery-queue.sh") {if (ended!=13 || active!=1) exit 1; recovery=1}
     else if (recovery) exit 1
   }
   $1=="end" {active--; ended++; if ($2=="test-rust-lob-recovery-queue.sh") recovery=0}
-  END {if (peak!=2 || active!=0 || ended!=15) exit 1}
+  END {if (peak!=2 || active!=0 || ended!=16) exit 1}
 ' "$root/events"
-[[ $(grep -c '^contract_result script=' "$root/output") == 15 ]]
+[[ $(grep -c '^contract_result script=' "$root/output") == 16 ]]
 grep -q elapsed_seconds= "$root/output"
 
 fixture fast-failure
@@ -69,7 +69,7 @@ grep -q 'exit=37' "$root/output"
 
 fixture slow-failure
 if FAIL=test-rust-lob-recovery-queue.sh bash "$runner" --root "$root" >"$root/output"; then exit 1; fi
-[[ $(grep -c '^end ' "$root/events") == 15 ]]
+[[ $(grep -c '^end ' "$root/events") == 16 ]]
 grep -q 'exit=37' "$root/output"
 
 fixture cancellation
