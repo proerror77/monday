@@ -99,6 +99,8 @@ CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生�
 
 `VerifiedCache` 对缺页执行读取、解码、时钟和 split 验证。cache hit 仍检查当前 view 的合同。多个试验可以复用一个只读 `Arc` batch；模型、optimizer 和 checkpoint 状态分别保存。batch owner 必须计入外部持有 Arc 的内存。LRU 不能单独限制这些引用的总驻留量。
 
+同一个缓存已验证的 view 在内部流转时复用验证结果，拒绝同一身份下修改 metadata。新的 view 仍执行首次验证；缓存命中仍检查其时钟、split 和 block 合同。准备数据的终态回读对实际解码字节只下载和校验一次，同一次 receipt 内复用该对象 key、摘要和大小的结果。不同对象、后续请求、首次导入和恢复各自保留边界验证。SHA256 用于内容身份，不代替授权或实际科学行为验收。
+
 `apps/backtest::engine::replay_shared_target_positions` 已消费这些 shared typed 输入，复用现有 IOC target-position engine，每个试验新建状态。它拒绝错误 manifest、market、instrument、多 gap segment 和 split 外决策；availability ns 向上取整到 us，避免提前看数据。这里没有新增被动排队成交或 live 交易声明。
 
 `hft-market-pipeline` 是独立的转换/导入 crate，属于 data workspace。默认仅做已经封印的 Binance raw triplet → 原协议与序列验证 → typed Decimal/LIST Parquet；`import` feature 才引入 PG/CH driver。它不依赖 collector、训练、控制服务或执行 adapter。`monday-market-pipeline --help` 不连接数据库或转换数据。
