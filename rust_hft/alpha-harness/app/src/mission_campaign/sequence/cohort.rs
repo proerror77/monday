@@ -127,11 +127,14 @@ where
     let parent = parent.canonicalize()?;
     let name = args.output_root.file_name().context("cohort output name")?;
     let output = parent.join(name);
-    data_mission::ensure_output_path_is_not_symlink(&output, "cohort output")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(&output, "cohort output")?;
     let mut lock_name = name.to_owned();
     lock_name.push(".cohort.lock");
     let lock_path = parent.join(lock_name);
-    data_mission::ensure_output_path_is_not_symlink(&lock_path, "cohort publication lock")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(
+        &lock_path,
+        "cohort publication lock",
+    )?;
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -149,8 +152,8 @@ where
         bail!("cohort receipt must be outside the worker view");
     }
     let pending = pending_receipt(&inputs_out)?;
-    data_mission::ensure_output_path_is_not_symlink(&inputs_out, "cohort receipt")?;
-    data_mission::ensure_output_path_is_not_symlink(&pending, "cohort pending receipt")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(&inputs_out, "cohort receipt")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(&pending, "cohort pending receipt")?;
     if output.is_dir() && pending.is_file() && !inputs_out.exists() {
         return finish_published_receipt(&output, &inputs_out, &pending, &verify);
     }
@@ -188,7 +191,7 @@ fn retain_receipt<T>(path: &Path, value: &T) -> anyhow::Result<()>
 where
     T: Serialize + serde::de::DeserializeOwned + PartialEq,
 {
-    data_mission::ensure_output_path_is_not_symlink(path, "cohort immutable receipt")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(path, "cohort immutable receipt")?;
     if path.exists() {
         let existing: T = read_json(path)?;
         if existing != *value {
@@ -497,7 +500,7 @@ pub(crate) fn put_metadata(root: &Path, bytes: &[u8], suffix: &str) -> anyhow::R
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file()
             || metadata.len() != bytes.len() as u64
-            || crate::mission_runner::sha256_file(&path)? != artifact.sha256
+            || hft_research_artifacts::sha256_file(&path)? != artifact.sha256
         {
             bail!("existing cohort metadata changed");
         }
@@ -530,7 +533,7 @@ pub(crate) fn copy_verified(
         let metadata = fs::symlink_metadata(destination)?;
         if !metadata.file_type().is_file()
             || metadata.len() > max
-            || crate::mission_runner::sha256_file(destination)? != hash
+            || hft_research_artifacts::sha256_file(destination)? != hash
         {
             bail!("cohort artifact conflict");
         }
@@ -542,7 +545,7 @@ pub(crate) fn copy_verified(
         .open(destination)?;
     let count = std::io::copy(&mut input.take(max + 1), &mut output)?;
     output.sync_all()?;
-    if count > max || crate::mission_runner::sha256_file(destination)? != hash {
+    if count > max || hft_research_artifacts::sha256_file(destination)? != hash {
         bail!("cohort copy hash or byte bound differs");
     }
     Ok(())

@@ -16,7 +16,7 @@ main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sh
 artifact_run_id=$current_run_id
 binaries_conclusion=missing
 smoke_conclusion=missing
-research_product=paired
+research_product=$(bash "$script_dir/research-release-products.sh" normalize all)
 finish() {
   printf '%s\n' "automation_state=$1" "main_sha=$main_sha" \
     "artifact_run_id=$artifact_run_id" "binaries_conclusion=$binaries_conclusion" \
@@ -75,9 +75,19 @@ case "$binaries_conclusion/$smoke_conclusion" in
   *) echo 'exact-source research binaries and smoke must both succeed' >&2; exit 1 ;;
 esac
 
+# Do not silently rebuild when the admitted producer artifact has expired.
+gh api --paginate --slurp \
+  "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_run_id/artifacts?per_page=100" > "$work/artifacts.json"
+research_product=$(jq -er --arg prefix "research-image-release-$source_sha-" --arg source "$source_sha" --argjson run "$artifact_run_id" '
+  [.[].artifacts[]? | select(.name | startswith($prefix))] | if length == 1 and
+  (.[0] | .workflow_run.id == $run and .workflow_run.head_sha == $source)
+  then .[0].name | ltrimstr($prefix) else error("missing/expired/ambiguous release") end' "$work/artifacts.json")
+canonical=$(bash "$script_dir/research-release-products.sh" normalize "$research_product")
+[[ $canonical == "$research_product" ]] || { echo 'noncanonical producer products' >&2; exit 1; }
 # Existing workflow concurrency serializes these reads with earlier publishers.
 # A deferred (successful but no-op) workflow is not publication evidence. Only
-# the dedicated marker after both image readbacks suppresses another wakeup.
+# product markers cover the complete producer selection before another wakeup
+# is suppressed. A manual publication of one product cannot hide another.
 if [[ $mode == automatic ]]; then
 gh api --paginate --slurp \
   "repos/$GITHUB_REPOSITORY/actions/workflows/acr-publish.yml/runs?head_sha=$source_sha&branch=main&status=success&per_page=100" > "$work/publishers.json"
@@ -93,20 +103,21 @@ while IFS=$'\t' read -r prior_id prior_attempt; do
     "repos/$GITHUB_REPOSITORY/actions/runs/$prior_id/attempts/$prior_attempt/jobs?per_page=100" > "$work/prior-jobs.json"
   marker=$(jq -er --arg source "$source_sha" --argjson run "$prior_id" --argjson attempt "$prior_attempt" '
     [.[].jobs[]? | select(.run_id==$run and .run_attempt==$attempt and .status=="completed" and .conclusion=="success" and
-      (.name==("Research release complete [paired] ("+$source+")") or
-       .name==("Research release complete [runner] ("+$source+")") or
-       .name==("Research release complete [controller] ("+$source+")")))] |
-    if length==0 then "none" elif length==1 then .[0].name else error("ambiguous completed release") end' "$work/prior-jobs.json")
-  if [[ $marker != none ]]; then finish already_published; fi
+      (.name | startswith("Research products published")))] |
+    if length==0 then "none" elif length!=1 then error("ambiguous completed release") else .[0].name |
+      capture("^Research products published \\[(?<products>[a-z,-]+)\\] \\((?<source>[0-9a-f]{40})\\)$") |
+      if .source == $source then .products else "none" end end' "$work/prior-jobs.json")
+  if [[ $marker != none ]]; then
+    canonical=$(bash "$script_dir/research-release-products.sh" normalize "$marker")
+    [[ $canonical == "$marker" ]] || exit 1
+    published=$(bash "$script_dir/research-release-products.sh" merge "${published:-none}" "$marker")
+    combined=$(bash "$script_dir/research-release-products.sh" merge "$published" "$research_product")
+    if [[ $combined == "$published" ]]; then finish already_published; fi
+  fi
 done < "$work/prior.tsv"
 fi
 
-# Do not silently rebuild when the admitted producer artifact has expired.
-gh api --paginate --slurp \
-  "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_run_id/artifacts?per_page=100" > "$work/artifacts.json"
-research_product=$(jq -er --arg prefix "research-image-release-$source_sha-" --arg source "$source_sha" --argjson run "$artifact_run_id" '
-  [.[].artifacts[]? | select(.name | startswith($prefix))] | if length == 1 and
-  (.[0] | .expired == false and .workflow_run.id == $run and .workflow_run.head_sha == $source)
-  then .[0].name | ltrimstr($prefix) else error("missing/expired/ambiguous release") end |
-  if . == "paired" or . == "controller" or . == "runner" then . else error("unknown release product") end' "$work/artifacts.json")
+jq -e --arg name "research-image-release-$source_sha-$research_product" '
+  [.[].artifacts[] | select(.name == $name)] | length == 1 and .[0].expired == false
+  ' "$work/artifacts.json" >/dev/null
 finish ready

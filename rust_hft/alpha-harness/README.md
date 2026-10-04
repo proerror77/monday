@@ -263,7 +263,7 @@ publish it once:
 
 ```bash
 MONDAY_RESEARCH_DATABASE_URL='postgresql://...' \
-alpha-harness prediction snapshot \
+monday-prediction-worker snapshot \
   --work-dir /work/snapshot-btc-001 \
   --result-put-url 'https://signed-oss-put-url' \
   -- \
@@ -279,7 +279,7 @@ Bind the latter into a reviewed BTC- or SOL-only mission revision, then run the
 mission from immutable GET URLs and publish one evidence bundle:
 
 ```bash
-alpha-harness prediction execute \
+monday-prediction-worker execute \
   --work-dir /work/prediction-btc-001 \
   --mission-url 'https://signed-mission-get-url' \
   --mission-sha256 "$MISSION_SHA256" \

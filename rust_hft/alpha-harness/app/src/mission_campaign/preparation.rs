@@ -147,7 +147,7 @@ pub(crate) fn verified_bytes(
 
 fn publish_bytes(root: &Path, relative: &Path, value: &[u8]) -> anyhow::Result<FileRef> {
     let path = root.join(relative);
-    data_mission::ensure_real_directory(
+    hft_research_artifacts::ensure_real_directory(
         path.parent()
             .context("preparation artifact has no parent")?,
         "preparation artifact",
@@ -160,7 +160,7 @@ fn publish_bytes(root: &Path, relative: &Path, value: &[u8]) -> anyhow::Result<F
             bail!("existing preparation artifact differs; refusing to replace evidence");
         }
     } else {
-        let mut staged = data_mission::temporary_output_file(&path, ".prepared-")?;
+        let mut staged = hft_research_artifacts::temporary_output_file(&path, ".prepared-")?;
         staged.write_all(value)?;
         staged.as_file().sync_all()?;
         staged.persist_noclobber(&path).map_err(|e| e.error)?;
@@ -446,10 +446,10 @@ pub(super) fn prepare_report(
         "source":plan.source_revision,"image":plan.image,"campaign_root":plan.campaign_root,
         "campaign_inputs_sha256":plan.campaign_inputs.sha256,"seeds":plan.seeds,
         "members":plan.members.iter().zip(&plans).map(|(m,p)|serde_json::json!({"id":m.id,"plan":p})).collect::<Vec<_>>() }))?;
-    data_mission::ensure_real_directory(&args.output_root, "preparation output")?;
+    hft_research_artifacts::ensure_real_directory(&args.output_root, "preparation output")?;
     let output = std::fs::canonicalize(&args.output_root)?.join(&key);
-    data_mission::ensure_real_directory(&output, "preparation state")?;
-    data_mission::ensure_output_path_is_not_symlink(
+    hft_research_artifacts::ensure_real_directory(&output, "preparation state")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(
         &output.join(".prepare.lock"),
         "preparation lock",
     )?;
@@ -462,7 +462,7 @@ pub(super) fn prepare_report(
     lock.try_lock()
         .context("this preparation already has an active writer")?;
     let index_path = output.join("preparation.json");
-    data_mission::ensure_output_path_is_not_symlink(&index_path, "preparation index")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(&index_path, "preparation index")?;
     let local_receipt = publish_bytes(&output, Path::new("campaign-inputs.json"), &receipt_bytes)?;
     plan.input_root = base.join(&plan.input_root);
     let mut args_for_freeze = freeze_args(&plan, &output.join(&local_receipt.path));
@@ -529,7 +529,10 @@ pub(super) fn prepare_report(
         );
     }
     let ready_path = output.join("input-ready.json");
-    data_mission::ensure_output_path_is_not_symlink(&ready_path, "input preparation checkpoint")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(
+        &ready_path,
+        "input preparation checkpoint",
+    )?;
     let (inputs, shared_ref, reused_inputs) = if ready_path.exists() {
         let reference: FileRef = serde_json::from_slice(&bytes(&ready_path, MAX_REQUEST_BYTES)?)?;
         if reference.path != Path::new("inputs").join(format!("{}.json", reference.sha256)) {

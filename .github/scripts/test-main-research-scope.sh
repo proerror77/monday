@@ -13,6 +13,7 @@ case "${!#}" in
   */workflows/acr-publish.yml/runs\?*) cat "$RESEARCH_SCOPE_FIXTURE/runs" ;;
   */runs/100/attempts/2/jobs\?*) cat "$RESEARCH_SCOPE_FIXTURE/pair" ;;
   */runs/200/attempts/2/jobs\?*) cat "$RESEARCH_SCOPE_FIXTURE/controller" ;;
+  */runs/300/attempts/2/jobs\?*) cat "$RESEARCH_SCOPE_FIXTURE/cex" ;;
   *) exit 91 ;;
 esac
 MOCK
@@ -36,7 +37,7 @@ git commit -qm 'fixture docs B'
 head=$(git rev-parse HEAD)
 publisher() {
   jq -n --arg sha "$1" '[{total_count:1,workflow_runs:[{id:100,run_attempt:2,head_sha:$sha,head_branch:"main",event:"workflow_run",path:".github/workflows/acr-publish.yml",head_repository:{full_name:"fixture/repo"},status:"completed",conclusion:"success"}]}]' >"$work/runs"
-  jq -n --arg sha "$1" '[{jobs:[{id:7,run_id:100,run_attempt:2,name:("Research release complete [paired] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/pair"
+  jq -n --arg sha "$1" '[{jobs:[{id:7,run_id:100,run_attempt:2,name:("Research products published [cex-runner,controller,prediction-runner] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/pair"
 }
 plan() {
   : >"$work/plan"
@@ -45,7 +46,7 @@ plan() {
 }
 publisher "$base"
 plan
-grep -Fqx research_product=paired "$work/plan"
+grep -Fqx research_product=cex-runner "$work/plan"
 grep -Fq ',ploy/research-image-binaries,ploy/research-image-smoke,' "$work/plan"
 publisher "$head"
 plan
@@ -63,20 +64,42 @@ plan
 grep -Fqx research_product=controller "$work/plan"
 jq --arg sha "$controller_head" '.[0].total_count=2 | .[0].workflow_runs += [.[0].workflow_runs[0] | .id=200 | .head_sha=$sha]' "$work/runs" >"$work/edit"
 mv "$work/edit" "$work/runs"
-jq -n --arg sha "$controller_head" '[{jobs:[{id:8,run_id:200,run_attempt:2,name:("Research release complete [controller] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/controller"
+jq -n --arg sha "$controller_head" '[{jobs:[{id:8,run_id:200,run_attempt:2,name:("Research products published [controller] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/controller"
 plan
 grep -Fqx research_product=none "$work/plan"
+# Prediction impact survives a later documentation commit and a newer CEX-only
+# publication. Each product retains its last independently verified source.
+publisher "$head"
+mkdir -p rust_hft/prediction-markets/crates/ploy-research/src
+printf 'prediction change\n' >rust_hft/prediction-markets/crates/ploy-research/src/lib.rs
+git add .
+git commit -qm 'fixture prediction E'
+printf 'docs F\n' >>README.md
+git commit -qam 'fixture docs F'
+head=$(git rev-parse HEAD)
+plan
+grep -Fqx research_product=prediction-runner "$work/plan"
+jq --arg sha "$head" '.[0].total_count=2 | .[0].workflow_runs += [.[0].workflow_runs[0] | .id=300 | .head_sha=$sha]' "$work/runs" >"$work/edit"
+mv "$work/edit" "$work/runs"
+jq -n --arg sha "$head" '[{jobs:[{id:9,run_id:300,run_attempt:2,name:("Research products published [cex-runner] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/cex"
+plan
+grep -Fqx research_product=prediction-runner "$work/plan"
 publisher "$pair_head"
 jq '.[0].jobs += [.[0].jobs[0]]' "$work/pair" >"$work/edit"
 mv "$work/edit" "$work/pair"
 if plan >"$work/rejected" 2>&1; then echo 'ambiguous baseline admitted' >&2; exit 1; fi
 publisher "$pair_head"
-jq '.[0].jobs[0].name="Research release complete [paired] (wrong-source)"' "$work/pair" >"$work/edit"
+jq '.[0].jobs[0].name="Research products published [cex-runner,controller,prediction-runner] (wrong-source)"' "$work/pair" >"$work/edit"
 mv "$work/edit" "$work/pair"
 if plan >"$work/rejected" 2>&1; then echo 'wrong baseline source admitted' >&2; exit 1; fi
+publisher "$head"
+jq --arg sha "$head" '.[0].jobs[0].name=("Research release complete [paired] ("+$sha+")")' "$work/pair" >"$work/edit"
+mv "$work/edit" "$work/pair"
+plan
+grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/plan"
 printf '[{"total_count":0,"workflow_runs":[]}]\n' >"$work/runs"
 plan
-grep -Fqx research_product=paired "$work/plan"
+grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/plan"
 printf '[{}]\n' >"$work/runs"
 if plan >"$work/rejected" 2>&1; then echo 'missing API baseline metadata admitted' >&2; exit 1; fi
 printf 'PASS: unpublished A survives docs B; separate product readbacks suppress completed work; malformed or ambiguous baselines fail\n'

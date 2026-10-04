@@ -1,7 +1,7 @@
 # shared workspace; source paths and runtime behavior are preserved.
 [workspace]
 resolver = "2"
-members = ["../market-core/core", "../market-core/ports", "../market-core/snapshot", "../market-core/integration", "../research-core/factor-dsl", "../research-core/manifest", "config", "instrument", "../governance-contracts", "polymarket-tape"]
+members = ["../research-core/artifacts", "../market-core/core", "../market-core/ports", "../market-core/snapshot", "../market-core/integration", "../research-core/factor-dsl", "../research-core/manifest", "config", "instrument", "../governance-contracts", "polymarket-tape", "../research-core/cex-input"]
 default-members = ["../market-core/core", "../market-core/ports", "../market-core/snapshot"]
 
 [workspace.dependencies]

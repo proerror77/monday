@@ -278,6 +278,24 @@ for asset in scripts/campaign-cycle-controller.sh scripts/campaign-job-watch.sh 
     assert_flag "$asset_scope" toolchain false
   done
 done
+# Domain source changes select only their own runner. A neutral shared source
+# selects both consumers through the dependency graph, not a mixed image.
+for domain in cex prediction; do
+  if [[ $domain == cex ]]; then
+    path=rust_hft/apps/backtest/src/main.rs
+    expected_product=cex-runner
+  else
+    path=rust_hft/prediction-markets/crates/ploy-research/src/lib.rs
+    expected_product=prediction-runner
+  fi
+  printf '%s\n' "$path" >"$tmp_dir/domain-image.txt"
+  domain_scope=$(run_case "$domain-image" push domain-image.txt)
+  grep -Fqx "research_product=$expected_product" "$domain_scope"
+  grep -Fq ',ploy/research-image-binaries,' "$domain_scope"
+done
+printf '%s\n' rust_hft/apps/backtest/src/main.rs rust_hft/prediction-markets/crates/ploy-research/src/lib.rs >"$tmp_dir/domain-image.txt"
+domain_scope=$(run_case both-domains push domain-image.txt)
+grep -Fqx research_product=cex-runner,prediction-runner "$domain_scope"
 # Adding an infrastructure helper to real Rust work must preserve the same
 # source-graph suites; the cheap path is not a short circuit for mixed changes.
 printf '%s\n' .github/scripts/wait-ack-research-receipt.sh >"$tmp_dir/ack-with-collector.txt"
