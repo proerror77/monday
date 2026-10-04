@@ -250,8 +250,12 @@ run_containment_fixture() {
     writer_containment_started=0
     writer_containment_failed=0
     trap 'printf "%s\n" "$writer_containment_started" >"$flags"' EXIT
+    # The dynamically sourced cutover_contain_writers calls this stub indirectly.
+    # shellcheck disable=SC2317
     die() { printf 'pair cutover failed: %s\n' "$*" >&2; exit 1; }
     # A fresh sample reaches this guard. No fixture executes containment.
+    # The dynamically sourced cutover_contain_writers calls this stub indirectly.
+    # shellcheck disable=SC2317
     monday_rust_lob_contain_writers() { printf 'containment guard\n' >>"$FIXTURE_HOST_CALLS"; return 1; }
     cutover_contain_writers
   ) >"$log" 2>&1; then
