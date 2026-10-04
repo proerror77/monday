@@ -254,6 +254,7 @@ pub struct VerifiedCache {
     max_bytes: u64,
     used_bytes: u64,
     blocks: BTreeMap<String, (BlockRef, Arc<TypedBlock>)>,
+    verified_view: Option<(String, PublishedView)>,
 }
 
 impl VerifiedCache {
@@ -263,6 +264,7 @@ impl VerifiedCache {
             max_bytes,
             used_bytes: 0,
             blocks: BTreeMap::new(),
+            verified_view: None,
         })
     }
 
@@ -273,7 +275,20 @@ impl VerifiedCache {
         exit: Exit,
         source: &mut impl BlockSource,
     ) -> Result<SharedInput> {
-        view.verify(manifest_sha)?;
+        if let Some((known_id, known_view)) = &self.verified_view {
+            if known_id == manifest_sha {
+                ensure!(
+                    known_view == view,
+                    "validated view identity reused with changed metadata"
+                );
+            } else {
+                view.verify(manifest_sha)?;
+                self.verified_view = Some((manifest_sha.into(), view.clone()));
+            }
+        } else {
+            view.verify(manifest_sha)?;
+            self.verified_view = Some((manifest_sha.into(), view.clone()));
+        }
         let selected: Vec<_> = view.blocks.iter().filter(|b| b.exit == exit).collect();
         ensure!(!selected.is_empty(), "requested exit is absent");
         let budget = selected.iter().try_fold(0_u64, |n, b| {
