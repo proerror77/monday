@@ -1,6 +1,6 @@
 use crate::{
     data_mission, governance, loop_control, mission, mission_campaign, mission_dispatch,
-    mission_fresh_inputs, mission_metrics, mission_runner, prediction_dispatch,
+    mission_fresh_inputs, mission_metrics, mission_runner,
 };
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
@@ -23,7 +23,7 @@ pub(crate) const BUILD_SOURCE_REVISION: &str = match option_env!("MONDAY_SOURCE_
 #[command(
     name = "alpha-harness",
     version = BUILD_SOURCE_REVISION,
-    about = "Governed CEX Campaign and prediction research control plane"
+    about = "Governed CEX Campaign research control plane"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -43,10 +43,6 @@ enum Command {
     Data {
         #[command(subcommand)]
         command: DataCommand,
-    },
-    Prediction {
-        #[command(subcommand)]
-        command: PredictionCommand,
     },
     Candidate {
         #[command(subcommand)]
@@ -145,21 +141,6 @@ enum DataCommand {
     ImportFeatures(ImportFeatureDataArgs),
     FreezeInventory(FreezeInventoryArgs),
     VerifyMaterializationManifest(VerifyMaterializationManifestArgs),
-}
-
-#[derive(Debug, Subcommand)]
-enum PredictionCommand {
-    Dispatch {
-        #[command(subcommand)]
-        command: PredictionDispatchCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum PredictionDispatchCommand {
-    Render(PredictionDispatchRenderArgs),
-    Status(PredictionDispatchStatusArgs),
-    Submit(PredictionDispatchSubmitArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -643,36 +624,6 @@ pub struct PrepareFreshInputsArgs {
     /// Optional create-once preparation report path.
     #[arg(long)]
     pub report_out: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct PredictionDispatchRenderArgs {
-    #[arg(long)]
-    pub submission: PathBuf,
-    #[arg(long)]
-    pub namespace: String,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct PredictionDispatchSubmitArgs {
-    #[arg(long)]
-    pub submission: PathBuf,
-    #[arg(long)]
-    pub context: String,
-    #[arg(long)]
-    pub namespace: String,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct PredictionDispatchStatusArgs {
-    #[arg(long)]
-    pub context: String,
-    #[arg(long)]
-    pub namespace: String,
-    #[arg(long)]
-    pub job_name: String,
-    #[arg(long)]
-    pub evidence: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1413,13 +1364,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 }))
             }
         },
-        Command::Prediction { command } => match command {
-            PredictionCommand::Dispatch { command } => match command {
-                PredictionDispatchCommand::Render(args) => prediction_dispatch::render(args),
-                PredictionDispatchCommand::Status(args) => prediction_dispatch::status(args),
-                PredictionDispatchCommand::Submit(args) => prediction_dispatch::submit(args),
-            },
-        },
         Command::Candidate { command } => match command {
             CandidateCommand::List(args) => governance::candidate_list(args),
             CandidateCommand::Show(args) => governance::candidate_show(args),
@@ -1592,7 +1536,7 @@ mod tests {
             .join("attempt=test/results.zip")
             .display()
             .to_string();
-        let (_, holdout_claim) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+        let (_, holdout_claim) = crate::mission_objects::cex_result_attempt_and_holdout_claim(
             &result,
             &mission_id,
             &holdout_id,
@@ -1642,12 +1586,6 @@ mod tests {
                 .contains(&format!("failed to open local source {missing_mission}")),
             "unexpected error: {error:#}"
         );
-    }
-
-    #[test]
-    fn parses_prediction_dispatch_render() {
-        let args = "alpha-harness prediction dispatch render --submission submission.json --namespace monday-research";
-        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 
     #[test]
@@ -1791,14 +1729,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_prediction_dispatch_status_with_explicit_cluster_identity() {
-        let args = "alpha-harness prediction dispatch status --context ack --namespace monday-research --job-name prediction-job";
-        assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
-    }
-
-    #[test]
     fn prediction_worker_commands_are_not_cex_execution_paths() {
-        for command in ["execute", "snapshot"] {
+        let args = "alpha-harness prediction dispatch render --submission submission.json --namespace monday-research";
+        let error = Cli::try_parse_from(args.split_whitespace()).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        for command in ["execute", "snapshot", "dispatch"] {
             assert!(Cli::try_parse_from(["alpha-harness", "prediction", command]).is_err());
         }
     }

@@ -296,6 +296,16 @@ done
 printf '%s\n' rust_hft/apps/backtest/src/main.rs rust_hft/prediction-markets/crates/ploy-research/src/lib.rs >"$tmp_dir/domain-image.txt"
 domain_scope=$(run_case both-domains push domain-image.txt)
 grep -Fqx research_product=cex-runner,prediction-runner "$domain_scope"
+# The separate Prediction operator publishes its own domain. Shared cluster IO
+# reaches both the operator and CEX consumers through their real dependencies.
+"$script_dir/../../rust_hft/scripts/workspace-metadata.sh" >"$tmp_dir/operator-metadata.fixture"
+printf '%s\n' rust_hft/prediction-markets/crates/research-operator/src/dispatch.rs >"$tmp_dir/operator-image.txt"
+operator_scope=$(run_case prediction-operator push operator-image.txt "$tmp_dir/operator-metadata.fixture")
+grep -Fqx research_product=prediction-runner "$operator_scope"
+grep -Fq ',ploy/research-image-binaries,' "$operator_scope"
+printf '%s\n' rust_hft/research-core/dispatch-io/src/lib.rs >"$tmp_dir/shared-dispatch-image.txt"
+dispatch_scope=$(run_case shared-dispatch push shared-dispatch-image.txt "$tmp_dir/operator-metadata.fixture")
+grep -Fqx research_product=cex-runner,controller,prediction-runner "$dispatch_scope"
 # Adding an infrastructure helper to real Rust work must preserve the same
 # source-graph suites; the cheap path is not a short circuit for mixed changes.
 printf '%s\n' .github/scripts/wait-ack-research-receipt.sh >"$tmp_dir/ack-with-collector.txt"

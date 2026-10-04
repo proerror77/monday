@@ -158,7 +158,7 @@ release="$tmp_dir/release"
 mkdir -p "$repo/prediction-markets" "$release/research-bin"
 printf 'root lock\n' >"$repo/Cargo.lock"
 printf 'prediction lock\n' >"$repo/prediction-markets/Cargo.lock"
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot monday-prediction-worker; do
+for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot monday-prediction-worker monday-prediction-operator; do
   printf '%s\n' "$binary" >"$release/research-bin/$binary"
   chmod 0755 "$release/research-bin/$binary"
 done

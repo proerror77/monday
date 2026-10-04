@@ -782,7 +782,7 @@ select_job_if_affected ploy/rust-research-heavy ploy-feed-loaders ploy-research 
 select_job_if_affected ploy/frontend ploy-operator-contracts
 select_job_if_affected ploy/integration-regressions ploy
 
-if is_affected ploy-research || is_affected hft-prediction-research-worker; then
+if is_affected ploy-research || is_affected hft-prediction-research-worker || is_affected hft-prediction-research-operator; then
   research_product=$(bash "$products" merge "$research_product" prediction-runner)
   research_image_relevant=true
 fi
