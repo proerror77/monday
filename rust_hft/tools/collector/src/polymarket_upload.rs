@@ -1242,6 +1242,7 @@ fn scan_tape_with_identity_at(
     let mut event_token_lifecycles = BTreeMap::new();
     let mut expired_before_discovery_tokens = BTreeSet::new();
     let mut lifecycle_integrity_complete = true;
+    let mut broadcast_gaps = Vec::new();
     let mut quoted_token_ids = BTreeSet::new();
     let mut attempted_quote_token_ids = BTreeSet::new();
     let mut contextless_quote_tokens = BTreeSet::new();
@@ -1324,6 +1325,37 @@ fn scan_tape_with_identity_at(
         }
         if previous_recorded_at.is_some_and(|previous| recorded_at < previous) {
             bail!("line {line_number}: recorded_at moved backwards");
+        }
+        let recorded_at_text = record
+            .get("recorded_at")
+            .and_then(Value::as_str)
+            .expect("recorded_at was validated")
+            .to_owned();
+        first_recorded_at.get_or_insert_with(|| recorded_at_text.clone());
+        last_recorded_at = Some(recorded_at_text);
+        first_sequence.get_or_insert(sequence);
+        last_sequence = Some(sequence);
+        expected_sequence = sequence.checked_add(1);
+        if expected_sequence.is_none() {
+            bail!("line {line_number}: sequence overflow");
+        }
+        previous_recorded_at = Some(recorded_at);
+
+        if let Some(gap) = record.get("gap") {
+            if record.contains_key("update")
+                || gap.get("kind").and_then(Value::as_str) != Some("broadcast_lag")
+                || !gap
+                    .get("skipped_updates")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|skipped| skipped > 0)
+            {
+                bail!("line {line_number}: invalid broadcast gap record");
+            }
+            // A lost discovery or expiry leaves this entire source uncertain.
+            // Later quotes and hour boundaries cannot prove lifecycle recovery.
+            broadcast_gaps.push(Value::Object(record.clone()));
+            lifecycle_integrity_complete = false;
+            continue;
         }
         let update = record
             .get("update")
@@ -1741,21 +1773,6 @@ fn scan_tape_with_identity_at(
                 request_failures += 1;
             }
         }
-
-        let recorded_at_text = record
-            .get("recorded_at")
-            .and_then(Value::as_str)
-            .expect("recorded_at was validated")
-            .to_owned();
-        first_recorded_at.get_or_insert_with(|| recorded_at_text.clone());
-        last_recorded_at = Some(recorded_at_text);
-        first_sequence.get_or_insert(sequence);
-        last_sequence = Some(sequence);
-        expected_sequence = sequence.checked_add(1);
-        if expected_sequence.is_none() {
-            bail!("line {line_number}: sequence overflow");
-        }
-        previous_recorded_at = Some(recorded_at);
     }
 
     // A transport reconnect whose token never quoted again inside this tape
@@ -1953,7 +1970,25 @@ fn scan_tape_with_identity_at(
             "binance_reference_counts".to_owned(),
             Value::Object(binance_reference_counts),
         );
+    mark_broadcast_gaps_incomplete(&mut manifest, &broadcast_gaps);
     Ok(ScanResult { manifest, identity })
+}
+
+fn mark_broadcast_gaps_incomplete(manifest: &mut Value, gaps: &[Value]) {
+    if gaps.is_empty() {
+        return;
+    }
+    manifest["source_broadcast_gaps"] = json!(gaps);
+    for field in [
+        "canonical",
+        "segment_complete",
+        "lifecycle_integrity_complete",
+        "venue_depth_complete",
+        "temporal_updates_complete",
+    ] {
+        manifest[field] = json!(false);
+    }
+    manifest["replay_scope"] = json!("incomplete_normalized_hour_segment_broadcast_lag");
 }
 
 fn quote_levels(value: Option<&Value>, line_number: usize) -> Result<&[Value]> {
@@ -2111,8 +2146,27 @@ fn prepare_artifacts(source: &Path, config: &UploadConfig) -> Result<(Artifacts,
 fn prepare_artifacts_from_scan(
     source: &Path,
     config: &UploadConfig,
-    scan: ScanResult,
+    mut scan: ScanResult,
 ) -> Result<(Artifacts, Value)> {
+    if scan.manifest["event_types"]["quote"]
+        .as_u64()
+        .is_some_and(|quotes| quotes > 0)
+        && config.quote_depth_levels == 0
+        && config.quote_sample_ms == 0
+    {
+        // MarketUpdate::Quote carries token and source time, but no market,
+        // semantic-side or venue-update identity. Unknown JSON fields cannot
+        // establish that missing typed contract for a full-update recording.
+        scan.manifest["venue_identity_complete"] = json!(false);
+        scan.manifest["canonical"] = json!(false);
+        scan.manifest["segment_complete"] = json!(false);
+        scan.manifest["venue_depth_complete"] = json!(false);
+        scan.manifest["temporal_updates_complete"] = json!(false);
+        if scan.manifest.get("source_broadcast_gaps").is_none() {
+            scan.manifest["replay_scope"] =
+                json!("normalized_hour_segment_requires_venue_identity");
+        }
+    }
     let data = append_name(source, ".zst")?;
     let (temporary_data, temporary_file) = exclusive_sibling(&data, ".tmp")?;
     let output = temporary_file.try_clone()?;
@@ -2563,10 +2617,6 @@ fn remove_artifacts(artifacts: &Artifacts) -> Result<()> {
     Ok(())
 }
 
-fn upload_artifacts(artifacts: &Artifacts, config: &UploadConfig) -> Result<String> {
-    upload_artifacts_with(artifacts, config, &mut run_checked)
-}
-
 fn upload_artifact_with<F>(
     artifacts: &Artifacts,
     source: &Path,
@@ -2685,6 +2735,12 @@ where
 
 fn canonical_complete_manifest(manifest: &Value) -> bool {
     manifest.get("canonical").and_then(Value::as_bool) == Some(true)
+        && manifest
+            .get("venue_identity_complete")
+            .is_none_or(|complete| complete.as_bool() == Some(true))
+        && manifest
+            .get("source_broadcast_gaps")
+            .is_none_or(|gaps| gaps.as_array().is_some_and(Vec::is_empty))
         && manifest.get("segment_complete").and_then(Value::as_bool) == Some(true)
         && manifest
             .get("event_context_complete")
@@ -2886,6 +2942,17 @@ fn repair_torn_tail(source: &Path) -> Result<Option<u64>> {
 }
 
 fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSegment>> {
+    archive_source_with(source, config, &mut run_checked)
+}
+
+fn archive_source_with<F>(
+    source: &Path,
+    config: &UploadConfig,
+    runner: &mut F,
+) -> Result<Vec<UploadedSegment>>
+where
+    F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
+{
     let _archive_activity = ArchiveActivity::enter();
     if let Some(quarantine) = quarantine_empty_tape(source)? {
         bail!("empty closed tape quarantined at {}", quarantine.display());
@@ -2922,6 +2989,10 @@ fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSe
     ensure_upload_staging_root(&staging_root)?;
     let staging = ExclusiveTempDir::create(&staging_root, "session")?;
     let source_identity = source_scan.identity;
+    let source_broadcast_gaps = source_scan.manifest["source_broadcast_gaps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let chunks = match stage_validated_single_hour(source, staging.path(), source_scan)? {
         Some(chunk) => vec![chunk],
         None => {
@@ -2933,7 +3004,7 @@ fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSe
             paths
                 .into_iter()
                 .map(|chunk| {
-                    let scan = {
+                    let mut scan = {
                         let _phase = PhaseAttribution::new("scan_multi_hour_chunk");
                         scan_tape_with_identity(
                             &chunk,
@@ -2942,6 +3013,7 @@ fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSe
                             config.quote_sample_ms,
                         )?
                     };
+                    mark_broadcast_gaps_incomplete(&mut scan.manifest, &source_broadcast_gaps);
                     Ok((chunk, scan))
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -2950,13 +3022,13 @@ fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSe
     let mut uploaded = Vec::new();
     for (chunk, scan) in chunks {
         let (artifacts, manifest) = prepare_artifacts_from_scan(&chunk, config, scan)?;
-        // upload_artifacts only returns Ok after data+manifest+_SUCCESS were all
+        // Upload only returns Ok after data+manifest+_SUCCESS were all
         // PUT and read back byte-identical. Any failure propagates here and
         // aborts before the source deletion below, so the source rotated tape is
         // never removed unless EVERY chunk's readback passed. The caller records
         // the failure (source still present) in upload-status.json failed_segments.
         uploaded.push(UploadedSegment {
-            object: upload_artifacts(&artifacts, config)?,
+            object: upload_artifacts_with(&artifacts, config, runner)?,
             canonical_complete: canonical_complete_manifest(&manifest),
         });
     }
@@ -5344,11 +5416,20 @@ mod tests {
         incomplete_coverage["quote_coverage_complete"] = json!(false);
         let mut missing_quality = complete.clone();
         missing_quality["quality"]["executable_quotes"] = Value::Null;
+        let mut missing_venue_identity = complete.clone();
+        missing_venue_identity["venue_identity_complete"] = json!(false);
+        let mut broadcast_gap = complete.clone();
+        broadcast_gap["source_broadcast_gaps"] = json!([{
+            "sequence": 0, "recorded_at": "2026-07-15T01:00:00Z",
+            "gap": {"kind": "broadcast_lag", "skipped_updates": 7},
+        }]);
         for manifest in [
             not_canonical,
             incomplete_segment,
             incomplete_coverage,
             missing_quality,
+            missing_venue_identity,
+            broadcast_gap,
         ] {
             assert!(!canonical_complete_manifest(&manifest));
         }
@@ -5537,6 +5618,216 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_gap_tapes_archive_after_lag_and_repeated_rotations() {
+        let root = TestDir::new();
+        let mut config = config(root.path());
+        config.quote_depth_levels = 0;
+        config.quote_sample_ms = 0;
+        config.zstd_threads = 1;
+        let mut remote = BTreeMap::new();
+        for rotation in 0..3 {
+            let gap = json!({
+                "sequence": 0, "recorded_at": "2026-07-15T01:00:00Z",
+                "gap": {"kind": "broadcast_lag", "skipped_updates": 7},
+            });
+            let mut rows = vec![gap.clone()];
+            if rotation > 0 {
+                let mut discovery = sample_rows().remove(0);
+                discovery["sequence"] = json!(1);
+                rows.push(discovery);
+                rows.push(quote_record(2, "2026-07-15T01:00:01Z", "up-1"));
+                rows.push(quote_record(3, "2026-07-15T01:00:02Z", "down-1"));
+            }
+            let tape = write_tape(
+                root.path(),
+                &format!("market-updates.20260715T01000{rotation}.ndjson"),
+                &rows,
+            );
+            let original = fs::read(&tape).unwrap();
+            assert!(!tape_seal_path(&tape).unwrap().exists());
+            let segments = archive_source_with(&tape, &config, &mut |command, _| {
+                copy_test_oss_object(command, &mut remote)
+            })
+            .unwrap();
+            assert_eq!(segments.len(), 1);
+            assert!(!segments[0].canonical_complete);
+            assert!(!tape.exists(), "verified archival must drain the spool");
+            let data_name = Path::new(&segments[0].object)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!(
+                zstd::stream::decode_all(remote[data_name].as_slice()).unwrap(),
+                original
+            );
+            let manifest: Value =
+                serde_json::from_slice(&remote[&format!("{data_name}.manifest.json")]).unwrap();
+            assert_eq!(manifest["source_broadcast_gaps"], json!([gap]));
+            assert_eq!(manifest["events"], rows.len());
+            assert_eq!(manifest["sequence_gaps"], 0);
+            for field in [
+                "canonical",
+                "segment_complete",
+                "lifecycle_integrity_complete",
+                "venue_depth_complete",
+                "temporal_updates_complete",
+            ] {
+                assert_eq!(manifest[field], false, "{field}");
+            }
+            assert_eq!(
+                manifest["replay_scope"],
+                "incomplete_normalized_hour_segment_broadcast_lag"
+            );
+            assert!(!canonical_complete_manifest(&manifest));
+            assert_eq!(
+                String::from_utf8(remote[&format!("{data_name}._SUCCESS")].clone())
+                    .unwrap()
+                    .trim(),
+                manifest["sha256"].as_str().unwrap()
+            );
+        }
+    }
+
+    fn copy_test_oss_object(
+        command: &mut Command,
+        remote: &mut BTreeMap<String, Vec<u8>>,
+    ) -> Result<ExitStatus> {
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if args[2].starts_with("oss://") {
+            let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+            let bytes = remote.get(name).ok_or_else(|| anyhow!("NoSuchKey"))?;
+            fs::write(&args[3], bytes)?;
+        } else {
+            let name = Path::new(&args[3])
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            remote.insert(name, fs::read(&args[2])?);
+        }
+        Ok(success_status())
+    }
+
+    #[test]
+    fn broadcast_gap_marks_later_hour_chunks_incomplete() {
+        let root = TestDir::new();
+        let mut config = config(root.path());
+        config.quote_depth_levels = 0;
+        config.quote_sample_ms = 0;
+        config.zstd_threads = 1;
+        let gap = json!({
+            "sequence": 3, "recorded_at": "2026-07-15T01:00:03Z",
+            "gap": {"kind": "broadcast_lag", "skipped_updates": 7},
+        });
+        let mut later_discovery = sample_rows().remove(0);
+        later_discovery["sequence"] = json!(4);
+        later_discovery["recorded_at"] = json!("2026-07-15T02:00:00Z");
+        later_discovery["update"]["event_id"] = json!("event-2");
+        later_discovery["update"]["end_time"] = json!("2026-07-15T02:05:00Z");
+        let rows = vec![
+            sample_rows().remove(0),
+            quote_record(1, "2026-07-15T01:00:01Z", "up-1"),
+            quote_record(2, "2026-07-15T01:00:02Z", "down-1"),
+            gap.clone(),
+            later_discovery,
+            quote_record(5, "2026-07-15T02:00:01Z", "up-1"),
+            quote_record(6, "2026-07-15T02:00:02Z", "down-1"),
+        ];
+        let tape = write_tape(root.path(), "market-updates.20260715T030000.ndjson", &rows);
+        let original = fs::read(&tape).unwrap();
+        let mut remote = BTreeMap::new();
+        let segments = archive_source_with(&tape, &config, &mut |command, _| {
+            copy_test_oss_object(command, &mut remote)
+        })
+        .unwrap();
+        assert_eq!(segments.len(), 2);
+        assert!(!tape.exists());
+        let mut decoded = Vec::new();
+        for segment in segments {
+            assert!(!segment.canonical_complete);
+            let name = Path::new(&segment.object)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            decoded.extend(zstd::stream::decode_all(remote[name].as_slice()).unwrap());
+            let manifest: Value =
+                serde_json::from_slice(&remote[&format!("{name}.manifest.json")]).unwrap();
+            assert_eq!(manifest["source_broadcast_gaps"], json!([gap]));
+            assert_eq!(manifest["canonical"], false);
+            assert_eq!(manifest["segment_complete"], false);
+            assert_eq!(manifest["lifecycle_integrity_complete"], false);
+            assert!(!canonical_complete_manifest(&manifest));
+        }
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn broadcast_gap_records_still_require_valid_shape_sequence_and_time() {
+        let valid = json!({
+            "sequence": 0, "recorded_at": "2026-07-15T01:00:00Z",
+            "gap": {"kind": "broadcast_lag", "skipped_updates": 7},
+        });
+        for (field, value) in [
+            ("kind", json!("unknown")),
+            ("skipped_updates", json!(0)),
+            ("skipped_updates", json!(-1)),
+            ("skipped_updates", json!("7")),
+            ("skipped_updates", Value::Null),
+        ] {
+            let root = TestDir::new();
+            let mut gap = valid.clone();
+            gap["gap"][field] = value;
+            let tape = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &[gap]);
+            assert!(
+                scan_tape(&tape, "crypto_expiry", 0, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid broadcast gap record")
+            );
+        }
+        for (sequence, recorded_at, message) in [
+            (2, "2026-07-15T01:00:01Z", "sequence gap"),
+            (1, "2026-07-15T00:59:59Z", "recorded_at moved backwards"),
+        ] {
+            let root = TestDir::new();
+            let mut gap = valid.clone();
+            gap["sequence"] = json!(sequence);
+            gap["recorded_at"] = json!(recorded_at);
+            let tape = write_tape(
+                root.path(),
+                "market-updates.20260715T010000.ndjson",
+                &[sample_rows().remove(0), gap],
+            );
+            assert!(
+                scan_tape(&tape, "crypto_expiry", 0, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(message)
+            );
+        }
+        let root = TestDir::new();
+        let mut ambiguous = valid;
+        ambiguous["update"] = quote_record(0, "2026-07-15T01:00:00Z", "up-1")["update"].clone();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &[ambiguous],
+        );
+        assert!(
+            scan_tape(&tape, "crypto_expiry", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid broadcast gap record")
+        );
+    }
+
+    #[test]
     fn full_update_clob_fixture_rejects_sequence_gap_or_bad_sha() {
         let root = TestDir::new();
         let mut config = config(root.path());
@@ -5545,40 +5836,29 @@ mod tests {
         config.zstd_threads = 1;
 
         let mut rows = vec![sample_rows().remove(0)];
-        rows[0]["update"]["market_id"] = json!("market-1");
-        for (sequence, token, side, source_at, received_at, update_id) in [
+        for (sequence, token, source_at, received_at) in [
             (
                 1,
                 "up-1",
-                "Up",
                 "2026-07-15T01:00:01.100Z",
                 "2026-07-15T01:00:01.110Z",
-                "up-seed",
             ),
             (
                 2,
                 "down-1",
-                "Down",
                 "2026-07-15T01:00:01.200Z",
                 "2026-07-15T01:00:01.210Z",
-                "down-seed",
             ),
             (
                 3,
                 "up-1",
-                "Up",
                 "2026-07-15T01:00:01.300Z",
                 "2026-07-15T01:00:01.310Z",
-                "up-change",
             ),
         ] {
             let mut row = quote_record(sequence, received_at, token);
             let update = &mut row["update"];
             update["ts"] = json!(source_at);
-            update["venue_id"] = json!("polymarket");
-            update["market_id"] = json!("market-1");
-            update["semantic_side"] = json!(side);
-            update["venue_update_id"] = json!(update_id);
             update["bid_levels"] = json!([
                 {"price":"0.49","size":"10"}, {"price":"0.48","size":"20"}
             ]);
@@ -5594,28 +5874,35 @@ mod tests {
         let source = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
         let (artifacts, manifest) = prepare_artifacts(&source, &config).unwrap();
 
-        assert!(canonical_complete_manifest(&manifest));
+        assert!(!canonical_complete_manifest(&manifest));
+        assert_eq!(manifest["canonical"], false);
+        assert_eq!(manifest["segment_complete"], false);
+        assert_eq!(manifest["venue_identity_complete"], false);
+        assert_eq!(manifest["venue_depth_complete"], false);
+        assert_eq!(manifest["temporal_updates_complete"], false);
         assert_eq!(manifest["venue"], "polymarket");
         assert_eq!(manifest["recording_policy"]["quote_sample_ms"], 0);
         assert_eq!(manifest["recording_policy"]["quote_depth_levels"], 0);
         assert_eq!(
             manifest["replay_scope"],
-            "complete_full_depth_normalized_hour_segment"
+            "normalized_hour_segment_requires_venue_identity"
         );
         assert_eq!(manifest["events"], 4);
         assert_eq!(manifest["event_types"]["quote"], 3);
         assert_eq!(manifest["token_count"], 2);
-        assert_eq!(manifest["market_count"], 1);
+        assert_eq!(manifest["market_count"], 0);
         assert_eq!(manifest["sequence_gaps"], 0);
         assert_eq!(manifest["quality"]["max_quote_latency_ms"], 10);
-        for field in [
-            "ts",
-            "venue_id",
-            "market_id",
-            "semantic_side",
-            "venue_update_id",
-        ] {
+        for field in ["ts", "token_id"] {
             assert_eq!(manifest["field_non_null"]["quote"][field], 3);
+        }
+        for field in ["venue_id", "market_id", "semantic_side", "venue_update_id"] {
+            assert!(manifest["field_non_null"]["quote"][field].is_null());
+            assert!(
+                rows.iter()
+                    .skip(1)
+                    .all(|row| row["update"].get(field).is_none())
+            );
         }
         assert_eq!(sha256_file(&artifacts.data).unwrap(), manifest["sha256"]);
         assert_eq!(
@@ -5636,6 +5923,30 @@ mod tests {
             .map(|line| serde_json::from_slice::<Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(decoded_rows, rows);
+        assert_eq!(decoded_rows[1]["update"]["token_id"], "up-1");
+        assert_eq!(decoded_rows[2]["update"]["token_id"], "down-1");
+        assert_eq!(decoded_rows[3]["update"]["token_id"], "up-1");
+        assert_eq!(decoded_rows[1]["update"]["ts"], "2026-07-15T01:00:01.100Z");
+        assert_eq!(decoded_rows[3]["update"]["ts"], "2026-07-15T01:00:01.300Z");
+
+        for field in ["token_id", "ts"] {
+            let missing_root = TestDir::new();
+            let mut missing_identity = rows.clone();
+            missing_identity[1]["update"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let tape = write_tape(
+                missing_root.path(),
+                "market-updates.20260715T010000.ndjson",
+                &missing_identity,
+            );
+            let error = prepare_artifacts(&tape, &config)
+                .err()
+                .expect("losing quote identity must reject the batch");
+            assert!(error.to_string().contains(field), "{error:#}");
+            assert!(!append_name(&tape, ".zst._SUCCESS").unwrap().exists());
+        }
 
         let readback = root.path().join("readback");
         fs::create_dir(&readback).unwrap();
