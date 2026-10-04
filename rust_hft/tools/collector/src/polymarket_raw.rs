@@ -575,7 +575,9 @@ fn trade_poll_candidates(
                 .or_else(|| parse_optional_datetime(tracked.end_time.as_deref()));
             Some(TradePollCandidate {
                 market_id: market_id.clone(),
-                priority: tracked.trade_failure_since.is_some()
+                // Settled markets need priority polls until stable finalization completes.
+                priority: tracked.settled
+                    || tracked.trade_failure_since.is_some()
                     || end_time.is_none_or(|end| end >= priority_cutoff),
                 last_success_at: parse_optional_datetime(tracked.last_trade_success_at.as_deref()),
                 end_time,
@@ -4879,6 +4881,178 @@ mod tests {
         let plan = plan_trade_polls(candidates, 2);
         assert_eq!(plan.priority_deferred, 1);
         assert_eq!(plan.deferred, 1);
+    }
+
+    fn priority_trade_poll_fixture() -> (
+        BTreeMap<String, (Value, TargetMarket)>,
+        CollectorState,
+        DateTime<Utc>,
+    ) {
+        let end_time = fixed_time("2026-07-15T01:00:00Z");
+        let settlement_seen_at = end_time + TimeDelta::seconds(60);
+        let mut state = CollectorState::default();
+        let targets = ["finalizing", "backfill"]
+            .into_iter()
+            .map(|market_id| {
+                state.markets.insert(
+                    market_id.to_owned(),
+                    TrackedMarket {
+                        settled: market_id == "finalizing",
+                        settlement_seen_at: Some(iso_z(settlement_seen_at)),
+                        last_trade_change_at: Some(iso_z(settlement_seen_at)),
+                        last_trade_success_at: (market_id == "finalizing")
+                            .then(|| iso_z(settlement_seen_at)),
+                        end_time: Some(iso_z(end_time)),
+                        ..TrackedMarket::default()
+                    },
+                );
+                (
+                    market_id.to_owned(),
+                    (
+                        json!({"conditionId": market_id, "endDate": iso_z(end_time)}),
+                        TargetMarket {
+                            symbol: "BTCUSDT".to_owned(),
+                            window_secs: 300,
+                        },
+                    ),
+                )
+            })
+            .collect();
+        (targets, state, settlement_seen_at)
+    }
+
+    #[test]
+    fn priority_trade_poll_keeps_settled_markets_until_three_stable_polls() {
+        let (targets, mut state, settlement_seen_at) = priority_trade_poll_fixture();
+        let config = ReferenceConfig::default();
+        assert_eq!(config.trade_finalization_lag_secs, 1_800);
+        assert_eq!(config.trade_finalization_stable_polls, 3);
+
+        for (elapsed_secs, expected_stable_polls) in
+            [(1_799, 0), (1_800, 1), (1_830, 2), (1_860, 3)]
+        {
+            let now = settlement_seen_at + TimeDelta::seconds(elapsed_secs);
+            let plan = plan_trade_polls(
+                trade_poll_candidates(
+                    &targets,
+                    &state,
+                    now - TimeDelta::seconds(config.trade_finalization_lag_secs),
+                ),
+                1,
+            );
+            assert_eq!(plan.priority, 1);
+            assert_eq!(plan.selected, BTreeSet::from(["finalizing".to_owned()]));
+            let tracked = state.markets.get_mut("finalizing").unwrap();
+            tracked.trade_complete = advance_trade_finalization(
+                tracked,
+                now,
+                &iso_z(now),
+                true,
+                false,
+                false,
+                false,
+                true,
+                config.trade_finalization_lag_secs,
+                config.trade_finalization_stable_polls,
+            );
+            tracked.last_trade_success_at = Some(iso_z(now));
+            assert_eq!(
+                tracked.trade_finalization_stable_polls,
+                expected_stable_polls
+            );
+            assert_eq!(tracked.trade_complete, expected_stable_polls == 3);
+        }
+
+        let now = settlement_seen_at + TimeDelta::seconds(1_890);
+        let plan = plan_trade_polls(
+            trade_poll_candidates(
+                &targets,
+                &state,
+                now - TimeDelta::seconds(config.trade_finalization_lag_secs),
+            ),
+            1,
+        );
+        assert_eq!(plan.priority, 0);
+        assert_eq!(plan.selected, BTreeSet::from(["backfill".to_owned()]));
+    }
+
+    #[test]
+    fn priority_trade_poll_stays_priority_when_finalization_resets() {
+        let config = ReferenceConfig::default();
+        for (snapshot_changed, truncated, malformed, settlement_available) in [
+            (true, false, false, true),
+            (false, true, false, true),
+            (false, false, true, true),
+            (false, false, false, false),
+        ] {
+            let (targets, mut state, settlement_seen_at) = priority_trade_poll_fixture();
+            let now = settlement_seen_at + TimeDelta::seconds(1_860);
+            let tracked = state.markets.get_mut("finalizing").unwrap();
+            tracked.trade_finalization_stable_polls = 2;
+            assert!(!advance_trade_finalization(
+                tracked,
+                now,
+                &iso_z(now),
+                settlement_available,
+                snapshot_changed,
+                truncated,
+                malformed,
+                true,
+                config.trade_finalization_lag_secs,
+                config.trade_finalization_stable_polls,
+            ));
+            assert_eq!(tracked.trade_finalization_stable_polls, 0);
+            assert!(!tracked.trade_complete);
+
+            // A late trade restarts the full lag before stable polls can count.
+            let stable_start = if snapshot_changed {
+                let before_lag = now + TimeDelta::seconds(1_799);
+                assert!(!advance_trade_finalization(
+                    tracked,
+                    before_lag,
+                    &iso_z(before_lag),
+                    true,
+                    false,
+                    false,
+                    false,
+                    true,
+                    config.trade_finalization_lag_secs,
+                    config.trade_finalization_stable_polls,
+                ));
+                now + TimeDelta::seconds(config.trade_finalization_lag_secs)
+            } else {
+                now + TimeDelta::seconds(30)
+            };
+            for stable_poll in 1..=3 {
+                let now = stable_start + TimeDelta::seconds((stable_poll - 1) * 30);
+                let plan = plan_trade_polls(
+                    trade_poll_candidates(
+                        &targets,
+                        &state,
+                        now - TimeDelta::seconds(config.trade_finalization_lag_secs),
+                    ),
+                    1,
+                );
+                assert_eq!(plan.priority, 1);
+                assert_eq!(plan.selected, BTreeSet::from(["finalizing".to_owned()]));
+                let tracked = state.markets.get_mut("finalizing").unwrap();
+                tracked.trade_complete = advance_trade_finalization(
+                    tracked,
+                    now,
+                    &iso_z(now),
+                    true,
+                    false,
+                    false,
+                    false,
+                    true,
+                    config.trade_finalization_lag_secs,
+                    config.trade_finalization_stable_polls,
+                );
+                tracked.last_trade_success_at = Some(iso_z(now));
+                assert_eq!(tracked.trade_finalization_stable_polls, stable_poll as u64);
+                assert_eq!(tracked.trade_complete, stable_poll == 3);
+            }
+        }
     }
 
     #[test]
