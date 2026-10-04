@@ -5,6 +5,8 @@ use hft_research_platform::{
     research::Run,
     sha256,
 };
+#[cfg(feature = "control")]
+mod common;
 fn hash(c: char) -> String {
     c.to_string().repeat(64)
 }
@@ -189,4 +191,130 @@ fn compiler_inputs_invalidate_build_and_cache_never_proves_executable_bytes() {
     let mut changed_run = run(&artifact);
     changed_run.image = format!("other@sha256:{}", hash('f'));
     assert!(changed_run.admit_build(&artifact).is_err());
+}
+
+#[test]
+#[cfg(feature = "control")]
+fn signed_release_import_binds_source_compiler_image_and_executables() {
+    let (artifact, signed, trust) = common::attest(artifact());
+    let verified = trust.verify(&artifact, &signed).unwrap();
+    assert_eq!(verified.artifact(), &artifact);
+    assert_eq!(verified.signed(), &signed);
+    assert_eq!(
+        verified.trust_sha256(),
+        hft_research_platform::identity(&trust).unwrap()
+    );
+    for changed in [
+        {
+            let mut a = artifact.clone();
+            a.image = format!("other@sha256:{}", hash('f'));
+            a
+        },
+        {
+            let mut a = artifact.clone();
+            a.build.target = "aarch64-unknown-linux-gnu".into();
+            a
+        },
+        {
+            let mut a = artifact.clone();
+            a.build.code_commit = "b".repeat(40);
+            a
+        },
+        {
+            let mut a = artifact.clone();
+            a.build.cargo_lock_sha256 = hash('f');
+            a
+        },
+        {
+            let mut a = artifact.clone();
+            a.executables[0].blob.sha256 = hash('d');
+            a
+        },
+        {
+            let mut a = artifact.clone();
+            a.release_receipt_sha256 = hash('a');
+            a
+        },
+    ] {
+        assert!(trust.verify(&changed, &signed).is_err());
+    }
+}
+
+#[test]
+#[cfg(feature = "control")]
+fn untrusted_or_tampered_release_cannot_be_repaired_with_new_hashes() {
+    let (artifact, signed, trust) = common::attest(artifact());
+    let mut wrong_key = trust.clone();
+    wrong_key.keys.clear();
+    assert!(wrong_key.verify(&artifact, &signed).is_err());
+    let mut other_repo = trust.clone();
+    other_repo.repository = "attacker/monday".into();
+    assert!(other_repo.verify(&artifact, &signed).is_err());
+    let mut other_workflow = trust.clone();
+    other_workflow.producer_workflow_path = ".github/workflows/fork.yml".into();
+    assert!(other_workflow.verify(&artifact, &signed).is_err());
+    for tampered in [
+        {
+            let mut s = signed.clone();
+            s.receipt.producer.run_attempt += 1;
+            s
+        },
+        {
+            let mut s = signed.clone();
+            s.receipt.source.archive.sha256 = hash('d');
+            s
+        },
+        {
+            let mut s = signed.clone();
+            s.receipt.publication_readback_sha256 = hash('f');
+            s
+        },
+        {
+            let mut s = signed.clone();
+            s.signature_hex = "00".repeat(64);
+            s
+        },
+    ] {
+        let mut rewritten = artifact.clone();
+        rewritten.release_receipt_sha256 = hft_research_platform::identity(&tampered).unwrap();
+        assert!(trust.verify(&rewritten, &tampered).is_err());
+    }
+}
+
+#[test]
+#[cfg(feature = "control")]
+fn trusted_signature_cannot_admit_an_incomplete_or_wrong_source_receipt() {
+    use ed25519_dalek::{Signer, SigningKey};
+    let (artifact, signed, trust) = common::attest(artifact());
+    let key = SigningKey::from_bytes(&[17; 32]);
+    for mut invalid in [
+        {
+            let mut s = signed.clone();
+            s.receipt.producer.run_attempt = 0;
+            s
+        },
+        {
+            let mut s = signed.clone();
+            s.receipt.producer.source_sha = "b".repeat(40);
+            s
+        },
+        {
+            let mut s = signed.clone();
+            s.receipt.source.archive.key = "outside/source.tar".into();
+            s
+        },
+        {
+            let mut s = signed.clone();
+            s.receipt.source.archive.bytes = 0;
+            s
+        },
+    ] {
+        invalid.signature_hex = key
+            .sign(&invalid.signing_bytes().unwrap())
+            .to_string()
+            .to_ascii_lowercase();
+        let mut rewritten = artifact.clone();
+        rewritten.release_receipt_sha256 = hft_research_platform::identity(&invalid).unwrap();
+        assert!(trust.verify(&rewritten, &invalid).is_err());
+    }
 }

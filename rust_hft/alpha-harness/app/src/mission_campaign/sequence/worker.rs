@@ -68,7 +68,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         || request.build_source_revision != BUILD_SOURCE_REVISION
         || request.campaign_id != args.campaign_id
         || request.image_identity != args.image_identity
-        || crate::mission_runner::sha256_file(&args.request)? != args.request_sha256
+        || hft_research_artifacts::sha256_file(&args.request)? != args.request_sha256
     {
         bail!("sequence worker source, mode or request identity changed");
     }
@@ -134,14 +134,14 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             path.file_name().unwrap().to_string_lossy()
         ));
         fetch_to_file(&client, url, &readback, limit)?;
-        if crate::mission_runner::sha256_file(path)?
-            != crate::mission_runner::sha256_file(&readback)?
+        if hft_research_artifacts::sha256_file(path)?
+            != hft_research_artifacts::sha256_file(&readback)?
         {
             bail!("sequence publication readback differs");
         }
     }
     print_json(
-        &serde_json::json!({"campaign_id":request.campaign_id,"result_sha256":crate::mission_runner::sha256_file(&result_path)?,
+        &serde_json::json!({"campaign_id":request.campaign_id,"result_sha256":hft_research_artifacts::sha256_file(&result_path)?,
         "primary_fits_attempted":result.primary_fits_attempted,"verification_fits_attempted":result.verification_fits_attempted,
         "sealed_holdout_opened":false,"state":"development_fold_complete"}),
     )
@@ -409,7 +409,7 @@ pub(super) fn evaluate_group(
     predictions.flush()?;
     artifacts.insert(
         predictions_name.clone(),
-        crate::mission_runner::sha256_file(&results_dir.join(predictions_name))?,
+        hft_research_artifacts::sha256_file(&results_dir.join(predictions_name))?,
     );
     group.coverage = Some(coverage.clone());
     if !coverage.complete_decision_grid {
@@ -517,7 +517,7 @@ pub(crate) fn replay_group(
             write_new_json(&results_dir.join(&config_name), &config)?;
             artifacts.insert(
                 config_name.clone(),
-                crate::mission_runner::sha256_file(&results_dir.join(config_name))?,
+                hft_research_artifacts::sha256_file(&results_dir.join(config_name))?,
             );
             report.blocks = blocks_from_trace(&replay.trace_bytes, costs.position_notional_usd)?;
             report.fees = Some(SequenceFeeBreakdownV1 {

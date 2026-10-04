@@ -81,8 +81,8 @@ pub(crate) fn precheck(args: CampaignPrecheckArgs) -> anyhow::Result<()> {
     }
     crate::cli::print_json(&serde_json::json!({
         "status":"development_precheck_complete", "report":args.output,
-        "research_plan":args.research_plan_out, "report_sha256":crate::mission_runner::sha256_file(&args.output)?,
-        "research_plan_sha256":crate::mission_runner::sha256_file(&args.research_plan_out)?,
+        "research_plan":args.research_plan_out, "report_sha256":hft_research_artifacts::sha256_file(&args.output)?,
+        "research_plan_sha256":hft_research_artifacts::sha256_file(&args.research_plan_out)?,
         "training_performed":false, "campaign_frozen":false, "report_reused":report_reused, "plan_reused":plan_reused,
     }))
 }
@@ -90,7 +90,6 @@ pub(crate) fn precheck(args: CampaignPrecheckArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_mission;
     #[test]
     fn precheck_command_publishes_bound_plan_before_any_freeze() {
         let fixture = crate::mission_render::tests::Fixture::new(28_795);
@@ -114,7 +113,7 @@ mod tests {
         let input = root.path().join("plan.json");
         let output = root.path().join("precheck.json");
         let checked = root.path().join("checked-plan.json");
-        data_mission::write_json_atomic(&input, &plan).unwrap();
+        hft_research_artifacts::write_json_atomic(&input, &plan).unwrap();
         let args = CampaignPrecheckArgs {
             feature: fixture.feature_path.clone(),
             materialization: fixture.materialization_path.clone(),

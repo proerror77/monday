@@ -10,6 +10,205 @@ use hft_research_manifest::{
 };
 use std::path::Path;
 
+#[test]
+fn prepared_market_reader_matches_jsonl_samples_scaling_and_mature_targets() {
+    use hft_research_manifest::prepared_market::{
+        write_feature_parquet_shard, write_target_parquet_shard,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let (json_features, json_targets, json_fit) = fixture(root.path());
+    let feature_rows = std::fs::read_to_string(root.path().join("features.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<MarketFeatureFrameV1>(line).unwrap())
+        .collect::<Vec<_>>();
+    let target_rows = std::fs::read_to_string(root.path().join("targets.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<MarketTargetFrameV1>(line).unwrap())
+        .collect::<Vec<_>>();
+    let mut features = json_features.clone();
+    features.schema_version = FEATURE_PARQUET_SCHEMA.into();
+    features.shards = vec![
+        write_feature_parquet_shard(
+            root.path(),
+            "features-0.parquet",
+            &feature_rows[..90],
+            &features.input,
+        )
+        .unwrap(),
+        write_feature_parquet_shard(
+            root.path(),
+            "features-1.parquet",
+            &feature_rows[90..],
+            &features.input,
+        )
+        .unwrap(),
+    ];
+    let mut targets = json_targets.clone();
+    targets.schema_version = TARGET_PARQUET_SCHEMA.into();
+    targets.feature_dataset_sha256 = features.digest().unwrap();
+    targets.shards =
+        vec![write_target_parquet_shard(root.path(), "targets.parquet", &target_rows).unwrap()];
+    let mut fit = json_fit.clone();
+    fit.feature_dataset_sha256 = features.digest().unwrap();
+    let mut json_reader = reader(root.path(), &json_features, &json_fit);
+    let mut prepared_reader = reader(root.path(), &features, &fit);
+    let json_scaling = fit_market_scaling(&mut json_reader, 64, 64).unwrap();
+    let prepared_scaling = fit_market_scaling(&mut prepared_reader, 64, 64).unwrap();
+    assert_eq!(json_scaling, prepared_scaling);
+    // Changing batch boundaries does not change qualified samples or values.
+    let mut json_examples = Vec::new();
+    loop {
+        let batch = json_reader.next_batch(7).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        json_examples.extend(batch);
+    }
+    let mut prepared_examples = Vec::new();
+    loop {
+        let batch = prepared_reader.next_batch(16).unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        prepared_examples.extend(batch);
+    }
+    assert_eq!(json_examples, prepared_examples);
+    prepared_reader.finish_pass().unwrap();
+    prepared_reader.rewind().unwrap();
+    assert_eq!(prepared_reader.next_batch(7).unwrap(), json_examples[..7]);
+    let mut json_task = task_reader(root.path(), &json_features, &json_targets, &json_fit);
+    let mut prepared_task = task_reader(root.path(), &features, &targets, &fit);
+    loop {
+        let expected = json_task.next_batch(16).unwrap();
+        let actual = prepared_task.next_batch(16).unwrap();
+        assert_eq!(expected.len(), actual.len());
+        for (expected, actual) in expected.iter().zip(&actual) {
+            assert_eq!(expected.features, actual.features);
+            assert_eq!(expected.target, actual.target);
+        }
+        if expected.is_empty() {
+            break;
+        }
+    }
+    json_task.finish_pass().unwrap();
+    prepared_task.finish_pass().unwrap();
+    let json_anchors = derive_market_training_anchors(
+        &mut reader(root.path(), &json_features, &json_fit),
+        root.path(),
+        json_targets.clone(),
+        &json_targets.digest().unwrap(),
+    )
+    .unwrap();
+    let prepared_anchors = derive_market_training_anchors(
+        &mut reader(root.path(), &features, &fit),
+        root.path(),
+        targets.clone(),
+        &targets.digest().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json_anchors.anchors, prepared_anchors.anchors);
+    assert_eq!(json_anchors.view, prepared_anchors.view);
+    assert_eq!(json_anchors.anchor_end_ms, prepared_anchors.anchor_end_ms);
+}
+
+#[test]
+fn prepared_conversion_proof_preserves_native_union_and_rejects_float_bit_changes() {
+    use hft_research_manifest::prepared_market::{
+        write_feature_parquet_shard, write_target_parquet_shard,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let (original_features, original_targets, _) = fixture(root.path());
+    let rows = std::fs::read_to_string(root.path().join("features.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<MarketFeatureFrameV1>(line).unwrap())
+        .collect::<Vec<_>>();
+    let labels = std::fs::read_to_string(root.path().join("targets.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<MarketTargetFrameV1>(line).unwrap())
+        .collect::<Vec<_>>();
+    let mut prepared_features = original_features.clone();
+    prepared_features.schema_version = FEATURE_PARQUET_SCHEMA.into();
+    prepared_features.shards = vec![write_feature_parquet_shard(
+        root.path(),
+        "prepared.parquet",
+        &rows,
+        &original_features.input,
+    )
+    .unwrap()];
+    let mut source_a = original_features.clone();
+    source_a.shards = vec![shard(
+        root.path(),
+        "original-a.jsonl",
+        &rows[..90],
+        0,
+        89000,
+    )];
+    let mut source_b = original_features.clone();
+    source_b.shards = vec![shard(
+        root.path(),
+        "original-b.jsonl",
+        &rows[90..],
+        90000,
+        149000,
+    )];
+    let sources = vec![
+        (root.path().to_path_buf(), source_a),
+        (root.path().to_path_buf(), source_b),
+    ];
+    let proof =
+        verify_prepared_feature_equivalence(&sources, root.path(), &prepared_features).unwrap();
+    assert_eq!(proof.rows, 150);
+    assert_eq!(
+        proof.source_dataset_sha256,
+        sources
+            .iter()
+            .map(|(_, source)| source.digest().unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert!(verify_prepared_feature_equivalence(
+        &[sources[1].clone(), sources[0].clone()],
+        root.path(),
+        &prepared_features
+    )
+    .is_err());
+    let mut altered_rows = rows;
+    altered_rows[0].channels[0] = -0.0;
+    let mut altered_features = prepared_features.clone();
+    altered_features.shards = vec![write_feature_parquet_shard(
+        root.path(),
+        "altered.parquet",
+        &altered_rows,
+        &original_features.input,
+    )
+    .unwrap()];
+    // Numeric equality would accept this change; immutable conversion checks bits.
+    assert!(verify_prepared_feature_equivalence(&sources, root.path(), &altered_features).is_err());
+    let mut prepared_targets = original_targets.clone();
+    prepared_targets.schema_version = TARGET_PARQUET_SCHEMA.into();
+    prepared_targets.feature_dataset_sha256 = prepared_features.digest().unwrap();
+    prepared_targets.shards =
+        vec![write_target_parquet_shard(root.path(), "labels.parquet", &labels).unwrap()];
+    let target_sources = vec![(root.path().to_path_buf(), original_targets)];
+    let proof = verify_prepared_target_equivalence(&target_sources, root.path(), &prepared_targets)
+        .unwrap();
+    assert_eq!(proof.rows, 123);
+    let mut altered_labels = labels;
+    altered_labels[0].simple_return = -0.0;
+    let mut altered_targets = prepared_targets;
+    altered_targets.shards =
+        vec![
+            write_target_parquet_shard(root.path(), "altered-labels.parquet", &altered_labels)
+                .unwrap(),
+        ];
+    assert!(
+        verify_prepared_target_equivalence(&target_sources, root.path(), &altered_targets).is_err()
+    );
+}
+
 fn shard<T: serde::Serialize>(
     root: &Path,
     name: &str,

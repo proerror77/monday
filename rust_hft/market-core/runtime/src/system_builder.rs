@@ -12,6 +12,7 @@ use crate::portfolio_manager::PortfolioManager;
 use engine::{
     create_execution_queues,
     dataflow::{EventConsumer, FlipPolicy},
+    rate_budget::RateBudget,
     Engine, EngineConfig, ExecutionQueueConfig, ExecutionWorkerConfig,
 };
 use hft_core::HftError;
@@ -237,6 +238,8 @@ pub struct SystemBuilder {
     execution_client_is_binance_usdm: Vec<bool>,
     // Runtime-owned external account proofs. Empty is intentionally deny-all at the worker.
     execution_account_admissions: HashMap<hft_core::AccountId, AccountExecutionAdmission>,
+    execution_rate_budget: RateBudget,
+    execution_account_egress: HashMap<AccountId, String>,
 }
 
 impl SystemBuilder {
@@ -254,6 +257,8 @@ impl SystemBuilder {
             execution_client_accounts: Vec::new(),
             execution_client_is_binance_usdm: Vec::new(),
             execution_account_admissions: HashMap::new(),
+            execution_rate_budget: RateBudget::default(),
+            execution_account_egress: HashMap::new(),
         }
     }
 
@@ -282,6 +287,18 @@ impl SystemBuilder {
         admissions: HashMap<hft_core::AccountId, AccountExecutionAdmission>,
     ) -> Self {
         self.execution_account_admissions = admissions;
+        self
+    }
+
+    /// Bind a validated budget and runtime-owned egress identities to the single execution worker.
+    /// Missing policy or identity keeps new-order admission closed.
+    pub fn with_execution_rate_budget(
+        mut self,
+        budget: RateBudget,
+        account_egress: HashMap<AccountId, String>,
+    ) -> Self {
+        self.execution_rate_budget = budget;
+        self.execution_account_egress = account_egress;
         self
     }
 
@@ -628,6 +645,7 @@ impl SystemBuilder {
 
         // 創建引擎
         let mut engine = Engine::new(engine_config);
+        engine.set_execution_rate_budget(self.execution_rate_budget, self.execution_account_egress);
         if self.config.engine.auto_cancel_exchange_only {
             error!("unsupported auto_cancel_exchange_only requested; engine remains paused");
             engine.pause_trading();
@@ -1282,7 +1300,7 @@ impl SystemRuntime {
             let (engine_queues, mut worker_queues) = create_execution_queues(queue_config);
 
             // 获取执行客户端从引擎移出，设置队列
-            let (execution_clients, engine_notify, market_reader) = {
+            let (execution_clients, engine_notify, market_reader, rate_budget, account_egress) = {
                 let mut eng = self.engine.lock().await;
                 let notify = eng.get_wakeup_notify();
                 eng.set_execution_queues(engine_queues);
@@ -1312,7 +1330,14 @@ impl SystemRuntime {
                     }
                 }
                 eng.set_execution_price_protection(price_protection);
-                (clients, notify, eng.market_reader())
+                let (rate_budget, account_egress) = eng.take_execution_rate_budget();
+                (
+                    clients,
+                    notify,
+                    eng.market_reader(),
+                    rate_budget,
+                    account_egress,
+                )
             };
 
             // 为执行队列设置引擎唤醒通知器
@@ -1439,6 +1464,8 @@ impl SystemRuntime {
                     Some(account_admissions.clone()),
                     Some(account_environments.clone()),
                     binance_usdm_client_indices.clone(),
+                    rate_budget,
+                    account_egress,
                 )
             } else {
                 // 沒有路由器配置，使用預設邏輯
@@ -1475,6 +1502,8 @@ impl SystemRuntime {
                     Some(account_admissions),
                     Some(account_environments),
                     binance_usdm_client_indices,
+                    rate_budget,
+                    account_egress,
                 )
             };
             self.execution_worker_tasks.push(worker_handle);
@@ -2146,6 +2175,295 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    struct RateBudgetTestClient {
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        product: ProductType,
+    }
+
+    #[async_trait]
+    impl ExecutionClient for RateBudgetTestClient {
+        async fn place_order(&mut self, _intent: ports::OrderIntent) -> HftResult<OrderId> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(HftError::SubmissionNotAttempted(
+                "rate-budget test adapter".into(),
+            ))
+        }
+
+        async fn cancel_order(&mut self, _order_id: &OrderId) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn modify_order(
+            &mut self,
+            _order_id: &OrderId,
+            _new_quantity: Option<Quantity>,
+            _new_price: Option<Price>,
+        ) -> HftResult<OrderId> {
+            Err(HftError::SubmissionNotAttempted(
+                "rate-budget test adapter".into(),
+            ))
+        }
+
+        async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
+            Ok(Box::pin(stream::pending()))
+        }
+
+        async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
+            Ok(Vec::new())
+        }
+
+        fn asset_inventory_capability(&self) -> AssetInventoryCapability {
+            if self.product == ProductType::Spot {
+                AssetInventoryCapability::Unsupported
+            } else {
+                AssetInventoryCapability::PositionSnapshotRequired
+            }
+        }
+
+        // This mock has no market-data source. Admission still uses every account and product gate.
+        fn price_protection(&self) -> ExecutionPriceProtection {
+            ExecutionPriceProtection::VenueQuote
+        }
+
+        async fn connect(&mut self) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn health(&self) -> ConnectionHealth {
+            ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: now_micros(),
+            }
+        }
+    }
+
+    async fn check_system_builder_rate_budget(
+        product: ProductType,
+        routed: bool,
+        quotas: Option<(u32, u32)>,
+        bind_egress: bool,
+    ) {
+        use engine::rate_budget::{
+            RateBudgetKey, RateBudgetOperation, RateBudgetScope, RateBudgetSpec,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let venue = if product == ProductType::Spot {
+            VenueId::BINANCE
+        } else {
+            VenueId::BINANCE_FUTURES
+        };
+        let account = AccountId("rate-budget-account".into());
+        let egress = "runtime-egress";
+        let mut config = SystemConfig::default();
+        let mut venue_config = live_venue_config();
+        venue_config.account_id = Some(account.0.clone());
+        venue_config.execution_mode = Some("Testnet".into());
+        if product != ProductType::Spot {
+            venue_config.inst_type = Some("usdm".into());
+            venue_config.execution_config = Some(serde_yaml::from_str("market: usdm").unwrap());
+        }
+        config.venues.push(venue_config);
+        config.engine.ack_timeout_ms = 0;
+        config.engine.reconcile_interval_ms = 0;
+        config.engine.intent_max_latency_us = 1_000_000;
+        config
+            .strategy_accounts
+            .insert("rate-budget".into(), account.0.clone());
+        if routed {
+            config.router = Some(ports::RouterConfig::SameVenue {
+                default_venue: "binance".into(),
+            });
+        }
+        let admission = AccountExecutionAdmission {
+            account_id: account.clone(),
+            venue,
+            product_type: product,
+            environment: AccountExecutionEnvironment::Testnet,
+            credential_reference: "secret-ref:rate-budget-test".into(),
+            readback: AccountExternalReadback {
+                state: AccountReadbackState::Enabled,
+                balances: vec![AccountBalance {
+                    asset: "USDT".into(),
+                    available: Decimal::from(1000),
+                    frozen: Decimal::ZERO,
+                    total: Decimal::from(1000),
+                    usd_value: Some(Decimal::from(1000)),
+                }],
+                capability: AccountCapability {
+                    can_trade_crypto_spot: true,
+                    ..Default::default()
+                },
+                regional_compliance_attestation_id: "rate-budget-compliance-test".into(),
+                receipt_id: "rate-budget-account-test".into(),
+                evidence_digest: "sha256:test".into(),
+                validated_at: 1,
+                valid_until: u64::MAX,
+            },
+            max_order_notional: Decimal::from(1000),
+            max_open_orders: 10,
+            kill_switch_active: false,
+            ready: true,
+        };
+        let mut budget = match quotas {
+            Some((account_quota, egress_quota)) => RateBudget::new(
+                [
+                    (RateBudgetScope::Account(account.clone()), account_quota),
+                    (RateBudgetScope::Egress(egress.into()), egress_quota),
+                ]
+                .into_iter()
+                .map(|(scope, max_requests)| RateBudgetSpec {
+                    key: RateBudgetKey {
+                        venue,
+                        product,
+                        operation: RateBudgetOperation::NewOrder,
+                        scope,
+                    },
+                    max_requests,
+                    refill_interval: Duration::from_secs(3600),
+                }),
+            )
+            .unwrap(),
+            None => RateBudget::default(),
+        };
+        if quotas.is_some() {
+            budget
+                .admit(
+                    venue,
+                    product,
+                    RateBudgetOperation::NewOrder,
+                    &account,
+                    egress,
+                )
+                .unwrap();
+        }
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut builder = SystemBuilder::new(config)
+            .with_execution_account_admissions(HashMap::from([(account.clone(), admission)]))
+            .register_execution_client_with_key_and_kind(
+                RateBudgetTestClient {
+                    attempts: attempts.clone(),
+                    product,
+                },
+                venue,
+                Some(account.clone()),
+                product != ProductType::Spot,
+            );
+        if quotas.is_some() || bind_egress {
+            builder = builder.with_execution_rate_budget(
+                budget,
+                if bind_egress {
+                    HashMap::from([(account.clone(), egress.into())])
+                } else {
+                    HashMap::new()
+                },
+            );
+        }
+        let mut runtime = builder.build();
+        let mut events = runtime.engine.lock().await.subscribe_execution_events();
+        runtime.start().await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            runtime
+                .exec_control_tx
+                .as_ref()
+                .unwrap()
+                .send(engine::execution_worker::ControlCommand::Reconcile {
+                    include_balances: false,
+                    include_positions: false,
+                    include_recent_fills: false,
+                    reply,
+                })
+                .unwrap();
+            response.await.unwrap();
+            let mut engine = runtime.engine.lock().await;
+            for _ in 0..2 {
+                let mut intent = ports::OrderIntent::crypto_spot(
+                    Symbol::new("BTCUSDT"),
+                    Side::Buy,
+                    Quantity(Decimal::ONE),
+                    OrderType::Limit,
+                    Some(Price(Decimal::from(100))),
+                    TimeInForce::IOC,
+                    "rate-budget".into(),
+                    Some(venue),
+                );
+                intent.product_type = product;
+                engine.submit_order_intent(intent).unwrap();
+            }
+            drop(engine);
+            let mut reasons = Vec::new();
+            while reasons.len() < 2 {
+                if let ExecutionEvent::OrderReject { reason, .. } = events.recv().await.unwrap() {
+                    reasons.push(reason);
+                }
+            }
+            reasons
+        })
+        .await;
+        runtime.stop().await.unwrap();
+        let reasons = outcome.expect("spawned worker must return both order rejections");
+        if let Some((account_quota, _)) = quotas.filter(|_| bind_egress) {
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "first order reaches the non-simulated adapter"
+            );
+            let dimension = if account_quota == 2 {
+                "account"
+            } else {
+                "egress"
+            };
+            assert!(
+                reasons[0].contains("rate-budget test adapter"),
+                "{reasons:?}"
+            );
+            assert_eq!(reasons[1], format!("local rate budget rejected new order: {dimension} rate budget exhausted for NewOrder"));
+        } else {
+            assert_eq!(attempts.load(Ordering::SeqCst), 0);
+            let expected = if bind_egress {
+                "local rate budget rejected new order: unconfigured account rate budget for NewOrder"
+            } else {
+                "local rate budget rejected new order: missing runtime-bound egress identity for rate budget"
+            };
+            assert!(
+                reasons.iter().all(|reason| reason == expected),
+                "{reasons:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
+    async fn system_builder_rate_budget_preserves_charged_quota_on_both_spawn_paths() {
+        for product in [ProductType::Spot, ProductType::Futures, ProductType::Perp] {
+            for routed in [false, true] {
+                for quotas in [(2, 3), (3, 2)] {
+                    check_system_builder_rate_budget(product, routed, Some(quotas), true).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
+    async fn system_builder_rate_budget_missing_bindings_fail_closed() {
+        for product in [ProductType::Spot, ProductType::Futures, ProductType::Perp] {
+            for routed in [false, true] {
+                check_system_builder_rate_budget(product, routed, None, false).await;
+                check_system_builder_rate_budget(product, routed, None, true).await;
+                check_system_builder_rate_budget(product, routed, Some((2, 2)), false).await;
+            }
+        }
+    }
 
     struct AuthoritativeBalanceClient {
         equity_usd: Decimal,

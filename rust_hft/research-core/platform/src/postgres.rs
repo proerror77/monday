@@ -1,21 +1,54 @@
 //! PostgreSQL is the sole task/result ledger. There is no DuckDB fallback.
 use anyhow::{ensure, Context, Result};
+use hft_cex_research_input::data::PublishedView;
 use serde_json::Value;
 use sqlx_core::{query::query, query_scalar::query_scalar, row::Row, transaction::Transaction};
 use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
 
 use crate::{
-    data::{PreparationPlan, PublishedView},
     execution::Acceptance,
     identity,
     orchestrator::{ResultReceipt, State, Task, TaskKind, TaskSpec},
+    preparation::PreparationPlan,
 };
 
 pub const MIGRATION: &str = include_str!("../sql/postgres.sql");
+pub const BUILD_RELEASE_MIGRATION: &str = include_str!("../sql/verified_build_release.sql");
 
 #[derive(Clone)]
 pub struct Ledger {
     pool: PgPool,
+}
+
+pub const SESSION_DELIVERY_MIGRATION: &str = include_str!("../sql/session_deliveries.sql");
+
+pub fn completion_message(intent_id: &str, intent: &Value) -> Result<String> {
+    ensure!(
+        crate::valid_digest(intent_id),
+        "invalid completion intent identity"
+    );
+    for name in ["session_sha256", "run_sha256", "task_id"] {
+        ensure!(
+            intent
+                .get(name)
+                .and_then(Value::as_str)
+                .is_some_and(crate::valid_digest),
+            "invalid completion identity"
+        );
+    }
+    let state = intent
+        .get("state")
+        .and_then(Value::as_str)
+        .context("completion state missing")?;
+    ensure!(
+        matches!(state, "succeeded" | "failed" | "cancelled" | "timed_out")
+            && intent
+                .get("terminal_revision")
+                .and_then(Value::as_i64)
+                .is_some_and(|v| v > 0),
+        "completion must bind a terminal revision"
+    );
+    Ok(format!("Research Run {} finished with state {state}. Read research.status and research.artifacts for verified results. Completion intent: {}.", intent["run_sha256"].as_str().context("completion Run missing")?, intent_id))
 }
 
 /// An opaque, live PG admission plus a session-scoped lock for one DataView.
@@ -157,7 +190,7 @@ impl Ledger {
     pub async fn register_plan(&self, plan: &PreparationPlan) -> Result<String> {
         let id = plan.id()?;
         ensure!(
-            plan.spec.split == crate::data::Split::Train,
+            plan.spec.split == hft_cex_research_input::data::Split::Train,
             "preparation worker supports only the training split"
         );
         let mut tx = self.pool.begin().await?;
@@ -169,7 +202,7 @@ impl Ledger {
 
     pub async fn find_view(
         &self,
-        spec: &crate::data::DataViewSpec,
+        spec: &hft_cex_research_input::data::DataViewSpec,
     ) -> Result<Option<PublishedView>> {
         let manifest: Option<String> =
             query_scalar("SELECT manifest_sha256 FROM research.views WHERE view_id=$1")
@@ -245,24 +278,38 @@ impl Ledger {
         tx.commit().await?;
         Ok(id)
     }
-    /// Trusted release metadata import. Launch independently reads actual bytes;
-    /// no cache hit or operator flag substitutes for that readback.
-    pub async fn register_build(&self, artifact: &crate::build::BuildArtifact) -> Result<String> {
+    /// Import the release verifier's signed proof. This can stage a Build while
+    /// authority is paused; it neither admits a Run nor enables a backend.
+    pub async fn register_build(
+        &self,
+        verified: &crate::release::VerifiedBuildRelease,
+    ) -> Result<String> {
+        let artifact = verified.artifact();
         let id = artifact.id()?;
         let mut tx = self.pool.begin().await?;
-        Self::authority(&mut tx, false).await?;
+        query("SELECT mode FROM research.authority WHERE singleton FOR SHARE")
+            .fetch_one(&mut *tx)
+            .await?;
         query("INSERT INTO research.build_artifacts(artifact_sha256,build_sha256,document) VALUES($1,$2,$3) ON CONFLICT DO NOTHING").bind(&id).bind(artifact.build.id()?).bind(serde_json::to_value(artifact)?).execute(&mut *tx).await?;
+        query("INSERT INTO research.build_releases(artifact_sha256,receipt_sha256,trust_sha256,document) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+            .bind(&id).bind(&artifact.release_receipt_sha256).bind(verified.trust_sha256())
+            .bind(serde_json::to_value(verified.signed())?).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(id)
     }
     pub async fn build_artifact(&self, id: &str) -> Result<crate::build::BuildArtifact> {
-        let value: Value =
-            query_scalar("SELECT document FROM research.build_artifacts WHERE artifact_sha256=$1")
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await?;
+        let row = query("SELECT a.document AS artifact,r.document AS release,r.receipt_sha256 FROM research.build_artifacts a JOIN research.build_releases r USING(artifact_sha256) WHERE artifact_sha256=$1")
+            .bind(id).fetch_one(&self.pool).await?;
+        let value: Value = row.get("artifact");
         let artifact: crate::build::BuildArtifact = serde_json::from_value(value)?;
         ensure!(artifact.id()? == id, "build artifact identity changed");
+        let signed: crate::release::SignedBuildRelease =
+            serde_json::from_value(row.get("release"))?;
+        ensure!(
+            row.get::<String, _>("receipt_sha256") == artifact.release_receipt_sha256,
+            "stored release identity changed"
+        );
+        signed.validate_binding(&artifact)?;
         Ok(artifact)
     }
     pub async fn build_for_task(&self, task: &Task) -> Result<crate::build::BuildArtifact> {
@@ -320,6 +367,71 @@ impl Ledger {
         ensure!(owner == tenant, "session belongs to another principal");
         tx.commit().await?;
         Ok(id)
+    }
+    pub async fn session_for_tenant(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<crate::research::Session> {
+        let value: Value = query_scalar(
+            "SELECT document FROM research.sessions WHERE session_sha256=$1 AND tenant=$2",
+        )
+        .bind(id)
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await?;
+        let session: crate::research::Session = serde_json::from_value(value)?;
+        // The immutable record was validated by register_session. PG supplies
+        // its primary key and tenant relationship; do not rehash it per poll.
+        Ok(session)
+    }
+    /// Native terminal intents only. The exact terminal task revision is read
+    /// back before delivery; a success-shaped caller payload cannot create one.
+    pub async fn pending_completions(
+        &self,
+        tenant: &str,
+        session: &str,
+    ) -> Result<Vec<(String, Value)>> {
+        self.session_for_tenant(tenant, session).await?;
+        let rows: Vec<(String, Value)> = sqlx_core::query_as::query_as("SELECT i.intent_sha256,i.document FROM research.completion_intents i JOIN research.tasks t ON t.task_id=i.task_id AND t.tenant=$2 AND t.revision=i.terminal_revision WHERE i.session_sha256=$1 AND t.state IN ('succeeded','failed','cancelled','timed_out') AND NOT EXISTS(SELECT 1 FROM research.completion_deliveries d WHERE d.intent_sha256=i.intent_sha256) ORDER BY i.intent_sha256 LIMIT 32")
+            .bind(session).bind(tenant).fetch_all(&self.pool).await?;
+        for (id, value) in &rows {
+            ensure!(
+                crate::valid_digest(id)
+                    && value.get("session_sha256").and_then(Value::as_str) == Some(session),
+                "corrupt completion intent"
+            );
+        }
+        Ok(rows)
+    }
+    pub async fn record_completion_delivery(
+        &self,
+        tenant: &str,
+        session: &str,
+        verified: &crate::session::VerifiedDelivery,
+    ) -> Result<()> {
+        let provider = self.session_for_tenant(tenant, session).await?;
+        let record = verified.record();
+        ensure!(
+            provider.provider_thread_id == record.thread_id
+                && provider.provider_binary_sha256 == verified.provider_binary_sha256(),
+            "delivery belongs to another provider session"
+        );
+        let readback = record
+            .native_readback_sha256
+            .as_ref()
+            .context("missing native readback")?;
+        let mut tx = self.pool.begin().await?;
+        let intent: Value = query_scalar("SELECT document FROM research.completion_intents WHERE intent_sha256=$1 AND session_sha256=$2 FOR UPDATE")
+            .bind(&record.intent_sha256).bind(session).fetch_one(&mut *tx).await?;
+        ensure!(
+            verified.message() == completion_message(&record.intent_sha256, &intent)?,
+            "completion payload identity changed"
+        );
+        query("INSERT INTO research.completion_deliveries(intent_sha256,process_generation,native_readback_sha256,document) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+            .bind(&record.intent_sha256).bind(&record.process_generation).bind(readback).bind(serde_json::to_value(record)?).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
     }
     pub async fn snapshot_session(
         &self,
@@ -449,7 +561,7 @@ impl Ledger {
                 "plan identity mismatch"
             );
             ensure!(
-                plan.spec.split == crate::data::Split::Train,
+                plan.spec.split == hft_cex_research_input::data::Split::Train,
                 "preparation worker supports only the training split"
             );
             plan.spec.split
@@ -461,9 +573,9 @@ impl Ledger {
             let view: PublishedView = serde_json::from_value(input.get("document"))?;
             view.verify(&task.spec.view_manifest_sha256)?;
             let exit = match task.spec.kind {
-                TaskKind::Train => crate::data::Exit::Training,
-                TaskKind::Backtest => crate::data::Exit::Replay,
-                _ => crate::data::Exit::Features,
+                TaskKind::Train => hft_cex_research_input::data::Exit::Training,
+                TaskKind::Backtest => hft_cex_research_input::data::Exit::Replay,
+                _ => hft_cex_research_input::data::Exit::Features,
             };
             ensure!(
                 view.blocks.iter().any(|b| b.exit == exit),
@@ -474,7 +586,7 @@ impl Ledger {
         // This service has no sealed evaluation grant verifier. Holdout must
         // remain closed, rather than accepting a caller-supplied approval flag.
         ensure!(
-            split != crate::data::Split::Holdout,
+            split != hft_cex_research_input::data::Split::Holdout,
             "sealed holdout requires separate governed evaluator admission"
         );
         query("INSERT INTO research.tasks(task_id,tenant,idempotency_key,request_sha256,view_manifest_sha256,state,document,run_manifest_sha256) VALUES($1,$2,$3,$1,$4,'queued',$5,$6) ON CONFLICT DO NOTHING")

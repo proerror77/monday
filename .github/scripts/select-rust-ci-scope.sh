@@ -33,6 +33,7 @@ jobs=
 security_jobs=
 research_image_relevant=false
 research_product=none
+products="$(dirname "${BASH_SOURCE[0]}")/research-release-products.sh"
 architecture=false
 owning_packages=
 loop_packages=
@@ -128,7 +129,7 @@ select_all_rust_ci_jobs() {
 }
 
 select_all_ploy_jobs() {
-  research_product=paired
+  research_product=$(bash "$products" merge "$research_product" "${1:-all}")
   architecture=true
   research_image_relevant=true
   [[ $event == pull_request ]] && select_job ploy/commit-hygiene
@@ -147,7 +148,7 @@ select_all_ploy_jobs() {
 }
 
 select_research_image_jobs() {
-  if [[ ${1:-paired} == paired || $research_product == paired ]]; then research_product=paired; else research_product=controller; fi
+  research_product=$(bash "$products" merge "$research_product" "${1:-all}")
   research_image_relevant=true
   [[ $event == pull_request ]] && select_job ploy/commit-hygiene
   select_job ploy/research-image-binaries
@@ -157,7 +158,7 @@ select_research_image_jobs() {
 
 select_main_research_image_jobs() {
   if [[ $event == push && $research_image_relevant == true ]]; then
-    [[ $research_product != none ]] || research_product=paired
+    [[ $research_product != none ]] || research_product=$(bash "$products" normalize all)
     select_job ploy/research-image-binaries
     select_job ploy/research-image-smoke
   fi
@@ -180,7 +181,7 @@ select_all() {
 
 emit() {
   local value
-  if [[ ,$jobs, == *,ploy/research-image-binaries,* && $research_product == none ]]; then research_product=paired; fi
+  if [[ ,$jobs, == *,ploy/research-image-binaries,* && $research_product == none ]]; then research_product=$(bash "$products" normalize all); fi
   [[ ,$owning_packages, != *",hft-research-platform,"* ]] || select_job ci/research-foundation
   [[ $architecture == true ]] && select_job ploy/architecture-contracts
   [[ $control == true ]] && select_job ci/control-contracts
@@ -284,7 +285,11 @@ for path in "${paths[@]}"; do
       continue
       ;;
     rust_hft/deployment/docker/Dockerfile.research)
-      select_research_image_jobs
+      select_research_image_jobs cex-runner
+      continue
+      ;;
+    rust_hft/deployment/docker/Dockerfile.prediction-research)
+      select_research_image_jobs prediction-runner
       continue
       ;;
     deployment/aliyun/research/Dockerfile.campaign-cycle-controller)
@@ -292,7 +297,8 @@ for path in "${paths[@]}"; do
       continue
       ;;
     deployment/aliyun/research/Dockerfile.research-data)
-      select_research_image_jobs
+      select_job ci/ci-contracts
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
     .dockerignore)
@@ -334,7 +340,7 @@ for path in "${paths[@]}"; do
         lock_packages=$(jq -cn --argjson prior "$lock_packages" --argjson names "$narrowed" --arg workspace "${path%/Cargo.lock}" '$prior + [$names[] | {name:.,workspace:$workspace}]')
         needs_metadata=true
       elif [[ $path == rust_hft/prediction-markets/Cargo.lock ]]; then
-        select_all_ploy_jobs
+        select_all_ploy_jobs prediction-runner
       else
         select_all
         select_all_rust_ci_jobs
@@ -343,12 +349,12 @@ for path in "${paths[@]}"; do
       continue
       ;;
     rust_hft/prediction-markets/Cargo.toml)
-      select_all_ploy_jobs
+      select_all_ploy_jobs prediction-runner
       select_job ci/research-foundation
       continue
       ;;
     rust_hft/prediction-markets/*/Cargo.toml)
-      select_research_image_jobs
+      select_research_image_jobs prediction-runner
       select_job ploy/audit
       needs_metadata=true
       ;;
@@ -380,7 +386,7 @@ for path in "${paths[@]}"; do
       select_job ploy/workflow-lint
       continue
       ;;
-    .github/scripts/research-release-products.sh|.github/scripts/research-release-products.json|.github/scripts/test-research-release-products.sh|.github/scripts/research-release-bundle.rb|.github/scripts/research-release-source-sha.sh|.github/scripts/test-research-checkout-ownership.sh|.github/scripts/verify-research-runtime-abi.sh|.github/scripts/test-research-runtime-abi.sh|.github/scripts/build-research-release.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/verify-research-controller-image.sh|.github/scripts/test-research-controller-image.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
+    .github/scripts/research-release-products.sh|.github/scripts/research-release-products.json|.github/scripts/test-research-release-products.sh|.github/scripts/research-release-bundle.rb|.github/scripts/research-release-source-sha.sh|.github/scripts/test-research-checkout-ownership.sh|.github/scripts/verify-research-runtime-abi.sh|.github/scripts/test-research-runtime-abi.sh|.github/scripts/build-research-release.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/verify-research-product-image.sh|.github/scripts/test-research-product-image.sh|.github/scripts/verify-research-controller-image.sh|.github/scripts/test-research-controller-image.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
       select_research_image_jobs
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
@@ -760,8 +766,6 @@ for ((index = 0; index < ${#package_names[@]}; index++)); do
   fi
 done
 if [[ $prediction_package_affected == true ]]; then
-  research_product=paired
-  research_image_relevant=true
   [[ $event == pull_request ]] && select_job ploy/commit-hygiene
   select_job ploy/rust-format
   select_job ploy/safety-scans
@@ -778,9 +782,16 @@ select_job_if_affected ploy/rust-research-heavy ploy-feed-loaders ploy-research 
 select_job_if_affected ploy/frontend ploy-operator-contracts
 select_job_if_affected ploy/integration-regressions ploy
 
-if is_affected hft-collector || is_affected alpha-harness || is_affected hft-backtest; then
-  research_product=paired
+if is_affected ploy-research || is_affected hft-prediction-research-worker; then
+  research_product=$(bash "$products" merge "$research_product" prediction-runner)
   research_image_relevant=true
+fi
+if is_affected hft-collector || is_affected alpha-harness || is_affected hft-backtest; then
+  research_product=$(bash "$products" merge "$research_product" cex-runner)
+  research_image_relevant=true
+fi
+if is_affected hft-collector || is_affected alpha-harness; then
+  research_product=$(bash "$products" merge "$research_product" controller)
 fi
 if [[ $event == pull_request ]] && is_affected hft-backtest; then
   select_job ploy/research-image-binaries

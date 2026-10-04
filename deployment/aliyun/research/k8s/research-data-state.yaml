@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: monday-research-data-state
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/part-of: monday
+    research.monday/contract: research-data-platform-1256
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: monday-research-data-essd
+  resources:
+    requests: {storage: 40Gi}

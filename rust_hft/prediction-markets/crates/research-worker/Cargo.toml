@@ -1,0 +1,22 @@
+[package]
+name = "hft-prediction-research-worker"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+hft-research-artifacts = { path = "../../../research-core/artifacts" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = "0.4"
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+zip = { version = "6", default-features = false, features = ["deflate"] }
+
+[[bin]]
+name = "monday-prediction-worker"
+path = "src/main.rs"

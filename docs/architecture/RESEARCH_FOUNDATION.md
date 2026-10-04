@@ -44,7 +44,9 @@ flowchart LR
 
 `rust_hft/workspaces.json` 登记六个真实入口：shared、data、research、control、runtime、prediction。每个入口拥有独立 lockfile、resolver 2 和 Rust 1.98.1。源码路径保持原位置，package 显式声明唯一 owner；原 root package 属于 runtime workspace。
 
-轻量 control workspace 只含 `hft-research-platform`。其依赖树没有 collector、Burn、ONNX 或 Parquet。Data 的协议库不反向依赖采集运行时；`hft-market-pipeline` 也不依赖训练或执行。科学 research workspace 默认选择 search kernel，实际训练与 harness 由明确 package/build recipe 选择。
+shared workspace 的 `hft-cex-research-input` 独立拥有 DataView、typed block、二进制 codec 和有界验证缓存。它只依赖序列化与摘要库，不含 SQL、数据库驱动、HTTP、provider 或 Agent 状态。backtest 直接消费该输入 crate。轻量 control workspace 只含 `hft-research-platform`，消费相同输入合同；其依赖树没有 collector、Burn、ONNX 或 Parquet。Data 的协议库不反向依赖采集运行时；`hft-market-pipeline` 也不依赖训练或执行。科学 research workspace 默认选择 search kernel，实际训练与 harness 由明确 package/build recipe 选择。
+
+CEX 与 Prediction Markets 保留不同的科学输入和 evaluator。`hft-cex-research-input` 的 horizon、成熟时钟和连续 LOB 回放属于 CEX 时间序列合同；它不是事件结算概率数据集。Prediction 的 episode、UP/DOWN outcome、event-disjoint cohort 和 ResearchSnapshot 继续由 prediction workspace 所有。两条链可共享领域中性的搜索机制、行情和治理合同。依赖检查覆盖 Prediction 的 default/db/full 构建，拒绝引入 CEX input、harness、collector、backtest 或 control platform。
 
 CI selector 汇总真实 metadata，包括跨域 path dependencies 和 integration/dev edges。`cargo-scoped.sh` 把显式包集合分到各 owner；跨 workspace features 或命名 target 组合拒绝模糊执行。CI 单 runner 可复用自己的 target cache；多个 Cargo invocation 仍各自解析所属 workspace 的 features。共享可写多租户 cache 不属于此合同。
 
@@ -75,11 +77,15 @@ Run 是固定科学调用：Experiment、BuildArtifact、配置摘要、命令�
 
 CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生软件版本、编译环境、profile、lock 和 scoped 配方指纹纳入缓存键，并将这些输入保存在 release manifest。Cargo cache 与可执行产物分开：缓存只影响后续编译效率，命中缓存仍必须执行 build、二进制摘要验证和 image smoke。每个 runner 有自己的可写 target，禁止多租户共享可写 target；readonly prepared-data mount 不能被当作 compiler cache。
 
-生产构建调度、变异 workspace 的源码归档/签名导入和 release verifier 向 PG 的自动投影尚未实现。现有 CI bundle 能构建一次并被 smoke/发布复用；新 PG 合同能让多个 Run/Attempt 复用已导入的同一产物。不能据此声称已有自动 Agent 变异 → Build → 科学执行闭环。
+`researchctl register-build ARTIFACT SIGNED_RELEASE` 只接受独立发布 verifier 的 Ed25519 签名。`MONDAY_RESEARCH_BUILD_TRUST_FILE` 指向 operator 管理的公开信任配置，绑定 repository、producer workflow 和公钥。输入 envelope 不能自带受信公钥。签名绑定源码归档 manifest、完整 Build 身份、target、OCI digest、二进制集合、CI run/attempt/job 和独立发布回读摘要。修改这些字段或重新计算普通摘要不能修复签名。
+
+先离线应用 `platform/sql/verified_build_release.sql`。该迁移保留原 Build 行作为审计记录，不自动为旧行补信任。只有附有签名证明的 Build 才能进入新 Run。导入事务写入不可变 release 和信任配置摘要；重复导入复用原记录。Build 可在 authority 为 paused 时预先登记；导入不启用 backend，也不授予科学预算或运行权。Run 启动与基础设施 retry 仍独立回读二进制字节。
+
+生产构建调度、变异 workspace 的源码归档上传、原生发布 verifier 出具此签名，以及 release 向 PG 的自动投影仍待接入。现有 CI bundle 能构建一次并被 smoke/发布复用；新 PG 合同能让多个 Run/Attempt 复用已导入的同一产物。不能据此声称已有自动 Agent 变异 → Build → 科学执行闭环。
 
 ## 数据：CH 数值准备、版本化出口、bounded 共享
 
-`src/data.rs` 的 `DataViewSpec` 绑定 venue、instrument、market、depth、排序后的 source SHA、normalizer、SQL recipe、feature names、时间窗、lookback、多个 horizon、容差、split 和 fitting cutoff。没有写死某个资产、100 档或某组 horizon。
+`research-core/cex-input/src/data.rs` 的 `DataViewSpec` 绑定 venue、instrument、market、depth、排序后的 source SHA、normalizer、SQL recipe、feature names、时间窗、lookback、多个 horizon、容差、split 和 fitting cutoff。没有写死某个资产、100 档或某组 horizon。
 
 默认 SQL recipe 为 mid/spread/depth imbalance。PreparationPlan 也可携带经过原生 admission 审核的不可变 recipe_sql，绑定 exact SQL digest、固定 features/labels 两个插入目标和输出 schema；算法变化形成新的数据身份，可以复用同一 prepare Build。参数、horizons、数据窗或已审核 SQL recipe 变化无需编译 Rust。这个入口不是向 Agent 开放的任意 SQL 执行器，也不是 SQL parser/sandbox；科学 grant 和 CH 的独立权限边界仍必须接入。改动 Rust 的解码/计算实现或打包默认值本身才需新 Build。
 
@@ -89,9 +95,11 @@ CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生�
 
 当前 preparation worker 只支持 Train。plan 登记和任务提交都拒绝 Validation 与 Holdout，避免消耗必然失败的 attempt。通用 DataView schema 保留这些 split，未来 evaluator 仍需独立准入。
 
-`src/prepared.rs` 使用带版本和大小上限的 bincode。读取本地文件或对象时，调用方必须核验 manifest 和 block digest。Transport 只提供字节，不能替换解码结果。解码后释放一次性 acquired buffers。
+`research-core/cex-input/src/prepared.rs` 使用带版本和大小上限的 bincode。读取本地文件或对象时，调用方必须核验 manifest 和 block digest。Transport 只提供字节，不能替换解码结果。解码后释放一次性 acquired buffers。控制侧的 `preparation.rs` 保留 reviewed SQL plan 和默认 recipe；`block_objects.rs` 保留有界 HTTPS 获取。crate 迁移不改变已发布的 manifest 字段、bincode schema 或内容摘要。
 
 `VerifiedCache` 对缺页执行读取、解码、时钟和 split 验证。cache hit 仍检查当前 view 的合同。多个试验可以复用一个只读 `Arc` batch；模型、optimizer 和 checkpoint 状态分别保存。batch owner 必须计入外部持有 Arc 的内存。LRU 不能单独限制这些引用的总驻留量。
+
+同一个缓存已验证的 view 在内部流转时复用验证结果，拒绝同一身份下修改 metadata。新的 view 仍执行首次验证；缓存命中仍检查其时钟、split 和 block 合同。准备数据的终态回读对实际解码字节只下载和校验一次，同一次 receipt 内复用该对象 key、摘要和大小的结果。不同对象、后续请求、首次导入和恢复各自保留边界验证。SHA256 用于内容身份，不代替授权或实际科学行为验收。
 
 `apps/backtest::engine::replay_shared_target_positions` 已消费这些 shared typed 输入，复用现有 IOC target-position engine，每个试验新建状态。它拒绝错误 manifest、market、instrument、多 gap segment 和 split 外决策；availability ns 向上取整到 us，避免提前看数据。这里没有新增被动排队成交或 live 交易声明。
 
@@ -129,13 +137,17 @@ ArtifactGateway/Writer 是 HTTPS、无 redirect、大小有界的 scoped gateway
 
 参考固定版本 [OpenResearch f4cec9f, v0.2.15](https://github.com/alphaXiv/OpenResearch/commit/f4cec9f010a64fccf51cd4653ba548df2e5fb648)（MIT），只参考合同，未复制其运行时代码或引入 AX 依赖。
 
-其 [Codex harness](https://github.com/alphaXiv/OpenResearch/blob/f4cec9f010a64fccf51cd4653ba548df2e5fb648/src/local/harness/codex.rs) / [本地 adapter](https://github.com/alphaXiv/OpenResearch/blob/f4cec9f010a64fccf51cd4653ba548df2e5fb648/src/local/codex.rs) 提示需要长驻 app-server child、initialize/initialized、thread start/resume、turn start/steer/interrupt 和双向审批。PG thread ID 不能替代 native CODEX_HOME 状态。`research::SessionSnapshot` 因此绑定 workspace、transcript、code commit 和 native-state manifest；`coding_agent::admit_resume` 拒绝缺失或摘要错误的 native state。实际 child transport、workspace/native files 的持久化与恢复尚未实现。
+其 [Codex harness](https://github.com/alphaXiv/OpenResearch/blob/f4cec9f010a64fccf51cd4653ba548df2e5fb648/src/local/harness/codex.rs) / [本地 adapter](https://github.com/alphaXiv/OpenResearch/blob/f4cec9f010a64fccf51cd4653ba548df2e5fb648/src/local/codex.rs) 提示需要长驻 app-server child、initialize/initialized、thread start/resume、turn start/steer/interrupt 和双向审批。PG thread ID 不能替代 native CODEX_HOME 状态。`research::SessionSnapshot` 因此绑定 workspace、transcript、code commit 和 native-state manifest；`coding_agent::admit_resume` 拒绝缺失或摘要错误的 native state。
 
-OpenResearch 测试的 Codex 版本为 0.144.0；本机只读生成的 app-server schema 为已安装 0.159.2。本分支审批合同标注后者，并绑定原 RPC ID + process generation + command/file/user-input 类型；重启后相同 RPC ID 不能复用旧审批。当前只接受逐次 accept/decline/cancel，不授予持久 policy amendment。未启动 model/session，不能声称完整协议互通或版本兼容验收。
+`session::AppServer` 和 `research-session start CONFIG | resume CONFIG NATIVE_STATE` 提供实际 Rust stdio child transport。启动使用受信、固定身份的原生二进制，隔离 native home，清除继承环境；native home 和 host delivery directory 分别有 OS 独占锁。初始化、持久 thread、固定权限的 resume、turn start/interrupt、原 RPC 审批和受控 research 工具有界处理。接收器保留部分 frame，因此等待事件时被 timer/输入打断不会丢失协议字节。默认 read-only、无 shell/browser/app 工具和受限网络不构成云 Sandbox 隔离验收。
 
-Plan mode 是 prompt，不能替代隔离或授权。未知或已接受的消息 delivery 必须 reconcile，不能盲重发；not_sent/rejected 可重试。Run 完成订阅独立于 Session 所有权，PG 在终态事务中按显式 subscription 写去重 completion intent；迟到订阅也读取终态。provider wake 的 delivery ledger/dispatcher 仍未实现，outbox intent 不等于消息已送达。
+停止 child 后，在同一个锁下生成仅包含 thread rollout 和原生 state SQLite/WAL 的 manifest；身份文件、配置、私钥和工具 token 不进入快照。生成时每份字节只读取一次，内部复用结果；冷恢复作为独立消费者，在启动新 child 之前再核验所列文件。workspace 和 native home 使用既有持久挂载，远端 PVC、源码归档运输和跨存储恢复仍需部署验收。
 
-`agent_api.rs` 提供可选、默认关闭的 loopback bearer-capability API，只有 `research.submit/status/artifacts`，principal 来自服务配置。submit 只能引用预先批准的请求；不允许配置 evaluator、打开 holdout、签名、kubectl 或携带 PG/cluster 凭据。`researchctl tool` 是独立客户端。远端 Sandbox 到这个 loopback API 的受控 HTTPS/proxy/broker 连接尚未实现，不能声称 Session 已连通。
+OpenResearch 测试的 Codex 版本为 0.144.0；本机只读生成的 app-server schema 为已安装 0.159.2。transport 按后者实现，并绑定原 RPC ID + process generation + command/file/user-input 类型；重启后相同 RPC ID 不能复用旧审批。当前只接受逐次 accept/decline/cancel，不授予持久 policy amendment。已对实际安装的原生 app-server 验证 initialize/initialized 和 child stop，没有真实 model turn；协议 peer 的恢复/审批测试是代码合同证据，不是云 Session 验收。
+
+Plan mode 是 prompt，不能替代隔离或授权。未知或已接受的消息 delivery 必须 reconcile，不能盲重发；not_sent/rejected 可重试。Run 完成订阅独立于 Session 所有权，PG 在终态事务中按显式 subscription 写去重 completion intent；迟到订阅也读取终态。Session host 接入现有 intent，发送前 durable 写入 Unknown，以稳定 clientUserMessageId 回读原生分页 item。只有原生 thread、turn、client ID 和实际消息内容均匹配，才产生不可从 JSON 构造的 VerifiedDelivery。离线迁移 `sql/session_deliveries.sql` 记录不可变 delivery；普通 Agent 和 worker 无写权限。host 自动轮询已订阅终态，并处理原生事件和逐次审批；缺少 intent/原生回读不能写 delivery。远端实际完成通知仍需部署验收。
+
+`agent_api.rs` 提供可选、默认关闭的 loopback bearer-capability API，只有 `research.submit/status/artifacts`，principal 来自服务配置。submit 只能引用预先批准的请求；不允许配置 evaluator、打开 holdout、签名、kubectl 或携带 PG/cluster 凭据。`researchctl tool` 是独立客户端。Session host 的 ResearchClient 支持既有 loopback 或 HTTPS `/research` broker，拒绝重定向、URL credentials 和超限响应；token 只进入 host 请求，不传入 child 环境或 tool payload。远端 HTTPS/proxy/broker 的部署和权限尚未验收，不能声称云 Session 已连通。
 
 OpenResearch [chat delivery](https://github.com/alphaXiv/OpenResearch/blob/f4cec9f010a64fccf51cd4653ba548df2e5fb648/src/local/chat/mod.rs) 和 [Kubernetes jobs](https://github.com/alphaXiv/OpenResearch/blob/f4cec9f010a64fccf51cd4653ba548df2e5fb648/src/jobs/kubernetes.rs) 的可恢复 handle 不能代替 Monday 的 durable claim、幂等、UID/fence 和最终 manifest。没有照搬 kubectl cp bootstrap、namespace-wide secret 或共享可写 target。
 

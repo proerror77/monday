@@ -25,8 +25,14 @@
 # health.json session/regression rebaselines stay warnings: reported, never
 # blocking ok:true. journalctl must not be called by this monitor.
 #
-# Usage: ./test-monday-collector-health.sh
+# Usage: ./test-monday-collector-health.sh [--sequence-gap-latch]
 set -euo pipefail
+
+case "${1:-}" in
+  '') test_scope=all ;;
+  --sequence-gap-latch) test_scope=sequence-gap-latch ;;
+  *) printf 'usage: %s [--sequence-gap-latch]\n' "$0" >&2; exit 2 ;;
+esac
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 health_script="$script_dir/monday-collector-health.sh"
@@ -42,6 +48,7 @@ out_file="$test_root/out"
 err_file="$test_root/err"
 journal_calls_file="$test_root/journal.calls"
 flock_calls_file="$test_root/flock.calls"
+real_mv=$(command -v mv)
 
 DF_TOTAL=196000000   # KiB, ~187 GiB (matches the ~196G host disk)
 DF_AVAIL_HEALTHY=117600000   # 60% free
@@ -98,6 +105,10 @@ run_health() {
     STUB_FLOCK_CALLS_FILE="$flock_calls_file" \
     STUB_FLOCK_HELD="${STUB_FLOCK_HELD:-0}" \
     STUB_FLOCK_ERROR="${STUB_FLOCK_ERROR:-0}" \
+    STUB_STATE_LOCK_ERROR="${STUB_STATE_LOCK_ERROR:-0}" \
+    STUB_STATE_LOCK_ATTEMPT="${STUB_STATE_LOCK_ATTEMPT:-}" \
+    STUB_STATE_WRITE_PAUSE="${STUB_STATE_WRITE_PAUSE:-}" \
+    STUB_REAL_MV="$real_mv" \
     STUB_LOCK_APPEAR="${STUB_LOCK_APPEAR:-0}" \
     STUB_LOCK_PATH="$test_root/run/monday/polymarket-raw-ops-gates/control.lock" \
     MONDAY_COLLECTOR_SPOOL_ROOT="$spool_root" \
@@ -124,6 +135,8 @@ reset_env() {
   STUB_JOURNAL_FAIL=0
   STUB_FLOCK_HELD=0
   STUB_FLOCK_ERROR=0
+  STUB_STATE_LOCK_ERROR=0
+  unset STUB_STATE_LOCK_ATTEMPT STUB_STATE_WRITE_PAUSE
   STUB_LOCK_APPEAR=0
   STUB_HFT_GID=$(id -g)
   unset MONDAY_COLLECTOR_STATE_DIR
@@ -445,6 +458,29 @@ if [ -n "${STUB_FLOCK_CALLS_FILE:-}" ]; then
   printf '%s\n' "$*" >> "$STUB_FLOCK_CALLS_FILE"
 fi
 case "$*" in
+  '-w 60 8')
+    [ "${STUB_STATE_LOCK_ERROR:-0}" != 1 ] || exit 2
+    # Use a real descriptor lock on macOS and Linux. The monitor retains fd 8.
+    exec perl - <<'PERL'
+use strict;
+use warnings;
+use Errno qw(EAGAIN EWOULDBLOCK);
+use Fcntl qw(LOCK_EX LOCK_NB);
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
+
+if (my $attempt = $ENV{STUB_STATE_LOCK_ATTEMPT}) {
+    open my $marker, '>', $attempt or die "create lock marker: $!\n";
+    close $marker or die "close lock marker: $!\n";
+}
+open my $lock, '<&=', 8 or die "open lock fd 8: $!\n";
+my $deadline = clock_gettime(CLOCK_MONOTONIC) + 60;
+while (!flock($lock, LOCK_EX | LOCK_NB)) {
+    die "lock fd 8: $!\n" unless $! == EAGAIN || $! == EWOULDBLOCK;
+    exit 1 if clock_gettime(CLOCK_MONOTONIC) >= $deadline;
+    sleep 0.02;
+}
+PERL
+    ;;
   '-s -n 9' | '-n 9') ;;
   *) exit 2 ;;
 esac
@@ -455,6 +491,28 @@ fi
 exit 0
 EOF
 
+cat > "$stub_dir/mv" <<'EOF'
+#!/bin/sh
+if [ -n "${STUB_STATE_WRITE_PAUSE:-}" ] && [ "$2" = "$MONDAY_COLLECTOR_STATE_DIR/state.json" ]; then
+  perl - <<'PERL'
+use strict;
+use warnings;
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
+
+my $pause = $ENV{STUB_STATE_WRITE_PAUSE};
+open my $marker, '>', "$pause.reached" or die "create pause marker: $!\n";
+close $marker or die "close pause marker: $!\n";
+my $deadline = clock_gettime(CLOCK_MONOTONIC) + 20;
+while (!-e "$pause.release") {
+    exit 1 if clock_gettime(CLOCK_MONOTONIC) >= $deadline;
+    sleep 0.02;
+}
+PERL
+  [ "$?" -eq 0 ] || exit 1
+fi
+exec "$STUB_REAL_MV" "$@"
+EOF
+
 cat > "$stub_dir/logger" <<'EOF'
 #!/bin/sh
 exit 0
@@ -462,6 +520,7 @@ EOF
 
 chmod +x "$stub_dir"/* "$health_script"
 
+if [ "$test_scope" = all ]; then
 # ---------------------------------------------------------------------------
 # 1. Healthy baseline
 # ---------------------------------------------------------------------------
@@ -1031,7 +1090,181 @@ run_health --json
 expect "health gap post-regression: exit 1" "$(rc_is 1; echo $?)"
 expect "health gap post-regression: delta breach" "$(json_query '.breaches | any(contains("sequence_gap_total increased 0 -> 1 (delta=1)"))'; echo $?)"
 expect "health gap post-regression: rebaseline applied" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "increased" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == 1'; echo $?)"
+fi
 
+# A session restart or counter regression can clear the current gap before
+# the GitHub poll. Rebaselining must not acknowledge the timer's durable breach.
+run_sequence_health() {
+  # Refresh only fixture timestamps so slow machines cannot add unrelated
+  # liveness/upload-age breaches to these multi-poll state-machine scenarios.
+  for health in "$spool_root"/binance-lob/*/health.json; do
+    jq '.updated_at_ns = (now * 1000000000 | floor)' "$health" > "$health.tmp"
+    mv "$health.tmp" "$health"
+  done
+  for upload in "$spool_root"/*/upload-status.json "$spool_root"/binance-lob/*/upload-status.json; do
+    jq '.last_success_at = (now | todateiso8601)' "$upload" > "$upload.tmp"
+    mv "$upload.tmp" "$upload"
+  done
+  run_health "$@"
+}
+
+for reset_kind in session regression; do
+  reset_env
+  reset_state
+  healthy_scenario
+  healthy_fixtures
+  write_health usdm 45 0 false synced unacked-session 2
+  run_sequence_health
+  write_health usdm 45 3 false synced unacked-session 5
+  MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+  expect "health unacked $reset_kind: timer detects gap" "$(rc_is 1; echo $?)"
+
+  next_session=unacked-session
+  [ "$reset_kind" != session ] || next_session=reset-session
+  write_health usdm 45 0 false synced "$next_session" 0
+  MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+  expect "health unacked $reset_kind: cleared counter stays breached" "$(rc_is 1; echo $?)"
+  expect "health unacked $reset_kind: original breach survives rebaseline" "$(json_query '
+    .ok == false and (.breaches | any(contains("unacknowledged sequence-gap breach")))
+    and (.checks.health["binance-lob-archiver-production@usdm"] |
+      .sequence_gaps == 0 and .sequence_gap_total == 0
+      and (.sequence_gap_baseline == "session_changed" or .sequence_gap_baseline == "regressed")
+      and .sequence_gap_pending == {session_id:"unacked-session",previous_total:2,total:5})'; echo $?)"
+
+  MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+  expect "health unacked $reset_kind: stable timer still breached" "$(rc_is 1; echo $?)"
+  cp "$state_dir/state.json" "$test_root/state.before-dry-run"
+  run_sequence_health --json --dry-run
+  expect "health unacked $reset_kind: dry-run stays breached" "$(rc_is 1; echo $?)"
+  expect "health unacked $reset_kind: dry-run reports pending evidence" "$(json_query '
+    .ok == false and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending
+      == {session_id:"unacked-session",previous_total:2,total:5}'; echo $?)"
+  expect "health unacked $reset_kind: dry-run leaves state unchanged" "$(cmp -s "$state_dir/state.json" "$test_root/state.before-dry-run"; echo $?)"
+  run_sequence_health --json
+  expect "health unacked $reset_kind: alerting poll still breached" "$(rc_is 1; echo $?)"
+  expect "health unacked $reset_kind: alerting poll observes original breach" "$(json_query '
+    .ok == false and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending
+      == {session_id:"unacked-session",previous_total:2,total:5}'; echo $?)"
+  run_sequence_health --json
+  expect "health unacked $reset_kind: acknowledged poll becomes healthy" "$(rc_is 0; echo $?)"
+  expect "health unacked $reset_kind: acknowledged breach is absent" "$(json_query '
+    .ok == true and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending == null'; echo $?)"
+done
+
+# Later increases must survive a reset, including increases in another session.
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_health usdm 45 0 false synced first-session 2
+run_sequence_health
+write_health usdm 45 0 false synced first-session 5
+MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+write_health usdm 45 0 false synced first-session 8
+MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+expect 'health unacked growth: same-session increase retained' "$(json_query '
+  .ok == false and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending
+    == {session_id:"first-session",previous_total:2,total:8}'; echo $?)"
+write_health usdm 45 0 false synced second-session 0
+MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+write_health usdm 45 0 false synced second-session 3
+MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+expect 'health unacked growth: later-session increase retained' "$(json_query '
+  .ok == false and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending
+    == {session_id:"first-session",previous_total:2,total:8,
+        additional_breaches:[{session_id:"second-session",previous_total:0,total:3}]}'; echo $?)"
+write_health usdm 45 0 false synced second-session 6
+MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+expect 'health unacked growth: later-session interval extends' "$(json_query '
+  .ok == false and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending
+    == {session_id:"first-session",previous_total:2,total:8,
+        additional_breaches:[{session_id:"second-session",previous_total:0,total:6}]}'; echo $?)"
+write_health usdm 45 0 false synced third-session 0
+MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+cp "$state_dir/state.json" "$test_root/state.before-dry-run"
+run_sequence_health --dry-run --json
+expect 'health unacked growth: dry-run reports all evidence after reset' "$(json_query '
+  .ok == false and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending
+    == {session_id:"first-session",previous_total:2,total:8,
+        additional_breaches:[{session_id:"second-session",previous_total:0,total:6}]}'; echo $?)"
+expect 'health unacked growth: dry-run preserves all pending state' "$(cmp -s "$state_dir/state.json" "$test_root/state.before-dry-run"; echo $?)"
+run_sequence_health --json
+expect 'health unacked growth: alerting poll reports both sessions' "$(json_query '
+  .ok == false and (.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending |
+    .total == 8 and .additional_breaches[0].total == 6)'; echo $?)"
+run_sequence_health --json
+expect 'health unacked growth: acknowledged state becomes healthy' "$(rc_is 0; echo $?)"
+
+# Invalid pending evidence must remain breached, including during dry-run.
+printf '%s\n' 'sequence_gap_pending|binance-lob-archiver-production@usdm=invalid' >> "$state_dir/state.json"
+cp "$state_dir/state.json" "$test_root/state.before-dry-run"
+run_sequence_health --dry-run --json
+expect 'health invalid pending: dry-run fails closed' "$(json_query '
+  .ok == false and (.breaches | any(contains("pending state malformed")))'; echo $?)"
+expect 'health invalid pending: dry-run preserves state' "$(cmp -s "$state_dir/state.json" "$test_root/state.before-dry-run"; echo $?)"
+
+wait_for_fixture() {
+  # A bounded barrier makes the overlapping invocations deterministic.
+  perl - "$1" <<'PERL'
+use strict;
+use warnings;
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
+
+my $deadline = clock_gettime(CLOCK_MONOTONIC) + 10;
+while (!-e $ARGV[0]) {
+    exit 1 if clock_gettime(CLOCK_MONOTONIC) >= $deadline;
+    sleep 0.02;
+}
+PERL
+}
+
+reset_env
+reset_state
+healthy_scenario
+healthy_fixtures
+write_health usdm 45 0 false synced concurrent-session 2
+run_sequence_health
+pause="$test_root/state-write-pause"
+(
+  out_file="$test_root/first.out"
+  err_file="$test_root/first.err"
+  STUB_STATE_WRITE_PAUSE="$pause" run_health --json
+  printf '%s\n' "$RC" > "$test_root/first.rc"
+) &
+first_pid=$!
+barrier_rc=0
+wait_for_fixture "$pause.reached" || barrier_rc=$?
+expect 'health overlap: first monitor pauses before commit' "$barrier_rc"
+write_health usdm 45 0 false synced concurrent-session 5
+(
+  out_file="$test_root/second.out"
+  err_file="$test_root/second.err"
+  STUB_STATE_LOCK_ATTEMPT="$test_root/second.lock-attempt" \
+    MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_health --json
+  printf '%s\n' "$RC" > "$test_root/second.rc"
+) &
+second_pid=$!
+barrier_rc=0
+wait_for_fixture "$test_root/second.lock-attempt" || barrier_rc=$?
+expect 'health overlap: second monitor attempts state lock' "$barrier_rc"
+expect 'health overlap: second monitor waits for first commit' "$(if [ ! -e "$test_root/second.rc" ]; then echo 0; else echo 1; fi)"
+touch "$pause.release"
+wait "$first_pid"
+wait "$second_pid"
+expect 'health overlap: first snapshot was healthy' "$(if [ "$(cat "$test_root/first.rc")" = 0 ]; then echo 0; else echo 1; fi)"
+expect 'health overlap: second snapshot breaches' "$(if [ "$(cat "$test_root/second.rc")" = 1 ]; then echo 0; else echo 1; fi)"
+write_health usdm 45 0 false synced concurrent-reset 0
+MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS=1 run_sequence_health --json
+expect 'health overlap: pending survives overlapping writes and reset' "$(json_query '
+  .ok == false and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_pending
+    == {session_id:"concurrent-session",previous_total:2,total:5}'; echo $?)"
+cp "$state_dir/state.json" "$test_root/state.before-lock-error"
+STUB_STATE_LOCK_ERROR=1 run_sequence_health --json
+expect 'health state lock failure: monitor fails closed' "$(json_query '
+  .ok == false and (.breaches | any(contains("state lock")))'; echo $?)"
+expect 'health state lock failure: pending state cannot be overwritten' "$(cmp -s "$state_dir/state.json" "$test_root/state.before-lock-error"; echo $?)"
+
+if [ "$test_scope" = all ]; then
 reset_env
 reset_state
 healthy_scenario
@@ -1060,9 +1293,9 @@ expect "health malformed session: typed total and prior retained" "$(json_query 
 
 write_health usdm 45 0 false synced session-preserved 9
 run_health --dry-run --json
-expect "health dry-run: exit 0" "$(rc_is 0; echo $?)"
-expect "health dry-run: no counter comparison" "$(grep_not_out 'sequence_gap_total increased'; echo $?)"
-expect "health dry-run: typed status" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "dry_run" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_observed == true and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == null'; echo $?)"
+expect "health dry-run: exit 1" "$(rc_is 1; echo $?)"
+expect "health dry-run: counter comparison remains active" "$(grep_out 'sequence_gap_total increased'; echo $?)"
+expect "health dry-run: typed status" "$(json_query '.checks.health["binance-lob-archiver-production@usdm"].sequence_gap_baseline == "increased" and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_observed == true and .checks.health["binance-lob-archiver-production@usdm"].sequence_gap_delta == 5'; echo $?)"
 
 reset_env
 reset_state
@@ -1898,6 +2131,7 @@ expect 'reader failure preserves fail-closed unknown count' "$(json_query '
 printf '#!/bin/sh\nprintf "{}\\n"\n' >"$stub_dir/monday-rust-lob-retained-check"
 run_health --json --dry-run
 expect 'incomplete reader response cannot acknowledge failures' "$(json_query '.ok==false and .checks.recovery_queue.spot.retention_check_status=="failed"'; echo $?)"
+fi
 
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"

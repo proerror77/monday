@@ -35,25 +35,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --bin binance-market-tape-slicer \
     --bin binance-replay-parquet-materializer \
     --bin clickhouse-analytics-materializer \
-    && CARGO_TARGET_DIR=/work/target/prediction-markets \
-    cargo --config 'build.rustc-wrapper=""' build \
-    --manifest-path prediction-markets/Cargo.toml \
-    --release \
-    --locked \
-    -p ploy-research \
-    --features db \
-    --bin monday-prediction-research \
-    --bin monday-prediction-evaluator \
-    --bin monday-prediction-snapshot \
     && install -D -m 0755 /work/target/release/hft-backtest /out/bin/hft-backtest \
     && install -D -m 0755 /work/target/release/alpha-harness /out/bin/alpha-harness \
     && install -D -m 0755 /work/target/release/lob-pit-materializer /out/bin/lob-pit-materializer \
     && install -D -m 0755 /work/target/release/binance-market-tape-slicer /out/bin/binance-market-tape-slicer \
     && install -D -m 0755 /work/target/release/binance-replay-parquet-materializer /out/bin/binance-replay-parquet-materializer \
-    && install -D -m 0755 /work/target/release/clickhouse-analytics-materializer /out/bin/clickhouse-analytics-materializer \
-    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-research /out/bin/monday-prediction-research \
-    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-evaluator /out/bin/monday-prediction-evaluator \
-    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-snapshot /out/bin/monday-prediction-snapshot
+    && install -D -m 0755 /work/target/release/clickhouse-analytics-materializer /out/bin/clickhouse-analytics-materializer
 
 FROM debian:bookworm-slim AS runtime-base
 ENV MONDAY_EXECUTION_HOST=ack
@@ -71,15 +58,17 @@ RUN mkdir -p /work/config /work/data /work/results \
 USER research
 WORKDIR /work
 ENV ALPHA_HARNESS_BIN=/usr/local/bin/alpha-harness
-ENV MONDAY_PREDICTION_RESEARCH_BIN=/usr/local/bin/monday-prediction-research \
-    MONDAY_PREDICTION_EVALUATOR_BIN=/usr/local/bin/monday-prediction-evaluator \
-    MONDAY_PREDICTION_SNAPSHOT_BIN=/usr/local/bin/monday-prediction-snapshot
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hft-backtest"]
 
 FROM runtime-base AS prebuilt
 
-COPY --chmod=0755 research-bin/ /usr/local/bin/
+COPY --chmod=0755 research-bin/hft-backtest /usr/local/bin/hft-backtest
+COPY --chmod=0755 research-bin/alpha-harness /usr/local/bin/alpha-harness
+COPY --chmod=0755 research-bin/lob-pit-materializer /usr/local/bin/lob-pit-materializer
+COPY --chmod=0755 research-bin/binance-market-tape-slicer /usr/local/bin/binance-market-tape-slicer
+COPY --chmod=0755 research-bin/binance-replay-parquet-materializer /usr/local/bin/binance-replay-parquet-materializer
+COPY --chmod=0755 research-bin/clickhouse-analytics-materializer /usr/local/bin/clickhouse-analytics-materializer
 
 FROM runtime-base AS runtime
 
