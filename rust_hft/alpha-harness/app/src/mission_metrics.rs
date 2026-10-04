@@ -4,7 +4,6 @@ pub(crate) mod campaign;
 
 use crate::{
     cli::{ModelMetricsArgs, ModelMetricsBenchmark},
-    data_mission,
     mission_runner::CexSupervisedModelSelectionV1,
 };
 use alpha_domain::{CexBaselineModelKindV1, CexResearchContentRefV1};
@@ -178,7 +177,7 @@ pub(crate) fn existing_output_matches(path: &Path, bytes: &[u8]) -> anyhow::Resu
 }
 
 pub(crate) fn persist_immutable_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let mut file = data_mission::temporary_output_file(path, ".monday-model-metrics-")?;
+    let mut file = hft_research_artifacts::temporary_output_file(path, ".monday-model-metrics-")?;
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
     match file.persist_noclobber(path) {

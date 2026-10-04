@@ -2,7 +2,7 @@ use crate::{
     cli::ValidationArgs,
     data_mission,
     mission_runner::{
-        decode_materialization, normalized_sha256, validate_materialization, MAX_FEATURE_BYTES,
+        decode_materialization, validate_materialization, MAX_FEATURE_BYTES,
         MAX_MATERIALIZATION_BYTES,
     },
 };
@@ -25,6 +25,7 @@ use anyhow::{bail, Context};
 use hft_collector::import_feature_dataset;
 use hft_collector::FeatureDatasetManifest;
 use hft_factor_dsl::FactorOperator;
+use hft_research_artifacts::normalized_sha256;
 use hft_research_manifest::CexReplayDatasetManifestV5;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

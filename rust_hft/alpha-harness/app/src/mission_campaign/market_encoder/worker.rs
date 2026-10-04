@@ -133,7 +133,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         || request.build_source_revision != BUILD_SOURCE_REVISION
         || request.campaign_id != args.campaign_id
         || request.image_identity != args.image_identity
-        || crate::mission_runner::sha256_file(&args.request)? != args.request_sha256
+        || hft_research_artifacts::sha256_file(&args.request)? != args.request_sha256
     {
         bail!("market worker source, mode or request identity changed");
     }
@@ -184,8 +184,8 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         let extracted = temporary.path().join("extracted");
         extract_bundle_with_file_limit(&bundle, &extracted, archive_file_limit(&request)?)?;
         verify_artifact_inventory(&bundle, &extracted, DIRECTORY, &result.artifacts)?;
-        if crate::mission_runner::sha256_file(&extracted.join("result.json"))?
-            != crate::mission_runner::sha256_file(&result_path)?
+        if hft_research_artifacts::sha256_file(&extracted.join("result.json"))?
+            != hft_research_artifacts::sha256_file(&result_path)?
         {
             bail!("existing market archive result differs");
         }
@@ -218,14 +218,14 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     ] {
         let readback = tempfile::NamedTempFile::new_in(&args.work_dir)?;
         fetch_to_file(&client, url, readback.path(), limit)?;
-        if crate::mission_runner::sha256_file(path)?
-            != crate::mission_runner::sha256_file(readback.path())?
+        if hft_research_artifacts::sha256_file(path)?
+            != hft_research_artifacts::sha256_file(readback.path())?
         {
             bail!("market publication readback differs");
         }
     }
     print_json(
-        &serde_json::json!({"campaign_id":request.campaign_id,"result_sha256":crate::mission_runner::sha256_file(&result_path)?,"state":result.state,"primary_fits_attempted":result.primary_fits_attempted,"verification_fits_attempted":result.verification_fits_attempted,"charged_trials":result.charged_trials,"sealed_holdout_opened":false,"deployment_authority":false}),
+        &serde_json::json!({"campaign_id":request.campaign_id,"result_sha256":hft_research_artifacts::sha256_file(&result_path)?,"state":result.state,"primary_fits_attempted":result.primary_fits_attempted,"verification_fits_attempted":result.verification_fits_attempted,"charged_trials":result.charged_trials,"sealed_holdout_opened":false,"deployment_authority":false}),
     )
 }
 
@@ -693,7 +693,7 @@ fn track(
 ) -> anyhow::Result<()> {
     artifacts.insert(
         name.clone(),
-        crate::mission_runner::sha256_file(&directory.join(name))?,
+        hft_research_artifacts::sha256_file(&directory.join(name))?,
     );
     Ok(())
 }
@@ -701,7 +701,7 @@ fn persist_exact(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if path.try_exists()? {
         if !path.is_file()
             || path.metadata()?.len() != bytes.len() as u64
-            || crate::mission_runner::sha256_file(path)? != format!("{:x}", Sha256::digest(bytes))
+            || hft_research_artifacts::sha256_file(path)? != format!("{:x}", Sha256::digest(bytes))
         {
             bail!(
                 "existing immutable market artifact differs: {}",

@@ -6,12 +6,12 @@ use super::{
 };
 use crate::{
     cli::{print_json, CampaignControllerHandoffArgs, CampaignControllerPrepareArgs},
-    data_mission::temporary_output_file,
     prediction_dispatch::{validate_cluster_target, validate_dns_label},
 };
 use alpha_domain::campaign_control::SignedCampaignRootGrantV1;
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
+use hft_research_artifacts::temporary_output_file;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{

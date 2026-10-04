@@ -1,9 +1,6 @@
-use crate::{
-    cli::{print_json, PredictionSnapshotArgs},
-    data_mission,
-    mission_runner::{configured_sibling_binary, create_bundle, publish_result, sha256_file},
-};
+use crate::cli::{print_json, PredictionSnapshotArgs};
 use anyhow::{bail, Context};
+use hft_research_artifacts::{configured_binary, create_bundle, publish_result, sha256_file};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -37,9 +34,9 @@ struct SnapshotExecutionReport<'a> {
 }
 
 pub fn snapshot(args: PredictionSnapshotArgs) -> anyhow::Result<()> {
-    let compiler = configured_sibling_binary(
+    let compiler = configured_binary(
         "MONDAY_PREDICTION_SNAPSHOT_BIN",
-        "monday-prediction-snapshot",
+        Path::new("/usr/local/bin/monday-prediction-snapshot"),
     )?;
     snapshot_with_compiler(args, &compiler)
 }
@@ -47,12 +44,18 @@ pub fn snapshot(args: PredictionSnapshotArgs) -> anyhow::Result<()> {
 fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyhow::Result<()> {
     validate_snapshot_args(&args)?;
     let artifact_dir = args.work_dir.join("artifacts");
-    data_mission::ensure_real_directory(&args.work_dir, "prediction snapshot work")?;
-    data_mission::ensure_real_directory(&artifact_dir, "prediction snapshot artifact")?;
+    hft_research_artifacts::ensure_real_directory(&args.work_dir, "prediction snapshot work")?;
+    hft_research_artifacts::ensure_real_directory(&artifact_dir, "prediction snapshot artifact")?;
     let stdout_path = artifact_dir.join("snapshot-compiler.stdout");
     let stderr_path = artifact_dir.join("snapshot-compiler.stderr");
-    data_mission::ensure_output_path_is_not_symlink(&stdout_path, "snapshot compiler stdout")?;
-    data_mission::ensure_output_path_is_not_symlink(&stderr_path, "snapshot compiler stderr")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(
+        &stdout_path,
+        "snapshot compiler stdout",
+    )?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(
+        &stderr_path,
+        "snapshot compiler stderr",
+    )?;
     // A failed immutable upload cannot make a writable previous output
     // trustworthy. Compile each retry into a new private directory.
     let snapshot_dir = tempfile::Builder::new()
@@ -65,8 +68,10 @@ fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyh
             )
         })?;
 
-    let stdout = data_mission::temporary_output_file(&stdout_path, ".monday-artifact-log-")?;
-    let stderr = data_mission::temporary_output_file(&stderr_path, ".monday-artifact-log-")?;
+    let stdout =
+        hft_research_artifacts::temporary_output_file(&stdout_path, ".monday-artifact-log-")?;
+    let stderr =
+        hft_research_artifacts::temporary_output_file(&stderr_path, ".monday-artifact-log-")?;
     let status = Command::new(compiler)
         .arg("--output-dir")
         .arg(snapshot_dir.path())
@@ -78,8 +83,8 @@ fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyh
         .with_context(|| format!("start prediction snapshot compiler {}", compiler.display()))?;
     stdout.as_file().sync_all()?;
     stderr.as_file().sync_all()?;
-    data_mission::persist_output_file(stdout, &stdout_path, "snapshot compiler stdout")?;
-    data_mission::persist_output_file(stderr, &stderr_path, "snapshot compiler stderr")?;
+    hft_research_artifacts::persist_output_file(stdout, &stdout_path, "snapshot compiler stdout")?;
+    hft_research_artifacts::persist_output_file(stderr, &stderr_path, "snapshot compiler stderr")?;
     if !status.success() {
         bail!(
             "prediction snapshot compiler exited unsuccessfully with {:?}; see {}",
@@ -105,7 +110,7 @@ fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyh
         snapshot_contract_hash: manifest.snapshot_contract_hash.as_deref(),
         compiler_exit_code: status.code(),
     };
-    data_mission::write_json_atomic(
+    hft_research_artifacts::write_json_atomic(
         &snapshot_dir.path().join("monday-snapshot-evidence.json"),
         &evidence,
     )?;
