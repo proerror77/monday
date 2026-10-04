@@ -115,8 +115,8 @@ impl ArtifactGateway {
         }
         if let Some(view) = &receipt.prepared_view {
             let mut orders = std::collections::BTreeMap::<
-                hft_research_input::data::Exit,
-                hft_research_input::data::BlockOrder,
+                hft_cex_research_input::data::Exit,
+                hft_cex_research_input::data::BlockOrder,
             >::new();
             for block in &view.blocks {
                 let artifact = receipt
@@ -132,8 +132,8 @@ impl ArtifactGateway {
                     sha256(&bytes) == block.sha256,
                     "prepared block changed during publication"
                 );
-                let typed = hft_research_input::prepared::decode(&bytes)?;
-                hft_research_input::data::validate_block(&typed, block, &view.spec)?;
+                let typed = hft_cex_research_input::prepared::decode(&bytes)?;
+                hft_cex_research_input::data::validate_block(&typed, block, &view.spec)?;
                 orders
                     .entry(block.exit.clone())
                     .or_default()
@@ -361,7 +361,7 @@ mod tests {
         orchestrator::{Artifact, Task, TaskKind, TaskSpec},
         sha256,
     };
-    use hft_research_input::{
+    use hft_cex_research_input::{
         data::{
             BlockRef, DataViewSpec, Exit, FeatureFrame, PublishedView, Split, TypedBlock, Window,
         },
@@ -456,7 +456,7 @@ mod tests {
                     sha256: block_sha,
                     bytes: artifact.bytes,
                     rows: 1,
-                    decoded_bytes: hft_research_input::data::memory_bytes(&typed),
+                    decoded_bytes: hft_cex_research_input::data::memory_bytes(&typed),
                     exit: Exit::Features,
                 }],
                 producer_image: task.spec.image.clone(),

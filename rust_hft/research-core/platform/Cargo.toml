@@ -9,7 +9,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 anyhow = "1"
-hft-research-input = { path = "../input" }
+hft-cex-research-input = { path = "../cex-input" }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "time", "signal", "net"] }
 reqwest = { workspace = true, optional = true, features = ["rustls-tls", "json"] }
 axum = { workspace = true, optional = true }

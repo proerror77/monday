@@ -2,7 +2,7 @@
 //! attempt writes a distinct physical generation; publication remains in PG.
 use crate::{postgres::PreparationPermit, preparation::PREPARE_SQL};
 use anyhow::{ensure, Context, Result};
-use hft_research_input::data::{
+use hft_cex_research_input::data::{
     DataViewSpec, Exit, FeatureFrame, Label, PublishedView, ReplayEvent, ReplayPayload, Split,
     TrainingFrame, TypedBlock,
 };
@@ -367,7 +367,7 @@ mod tests {
             normalizer_sha256: "b".repeat(64),
             feature_sql_sha256: sha256(PREPARE_SQL.as_bytes()),
             feature_names: vec!["mid".into(), "spread".into(), "depth_imbalance".into()],
-            window: hft_research_input::data::Window {
+            window: hft_cex_research_input::data::Window {
                 start_ns: 100,
                 end_ns: 1000,
             },
@@ -426,14 +426,14 @@ mod tests {
         assert_eq!(anchor.values, vec![101.0, 2.0, 0.0]);
         assert_eq!(anchor.event_ns, 199);
         assert_eq!(anchor.available_ns, 200);
-        let encoded = hft_research_input::prepared::encode(&block).unwrap();
-        let reference = hft_research_input::data::BlockRef {
+        let encoded = hft_cex_research_input::prepared::encode(&block).unwrap();
+        let reference = hft_cex_research_input::data::BlockRef {
             sha256: sha256(&encoded),
             bytes: encoded.len() as u64,
             rows: 7,
             decoded_bytes: 65536,
             exit: Exit::Features,
         };
-        hft_research_input::data::validate_block(&block, &reference, &spec()).unwrap();
+        hft_cex_research_input::data::validate_block(&block, &reference, &spec()).unwrap();
     }
 }

@@ -1,5 +1,6 @@
-//! Immutable, verified scientific inputs shared by control and CPU workers.
+//! Immutable CEX time-series inputs shared by control and CPU workers.
 //! No database, provider, agent, acquisition or execution dependency.
+//! Prediction-market event and settlement inputs remain in their own contracts.
 pub mod data;
 pub mod prepared;
 

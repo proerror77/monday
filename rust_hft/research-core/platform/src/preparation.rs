@@ -1,7 +1,7 @@
 //! Reviewed preparation plans remain owned by the controller/data publisher.
 use crate::{identity, sha256, valid_digest};
 use anyhow::{ensure, Result};
-use hft_research_input::data::DataViewSpec;
+use hft_cex_research_input::data::DataViewSpec;
 use serde::{Deserialize, Serialize};
 
 pub const CLICKHOUSE_SCHEMA: &str = include_str!("../sql/clickhouse.sql");

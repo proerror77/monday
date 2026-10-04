@@ -44,7 +44,9 @@ flowchart LR
 
 `rust_hft/workspaces.json` 登记六个真实入口：shared、data、research、control、runtime、prediction。每个入口拥有独立 lockfile、resolver 2 和 Rust 1.98.1。源码路径保持原位置，package 显式声明唯一 owner；原 root package 属于 runtime workspace。
 
-shared workspace 的 `hft-research-input` 独立拥有 DataView、typed block、二进制 codec 和有界验证缓存。它只依赖序列化与摘要库，不含 SQL、数据库驱动、HTTP、provider 或 Agent 状态。backtest 直接消费该输入 crate。轻量 control workspace 只含 `hft-research-platform`，消费相同输入合同；其依赖树没有 collector、Burn、ONNX 或 Parquet。Data 的协议库不反向依赖采集运行时；`hft-market-pipeline` 也不依赖训练或执行。科学 research workspace 默认选择 search kernel，实际训练与 harness 由明确 package/build recipe 选择。
+shared workspace 的 `hft-cex-research-input` 独立拥有 DataView、typed block、二进制 codec 和有界验证缓存。它只依赖序列化与摘要库，不含 SQL、数据库驱动、HTTP、provider 或 Agent 状态。backtest 直接消费该输入 crate。轻量 control workspace 只含 `hft-research-platform`，消费相同输入合同；其依赖树没有 collector、Burn、ONNX 或 Parquet。Data 的协议库不反向依赖采集运行时；`hft-market-pipeline` 也不依赖训练或执行。科学 research workspace 默认选择 search kernel，实际训练与 harness 由明确 package/build recipe 选择。
+
+CEX 与 Prediction Markets 保留不同的科学输入和 evaluator。`hft-cex-research-input` 的 horizon、成熟时钟和连续 LOB 回放属于 CEX 时间序列合同；它不是事件结算概率数据集。Prediction 的 episode、UP/DOWN outcome、event-disjoint cohort 和 ResearchSnapshot 继续由 prediction workspace 所有。两条链可共享领域中性的搜索机制、行情和治理合同。依赖检查覆盖 Prediction 的 default/db/full 构建，拒绝引入 CEX input、harness、collector、backtest 或 control platform。
 
 CI selector 汇总真实 metadata，包括跨域 path dependencies 和 integration/dev edges。`cargo-scoped.sh` 把显式包集合分到各 owner；跨 workspace features 或命名 target 组合拒绝模糊执行。CI 单 runner 可复用自己的 target cache；多个 Cargo invocation 仍各自解析所属 workspace 的 features。共享可写多租户 cache 不属于此合同。
 
@@ -79,7 +81,7 @@ CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生�
 
 ## 数据：CH 数值准备、版本化出口、bounded 共享
 
-`research-core/input/src/data.rs` 的 `DataViewSpec` 绑定 venue、instrument、market、depth、排序后的 source SHA、normalizer、SQL recipe、feature names、时间窗、lookback、多个 horizon、容差、split 和 fitting cutoff。没有写死某个资产、100 档或某组 horizon。
+`research-core/cex-input/src/data.rs` 的 `DataViewSpec` 绑定 venue、instrument、market、depth、排序后的 source SHA、normalizer、SQL recipe、feature names、时间窗、lookback、多个 horizon、容差、split 和 fitting cutoff。没有写死某个资产、100 档或某组 horizon。
 
 默认 SQL recipe 为 mid/spread/depth imbalance。PreparationPlan 也可携带经过原生 admission 审核的不可变 recipe_sql，绑定 exact SQL digest、固定 features/labels 两个插入目标和输出 schema；算法变化形成新的数据身份，可以复用同一 prepare Build。参数、horizons、数据窗或已审核 SQL recipe 变化无需编译 Rust。这个入口不是向 Agent 开放的任意 SQL 执行器，也不是 SQL parser/sandbox；科学 grant 和 CH 的独立权限边界仍必须接入。改动 Rust 的解码/计算实现或打包默认值本身才需新 Build。
 
@@ -89,7 +91,7 @@ CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生�
 
 当前 preparation worker 只支持 Train。plan 登记和任务提交都拒绝 Validation 与 Holdout，避免消耗必然失败的 attempt。通用 DataView schema 保留这些 split，未来 evaluator 仍需独立准入。
 
-`research-core/input/src/prepared.rs` 使用带版本和大小上限的 bincode。读取本地文件或对象时，调用方必须核验 manifest 和 block digest。Transport 只提供字节，不能替换解码结果。解码后释放一次性 acquired buffers。控制侧的 `preparation.rs` 保留 reviewed SQL plan 和默认 recipe；`block_objects.rs` 保留有界 HTTPS 获取。crate 迁移不改变已发布的 manifest 字段、bincode schema 或内容摘要。
+`research-core/cex-input/src/prepared.rs` 使用带版本和大小上限的 bincode。读取本地文件或对象时，调用方必须核验 manifest 和 block digest。Transport 只提供字节，不能替换解码结果。解码后释放一次性 acquired buffers。控制侧的 `preparation.rs` 保留 reviewed SQL plan 和默认 recipe；`block_objects.rs` 保留有界 HTTPS 获取。crate 迁移不改变已发布的 manifest 字段、bincode schema 或内容摘要。
 
 `VerifiedCache` 对缺页执行读取、解码、时钟和 split 验证。cache hit 仍检查当前 view 的合同。多个试验可以复用一个只读 `Arc` batch；模型、optimizer 和 checkpoint 状态分别保存。batch owner 必须计入外部持有 Arc 的内存。LRU 不能单独限制这些引用的总驻留量。
 
