@@ -461,24 +461,25 @@ case "$*" in
   '-w 60 8')
     [ "${STUB_STATE_LOCK_ERROR:-0}" != 1 ] || exit 2
     # Use a real descriptor lock on macOS and Linux. The monitor retains fd 8.
-    exec python3 - <<'PY'
-import fcntl
-import os
-import time
+    exec perl - <<'PERL'
+use strict;
+use warnings;
+use Errno qw(EAGAIN EWOULDBLOCK);
+use Fcntl qw(LOCK_EX LOCK_NB);
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
 
-attempt = os.environ.get("STUB_STATE_LOCK_ATTEMPT")
-if attempt:
-    open(attempt, "w").close()
-deadline = time.monotonic() + 60
-while True:
-    try:
-        fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        break
-    except BlockingIOError:
-        if time.monotonic() >= deadline:
-            raise SystemExit(1)
-        time.sleep(0.02)
-PY
+if (my $attempt = $ENV{STUB_STATE_LOCK_ATTEMPT}) {
+    open my $marker, '>', $attempt or die "create lock marker: $!\n";
+    close $marker or die "close lock marker: $!\n";
+}
+open my $lock, '<&=', 8 or die "open lock fd 8: $!\n";
+my $deadline = clock_gettime(CLOCK_MONOTONIC) + 60;
+while (!flock($lock, LOCK_EX | LOCK_NB)) {
+    die "lock fd 8: $!\n" unless $! == EAGAIN || $! == EWOULDBLOCK;
+    exit 1 if clock_gettime(CLOCK_MONOTONIC) >= $deadline;
+    sleep 0.02;
+}
+PERL
     ;;
   '-s -n 9' | '-n 9') ;;
   *) exit 2 ;;
@@ -493,18 +494,20 @@ EOF
 cat > "$stub_dir/mv" <<'EOF'
 #!/bin/sh
 if [ -n "${STUB_STATE_WRITE_PAUSE:-}" ] && [ "$2" = "$MONDAY_COLLECTOR_STATE_DIR/state.json" ]; then
-  python3 - <<'PY'
-import os
-import time
+  perl - <<'PERL'
+use strict;
+use warnings;
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
 
-pause = os.environ["STUB_STATE_WRITE_PAUSE"]
-open(pause + ".reached", "w").close()
-deadline = time.monotonic() + 20
-while not os.path.exists(pause + ".release"):
-    if time.monotonic() >= deadline:
-        raise SystemExit(1)
-    time.sleep(0.02)
-PY
+my $pause = $ENV{STUB_STATE_WRITE_PAUSE};
+open my $marker, '>', "$pause.reached" or die "create pause marker: $!\n";
+close $marker or die "close pause marker: $!\n";
+my $deadline = clock_gettime(CLOCK_MONOTONIC) + 20;
+while (!-e "$pause.release") {
+    exit 1 if clock_gettime(CLOCK_MONOTONIC) >= $deadline;
+    sleep 0.02;
+}
+PERL
   [ "$?" -eq 0 ] || exit 1
 fi
 exec "$STUB_REAL_MV" "$@"
@@ -1202,17 +1205,17 @@ expect 'health invalid pending: dry-run preserves state' "$(cmp -s "$state_dir/s
 
 wait_for_fixture() {
   # A bounded barrier makes the overlapping invocations deterministic.
-  python3 - "$1" <<'PY'
-import os
-import sys
-import time
+  perl - "$1" <<'PERL'
+use strict;
+use warnings;
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
 
-deadline = time.monotonic() + 10
-while not os.path.exists(sys.argv[1]):
-    if time.monotonic() >= deadline:
-        raise SystemExit(1)
-    time.sleep(0.02)
-PY
+my $deadline = clock_gettime(CLOCK_MONOTONIC) + 10;
+while (!-e $ARGV[0]) {
+    exit 1 if clock_gettime(CLOCK_MONOTONIC) >= $deadline;
+    sleep 0.02;
+}
+PERL
 }
 
 reset_env

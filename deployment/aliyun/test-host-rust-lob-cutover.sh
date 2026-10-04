@@ -183,13 +183,16 @@ for market in spot usdm; do
         dangling_symlink) ln -s "$ROOT/missing" "$artifact" ;;
         fifo) mkfifo "$artifact" ;;
         socket)
-          python3 - "$artifact" <<'SOCKET'
-import os
-import socket
-import sys
-os.chdir(os.path.dirname(sys.argv[1]))
-with socket.socket(socket.AF_UNIX) as listener:
-    listener.bind(os.path.basename(sys.argv[1]))
+          perl - "$artifact" <<'SOCKET'
+use strict;
+use warnings;
+use File::Basename qw(dirname basename);
+use Socket qw(AF_UNIX SOCK_STREAM sockaddr_un);
+
+chdir dirname($ARGV[0]) or die "chdir socket directory: $!\n";
+socket(my $listener, AF_UNIX, SOCK_STREAM, 0) or die "create socket: $!\n";
+bind($listener, sockaddr_un(basename($ARGV[0]))) or die "bind socket: $!\n";
+close $listener or die "close socket: $!\n";
 SOCKET
           ;;
       esac
