@@ -4,7 +4,7 @@ use hft_research_platform::{
     execution::{Acceptance, Backend, Profile},
     identity,
     orchestrator::{State, TaskKind, TaskSpec},
-    postgres::{Ledger, BUILD_RELEASE_MIGRATION, MIGRATION},
+    postgres::{Ledger, BUILD_RELEASE_MIGRATION, MIGRATION, SESSION_DELIVERY_MIGRATION},
 };
 mod common;
 
@@ -54,6 +54,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .execute(&pool)
         .await?;
     sqlx_core::raw_sql::raw_sql(BUILD_RELEASE_MIGRATION)
+        .execute(&pool)
+        .await?;
+    sqlx_core::raw_sql::raw_sql(SESSION_DELIVERY_MIGRATION)
         .execute(&pool)
         .await?;
     let ledger = Ledger::connect(&url).await?;
@@ -349,13 +352,40 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     second.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
     admit(second.clone()).await?;
     ledger.submit("fixture", "two", second).await?;
+    let session_temp = tempfile::tempdir()?;
+    let session_root = session_temp.path().canonicalize()?;
+    let fixture_source = session_root.join("fixture.rs");
+    std::fs::write(&fixture_source, include_str!("fixtures/app_server.rs"))?;
+    let fixture_binary = session_root.join("fixture-codex");
+    anyhow::ensure!(
+        std::process::Command::new("rustc")
+            .arg("--edition=2021")
+            .arg(&fixture_source)
+            .arg("-o")
+            .arg(&fixture_binary)
+            .status()?
+            .success(),
+        "native protocol fixture compile failed"
+    );
+    let workspace = session_root.join("workspace");
+    std::fs::create_dir(&workspace)?;
+    let session_config = hft_research_platform::session::SessionConfig {
+        executable_sha256: hft_research_platform::sha256(&std::fs::read(&fixture_binary)?),
+        executable: fixture_binary,
+        workspace,
+        native_home: session_root.join("native"),
+        delivery_directory: session_root.join("delivery"),
+    };
+    let mut native_session =
+        hft_research_platform::session::AppServer::start(session_config.clone()).await?;
+    native_session.open_thread(None).await?;
     let session = hft_research_platform::research::Session {
         schema: 1,
         experiment_sha256: run.experiment_sha256.clone(),
         provider: hft_research_platform::research::CodingAgent::CodexAppServer,
         provider_version: "0.159.2".into(),
-        provider_thread_id: "fixture-thread".into(),
-        provider_binary_sha256: hash('a'),
+        provider_thread_id: native_session.thread_id().unwrap().into(),
+        provider_binary_sha256: session_config.executable_sha256,
         capability_policy_receipt_sha256: hash('b'),
     };
     let session_id = ledger.register_session("fixture", &session).await?;
@@ -410,6 +440,42 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     .fetch_one(&pool)
     .await?;
     assert_eq!(intents, 1);
+    let pending = ledger.pending_completions("fixture", &session_id).await?;
+    assert_eq!(pending.len(), 1);
+    assert!(
+        hft_research_platform::postgres::completion_message(&pending[0].0, &pending[0].1)?
+            .contains("cancelled")
+    );
+    assert!(ledger
+        .pending_completions("another", &session_id)
+        .await
+        .is_err());
+    let message =
+        hft_research_platform::postgres::completion_message(&pending[0].0, &pending[0].1)?;
+    native_session.send_message(&pending[0].0, &message).await?;
+    let delivery = native_session.verified_delivery(&pending[0].0).await?;
+    assert!(ledger
+        .record_completion_delivery("another", &session_id, &delivery)
+        .await
+        .is_err());
+    ledger
+        .record_completion_delivery("fixture", &session_id, &delivery)
+        .await?;
+    ledger
+        .record_completion_delivery("fixture", &session_id, &delivery)
+        .await?;
+    assert!(ledger
+        .pending_completions("fixture", &session_id)
+        .await?
+        .is_empty());
+    assert!(sqlx_core::query::query(
+        "UPDATE research.completion_deliveries SET native_readback_sha256=$1"
+    )
+    .bind(hash('e'))
+    .execute(&pool)
+    .await
+    .is_err());
+    native_session.close().await?;
 
     sqlx_core::query::query("UPDATE research.authority SET mode='postgres'")
         .execute(&pool)
