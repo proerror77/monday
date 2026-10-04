@@ -333,7 +333,7 @@ jobs:
       - name: Verify Polymarket compiler source binding
         if: ${{ (matrix.repository == 'polymarket-evidence-compiler') && !matrix.research_artifact }}
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           docker pull "$IMAGE"
@@ -347,7 +347,7 @@ jobs:
       - name: Verify Polymarket market recorder image
         if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           docker pull "$IMAGE"
@@ -366,9 +366,9 @@ jobs:
       - name: Extract bare-metal Polymarket market recorder
         if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-          IMAGE_DIGEST: ${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           mkdir -p polymarket-market-recorder-artifact
@@ -396,7 +396,7 @@ jobs:
       - name: Verify Campaign cycle controller image
         if: matrix.repository == 'campaign-cycle-controller'
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           set -euo pipefail
@@ -408,7 +408,7 @@ jobs:
         if: ${{ (matrix.repository == 'hft-trading') && !matrix.research_artifact }}
         env:
           IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/hft-trading
-          IMAGE_DIGEST: ${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           mkdir -p trading-host-artifact
@@ -746,7 +746,7 @@ jobs:
       - name: Read back research image source and executable bytes
         if: matrix.research_artifact
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
           IMAGE_REPOSITORY: ${{ matrix.repository }}
         run: |
