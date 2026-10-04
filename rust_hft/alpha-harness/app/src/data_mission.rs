@@ -9,6 +9,7 @@ use hft_collector::{
     DataAcquisitionMission, DataModality, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
 };
 use hft_research_artifacts::temporary_output_file;
+#[cfg(test)]
 use hft_research_artifacts::{write_json_atomic, write_json_atomic_bounded};
 use hft_research_manifest::{
     CexReplayDatasetManifestV1, CexReplayDatasetManifestV2, CexReplayDatasetManifestV3,
