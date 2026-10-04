@@ -25,10 +25,15 @@ assert_source() {
   shift 2
   local output="$tmp_dir/$name.out"
   "$selector" "$@" --output "$output"
-  diff -u <(printf '%s\n' "$expected" 'research_product=paired') "$output"
+  local products=cex-runner,controller,prediction-runner published=none
+  case "$name" in
+    automated) published=$products ;;
+    manual-rebuild) products=cex-runner; published=cex-runner ;;
+  esac
+  diff -u <(printf '%s\n' "$expected" "research_product=$products" "published_products=$published") "$output"
 }
 
-assert_source automated $'publish_target=research-runner\nresearch_mode=artifact\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=1234' \
+assert_source automated $'publish_target=research-products\nresearch_mode=artifact\nsource_sha=1111111111111111111111111111111111111111\nartifact_run_id=1234' \
   --event workflow_run --conclusion success --source-event push --head-branch main \
   --head-sha "$main_sha" --run-id 1234 \
   --binaries-conclusion success --smoke-conclusion success \
@@ -153,7 +158,7 @@ release="$tmp_dir/release"
 mkdir -p "$repo/prediction-markets" "$release/research-bin"
 printf 'root lock\n' >"$repo/Cargo.lock"
 printf 'prediction lock\n' >"$repo/prediction-markets/Cargo.lock"
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do
+for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot monday-prediction-worker; do
   printf '%s\n' "$binary" >"$release/research-bin/$binary"
   chmod 0755 "$release/research-bin/$binary"
 done

@@ -212,7 +212,7 @@ pub(crate) fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     if canonical != frozen.canonical_request {
         bail!("signed market encoder request changed its frozen semantics");
     }
-    data_mission::write_json_atomic(&args.request_out, &signed)?;
+    hft_research_artifacts::write_json_atomic(&args.request_out, &signed)?;
     let rendered = crate::mission_dispatch::sequence_admission::write_market_submission(
         &args.submission_out,
         &args.attempt_id,
@@ -327,7 +327,7 @@ pub(crate) fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
         canonical_request: request,
         signing_plan: CampaignSigningPlan { actions },
     };
-    data_mission::write_json_atomic(&args.output, &frozen)?;
+    hft_research_artifacts::write_json_atomic(&args.output, &frozen)?;
     print_json(
         &serde_json::json!({"schema_version":FREEZE_SCHEMA,"campaign_id":frozen.canonical_request.campaign_id,
         "policy_id":frozen.canonical_request.policy_id()?,"declared_primary_fits":frozen.canonical_request.plan.development_stages().map_err(anyhow::Error::msg)?.iter()
@@ -550,10 +550,10 @@ pub(crate) mod request_tests {
         let root = tempfile::tempdir().unwrap();
         let request = request();
         let path = root.path().join("request.json");
-        data_mission::write_json_atomic(&path, &request).unwrap();
+        hft_research_artifacts::write_json_atomic(&path, &request).unwrap();
         assert!(is_market_encoder_request(&path).unwrap());
         assert!(!sequence::is_sequence_request(&path).unwrap());
-        data_mission::write_json_atomic(&path, &request.plan).unwrap();
+        hft_research_artifacts::write_json_atomic(&path, &request.plan).unwrap();
         assert!(is_market_encoder_plan(Some(&path)).unwrap());
         assert!(!sequence::is_sequence_plan(Some(&path)).unwrap());
         assert!(!is_market_encoder_plan(None).unwrap());
@@ -577,7 +577,7 @@ pub(crate) mod request_tests {
             request_out: root.path().join("request.json"),
             submission_out: root.path().join("submission.json"),
         };
-        data_mission::write_json_atomic(&args.freeze, &frozen).unwrap();
+        hft_research_artifacts::write_json_atomic(&args.freeze, &frozen).unwrap();
         assert!(is_market_encoder_freeze(&args.freeze).unwrap());
         let mut signed = original.clone();
         for url in [
@@ -588,7 +588,7 @@ pub(crate) mod request_tests {
         ] {
             url.push_str("?signature=controlled-fixture");
         }
-        data_mission::write_json_atomic(&args.signed_request, &signed).unwrap();
+        hft_research_artifacts::write_json_atomic(&args.signed_request, &signed).unwrap();
         crate::mission_campaign::finalize(args.clone()).unwrap();
         let emitted: MarketRequest = read_json(&args.request_out).unwrap();
         assert_eq!(emitted, signed);
@@ -605,7 +605,7 @@ pub(crate) mod request_tests {
         let mut changed = signed;
         changed.plan.costs.fee_bps += 1.0;
         rebind(&mut changed);
-        data_mission::write_json_atomic(&args.signed_request, &changed).unwrap();
+        hft_research_artifacts::write_json_atomic(&args.signed_request, &changed).unwrap();
         assert!(crate::mission_campaign::finalize(args.clone()).is_err());
         assert_eq!(
             read_json::<MarketRequest>(&args.request_out).unwrap(),

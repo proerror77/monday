@@ -4,7 +4,7 @@ set -euo pipefail
 run=${1:?producer run required}
 source_sha=${2:?source SHA required}
 release=${3:?empty output directory required}
-product=${4:-paired}
+product=$(bash "$(dirname "${BASH_SOURCE[0]}")/research-release-products.sh" normalize "${4:-all}")
 root=$(cd "$(dirname "$0")/../.." && pwd)
 : "${GITHUB_REPOSITORY:?repository required}"
 [[ $run =~ ^[1-9][0-9]*$ && $source_sha =~ ^[0-9a-f]{40}$ ]]

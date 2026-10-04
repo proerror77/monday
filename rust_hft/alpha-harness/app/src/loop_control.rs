@@ -663,7 +663,7 @@ mod tests {
             created_at,
         };
         let manifest_path = directory.join("manifest.json");
-        data_mission::write_json_atomic(&manifest_path, &manifest).unwrap();
+        hft_research_artifacts::write_json_atomic(&manifest_path, &manifest).unwrap();
         (directory, manifest_path, manifest)
     }
 
@@ -740,7 +740,7 @@ mod tests {
         let envelope_path = directory.join(format!("{suffix}-envelope.json"));
         let signing_key_path = directory.join(format!("{suffix}-signing-key.hex"));
         let signed_path = directory.join(format!("{suffix}-signed.json"));
-        data_mission::write_json_atomic(&envelope_path, &envelope).unwrap();
+        hft_research_artifacts::write_json_atomic(&envelope_path, &envelope).unwrap();
         std::fs::write(&signing_key_path, hex::encode([9_u8; 32])).unwrap();
         governance::sign_deployment(SignDeploymentArgs {
             db: db.to_path_buf(),
