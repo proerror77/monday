@@ -1874,25 +1874,29 @@ mod tests {
             "mission-1",
         ])
         .is_ok());
-        assert!(Cli::try_parse_from([
-            "alpha-harness",
-            "prediction",
-            "snapshot",
-            "--work-dir",
-            "work",
-            "--result-put-url",
-            "snapshot.zip",
-            "--",
-            "--start-date",
-            "2026-07-01",
-            "--end-date",
-            "2026-07-02",
-            "--optimizer-data-dir",
-            "optimizer",
-            "--data-audit-report",
-            "audit.json",
-        ])
-        .is_ok());
+        assert_eq!(
+            Cli::try_parse_from([
+                "alpha-harness",
+                "prediction",
+                "snapshot",
+                "--work-dir",
+                "work",
+                "--result-put-url",
+                "snapshot.zip",
+                "--",
+                "--start-date",
+                "2026-07-01",
+                "--end-date",
+                "2026-07-02",
+                "--optimizer-data-dir",
+                "optimizer",
+                "--data-audit-report",
+                "audit.json",
+            ])
+            .unwrap_err()
+            .kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
         assert!(Cli::try_parse_from([
             "alpha-harness",
             "data",
@@ -1907,7 +1911,7 @@ mod tests {
             "artifacts",
         ])
         .is_ok());
-        assert!(Cli::try_parse_from([
+        assert_eq!(Cli::try_parse_from([
             "alpha-harness",
             "prediction",
             "execute",
@@ -1946,7 +1950,7 @@ mod tests {
             "--result-readback-url",
             "results.zip",
         ])
-        .is_ok());
+        .unwrap_err().kind(), clap::error::ErrorKind::InvalidSubcommand);
         assert!(Cli::try_parse_from([
             "alpha-harness",
             "mission",
