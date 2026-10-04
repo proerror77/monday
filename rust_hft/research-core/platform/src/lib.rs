@@ -1,16 +1,17 @@
 //! Research data/control/execution boundaries. No trading or cloud provisioning authority.
 #[cfg(feature = "control")]
 pub mod agent_api;
+#[cfg(feature = "control")]
+pub mod block_objects;
 pub mod build;
 #[cfg(feature = "control")]
 pub mod clickhouse;
 pub mod coding_agent;
-pub mod data;
 pub mod execution;
 pub mod orchestrator;
 #[cfg(feature = "control")]
 pub mod postgres;
-pub mod prepared;
+pub mod preparation;
 #[cfg(feature = "control")]
 pub mod release;
 pub mod research;

@@ -1,6 +1,6 @@
 #![cfg(feature = "control")]
+use hft_cex_research_input::data::{BlockRef, DataViewSpec, Exit, PublishedView, Split, Window};
 use hft_research_platform::{
-    data::{BlockRef, DataViewSpec, Exit, PublishedView, Split, Window},
     execution::{Acceptance, Backend, Profile},
     identity,
     orchestrator::{State, TaskKind, TaskSpec},
@@ -92,14 +92,14 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         producer_image: format!("fixture@sha256:{}", hash('e')),
         source_receipt_sha256: hash('f'),
     };
-    let mut plan = hft_research_platform::data::PreparationPlan {
+    let mut plan = hft_research_platform::preparation::PreparationPlan {
         spec: view.spec.clone(),
         source_receipt_sha256: view.source_receipt_sha256.clone(),
         producer_image: view.producer_image.clone(),
         recipe_sql: None,
     };
     plan.spec.feature_sql_sha256 =
-        hft_research_platform::sha256(hft_research_platform::data::PREPARE_SQL.as_bytes());
+        hft_research_platform::sha256(hft_research_platform::preparation::PREPARE_SQL.as_bytes());
     assert!(ledger.register_plan(&plan).await.is_err());
     // Test-only activation fixture. No application path performs this UPDATE.
     sqlx_core::query::query("UPDATE research.authority SET mode='postgres',legacy_quiescence_sha256=$1,migration_receipt_sha256=$2").bind(hash('a')).bind(hash('b')).execute(&pool).await?;
