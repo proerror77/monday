@@ -961,7 +961,15 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     fn row(sequence: u64, update: Value) -> Value {
-        json!({"sequence": sequence, "recorded_at": "2026-07-17T05:01:00Z", "update": update})
+        let recorded_at = if matches!(
+            update["kind"].as_str(),
+            Some("market_metadata" | "event_discovered" | "event_expired")
+        ) {
+            "2026-07-17T05:00:00Z"
+        } else {
+            "2026-07-17T05:01:00Z"
+        };
+        json!({"sequence": sequence, "recorded_at": recorded_at, "update": update})
     }
     fn metadata(kind: &str) -> Value {
         let mut value = json!({
@@ -977,6 +985,9 @@ mod tests {
                 "outcomes": "[\"Up\",\"Down\"]", "makerBaseFee": 1000, "takerBaseFee": 1000,
             },
         });
+        if kind == "market_metadata" {
+            value["retrieved_at"] = json!("2026-07-17T05:00:00Z");
+        }
         if kind == "market_settlement" {
             value["winning_token_id"] = json!("up-token");
             value["winning_outcome"] = json!("Up");
@@ -1046,7 +1057,7 @@ mod tests {
     }
 
     fn market_rows() -> Vec<Value> {
-        vec![
+        let mut rows = vec![
             row(
                 0,
                 json!({
@@ -1063,7 +1074,7 @@ mod tests {
                     "bid_size": "10", "ask_size": "11",
                     "request_status": "success", "collection_result": "executable",
                     "bid_levels": [{"price": "0.49", "size": "10"}],
-                    "ask_levels": [{"price": "0.51", "size": "11"}], "ts": "2026-07-17T05:00:59Z",
+                    "ask_levels": [{"price": "0.51", "size": "11"}], "ts": "2026-07-17T05:00:00Z",
                 }),
             ),
             row(
@@ -1073,7 +1084,7 @@ mod tests {
                     "bid_size": "12", "ask_size": "13",
                     "request_status": "success", "collection_result": "executable",
                     "bid_levels": [{"price": "0.48", "size": "12"}],
-                    "ask_levels": [{"price": "0.52", "size": "13"}], "ts": "2026-07-17T05:00:59Z",
+                    "ask_levels": [{"price": "0.52", "size": "13"}], "ts": "2026-07-17T05:00:00Z",
                 }),
             ),
             row(
@@ -1081,10 +1092,14 @@ mod tests {
                 json!({
                     "kind": "reference_price", "symbol": "btc/usd", "source": "chainlink",
                     "asset_class": "crypto", "price": "100", "full_accuracy_value": null,
-                    "is_carried_forward": false, "ts": "2026-07-17T05:00:59Z",
+                    "is_carried_forward": false, "ts": "2026-07-17T04:59:59Z",
                 }),
             ),
-        ]
+        ];
+        for record in &mut rows {
+            record["recorded_at"] = json!("2026-07-17T05:00:00Z");
+        }
+        rows
     }
 
     #[rustfmt::skip]
@@ -1216,13 +1231,13 @@ mod tests {
                 "token_id": "up-token",
                 "request_status": "failure",
                 "collection_result": "api_failure",
-                "request_started_at": "2026-07-17T05:01:00.900Z",
+                "request_started_at": "2026-07-17T05:00:00.900Z",
                 "http_status": null,
                 "error_kind": "websocket_payload",
-                "ts": "2026-07-17T05:01:01Z",
+                "ts": "2026-07-17T05:00:01Z",
             }),
         );
-        failure["recorded_at"] = json!("2026-07-17T05:01:01Z");
+        failure["recorded_at"] = json!("2026-07-17T05:00:01Z");
         failure
     }
 
@@ -1699,8 +1714,8 @@ mod tests {
         market_rows.push(quote_at(
             7,
             "up-token",
-            "2026-07-17T05:01:02Z",
-            "2026-07-17T05:01:02Z",
+            "2026-07-17T05:00:02Z",
+            "2026-07-17T05:00:02Z",
         ));
 
         let (_temp, config) = explicit_evidence_fixture(&market_rows);
@@ -1721,8 +1736,48 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .find(|row| row["surface"] == "orderbook_snapshot" && row["source_sequence"] == 7)
             .expect("recovered quote remains in normalized evidence");
-        assert_eq!(recovered_quote["ts"], "2026-07-17T05:01:02Z");
-        assert_eq!(recovered_quote["recorded_at"], "2026-07-17T05:01:02Z");
+        assert_eq!(recovered_quote["ts"], "2026-07-17T05:00:02Z");
+        assert_eq!(recovered_quote["recorded_at"], "2026-07-17T05:00:02Z");
+    }
+
+    #[test]
+    fn cohort_causal_availability_rejects_future_event_at_compiler_entry() {
+        let mut future_reference = market_rows();
+        future_reference[3]["update"]["ts"] = json!("2026-07-17T05:00:01Z");
+        let error = explicit_normalization_error(&future_reference);
+        assert!(
+            error.contains("causally unavailable chainlink_reference"),
+            "{error}"
+        );
+        assert!(error.contains("source ts is in the future"), "{error}");
+
+        let mut late_reference = market_rows();
+        late_reference[3]["update"]["received_at"] = json!("2026-07-17T05:05:00Z");
+        let error = explicit_normalization_error(&late_reference);
+        assert!(
+            error.contains("market-1 is causally unavailable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cohort_causal_availability_rejects_missing_source_manifest() {
+        for reference in [false, true] {
+            let (_temp, config) = explicit_evidence_fixture(&market_rows());
+            let manifest = if reference {
+                &config.segments.references[0].manifest
+            } else {
+                &config.segments.market.manifest
+            };
+            fs::remove_file(manifest).unwrap();
+            let error =
+                crate::polymarket_research_normalize::normalize_polymarket_evidence(&config)
+                    .expect_err("cohort compilation must fail without either source manifest");
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
     }
 
     #[test]
@@ -1736,8 +1791,8 @@ mod tests {
         late_recovery.push(quote_at(
             5,
             "up-token",
-            "2026-07-17T05:01:32Z",
-            "2026-07-17T05:01:32Z",
+            "2026-07-17T05:00:32Z",
+            "2026-07-17T05:00:32Z",
         ));
         assert!(explicit_normalization_error(&late_recovery).contains("over 30 seconds"));
 
@@ -1745,8 +1800,8 @@ mod tests {
         silent_gap.push(quote_at(
             4,
             "up-token",
-            "2026-07-17T05:01:31Z",
-            "2026-07-17T05:01:31Z",
+            "2026-07-17T05:00:31Z",
+            "2026-07-17T05:00:31Z",
         ));
         assert!(explicit_normalization_error(&silent_gap).contains("gap over 30 seconds"));
 
@@ -1999,6 +2054,7 @@ mod tests {
         let mut reference = reference_rows(true);
         for mut record in market_rows().into_iter().take(3) {
             record["sequence"] = json!(reference.len());
+            record["recorded_at"] = json!("2026-07-17T05:01:00Z");
             reference.push(record);
         }
         let (_temp, config) = fixture_rows(&market_rows(), &reference);
