@@ -70,6 +70,89 @@ if [[ $TEST_ONLY == false ]]; then
   flock -n 6 || die 'USD-M operation is active'
 fi
 
+cutover_health_preflight() {
+  local now_ns market spool health failed=0
+  local -A updated=()
+  for market in spot usdm; do
+    spool=$(monday_root_join "$ROOT" "data/monday/spool/binance-lob/$market") || return 1
+    health="$spool/health.json"
+    updated[$market]=
+    if monday_file_direct "$health"; then
+      updated[$market]=$(jq -er '.updated_at_ns | select(type == "number" and floor == . and . > 0)' \
+        "$health" 2>/dev/null) || updated[$market]=
+    fi
+  done
+  # Check both samples against the time after the paired read completes.
+  now_ns=$(date +%s%N) || return 1
+  [[ $now_ns =~ ^[1-9][0-9]{0,18}$ ]] || {
+    printf 'preflight: current nanosecond timestamp is unavailable\n' >&2
+    return 1
+  }
+  for market in spot usdm; do
+    health=$(monday_root_join "$ROOT" "data/monday/spool/binance-lob/$market/health.json") || return 1
+    # Capture publishes health every 30 seconds. Match the Gate's 120-second bound.
+    if [[ ! ${updated[$market]} =~ ^[1-9][0-9]{0,18}$ ]] \
+      || ! (( updated[$market] > 0 && updated[$market] <= now_ns && now_ns - updated[$market] <= 120000000000 )); then
+      printf 'preflight: old-production health is missing, invalid, stale or in the future: %s (updated_at_ns=%s, now_ns=%s, max_age_seconds=120)\n' \
+        "$health" "${updated[$market]:-invalid}" "$now_ns" >&2
+      failed=1
+    fi
+  done
+  (( failed == 0 ))
+}
+
+cutover_preflight() {
+  local market spool unsafe failed=0
+  for market in spot usdm; do
+    spool=$(monday_root_join "$ROOT" "data/monday/spool/binance-lob/$market") || return 1
+    if ! monday_path_direct "$spool" || [[ ! -d $spool ]]; then
+      printf 'preflight: canonical spool is missing or indirect: %s\n' "$spool" >&2
+      failed=1
+      continue
+    fi
+    # Rust's spool scan rejects every symlink and non-regular, non-directory entry.
+    # Active capture and sealing own .jsonl.part and .zst.tmp files. Defer those
+    # ambiguous artifacts until shutdown; recovery and upload-only drain stay strict.
+    if ! unsafe=$(find "$spool" \( \( ! -type d -a ! -type f \) -o \( \
+      -type f -name '*.part.corrupt' \
+    \) \) -print); then
+      printf 'preflight: canonical spool scan failed: %s\n' "$spool" >&2
+      failed=1
+    elif [[ -n $unsafe ]]; then
+      printf 'preflight: unsafe spool entries or corrupt segments in %s:\n%s\n' "$spool" "$unsafe" >&2
+      failed=1
+    fi
+  done
+  cutover_health_preflight || failed=1
+  (( failed == 0 ))
+}
+
+cutover_contain_writers() {
+  # Preparation can outlive the first sample. Admit both lanes again at this boundary.
+  if [[ $TEST_ONLY == false || ${MONDAY_CUTOVER_FIXTURE_PREFLIGHT:-0} == 1 ]]; then
+    cutover_health_preflight || die 'preflight refused; no units were stopped or masked'
+  fi
+  writer_containment_started=1
+  if ! monday_rust_lob_contain_writers; then
+    writer_containment_failed=1
+    die 'could not contain all canonical writers before pair transition'
+  fi
+  monday_rust_lob_verify_contained \
+    || die 'canonical writers are not stopped, disabled, and runtime-masked'
+  if ! monday_rust_lob_contain_recovery_schedulers; then
+    writer_containment_failed=1
+    die 'could not contain recovery schedulers before pair transition'
+  fi
+  monday_rust_lob_verify_recovery_schedulers_contained \
+    || die 'recovery schedulers are not stopped, disabled, and runtime-masked'
+}
+
+# Ordinary fixtures have no old-production health. Opt in to test this boundary.
+# Production always checks before containment or rollback can touch a unit.
+if [[ $TEST_ONLY == false || ${MONDAY_CUTOVER_FIXTURE_PREFLIGHT:-0} == 1 ]]; then
+  cutover_preflight || die 'preflight refused; no units were stopped or masked'
+fi
+
 FIXTURE_SYSTEMD=false
 if [[ $TEST_ONLY == true && ${MONDAY_CUTOVER_FIXTURE_SYSTEMD:-0} == 1 ]]; then
   FIXTURE_SYSTEMD=true
@@ -822,24 +905,13 @@ if [[ $FROM == direct ]]; then
     mkdir -p "$controller_backup_root/$(dirname -- "$asset")"
     cp -p -- "${controller_projection_target[$asset]}" "$controller_backup_root/$asset"
   done
-  projection_prepared=1
 fi
 if [[ $TEST_ONLY == false || $FIXTURE_SYSTEMD == true ]]; then
-  writer_containment_started=1
-  if ! monday_rust_lob_contain_writers; then
-    writer_containment_failed=1
-    die 'could not contain all canonical writers before pair transition'
-  fi
-  monday_rust_lob_verify_contained \
-    || die 'canonical writers are not stopped, disabled, and runtime-masked'
-  if ! monday_rust_lob_contain_recovery_schedulers; then
-    writer_containment_failed=1
-    die 'could not contain recovery schedulers before pair transition'
-  fi
-  monday_rust_lob_verify_recovery_schedulers_contained \
-    || die 'recovery schedulers are not stopped, disabled, and runtime-masked'
+  cutover_contain_writers
 fi
 if [[ $FROM == direct ]]; then
+  # Backup creation changed no live files. Arm topology rollback after final admission.
+  projection_prepared=1
   # The containment boundary must not widen the bootstrap identity window. Re-read
   # the frozen direct payload and all live runtime bytes immediately before
   # active=C1 is committed; the target manifest is never used as R0 evidence.
