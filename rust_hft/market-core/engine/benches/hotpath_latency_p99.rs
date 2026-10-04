@@ -53,6 +53,42 @@ fn percentile(sorted: &[u64], percentile: f64) -> u64 {
     sorted[index]
 }
 
+fn benchmark_config() -> EngineConfig {
+    EngineConfig {
+        ingestion: IngestionConfig {
+            // This gate measures local latency quantiles, not market freshness.
+            // A shared runner may pause one sample beyond the production 2ms
+            // freshness cutoff; keep that sample in the measured distribution.
+            stale_threshold_us: 1_000_000,
+            ..IngestionConfig::high_performance()
+        },
+        intent_max_latency_us: 1_000_000,
+        max_events_per_cycle: 1,
+        aggregation_symbols: vec![],
+        ..Default::default()
+    }
+}
+
+fn snapshot(sequence: u64, timestamp: u64) -> MarketEvent {
+    MarketEvent::Snapshot(MarketSnapshot {
+        symbol: Symbol::new("BTCUSDT"),
+        timestamp,
+        bids: vec![BookLevel {
+            price: Price::from_f64(50_000.0).unwrap(),
+            quantity: Quantity::from_f64(1.0).unwrap(),
+        }],
+        asks: vec![BookLevel {
+            price: Price::from_f64(50_001.0).unwrap(),
+            quantity: Quantity::from_f64(1.0).unwrap(),
+        }],
+        sequence,
+        source_venue: Some(VenueId::BINANCE),
+        timestamps: Default::default(),
+
+        provider_identity: None,
+    })
+}
+
 #[test]
 fn quote_to_worker_queue_p99_stays_below_budget() {
     const WARMUP: u64 = 1_000;
@@ -60,13 +96,7 @@ fn quote_to_worker_queue_p99_stays_below_budget() {
     const P99_BUDGET_NS: u64 = 500_000;
     const P999_BUDGET_NS: u64 = 1_000_000;
 
-    let mut engine = Engine::new(EngineConfig {
-        ingestion: IngestionConfig::high_performance(),
-        intent_max_latency_us: 1_000_000,
-        max_events_per_cycle: 1,
-        aggregation_symbols: vec![],
-        ..Default::default()
-    });
+    let mut engine = Engine::new(benchmark_config());
     engine.register_strategy(BenchmarkStrategy);
     let ingester = engine.create_event_ingester_pair();
     let (engine_queues, mut worker_queues) =
@@ -77,27 +107,16 @@ fn quote_to_worker_queue_p99_stays_below_budget() {
         ingester
             .lock()
             .unwrap()
-            .ingest(MarketEvent::Snapshot(MarketSnapshot {
-                symbol: Symbol::new("BTCUSDT"),
-                timestamp: hft_core::now_micros(),
-                bids: vec![BookLevel {
-                    price: Price::from_f64(50_000.0).unwrap(),
-                    quantity: Quantity::from_f64(1.0).unwrap(),
-                }],
-                asks: vec![BookLevel {
-                    price: Price::from_f64(50_001.0).unwrap(),
-                    quantity: Quantity::from_f64(1.0).unwrap(),
-                }],
-                sequence,
-                source_venue: Some(VenueId::BINANCE),
-                timestamps: Default::default(),
-
-                provider_identity: None,
-            }))
+            .ingest(snapshot(sequence, hft_core::now_micros()))
             .unwrap();
-        engine.tick().unwrap();
+        let tick = engine.tick().unwrap();
         let envelopes = worker_queues.receive_envelopes();
-        assert_eq!(envelopes.len(), 1);
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "sequence={sequence}, processed={}",
+            tick.events_processed
+        );
     };
 
     for sequence in 1..=WARMUP {
@@ -125,4 +144,30 @@ fn quote_to_worker_queue_p99_stays_below_budget() {
         p999 <= P999_BUDGET_NS,
         "quote-to-worker p999 {p999}ns exceeds {P999_BUDGET_NS}ns"
     );
+}
+
+#[test]
+fn latency_fixture_preserves_a_paused_sample_without_changing_production_freshness() {
+    let production = EngineConfig {
+        ingestion: IngestionConfig::high_performance(),
+        ..benchmark_config()
+    };
+    for (config, expected) in [(production, 0), (benchmark_config(), 1)] {
+        let mut engine = Engine::new(config);
+        engine.register_strategy(BenchmarkStrategy);
+        let ingester = engine.create_event_ingester_pair();
+        let (engine_queues, mut worker_queues) =
+            create_execution_queues(ExecutionQueueConfig::default());
+        engine.set_execution_queues(engine_queues);
+        // Simulate a 5ms descheduling gap before ingestion. Production must
+        // discard this event; the quantile fixture must measure its output.
+        ingester
+            .lock()
+            .unwrap()
+            .ingest(snapshot(1, hft_core::now_micros().saturating_sub(5_000)))
+            .unwrap();
+        let result = engine.tick().unwrap();
+        assert_eq!(result.events_processed, expected);
+        assert_eq!(worker_queues.receive_envelopes().len(), expected as usize);
+    }
 }

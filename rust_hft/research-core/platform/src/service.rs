@@ -104,15 +104,9 @@ impl ArtifactGateway {
             &task.spec,
             task.lease.as_ref().context("receipt without lease")?,
         )?;
-        // Readback streams large artifacts through bounded buffers; a receipt
-        // alone, an object HEAD, or a worker's claimed success is insufficient.
-        for artifact in receipt.artifacts.iter().chain(receipt.checkpoint.iter()) {
-            ensure!(
-                artifact.bytes <= 4 * 1024 * 1024 * 1024,
-                "artifact exceeds admitted readback limit"
-            );
-            self.verify_artifact(artifact).await?;
-        }
+        // Prepared blocks are checked on the exact bytes being decoded. Reuse
+        // that readback within this receipt, including its object key and size.
+        let mut verified = std::collections::BTreeSet::new();
         if let Some(view) = &receipt.prepared_view {
             let mut orders = std::collections::BTreeMap::<
                 hft_cex_research_input::data::Exit,
@@ -129,7 +123,7 @@ impl ArtifactGateway {
                     .await?
                     .context("prepared block missing")?;
                 ensure!(
-                    sha256(&bytes) == block.sha256,
+                    bytes.len() as u64 == block.bytes && sha256(&bytes) == block.sha256,
                     "prepared block changed during publication"
                 );
                 let typed = hft_cex_research_input::prepared::decode(&bytes)?;
@@ -138,6 +132,18 @@ impl ArtifactGateway {
                     .entry(block.exit.clone())
                     .or_default()
                     .observe(&typed)?;
+                verified.insert((&artifact.key, &artifact.sha256, artifact.bytes));
+            }
+        }
+        // Other keys are independently read even when their digests match.
+        // This set is request-local; a later receipt/launch starts fresh.
+        for artifact in receipt.artifacts.iter().chain(receipt.checkpoint.iter()) {
+            ensure!(
+                artifact.bytes <= 4 * 1024 * 1024 * 1024,
+                "artifact exceeds admitted readback limit"
+            );
+            if !verified.contains(&(&artifact.key, &artifact.sha256, artifact.bytes)) {
+                self.verify_artifact(artifact).await?;
             }
         }
         Ok(Some(receipt))
@@ -464,6 +470,9 @@ mod tests {
             }),
         };
         receipt.validate(&task.spec, &lease)?;
+        let block_key = artifact.key.clone();
+        let requests = Arc::new(std::sync::Mutex::new(BTreeMap::<String, usize>::new()));
+        let received = requests.clone();
         let objects = Arc::new(BTreeMap::from([
             (
                 format!("{prefix}receipt.json"),
@@ -476,7 +485,9 @@ mod tests {
             axum::routing::get(
                 move |axum::extract::Path(key): axum::extract::Path<String>| {
                     let objects = objects.clone();
+                    let received = received.clone();
                     async move {
+                        *received.lock().unwrap().entry(key.clone()).or_default() += 1;
                         match objects.get(&key) {
                             Some(bytes) => (reqwest::StatusCode::OK, bytes.clone()),
                             None => (reqwest::StatusCode::NOT_FOUND, Vec::new()),
@@ -500,6 +511,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("artifact readback rejected"));
+        assert_eq!(requests.lock().unwrap().get(&block_key), Some(&1));
         Ok(())
     }
 }
