@@ -1201,7 +1201,7 @@ fn market_worker_first_readback_rejects_self_consistent_forged_cache() {
     );
     assert!(readback::verify_published_result(&extracted, &hash).is_err());
     let forged_hash =
-        crate::mission_runner::sha256_file(&cache.path().join("result.json")).unwrap();
+        hft_research_artifacts::sha256_file(&cache.path().join("result.json")).unwrap();
     assert!(readback::fresh_result(&client, &url, cache.path(), Some(&forged_hash)).is_err());
     server.join().unwrap();
 }

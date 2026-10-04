@@ -1,3 +1,4 @@
+use hft_research_artifacts::{fetch_to_file, normalized_sha256, publish_immutable_file};
 pub(crate) mod final_evaluation;
 pub(crate) mod market_encoder;
 pub(crate) mod preparation;
@@ -18,8 +19,7 @@ use crate::{
         MAX_RESEARCH_PLAN_GENERATION,
     },
     mission_runner::{
-        decode_materialization, execute_report, fetch_to_file, normalized_sha256,
-        publish_immutable_file, recover_execution_report_from_cached_result,
+        decode_materialization, execute_report, recover_execution_report_from_cached_result,
         recover_execution_report_from_published_result, research_event, valid_git_revision,
         validate_cex_holdout_id, validate_supervised_candidate_binding,
         validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
@@ -541,7 +541,7 @@ pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
         let ledger = alpha_store::AlphaStore::open_read_only(path)?;
         plan.preparation_authentication_tag = Some(preparation::authenticate(&ledger, &plan)?);
     }
-    data_mission::write_json_atomic(&args.output, &plan)?;
+    hft_research_artifacts::write_json_atomic(&args.output, &plan)?;
     research_event(
         "alpha-harness",
         "campaign_freeze_completed",
@@ -569,7 +569,7 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
     let loaded = load_request(&args.request)?;
     validate_request(&loaded.request)?;
     let result = load_campaign_result(&args.result)?;
-    let result_sha256 = crate::mission_runner::sha256_file(&args.result)?;
+    let result_sha256 = hft_research_artifacts::sha256_file(&args.result)?;
     if result_sha256 != normalized_sha256("parent Campaign result", &args.result_sha256)? {
         bail!("parent Campaign result SHA256 mismatch");
     }
@@ -1277,7 +1277,7 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
 
     let loaded = load_request(&args.signed_request)?;
     validate_request_matches_freeze(&loaded.request, &plan)?;
-    data_mission::write_json_atomic(&args.request_out, &loaded.request)?;
+    hft_research_artifacts::write_json_atomic(&args.request_out, &loaded.request)?;
     let rendered = mission_dispatch::write_submission(
         &args.submission_out,
         &args.attempt_id,
@@ -1349,7 +1349,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         .timeout(Duration::from_secs(120))
         .redirect(Policy::none())
         .build()?;
-    data_mission::write_json_atomic(&local_request_path, &loaded.request)?;
+    hft_research_artifacts::write_json_atomic(&local_request_path, &loaded.request)?;
 
     research_event(
         "alpha-harness",
@@ -1455,7 +1455,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         let mission_publish_dir = round_dir.join("admission");
         std::fs::create_dir_all(&mission_publish_dir)?;
         let mission_local_path = mission_publish_dir.join("mission.json");
-        data_mission::write_json_atomic(&mission_local_path, &rendered.mission)?;
+        hft_research_artifacts::write_json_atomic(&mission_local_path, &rendered.mission)?;
         let mission_readback_path = mission_publish_dir.join("mission-readback.json");
         let mission_sha256 = publish_create_once_json(
             &client,
@@ -1641,7 +1641,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             "selected_candidate_id": &result.selected_candidate_id,
         }),
     );
-    data_mission::write_json_atomic(&local_result_path, &result)?;
+    hft_research_artifacts::write_json_atomic(&local_result_path, &result)?;
     if local_result_path.metadata()?.len() > MAX_CAMPAIGN_RESULT_BYTES {
         bail!("campaign result exceeds {MAX_CAMPAIGN_RESULT_BYTES} bytes");
     }
@@ -2077,7 +2077,7 @@ fn verify_local_receipt_item(
     path: &Path,
     expected_sha256: &str,
 ) -> anyhow::Result<String> {
-    let actual = crate::mission_runner::sha256_file(path)?;
+    let actual = hft_research_artifacts::sha256_file(path)?;
     if actual != normalized_sha256(label, expected_sha256)? {
         bail!("{label} local file SHA256 does not match the receipt");
     }
@@ -3131,7 +3131,7 @@ fn verify_cached_terminal_file(path: &Path, digest: &str, limit: u64) -> anyhow:
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > limit {
         bail!("cached terminal artifact is not a bounded regular file");
     }
-    if crate::mission_runner::sha256_file(path)?
+    if hft_research_artifacts::sha256_file(path)?
         != normalized_sha256("cached terminal artifact", digest)?
     {
         bail!("cached terminal artifact differs from the authenticated Campaign result");
@@ -3679,7 +3679,7 @@ pub(crate) fn request_for_materialization_for_tests(path: &Path) -> CampaignRequ
         &base.feature_url,
         &materialization.artifact_sha256,
         &base.materialization_url,
-        &crate::mission_runner::sha256_file(path).unwrap(),
+        &hft_research_artifacts::sha256_file(path).unwrap(),
         &base.replay_artifact_url,
         &base.replay_artifact_sha256,
         &base.replay_manifest_url,
@@ -4360,7 +4360,7 @@ fn publish_create_once_json(
     source: &Path,
     readback_path: &Path,
 ) -> anyhow::Result<String> {
-    let published_sha256 = crate::mission_runner::sha256_file(source)?;
+    let published_sha256 = hft_research_artifacts::sha256_file(source)?;
     let already_exists =
         match publish_immutable_file(client, destination, source, "application/json") {
             Ok(()) => false,
@@ -4716,10 +4716,10 @@ mod tests {
         let request_path = root.path().join("request.json");
         let result_path = root.path().join("result.json");
         std::fs::write(&request_path, serialize_request(&loaded.request).unwrap()).unwrap();
-        data_mission::write_json_atomic(&result_path, &result).unwrap();
+        hft_research_artifacts::write_json_atomic(&result_path, &result).unwrap();
         let args = CampaignLearnArgs {
             request: request_path,
-            result_sha256: crate::mission_runner::sha256_file(&result_path).unwrap(),
+            result_sha256: hft_research_artifacts::sha256_file(&result_path).unwrap(),
             result: result_path,
             output: root.path().join("learned-plan.json"),
         };
@@ -5612,7 +5612,7 @@ mod tests {
             signing_plan: signing_plan(&canonical_request).unwrap(),
             canonical_request: canonical_request.clone(),
         };
-        data_mission::write_json_atomic(&freeze_path, &frozen).unwrap();
+        hft_research_artifacts::write_json_atomic(&freeze_path, &frozen).unwrap();
 
         let mut signed = valid_request();
         signed.feature_url.push_str("?feature-signature=1");
@@ -5642,7 +5642,7 @@ mod tests {
                 .push_str("?result-readback-signature=1");
         }
         let signed_request_path = root.path().join("signed-request.json");
-        data_mission::write_json_atomic(&signed_request_path, &signed).unwrap();
+        hft_research_artifacts::write_json_atomic(&signed_request_path, &signed).unwrap();
 
         finalize(CampaignFinalizeArgs {
             freeze: freeze_path,
@@ -5756,13 +5756,13 @@ mod tests {
             feature: CampaignInputReceiptItem {
                 relative_path: feature_relative.clone(),
                 object_url: format!("{TEST_ROOT}/runs/campaign-freeze/features.jsonl"),
-                sha256: crate::mission_runner::sha256_file(&input_root.join(&feature_relative))
+                sha256: hft_research_artifacts::sha256_file(&input_root.join(&feature_relative))
                     .unwrap(),
             },
             materialization: CampaignInputReceiptItem {
                 relative_path: materialization_relative.clone(),
                 object_url: format!("{TEST_ROOT}/runs/campaign-freeze/materialization.json"),
-                sha256: crate::mission_runner::sha256_file(
+                sha256: hft_research_artifacts::sha256_file(
                     &input_root.join(&materialization_relative),
                 )
                 .unwrap(),
@@ -5773,7 +5773,7 @@ mod tests {
                     "{TEST_ROOT}/runs/campaign-freeze/{}",
                     replay_artifact_relative.display()
                 ),
-                sha256: crate::mission_runner::sha256_file(
+                sha256: hft_research_artifacts::sha256_file(
                     &input_root.join(&replay_artifact_relative),
                 )
                 .unwrap(),
@@ -5784,13 +5784,13 @@ mod tests {
                     "{TEST_ROOT}/runs/campaign-freeze/{}",
                     replay_manifest_relative.display()
                 ),
-                sha256: crate::mission_runner::sha256_file(
+                sha256: hft_research_artifacts::sha256_file(
                     &input_root.join(&replay_manifest_relative),
                 )
                 .unwrap(),
             },
         };
-        data_mission::write_json_atomic(&receipt_path, &receipt).unwrap();
+        hft_research_artifacts::write_json_atomic(&receipt_path, &receipt).unwrap();
         let output = root.path().join("freeze.json");
         let preparation_ledger = root.path().join("preparation.duckdb");
         drop(alpha_store::AlphaStore::open(&preparation_ledger).unwrap());
@@ -5847,7 +5847,7 @@ mod tests {
             stage_authority: None,
             preparation_ledger: Some(preparation_ledger.clone()),
             reuse: Some(output.clone()),
-            reuse_sha256: Some(crate::mission_runner::sha256_file(&output).unwrap()),
+            reuse_sha256: Some(hft_research_artifacts::sha256_file(&output).unwrap()),
             final_evaluation_control: None,
             campaign_inputs: receipt_path.clone(),
             input_root: input_root.clone(),
@@ -5884,15 +5884,15 @@ mod tests {
         let mut changed_plan = CexCampaignResearchPlanV1::canonical();
         changed_plan.hypothesis.push_str(" Revised hypothesis.");
         let changed_plan_path = root.path().join("changed-plan.json");
-        data_mission::write_json_atomic(&changed_plan_path, &changed_plan).unwrap();
+        hft_research_artifacts::write_json_atomic(&changed_plan_path, &changed_plan).unwrap();
         reuse.research_plan = Some(changed_plan_path);
         assert!(freeze_request(&reuse).is_err());
         let mut changed_receipt = receipt.clone();
         changed_receipt.feature.sha256 = "9".repeat(64);
-        data_mission::write_json_atomic(&receipt_path, &changed_receipt).unwrap();
+        hft_research_artifacts::write_json_atomic(&receipt_path, &changed_receipt).unwrap();
         reuse.research_plan = None;
         assert!(freeze_request(&reuse).is_err());
-        data_mission::write_json_atomic(&receipt_path, &receipt).unwrap();
+        hft_research_artifacts::write_json_atomic(&receipt_path, &receipt).unwrap();
         std::fs::rename(&offline_inputs, &input_root).unwrap();
 
         // Exercise the fixed matrix preparation entrypoint with shared input
@@ -5916,7 +5916,7 @@ mod tests {
             "members":[{"id":"short","mlp":{"updates":4096,"learning_rate":0.0003}},
                        {"id":"long","mlp":{"updates":8192,"learning_rate":0.0003}}]
         });
-        data_mission::write_json_atomic(&matrix_path, &matrix).unwrap();
+        hft_research_artifacts::write_json_atomic(&matrix_path, &matrix).unwrap();
         let prepare_matrix = || {
             preparation::prepare(crate::cli::CampaignPrepareArgs {
                 ledger: preparation_ledger.clone(),
@@ -5995,7 +5995,7 @@ mod tests {
         });
         matrix["members"][0]["mlp"]["updates"] = 8192.into();
         matrix["members"][1]["mlp"]["updates"] = 16384.into();
-        data_mission::write_json_atomic(&matrix_path, &matrix).unwrap();
+        hft_research_artifacts::write_json_atomic(&matrix_path, &matrix).unwrap();
         prepare_matrix().unwrap();
         assert_eq!(std::fs::read(&index_path).unwrap(), first_index);
         let second_root = std::fs::read_dir(&matrix_root)
@@ -6077,7 +6077,7 @@ mod tests {
 
         let mut wrong_symbol = receipt.clone();
         wrong_symbol.symbol = "SOLUSDT".to_string();
-        data_mission::write_json_atomic(&receipt_path, &wrong_symbol).unwrap();
+        hft_research_artifacts::write_json_atomic(&receipt_path, &wrong_symbol).unwrap();
         let mismatch = freeze_request(&CampaignFreezeArgs {
             stage_authority: None,
             preparation_ledger: None,
@@ -6098,7 +6098,7 @@ mod tests {
         assert!(mismatch
             .to_string()
             .contains("receipt instrument does not match"));
-        data_mission::write_json_atomic(&receipt_path, &receipt).unwrap();
+        hft_research_artifacts::write_json_atomic(&receipt_path, &receipt).unwrap();
 
         let mut invalid_producer = receipt.clone();
         invalid_producer.source_revision = "not-a-git-sha".to_string();
@@ -6132,11 +6132,12 @@ mod tests {
         let mut invalid_manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&replay_manifest_path).unwrap()).unwrap();
         invalid_manifest["artifact_path"] = serde_json::json!("wrong.parquet");
-        data_mission::write_json_atomic(&replay_manifest_path, &invalid_manifest).unwrap();
+        hft_research_artifacts::write_json_atomic(&replay_manifest_path, &invalid_manifest)
+            .unwrap();
         let mut invalid_replay_receipt = receipt.clone();
         invalid_replay_receipt.replay_manifest.sha256 =
-            crate::mission_runner::sha256_file(&replay_manifest_path).unwrap();
-        data_mission::write_json_atomic(&receipt_path, &invalid_replay_receipt).unwrap();
+            hft_research_artifacts::sha256_file(&replay_manifest_path).unwrap();
+        hft_research_artifacts::write_json_atomic(&receipt_path, &invalid_replay_receipt).unwrap();
         let invalid_replay = freeze_request(&CampaignFreezeArgs {
             stage_authority: None,
             preparation_ledger: None,
@@ -6209,9 +6210,9 @@ mod tests {
             signing_plan,
             canonical_request: canonical_request.clone(),
         };
-        data_mission::write_json_atomic(&freeze_path, &frozen).unwrap();
+        hft_research_artifacts::write_json_atomic(&freeze_path, &frozen).unwrap();
         let signed_request_path = root.path().join("signed-request.json");
-        data_mission::write_json_atomic(&signed_request_path, &valid_request()).unwrap();
+        hft_research_artifacts::write_json_atomic(&signed_request_path, &valid_request()).unwrap();
 
         let error = finalize(CampaignFinalizeArgs {
             freeze: freeze_path,
@@ -6271,10 +6272,10 @@ mod tests {
 
         assert_eq!(
             mission_sha256,
-            crate::mission_runner::sha256_file(&destination).unwrap()
+            hft_research_artifacts::sha256_file(&destination).unwrap()
         );
         assert_eq!(
-            crate::mission_runner::sha256_file(&readback).unwrap(),
+            hft_research_artifacts::sha256_file(&readback).unwrap(),
             mission_sha256
         );
     }
@@ -6328,10 +6329,10 @@ mod tests {
 
         assert_eq!(
             result_sha256,
-            crate::mission_runner::sha256_file(&destination).unwrap()
+            hft_research_artifacts::sha256_file(&destination).unwrap()
         );
         assert_eq!(
-            crate::mission_runner::sha256_file(&readback).unwrap(),
+            hft_research_artifacts::sha256_file(&readback).unwrap(),
             result_sha256
         );
     }
@@ -6568,7 +6569,7 @@ mod tests {
         assert_eq!(request.declared_total_trials, 46);
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
-            crate::mission_runner::sha256_file(&fixture.args.request).unwrap();
+            hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
         let client = Client::builder().redirect(Policy::none()).build().unwrap();
@@ -6754,7 +6755,7 @@ mod tests {
         request.research_plan.comparison_family_trials = Some(request.declared_total_trials * 3);
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
-            crate::mission_runner::sha256_file(&fixture.args.request).unwrap();
+            hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
         let materialization = crate::mission_runner::decode_materialization(
@@ -6777,16 +6778,20 @@ mod tests {
             validate_negative_campaign_result(
                 &loaded,
                 &result,
-                &crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
-                    .unwrap(),
+                &hft_research_artifacts::sha256_file(
+                    &fixture.work_dir.join("campaign-result.json"),
+                )
+                .unwrap(),
             )
             .unwrap();
             assert!(result.rounds.iter().all(|r| r.feedback.accepted_factors > 0
                 && r.feedback.supervised_ridge.as_ref().unwrap().trade_count == 0));
             assert!(next_campaign_policy_revision(
                 &loaded,
-                &crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
-                    .unwrap(),
+                &hft_research_artifacts::sha256_file(
+                    &fixture.work_dir.join("campaign-result.json")
+                )
+                .unwrap(),
                 classify_campaign_failure(&result).unwrap()
             )
             .is_err());
@@ -6890,7 +6895,7 @@ mod tests {
         assert_eq!(trials, result["consumed_trials"].as_u64().unwrap());
         assert_eq!(
             hash,
-            crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+            hft_research_artifacts::sha256_file(&fixture.work_dir.join("campaign-result.json"))
                 .unwrap()
         );
 
@@ -7136,7 +7141,7 @@ mod tests {
         });
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
-            crate::mission_runner::sha256_file(&fixture.args.request).unwrap();
+            hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
         let materialization = crate::mission_runner::decode_materialization(
@@ -7236,7 +7241,7 @@ mod tests {
         validate_terminal_cache(&cache).unwrap();
         let artifact = cache.join("artifact");
         std::fs::write(&artifact, b"bound evidence").unwrap();
-        let digest = crate::mission_runner::sha256_file(&artifact).unwrap();
+        let digest = hft_research_artifacts::sha256_file(&artifact).unwrap();
         verify_cached_terminal_file(&artifact, &digest, 14).unwrap();
         assert!(verify_cached_terminal_file(&artifact, &digest, 13).is_err());
         std::fs::write(&artifact, b"other evidence").unwrap();
@@ -7245,7 +7250,7 @@ mod tests {
         {
             let linked = cache.join("linked");
             std::os::unix::fs::symlink(&artifact, &linked).unwrap();
-            let actual = crate::mission_runner::sha256_file(&artifact).unwrap();
+            let actual = hft_research_artifacts::sha256_file(&artifact).unwrap();
             assert!(verify_cached_terminal_file(&linked, &actual, 14).is_err());
             let linked_cache = root.path().join("linked-cache");
             std::os::unix::fs::symlink(&cache, &linked_cache).unwrap();
@@ -7454,7 +7459,7 @@ mod tests {
             writer.write_all(&bytes).unwrap();
         }
         std::fs::write(bundle_path, writer.finish().unwrap().into_inner()).unwrap();
-        let changed_hash = crate::mission_runner::sha256_file(bundle_path).unwrap();
+        let changed_hash = hft_research_artifacts::sha256_file(bundle_path).unwrap();
         let mut changed: serde_json::Value = serde_json::from_slice(&original_result).unwrap();
         changed["rounds"][0]["result_bundle_sha256"] = serde_json::json!(changed_hash);
         changed["rounds"][0]["result_readback_bundle_sha256"] = serde_json::json!(changed_hash);
@@ -7531,10 +7536,10 @@ mod tests {
         )
         .unwrap();
         let final_request_path = fixture._root.path().join("final-request.json");
-        data_mission::write_json_atomic(&final_request_path, &final_request).unwrap();
-        let final_sha = crate::mission_runner::sha256_file(&final_request_path).unwrap();
+        hft_research_artifacts::write_json_atomic(&final_request_path, &final_request).unwrap();
+        let final_sha = hft_research_artifacts::sha256_file(&final_request_path).unwrap();
         let keys = fixture._root.path().join("final-keys.json");
-        data_mission::write_json_atomic(
+        hft_research_artifacts::write_json_atomic(
             &keys,
             &std::collections::BTreeMap::from([(
                 "final-key",
@@ -7637,7 +7642,7 @@ mod tests {
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
         let hash =
-            crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+            hft_research_artifacts::sha256_file(&fixture.work_dir.join("campaign-result.json"))
                 .unwrap();
         let client = Client::builder().redirect(Policy::none()).build().unwrap();
         assert_final_worker_outcome(
@@ -7684,7 +7689,7 @@ mod tests {
         assert_eq!(trials, result["consumed_trials"].as_u64().unwrap());
         assert_eq!(
             hash,
-            crate::mission_runner::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+            hft_research_artifacts::sha256_file(&fixture.work_dir.join("campaign-result.json"))
                 .unwrap()
         );
         let result_path = Path::new(&loaded.request.campaign_result_readback_url);
@@ -7717,7 +7722,7 @@ mod tests {
             .unwrap();
         archive.write_all(b"{}").unwrap();
         archive.finish().unwrap();
-        let changed_hash = crate::mission_runner::sha256_file(bundle_path).unwrap();
+        let changed_hash = hft_research_artifacts::sha256_file(bundle_path).unwrap();
         let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
         changed["rounds"][0]["result_bundle_sha256"] = serde_json::json!(changed_hash);
         changed["rounds"][0]["result_readback_bundle_sha256"] = serde_json::json!(changed_hash);
@@ -7854,9 +7859,9 @@ mod tests {
         let mission: alpha_domain::CexResearchMissionArtifactV1 =
             serde_json::from_slice(&std::fs::read(&mission_readback).unwrap()).unwrap();
         let mission_id = mission.semantic_id().unwrap();
-        let mission_sha256 = crate::mission_runner::sha256_file(&mission_readback).unwrap();
+        let mission_sha256 = hft_research_artifacts::sha256_file(&mission_readback).unwrap();
         let request_sha256 =
-            crate::mission_runner::sha256_file(&work_dir.join("campaign-request.json")).unwrap();
+            hft_research_artifacts::sha256_file(&work_dir.join("campaign-request.json")).unwrap();
         let binding = ExecutionBinding::Campaign {
             campaign_id: request.campaign_id.clone(),
             round_id: round.round_id.clone(),
@@ -8427,7 +8432,7 @@ mod tests {
     }
 
     fn rebind_materialization_feature_artifact(materialization_path: &Path, feature_path: &Path) {
-        let feature_sha256 = crate::mission_runner::sha256_file(feature_path).unwrap();
+        let feature_sha256 = hft_research_artifacts::sha256_file(feature_path).unwrap();
         let mut materialization: serde_json::Value =
             serde_json::from_slice(&std::fs::read(materialization_path).unwrap()).unwrap();
         materialization["artifact_sha256"] = serde_json::json!(feature_sha256.clone());
@@ -8461,13 +8466,13 @@ mod tests {
         );
         let published = root.join("published");
         let research_plan = CexCampaignResearchPlanV1::canonical();
-        let feature_sha256 = crate::mission_runner::sha256_file(feature_path).unwrap();
+        let feature_sha256 = hft_research_artifacts::sha256_file(feature_path).unwrap();
         let materialization_sha256 =
-            crate::mission_runner::sha256_file(materialization_path).unwrap();
+            hft_research_artifacts::sha256_file(materialization_path).unwrap();
         let replay_artifact_sha256 =
-            crate::mission_runner::sha256_file(replay_artifact_path).unwrap();
+            hft_research_artifacts::sha256_file(replay_artifact_path).unwrap();
         let replay_manifest_sha256 =
-            crate::mission_runner::sha256_file(replay_manifest_path).unwrap();
+            hft_research_artifacts::sha256_file(replay_manifest_path).unwrap();
         let round_identity = CampaignRoundIdentityV1 {
             schema_version: CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1.to_string(),
             data_window_hours: CAMPAIGN_DATA_WINDOW_HOURS,
@@ -8650,7 +8655,7 @@ message binance_replay {
         group.close().unwrap();
         writer.close().unwrap();
         let replay_artifact_sha256 =
-            crate::mission_runner::sha256_file(&temporary_artifact).unwrap();
+            hft_research_artifacts::sha256_file(&temporary_artifact).unwrap();
         let replay_artifact_path = root.join(format!("{replay_artifact_sha256}.parquet"));
         std::fs::rename(&temporary_artifact, &replay_artifact_path).unwrap();
         let replay_manifest = serde_json::json!({

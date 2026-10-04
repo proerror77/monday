@@ -193,7 +193,7 @@ pub struct ResultReceipt {
     pub fit_identity_sha256: Option<String>,
     pub artifacts: Vec<Artifact>,
     pub checkpoint: Option<Artifact>,
-    pub prepared_view: Option<crate::data::PublishedView>,
+    pub prepared_view: Option<hft_cex_research_input::data::PublishedView>,
 }
 
 impl ResultReceipt {

@@ -220,7 +220,7 @@ pub(super) fn fresh_result(
     Ok((file, hash))
 }
 pub(super) fn verify_published_result(extracted: &Path, remote_hash: &str) -> anyhow::Result<()> {
-    if crate::mission_runner::sha256_file(&extracted.join("result.json"))? != remote_hash {
+    if hft_research_artifacts::sha256_file(&extracted.join("result.json"))? != remote_hash {
         bail!("market archive result differs from published result");
     }
     Ok(())

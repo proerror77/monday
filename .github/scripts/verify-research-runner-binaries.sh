@@ -2,7 +2,7 @@
 set -euo pipefail
 
 directory=${1:?expected research-runner binary directory}
-product=${2:-paired}
+product=$(bash "$(dirname "${BASH_SOURCE[0]}")/research-release-products.sh" normalize "${2:-all}")
 expected=()
 while IFS= read -r binary; do expected+=("$binary"); done < <(bash "$(dirname "${BASH_SOURCE[0]}")/research-release-products.sh" binaries "$product")
 [[ ${#expected[@]} -gt 0 ]] || exit 2

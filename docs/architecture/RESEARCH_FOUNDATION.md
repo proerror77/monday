@@ -44,7 +44,9 @@ flowchart LR
 
 `rust_hft/workspaces.json` 登记六个真实入口：shared、data、research、control、runtime、prediction。每个入口拥有独立 lockfile、resolver 2 和 Rust 1.98.1。源码路径保持原位置，package 显式声明唯一 owner；原 root package 属于 runtime workspace。
 
-轻量 control workspace 只含 `hft-research-platform`。其依赖树没有 collector、Burn、ONNX 或 Parquet。Data 的协议库不反向依赖采集运行时；`hft-market-pipeline` 也不依赖训练或执行。科学 research workspace 默认选择 search kernel，实际训练与 harness 由明确 package/build recipe 选择。
+shared workspace 的 `hft-cex-research-input` 独立拥有 DataView、typed block、二进制 codec 和有界验证缓存。它只依赖序列化与摘要库，不含 SQL、数据库驱动、HTTP、provider 或 Agent 状态。backtest 直接消费该输入 crate。轻量 control workspace 只含 `hft-research-platform`，消费相同输入合同；其依赖树没有 collector、Burn、ONNX 或 Parquet。Data 的协议库不反向依赖采集运行时；`hft-market-pipeline` 也不依赖训练或执行。科学 research workspace 默认选择 search kernel，实际训练与 harness 由明确 package/build recipe 选择。
+
+CEX 与 Prediction Markets 保留不同的科学输入和 evaluator。`hft-cex-research-input` 的 horizon、成熟时钟和连续 LOB 回放属于 CEX 时间序列合同；它不是事件结算概率数据集。Prediction 的 episode、UP/DOWN outcome、event-disjoint cohort 和 ResearchSnapshot 继续由 prediction workspace 所有。两条链可共享领域中性的搜索机制、行情和治理合同。依赖检查覆盖 Prediction 的 default/db/full 构建，拒绝引入 CEX input、harness、collector、backtest 或 control platform。
 
 CI selector 汇总真实 metadata，包括跨域 path dependencies 和 integration/dev edges。`cargo-scoped.sh` 把显式包集合分到各 owner；跨 workspace features 或命名 target 组合拒绝模糊执行。CI 单 runner 可复用自己的 target cache；多个 Cargo invocation 仍各自解析所属 workspace 的 features。共享可写多租户 cache 不属于此合同。
 
@@ -75,11 +77,15 @@ Run 是固定科学调用：Experiment、BuildArtifact、配置摘要、命令�
 
 CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生软件版本、编译环境、profile、lock 和 scoped 配方指纹纳入缓存键，并将这些输入保存在 release manifest。Cargo cache 与可执行产物分开：缓存只影响后续编译效率，命中缓存仍必须执行 build、二进制摘要验证和 image smoke。每个 runner 有自己的可写 target，禁止多租户共享可写 target；readonly prepared-data mount 不能被当作 compiler cache。
 
-生产构建调度、变异 workspace 的源码归档/签名导入和 release verifier 向 PG 的自动投影尚未实现。现有 CI bundle 能构建一次并被 smoke/发布复用；新 PG 合同能让多个 Run/Attempt 复用已导入的同一产物。不能据此声称已有自动 Agent 变异 → Build → 科学执行闭环。
+`researchctl register-build ARTIFACT SIGNED_RELEASE` 只接受独立发布 verifier 的 Ed25519 签名。`MONDAY_RESEARCH_BUILD_TRUST_FILE` 指向 operator 管理的公开信任配置，绑定 repository、producer workflow 和公钥。输入 envelope 不能自带受信公钥。签名绑定源码归档 manifest、完整 Build 身份、target、OCI digest、二进制集合、CI run/attempt/job 和独立发布回读摘要。修改这些字段或重新计算普通摘要不能修复签名。
+
+先离线应用 `platform/sql/verified_build_release.sql`。该迁移保留原 Build 行作为审计记录，不自动为旧行补信任。只有附有签名证明的 Build 才能进入新 Run。导入事务写入不可变 release 和信任配置摘要；重复导入复用原记录。Build 可在 authority 为 paused 时预先登记；导入不启用 backend，也不授予科学预算或运行权。Run 启动与基础设施 retry 仍独立回读二进制字节。
+
+生产构建调度、变异 workspace 的源码归档上传、原生发布 verifier 出具此签名，以及 release 向 PG 的自动投影仍待接入。现有 CI bundle 能构建一次并被 smoke/发布复用；新 PG 合同能让多个 Run/Attempt 复用已导入的同一产物。不能据此声称已有自动 Agent 变异 → Build → 科学执行闭环。
 
 ## 数据：CH 数值准备、版本化出口、bounded 共享
 
-`src/data.rs` 的 `DataViewSpec` 绑定 venue、instrument、market、depth、排序后的 source SHA、normalizer、SQL recipe、feature names、时间窗、lookback、多个 horizon、容差、split 和 fitting cutoff。没有写死某个资产、100 档或某组 horizon。
+`research-core/cex-input/src/data.rs` 的 `DataViewSpec` 绑定 venue、instrument、market、depth、排序后的 source SHA、normalizer、SQL recipe、feature names、时间窗、lookback、多个 horizon、容差、split 和 fitting cutoff。没有写死某个资产、100 档或某组 horizon。
 
 默认 SQL recipe 为 mid/spread/depth imbalance。PreparationPlan 也可携带经过原生 admission 审核的不可变 recipe_sql，绑定 exact SQL digest、固定 features/labels 两个插入目标和输出 schema；算法变化形成新的数据身份，可以复用同一 prepare Build。参数、horizons、数据窗或已审核 SQL recipe 变化无需编译 Rust。这个入口不是向 Agent 开放的任意 SQL 执行器，也不是 SQL parser/sandbox；科学 grant 和 CH 的独立权限边界仍必须接入。改动 Rust 的解码/计算实现或打包默认值本身才需新 Build。
 
@@ -89,9 +95,11 @@ CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生�
 
 当前 preparation worker 只支持 Train。plan 登记和任务提交都拒绝 Validation 与 Holdout，避免消耗必然失败的 attempt。通用 DataView schema 保留这些 split，未来 evaluator 仍需独立准入。
 
-`src/prepared.rs` 使用带版本和大小上限的 bincode。读取本地文件或对象时，调用方必须核验 manifest 和 block digest。Transport 只提供字节，不能替换解码结果。解码后释放一次性 acquired buffers。
+`research-core/cex-input/src/prepared.rs` 使用带版本和大小上限的 bincode。读取本地文件或对象时，调用方必须核验 manifest 和 block digest。Transport 只提供字节，不能替换解码结果。解码后释放一次性 acquired buffers。控制侧的 `preparation.rs` 保留 reviewed SQL plan 和默认 recipe；`block_objects.rs` 保留有界 HTTPS 获取。crate 迁移不改变已发布的 manifest 字段、bincode schema 或内容摘要。
 
 `VerifiedCache` 对缺页执行读取、解码、时钟和 split 验证。cache hit 仍检查当前 view 的合同。多个试验可以复用一个只读 `Arc` batch；模型、optimizer 和 checkpoint 状态分别保存。batch owner 必须计入外部持有 Arc 的内存。LRU 不能单独限制这些引用的总驻留量。
+
+同一个缓存已验证的 view 在内部流转时复用验证结果，拒绝同一身份下修改 metadata。新的 view 仍执行首次验证；缓存命中仍检查其时钟、split 和 block 合同。准备数据的终态回读对实际解码字节只下载和校验一次，同一次 receipt 内复用该对象 key、摘要和大小的结果。不同对象、后续请求、首次导入和恢复各自保留边界验证。SHA256 用于内容身份，不代替授权或实际科学行为验收。
 
 `apps/backtest::engine::replay_shared_target_positions` 已消费这些 shared typed 输入，复用现有 IOC target-position engine，每个试验新建状态。它拒绝错误 manifest、market、instrument、多 gap segment 和 split 外决策；availability ns 向上取整到 us，避免提前看数据。这里没有新增被动排队成交或 live 交易声明。
 

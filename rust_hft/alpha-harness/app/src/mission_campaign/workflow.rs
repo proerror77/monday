@@ -95,13 +95,13 @@ fn read(path: &Path) -> anyhow::Result<Vec<u8>> {
 }
 
 fn retain(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    data_mission::ensure_output_path_is_not_symlink(path, "workflow evidence")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(path, "workflow evidence")?;
     if path.exists() {
         if read(path)? != bytes {
             bail!("workflow evidence differs; use its original plan and state");
         }
     } else {
-        let mut temporary = data_mission::temporary_output_file(path, ".workflow-")?;
+        let mut temporary = hft_research_artifacts::temporary_output_file(path, ".workflow-")?;
         temporary.write_all(bytes)?;
         temporary.as_file().sync_all()?;
         temporary.persist_noclobber(path).map_err(|e| e.error)?;
@@ -141,10 +141,10 @@ pub fn run(args: CampaignWorkflowArgs) -> anyhow::Result<()> {
             bail!("duplicate workflow member");
         }
     }
-    data_mission::ensure_real_directory(&args.work_dir, "workflow state")?;
+    hft_research_artifacts::ensure_real_directory(&args.work_dir, "workflow state")?;
     let root = std::fs::canonicalize(&args.work_dir)?;
     let lock_path = root.join(".workflow.lock");
-    data_mission::ensure_output_path_is_not_symlink(&lock_path, "workflow lock")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(&lock_path, "workflow lock")?;
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -251,7 +251,7 @@ fn execute(
     match execute_inner(plan, base, root, lock, groups, plan_sha) {
         Ok(report) => Ok(report),
         Err(error) => {
-            data_mission::write_json_atomic(
+            hft_research_artifacts::write_json_atomic(
                 &root.join("workflow-status.json"),
                 &json!({
                     "schema_version":"monday.cex_campaign_workflow_report.v1", "plan_sha256":plan_sha,
@@ -298,9 +298,12 @@ fn execute_inner(
             .find(|m| m.id == member.id)
             .context("prepared member")?;
         let cycle = root.join("cycles").join(&member.id);
-        data_mission::ensure_real_directory(&cycle, "workflow cycle")?;
+        hft_research_artifacts::ensure_real_directory(&cycle, "workflow cycle")?;
         let output = cycle.join("workflow-controller-output.json");
-        data_mission::ensure_output_path_is_not_symlink(&output, "workflow controller output")?;
+        hft_research_artifacts::ensure_output_path_is_not_symlink(
+            &output,
+            "workflow controller output",
+        )?;
         let mut complete = false;
         let mut recover_summary = false;
         if cycle.join("controller-inputs.json").exists() {
@@ -414,7 +417,7 @@ fn execute_inner(
     let report = json!({"schema_version":"monday.cex_campaign_workflow_report.v1","plan_sha256":plan_sha,
         "state":state,"deadline_at":plan.deadline_at,"members":outcomes,"declared_members":plan.members.len(),
         "automatic_follow_ups":false,"accounting_source":"authenticated_campaign_ledger","report_reuses_native_metrics":true});
-    data_mission::write_json_atomic(&root.join("workflow-status.json"), &report)?;
+    hft_research_artifacts::write_json_atomic(&root.join("workflow-status.json"), &report)?;
     Ok(report)
 }
 

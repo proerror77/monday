@@ -106,7 +106,7 @@ end
 publication=acr.fetch('jobs').fetch('publish')
 abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']
 readback=publication.fetch('steps').find { |s|s.fetch('name','')=='Read back research image source and executable bytes' }
-abort 'independent executable readback missing' unless readback && readback.fetch('if')=='matrix.research_artifact' && readback.fetch('run').include?('docker pull') && readback.fetch('run').include?('cmp ')
+abort 'independent executable readback missing' unless readback && readback.fetch('if')=='matrix.research_artifact' && readback.fetch('run').include?('docker pull') && readback.fetch('run').include?('verify-research-product-image.sh')
 logout=publication.fetch('steps').index { |s|s.fetch('name','')=='Remove ACR credentials' }
 abort 'registry identity removed before image readback' unless logout && logout>publication.fetch('steps').index(readback)
 source=acr.fetch('jobs').fetch('publish-source-test')
@@ -124,14 +124,20 @@ abort 'controller verifier is not used by publication' unless controller.fetch('
 complete=acr.fetch('jobs').fetch('research-release-complete')
 abort 'completion marker can bypass failed publication' unless complete.fetch('needs').include?('publish') && complete.fetch('if').include?("needs.publish.result == 'success'")
 RUBY
-for publish_target in all research-runner campaign-cycle-controller; do
+for publish_target in all research-runner prediction-research-runner campaign-cycle-controller research-products; do
   : >"$tmp_dir/matrix-output"
-  TARGET="$publish_target" GITHUB_OUTPUT="$tmp_dir/matrix-output" bash "$tmp_dir/select-matrix.sh"
+  TARGET="$publish_target" PUBLISHED_PRODUCTS=controller,prediction-runner GITHUB_OUTPUT="$tmp_dir/matrix-output" bash "$tmp_dir/select-matrix.sh"
   sed 's/^matrix=//' "$tmp_dir/matrix-output" >"$tmp_dir/matrix.json"
-  ruby -rjson - "$tmp_dir/matrix.json" "$tmp_dir/controller-condition.txt" <<'RUBY'
+  ruby -rjson - "$tmp_dir/matrix.json" "$tmp_dir/controller-condition.txt" "$publish_target" <<'RUBY'
 rows=JSON.parse(File.read(ARGV[0])).fetch('include')
+expected = case ARGV[2]
+when 'all' then %w[research-runner prediction-research-runner campaign-cycle-controller hft-trading binance-lob-archiver polymarket-evidence-compiler polymarket-market-recorder]
+when 'research-products' then %w[campaign-cycle-controller prediction-research-runner]
+else [ARGV[2]]
+end
+abort 'product publication matrix contains another domain' unless rows.map { |row| row.fetch('repository') }.sort == expected.sort
 controller=rows.find { |row|row['repository']=='campaign-cycle-controller' }
-abort 'actual publish matrix omitted prebuilt controller' unless controller && controller['research_artifact']==true
+abort 'actual publish matrix misconfigured controller' if controller && controller['research_artifact']!=true
 condition=File.read(ARGV[1]).strip.sub(/\A\$\{\{\s*/,'').sub(/\s*\}\}\z/,'')
 tokens=condition.scan(/matrix\.(?:repository|research_artifact)|'[^']*'|true|false|==|!=|&&|\|\||[!()]|\s+/)
 abort 'unrecognized controller predicate' unless tokens.join==condition

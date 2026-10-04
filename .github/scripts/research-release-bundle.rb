@@ -4,10 +4,11 @@ require 'rubygems/package'
 require 'fileutils'
 require 'json'
 
-PRODUCT = ARGV[3] || 'paired'
 CATALOG = JSON.parse(File.read(File.join(__dir__, 'research-release-products.json'))).fetch('products')
-abort 'invalid research release product' unless %w[runner controller paired].include?(PRODUCT)
-BINARIES = (PRODUCT == 'paired' ? CATALOG.values.flatten : CATALOG.fetch(PRODUCT)).uniq.sort.freeze
+selection = ARGV[3] || 'all'
+PRODUCTS = (selection == 'all' ? CATALOG.keys : selection.split(',', -1)).sort.freeze
+abort 'invalid research release products' unless PRODUCTS.any? && PRODUCTS.uniq == PRODUCTS && PRODUCTS.all? { |name| CATALOG.key?(name) }
+BINARIES = PRODUCTS.flat_map { |name| CATALOG.fetch(name) }.uniq.sort.freeze
 FILES = { 'research-image-release.json' => [0o644, 1024 * 1024] }.merge(
   BINARIES.to_h { |name| ["research-bin/#{name}", [0o755, 512 * 1024 * 1024]] }
 ).freeze

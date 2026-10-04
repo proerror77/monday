@@ -1,13 +1,16 @@
-use hft_research_platform::{
+use hft_cex_research_input::{
     data::{
-        self, BlockRef, BlockSource, DataViewSpec, Exit, FeatureFrame, PreparationPlan,
-        PublishedView, ReplayEvent, ReplayPayload, Split, TrainingFrame, TypedBlock, VerifiedCache,
-        Window,
+        self, BlockRef, BlockSource, DataViewSpec, Exit, FeatureFrame, PublishedView, ReplayEvent,
+        ReplayPayload, Split, TrainingFrame, TypedBlock, VerifiedCache, Window,
     },
+    prepared,
+};
+use hft_research_platform::{
     execution::{self, Acceptance, Backend, ExecutionHandle, Profile},
     identity,
     orchestrator::{Artifact, ResultReceipt, State, Task, TaskKind, TaskSpec},
-    prepared, sha256,
+    preparation::{PreparationPlan, PREPARE_SQL},
+    sha256,
 };
 
 fn hash(c: char) -> String {
@@ -22,7 +25,7 @@ fn spec() -> DataViewSpec {
         depth: 3,
         sources: vec![hash('a')],
         normalizer_sha256: hash('b'),
-        feature_sql_sha256: sha256(data::PREPARE_SQL.as_bytes()),
+        feature_sql_sha256: sha256(PREPARE_SQL.as_bytes()),
         feature_names: vec!["mid".into(), "spread".into(), "depth_imbalance".into()],
         window: Window {
             start_ns: 100,
@@ -603,7 +606,7 @@ fn reviewed_sql_changes_data_identity_without_rebuilding_the_worker() {
         recipe_sql: None,
     };
     let mut second = first.clone();
-    let sql = data::PREPARE_SQL.replace(
+    let sql = PREPARE_SQL.replace(
         "asks_price[1]-bids_price[1]",
         "(asks_price[1]-bids_price[1])*2",
     );
