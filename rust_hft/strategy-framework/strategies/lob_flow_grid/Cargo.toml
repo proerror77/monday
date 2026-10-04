@@ -1,4 +1,5 @@
 [package]
+workspace = "../../../runtime"
 name = "hft-strategy-lob-flow-grid"
 version = "0.1.0"
 edition = "2021"

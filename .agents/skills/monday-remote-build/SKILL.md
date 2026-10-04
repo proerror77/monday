@@ -1,101 +1,69 @@
 ---
 name: monday-remote-build
-description: Select and verify Monday managed ACK CI or a disposable Cloud Assistant build, preserving each path's source, cache, and cleanup contract.
+description: Select scoped Monday Rust validation or an explicitly assigned remote build, following the current CI workflow and reusing verified Build artifacts. Does not dispatch research, create workers, or grant resources.
 ---
 
-# Monday remote build
+# Monday Remote Build
 
-Use this before remote Rust compilation, validation, toolchain installation, or
-source materialization. Select the execution path from the current task; this
-skill does not create a new approval, resource budget, or deployment target.
+Choose the build path for the requested package and source. This skill supplies
+routing, not a new executor, budget, deployment target, or mandatory audit.
 
-## Choose the execution path
+## Choose the path
 
-- **Managed ACK CI:** the task already has a reviewed private executor profile,
-  committed request, named controller, and signed public-receipt contract. Use
-  that executor and its pinned control source. Read the matching private
-  executor README and admission/cache scripts; do not substitute a one-off
-  Cloud Assistant compiler or an empty temporary cache for the managed recipe.
-- **Disposable Cloud Assistant build:** no managed execution is assigned and
-  the task calls for a bounded standalone build command. Use the disposable
-  task contract below.
+- **PR/CI validation:** follow the current workflow and its affected-package
+  selection. Native CI performs the checks it declares. Historical private ACK
+  receipts are not an alternate completion path for those checks.
+- **Focused local validation:** use the package's owning manifest and an existing
+  task-owned cache. Do not default to the old root workspace or all packages.
+- **Explicit remote build:** use the executor/profile already assigned by the
+  task. Read only its matching source, command, cache and cleanup contract.
+  A legacy ACK profile or disposable Cloud Assistant build is an explicit
+  exception, not a fallback when CI or a worker is unavailable.
+- **Scientific compute:** consume the admitted, verified binary/image. A compute
+  Job does not cold-build Rust. Coding Agent sessions and their workspaces are
+  separate from scientific compute and its lifecycle.
 
-For either path, verify the actual worker, source identity, remaining budget,
-deadline, and task-owned cleanup before mutation. Keep existing authorization;
-an expired technical grant or conflicting writer still blocks its affected work.
-Do not infer a healthy worker from a stale Pod Running status.
+See [workspace and Build contracts](../../../docs/architecture/RESEARCH_FOUNDATION.md#独立-cargo-构建边界).
+Follow [Rust instructions](../../../rust_hft/AGENTS.md) and the owning manifest;
+[workspaces.json](../../../rust_hft/workspaces.json) is the owner index. Inspect
+existing manifests for command selection. Run Cargo metadata only when a graph
+change or an unresolved owner actually requires it.
 
-## Managed ACK CI
-
-Keep the current private executor as the sole computation writer. The public
-runner only performs the checks permitted by its workflow; a local diagnostic
-or cached artifact is not a signed CI pass.
-
-Reuse admitted registry/Git downloads and immutable toolchain image layers.
-Resolve the writable target isolation from the reviewed task contract and
-actual cache implementation, rather than inferring it from directory presence
-or stale prose. If a task requires per-SHA targets, test/clippy stages for that
-SHA may share the target; another SHA may not. Keep compiler-state reuse,
-successful-checkpoint reuse, and artifact publication as separate decisions.
-
-Verify the research-worker identity and /work placement, the admitted cache
-volume UID and owner, available space, source/command bindings, lease, and
-public consumer before dispatch. Use the executor's cleanup and terminal
-persistence mechanisms. Retain a separately owned cache volume according to its
-contract; do not delete it as if it belonged to a disposable command.
-
-Report execution, terminal receipt, public consumption, and any artifact
-readback separately. A private failure or cancellation needs a terminal public
-outcome; it is not a reason to launch a fresh unnamed attempt.
-
-The remaining sections apply only to a disposable Cloud Assistant command.
-
-## Disposable inputs
-
-- A lowercase task `contract` containing only letters, digits, dots, underscores,
-  or hyphens.
-- The reviewed build or validation command and its required durable result.
-
-## Disposable preconditions
-
-1. Resolve the ECS target live. Require `project=monday`, `role=research-worker`,
-   `Running`, and a healthy Cloud Assistant heartbeat. Require `workload=backtest`
-   either directly or through ACK's `node-template/label/workload` tag.
-2. On the target, require `/work` to be a mounted filesystem with at least 20 GiB
-   free. Create `/work/monday-builds` mode `0700` if it is absent.
-3. Resolve one named controller for the task.
-
-## Disposable stop conditions
-
-Reject `role=ack-system`, a missing `/work`, insufficient free space, an active
-conflicting controller, or every attempt to use `/tmp` as a fallback.
-
-## Disposable task contract
-
-Create exactly one task root and keep all mutable build state inside it.
-
-This one-off isolation contract is an exception to general build-cache reuse.
-Do not redirect its writable caches or toolchains into shared locations. This
-exception does not apply to the managed ACK execution path above.
+From the repository root, a focused command has this shape:
 
 ```bash
-task_root=$(mktemp -d "/work/monday-builds/${contract}.XXXXXX")
-cleanup() { rm -rf -- "$task_root"; }
-trap cleanup EXIT
-export TMPDIR="$task_root/tmp"
-export CARGO_HOME="$task_root/cargo"
-export RUSTUP_HOME="$task_root/rustup"
-export CARGO_TARGET_DIR="$task_root/target"
-export SCCACHE_DIR="$task_root/sccache"
-mkdir -p "$TMPDIR" "$CARGO_HOME" "$RUSTUP_HOME" "$CARGO_TARGET_DIR" "$SCCACHE_DIR"
+cargo test --manifest-path rust_hft/<owning-manifest> --locked -p <package> <filter>
+cargo clippy --manifest-path rust_hft/<owning-manifest> --locked -p <package> --all-targets -- -D warnings
 ```
 
-Upload or read back every required result before the command exits. A task root
-is never a retention surface: any evidence that must survive belongs in a
-reviewed durable location before the command exits.
+Use the existing scoped script for explicit package sets. Its dry-run still
+reads Cargo metadata; it is not a pure static preview.
 
-## Disposable output
+## Remote execution, when assigned
 
-Report the target instance ID and tags, `/work` free space before and after, the
-task root, the build verdict, artifact readback, and `test ! -e "$task_root"`.
-Also confirm that no new `/tmp/monday-*` directory was created.
+Before mutation, resolve the exact source/command, worker and controller,
+technical admission, original deadline and remaining task budget. Unknown
+placement or a conflicting writer stops the affected command. A stale Pod
+Running status is not worker-health evidence. Do not create or renew resources
+to complete a build-selection request.
+
+Reuse the profile's admitted downloads, toolchain layers and writable cache
+isolation. Cache hits do not prove build success or artifact identity. Keep
+workspaces, toolchains and target directories off `ack-system` nodes.
+
+For an explicitly assigned disposable Cloud Assistant task, use its reviewed
+research-worker identity, mounted `/work` capacity and isolated task root.
+Arm task-owned exit cleanup before writes; persist required results before
+cleanup. Fresh task-local caches are that profile's exception. Never delete
+a separately owned managed cache or use `/tmp` as a missing-mount fallback.
+
+## Results and stops
+
+Bind checks and artifacts to the exact source and command. Report execution,
+required terminal evidence and requested artifact readback separately. CI job
+timeouts do not become research grant deadlines. Reuse the same pending
+operation after interruption; do not dispatch an unnamed replacement.
+
+Missing or expired admission, unavailable execution, unverified Build artifacts
+or ownership conflict remains a concrete blocker. Do not replace it with a local
+pass, preparation receipt or speculative cloud deployment.

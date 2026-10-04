@@ -3030,6 +3030,7 @@ mod tests {
     fn market_encoder_checkpoint_tail_flushes_without_crossing_recovery_gap() {
         let snapshot = |received_at_ns| {
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                clock: None,
                 received_at_ns,
                 bids: (0..5)
                     .map(|i| level(&(100 - i).to_string(), "10"))
@@ -3165,6 +3166,7 @@ mod tests {
         let received_at_ns = event_ns(1_000);
         let events = vec![
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                clock: None,
                 received_at_ns,
                 bids: vec![
                     level("100", "10"),
@@ -3182,6 +3184,7 @@ mod tests {
                 ],
             }),
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                clock: None,
                 received_at_ns,
                 bids: vec![],
                 asks: vec![level("102", "0"), level("101", "4")],
@@ -3499,6 +3502,7 @@ mod tests {
     fn checkpoint_only_batch_does_not_advance_sample_clock_and_snapshot_reseeds_series() {
         let events = vec![
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                clock: None,
                 received_at_ns: event_ns(1_000),
                 bids: vec![
                     level("100", "10"),
@@ -3519,6 +3523,7 @@ mod tests {
                 received_at_ns: event_ns(1_500),
             },
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                clock: None,
                 received_at_ns: event_ns(3_000),
                 bids: vec![
                     level("200", "10"),

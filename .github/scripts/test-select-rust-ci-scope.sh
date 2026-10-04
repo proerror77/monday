@@ -11,6 +11,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 run_case() {
   local name=$1 event=$2 changed=$3 ref=
+  local metadata=${4:-"$fixtures/metadata.fixture"}
   local output="$tmp_dir/$name.out"
   local changed_file="$fixtures/$changed"
   [[ -f $changed_file ]] || changed_file="$tmp_dir/$changed"
@@ -18,7 +19,7 @@ run_case() {
   # Each scenario is a fresh workflow output file, including repeated paths.
   : > "$output"
   GITHUB_REF=$ref "$selector" --event "$event" --changed-files "$changed_file" \
-    --metadata "$fixtures/metadata.fixture" --output "$output"
+    --metadata "$metadata" --output "$output"
   printf '%s\n' "$output"
 }
 
@@ -62,6 +63,7 @@ assert_flag() {
 assert_jobs() {
   local output=$1 expected=$2
   local actual
+  if grep -Eq '^clippy_(loop|handoff)=true$' "$output" && ! grep -Fqx 'jobs=,,' "$output"; then expected="${expected:+$expected,}ci/clippy-strict"; fi
   if grep -Fqx 'control=true' "$output"; then
     expected="${expected:+$expected,}ci/control-contracts"
   fi
@@ -95,6 +97,7 @@ assert_owning_packages() {
 
 assert_security_jobs() {
   local output=$1 expected=$2 actual
+  if grep -q '^jobs=.*ci/clippy-strict' "$output" && ! grep -q '^security_jobs=.*security/clippy-strict' "$output"; then expected=${expected/,security\/clippy-strict/}; fi
   actual=$(sed -n 's/^security_jobs=//p' "$output")
   [[ $actual == ,*, ]] || {
     printf '%s: security_jobs output must use exact comma-delimited membership: %s\n' "$output" "$actual" >&2
@@ -123,7 +126,7 @@ job_cases=(
   'prediction-lock|pull_request|prediction-lock.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'research-dockerfile|pull_request|research-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
   'campaign-controller-dockerfile|pull_request|campaign-controller-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
-  'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
+  'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/research-foundation,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'prediction-workflow|pull_request|prediction-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'root-node|pull_request|root-node.txt|ci/node-install'
   'security-workflow|pull_request|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
@@ -139,7 +142,7 @@ job_cases=(
   'agent-instructions|pull_request|agent-instructions.txt|ploy/commit-hygiene'
   'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
   'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
-  'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
+  'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/research-foundation,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
   'unknown-nested|pull_request|unknown-nested.txt|'
   'rust-docs|pull_request|rust-docs.txt|'
   'package-readme|pull_request|package-readme.txt|'
@@ -250,6 +253,30 @@ for event in pull_request push; do
   assert_jobs "$image_scope" "$expected"
   for flag in loop handoff json ondo collector control focused toolchain; do assert_flag "$image_scope" "$flag" false; done
 done
+for helper in verify-research-controller-image.sh test-research-controller-image.sh; do
+  printf '%s\n' ".github/scripts/$helper" >"$tmp_dir/controller-image-helper.txt"
+  for event in pull_request push; do
+    helper_scope=$(run_case "controller-helper-$event" "$event" controller-image-helper.txt)
+    expected='ci/ci-contracts,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
+    [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+    assert_jobs "$helper_scope" "$expected"
+    assert_flag "$helper_scope" toolchain false
+  done
+done
+# Controller assets retain their operational contracts when selecting only the
+# controller image. Every copied script and template must exercise this boundary.
+for asset in scripts/campaign-cycle-controller.sh scripts/campaign-job-watch.sh scripts/cex-materialization-entrypoint.sh k8s/campaign-cycle-controller-job.example.yaml; do
+  printf '%s\n' "deployment/aliyun/research/$asset" >"$tmp_dir/controller-asset.txt"
+  for event in pull_request push; do
+    asset_scope=$(run_case "controller-asset-$event" "$event" controller-asset.txt)
+    expected='ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans,ci/deployment-artifacts'
+    [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
+    assert_jobs "$asset_scope" "$expected"
+    assert_flag "$asset_scope" control true
+    grep -qx 'research_product=controller' "$asset_scope"
+    assert_flag "$asset_scope" toolchain false
+  done
+done
 # Adding an infrastructure helper to real Rust work must preserve the same
 # source-graph suites; the cheap path is not a short circuit for mixed changes.
 printf '%s\n' .github/scripts/wait-ack-research-receipt.sh >"$tmp_dir/ack-with-collector.txt"
@@ -355,6 +382,55 @@ assert_owning_packages "$known_and_future" 'future-rust-tool'
 
 printf '%s\n' rust_hft/apps/live/src/lib.rs rust_hft/apps/paper/src/main.rs \
   >"$tmp_dir/same-suite.txt"
+printf '%s\n' rust_hft/data-pipelines/market-pipeline/src/market_import.rs >"$tmp_dir/market-pipeline.txt"
+pipeline=$(run_case market-pipeline pull_request market-pipeline.txt)
+assert_jobs "$pipeline" 'ci/research-foundation'
+assert_flag "$pipeline" collector false
+assert_flag "$pipeline" loop false
+assert_flag "$pipeline" handoff false
+printf '%s\n' .github/scripts/test-market-import.sh >"$tmp_dir/market-import-driver.txt"
+import_driver=$(run_case market-import-driver pull_request market-import-driver.txt)
+assert_jobs "$import_driver" 'ci/research-foundation,ci/ci-contracts,ploy/workflow-lint'
+
+# This graph contains every member and local dependency of the six locked owners,
+# including control -> backtest -> Alpha. Keep the smaller fixture for its existing
+# scenarios, which deliberately model a different dependency graph.
+owners_metadata="$fixtures/workspace-owners.fixture"
+jq -e '.packages | length == 92 and (map(.name) | unique | length == 92)' "$owners_metadata" >/dev/null
+workspace_inputs=(
+  rust_hft/Cargo.toml
+  rust_hft/workspaces.json
+  rust_hft/shared/Cargo.toml
+  rust_hft/data-pipelines/Cargo.toml
+  rust_hft/research-core/Cargo.toml
+  rust_hft/research-core/platform/Cargo.toml
+  rust_hft/runtime/Cargo.toml
+  rust_hft/prediction-markets/Cargo.toml
+)
+for event in pull_request push; do
+  for path in "${workspace_inputs[@]}"; do
+    printf '%s\n' "$path" >"$tmp_dir/owner-config.txt"
+    owner_config=$(run_case "owner-config-$event" "$event" owner-config.txt "$owners_metadata")
+    grep -Eq '^jobs=.*,(ci/research-foundation),' "$owner_config" || {
+      printf 'workspace input omitted foundation: %s %s\n' "$event" "$path" >&2
+      exit 1
+    }
+    assert_flag "$owner_config" selection_complete true
+  done
+  printf '%s\n' rust_hft/research-core/platform/src/build.rs >"$tmp_dir/control-owner.txt"
+  control_owner=$(run_case "control-owner-$event" "$event" control-owner.txt "$owners_metadata")
+  assert_owning_packages "$control_owner" hft-research-platform
+  grep -Fqx 'loop_packages=,alpha-harness,' "$control_owner"
+  grep -Eq '^jobs=.*,(ci/research-foundation),' "$control_owner"
+  grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$control_owner"
+  if [[ $event == push ]]; then grep -Eq '^jobs=.*,(ploy/research-image-smoke),' "$control_owner"; fi
+  owner_docs=$(run_case "owner-docs-$event" "$event" docs.txt "$owners_metadata")
+  assert_flag "$owner_docs" toolchain false
+  if grep -Eq '^jobs=.*,(ci/rust|ci/research-foundation|ploy/research-image-binaries|ploy/research-image-smoke),' "$owner_docs"; then
+    echo 'docs-only owner graph selected compilation' >&2; exit 1
+  fi
+done
+
 same_suite=$(run_case same-suite pull_request same-suite.txt)
 assert_jobs "$same_suite" 'ci/rust,ci/deployment-artifacts'
 assert_owning_packages "$same_suite" ''
@@ -425,13 +501,15 @@ for workflow in \
   "$ci_workflow" \
   "$script_dir/../workflows/release-rust.yml" \
   "$script_dir/../workflows/security-enabled.yml"; do
-  stable_uses=$(grep -Fc 'dtolnay/rust-toolchain@stable' "$workflow")
+  # Action refs are immutable SHAs after the supply-chain review. Compiler
+  # version pinning is independent from the action's tag spelling.
+  stable_uses=$(grep -Fc 'dtolnay/rust-toolchain@' "$workflow")
   pinned_toolchains=$(grep -Fxc '          toolchain: 1.98.1' "$workflow")
   test "$stable_uses" -eq "$pinned_toolchains"
 done
 # Research software runs under the private ACK profile, so public metadata
 # jobs carry neither a compiler container nor its cache/toolchain setup.
-grep -Fq 'wait-ack-research-receipt.sh research-image-binaries "$(git rev-parse HEAD)"' "$script_dir/../workflows/ploy-ci.yml"
+grep -Fq 'bash .github/scripts/build-research-release.sh' "$script_dir/../workflows/ploy-ci.yml"
 # shellcheck disable=SC2016
 always_condition='    if: ${{ always() }}'
 grep -Fqx '    needs: selector' "$ci_workflow"
@@ -470,7 +548,7 @@ control_job_block=$(job_block control_contracts)
 # Rust changes and lightweight Rust shell changes.
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust,') || contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$fast_gates_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/rust,')" <<<"$rust_job_block"
-grep -Fq "needs.research_preflight.result == 'success'" <<<"$rust_job_block"
+grep -Fq 'check-collector-test-presence.sh' <<<"$rust_job_block"
 grep -Fq "if: \${{ contains(needs.scope.outputs.jobs, ',ci/rust-shell-scripts,') }}" <<<"$rust_shell_scripts_block"
 grep -Fq "uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1" <<<"$rust_shell_scripts_block"
 grep -Fq "find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \\;" <<<"$rust_shell_scripts_block"
@@ -489,7 +567,7 @@ grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$fast_lane_block"
 
 # Suite placement is pinned both ways: fast-only work stays out of the heavy
 # job, and each suite's required home is asserted positively.
-if grep -Fq 'cargo fmt --check' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+if grep -Fq 'cargo-scoped.sh" fmt --check' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'shellcheck' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'test-rust-lob-control-plane.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$fast_gates_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
@@ -502,10 +580,10 @@ grep -Fq 'test-rust-lob-recovery-queue.sh' "$script_dir/run-collector-control-co
 [[ $scope_job_block != *test-* && $scope_job_block != *shellcheck* ]]
 grep -Fq 'test-monday-collector-health.sh' "$script_dir/run-collector-control-contracts.sh"
 grep -Fq 'shellcheck' <<<"$control_job_block"
-grep -Fq 'cargo fmt --check' <<<"$fast_gates_block"
+grep -Fq 'cargo-scoped.sh" fmt --check' <<<"$fast_gates_block"
 grep -Fq 'test-polymarket-raw-ops-control-plane.sh' <<<"$rust_job_block"
 grep -Fqx '      - name: Test directly changed Rust packages' "$ci_workflow"
-grep -Fq 'cargo test "${args[@]}" --locked' <<<"$rust_job_block"
+grep -Fq 'cargo-scoped.sh" test "${args[@]}" --locked' <<<"$rust_job_block"
 
 # The market-recorder release contract runs as its own parallel job (#568).
 ci_gate_block=$(job_block ci-gate)
@@ -516,7 +594,7 @@ recorder_block=$(job_block market_recorder_contract)
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fq "if: \${{ (always() && needs.scope.outputs.toolchain == 'true') && needs.scope.outputs.ack_research != 'true' }}" <<<"$rust_job_block"
+grep -Fq "if: \${{ (always() && needs.scope.outputs.toolchain == 'true') }}" <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
@@ -598,79 +676,20 @@ for ploy_rust_job in \
   grep -Fq 'steps.cache-info.outputs.sccache' <<<"$ploy_block"
   if grep -Fq -- '}}-${{ github.sha }}' <<<"$ploy_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
 done
-# Fixed ACK profiles preserve the selected public job identities while
-# rejecting hosted execution. Scope and selected-job Gate cases above/below
-# remain unchanged: a failed/missing receipt fails the same selected job.
-for mapping in \
-  research-image-binaries:research-image-binaries \
-  research-image-smoke:research-image-smoke \
-  rust-format:prediction-research-format \
-  rust-research-heavy:prediction-research-heavy; do
-  job=${mapping%%:*}
-  profile=${mapping#*:}
-  relay_block=$(ploy_job_block "$job")
-  grep -Fqx '    runs-on: ubuntu-latest' <<<"$relay_block"
-  grep -Fqx '    timeout-minutes: 360' <<<"$relay_block"
-  grep -Fq "wait-ack-research-receipt.sh $profile \"\$(git rev-parse HEAD)\"" <<<"$relay_block"
-  if grep -Eq 'container:|RUSTC_WRAPPER:|SCCACHE_GHA_ENABLED:|uses: (docker/|dtolnay/rust-toolchain|Swatinem/rust-cache|mozilla-actions/sccache)|(^|[[:space:]])(cargo|docker) (build|test|run|check|clippy|fmt)' <<<"$relay_block"; then
-    echo "selected research job $job still executes on a public hosted runner" >&2
-    exit 1
-  fi
-done
-for mapping in rust:ci-rust; do
-  job=${mapping%%:*}
-  profile=${mapping#*:}
-  mixed_block=$(job_block "$job")
-  grep -Fq "wait-ack-research-receipt.sh $profile \"\$(git rev-parse HEAD)\"" <<<"$mixed_block"
-  grep -Fq "if: needs.scope.outputs.ack_research == 'true'" <<<"$mixed_block"
-done
-# Verify every native mixed-lane action keeps its non-research guard; a
-# newly-added unguarded compiler/setup step must fail this contract.
-ruby -ryaml - "$ci_workflow" <<'RUBY'
-ci=YAML.safe_load(File.read(ARGV.fetch(0)))
-%w[rust].each do |id|
-  ci.fetch('jobs').fetch(id).fetch('steps').each do |step|
-    next if step.fetch('uses','').include?('actions/checkout@') || step.fetch('run','').include?('wait-ack-research-receipt.sh')
-    abort "unguarded native research action in #{id}" unless step.fetch('if','').include?("needs.scope.outputs.ack_research != 'true'")
-  end
+# Native test/build jobs preserve domain coverage and have no resource relay.
+ruby -ryaml - "$ci_workflow" "$script_dir/../workflows/security-enabled.yml" "$ploy_workflow" <<'RUBY'
+ci,security,ploy=ARGV.map{|p| YAML.safe_load(File.read(p)).fetch('jobs')}
+[ci,security,ploy].each do |jobs|
+  abort 'active cloud execution relay' if jobs.to_s.include?('wait-ack-') || jobs.to_s.include?('ack_research')
 end
-RUBY
-
-# The relay derives its own ACK scope for these profiles by resolving
-# `git diff "$base...$head"` and `git merge-base "$base" "$head"` from the PR
-# event's base/head SHAs, so the checked-out object database must contain both
-# commits. A default depth-1 checkout keeps only the PR merge commit and the
-# relay dies with `Not a valid commit name`. Every relay job for a derived
-# profile therefore needs a full-history checkout; the expected job map keeps
-# this scan from passing vacuously if a command shape or file drifts.
-ruby -ryaml - \
-  "$ci_workflow" \
-  "$script_dir/../workflows/security-enabled.yml" \
-  "$script_dir/../workflows/ploy-ci.yml" <<'RUBY'
-derived = %w[ci-rust security-clippy-research research-image-binaries]
-expected = {
-  'ci.yml' => %w[rust],
-  'security-enabled.yml' => %w[clippy-strict],
-  'ploy-ci.yml' => %w[research-image-binaries]
-}
-relays = Hash.new { |hash, key| hash[key] = [] }
-ARGV.each do |path|
-  name = File.basename(path)
-  YAML.safe_load(File.read(path)).fetch('jobs').each do |id, job|
-    steps = job.fetch('steps', [])
-    profiles = steps.map { |step| step.fetch('run', '')[/wait-ack-research-receipt\.sh\s+(\S+)/, 1] }.compact
-                    .select { |profile| derived.include?(profile) }
-    next if profiles.empty?
-    relays[name] << id
-    checkouts = steps.select { |step| step.fetch('uses', '').include?('actions/checkout@') }
-    abort "derived ACK relay in #{name}:#{id} has no checkout step" if checkouts.empty?
-    next if checkouts.any? { |step| (step['with'] || {}).fetch('fetch-depth', nil).to_s == '0' }
-
-    abort "#{name}:#{id} relays #{profiles.uniq.join(',')} without a full-history checkout"
-  end
-end
-expected.each do |name, ids|
-  abort "derived ACK relay jobs drifted in #{name}: expected #{ids.sort}, got #{relays[name].sort}" unless relays[name].sort == ids.sort
+abort 'missing selected Rust domain tests' unless %w[loop owning handoff json ondo collector control focused clippy_loop clippy_handoff].all?{|id|ci.fetch('rust').fetch('steps').any?{|s|s['id']==id}}
+abort 'missing shared producer evidence' unless ci.fetch('rust').to_s.include?('write-ci-rust-evidence.sh')
+abort 'Security duplicates Clippy on PR/push' unless security.fetch('clippy-strict').fetch('steps').select{|s|s.fetch('run','').include?('cargo-scoped.sh" clippy')}.all?{|s|s.fetch('if','').include?("github.event_name == 'schedule'")}
+abort 'Clippy lacks same-run dependency' unless ci.fetch('clippy_strict').fetch('needs').include?('rust') && ci.fetch('clippy_strict').to_s.include?('verify-ci-rust-same-run.sh')
+abort 'Security still polls native Clippy' if security.fetch('clippy-strict').to_s.include?('wait-ci-rust-evidence.sh')
+abort 'smoke does not reuse binary job' unless ploy.fetch('research-image-smoke').fetch('needs').include?('research-image-binaries')
+%w[research-image-binaries rust-format rust-research-heavy].each do |id|
+  abort "native compiler absent #{id}" unless ploy.fetch(id).to_s.include?('dtolnay/rust-toolchain@')
 end
 RUBY
 
@@ -713,7 +732,7 @@ if printf '%s' '{"selector":{"result":"success"},"rust":{"result":"skipped"}}' |
 fi
 printf '%s' '{"selector":{"result":"success"},"rust":{"result":"success"}}' | \
   bash "$gate" --expected-jobs ',ci/rust,'
-for selected in ploy/architecture-contracts ci/rust-hft-engine-fast-lane; do
+for selected in ploy/architecture-contracts ci/rust-hft-engine-fast-lane ci/research-foundation; do
   job=${selected#*/}
   [[ $selected == ci/* ]] && job=${job//-/_}
   for state in missing skipped failure cancelled; do

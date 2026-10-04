@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=monday-binance-lob-bullseye-rust-${RUST_VERSION}-${TARGETARCH},target=/work/target,sharing=locked \
     printf '%s\n' "$SOURCE_REVISION" | grep -Eq '^[0-9a-f]{40}$' \
-    && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo --config 'build.rustc-wrapper=""' build \
+    && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" CARGO_TARGET_DIR=/work/target cargo --config 'build.rustc-wrapper=""' build --manifest-path data-pipelines/Cargo.toml \
     --release \
     --locked \
     --no-default-features \

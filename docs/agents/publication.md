@@ -64,3 +64,15 @@ path retains required-check admission and immutable registry readback.
 Runtime experiment configuration and ordinary Job manifests do not rebuild
 research binaries. Scripts/templates copied into the controller image remain
 image inputs; changes to that COPY boundary must update the scope mapping.
+
+Research release v4 binds a catalog product to its source, build inputs,
+producer run, attempt, job, and executable hashes. Runner and Campaign
+controller are the existing deployed products. Controller asset changes build
+only its four required executables. Unpublished image impact survives later
+main commits through authenticated product completion markers. The catalog
+migration bootstraps both images until their first readback succeeds.
+
+Collector publication loads the successful Monorepo CI image. It checks the
+producer, platform, archive hash, image ID and source before promotion. The
+publisher does not compile that product. Immutable registry readback must
+match the saved image ID. Missing or expired evidence blocks publication.

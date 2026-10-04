@@ -14,7 +14,7 @@ frontends. There is no compatibility test runner or second-language fallback.
 3. Locate the relevant manifest before inventing a command:
 
    ```bash
-   find . -maxdepth 4 \( -name Cargo.toml -o -name package.json \) -print
+   rg --files -g Cargo.toml -g package.json rust_hft
    ```
 
 4. Identify the smallest changed Rust package or TypeScript frontend.
@@ -24,17 +24,21 @@ frontends. There is no compatibility test runner or second-language fallback.
 
 ## Rust lanes
 
-Use explicit manifests and locked dependencies:
+Use `rust_hft/workspaces.json` and the package's declared owner to choose the
+manifest. The old root manifest is not a generic entry for every package.
+Use the existing `rust_hft/scripts/cargo-scoped.sh` for explicit package sets;
+its dry-run still invokes Cargo metadata. Static command selection reads the
+existing registry and manifests without compiling.
+
+From the repository root, use locked dependencies and the owning manifest:
 
 ```bash
-cargo test --manifest-path rust_hft/Cargo.toml -p <package> --locked
-cargo clippy --manifest-path rust_hft/Cargo.toml -p <package> --all-targets --locked -- -D warnings
-cargo fmt --manifest-path rust_hft/Cargo.toml --package <package> -- --check
-
-cargo test --manifest-path rust_hft/prediction-markets/Cargo.toml -p <package> --locked
-cargo clippy --manifest-path rust_hft/prediction-markets/Cargo.toml -p <package> --all-targets --locked -- -D warnings
-cargo fmt --manifest-path rust_hft/prediction-markets/Cargo.toml --package <package> -- --check
+cargo test --manifest-path rust_hft/<owning-manifest> -p <package> --locked <filter>
+cargo clippy --manifest-path rust_hft/<owning-manifest> -p <package> --all-targets --locked -- -D warnings
+cargo fmt --manifest-path rust_hft/<owning-manifest> --package <package> -- --check
 ```
+
+The Prediction workspace remains `rust_hft/prediction-markets/Cargo.toml`.
 
 During diagnosis, prefer one test target or name filter. Expand to the package,
 feature matrix, or workspace only when the affected boundary warrants it. PLOY

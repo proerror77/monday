@@ -1,6 +1,6 @@
 # GitHub Operations
 
-Use the root [delivery authority](../../AGENTS.md#delivery-authority) and
+Use the root [delivery authority](../../AGENTS.md#authority) and
 [issue lifecycle](../../docs/agents/issue-tracker.md). Use structured `--json`
 readback and `--body-file` for multiline publication. Execute the requested
 operation directly and handle its actual result.

@@ -6497,28 +6497,28 @@ mod tests {
     fn execute_rejects_label_only_edge_before_event_replay() {
         let fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false, false);
         let request = load_request(&fixture.args.request).unwrap().request;
-        execute(fixture.args).unwrap();
-        let mut recovered_burn = false;
+        execute(fixture.args.clone()).unwrap();
         for round in &request.rounds {
             let recovered = recover_round_report(&fixture.work_dir, &request, round);
-            let burn: CexSupervisedModelCandidateV2 = serde_json::from_slice(
+            let selection: CexSupervisedModelSelectionV1 = serde_json::from_slice(
                 &std::fs::read(fixture.work_dir.join(format!(
-                    "mission/{}/execute/results/burn_mlp-supervised-candidate.json",
+                    "mission/{}/execute/results/supervised-model-selection.json",
                     round.round_id
                 )))
                 .unwrap(),
             )
             .unwrap();
-            recovered_burn |=
-                recovered.supervised_candidate_id.as_deref() == Some(burn.artifact_id.as_str());
-            assert!(recovered.supervised_candidate_id.is_some());
+            assert_eq!(
+                recovered.supervised_candidate_id.as_deref(),
+                Some(selection.selected_candidate.id.as_str())
+            );
             assert!(recovered.supervised_replay_receipt_id.is_none());
         }
-
-        assert!(
-            recovered_burn,
-            "negative-result recovery must exercise the Burn winner"
-        );
+        // Model ranking varies with fitted weights. Controlled negative
+        // selections exercise every recovery path without requiring a winner.
+        for model in ["ridge", "cart", "burn_mlp"] {
+            assert_negative_candidate_recovery(&fixture, &request, &request.rounds[0], model);
+        }
         let work_dir = fixture.work_dir;
         assert!(work_dir.join("shared-inputs/features.jsonl").exists());
         assert!(work_dir.join("shared-inputs/materialization.json").exists());
@@ -7982,6 +7982,58 @@ mod tests {
         )
         .unwrap()
         .unwrap()
+    }
+
+    fn assert_negative_candidate_recovery(
+        fixture: &CampaignE2eFixture,
+        request: &CampaignRequest,
+        round: &CampaignRoundRequest,
+        model: &str,
+    ) {
+        let mut source =
+            zip::ZipArchive::new(File::open(&round.result_readback_url).unwrap()).unwrap();
+        let mut entries = std::collections::BTreeMap::new();
+        for index in 0..source.len() {
+            let mut entry = source.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            entries.insert(entry.name().to_string(), bytes);
+        }
+        let candidate: CexSupervisedModelCandidateV2 =
+            serde_json::from_slice(&entries[&format!("results/{model}-supervised-candidate.json")])
+                .unwrap();
+        assert!(!candidate.evaluation.passed);
+        let mut selection: CexSupervisedModelSelectionV1 =
+            serde_json::from_slice(&entries["results/supervised-model-selection.json"]).unwrap();
+        selection.selected_candidate = alpha_domain::CexResearchContentRefV1 {
+            id: candidate.artifact_id.clone(),
+            content_sha256: canonical_json_hash(&candidate).unwrap(),
+        };
+        selection.replay_eligible = false;
+        entries.insert(
+            "results/supervised-model-selection.json".into(),
+            serde_json::to_vec(&selection).unwrap(),
+        );
+        regenerate_metric_entries(&mut entries);
+        let bundle = fixture.work_dir.join(format!("negative-{model}.zip"));
+        let mut writer = zip::ZipWriter::new(File::create(&bundle).unwrap());
+        for (name, bytes) in entries {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let mut controlled = round.clone();
+        controlled.result_readback_url = bundle.to_string_lossy().into_owned();
+        let recovered = recover_round_report(&fixture.work_dir, request, &controlled);
+        assert_eq!(
+            recovered.supervised_candidate_id.as_deref(),
+            Some(candidate.artifact_id.as_str())
+        );
+        assert!(recovered.supervised_replay_receipt_id.is_none());
+        assert!(recovered.supervised_replay_gate_passed.is_none());
+        assert!(recovered.sealed_receipt_id.is_none());
     }
 
     #[test]

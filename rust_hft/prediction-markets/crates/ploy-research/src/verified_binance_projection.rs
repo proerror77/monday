@@ -454,11 +454,13 @@ mod tests {
     fn book_events(snapshot_received_at_ns: u64) -> Vec<ReplayedBinanceBookEvent> {
         vec![
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                clock: None,
                 received_at_ns: snapshot_received_at_ns,
                 bids: vec![["100".into(), "1".into()]],
                 asks: vec![["101".into(), "1".into()]],
             }),
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                clock: None,
                 received_at_ns: RECEIVED_NS,
                 bids: vec![["100.5".into(), "2".into()]],
                 asks: Vec::new(),
@@ -622,16 +624,19 @@ mod tests {
         let base_ns = SOURCE_MS * 1_000_000;
         let events = vec![
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                clock: None,
                 received_at_ns: base_ns,
                 bids: vec![["100".into(), "1".into()]],
                 asks: vec![["101".into(), "1".into()]],
             }),
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                clock: None,
                 received_at_ns: base_ns + 31 * SECOND_NS,
                 bids: vec![["100.5".into(), "2".into()]],
                 asks: Vec::new(),
             }),
             ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                clock: None,
                 received_at_ns: base_ns + 32 * SECOND_NS,
                 bids: vec![["100.75".into(), "2".into()]],
                 asks: Vec::new(),

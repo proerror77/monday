@@ -1,4 +1,5 @@
 [package]
+workspace = "runtime"
 name = "rust-hft-workspace"
 version = "0.0.0"
 edition = "2021"
@@ -9,116 +10,6 @@ autoexamples = false
 autotests = false
 autobenches = false
 
-[workspace]
-resolver = "2"  # 防止 feature 無腦合併
-members = [
-    ".",
-    # Market Core
-    "market-core/core",
-    "market-core/ports",
-    "market-core/snapshot",
-    "market-core/engine",
-    "market-core/integration",
-    "market-core/runtime",
-
-    # Data Pipelines
-    "data-pipelines/core",
-    "data-pipelines/adapters-common",
-    "data-pipelines/adapters/adapter-bitget",
-    "data-pipelines/adapters/adapter-binance",
-    "data-pipelines/adapters/adapter-binance-prediction",
-    "data-pipelines/adapters/adapter-predict-fun",
-    "data-pipelines/adapters/adapter-deribit-reference",
-    "data-pipelines/adapters/adapter-mock",
-    "data-pipelines/adapters/adapter-asterdex",
-    "data-pipelines/adapters/adapter-bybit",
-    "data-pipelines/adapters/adapter-grvt",
-    "data-pipelines/adapters/adapter-ondo-perps",
-    "data-pipelines/adapters/adapter-polymarket",
-
-    # Strategy Framework
-    "strategy-framework/strategy-dl",
-    "strategy-framework/infer-onnx",
-    "strategy-framework/strategies/trend",
-    "strategy-framework/strategies/arbitrage",
-    "strategy-framework/strategies/imbalance",
-    "strategy-framework/strategies/formula",
-    "strategy-framework/strategies/lob_flow_grid",
-
-    # Risk Control
-    "risk-control/risk",
-    "risk-control/oms-core",
-    "risk-control/portfolio-core",
-
-    # Execution Gateway
-    "execution-gateway/execution",
-    "execution-gateway/adapters/adapter-bitget",
-    "execution-gateway/adapters/adapter-binance",
-    "execution-gateway/adapters/adapter-binance-prediction",
-    "execution-gateway/adapters/adapter-okx",
-    "execution-gateway/adapters/adapter-bybit",
-    "execution-gateway/adapters/adapter-asterdex",
-    "execution-gateway/adapters/adapter-grvt",
-    "execution-gateway/adapters/adapter-ondo-perps",
-    "execution-gateway/adapters/adapter-polymarket",
-
-    # Infra Services
-    "infra-services/core/clickhouse",
-    "infra-services/core/redis",
-    "infra-services/core/metrics",
-    "infra-services/core/secrets",
-    "infra-services/core/ipc",
-    "infra-services/core/grpc-server",
-
-    # Research Core
-    "research-core/factor-dsl",
-    "research-core/manifest",
-    "research-core/ml",
-    "research-core/search-kernel",
-
-    # Governance contracts shared by research producers and the runtime
-    "governance-contracts",
-
-    # Bounded Loop Engineer research plane
-    "alpha-harness/domain",
-    "alpha-harness/store",
-    "alpha-harness/engine",
-    "alpha-harness/onnx-evaluator",
-    "alpha-harness/app",
-
-    # Applications
-    "apps/live",
-    "apps/all-in-one",
-    "apps/binance-md",
-    "apps/paper",
-    "apps/replay",
-    "apps/backtest",
-
-    # Shared Catalogs
-    "shared/instrument",
-    "shared/config",
-    "shared/polymarket-tape",
-
-    # Tools & Utilities
-    "tools/collector",
-    "tools/ws_test",
-    "tools/harnessctl",
-    "tools/listing-monitor"
-]
-
-# 預設只編譯核心元件與主要應用，可透過 `cargo build -p` 指定其他 crate。
-default-members = [
-    ".",
-    "market-core/core",
-    "market-core/ports",
-    "market-core/engine",
-    "market-core/runtime",
-    "strategy-framework/strategy-dl",
-    "apps/live",
-    "apps/paper",
-    "apps/all-in-one"
-]
-
 # 工作區級別依賴 (最小化)
 [dependencies]
 serde_json = { workspace = true, optional = true }
@@ -128,67 +19,6 @@ arc-swap = { workspace = true, optional = true }
 clickhouse = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
-
-[workspace.dependencies]
-# 核心零依賴
-serde = { version = "1.0", features = ["derive", "rc"] }
-thiserror = "2.0"
-sha2 = "0.10"
-ed25519-dalek = "2"
-hex = "0.4"
-fs4 = "1.1.0"
-
-# 非同步 (只在需要的 crate 開)
-tokio = { version = "1.0", default-features = false }
-tokio-stream = "0.1"
-futures = "0.3"
-futures-util = "0.3"
-
-# 高性能 (只在 integration/apps 開)
-crossbeam = { version = "0.8", default-features = false }
-arc-swap = "1.6"
-# left-right = "0.11"  # Removed: incompatible with Sync requirement
-crossbeam-utils = { version = "0.8", default-features = false }
-
-# 網路 (只在 integration 開，其他復用)
-tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "stream", "rustls-tls-webpki-roots"] }
-reqwest = { version = "0.12", default-features = false }
-axum = "0.7"
-
-# JSON (熱點可選 SIMD)
-serde_json = "1.0"
-simd-json = "0.14"
-
-# 基礎設施（版本統一於 workspace；是否 optional 由各 crate 自己決定）
-clickhouse = "0.14"
-redis = "1.0"
-prometheus = "0.14"
-
-parking_lot = "0.12"
-
-# 日誌 
-tracing = "0.1"
-
-# IPC 相關
-rmp-serde = "1.3"
-uuid = { version = "1.0", features = ["v4"] }
-tracing-subscriber = "0.3"
-
-# 時間處理
-chrono = { version = "0.4", features = ["serde"] }
-
-# async trait
-async-trait = "0.1"
-
-# Decimal types
-rust_decimal = { version = "1.33", features = ["serde"] }
-
-# CLI and examples
-clap = { version = "4.0", features = ["derive"] }
-metrics-exporter-prometheus = "0.17"
-burn = { version = "0.20.1", default-features = false, features = ["ndarray", "autodiff", "std"] }
-burn-ndarray = "0.20.1"
-burn-store = { version = "0.20.1", default-features = false, features = ["std", "burnpack"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -224,29 +54,3 @@ harness = false
 name = "ultra_components"
 path = "benches/ultra_components.rs"
 harness = false
-
-[profile.dev]
-# 開發模式：編譯快優先
-opt-level = 0
-debug = true
-incremental = true
-lto = false
-
-[profile.release]
-# 發布模式：執行快優先，並保持可分發產物精簡
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-panic = "abort"
-strip = "symbols"
-split-debuginfo = "packed"
-
-[profile.bench]
-# 基準測試：最高優化
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-debug = false
-
-[patch.crates-io]
-rust_decimal = { git = "https://github.com/proerror77/monday-rust-decimal-security-694", rev = "4f7bc6f02d7920b6416988914ae86d25f6670b22" }

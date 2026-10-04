@@ -1,4 +1,5 @@
 [package]
+workspace = "../../data-pipelines"
 name = "ws-connection-test"
 version = "0.1.0"
 edition = "2021"

@@ -1,4 +1,5 @@
 [package]
+workspace = ".."
 name = "hft-data"
 version = "0.1.0"
 edition = "2021"
@@ -19,6 +20,8 @@ futures = { workspace = true }
 tracing = { workspace = true }
 libc = "0.2"
 zstd = "0.13"
+parquet = { version = "59.1", default-features = false, features = ["zstd"], optional = true }
+bytes = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -26,6 +29,7 @@ tempfile = "3.10"
 [features]
 default = []
 json-simd = ["dep:simd-json"]
+columnar = ["dep:parquet", "dep:bytes"]
 
 [dependencies.simd-json]
 workspace = true

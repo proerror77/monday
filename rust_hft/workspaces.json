@@ -1,0 +1,29 @@
+{
+  "schema": "monday.cargo_workspaces.v1",
+  "workspaces": [
+    {
+      "id": "shared",
+      "manifest": "shared/Cargo.toml"
+    },
+    {
+      "id": "data",
+      "manifest": "data-pipelines/Cargo.toml"
+    },
+    {
+      "id": "research",
+      "manifest": "research-core/Cargo.toml"
+    },
+    {
+      "id": "control",
+      "manifest": "research-core/platform/Cargo.toml"
+    },
+    {
+      "id": "runtime",
+      "manifest": "runtime/Cargo.toml"
+    },
+    {
+      "id": "prediction",
+      "manifest": "prediction-markets/Cargo.toml"
+    }
+  ]
+}

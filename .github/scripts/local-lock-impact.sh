@@ -9,7 +9,7 @@ if [[ ${1:-} == --files ]]; then
 else
   base=${1:-} head=${2:-} path=${3:-}
   [[ $base =~ ^[0-9a-f]{40}$ && $head =~ ^[0-9a-f]{40}$ ]] || exit 3
-  case "$path" in rust_hft/Cargo.lock|rust_hft/prediction-markets/Cargo.lock) ;; *) exit 3 ;; esac
+  case "$path" in rust_hft/Cargo.lock|rust_hft/runtime/Cargo.lock|rust_hft/shared/Cargo.lock|rust_hft/data-pipelines/Cargo.lock|rust_hft/research-core/Cargo.lock|rust_hft/research-core/platform/Cargo.lock|rust_hft/prediction-markets/Cargo.lock) ;; *) exit 3 ;; esac
   before=$tmp/before after=$tmp/after
   git show "$base:$path" >"$before" || exit 3
   git show "$head:$path" >"$after" || exit 3

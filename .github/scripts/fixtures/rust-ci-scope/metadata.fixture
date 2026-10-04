@@ -28,6 +28,7 @@
     { "name": "ploy-replay", "manifest_path": "rust_hft/prediction-markets/apps/ploy-replay/Cargo.toml", "dependencies": [{ "name": "ploy-market-data", "path": "../../crates/ploy-market-data" }] },
     { "name": "new-ploy-runner", "manifest_path": "rust_hft/prediction-markets/apps/new-ploy-runner/Cargo.toml", "dependencies": [{ "name": "ploy-strategy-bundles", "path": "../../crates/ploy-strategy-bundles" }] },
     { "name": "ploy-research", "manifest_path": "rust_hft/prediction-markets/crates/ploy-research/Cargo.toml", "dependencies": [{ "name": "ploy-feed-loaders", "path": "../ploy-feed-loaders" }] },
-    { "name": "ploy", "manifest_path": "rust_hft/prediction-markets/Cargo.toml", "dependencies": [{ "name": "ploy-operator-contracts", "path": "crates/ploy-operator-contracts" }] }
+    { "name": "ploy", "manifest_path": "rust_hft/prediction-markets/Cargo.toml", "dependencies": [{ "name": "ploy-operator-contracts", "path": "crates/ploy-operator-contracts" }] },
+    { "name": "hft-market-pipeline", "manifest_path": "rust_hft/data-pipelines/market-pipeline/Cargo.toml", "dependencies": [] }
   ]
 }
