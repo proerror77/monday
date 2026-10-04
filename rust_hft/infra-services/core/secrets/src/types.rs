@@ -39,7 +39,7 @@ impl fmt::Debug for SecretValue {
 
 impl fmt::Display for SecretValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SecretValue({})", &self.name)
+        write!(f, "SecretValue({})", self.name)
     }
 }
 

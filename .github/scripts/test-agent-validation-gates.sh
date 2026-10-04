@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$script_dir/../.." && pwd)
+export GITHUB_WORKSPACE="$root"
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 
@@ -37,12 +38,23 @@ mkdir "$fixture/bin"
 cat >"$fixture/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ $1 == metadata ]]; then
+  case ${3:-} in
+    "$GITHUB_WORKSPACE/rust_hft/runtime/Cargo.toml")
+      jq -n --arg workspace "${3%/Cargo.toml}" --arg manifest "$GITHUB_WORKSPACE/rust_hft/market-core/engine/Cargo.toml" \
+        '{workspace_root:$workspace,workspace_members:["engine"],packages:[{id:"engine",name:"hft-engine",manifest_path:$manifest}]}' ;;
+    "$GITHUB_WORKSPACE/rust_hft/shared/Cargo.toml"|"$GITHUB_WORKSPACE/rust_hft/data-pipelines/Cargo.toml"|"$GITHUB_WORKSPACE/rust_hft/research-core/Cargo.toml"|"$GITHUB_WORKSPACE/rust_hft/research-core/platform/Cargo.toml"|"$GITHUB_WORKSPACE/rust_hft/prediction-markets/Cargo.toml")
+      jq -n --arg workspace "${3%/Cargo.toml}" '{workspace_root:$workspace,workspace_members:[],packages:[]}' ;;
+    *) exit 78 ;;
+  esac
+  exit 0
+fi
 printf '%s\n' "$@" >"$RUNNER_TEMP/cargo-args"
 printf 'quote_to_worker_queue samples=20000 warmup=1000 p50_ns=10 p99_ns=20 p999_ns=30 p99_budget_ns=500000 p999_budget_ns=1000000\n'
 exit "$BENCHMARK_EXIT"
 SH
 chmod +x "$fixture/bin/cargo"
-printf '%s\n' test -p hft-engine --bench hotpath_latency_p99 --release --locked -- --nocapture \
+printf '%s\n' test --manifest-path "$root/rust_hft/runtime/Cargo.toml" -p hft-engine --bench hotpath_latency_p99 --release --locked -- --nocapture \
   >"$fixture/expected-args"
 
 for result in 0 101; do

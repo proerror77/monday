@@ -103,11 +103,13 @@
   identity and the properties or relationships required by that request. Do not
   require later delivery states unless requested. For an asynchronous job whose
   result is requested, verify its terminal result and output, not just submission.
-- Remote build or validation tasks use `monday-remote-build` to select the existing
-  managed ACK executor or a disposable Cloud Assistant task. Managed CI follows
-  its reviewed request, cache, and receipt contract; do not apply disposable
-  fresh-cache isolation to that executor. Neither path may place a workspace,
-  toolchain, Cargo cache, or target directory on an `ack-system` node.
+- Rust validation follows the current workflow and the package's owning
+  workspace. Use `monday-remote-build` when selecting a build execution path;
+  native CI is not redirected to historical private ACK receipt dispatch.
+  Remote compilation uses only an explicitly assigned executor/profile and its
+  admitted source, cache and cleanup contract. Scientific compute consumes a
+  verified Build; neither caches nor Agent sessions grant compute authority.
+  Keep build workspaces, toolchains and targets off `ack-system` nodes.
 - For CEX cloud research, follow the
   [ACK-only evidence and recovery boundary](deployment/aliyun/research/README.md#data-flow-review-and-host-lifetime)
   during preparation, verification, reporting, recovery, and resource cleanup.
@@ -182,3 +184,29 @@
 
 - Lead with the result in concise Chinese unless the user requests another
   language. Use plain paragraphs; use lists or tables when they aid comparison.
+
+- Use [Karpathy's explanation method](https://x.com/karpathy/status/2105819303471976479)
+  for new or edited technical explanations, documentation, PR descriptions,
+  and code comments. Use approximately 80% of ASD-STE100 by default.
+  Write short, direct sentences. Use active voice and one term per concept.
+- For English prose, aim for at most 20 words per instruction and 25 words per
+  descriptive sentence. Give one action per instruction. Keep each paragraph
+  on one topic, usually within six sentences. Explain necessary technical names.
+  Apply these clarity principles to Chinese without imposing English word counts.
+- Preserve exact identifiers, commands, scientific constraints, and evidence.
+  The 80% target describes writing style, not a measured compliance score.
+  Do not claim formal STE compliance without checking the rules and dictionary.
+- Choose the form that makes the explanation easiest to understand.
+  Use short prose for simple results. Use diagrams for relationships, boundaries,
+  or sequences. Use a self-contained interactive HTML explainer when controls,
+  scenarios, or animation make a complex idea clearer.
+- Use a focused 3b1b-style video when a narrated sequence materially improves
+  understanding. Start with a concrete example. Build the visual model step by
+  step, then introduce the definition or formula. Each visual change must explain
+  a specific point. Apply the same sequence to diagrams and interactive explainers.
+- Keep the written technical contract as the source of truth. Link each visual
+  or interactive explainer to its source. Distinguish implemented behavior,
+  proposed interfaces, and verified deployments in every format.
+- Create explanation artifacts within the assigned outcome and existing budget.
+  Use already-authorized audio tools or suitable local alternatives. Do not
+  assume an API key or a paid narration service is available.

@@ -637,6 +637,15 @@ fn validated_data_audit(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
+        println!(
+            "monday-prediction-snapshot: immutable prediction snapshot tooling\n\
+          --admit-authenticated-snapshot\n\
+          --verify-polymarket-evidence <explicit evidence flags>\n\
+          Snapshot and artifact access require explicit input and admission flags."
+        );
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("--admit-authenticated-snapshot") {
         let Some(roots) = snapshot_admission_roots_from_env() else {
             println!(

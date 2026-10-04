@@ -1,0 +1,37 @@
+message monday_market_events_v1 {
+  REQUIRED BINARY batch_id (UTF8);
+  REQUIRED BINARY venue (UTF8);
+  REQUIRED BINARY market (UTF8);
+  REQUIRED BINARY instrument (UTF8);
+  REQUIRED BINARY session (UTF8);
+  REQUIRED BINARY normalizer_sha256 (UTF8);
+  REQUIRED BINARY source_sha256 (UTF8);
+  REQUIRED BINARY event_kind (UTF8);
+  REQUIRED INT64 ordinal;
+  REQUIRED INT64 source_row;
+  REQUIRED INT64 source_received_ns;
+  REQUIRED INT64 available_ns;
+  OPTIONAL INT64 exchange_event_ns;
+  OPTIONAL INT64 transaction_ns;
+  OPTIONAL INT64 first_update_id;
+  OPTIONAL INT64 final_update_id;
+  OPTIONAL INT64 previous_update_id;
+  OPTIONAL INT64 aggregate_trade_id;
+  OPTIONAL INT64 first_trade_id;
+  OPTIONAL INT64 last_trade_id;
+  OPTIONAL INT64 price (DECIMAL(18,8));
+  OPTIONAL INT64 quantity (DECIMAL(18,8));
+  OPTIONAL BOOLEAN is_buyer_maker;
+  REQUIRED GROUP bid_price (LIST) {
+    REPEATED GROUP list { REQUIRED INT64 element (DECIMAL(18,8)); }
+  }
+  REQUIRED GROUP bid_quantity (LIST) {
+    REPEATED GROUP list { REQUIRED INT64 element (DECIMAL(18,8)); }
+  }
+  REQUIRED GROUP ask_price (LIST) {
+    REPEATED GROUP list { REQUIRED INT64 element (DECIMAL(18,8)); }
+  }
+  REQUIRED GROUP ask_quantity (LIST) {
+    REPEATED GROUP list { REQUIRED INT64 element (DECIMAL(18,8)); }
+  }
+}

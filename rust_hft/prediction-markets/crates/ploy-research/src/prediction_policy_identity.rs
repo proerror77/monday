@@ -50,7 +50,7 @@ mod tests {
             format!("sha256:{:x}", Sha256::digest(fingerprint)),
             "the runtime identity must hash the exact checked-in Linux graph"
         );
-        assert!(fingerprint.starts_with("prediction-policy-dependencies.v5\n"));
+        assert!(fingerprint.starts_with("prediction-policy-dependencies.v6\n"));
         assert!(fingerprint.contains("target=x86_64-unknown-linux-gnu\n"));
         assert!(fingerprint.contains("profile=default,db\n"));
         for input in [
@@ -67,6 +67,11 @@ mod tests {
             "../market-core/snapshot/Cargo.toml",
             "../risk-control/oms-core/Cargo.toml",
             "../risk-control/portfolio-core/Cargo.toml",
+            "../shared/Cargo.toml",
+            "../data-pipelines/Cargo.toml",
+            "../research-core/Cargo.toml",
+            "../runtime/Cargo.toml",
+            "../research-core/search-kernel/Cargo.toml",
         ] {
             assert!(fingerprint.contains(&format!("input:{input}=sha256:")));
         }
@@ -131,6 +136,11 @@ mod tests {
         for input in [
             "../risk-control/oms-core/Cargo.toml",
             "../risk-control/portfolio-core/Cargo.toml",
+            "../shared/Cargo.toml",
+            "../data-pipelines/Cargo.toml",
+            "../research-core/Cargo.toml",
+            "../runtime/Cargo.toml",
+            "../research-core/search-kernel/Cargo.toml",
         ] {
             let input_line = graph
                 .lines()

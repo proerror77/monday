@@ -2,14 +2,17 @@
 
 FROM rust:1.98.1-slim-bookworm AS builder
 
-RUN apt-get update && apt-get install -y pkg-config libssl-dev ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang cmake mold pkg-config protobuf-compiler libssl-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
 COPY . .
 
 # Build only the hft-live binary with required features
-RUN cargo build -p hft-live --release --features "bitget,binance,imbalance-strategy,full-infra"
+RUN CARGO_TARGET_DIR=/work/target cargo --config 'build.rustc-wrapper=""' build \
+    --manifest-path runtime/Cargo.toml -p hft-live --bin hft-live --release --locked \
+    --features "bitget,binance,imbalance-strategy,full-infra"
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*

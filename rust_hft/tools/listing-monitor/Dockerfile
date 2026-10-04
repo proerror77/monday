@@ -7,7 +7,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/work/target,sharing=locked \
-    cargo build --release --locked -p listing-monitor \
+    CARGO_TARGET_DIR=/work/target cargo build --manifest-path data-pipelines/Cargo.toml --release --locked -p listing-monitor \
     --bin listing-monitor-alpha \
     --bin listing-monitor-spot \
     && install -D -m 0755 target/release/listing-monitor-alpha /out/listing-monitor-alpha \

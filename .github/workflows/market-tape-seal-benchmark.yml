@@ -89,7 +89,7 @@ jobs:
         working-directory: rust_hft
         run: |
           set -euo pipefail
-          cargo test -p hft-collector --lib --features collector-binance --release --locked \
+          cargo test --manifest-path data-pipelines/Cargo.toml -p hft-collector --lib --features collector-binance --release --locked \
             synthetic_immutable_fixture_reports_full_scan_and_seal_lookup_phases \
             --no-run
 
@@ -111,7 +111,7 @@ jobs:
           set -euo pipefail
           test_name='polymarket_upload::tests::synthetic_immutable_fixture_reports_full_scan_and_seal_lookup_phases'
           set +e
-          cargo test -p hft-collector --lib --features collector-binance --release --locked \
+          cargo test --manifest-path data-pipelines/Cargo.toml -p hft-collector --lib --features collector-binance --release --locked \
             "$test_name" -- --ignored --exact --nocapture 2>&1 | tee "$BENCHMARK_LOG"
           cargo_status=${PIPESTATUS[0]}
           set -e

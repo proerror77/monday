@@ -1,0 +1,60 @@
+# data workspace; source paths and runtime behavior are preserved.
+[workspace]
+resolver = "2"
+members = ["adapters/adapter-bitget", "adapters-common", "adapters/adapter-asterdex", "adapters/adapter-binance", "adapters/adapter-binance-prediction", "adapters/adapter-bybit", "adapters/adapter-grvt", "adapters/adapter-mock", "adapters/adapter-ondo-perps", "adapters/adapter-polymarket", "core", "adapters/adapter-predict-fun", "adapters/adapter-deribit-reference", "../tools/collector", "../apps/binance-md", "../tools/ws_test", "../tools/listing-monitor", "market-pipeline"]
+default-members = ["core"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive", "rc"] }
+thiserror = "2.0"
+sha2 = "0.10"
+hex = "0.4"
+fs4 = "1.1.0"
+tokio = { version = "1.0", default-features = false }
+tokio-stream = "0.1"
+futures = "0.3"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "stream", "rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false }
+serde_json = "1.0"
+simd-json = "0.14"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+rust_decimal = { version = "1.33", features = ["serde"] }
+clap = { version = "4.0", features = ["derive"] }
+
+[profile.dev]
+# 開發模式：編譯快優先
+opt-level = 0
+debug = true
+incremental = true
+lto = false
+
+[profile.release]
+# 發布模式：執行快優先，並保持可分發產物精簡
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+split-debuginfo = "packed"
+
+# Admitted research builds trade cross-crate LTO for shorter edit/build loops.
+# Profile bytes are part of BuildSpec; production release behavior stays separate.
+[profile.research]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+
+[profile.bench]
+# 基準測試：最高優化
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+
+[patch.crates-io]
+rust_decimal = { git = "https://github.com/proerror77/monday-rust-decimal-security-694", rev = "4f7bc6f02d7920b6416988914ae86d25f6670b22" }

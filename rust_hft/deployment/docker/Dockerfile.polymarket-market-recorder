@@ -13,19 +13,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY . .
 WORKDIR /work/prediction-markets
+ENV CARGO_TARGET_DIR=/work/prediction-markets/target
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/work/prediction-markets/target,sharing=locked \
     printf '%s\n' "$SOURCE_REVISION" | grep -Eq '^[0-9a-f]{40}$' \
-    && if cargo tree --locked -p new-ploy-runner --features full -e features \
+    && if cargo tree --manifest-path Cargo.toml --locked -p new-ploy-runner --features full -e features \
       | grep -q 'live-execution'; then \
       echo "new-ploy-runner full feature must not enable live-execution" >&2; \
       exit 1; \
     fi \
     && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo --config 'build.rustc-wrapper=""' build \
+      --manifest-path Cargo.toml \
       --release \
       --locked \
       -p new-ploy-runner \
+      --bin new-ploy-runner \
       --features full \
     && install -D -m 0755 target/release/new-ploy-runner \
       /out/bin/new-ploy-runner

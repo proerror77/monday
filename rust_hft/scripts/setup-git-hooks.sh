@@ -18,13 +18,15 @@ cat > "$HOOKS_DIR/pre-commit" << 'EOF'
 # Pre-commit hook: 在提交前檢查代碼質量
 
 set -e
+REPO_ROOT=$(git rev-parse --show-toplevel)
+SCOPED_CARGO="$REPO_ROOT/rust_hft/scripts/cargo-scoped.sh"
 
 echo "🔍 Pre-commit 檢查..."
 echo ""
 
 # 格式檢查
 echo "📝 檢查代碼格式..."
-if ! cargo fmt -- --check 2>&1 | grep -q "Diff"; then
+if ! "$SCOPED_CARGO" fmt -p hft-core -p hft-snapshot -p hft-engine --check 2>&1 | grep -q "Diff"; then
     echo "✅ 代碼格式符合規範"
 else
     echo "❌ 代碼格式不符，運行以下命令修復:"
@@ -43,7 +45,7 @@ CORE_CRATES=(
 
 for crate in "${CORE_CRATES[@]}"; do
     echo -n "  ├─ 檢查 $crate... "
-    if cargo check -p "$crate" --quiet 2>&1; then
+    if "$SCOPED_CARGO" check -p "$crate" --quiet 2>&1; then
         echo "✅"
     else
         echo "❌"
@@ -56,7 +58,7 @@ done
 # Clippy 快速檢查（只檢查核心 crates）
 echo ""
 echo "📎 Clippy 檢查..."
-if cargo clippy -p hft-core -p hft-snapshot -p hft-engine -- -D warnings 2>&1 | grep -q "error"; then
+if "$SCOPED_CARGO" clippy -p hft-core -p hft-snapshot -p hft-engine -- -D warnings 2>&1 | grep -q "error"; then
     echo "❌ Clippy 發現問題，請修復後重試"
     exit 1
 else

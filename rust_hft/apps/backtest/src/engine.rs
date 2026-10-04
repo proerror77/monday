@@ -20,7 +20,8 @@ use hft_core::{
 };
 
 use crate::config::{
-    BacktestConfig, BacktestInputEvidence, ExecutionConfig, RiskConfig, StrategyConfig,
+    validate_market_identity, BacktestConfig, BacktestInputEvidence, ExecutionConfig, RiskConfig,
+    StrategyConfig,
 };
 use crate::event::{EventEnvelope, EventPayload, EventStream, Level, TradeSide};
 use hft_research_manifest::model::{
@@ -235,6 +236,92 @@ pub fn replay_target_positions_with_trace_and_spot_rules(
     let stream = EventStream::new(BufReader::new(Cursor::new(event_bytes)), None, None, true);
     for event in stream {
         replay.observe(&event?)?;
+    }
+    replay.finish_with_trace()
+}
+
+/// The verified typed input is loaded once by the batch owner. Each call creates
+/// an independent IOC replay state; neither the input nor another trial is mutated.
+/// Multiple gap-separated segments require separate scientific replay tasks.
+pub fn replay_shared_target_positions(
+    input: &hft_research_platform::data::SharedInput,
+    expected_manifest_sha256: &str,
+    decisions: &[TargetPositionDecision],
+    config: &TargetPositionReplayConfig,
+    spot_instrument_rules: Option<&CexSpotInstrumentRulesV1>,
+) -> Result<TargetPositionReplayOutput> {
+    use hft_research_platform::data::{ReplayPayload, TypedBlock};
+    anyhow::ensure!(
+        input.manifest_sha256() == expected_manifest_sha256,
+        "wrong shared DataView identity"
+    );
+    validate_market_identity(&config.market, &input.spec().market)?;
+    if let Some(rules) = spot_instrument_rules {
+        anyhow::ensure!(
+            rules.symbol == input.spec().instrument,
+            "Spot rules instrument mismatch"
+        );
+    }
+    anyhow::ensure!(
+        decisions.iter().all(|d| i128::from(d.timestamp_us) * 1000
+            >= i128::from(input.spec().window.start_ns)
+            && i128::from(d.timestamp_us) * 1000 < i128::from(input.spec().window.end_ns)),
+        "decision outside admitted split"
+    );
+    let mut replay =
+        TargetPositionReplay::new_with_spot_rules(decisions, config, spot_instrument_rules)?;
+    let mut segment: Option<&str> = None;
+    for block in input.blocks() {
+        let TypedBlock::Replay(rows) = block.as_ref() else {
+            bail!("expected typed replay input");
+        };
+        for row in rows {
+            anyhow::ensure!(
+                segment.is_none_or(|s| s == row.segment),
+                "cannot carry replay state across gap/session"
+            );
+            segment = Some(&row.segment);
+            let levels = |rows: &[[f64; 2]]| {
+                rows.iter()
+                    .map(|v| Level {
+                        price: v[0],
+                        quantity: v[1],
+                    })
+                    .collect()
+            };
+            let payload = match &row.payload {
+                ReplayPayload::Snapshot { bids, asks } => EventPayload::Snapshot {
+                    bids: levels(bids),
+                    asks: levels(asks),
+                },
+                ReplayPayload::Delta { bids, asks } => EventPayload::L2Update {
+                    bids: levels(bids),
+                    asks: levels(asks),
+                },
+                ReplayPayload::Trade {
+                    price,
+                    quantity,
+                    buyer_initiated,
+                } => EventPayload::Trade {
+                    side: if *buyer_initiated {
+                        TradeSide::Buy
+                    } else {
+                        TradeSide::Sell
+                    },
+                    price: *price,
+                    quantity: *quantity,
+                },
+            };
+            // Availability rounds upward when the old engine's microsecond
+            // clock cannot represent a nanosecond. Never expose an event early.
+            let ts = row.available_ns.div_euclid(1000)
+                + i64::from(row.available_ns.rem_euclid(1000) != 0);
+            replay.observe(&EventEnvelope {
+                ts,
+                sequence: Some(row.ordinal),
+                payload,
+            })?;
+        }
     }
     replay.finish_with_trace()
 }
@@ -2673,6 +2760,138 @@ mod tests {
             risk: RiskConfig::default(),
             output: OutputConfig::default(),
         }
+    }
+
+    #[test]
+    fn shared_typed_replay_reuses_input_and_keeps_trial_state_independent() {
+        use hft_research_platform::{
+            data::{
+                self, BlockRef, DataViewSpec, Exit, PublishedView, ReplayEvent, ReplayPayload,
+                Split, TypedBlock, VerifiedCache, Window,
+            },
+            identity,
+            prepared::{self, AcquiredBlocks},
+            sha256,
+        };
+        let spec = DataViewSpec {
+            schema: 1,
+            venue: "fixture".into(),
+            instrument: "fixture".into(),
+            market: "usdm".into(),
+            depth: 1,
+            sources: vec!["a".repeat(64)],
+            normalizer_sha256: "b".repeat(64),
+            feature_sql_sha256: "c".repeat(64),
+            feature_names: vec!["mid".into()],
+            window: Window {
+                start_ns: 1_000_000,
+                end_ns: 4_000_000,
+            },
+            lookback_ns: 0,
+            horizons_ns: vec![500_000],
+            label_tolerance_ns: 0,
+            fit_cutoff_ns: 4_000_000,
+            split: Split::Train,
+        };
+        let events = vec![
+            ReplayEvent {
+                segment: "a".into(),
+                ordinal: 0,
+                event_ns: 1_000_000,
+                available_ns: 1_000_000,
+                payload: ReplayPayload::Snapshot {
+                    bids: vec![[99.0, 10.0]],
+                    asks: vec![[101.0, 10.0]],
+                },
+            },
+            ReplayEvent {
+                segment: "a".into(),
+                ordinal: 1,
+                event_ns: 2_000_000,
+                available_ns: 2_000_000,
+                payload: ReplayPayload::Delta {
+                    bids: vec![[99.0, 12.0]],
+                    asks: vec![[101.0, 12.0]],
+                },
+            },
+            ReplayEvent {
+                segment: "a".into(),
+                ordinal: 2,
+                event_ns: 3_000_000,
+                available_ns: 3_000_000,
+                payload: ReplayPayload::Delta {
+                    bids: vec![[99.0, 11.0]],
+                    asks: vec![[101.0, 11.0]],
+                },
+            },
+        ];
+        let bytes = prepared::encode(&TypedBlock::Replay(events)).unwrap();
+        let block = prepared::decode(&bytes).unwrap();
+        let sha = sha256(&bytes);
+        let view = PublishedView {
+            prepared_id: "d".repeat(64),
+            spec,
+            blocks: vec![BlockRef {
+                sha256: sha.clone(),
+                bytes: bytes.len() as u64,
+                rows: 3,
+                decoded_bytes: data::memory_bytes(&block),
+                exit: Exit::Replay,
+            }],
+            producer_image: format!("fixture@sha256:{}", "e".repeat(64)),
+            source_receipt_sha256: "f".repeat(64),
+        };
+        let manifest = identity(&view).unwrap();
+        let mut source = AcquiredBlocks {
+            bytes: std::collections::BTreeMap::from([(sha, bytes)]),
+        };
+        let input = VerifiedCache::new(64 * 1024)
+            .unwrap()
+            .load(&view, &manifest, Exit::Replay, &mut source)
+            .unwrap();
+        let config = TargetPositionReplayConfig {
+            holding: None,
+            market: "usdm".into(),
+            max_depth_levels: 1,
+            max_decision_delay_us: 5000,
+            order_latency_us: 0,
+            position_notional_usd: 100.0,
+            fee_bps: 1.0,
+            rebate_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            additional_slippage_bps: 0.0,
+            cross_spread: true,
+            capacity_depth_levels: 1,
+            trade_tape_declared: false,
+        };
+        let decisions = vec![
+            TargetPositionDecision {
+                entry_target: None,
+                timestamp_us: 1000,
+                target_position: 1.0,
+            },
+            TargetPositionDecision {
+                entry_target: None,
+                timestamp_us: 3000,
+                target_position: 0.0,
+            },
+        ];
+        let first =
+            replay_shared_target_positions(&input, &manifest, &decisions, &config, None).unwrap();
+        let second =
+            replay_shared_target_positions(&input.clone(), &manifest, &decisions, &config, None)
+                .unwrap();
+        assert_eq!(first, second);
+        assert!(
+            replay_shared_target_positions(&input, &"a".repeat(64), &decisions, &config, None)
+                .is_err()
+        );
+        let mut wrong = config;
+        wrong.market = "spot".into();
+        assert!(
+            replay_shared_target_positions(&input, &manifest, &decisions, &wrong, None).is_err()
+        );
     }
 
     fn spot_replay_rules() -> CexSpotInstrumentRulesV1 {

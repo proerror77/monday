@@ -9,11 +9,15 @@ Produce a read-only inventory. Classification is not deletion authorization.
 
 ## Workflow
 
-1. Scope the audit to the requested paths. For a repository-wide inventory, run
+1. Scope the audit to the requested paths. A single `git worktree list` covers
+   one Git common directory, not independent clones of the same repository.
+   Include separately recorded checkout paths when the task names them; compare
+   each path's common directory, exact HEAD and status. Do not scan the whole host
+   or create another checkout registry.
+   For one repository's registered inventory, use
    `.github/scripts/agent-worktree-preflight.sh report` once. For named paths,
-   read `git worktree list --porcelain` and each path's status directly. Preserve
-   the path, branch or detached `HEAD`, and Git's `prunable` marker; do not repeat
-   an equivalent inventory or expand a named-path request to the whole repository.
+   read Git metadata directly. Preserve branch/detached HEAD and Git's prunable
+   marker. Reuse equivalent inventory within the requested scope.
 2. Enumerate unattached local branches only for repository-wide inventory or
    branch-cleanup requests. For dirty entries, report changed and untracked paths.
 3. Classify from the selected inventory source:
@@ -24,6 +28,7 @@ Produce a read-only inventory. Classification is not deletion authorization.
    not prove an active owner or make a worktree safe to remove.
 4. For cleanup candidates or ownership conflicts, read the ownership record,
    exact `HEAD`, upstream/push state, PR disposition, merge state, and active use.
+   A shared branch/PR name does not prove a shared checkout or one writer.
    A lock is active only with `flock` or holder evidence, not mere file existence.
 5. Mark `cleanup-safe` only when existing task authorization covers the exact
    paths, they are clean with no unpushed work, PR disposition is resolved, no
