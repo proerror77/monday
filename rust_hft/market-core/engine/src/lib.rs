@@ -12,6 +12,7 @@ pub mod execution_control;
 pub mod execution_queues;
 pub mod execution_worker;
 pub mod latency_monitor;
+pub mod rate_budget;
 
 use aggregation::{AggregationEngine, MarketView, TopNSnapshot};
 use dataflow::{EventConsumer, IngestionConfig};

@@ -8,6 +8,7 @@
 
 use crate::execution_queues::WorkerQueues;
 use crate::latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
+use crate::rate_budget::{RateBudget, RateBudgetOperation};
 use futures::stream::SelectAll;
 use futures::{FutureExt, StreamExt};
 use hft_core::{
@@ -251,6 +252,9 @@ pub struct ExecutionWorker {
     account_admissions: FxHashMap<AccountId, AccountExecutionAdmission>,
     /// Environment independently bound to the selected runtime client.
     account_environments: FxHashMap<AccountId, AccountExecutionEnvironment>,
+    /// Local admission is deny-all until runtime configuration binds both dimensions.
+    rate_budget: RateBudget,
+    account_egress: HashMap<AccountId, String>,
     /// Emergency is sticky for the worker lifetime; restart is required to re-arm execution.
     accepting_intents: bool,
     /// Operator authorization is independent from transient stream recovery. Automatic recovery
@@ -554,6 +558,8 @@ impl ExecutionWorker {
             account_to_client: FxHashMap::default(),
             account_admissions: FxHashMap::default(),
             account_environments: FxHashMap::default(),
+            rate_budget: RateBudget::default(),
+            account_egress: HashMap::new(),
             accepting_intents: true,
             operator_intake_enabled: true,
             emergency_latched: false,
@@ -603,6 +609,8 @@ impl ExecutionWorker {
             account_to_client: FxHashMap::default(),
             account_admissions: FxHashMap::default(),
             account_environments: FxHashMap::default(),
+            rate_budget: RateBudget::default(),
+            account_egress: HashMap::new(),
             accepting_intents: true,
             operator_intake_enabled: true,
             emergency_latched: false,
@@ -620,6 +628,52 @@ impl ExecutionWorker {
     /// 獲取延遲監控器的引用
     pub fn latency_monitor(&self) -> Arc<LatencyMonitor> {
         self.latency_monitor.clone()
+    }
+
+    /// Bind local budgets and independently configured egress identities before starting the worker.
+    pub fn with_rate_budget(
+        mut self,
+        budget: RateBudget,
+        account_egress: HashMap<AccountId, String>,
+    ) -> Self {
+        self.rate_budget = budget;
+        self.account_egress = account_egress;
+        self
+    }
+
+    fn admit_new_order_rate_budget(
+        &mut self,
+        account_id: Option<&AccountId>,
+        intent: &OrderIntent,
+        client_idx: usize,
+    ) -> Result<(), String> {
+        if self.execution_clients[client_idx].is_simulated_execution()
+            || !matches!(
+                intent.product_type,
+                ProductType::Spot
+                    | ProductType::Futures
+                    | ProductType::Perp
+                    | ProductType::TokenizedSecuritySpot
+            )
+        {
+            return Ok(());
+        }
+        let account_id = account_id.ok_or("missing canonical account identity for rate budget")?;
+        let admission = self
+            .account_admissions
+            .get(account_id)
+            .ok_or("missing account admission for rate budget")?;
+        let egress = self
+            .account_egress
+            .get(account_id)
+            .ok_or("missing runtime-bound egress identity for rate budget")?;
+        self.rate_budget.admit(
+            admission.venue,
+            intent.product_type,
+            RateBudgetOperation::NewOrder,
+            account_id,
+            egress,
+        )
     }
 
     /// 启动 Worker 主循环
@@ -1023,6 +1077,17 @@ impl ExecutionWorker {
                 self.reject_intent(
                     &envelope.client_order_id,
                     format!("final market price protection rejected intent: {reason:?}"),
+                )
+                .await;
+                continue;
+            }
+            if let Err(reason) =
+                self.admit_new_order_rate_budget(account_id.as_ref(), &envelope.intent, client_idx)
+            {
+                warn!(account_id = ?account_id, client_idx, reason, "local new-order rate admission rejected");
+                self.reject_intent(
+                    &envelope.client_order_id,
+                    format!("local rate budget rejected new order: {reason}"),
                 )
                 .await;
                 continue;
@@ -3364,6 +3429,7 @@ mod tests {
         client_idx: usize,
         venue: VenueId,
     ) {
+        bind_test_rate_budget(worker, &account_id, venue, ProductType::Spot);
         worker.venue_to_client.insert(venue, client_idx);
         worker
             .account_to_client
@@ -3393,6 +3459,7 @@ mod tests {
         client_idx: usize,
         venue: VenueId,
     ) {
+        bind_test_rate_budget(worker, &account_id, venue, ProductType::Perp);
         worker.venue_to_client.insert(venue, client_idx);
         worker
             .account_to_client
@@ -3408,6 +3475,217 @@ mod tests {
             .reconciled_open_order_ids
             .entry(account_id)
             .or_default();
+    }
+
+    fn test_rate_budget_specs(
+        account: &AccountId,
+        egress: &str,
+        venue: VenueId,
+        product: ProductType,
+        account_quota: u32,
+        egress_quota: u32,
+    ) -> Vec<crate::rate_budget::RateBudgetSpec> {
+        use crate::rate_budget::{RateBudgetKey, RateBudgetScope, RateBudgetSpec};
+        [
+            (RateBudgetScope::Account(account.clone()), account_quota),
+            (RateBudgetScope::Egress(egress.to_string()), egress_quota),
+        ]
+        .into_iter()
+        .map(|(scope, max_requests)| RateBudgetSpec {
+            key: RateBudgetKey {
+                venue,
+                product,
+                operation: RateBudgetOperation::NewOrder,
+                scope,
+            },
+            max_requests,
+            refill_interval: Duration::from_secs(3600),
+        })
+        .collect()
+    }
+
+    fn bind_test_rate_budget(
+        worker: &mut ExecutionWorker,
+        account: &AccountId,
+        venue: VenueId,
+        product: ProductType,
+    ) {
+        let egress = format!("test-egress:{}", account.0);
+        for spec in test_rate_budget_specs(account, &egress, venue, product, 1000, 1000) {
+            worker.rate_budget.add(spec).expect("test rate budget");
+        }
+        worker.account_egress.insert(account.clone(), egress);
+    }
+
+    #[tokio::test]
+    async fn rate_budget_breach_rejects_new_order_before_adapter_submission() {
+        for (account_quota, egress_quota, dimension) in [(1, 2, "account"), (2, 1, "egress")] {
+            let state = Arc::new(StdMutex::new(MockExecutionState::default()));
+            let client = MockExecutionClient {
+                state: Arc::clone(&state),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            };
+            let (mut engine_queues, worker_queues) =
+                crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            let mut worker = ExecutionWorker::new(
+                ExecutionWorkerConfig::default(),
+                worker_queues,
+                vec![Box::new(client)],
+                control_rx,
+            );
+            let account = AccountId("budget-account".into());
+            bind_ready_spot_admission(&mut worker, account.clone(), 0, VenueId::BYBIT);
+            let budget = RateBudget::new(test_rate_budget_specs(
+                &account,
+                "bound-ip",
+                VenueId::BYBIT,
+                ProductType::Spot,
+                account_quota,
+                egress_quota,
+            ))
+            .unwrap();
+            worker = worker.with_rate_budget(
+                budget,
+                HashMap::from([(account.clone(), "bound-ip".into())]),
+            );
+            for symbol in ["ADMITTED", "REJECTED"] {
+                engine_queues
+                    .send_intent(account.clone(), create_test_intent(symbol))
+                    .unwrap();
+            }
+            let mut queued = worker.queues.receive_envelopes();
+            let rejected_id = OrderId(queued[1].client_order_id.clone());
+            worker.process_order_intents(&mut queued).await;
+
+            let state = state.lock().unwrap();
+            assert_eq!(state.placed, vec![Symbol::new("ADMITTED")]);
+            assert_eq!(
+                state.placed_accounts.len(),
+                1,
+                "rejected envelope never reaches adapter"
+            );
+            assert_eq!(worker.stats.orders_placed, 1);
+            assert_eq!(worker.stats.orders_failed, 1);
+            assert!(!worker.tracked_orders.contains_key(&rejected_id));
+            assert!(!worker.order_to_client.contains_key(&rejected_id));
+            assert!(!worker.pending_acks.contains_key(&rejected_id));
+            assert!(!worker.execution_timelines.contains_key(&rejected_id));
+            assert!(worker.accepting_intents);
+            assert!(
+                !worker.emergency_latched,
+                "local denial is a known rejection"
+            );
+            let mut events = Vec::new();
+            engine_queues.receive_events_into(&mut events);
+            assert!(
+                matches!(events.as_slice(), [ExecutionEvent::OrderNew { .. }, ExecutionEvent::OrderReject { order_id, reason, .. }]
+                if order_id == &rejected_id && reason == &format!("local rate budget rejected new order: {dimension} rate budget exhausted for NewOrder"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_budget_missing_policy_or_egress_rejects_before_adapter_submission() {
+        for missing_egress in [true, false] {
+            let state = Arc::new(StdMutex::new(MockExecutionState::default()));
+            let client = MockExecutionClient {
+                state: Arc::clone(&state),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            };
+            let (mut engine_queues, worker_queues) =
+                crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            let mut worker = ExecutionWorker::new(
+                ExecutionWorkerConfig::default(),
+                worker_queues,
+                vec![Box::new(client)],
+                control_rx,
+            );
+            let account = AccountId("budget-account".into());
+            bind_ready_spot_admission(&mut worker, account.clone(), 0, VenueId::BYBIT);
+            if missing_egress {
+                worker.account_egress.clear();
+            } else {
+                worker.rate_budget = RateBudget::default();
+            }
+            engine_queues
+                .send_intent(account, create_test_intent("REJECTED"))
+                .unwrap();
+            let mut queued = worker.queues.receive_envelopes();
+            let rejected_id = OrderId(queued[0].client_order_id.clone());
+            worker.process_order_intents(&mut queued).await;
+            assert!(state.lock().unwrap().placed_accounts.is_empty());
+            assert!(worker.tracked_orders.is_empty());
+            assert!(worker.pending_acks.is_empty());
+            assert!(worker.execution_timelines.is_empty());
+            assert_eq!(worker.stats.orders_failed, 1);
+            let mut events = Vec::new();
+            engine_queues.receive_events_into(&mut events);
+            let expected = if missing_egress {
+                "local rate budget rejected new order: missing runtime-bound egress identity for rate budget"
+            } else {
+                "local rate budget rejected new order: unconfigured account rate budget for NewOrder"
+            };
+            assert!(
+                matches!(events.as_slice(), [ExecutionEvent::OrderReject { order_id, reason, .. }]
+                if order_id == &rejected_id && reason == expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_budget_preserves_size_gate_without_charging_rejected_intent() {
+        let state = Arc::new(StdMutex::new(MockExecutionState::default()));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let account = AccountId("budget-account".into());
+        bind_ready_spot_admission(&mut worker, account.clone(), 0, VenueId::BYBIT);
+        worker = worker.with_rate_budget(
+            RateBudget::new(test_rate_budget_specs(
+                &account,
+                "bound-ip",
+                VenueId::BYBIT,
+                ProductType::Spot,
+                1,
+                1,
+            ))
+            .unwrap(),
+            HashMap::from([(account.clone(), "bound-ip".into())]),
+        );
+        engine_queues
+            .send_intent(account.clone(), create_test_intent("TOO_LARGE"))
+            .unwrap();
+        engine_queues
+            .send_intent(account, create_test_intent("ADMITTED"))
+            .unwrap();
+        let mut queued = worker.queues.receive_envelopes();
+        queued[0].lifecycle.max_order_quantity = Some(rust_decimal::Decimal::new(5, 1));
+        worker.process_order_intents(&mut queued).await;
+        assert_eq!(state.lock().unwrap().placed, vec![Symbol::new("ADMITTED")]);
+        let mut events = Vec::new();
+        engine_queues.receive_events_into(&mut events);
+        assert!(
+            matches!(events.as_slice(), [ExecutionEvent::OrderReject { reason, .. }, ExecutionEvent::OrderNew { .. }]
+            if reason.starts_with("execution lifecycle gate rejected intent:"))
+        );
     }
 
     async fn reject_unqualified_usdm_intent(
