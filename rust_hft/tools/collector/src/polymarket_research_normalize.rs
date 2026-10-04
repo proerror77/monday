@@ -797,15 +797,14 @@ fn validate_causal_event_availability(
         let contract = &contracts[&row.key.market_id];
         let fields = row.value.as_object().expect("evidence row is an object");
         match required(fields, "surface")? {
-            "market_contract" => {
+            "market_contract"
                 if timestamp(required(fields, "available_at")?, "contract available_at")?
-                    >= contract.event_end
-                {
-                    bail!(
-                        "selected market {} has no causally available contract",
-                        contract.market_id
-                    );
-                }
+                    > contract.event_start =>
+            {
+                bail!(
+                    "selected market {} has no causally available contract at event open",
+                    contract.market_id
+                );
             }
             surface @ ("orderbook_snapshot" | "chainlink_reference") => {
                 let source = timestamp(required(fields, "ts")?, "source ts")?;
@@ -818,11 +817,21 @@ fn validate_causal_event_availability(
                     continue;
                 }
                 if surface == "orderbook_snapshot" {
+                    if !["bid_levels", "ask_levels"].iter().all(|field| {
+                        fields
+                            .get(*field)
+                            .and_then(Value::as_array)
+                            .is_some_and(|levels| !levels.is_empty())
+                    }) {
+                        continue;
+                    }
                     books
                         .entry(contract.market_id.clone())
                         .or_default()
                         .insert(required(fields, "token_id")?.to_owned());
-                } else if fields.get("is_carried_forward").and_then(Value::as_bool) == Some(false) {
+                } else if source < contract.event_start
+                    && fields.get("is_carried_forward").and_then(Value::as_bool) == Some(false)
+                {
                     references.insert(contract.market_id.clone());
                 }
             }
@@ -834,7 +843,7 @@ fn validate_causal_event_availability(
         if books.get(&contract.market_id) != Some(&expected)
             || !references.contains(&contract.market_id)
         {
-            bail!("selected market {} is causally unavailable: both token books and a fresh Chainlink observation must be available before event end", contract.market_id);
+            bail!("selected market {} is causally unavailable: both token books need nonempty bid and ask depth. A fresh pre-open Chainlink observation is required before event end", contract.market_id);
         }
     }
     Ok(())
@@ -976,17 +985,20 @@ mod tests {
                     token,
                     1,
                     json!({"surface": "orderbook_snapshot", "token_id": token,
-                        "ts": clock, "available_at": clock}),
+                        "ts": clock, "available_at": clock,
+                        "bid_levels": [{"price": "0.49", "size": "10"}],
+                        "ask_levels": [{"price": "0.51", "size": "11"}]}),
                 ));
             }
+            let reference_clock = utc_text(contract.event_start - chrono::Duration::seconds(1));
             rows.push(row(
                 SurfaceOrder::ChainlinkReference,
                 contract,
-                &clock,
+                &reference_clock,
                 "",
                 1,
-                json!({"surface": "chainlink_reference", "ts": clock,
-                    "available_at": clock, "is_carried_forward": false}),
+                json!({"surface": "chainlink_reference", "ts": reference_clock,
+                    "available_at": reference_clock, "is_carried_forward": false}),
             ));
         }
         (contracts, rows)
@@ -996,6 +1008,71 @@ mod tests {
     fn causal_availability_accepts_three_independent_events() {
         let (contracts, rows) = causal_availability_cohort();
         validate_causal_event_availability(&contracts, &rows).unwrap();
+    }
+
+    #[test]
+    fn causal_availability_rejects_only_at_or_after_open_references() {
+        for offset in [0, 1, 30] {
+            let (contracts, mut rows) = causal_availability_cohort();
+            let reference = rows
+                .iter_mut()
+                .find(|row| {
+                    row.key.market_id == "market-0" && row.value["surface"] == "chainlink_reference"
+                })
+                .unwrap();
+            let clock =
+                utc_text(contracts["market-0"].event_start + chrono::Duration::seconds(offset));
+            reference.value["ts"] = json!(clock);
+            reference.value["available_at"] = json!(clock);
+            let error = validate_causal_event_availability(&contracts, &rows)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("market-0 is causally unavailable"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn causal_availability_rejects_books_without_usable_depth() {
+        for token in ["up-0", "down-0"] {
+            for field in ["bid_levels", "ask_levels"] {
+                for depth in [Value::Null, json!([])] {
+                    let (contracts, mut rows) = causal_availability_cohort();
+                    let book = rows
+                        .iter_mut()
+                        .find(|row| row.value["token_id"] == token)
+                        .unwrap();
+                    book.value[field] = depth;
+                    let error = validate_causal_event_availability(&contracts, &rows)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        error.contains("market-0 is causally unavailable"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn causal_availability_rejects_contract_discovered_during_event() {
+        for offset in [1, 60, WINDOW_SECS - 1] {
+            let (mut contracts, mut rows) = causal_availability_cohort();
+            contracts.get_mut("market-1").unwrap().discovery_recorded_at =
+                utc_text(contracts["market-1"].event_start + chrono::Duration::seconds(offset));
+            rows.retain(|row| row.key.surface != SurfaceOrder::MarketContract);
+            contract_rows(&contracts, &mut rows).unwrap();
+            let error = validate_causal_event_availability(&contracts, &rows)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("market-1 has no causally available contract"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
