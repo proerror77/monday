@@ -1,7 +1,16 @@
 //! Verified streaming feature/target readers. Pretraining cannot deserialize labels.
 use crate::sequence_storage::{Frame, Frames};
-use hft_research_manifest::{market_encoder::*, sequence::SequenceInputSpecV1};
-use std::{collections::VecDeque, fs::File, io::Read, path::Path};
+use hft_research_manifest::{
+    market_encoder::*,
+    prepared_market::{FeatureParquetReader, TargetParquetReader},
+    sequence::SequenceInputSpecV1,
+};
+use std::{
+    collections::VecDeque,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 impl Frame for MarketFeatureFrameV1 {
     fn clock(&self) -> i64 {
@@ -27,8 +36,77 @@ pub struct UnlabeledSequenceExample {
     pub inputs: Vec<f32>,
 }
 
+// The manifest selects a format explicitly. A feature reader never constructs a
+// target decoder, including when both artifacts live in the same prepared view.
+enum FeatureFrames {
+    Jsonl(Box<Frames<MarketFeatureFrameV1>>),
+    Parquet(Box<FeatureParquetReader>),
+}
+impl FeatureFrames {
+    fn next(&mut self) -> Result<Option<MarketFeatureFrameV1>, String> {
+        match self {
+            Self::Jsonl(r) => r.next(),
+            Self::Parquet(r) => r.next_frame(),
+        }
+    }
+    fn rewind(&mut self) -> Result<(), String> {
+        match self {
+            Self::Jsonl(r) => r.rewind(),
+            Self::Parquet(r) => r.rewind(),
+        }
+    }
+    fn is_at_start(&self) -> bool {
+        match self {
+            Self::Jsonl(r) => r.is_at_start(),
+            Self::Parquet(r) => r.is_at_start(),
+        }
+    }
+}
+enum TargetFrames {
+    Jsonl(Box<Frames<MarketTargetFrameV1>>),
+    Parquet(Box<TargetParquetReader>),
+}
+impl TargetFrames {
+    fn open(
+        root: &Path,
+        targets: MarketTargetDatasetV1,
+        input: SequenceInputSpecV1,
+    ) -> Result<Self, String> {
+        match targets.schema_version.as_str() {
+            TARGET_SCHEMA => Ok(Self::Jsonl(Box::new(Frames::open(
+                root,
+                targets.shards,
+                input,
+            )?))),
+            TARGET_PARQUET_SCHEMA => Ok(Self::Parquet(Box::new(TargetParquetReader::open(
+                root,
+                targets.shards,
+            )?))),
+            _ => Err("unsupported market target storage schema".into()),
+        }
+    }
+    fn next(&mut self) -> Result<Option<MarketTargetFrameV1>, String> {
+        match self {
+            Self::Jsonl(r) => r.next(),
+            Self::Parquet(r) => r.next_frame(),
+        }
+    }
+    fn rewind(&mut self) -> Result<(), String> {
+        match self {
+            Self::Jsonl(r) => r.rewind(),
+            Self::Parquet(r) => r.rewind(),
+        }
+    }
+    fn is_at_start(&self) -> bool {
+        match self {
+            Self::Jsonl(r) => r.is_at_start(),
+            Self::Parquet(r) => r.is_at_start(),
+        }
+    }
+}
+
 pub struct MarketFeatureReader {
-    frames: Frames<MarketFeatureFrameV1>,
+    frames: FeatureFrames,
     history: VecDeque<MarketFeatureFrameV1>,
     request: MarketDataReadRequestV1,
     qualified: Option<Vec<MarketTrainingAnchorV1>>,
@@ -79,8 +157,19 @@ impl MarketFeatureReader {
         } else {
             None
         };
+        let frames = match dataset.schema_version.as_str() {
+            FEATURE_SCHEMA => {
+                FeatureFrames::Jsonl(Box::new(Frames::open(root, dataset.shards, dataset.input)?))
+            }
+            FEATURE_PARQUET_SCHEMA => FeatureFrames::Parquet(Box::new(FeatureParquetReader::open(
+                root,
+                dataset.shards,
+                dataset.input,
+            )?)),
+            _ => return Err("unsupported market feature storage schema".into()),
+        };
         Ok(Self {
-            frames: Frames::open(root, dataset.shards, dataset.input)?,
+            frames,
             history: VecDeque::new(),
             request: request.clone(),
             qualified,
@@ -181,7 +270,7 @@ pub struct MarketTaskExample {
 
 pub struct MarketTaskReader {
     pub(crate) features: MarketFeatureReader,
-    targets: Frames<MarketTargetFrameV1>,
+    targets: TargetFrames,
     target_digest: String,
     next_target: Option<MarketTargetFrameV1>,
 }
@@ -205,7 +294,7 @@ impl MarketTaskReader {
         {
             return Err("market targets expose another dataset or future view".into());
         }
-        let frames = Frames::open(root, targets.shards, features.request.input.clone())?;
+        let frames = TargetFrames::open(root, targets, features.request.input.clone())?;
         Ok(Self {
             features,
             targets: frames,
@@ -386,8 +475,7 @@ pub fn derive_market_training_anchors(
     {
         return Err("anchor derivation requires the original grid and bounded target view".into());
     }
-    let mut target_reader =
-        Frames::<MarketTargetFrameV1>::open(target_root, targets.shards, request.input.clone())?;
+    let mut target_reader = TargetFrames::open(target_root, targets, request.input.clone())?;
     let mut current = None::<MarketTargetFrameV1>;
     let mut anchors = Vec::new();
     loop {
@@ -447,4 +535,171 @@ pub fn derive_market_training_anchors(
     };
     result.validate()?;
     Ok(result)
+}
+
+/// A format conversion claim, separate from the native receipt/source admission
+/// performed by Campaign. Its digest records every decoded clock and bit pattern.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedMarketEquivalenceV1 {
+    pub schema_version: String,
+    pub source_dataset_sha256: Vec<String>,
+    pub prepared_dataset_sha256: String,
+    pub decoded_sha256: String,
+    pub rows: u64,
+}
+
+/// Proves that prepared label-free frames preserve every admitted original row,
+/// including exact recovery identities and Float32 bits. It never reads targets.
+pub fn verify_prepared_feature_equivalence(
+    sources: &[(PathBuf, MarketFeatureDatasetV1)],
+    prepared_root: &Path,
+    prepared: &MarketFeatureDatasetV1,
+) -> Result<PreparedMarketEquivalenceV1, String> {
+    use sha2::{Digest, Sha256};
+    prepared.validate()?;
+    if prepared.schema_version != FEATURE_PARQUET_SCHEMA
+        || sources.is_empty()
+        || sources.len() > 512
+    {
+        return Err(
+            "feature equivalence requires bounded native sources and prepared Parquet".into(),
+        );
+    }
+    let mut output = FeatureParquetReader::open(
+        prepared_root,
+        prepared.shards.clone(),
+        prepared.input.clone(),
+    )?;
+    let mut decoded = Sha256::new();
+    decoded.update(b"monday.market_feature_equivalence.v1\0");
+    let mut source_hashes = Vec::with_capacity(sources.len());
+    let mut rows = 0_u64;
+    for (root, source) in sources {
+        source.validate()?;
+        if source.schema_version != FEATURE_SCHEMA
+            || source.input != prepared.input
+            || source.venue != prepared.venue
+            || source.symbol != prepared.symbol
+        {
+            return Err("prepared feature conversion changed native input or venue".into());
+        }
+        source_hashes.push(source.digest()?);
+        let mut original = Frames::<MarketFeatureFrameV1>::open(
+            root,
+            source.shards.clone(),
+            source.input.clone(),
+        )?;
+        while let Some(expected) = original.next()? {
+            let actual = output
+                .next_frame()?
+                .ok_or("prepared conversion omitted a native feature")?;
+            if expected.series_id != actual.series_id
+                || expected.observed_at_ms != actual.observed_at_ms
+                || expected.feature_max_available_at_ms != actual.feature_max_available_at_ms
+                || expected.channels.len() != actual.channels.len()
+                || expected
+                    .channels
+                    .iter()
+                    .zip(&actual.channels)
+                    .any(|(left, right)| left.to_bits() != right.to_bits())
+            {
+                return Err(
+                    "prepared conversion changed a native feature clock, series or Float32 value"
+                        .into(),
+                );
+            }
+            decoded.update(expected.series_id.to_le_bytes());
+            decoded.update(expected.observed_at_ms.to_le_bytes());
+            decoded.update(expected.feature_max_available_at_ms.to_le_bytes());
+            for value in expected.channels {
+                decoded.update(value.to_bits().to_le_bytes());
+            }
+            rows = rows
+                .checked_add(1)
+                .ok_or("feature equivalence row overflow")?;
+        }
+        original.finish()?;
+    }
+    if output.next_frame()?.is_some() {
+        return Err("prepared conversion added a native feature".into());
+    }
+    output.finish_pass()?;
+    Ok(PreparedMarketEquivalenceV1 {
+        schema_version: "monday.market_feature_equivalence.v1".into(),
+        source_dataset_sha256: source_hashes,
+        prepared_dataset_sha256: prepared.digest()?,
+        decoded_sha256: format!("{:x}", decoded.finalize()),
+        rows,
+    })
+}
+
+/// Proves exact target values and maturity clocks separately from the feature
+/// proof. The caller retains the original native source and holdout checks.
+pub fn verify_prepared_target_equivalence(
+    sources: &[(PathBuf, MarketTargetDatasetV1)],
+    prepared_root: &Path,
+    prepared: &MarketTargetDatasetV1,
+) -> Result<PreparedMarketEquivalenceV1, String> {
+    use sha2::{Digest, Sha256};
+    prepared.validate()?;
+    if prepared.schema_version != TARGET_PARQUET_SCHEMA || sources.is_empty() || sources.len() > 512
+    {
+        return Err(
+            "target equivalence requires bounded native sources and prepared Parquet".into(),
+        );
+    }
+    let mut output = TargetParquetReader::open(prepared_root, prepared.shards.clone())?;
+    let mut decoded = Sha256::new();
+    decoded.update(b"monday.market_target_equivalence.v1\0");
+    let mut source_hashes = Vec::with_capacity(sources.len());
+    let mut rows = 0_u64;
+    for (root, source) in sources {
+        source.validate()?;
+        if source.schema_version != TARGET_SCHEMA {
+            return Err("target equivalence source is not original JSONL".into());
+        }
+        source_hashes.push(source.digest()?);
+        let mut original = Frames::<MarketTargetFrameV1>::open(
+            root,
+            source.shards.clone(),
+            SequenceInputSpecV1::sol_lob(),
+        )?;
+        while let Some(expected) = original.next()? {
+            let actual = output
+                .next_frame()?
+                .ok_or("prepared conversion omitted a native target")?;
+            if expected.series_id != actual.series_id
+                || expected.observed_at_ms != actual.observed_at_ms
+                || expected.available_at_ms != actual.available_at_ms
+                || expected.simple_return.to_bits() != actual.simple_return.to_bits()
+                || expected.spread_bps.to_bits() != actual.spread_bps.to_bits()
+            {
+                return Err(
+                    "prepared conversion changed a native target value, series or maturity clock"
+                        .into(),
+                );
+            }
+            decoded.update(expected.series_id.to_le_bytes());
+            decoded.update(expected.observed_at_ms.to_le_bytes());
+            decoded.update(expected.available_at_ms.to_le_bytes());
+            decoded.update(expected.simple_return.to_bits().to_le_bytes());
+            decoded.update(expected.spread_bps.to_bits().to_le_bytes());
+            rows = rows
+                .checked_add(1)
+                .ok_or("target equivalence row overflow")?;
+        }
+        original.finish()?;
+    }
+    if output.next_frame()?.is_some() {
+        return Err("prepared conversion added a native target".into());
+    }
+    output.finish_pass()?;
+    Ok(PreparedMarketEquivalenceV1 {
+        schema_version: "monday.market_target_equivalence.v1".into(),
+        source_dataset_sha256: source_hashes,
+        prepared_dataset_sha256: prepared.digest()?,
+        decoded_sha256: format!("{:x}", decoded.finalize()),
+        rows,
+    })
 }

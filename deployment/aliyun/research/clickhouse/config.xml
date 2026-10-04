@@ -1,0 +1,22 @@
+<clickhouse>
+  <listen_host>0.0.0.0</listen_host>
+  <logger>
+    <level>information</level>
+    <log remove="1"/>
+    <errorlog remove="1"/>
+    <console>true</console>
+  </logger>
+  <max_server_memory_usage>4294967296</max_server_memory_usage>
+  <max_concurrent_queries>8</max_concurrent_queries>
+  <max_concurrent_select_queries>6</max_concurrent_select_queries>
+  <max_concurrent_insert_queries>2</max_concurrent_insert_queries>
+  <mark_cache_size>134217728</mark_cache_size>
+  <uncompressed_cache_size>67108864</uncompressed_cache_size>
+  <background_pool_size>4</background_pool_size>
+  <background_merges_mutations_concurrency_ratio>2</background_merges_mutations_concurrency_ratio>
+  <merge_tree>
+    <number_of_free_entries_in_pool_to_lower_max_size_of_merge>2</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+    <number_of_free_entries_in_pool_to_execute_mutation>2</number_of_free_entries_in_pool_to_execute_mutation>
+    <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>2</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+  </merge_tree>
+</clickhouse>
