@@ -87,7 +87,7 @@ def check_recipe(path, source, packages)
       if body.include?('cargo-scoped.sh') || body.include?('workspace-metadata.sh')
         raise "#{path}: metadata helper requires builder jq" unless builder_source.match?(/\bjq\b/)
       end
-      body.to_enum(:scan, /\bcargo(?:\s+--config\s+'[^']*')?\s+(build|fetch)\b/).each do
+      body.to_enum(:scan, /\bcargo(?:\s+--config\s+'[^']*')?\s+(build|fetch|test)\b/).each do
         match = Regexp.last_match
         prefix = body[0...match.begin(0)]
         tokens = Shellwords.split(body[match.begin(0)..-1].split(/\s+&&\s+/, 2)[0])
@@ -132,11 +132,11 @@ def check_recipe(path, source, packages)
       raise "#{path}: binary copy uses unbound target #{artifact}" unless directories.any? { |dir| absolute.start_with?("#{dir}/release/") }
     end
   end
-  raise "#{path}: no checked Cargo build/fetch command" if commands.zero?
+  raise "#{path}: no checked Cargo build/fetch/test command" if commands.zero?
 end
 
 recipes = tracked('*Dockerfile*').select do |path|
-  !path.include?('/docs/archive/') && File.read(File.join(ROOT, path)).match?(/\bcargo\s+(?:--config\s+'[^']*'\s+)?(?:build|fetch)\b/)
+  !path.include?('/docs/archive/') && File.read(File.join(ROOT, path)).match?(/\bcargo\s+(?:--config\s+'[^']*'\s+)?(?:build|fetch|test)\b/)
 end
 checked = 0
 recipes.each do |path|
@@ -186,6 +186,8 @@ if ARGV == ['--self-test']
   data_source = File.read(File.join(ROOT, data_path))
   {
     'wrong data owner' => data_source.sub('--manifest-path data-pipelines/Cargo.toml --release', '--manifest-path runtime/Cargo.toml --release'),
+    'wrong test owner' => data_source.sub('cargo test --manifest-path shared/Cargo.toml', 'cargo test --manifest-path runtime/Cargo.toml'),
+    'missing test owner' => data_source.sub('cargo test --manifest-path shared/Cargo.toml', 'cargo test'),
     'missing source COPY' => data_source.sub('COPY rust_hft/ rust_hft/', 'COPY unrelated/ rust_hft/')
   }.each do |name, changed|
     abort "invalid data recipe mutation: #{name}" if changed == data_source
