@@ -9,3 +9,10 @@ description = "Binance depth book sync. This crate has no order path."
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "binance_md_hotpath"
+harness = false

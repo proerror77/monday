@@ -2909,6 +2909,7 @@ dependencies = [
 name = "hft-binance-depth"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "serde",
  "serde_json",
 ]
@@ -3135,7 +3136,6 @@ dependencies = [
  "crossbeam-utils",
  "futures",
  "hdrhistogram",
- "hft-binance-depth",
  "hft-core",
  "hft-data-adapter-bitget",
  "hft-infra-metrics",

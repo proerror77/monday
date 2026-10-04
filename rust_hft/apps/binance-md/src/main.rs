@@ -6,14 +6,14 @@
 
 use clap::{Parser, Subcommand};
 use data_adapter_binance::BinanceRestClient;
+use futures_util::StreamExt;
+use hdrhistogram::Histogram;
 use hft_binance_depth::{
     normalize_depth_update, parse_fixed_6, read_replay_records, write_replay_batch,
     BinanceDepthUpdate, BookSyncState, FeatureSnapshot, LatencyTrace, MarketDataLane,
     ParsedDepthUpdate, ReplayBatch, ReplayKind, ReplayPayload, ReplayRecord, SequenceDecision,
     Signal, SignalRules, SignalSide,
 };
-use futures_util::StreamExt;
-use hdrhistogram::Histogram;
 use hft_core::{now_micros, Symbol};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
