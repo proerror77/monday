@@ -34,7 +34,10 @@ for unit in "${upload_units[@]}"; do
   assert_service_setting "$unit" Nice 10
 done
 
+assert_service_setting binance-usdm-reference-upload.service CPUQuota 20%
+assert_service_setting binance-usdm-reference-upload.service Nice 10
+
 # Preserve the collector quota that exists on the base branch.
 assert_service_setting polymarket-market-tape.service CPUQuota 100%
 
-printf 'PASS: six upload CPU limits and existing market collector quota\n'
+printf 'PASS: six 50%% upload limits, one 20%% reference upload limit, and existing market collector quota\n'
