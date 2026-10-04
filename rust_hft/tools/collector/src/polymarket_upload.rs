@@ -5942,8 +5942,7 @@ mod tests {
                 &missing_identity,
             );
             let error = prepare_artifacts(&tape, &config)
-                .err()
-                .expect("losing quote identity must reject the batch");
+                .expect_err("losing quote identity must reject the batch");
             assert!(error.to_string().contains(field), "{error:#}");
             assert!(!append_name(&tape, ".zst._SUCCESS").unwrap().exists());
         }
@@ -5988,8 +5987,7 @@ mod tests {
             &rows,
         );
         let error = prepare_artifacts(&gap, &config)
-            .err()
-            .expect("a sequence gap must reject the batch");
+            .expect_err("a sequence gap must reject the batch");
         assert!(
             error
                 .to_string()
