@@ -131,7 +131,7 @@ Stopping 仍检查 admission 撤销。撤销清除待提交 receipt，并将停�
 
 Backend profile 绑定 exact cluster/namespace/service account、架构、CPU/内存/scratch、接受证明及可选 readonly prepared PVC / worker config secret。GPU 显式拒绝。worker service account token 不自动挂载；控制平面 token 与 worker 凭据分开。新接口使用 `agents.kruise.io/v1alpha1` CRD 模板，但没有假定官方 Rust SDK、E2B 完整日志事件 API、memory snapshot 或 provider command reconnect 已被验证。
 
-ArtifactGateway/Writer 是 HTTPS、无 redirect、大小有界的 scoped gateway 合同，不是向 OSS 原生 endpoint 直接发送 bearer token。gateway、identity broker、每个 attempt 的输出前缀/短期凭据、只读源码/数据范围与 ACR pulls 仍需要独立部署和权限验收。当前代码不会创建这些资源或 RAM 权限。
+ArtifactGateway/Writer 使用 HTTPS、无 redirect、大小有界的 scoped gateway。`research-artifact-gateway` 已实现持久文件存储：Reader 只读受控前缀，Publisher 只写固定 source/Build 前缀，AttemptWriter 只写当前 tenant/task/attempt/fence 的输出。它逐请求读取私有 broker 准入投影，在上传前后检查有效期与撤销，并在最终原子发布期间用受限 PG 函数锁定 authority/task/admission；网关不获得这些表的写权限。文件经流式限额、同步及不可覆盖的原子 link 发布；路径逐段以 directory FD 和 NOFOLLOW 打开。网关监听 loopback，远端 TLS ingress、broker 发放/续期、持久卷与 ACR pulls 仍需独立部署和权限验收。当前代码不会创建这些资源或 RAM 权限。
 
 ## Session：借鉴 OpenResearch，保留 Monday 科学权威
 
