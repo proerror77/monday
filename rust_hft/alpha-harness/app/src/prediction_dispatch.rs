@@ -1656,7 +1656,10 @@ mod tests {
             "research_trial"
         );
         let container = &job["spec"]["template"]["spec"]["containers"][0];
-        assert_eq!(container["command"], json!(["/usr/local/bin/monday-prediction-worker"]));
+        assert_eq!(
+            container["command"],
+            json!(["/usr/local/bin/monday-prediction-worker"])
+        );
         assert_eq!(container["args"][0], "execute");
         assert!(container["args"].as_array().is_some_and(|args| {
             [

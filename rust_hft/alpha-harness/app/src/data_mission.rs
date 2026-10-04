@@ -8,7 +8,7 @@ use hft_collector::{
     acquire_dataset, import_feature_dataset, lob_archiver::source_revision, read_feature_rows,
     DataAcquisitionMission, DataModality, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
 };
-use hft_research_artifacts::{persist_output_file, temporary_output_file};
+use hft_research_artifacts::temporary_output_file;
 use hft_research_artifacts::{write_json_atomic, write_json_atomic_bounded};
 use hft_research_manifest::{
     CexReplayDatasetManifestV1, CexReplayDatasetManifestV2, CexReplayDatasetManifestV3,
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     io::{BufRead, Write},
-    path::{Component, Path, PathBuf},
+    path::Path,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -153,9 +153,7 @@ pub(crate) fn verify_artifact_inventory(
         bail!("sequence archive inventory differs from result");
     }
     for (name, hash) in artifacts {
-        if hft_research_artifacts::sha256_file(&extracted.join(directory).join(name))?
-            != *hash
-        {
+        if hft_research_artifacts::sha256_file(&extracted.join(directory).join(name))? != *hash {
             bail!("sequence result artifact bytes changed");
         }
     }

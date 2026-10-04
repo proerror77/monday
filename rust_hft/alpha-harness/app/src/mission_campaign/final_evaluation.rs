@@ -1154,9 +1154,7 @@ pub(crate) fn readback_terminal(
             "global holdout claim",
             &request.holdout_claim_readback_url,
             &global,
-            &hft_research_artifacts::sha256_file(
-                &results.join("sealed-holdout-claim.json"),
-            )?,
+            &hft_research_artifacts::sha256_file(&results.join("sealed-holdout-claim.json"))?,
             64 * 1024,
         )
         .map_err(terminal_readback_error)?;

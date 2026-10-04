@@ -701,8 +701,7 @@ fn persist_exact(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if path.try_exists()? {
         if !path.is_file()
             || path.metadata()?.len() != bytes.len() as u64
-            || hft_research_artifacts::sha256_file(path)?
-                != format!("{:x}", Sha256::digest(bytes))
+            || hft_research_artifacts::sha256_file(path)? != format!("{:x}", Sha256::digest(bytes))
         {
             bail!(
                 "existing immutable market artifact differs: {}",

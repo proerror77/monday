@@ -4,7 +4,6 @@ pub(crate) mod campaign;
 
 use crate::{
     cli::{ModelMetricsArgs, ModelMetricsBenchmark},
-    data_mission,
     mission_runner::CexSupervisedModelSelectionV1,
 };
 use alpha_domain::{CexBaselineModelKindV1, CexResearchContentRefV1};

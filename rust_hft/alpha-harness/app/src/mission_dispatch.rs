@@ -9,7 +9,6 @@ mod terminal;
 
 use crate::{
     cli::{print_json, MissionDispatchInspectArgs, MissionDispatchSubmitArgs},
-    data_mission,
     mission_campaign::{serialize_request, validate_request, CampaignRequest},
     prediction_dispatch::{
         ensure_kubectl_success, kubectl_binary, kubectl_json, kubectl_with_input,

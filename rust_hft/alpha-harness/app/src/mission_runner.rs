@@ -46,8 +46,8 @@ use hft_backtest::{
     },
 };
 use hft_research_artifacts::{
-    checked_result_bundle_bytes, configured_sibling_binary, create_bundle, fetch_to_file,
-    normalized_sha256, publish_immutable_file, publish_result, sha256_file,
+    checked_result_bundle_bytes, create_bundle, fetch_to_file, normalized_sha256,
+    publish_immutable_file, publish_result, sha256_file,
 };
 use hft_research_manifest::{
     CexInstrumentRulesV2, CexReplayDatasetManifestV5, CexReplaySnapshotV1, CexReplaySnapshotV2,
@@ -56,11 +56,7 @@ use hft_research_manifest::{
     BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5,
     BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
 };
-use reqwest::{
-    blocking::Client,
-    redirect::Policy,
-    StatusCode,
-};
+use reqwest::{blocking::Client, redirect::Policy, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{

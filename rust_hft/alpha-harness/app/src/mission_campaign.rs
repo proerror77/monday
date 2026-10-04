@@ -5814,10 +5814,8 @@ mod tests {
             feature: CampaignInputReceiptItem {
                 relative_path: feature_relative.clone(),
                 object_url: format!("{TEST_ROOT}/runs/campaign-freeze/features.jsonl"),
-                sha256: hft_research_artifacts::sha256_file(
-                    &input_root.join(&feature_relative),
-                )
-                .unwrap(),
+                sha256: hft_research_artifacts::sha256_file(&input_root.join(&feature_relative))
+                    .unwrap(),
             },
             materialization: CampaignInputReceiptItem {
                 relative_path: materialization_relative.clone(),
@@ -6934,10 +6932,8 @@ mod tests {
         assert_eq!(trials, result["consumed_trials"].as_u64().unwrap());
         assert_eq!(
             hash,
-            hft_research_artifacts::sha256_file(
-                &fixture.work_dir.join("campaign-result.json")
-            )
-            .unwrap()
+            hft_research_artifacts::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+                .unwrap()
         );
 
         assert!(result["rounds"].as_array().unwrap().iter().all(|round| {
@@ -7682,10 +7678,9 @@ mod tests {
         );
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
-        let hash = hft_research_artifacts::sha256_file(
-            &fixture.work_dir.join("campaign-result.json"),
-        )
-        .unwrap();
+        let hash =
+            hft_research_artifacts::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+                .unwrap();
         let client = Client::builder().redirect(Policy::none()).build().unwrap();
         assert_final_worker_outcome(
             &fixture,
@@ -7731,10 +7726,8 @@ mod tests {
         assert_eq!(trials, result["consumed_trials"].as_u64().unwrap());
         assert_eq!(
             hash,
-            hft_research_artifacts::sha256_file(
-                &fixture.work_dir.join("campaign-result.json")
-            )
-            .unwrap()
+            hft_research_artifacts::sha256_file(&fixture.work_dir.join("campaign-result.json"))
+                .unwrap()
         );
         let result_path = Path::new(&loaded.request.campaign_result_readback_url);
         let original = std::fs::read(result_path).unwrap();
@@ -7905,8 +7898,7 @@ mod tests {
         let mission_id = mission.semantic_id().unwrap();
         let mission_sha256 = hft_research_artifacts::sha256_file(&mission_readback).unwrap();
         let request_sha256 =
-            hft_research_artifacts::sha256_file(&work_dir.join("campaign-request.json"))
-                .unwrap();
+            hft_research_artifacts::sha256_file(&work_dir.join("campaign-request.json")).unwrap();
         let binding = ExecutionBinding::Campaign {
             campaign_id: request.campaign_id.clone(),
             round_id: round.round_id.clone(),

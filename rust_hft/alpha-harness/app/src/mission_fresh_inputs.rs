@@ -4,16 +4,13 @@
 //! and the already-reviewed materializer entrypoint. It does not freeze a
 //! Campaign, sign a request, reserve a trial, or dispatch a Job.
 
-use crate::{
-    cli::{print_json, PrepareFreshInputsArgs, BUILD_SOURCE_REVISION},
-    data_mission,
-    hft_research_artifacts::sha256_file,
-};
+use crate::cli::{print_json, PrepareFreshInputsArgs, BUILD_SOURCE_REVISION};
 use anyhow::{bail, Context};
 use hft_collector::research_inventory::{
     freeze_inventory_from_selection, select_fresh_window, FreshWindowMode, FreshWindowRequest,
     FreshWindowSelection, Market, FRESH_WINDOW_SELECTION_SCHEMA,
 };
+use hft_research_artifacts::sha256_file;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,

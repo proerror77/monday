@@ -90,7 +90,6 @@ pub(crate) fn precheck(args: CampaignPrecheckArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_mission;
     #[test]
     fn precheck_command_publishes_bound_plan_before_any_freeze() {
         let fixture = crate::mission_render::tests::Fixture::new(28_795);
