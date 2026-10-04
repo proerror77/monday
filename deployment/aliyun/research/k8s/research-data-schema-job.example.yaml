@@ -1,0 +1,59 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: monday-data-schema-
+  namespace: monday-research
+  labels:
+    research.monday/contract: research-data-platform-1256
+    research.monday/controller: REPLACE_CONTROLLER
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        research.monday/contract: research-data-platform-1256
+        research.monday/data-access: admitted
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector: {kubernetes.io/arch: amd64, workload: research-data}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: schema
+          image: clickhouse/clickhouse-server@sha256:6e9c8937d38b3474107a0f1883eaf93a83151abdeb4e7cddf9639748f09a04be
+          command: [/bin/sh, -ceu]
+          args:
+            - |
+              # Read the password from the environment, not process arguments.
+              clickhouse-client --host monday-clickhouse --user monday_admin \
+                --multiquery < /schema/schema.sql
+              clickhouse-client --host monday-clickhouse --user monday_admin \
+                --query "SELECT name, engine, sorting_key FROM system.tables WHERE database='monday_analytics' ORDER BY name FORMAT JSONEachRow"
+          env:
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: monday-clickhouse-admin, key: password}
+            - {name: HOME, value: /tmp}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - {name: schema, mountPath: /schema, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: schema
+          configMap: {name: monday-clickhouse-schema-REPLACE_SCHEMA_SHA}
+        - name: tmp
+          emptyDir: {sizeLimit: 128Mi}
