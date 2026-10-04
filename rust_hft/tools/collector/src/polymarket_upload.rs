@@ -5537,6 +5537,169 @@ mod tests {
     }
 
     #[test]
+    fn full_update_clob_fixture_rejects_sequence_gap_or_bad_sha() {
+        let root = TestDir::new();
+        let mut config = config(root.path());
+        config.quote_depth_levels = 0;
+        config.quote_sample_ms = 0;
+        config.zstd_threads = 1;
+
+        let mut rows = vec![sample_rows().remove(0)];
+        rows[0]["update"]["market_id"] = json!("market-1");
+        for (sequence, token, side, source_at, received_at, update_id) in [
+            (
+                1,
+                "up-1",
+                "Up",
+                "2026-07-15T01:00:01.100Z",
+                "2026-07-15T01:00:01.110Z",
+                "up-seed",
+            ),
+            (
+                2,
+                "down-1",
+                "Down",
+                "2026-07-15T01:00:01.200Z",
+                "2026-07-15T01:00:01.210Z",
+                "down-seed",
+            ),
+            (
+                3,
+                "up-1",
+                "Up",
+                "2026-07-15T01:00:01.300Z",
+                "2026-07-15T01:00:01.310Z",
+                "up-change",
+            ),
+        ] {
+            let mut row = quote_record(sequence, received_at, token);
+            let update = &mut row["update"];
+            update["ts"] = json!(source_at);
+            update["venue_id"] = json!("polymarket");
+            update["market_id"] = json!("market-1");
+            update["semantic_side"] = json!(side);
+            update["venue_update_id"] = json!(update_id);
+            update["bid_levels"] = json!([
+                {"price":"0.49","size":"10"}, {"price":"0.48","size":"20"}
+            ]);
+            update["ask_levels"] = json!([
+                {"price":"0.51","size":"11"}, {"price":"0.52","size":"21"}
+            ]);
+            if sequence == 3 {
+                update["bid_size"] = json!("12");
+                update["bid_levels"][0]["size"] = json!("12");
+            }
+            rows.push(row);
+        }
+        let source = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
+        let (artifacts, manifest) = prepare_artifacts(&source, &config).unwrap();
+
+        assert!(canonical_complete_manifest(&manifest));
+        assert_eq!(manifest["venue"], "polymarket");
+        assert_eq!(manifest["recording_policy"]["quote_sample_ms"], 0);
+        assert_eq!(manifest["recording_policy"]["quote_depth_levels"], 0);
+        assert_eq!(
+            manifest["replay_scope"],
+            "complete_full_depth_normalized_hour_segment"
+        );
+        assert_eq!(manifest["events"], 4);
+        assert_eq!(manifest["event_types"]["quote"], 3);
+        assert_eq!(manifest["token_count"], 2);
+        assert_eq!(manifest["market_count"], 1);
+        assert_eq!(manifest["sequence_gaps"], 0);
+        assert_eq!(manifest["quality"]["max_quote_latency_ms"], 10);
+        for field in [
+            "ts",
+            "venue_id",
+            "market_id",
+            "semantic_side",
+            "venue_update_id",
+        ] {
+            assert_eq!(manifest["field_non_null"]["quote"][field], 3);
+        }
+        assert_eq!(sha256_file(&artifacts.data).unwrap(), manifest["sha256"]);
+        assert_eq!(
+            fs::read_to_string(&artifacts.success).unwrap().trim(),
+            manifest["sha256"].as_str().unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&artifacts.manifest).unwrap()).unwrap(),
+            manifest
+        );
+        // recorded_at is the receive clock; ts is the independent source clock.
+        // Byte equality also proves that both updates to Up in one second survive.
+        let decoded = zstd::stream::decode_all(File::open(&artifacts.data).unwrap()).unwrap();
+        assert_eq!(decoded, fs::read(&source).unwrap());
+        let decoded_rows = decoded
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded_rows, rows);
+
+        let readback = root.path().join("readback");
+        fs::create_dir(&readback).unwrap();
+        let mut downloaded = BTreeMap::new();
+        for path in [&artifacts.data, &artifacts.manifest, &artifacts.success] {
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            let copy = readback.join(&name);
+            fs::copy(path, &copy).unwrap();
+            downloaded.insert(name, copy);
+        }
+        verify_downloaded_paths(&artifacts, &downloaded).unwrap();
+        let data_name = artifacts.data.file_name().unwrap().to_str().unwrap();
+        let mut bad_data = fs::read(&artifacts.data).unwrap();
+        bad_data[0] ^= 1; // Keep the size unchanged, so SHA is the rejecting gate.
+        fs::write(&downloaded[data_name], bad_data).unwrap();
+        let error = verify_downloaded_paths(&artifacts, &downloaded).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("data sha256 does not match manifest"),
+            "{error:#}"
+        );
+        fs::copy(&artifacts.data, &downloaded[data_name]).unwrap();
+        let success_name = artifacts.success.file_name().unwrap().to_str().unwrap();
+        fs::write(&downloaded[success_name], format!("{}\n", "0".repeat(64))).unwrap();
+        let error = verify_downloaded_paths(&artifacts, &downloaded).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("_SUCCESS does not match manifest"),
+            "{error:#}"
+        );
+
+        let gap_root = TestDir::new();
+        rows.remove(2); // Drop Down's update without rebasing the remaining sequence.
+        let gap = write_tape(
+            gap_root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &rows,
+        );
+        let error = prepare_artifacts(&gap, &config)
+            .err()
+            .expect("a sequence gap must reject the batch");
+        assert!(
+            error
+                .to_string()
+                .contains("sequence gap expected=2 actual=3"),
+            "{error:#}"
+        );
+        for suffix in [".zst", ".zst.manifest.json", ".zst._SUCCESS"] {
+            assert!(!append_name(&gap, suffix).unwrap().exists());
+        }
+        assert!(gap.exists());
+        for path in [
+            &source,
+            &artifacts.data,
+            &artifacts.manifest,
+            &artifacts.success,
+        ] {
+            assert!(path.exists(), "rejection deleted {}", path.display());
+        }
+    }
+
+    #[test]
     fn hash_triplet_and_remote_tamper_are_fail_closed() {
         if Command::new("zstd").arg("--version").output().is_err() {
             return;
