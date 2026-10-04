@@ -50,6 +50,9 @@ def check_recipe(path, source, packages)
   cwd = '/'
   env = {}
   directories = Set.new
+  stages = {}
+  stage = nil
+  rust_root = nil
   builder_source = ''
   commands = 0
   source.gsub(/\\\r?\n\s*/, ' ').lines.each do |line|
@@ -58,8 +61,13 @@ def check_recipe(path, source, packages)
     body ||= ''
     case instruction
     when 'FROM'
-      cwd = '/'
-      env = {}
+      stages[stage] = {cwd: cwd, env: env.dup, rust_root: rust_root} if stage
+      tokens = Shellwords.split(body)
+      parent = stages[tokens.first]
+      cwd = parent ? parent.fetch(:cwd) : '/'
+      env = parent ? parent.fetch(:env).dup : {}
+      rust_root = parent && parent[:rust_root]
+      stage = body[/\s+AS\s+(\S+)\z/i, 1]
     when 'WORKDIR'
       cwd = File.expand_path(body, cwd)
     when 'ENV'
@@ -67,12 +75,19 @@ def check_recipe(path, source, packages)
         key, value = word.split('=', 2)
         env[key] = value if value
       end
+    when 'COPY'
+      tokens = Shellwords.split(body)
+      # This root is proved by the repository-directory COPY boundary. It is
+      # inherited only by stages based on this source stage.
+      if tokens.length == 2 && tokens.first == 'rust_hft/'
+        rust_root = File.expand_path(tokens.last, cwd)
+      end
     when 'RUN'
       builder_source += "\n#{body}"
       if body.include?('cargo-scoped.sh') || body.include?('workspace-metadata.sh')
         raise "#{path}: metadata helper requires builder jq" unless builder_source.match?(/\bjq\b/)
       end
-      body.to_enum(:scan, /\bcargo(?:\s+--config\s+'[^']*')?\s+(build|fetch)\b/).each do
+      body.to_enum(:scan, /\bcargo(?:\s+--config\s+'[^']*')?\s+(build|fetch|test)\b/).each do
         match = Regexp.last_match
         prefix = body[0...match.begin(0)]
         tokens = Shellwords.split(body[match.begin(0)..-1].split(/\s+&&\s+/, 2)[0])
@@ -96,7 +111,12 @@ def check_recipe(path, source, packages)
           end
           raise "#{path}: dynamic Docker target builds extra binaries" unless tokens.include?('--bin') && tokens.include?('hft-${TARGET}')
         else
-          manifest = File.expand_path(manifest, cwd).sub(%r{\A/(?:app|work)/}, '')
+          absolute_manifest = File.expand_path(manifest, cwd)
+          manifest = if rust_root && absolute_manifest.start_with?("#{rust_root}/")
+                       absolute_manifest.delete_prefix("#{rust_root}/")
+                     else
+                       absolute_manifest.sub(%r{\A/(?:app|work)/}, '')
+                     end
           raise "#{path}: unregistered Docker manifest #{manifest}" unless ENTRANCES.include?(manifest)
           selections.each do |package|
             raise "#{path}: #{package} has wrong owner #{manifest}" unless packages[package] == manifest
@@ -112,11 +132,11 @@ def check_recipe(path, source, packages)
       raise "#{path}: binary copy uses unbound target #{artifact}" unless directories.any? { |dir| absolute.start_with?("#{dir}/release/") }
     end
   end
-  raise "#{path}: no checked Cargo build/fetch command" if commands.zero?
+  raise "#{path}: no checked Cargo build/fetch/test command" if commands.zero?
 end
 
 recipes = tracked('*Dockerfile*').select do |path|
-  !path.include?('/docs/archive/') && File.read(File.join(ROOT, path)).match?(/\bcargo\s+(?:--config\s+'[^']*'\s+)?(?:build|fetch)\b/)
+  !path.include?('/docs/archive/') && File.read(File.join(ROOT, path)).match?(/\bcargo\s+(?:--config\s+'[^']*'\s+)?(?:build|fetch|test)\b/)
 end
 checked = 0
 recipes.each do |path|
@@ -161,6 +181,23 @@ if ARGV == ['--self-test']
     rejected += 1
   else
     abort 'swapped dynamic Docker owner was admitted'
+  end
+  data_path = 'deployment/aliyun/research/Dockerfile.research-data'
+  data_source = File.read(File.join(ROOT, data_path))
+  {
+    'wrong data owner' => data_source.sub('--manifest-path data-pipelines/Cargo.toml --release', '--manifest-path runtime/Cargo.toml --release'),
+    'wrong test owner' => data_source.sub('cargo test --manifest-path shared/Cargo.toml', 'cargo test --manifest-path runtime/Cargo.toml'),
+    'missing test owner' => data_source.sub('cargo test --manifest-path shared/Cargo.toml', 'cargo test'),
+    'missing source COPY' => data_source.sub('COPY rust_hft/ rust_hft/', 'COPY unrelated/ rust_hft/')
+  }.each do |name, changed|
+    abort "invalid data recipe mutation: #{name}" if changed == data_source
+    begin
+      check_recipe(data_path, changed, packages)
+    rescue RuntimeError
+      rejected += 1
+      next
+    end
+    abort "invalid data Docker contract accepted: #{name}"
   end
 elsif !ARGV.empty?
   abort 'usage: test-rust-docker-workspaces.rb [--self-test]'
