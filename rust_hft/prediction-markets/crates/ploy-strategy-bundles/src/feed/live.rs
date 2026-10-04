@@ -6,11 +6,29 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::traits::{Feed, MarketUpdate};
+
+tokio::task_local! {
+    // RecordingFeed scopes this counter to one inner poll. It also works through
+    // Box<dyn Feed> without changing the shared market-data Feed contract.
+    static RECORDING_SKIPPED_UPDATES: Arc<AtomicU64>;
+}
+
+pub(super) async fn capture_recording_lag<F: Future>(
+    skipped_updates: Arc<AtomicU64>,
+    future: F,
+) -> F::Output {
+    RECORDING_SKIPPED_UPDATES
+        .scope(skipped_updates, future)
+        .await
+}
 
 /// How the feed reacts when the broadcast receiver lags behind producers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +111,13 @@ impl Feed for LiveFeed {
                         return None;
                     }
                     LagPolicy::SkipAndContinue => {
+                        let _ = RECORDING_SKIPPED_UPDATES.try_with(|skipped| {
+                            let _ = skipped.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |total| Some(total.saturating_add(n)),
+                            );
+                        });
                         self.skipped_total = self.skipped_total.saturating_add(n);
                         self.lag_events_total = self.lag_events_total.saturating_add(1);
                         self.pending_skipped = self.pending_skipped.saturating_add(n);
