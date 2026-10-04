@@ -34,6 +34,8 @@ const SETTLEMENT_MATURITY_LAG_SECONDS: i64 = 600;
 // Trade APIs are eventually consistent and the two collectors poll on
 // independent schedules. Keep the full retrieval cutoff, but compare only
 // trades whose event time is mature enough to have appeared in both lanes.
+// Settled markets retain priority until trade completion. Stable polls use
+// cycle cadence when the per-cycle request budget admits them.
 // The comparison window for trades must end early enough that every market
 // contributing a window trade can complete the collector's deferred trade
 // emission before the parity read: settlement availability (~60s) plus the
