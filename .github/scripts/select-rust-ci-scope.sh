@@ -297,7 +297,8 @@ for path in "${paths[@]}"; do
       continue
       ;;
     deployment/aliyun/research/Dockerfile.research-data)
-      select_research_image_jobs
+      select_job ci/ci-contracts
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
     .dockerignore)
