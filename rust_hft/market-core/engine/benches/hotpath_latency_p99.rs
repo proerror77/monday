@@ -91,15 +91,7 @@ fn snapshot(sequence: u64, timestamp: u64) -> MarketEvent {
     })
 }
 
-#[test]
-fn quote_to_worker_queue_p99_stays_below_budget() {
-    const WARMUP: u64 = 1_000;
-    const SAMPLES: u64 = 20_000;
-    const P99_BUDGET_NS: u64 = 500_000;
-    const P999_BUDGET_NS: u64 = 1_000_000;
-
-    let mut engine = Engine::new(benchmark_config());
-    engine.register_strategy(BenchmarkStrategy);
+fn apply_latency_bench_execution_gates(engine: &mut Engine) {
     engine
         .set_intent_execution_limits(
             Some(100),
@@ -112,6 +104,18 @@ fn quote_to_worker_queue_p99_stays_below_budget() {
         VenueId::BINANCE,
         ExecutionPriceProtection::VenueQuote,
     )]));
+}
+
+#[test]
+fn quote_to_worker_queue_p99_stays_below_budget() {
+    const WARMUP: u64 = 1_000;
+    const SAMPLES: u64 = 20_000;
+    const P99_BUDGET_NS: u64 = 500_000;
+    const P999_BUDGET_NS: u64 = 1_000_000;
+
+    let mut engine = Engine::new(benchmark_config());
+    engine.register_strategy(BenchmarkStrategy);
+    apply_latency_bench_execution_gates(&mut engine);
     let ingester = engine.create_event_ingester_pair();
     let (engine_queues, mut worker_queues) =
         create_execution_queues(ExecutionQueueConfig::default());
@@ -169,6 +173,7 @@ fn latency_fixture_preserves_a_paused_sample_without_changing_production_freshne
     for (config, expected) in [(production, 0), (benchmark_config(), 1)] {
         let mut engine = Engine::new(config);
         engine.register_strategy(BenchmarkStrategy);
+        apply_latency_bench_execution_gates(&mut engine);
         let ingester = engine.create_event_ingester_pair();
         let (engine_queues, mut worker_queues) =
             create_execution_queues(ExecutionQueueConfig::default());
