@@ -77,7 +77,11 @@ Run 是固定科学调用：Experiment、BuildArtifact、配置摘要、命令�
 
 CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生软件版本、编译环境、profile、lock 和 scoped 配方指纹纳入缓存键，并将这些输入保存在 release manifest。Cargo cache 与可执行产物分开：缓存只影响后续编译效率，命中缓存仍必须执行 build、二进制摘要验证和 image smoke。每个 runner 有自己的可写 target，禁止多租户共享可写 target；readonly prepared-data mount 不能被当作 compiler cache。
 
-生产构建调度、变异 workspace 的源码归档/签名导入和 release verifier 向 PG 的自动投影尚未实现。现有 CI bundle 能构建一次并被 smoke/发布复用；新 PG 合同能让多个 Run/Attempt 复用已导入的同一产物。不能据此声称已有自动 Agent 变异 → Build → 科学执行闭环。
+`researchctl register-build ARTIFACT SIGNED_RELEASE` 只接受独立发布 verifier 的 Ed25519 签名。`MONDAY_RESEARCH_BUILD_TRUST_FILE` 指向 operator 管理的公开信任配置，绑定 repository、producer workflow 和公钥。输入 envelope 不能自带受信公钥。签名绑定源码归档 manifest、完整 Build 身份、target、OCI digest、二进制集合、CI run/attempt/job 和独立发布回读摘要。修改这些字段或重新计算普通摘要不能修复签名。
+
+先离线应用 `platform/sql/verified_build_release.sql`。该迁移保留原 Build 行作为审计记录，不自动为旧行补信任。只有附有签名证明的 Build 才能进入新 Run。导入事务写入不可变 release 和信任配置摘要；重复导入复用原记录。Build 可在 authority 为 paused 时预先登记；导入不启用 backend，也不授予科学预算或运行权。Run 启动与基础设施 retry 仍独立回读二进制字节。
+
+生产构建调度、变异 workspace 的源码归档上传、原生发布 verifier 出具此签名，以及 release 向 PG 的自动投影仍待接入。现有 CI bundle 能构建一次并被 smoke/发布复用；新 PG 合同能让多个 Run/Attempt 复用已导入的同一产物。不能据此声称已有自动 Agent 变异 → Build → 科学执行闭环。
 
 ## 数据：CH 数值准备、版本化出口、bounded 共享
 
