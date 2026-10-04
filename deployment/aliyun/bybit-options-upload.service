@@ -30,6 +30,8 @@ ProtectHome=true
 ReadWritePaths=/data/monday/spool/bybit-options
 RestrictAddressFamilies=AF_INET AF_INET6
 UMask=0027
+CPUQuota=50%
+Nice=10
 
 [Install]
 WantedBy=multi-user.target
