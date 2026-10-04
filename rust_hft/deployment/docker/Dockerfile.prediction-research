@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.98.1-bookworm AS builder
+ARG SOURCE_REVISION
+WORKDIR /work
+ENV RUST_MIN_STACK=33554432
+ENV CARGO_TARGET_DIR=/work/target/prediction-markets
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang cmake mold pkg-config protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/work/target/prediction-markets,sharing=locked \
+    test "${#SOURCE_REVISION}" -eq 40 \
+    && case "$SOURCE_REVISION" in *[!0-9a-f]*) exit 1 ;; esac \
+    && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo --config 'build.rustc-wrapper=""' build \
+    --manifest-path prediction-markets/Cargo.toml --release --locked \
+    -p ploy-research -p hft-prediction-research-worker --features ploy-research/db \
+    --bin monday-prediction-research --bin monday-prediction-evaluator --bin monday-prediction-snapshot --bin monday-prediction-worker \
+    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-worker /out/bin/monday-prediction-worker \
+    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-research /out/bin/monday-prediction-research \
+    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-evaluator /out/bin/monday-prediction-evaluator \
+    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-snapshot /out/bin/monday-prediction-snapshot
+
+FROM debian:bookworm-slim AS runtime-base
+ENV MONDAY_EXECUTION_HOST=ack
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini zstd \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 research \
+    && mkdir -p /work/config /work/data /work/results \
+    && chown -R research:research /work
+USER research
+WORKDIR /work
+ENV MONDAY_PREDICTION_RESEARCH_BIN=/usr/local/bin/monday-prediction-research \
+    MONDAY_PREDICTION_EVALUATOR_BIN=/usr/local/bin/monday-prediction-evaluator \
+    MONDAY_PREDICTION_SNAPSHOT_BIN=/usr/local/bin/monday-prediction-snapshot
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/monday-prediction-worker"]
+
+FROM runtime-base AS prebuilt
+COPY --chmod=0755 research-bin/monday-prediction-worker /usr/local/bin/monday-prediction-worker
+COPY --chmod=0755 research-bin/monday-prediction-research /usr/local/bin/monday-prediction-research
+COPY --chmod=0755 research-bin/monday-prediction-evaluator /usr/local/bin/monday-prediction-evaluator
+COPY --chmod=0755 research-bin/monday-prediction-snapshot /usr/local/bin/monday-prediction-snapshot
+
+FROM runtime-base AS runtime
+COPY --from=builder /out/bin/ /usr/local/bin/

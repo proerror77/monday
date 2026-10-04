@@ -11,7 +11,7 @@ job_id=${7:-${MONDAY_RELEASE_JOB_ID:-}}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 manifest="$release/research-image-release.json"
 target=x86_64-unknown-linux-gnu
-product=${8:-paired}
+product=$(bash "$(dirname "${BASH_SOURCE[0]}")/research-release-products.sh" normalize "${8:-all}")
 binaries=()
 while IFS= read -r binary; do binaries+=("$binary"); done < <(bash "$script_dir/research-release-products.sh" binaries "$product")
 [[ ${#binaries[@]} -gt 0 ]] || exit 2
@@ -48,8 +48,8 @@ case "$mode" in
       --arg product "$product" \
       --argjson locks "$locks" \
       --argjson binaries "$binary_manifest" \
-      '{schema:"monday.research-image-release.v4",
-        product:$product,
+      '{schema:"monday.research-image-release.v5",
+        products:($product | split(",")),
         source_sha:$source_sha,
         workflow_run_id:$workflow_run_id,
         workflow_run_attempt:$workflow_run_attempt,
@@ -73,8 +73,8 @@ case "$mode" in
       --arg product "$product" \
       --argjson binary_count "${#binaries[@]}" \
       --argjson locks "$locks" \
-      '.schema == "monday.research-image-release.v4" and
-       .product == $product and
+      '.schema == "monday.research-image-release.v5" and
+       .products == ($product | split(",")) and
        .source_sha == $source_sha and
        .workflow_run_id == $workflow_run_id and
        .workflow_run_attempt == $workflow_run_attempt and

@@ -8,6 +8,9 @@ use hft_collector::{
     acquire_dataset, import_feature_dataset, lob_archiver::source_revision, read_feature_rows,
     DataAcquisitionMission, DataModality, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
 };
+use hft_research_artifacts::temporary_output_file;
+#[cfg(test)]
+use hft_research_artifacts::{write_json_atomic, write_json_atomic_bounded};
 use hft_research_manifest::{
     CexReplayDatasetManifestV1, CexReplayDatasetManifestV2, CexReplayDatasetManifestV3,
     CexReplayDatasetManifestV4, CexReplayDatasetManifestV5, CexReplaySeriesV1, CexReplaySnapshotV1,
@@ -20,7 +23,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     io::{BufRead, Write},
-    path::{Component, Path, PathBuf},
+    path::Path,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,35 +31,6 @@ pub(crate) struct FeatureDecisionClock {
     pub(crate) series_id: u64,
     pub(crate) feature_available_time: DateTime<Utc>,
     pub(crate) series_close_time: DateTime<Utc>,
-}
-
-struct BoundedWriter<W> {
-    inner: W,
-    remaining: u64,
-    max_bytes: u64,
-}
-
-impl<W: Write> Write for BoundedWriter<W> {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let allowed = buffer
-            .len()
-            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
-        if allowed == 0 && !buffer.is_empty() {
-            return Err(std::io::Error::other(format!(
-                "serialized JSON exceeds maximum {} bytes",
-                self.max_bytes
-            )));
-        }
-        let written = self.inner.write(&buffer[..allowed])?;
-        self.remaining = self
-            .remaining
-            .saturating_sub(u64::try_from(written).unwrap_or(u64::MAX));
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
 }
 
 pub async fn acquire_and_register(
@@ -981,168 +955,6 @@ pub(crate) fn feature_decision_clocks(
         .collect())
 }
 
-pub(crate) fn ensure_real_directory(path: &Path, label: &str) -> anyhow::Result<()> {
-    let absolute_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("resolve current directory for output safety")?
-            .join(path)
-    };
-    ensure_real_directory_at(&normalize_platform_root_alias(&absolute_path)?, label)
-}
-
-fn normalize_platform_root_alias(path: &Path) -> anyhow::Result<PathBuf> {
-    let mut normalized = PathBuf::new();
-    let mut resolved_root_component = false;
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
-            Component::CurDir => {}
-            Component::ParentDir => normalized.push(".."),
-            Component::Normal(component) if !resolved_root_component => {
-                let root_component = normalized.join(component);
-                normalized = if is_platform_root_alias(component) {
-                    match std::fs::symlink_metadata(&root_component) {
-                        Ok(metadata) if metadata.file_type().is_symlink() => {
-                            std::fs::canonicalize(&root_component).with_context(|| {
-                                format!(
-                                    "resolve platform root alias for output safety: {}",
-                                    root_component.display()
-                                )
-                            })?
-                        }
-                        Ok(_) | Err(_) => root_component,
-                    }
-                } else {
-                    root_component
-                };
-                resolved_root_component = true;
-            }
-            Component::Normal(component) => {
-                normalized.push(component);
-                resolved_root_component = true;
-            }
-        }
-    }
-    Ok(normalized)
-}
-
-fn is_platform_root_alias(component: &std::ffi::OsStr) -> bool {
-    // On macOS these are symlinks into /private. They are the only root-level
-    // aliases we normalize; every other symlink must fail the directory walk.
-    #[cfg(target_os = "macos")]
-    {
-        component == std::ffi::OsStr::new("tmp") || component == std::ffi::OsStr::new("var")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = component;
-        false
-    }
-}
-
-fn ensure_real_directory_at(path: &Path, label: &str) -> anyhow::Result<()> {
-    // Root-level platform aliases (for example macOS /var) are normalized
-    // above. Every remaining component is application-controlled and must not
-    // resolve through a symlink.
-    if let Some(parent) = path.parent().filter(|parent| *parent != path) {
-        ensure_real_directory_at(parent, label)?;
-    }
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::create_dir(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("create {label} directory {}", path.display()))
-                }
-            }
-            std::fs::symlink_metadata(path)
-                .with_context(|| format!("inspect {label} directory {}", path.display()))?
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("inspect {label} directory {}", path.display()))
-        }
-    };
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "{label} directory cannot be a symbolic link: {}",
-            path.display()
-        );
-    }
-    if !metadata.is_dir() {
-        bail!("{label} path must be a directory: {}", path.display());
-    }
-    Ok(())
-}
-
-pub(crate) fn temporary_output_file(
-    path: &Path,
-    prefix: &str,
-) -> anyhow::Result<tempfile::NamedTempFile> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    ensure_real_directory(parent, "temporary output parent")?;
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempfile_in(parent)
-        .with_context(|| format!("create private temporary output in {}", parent.display()))
-}
-
-pub(crate) fn ensure_output_path_is_not_symlink(path: &Path, label: &str) -> anyhow::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("{label} path cannot be a symbolic link: {}", path.display());
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("inspect {label} path {}", path.display()))
-        }
-    }
-}
-
-pub(crate) fn persist_output_file(
-    file: tempfile::NamedTempFile,
-    path: &Path,
-    label: &str,
-) -> anyhow::Result<()> {
-    ensure_output_path_is_not_symlink(path, label)?;
-    file.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("atomically publish {label} to {}", path.display()))?;
-    Ok(())
-}
-
-pub fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
-    write_json_atomic_bounded(path, value, u64::MAX)
-}
-
-pub fn write_json_atomic_bounded(
-    path: &Path,
-    value: &impl serde::Serialize,
-    max_bytes: u64,
-) -> anyhow::Result<()> {
-    let mut temporary = temporary_output_file(path, ".monday-json-")?;
-    serde_json::to_writer_pretty(
-        BoundedWriter {
-            inner: temporary.as_file_mut(),
-            remaining: max_bytes,
-            max_bytes,
-        },
-        value,
-    )?;
-    temporary.as_file().sync_all()?;
-    persist_output_file(temporary, path, "JSON evidence")
-}
-
 pub fn default_manifest_path(manifest: &DatasetManifest) -> std::path::PathBuf {
     manifest
         .artifact_path
@@ -1217,7 +1029,7 @@ pub fn freeze_research_inventory(args: crate::cli::FreezeInventoryArgs) -> anyho
     output
         .persist_noclobber(&args.output)
         .map_err(|error| error.error)?;
-    if crate::mission_runner::sha256_file(&args.output)? != inventory.inventory_sha256 {
+    if hft_research_artifacts::sha256_file(&args.output)? != inventory.inventory_sha256 {
         bail!("frozen inventory output readback differs");
     }
     crate::cli::print_json(&serde_json::json!({"output":args.output,"inventory":inventory}))
@@ -1504,17 +1316,6 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
-    }
-
-    #[test]
-    fn platform_root_aliases_are_explicitly_whitelisted() {
-        assert!(!is_platform_root_alias(std::ffi::OsStr::new("evil")));
-
-        #[cfg(target_os = "macos")]
-        {
-            assert!(is_platform_root_alias(std::ffi::OsStr::new("tmp")));
-            assert!(is_platform_root_alias(std::ffi::OsStr::new("var")));
-        }
     }
 
     #[test]

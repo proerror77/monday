@@ -18,6 +18,7 @@ members = [
     "crates/ploy-platform",
     "crates/ploy-platform-runtime",
     "crates/ploy-research",
+    "crates/research-worker",
     "crates/ploy-runner-host",
     "crates/ploy-strategy-runtime",
     "crates/ploy-strategy-bundles",
