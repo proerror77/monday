@@ -183,14 +183,17 @@ for market in spot usdm; do
         dangling_symlink) ln -s "$ROOT/missing" "$artifact" ;;
         fifo) mkfifo "$artifact" ;;
         socket)
-          python3 - "$artifact" <<'SOCKET'
-import os
-import socket
-import sys
-os.chdir(os.path.dirname(sys.argv[1]))
-with socket.socket(socket.AF_UNIX) as listener:
-    listener.bind(os.path.basename(sys.argv[1]))
-SOCKET
+          # Bind from the parent directory so the sun_path stays short.
+          # The inode remains a socket after the binder exits; find(1) still
+          # classifies it as a non-regular entry.
+          (
+            cd -- "$(dirname -- "$artifact")" || exit 1
+            perl -e '
+              use Socket;
+              socket(my $listener, PF_UNIX, SOCK_STREAM, 0) or die $!;
+              bind($listener, sockaddr_un($ARGV[0])) or die $!;
+            ' -- "$(basename -- "$artifact")"
+          ) || fail "could not bind unix socket fixture $artifact"
           ;;
       esac
       run_fixture "$artifact"

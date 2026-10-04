@@ -49,6 +49,7 @@ err_file="$test_root/err"
 journal_calls_file="$test_root/journal.calls"
 flock_calls_file="$test_root/flock.calls"
 real_mv=$(command -v mv)
+real_flock=$(command -v flock || true)
 
 DF_TOTAL=196000000   # KiB, ~187 GiB (matches the ~196G host disk)
 DF_AVAIL_HEALTHY=117600000   # 60% free
@@ -109,6 +110,7 @@ run_health() {
     STUB_STATE_LOCK_ATTEMPT="${STUB_STATE_LOCK_ATTEMPT:-}" \
     STUB_STATE_WRITE_PAUSE="${STUB_STATE_WRITE_PAUSE:-}" \
     STUB_REAL_MV="$real_mv" \
+    STUB_REAL_FLOCK="$real_flock" \
     STUB_LOCK_APPEAR="${STUB_LOCK_APPEAR:-0}" \
     STUB_LOCK_PATH="$test_root/run/monday/polymarket-raw-ops-gates/control.lock" \
     MONDAY_COLLECTOR_SPOOL_ROOT="$spool_root" \
@@ -460,25 +462,13 @@ fi
 case "$*" in
   '-w 60 8')
     [ "${STUB_STATE_LOCK_ERROR:-0}" != 1 ] || exit 2
-    # Use a real descriptor lock on macOS and Linux. The monitor retains fd 8.
-    exec python3 - <<'PY'
-import fcntl
-import os
-import time
-
-attempt = os.environ.get("STUB_STATE_LOCK_ATTEMPT")
-if attempt:
-    open(attempt, "w").close()
-deadline = time.monotonic() + 60
-while True:
-    try:
-        fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        break
-    except BlockingIOError:
-        if time.monotonic() >= deadline:
-            raise SystemExit(1)
-        time.sleep(0.02)
-PY
+    # Apply a real descriptor lock. The monitor keeps fd 8 open, so the
+    # lock remains after this helper returns.
+    [ -n "${STUB_REAL_FLOCK:-}" ] || exit 2
+    if [ -n "${STUB_STATE_LOCK_ATTEMPT:-}" ]; then
+      : >"$STUB_STATE_LOCK_ATTEMPT"
+    fi
+    exec "$STUB_REAL_FLOCK" -w 60 8
     ;;
   '-s -n 9' | '-n 9') ;;
   *) exit 2 ;;
@@ -493,19 +483,14 @@ EOF
 cat > "$stub_dir/mv" <<'EOF'
 #!/bin/sh
 if [ -n "${STUB_STATE_WRITE_PAUSE:-}" ] && [ "$2" = "$MONDAY_COLLECTOR_STATE_DIR/state.json" ]; then
-  python3 - <<'PY'
-import os
-import time
-
-pause = os.environ["STUB_STATE_WRITE_PAUSE"]
-open(pause + ".reached", "w").close()
-deadline = time.monotonic() + 20
-while not os.path.exists(pause + ".release"):
-    if time.monotonic() >= deadline:
-        raise SystemExit(1)
-    time.sleep(0.02)
-PY
-  [ "$?" -eq 0 ] || exit 1
+  pause="${STUB_STATE_WRITE_PAUSE}"
+  : >"${pause}.reached"
+  n=0
+  while [ ! -e "${pause}.release" ]; do
+    n=$((n + 1))
+    [ "$n" -le 1000 ] || exit 1
+    sleep 0.02
+  done
 fi
 exec "$STUB_REAL_MV" "$@"
 EOF
@@ -1202,17 +1187,11 @@ expect 'health invalid pending: dry-run preserves state' "$(cmp -s "$state_dir/s
 
 wait_for_fixture() {
   # A bounded barrier makes the overlapping invocations deterministic.
-  python3 - "$1" <<'PY'
-import os
-import sys
-import time
-
-deadline = time.monotonic() + 10
-while not os.path.exists(sys.argv[1]):
-    if time.monotonic() >= deadline:
-        raise SystemExit(1)
-    time.sleep(0.02)
-PY
+  local deadline=$((SECONDS + 10))
+  while [ ! -e "$1" ]; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 0.02
+  done
 }
 
 reset_env
