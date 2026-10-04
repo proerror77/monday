@@ -160,9 +160,11 @@ const MAX_RECONNECT_PROOF_BUFFERED_HIGH_RATE_EVENTS: usize = 65_536;
 /// Extra archive-queue backlog per high-rate shard. The rotation barrier
 /// gather can stall the consumer for up to the stall timeout while producers
 /// keep capturing, so each high-rate shard adds its own burst load on top of
-/// MAX_BUFFERED_DIFFS; sized equal to its reconnect-proof budget so one full
-/// proof window of burst cannot overflow the queue by itself.
+/// MAX_BUFFERED_DIFFS, subject to the global archive-queue cap.
 const HIGH_RATE_SHARD_QUEUE_BACKLOG: usize = 65_536;
+/// Bound total queue slots independently of catalog size and configured backlog.
+/// Saturation retains lossless backpressure and the existing watchdog stop path.
+const MAX_ARCHIVE_QUEUE_CAPACITY: usize = 1_048_576;
 
 #[derive(Debug, Clone)]
 struct StreamShard {
@@ -2162,6 +2164,12 @@ fn queue_snapshot_resyncs(
     Ok(())
 }
 
+fn archive_queue_capacity(max_buffered_diffs: usize, high_rate_shards: usize) -> usize {
+    max_buffered_diffs
+        .saturating_add(high_rate_shards.saturating_mul(HIGH_RATE_SHARD_QUEUE_BACKLOG))
+        .min(MAX_ARCHIVE_QUEUE_CAPACITY)
+}
+
 async fn run_session(
     config: Arc<Config>,
     mut shutdown: watch::Receiver<bool>,
@@ -2180,9 +2188,7 @@ async fn run_session(
         .iter()
         .filter(|shard| shard.is_high_rate())
         .count();
-    let queue_capacity = config
-        .max_buffered_diffs
-        .saturating_add(high_rate_shards.saturating_mul(HIGH_RATE_SHARD_QUEUE_BACKLOG));
+    let queue_capacity = archive_queue_capacity(config.max_buffered_diffs, high_rate_shards);
     let (sender, mut receiver) = mpsc::channel(queue_capacity);
     watchdog.record_queue_health(QueueHealth::from_sender(&sender));
     let (rotation_pause_tx, rotation_pause_rx) = watch::channel(0_u64);
@@ -5737,6 +5743,55 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Barrier;
+
+    #[test]
+    fn archive_queue_cap_guard_preserves_budgets_below_the_ceiling() {
+        for (max_buffered_diffs, high_rate_shards, expected) in [
+            (1, 0, 1),
+            (250_000, 0, 250_000),
+            (250_000, 2, 381_072),
+            (250_000, 12, 1_036_432),
+            (1_048_576, 0, 1_048_576),
+        ] {
+            assert_eq!(
+                archive_queue_capacity(max_buffered_diffs, high_rate_shards),
+                expected,
+                "base={max_buffered_diffs}, shards={high_rate_shards}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_queue_cap_guard_bounds_large_catalogs_and_overflow() {
+        let mut config = test_config("http://unused".into());
+        config.symbols = (0..2_000)
+            .map(|index| format!("SYMBOL{index}USDT"))
+            .collect();
+        let high_rate_shards = config
+            .stream_shards()
+            .iter()
+            .filter(|shard| shard.is_high_rate())
+            .count();
+        assert_eq!(high_rate_shards, 40);
+
+        for (max_buffered_diffs, shards) in [
+            (250_000, high_rate_shards),
+            (250_000, 13),
+            (250_000, 4_000),
+            (1_048_577, 0),
+            (usize::MAX, 0),
+            (1, usize::MAX),
+            (usize::MAX, usize::MAX),
+        ] {
+            let capacity = archive_queue_capacity(max_buffered_diffs, shards);
+            assert_eq!(
+                capacity, 1_048_576,
+                "base={max_buffered_diffs}, shards={shards}"
+            );
+            let (sender, _receiver) = mpsc::channel::<Event>(capacity);
+            assert_eq!(QueueHealth::from_sender(&sender).capacity, 1_048_576);
+        }
+    }
 
     #[test]
     fn version_reports_bound_source_revision() {
