@@ -32,8 +32,8 @@ use ploy_research::{
     format_settlement_probability_walk_forward_report, format_trade_formation_v1_report,
     liquidity_gate_v1_with_deribit_and_pm_books,
     liquidity_gated_alpha_v1_with_deribit_and_pm_books, load_research_snapshot,
-    mine_domain_autofactors_from_v2_with_guidance, read_formula_mcts_checkpoint,
-    review_fillability_v1_with_deribit_and_pm_books, review_repricing_ic_with_deribit_and_pm_books,
+    mine_domain_autofactors_from_v2_with_guidance, review_fillability_v1_with_deribit_and_pm_books,
+    review_repricing_ic_with_deribit_and_pm_books,
     review_trade_formation_v1_with_deribit_and_pm_books, split_reprice_rows_by_event_cohort,
     validate_prediction_research_prior, validate_snapshot_request_coverage,
     walk_forward_factor_combo_v1_with_deribit_and_pm_books,
@@ -41,11 +41,11 @@ use ploy_research::{
     walk_forward_meta_label_v1_with_deribit_and_pm_books,
     walk_forward_settlement_probability_report_with_prior,
     walk_forward_settlement_verdict_report_with_prior,
-    write_alpha_search_artifacts_with_state_and_runtime_feedback,
-    write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback,
-    AlphaSearchArtifactSummary, AlphaSearchRuntimeFeedback, AlphaZooSnapshot, AutoFactorOptions,
-    AutoFactorV2Target, CandidateReplayFactorIdentity, FactorComboV1Options, FactorObservation,
-    FactorObservationV2, FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
+    write_alpha_search_artifacts_with_runtime_feedback,
+    write_side_bound_alpha_search_artifacts_with_runtime_feedback, AlphaSearchArtifactSummary,
+    AlphaSearchRuntimeFeedback, AlphaZooSnapshot, AutoFactorOptions, AutoFactorV2Target,
+    CandidateReplayFactorIdentity, FactorComboV1Options, FactorObservation, FactorObservationV2,
+    FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
     FillabilityReviewOptions, FullDepthExecutionMatrixOptions, FullDepthExecutionMatrixReport,
     LiquidityGateV1Options, LiquidityGatedAlphaV1Options, LlmPriorSpec,
     MetaLabelWalkForwardOptions, RepricePilotMetrics, RepricePilotSelection, RepricingIcOptions,
@@ -133,9 +133,7 @@ struct PipelineSmokeReport<'a> {
 #[derive(serde::Serialize)]
 struct RepricePilotSearchArtifact {
     summary: AlphaSearchArtifactSummary,
-    formula_mcts_checkpoint_sha256: String,
-    mcts_state_sha256: String,
-    mcts_expansion_plan_sha256: String,
+    node_metrics_sha256: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -577,14 +575,14 @@ fn run_reprice_pilot(
             ));
         }
         let reports =
-            mine_domain_autofactors_from_v2_with_guidance(&train_side, target, &options, &[], None)
+            mine_domain_autofactors_from_v2_with_guidance(&train_side, target, &options, None)
                 .map_err(|error| format!("mine train-only reprice candidates: {error}"))?;
         let input_names = autofactor_matrix_from_v2(&train_side)
             .map_err(|error| format!("build train-only reprice matrix: {error}"))?
             .input_names()
             .into_iter()
             .collect::<Vec<_>>();
-        let summary = write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
+        let summary = write_side_bound_alpha_search_artifacts_with_runtime_feedback(
             alpha_search_output_dir,
             target.as_str(),
             side,
@@ -593,12 +591,11 @@ fn run_reprice_pilot(
             &options,
             None,
             None,
-            None,
         )
-        .map_err(|error| format!("write train-only MCTS search artifacts: {error}"))?;
+        .map_err(|error| format!("write train-only descriptive search artifacts: {error}"))?;
         let candidate_name = summary.best_candidate.as_deref().ok_or_else(|| {
             format!(
-                "MCTS produced no candidate for target={} side={}",
+                "factor reports produced no candidate for target={} side={}",
                 target.as_str(),
                 side.as_str()
             )
@@ -607,7 +604,7 @@ fn run_reprice_pilot(
             .iter()
             .find(|report| report.name == candidate_name)
             .ok_or_else(|| {
-                format!("MCTS candidate {candidate_name} was not in its train-only report")
+                format!("reported candidate {candidate_name} was not in its train-only report")
             })?;
         let selection = fit_reprice_pilot_selection(candidate, &train_side, target, top_quantile)
             .map_err(|error| format!("fit train-only reprice selection: {error}"))?;
@@ -615,15 +612,11 @@ fn run_reprice_pilot(
             .map_err(|error| format!("evaluate frozen reprice selection: {error}"))?;
         let search_dir = Path::new(&summary.output_dir);
         let search = RepricePilotSearchArtifact {
-            formula_mcts_checkpoint_sha256: sha256_file(
-                &search_dir.join("formula-mcts-checkpoint.json"),
-            )?,
-            mcts_state_sha256: sha256_file(&search_dir.join("mcts-state.json"))?,
-            mcts_expansion_plan_sha256: sha256_file(&search_dir.join("mcts-expansion-plan.json"))?,
+            node_metrics_sha256: sha256_file(&search_dir.join("node-metrics.json"))?,
             summary,
         };
         let artifact = RepricePilotArtifact {
-            schema_version: "monday.polymarket.reprice_pilot.v2",
+            schema_version: "monday.polymarket.reprice_pilot.v3",
             non_finite_floats: "null",
             context,
             status: "pilot_not_promotable",
@@ -1027,6 +1020,27 @@ mod tests {
         ));
         fs::write(&path, payload).expect("write parity fixture");
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn mcts_cutover_rejects_all_retired_alpha_search_inputs() {
+        for flag in [
+            "--alpha-search-state-json",
+            "--formula-mcts-checkpoint-json",
+            "--alpha-search-plan-json",
+        ] {
+            for args in [
+                vec![flag.to_string()],
+                vec![format!("{flag}=unknown-v999.json")],
+            ] {
+                let error = reject_retired_search_inputs(&args)
+                    .expect_err("retired input must fail closed");
+                assert!(error.contains(flag));
+                assert!(error.contains("retired"));
+            }
+        }
+        reject_retired_search_inputs(&["--prediction-mcts-training-candidate-json".into()])
+            .expect("the official training adapter still accepts its typed candidate");
     }
 
     #[test]
@@ -1491,22 +1505,19 @@ mod tests {
     }
 }
 
-fn alpha_search_plan_factor_names(path: &str) -> Vec<String> {
-    let raw = std::fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("read alpha search plan JSON {path} failed: {err}"));
-    let json: serde_json::Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("parse alpha search plan JSON {path} failed: {err}"));
-    json.get("selected_nodes")
-        .and_then(serde_json::Value::as_array)
-        .map(|nodes| {
-            nodes
-                .iter()
-                .filter_map(|node| node.get("factor_name"))
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+fn reject_retired_search_inputs(args: &[String]) -> Result<(), String> {
+    for flag in [
+        "--alpha-search-state-json",
+        "--formula-mcts-checkpoint-json",
+        "--alpha-search-plan-json",
+    ] {
+        if args.iter().any(|arg| arg.split('=').next() == Some(flag)) {
+            return Err(format!(
+                "retired Alpha Search checkpoint/plan input {flag} is not resumable; only monday-prediction-research advances MCTS"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn read_llm_prior(path: &str) -> LlmPriorSpec {
@@ -1622,6 +1633,10 @@ async fn main() {
         );
         return;
     }
+    reject_retired_search_inputs(&args).unwrap_or_else(|reason| {
+        eprintln!("ERROR: {reason}");
+        std::process::exit(2);
+    });
     if flag_present(&args, "--pipeline-smoke-task") {
         run_pipeline_smoke(&args).unwrap_or_else(|reason| {
             eprintln!("ERROR: {reason}");
@@ -1731,7 +1746,6 @@ async fn main() {
     let alpha_search_output_dir = flag_value(&args, "--alpha-search-output-dir");
     let report_output_dir = flag_value(&args, "--report-output-dir");
     let mission_id = flag_value(&args, "--mission-id");
-    let alpha_search_plan_json = flag_value(&args, "--alpha-search-plan-json");
     let alpha_search_llm_prior_json = flag_value(&args, "--alpha-search-llm-prior-json");
     let prediction_mcts_training_candidate_json =
         flag_value(&args, "--prediction-mcts-training-candidate-json");
@@ -1804,20 +1818,6 @@ async fn main() {
     }
     if let Some(path) = alpha_search_llm_prior_json.as_deref() {
         eprintln!("alpha search typed LLM prior loaded from {path}");
-    }
-    let alpha_search_state_json = flag_value(&args, "--alpha-search-state-json");
-    if let Some(path) = alpha_search_state_json.as_deref() {
-        panic!(
-            "legacy alpha search state `{path}` is not resumable; use --formula-mcts-checkpoint-json"
-        );
-    }
-    let formula_mcts_checkpoint_json = flag_value(&args, "--formula-mcts-checkpoint-json");
-    let mcts_state = formula_mcts_checkpoint_json.as_deref().map(|path| {
-        read_formula_mcts_checkpoint(path)
-            .unwrap_or_else(|err| panic!("read Formula MCTS checkpoint JSON {path} failed: {err}"))
-    });
-    if let Some(path) = formula_mcts_checkpoint_json.as_deref() {
-        eprintln!("Formula MCTS checkpoint loaded from {path}");
     }
     let alpha_zoo_snapshot_json = flag_value(&args, "--alpha-zoo-snapshot-json");
     let data_quality_mode = parse_data_quality_mode(flag_value(&args, "--data-quality-mode"));
@@ -2393,10 +2393,6 @@ async fn main() {
             })
             .ok()
     });
-    let alpha_search_plan_names = alpha_search_plan_json
-        .as_deref()
-        .map(alpha_search_plan_factor_names)
-        .unwrap_or_default();
     let alpha_zoo = alpha_zoo_snapshot_json
         .as_deref()
         .map(read_alpha_zoo_snapshot);
@@ -2416,13 +2412,6 @@ async fn main() {
             feedback.formula_evaluations
         );
     }
-    if let Some(path) = alpha_search_plan_json.as_deref() {
-        eprintln!(
-            "alpha search MCTS plan loaded: {} selected nodes from {}",
-            alpha_search_plan_names.len(),
-            path
-        );
-    }
     for target in [
         AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Up),
         AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Down),
@@ -2437,16 +2426,11 @@ async fn main() {
         let side = target.review_side();
         let lane_runtime_feedback =
             runtime_feedback_for_lane(runtime_feedback.as_ref(), target_name, side);
-        let plan_names = side
-            .is_none()
-            .then_some(alpha_search_plan_names.as_slice())
-            .unwrap_or_default();
         let lane_llm_prior = side.is_none().then_some(llm_prior.as_ref()).flatten();
         match mine_domain_autofactors_from_v2_with_guidance(
             &autofactor_rows,
             target,
             &autofactor_options,
-            plan_names,
             lane_llm_prior,
         ) {
             Ok(reports) => {
@@ -2463,31 +2447,27 @@ async fn main() {
                 ) {
                     let write_result = match side {
                         Some(side) => lane_runtime_feedback.map(|feedback| {
-                            write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
+                            write_side_bound_alpha_search_artifacts_with_runtime_feedback(
                                 output_dir,
                                 target_name,
                                 side,
                                 input_names,
                                 &reports,
                                 &autofactor_options,
-                                None,
                                 Some(feedback),
                                 None,
                             )
                         }),
-                        None => Some(
-                            write_alpha_search_artifacts_with_state_and_runtime_feedback(
-                                output_dir,
-                                target_name,
-                                input_names,
-                                &reports,
-                                &autofactor_options,
-                                mcts_state.as_ref(),
-                                lane_runtime_feedback,
-                                llm_prior.as_ref(),
-                                alpha_zoo.as_ref(),
-                            ),
-                        ),
+                        None => Some(write_alpha_search_artifacts_with_runtime_feedback(
+                            output_dir,
+                            target_name,
+                            input_names,
+                            &reports,
+                            &autofactor_options,
+                            lane_runtime_feedback,
+                            llm_prior.as_ref(),
+                            alpha_zoo.as_ref(),
+                        )),
                     };
                     if let Some(write_result) = write_result {
                         match write_result {
