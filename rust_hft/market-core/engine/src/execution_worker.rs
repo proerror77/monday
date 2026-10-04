@@ -2505,6 +2505,8 @@ pub fn spawn_execution_worker_with_control(
     account_to_client: Option<std::collections::HashMap<AccountId, usize>>,
     account_admissions: Option<std::collections::HashMap<AccountId, AccountExecutionAdmission>>,
     account_environments: Option<std::collections::HashMap<AccountId, AccountExecutionEnvironment>>,
+    rate_budget: RateBudget,
+    account_egress: HashMap<AccountId, String>,
 ) -> (
     tokio::task::JoinHandle<Result<(), HftError>>,
     mpsc::UnboundedSender<ControlCommand>,
@@ -2519,6 +2521,8 @@ pub fn spawn_execution_worker_with_control(
         account_admissions,
         account_environments,
         HashSet::new(),
+        rate_budget,
+        account_egress,
     )
 }
 
@@ -2534,12 +2538,15 @@ pub fn spawn_execution_worker_with_control_and_capabilities(
     account_admissions: Option<std::collections::HashMap<AccountId, AccountExecutionAdmission>>,
     account_environments: Option<std::collections::HashMap<AccountId, AccountExecutionEnvironment>>,
     binance_usdm_client_indices: HashSet<usize>,
+    rate_budget: RateBudget,
+    account_egress: HashMap<AccountId, String>,
 ) -> (
     tokio::task::JoinHandle<Result<(), HftError>>,
     mpsc::UnboundedSender<ControlCommand>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let mut worker = ExecutionWorker::new(config.clone(), queues, execution_clients, rx);
+    let mut worker = ExecutionWorker::new(config.clone(), queues, execution_clients, rx)
+        .with_rate_budget(rate_budget, account_egress);
     worker.venue_to_client = venue_to_client;
     worker.binance_usdm_client_indices = binance_usdm_client_indices;
     if let Some(map) = strategy_to_client {
@@ -2573,6 +2580,8 @@ pub fn spawn_execution_worker_with_control_and_router(
     account_to_client: Option<std::collections::HashMap<AccountId, usize>>,
     account_admissions: Option<std::collections::HashMap<AccountId, AccountExecutionAdmission>>,
     account_environments: Option<std::collections::HashMap<AccountId, AccountExecutionEnvironment>>,
+    rate_budget: RateBudget,
+    account_egress: HashMap<AccountId, String>,
 ) -> (
     tokio::task::JoinHandle<Result<(), HftError>>,
     mpsc::UnboundedSender<ControlCommand>,
@@ -2588,6 +2597,8 @@ pub fn spawn_execution_worker_with_control_and_router(
         account_admissions,
         account_environments,
         HashSet::new(),
+        rate_budget,
+        account_egress,
     )
 }
 
@@ -2604,6 +2615,8 @@ pub fn spawn_execution_worker_with_control_and_router_and_capabilities(
     account_admissions: Option<std::collections::HashMap<AccountId, AccountExecutionAdmission>>,
     account_environments: Option<std::collections::HashMap<AccountId, AccountExecutionEnvironment>>,
     binance_usdm_client_indices: HashSet<usize>,
+    rate_budget: RateBudget,
+    account_egress: HashMap<AccountId, String>,
 ) -> (
     tokio::task::JoinHandle<Result<(), HftError>>,
     mpsc::UnboundedSender<ControlCommand>,
@@ -2616,7 +2629,8 @@ pub fn spawn_execution_worker_with_control_and_router_and_capabilities(
         rx,
         router,
         venue_to_client,
-    );
+    )
+    .with_rate_budget(rate_budget, account_egress);
     worker.binance_usdm_client_indices = binance_usdm_client_indices;
     if let Some(map) = strategy_to_client {
         worker.strategy_to_client = Some(map.into_iter().collect());
@@ -2652,6 +2666,8 @@ pub fn spawn_execution_worker(
         None,
         None,
         None,
+        RateBudget::default(),
+        HashMap::new(),
     );
     h
 }

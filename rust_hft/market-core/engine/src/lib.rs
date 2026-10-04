@@ -270,6 +270,8 @@ pub struct Engine {
     venue_specs: HashMap<VenueId, VenueSpec>,
     /// 註冊的執行客戶端
     execution_clients: Vec<Box<dyn ExecutionClient>>,
+    /// Runtime-owned state awaiting transfer to the single execution worker.
+    pending_execution_rate_budget: (rate_budget::RateBudget, HashMap<AccountId, String>),
     execution_price_protection: HashMap<VenueId, ports::ExecutionPriceProtection>,
     /// 執行回報流（與 execution_clients 對應）
     #[allow(dead_code)]
@@ -364,6 +366,7 @@ impl Engine {
             risk_manager: None,
             venue_specs: VenueSpec::build_default_venue_specs(),
             execution_clients: Vec::new(),
+            pending_execution_rate_budget: Default::default(),
             execution_price_protection: HashMap::new(),
             execution_streams: Vec::new(),
             order_manager: None,
@@ -575,6 +578,22 @@ impl Engine {
     /// 移出执行客户端给 worker 使用 (仅调用一次)
     pub fn take_execution_clients(&mut self) -> Vec<Box<dyn ExecutionClient>> {
         std::mem::take(&mut self.execution_clients)
+    }
+
+    /// Stage validated budget state and egress bindings before the execution worker starts.
+    pub fn set_execution_rate_budget(
+        &mut self,
+        budget: rate_budget::RateBudget,
+        account_egress: HashMap<AccountId, String>,
+    ) {
+        self.pending_execution_rate_budget = (budget, account_egress);
+    }
+
+    /// Move charged state once. Subsequent takes return empty, deny-all bindings.
+    pub fn take_execution_rate_budget(
+        &mut self,
+    ) -> (rate_budget::RateBudget, HashMap<AccountId, String>) {
+        std::mem::take(&mut self.pending_execution_rate_budget)
     }
 
     /// 获取引擎唤醒通知器的克隆，用于外部触发引擎唤醒
