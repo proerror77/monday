@@ -443,13 +443,15 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     let pending = ledger.pending_completions("fixture", &session_id).await?;
     assert_eq!(pending.len(), 1);
     assert!(
-        hft_research_platform::postgres::completion_message(&pending[0].1)?.contains("cancelled")
+        hft_research_platform::postgres::completion_message(&pending[0].0, &pending[0].1)?
+            .contains("cancelled")
     );
     assert!(ledger
         .pending_completions("another", &session_id)
         .await
         .is_err());
-    let message = hft_research_platform::postgres::completion_message(&pending[0].1)?;
+    let message =
+        hft_research_platform::postgres::completion_message(&pending[0].0, &pending[0].1)?;
     native_session.send_message(&pending[0].0, &message).await?;
     let delivery = native_session.verified_delivery(&pending[0].0).await?;
     assert!(ledger

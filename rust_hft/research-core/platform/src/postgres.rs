@@ -22,7 +22,11 @@ pub struct Ledger {
 
 pub const SESSION_DELIVERY_MIGRATION: &str = include_str!("../sql/session_deliveries.sql");
 
-pub fn completion_message(intent: &Value) -> Result<String> {
+pub fn completion_message(intent_id: &str, intent: &Value) -> Result<String> {
+    ensure!(
+        crate::valid_digest(intent_id),
+        "invalid completion intent identity"
+    );
     for name in ["session_sha256", "run_sha256", "task_id"] {
         ensure!(
             intent
@@ -44,7 +48,7 @@ pub fn completion_message(intent: &Value) -> Result<String> {
                 .is_some_and(|v| v > 0),
         "completion must bind a terminal revision"
     );
-    Ok(format!("Research Run {} finished with state {state}. Read research.status and research.artifacts for verified results. Completion intent: {}.", intent["run_sha256"].as_str().context("completion Run missing")?, identity(intent)?))
+    Ok(format!("Research Run {} finished with state {state}. Read research.status and research.artifacts for verified results. Completion intent: {}.", intent["run_sha256"].as_str().context("completion Run missing")?, intent_id))
 }
 
 /// An opaque, live PG admission plus a session-scoped lock for one DataView.
@@ -377,7 +381,8 @@ impl Ledger {
         .fetch_one(&self.pool)
         .await?;
         let session: crate::research::Session = serde_json::from_value(value)?;
-        ensure!(session.id()? == id, "corrupt session identity");
+        // The immutable record was validated by register_session. PG supplies
+        // its primary key and tenant relationship; do not rehash it per poll.
         Ok(session)
     }
     /// Native terminal intents only. The exact terminal task revision is read
@@ -392,7 +397,7 @@ impl Ledger {
             .bind(session).bind(tenant).fetch_all(&self.pool).await?;
         for (id, value) in &rows {
             ensure!(
-                identity(value)? == *id
+                crate::valid_digest(id)
                     && value.get("session_sha256").and_then(Value::as_str) == Some(session),
                 "corrupt completion intent"
             );
@@ -420,8 +425,7 @@ impl Ledger {
         let intent: Value = query_scalar("SELECT document FROM research.completion_intents WHERE intent_sha256=$1 AND session_sha256=$2 FOR UPDATE")
             .bind(&record.intent_sha256).bind(session).fetch_one(&mut *tx).await?;
         ensure!(
-            identity(&intent)? == record.intent_sha256
-                && crate::sha256(completion_message(&intent)?.as_bytes()) == record.payload_sha256,
+            verified.message() == completion_message(&record.intent_sha256, &intent)?,
             "completion payload identity changed"
         );
         query("INSERT INTO research.completion_deliveries(intent_sha256,process_generation,native_readback_sha256,document) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")

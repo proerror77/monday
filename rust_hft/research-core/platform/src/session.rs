@@ -472,8 +472,12 @@ pub struct MessageDelivery {
 pub struct VerifiedDelivery {
     record: MessageDelivery,
     provider_binary_sha256: String,
+    message: String,
 }
 impl VerifiedDelivery {
+    pub fn message(&self) -> &str {
+        &self.message
+    }
     pub fn record(&self) -> &MessageDelivery {
         &self.record
     }
@@ -503,6 +507,7 @@ pub struct AppServer {
     tool_requests: BTreeMap<String, Value>,
     thread_id: Option<String>,
     verified_resume: Option<String>,
+    verified_message: Option<String>,
     poisoned: bool,
 }
 
@@ -648,6 +653,7 @@ impl AppServer {
             tool_requests: BTreeMap::new(),
             thread_id: None,
             verified_resume,
+            verified_message: None,
             poisoned: false,
         };
         client.rpc("initialize", json!({"clientInfo":{"name":"monday_research","version":"0.1.0"},"capabilities":{"experimentalApi":true}})).await?;
@@ -920,6 +926,7 @@ impl AppServer {
         let path = self.delivery_path(intent)?;
         let mut record: MessageDelivery = read_json(&path)?;
         record.native_readback_sha256 = None;
+        self.verified_message = None;
         ensure!(
             record.schema == 1
                 && record.intent_sha256 == intent
@@ -975,6 +982,12 @@ impl AppServer {
                     record.turn_id = Some(turn.into());
                     record.delivery = Delivery::Accepted;
                     record.native_readback_sha256 = Some(identity(entry)?);
+                    self.verified_message = Some(
+                        content[0]["text"]
+                            .as_str()
+                            .context("native text missing")?
+                            .into(),
+                    );
                     durable_json(&path, &record)?;
                     return Ok(record);
                 }
@@ -1010,6 +1023,10 @@ impl AppServer {
         Ok(VerifiedDelivery {
             record,
             provider_binary_sha256: self.config.executable_sha256.clone(),
+            message: self
+                .verified_message
+                .take()
+                .context("native message readback missing")?,
         })
     }
     /// Session interruption never changes a scientific Job or its budget.

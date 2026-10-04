@@ -219,7 +219,7 @@ async fn wake(
 ) -> Result<Vec<String>> {
     let mut delivered = Vec::new();
     for (id, intent) in ledger.pending_completions(tenant, session).await? {
-        let message = completion_message(&intent)?;
+        let message = completion_message(&id, &intent)?;
         // A prior Unknown record is reconciled below, never resent.
         let _ = server.send_message(&id, &message).await;
         let delivery = server.verified_delivery(&id).await?;
