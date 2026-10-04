@@ -104,6 +104,7 @@ dependencies = [
  "hft-collector",
  "hft-factor-dsl",
  "hft-governance-contracts",
+ "hft-research-artifacts",
  "hft-research-manifest",
  "hft-research-ml",
  "parquet",
@@ -3317,6 +3318,20 @@ dependencies = [
  "hft-snapshot",
  "rust_decimal",
  "serde",
+]
+
+[[package]]
+name = "hft-research-artifacts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zip 6.0.0",
 ]
 
 [[package]]

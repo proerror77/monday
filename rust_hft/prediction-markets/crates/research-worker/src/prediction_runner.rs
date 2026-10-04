@@ -1,12 +1,9 @@
-use crate::{
-    cli::{print_json, PredictionExecuteArgs},
-    data_mission,
-    mission_runner::{
-        configured_sibling_binary, create_bundle, fetch_to_file, normalized_sha256, publish_result,
-        sha256_file,
-    },
-};
+use crate::cli::{print_json, PredictionExecuteArgs};
 use anyhow::{bail, Context};
+use hft_research_artifacts::{
+    configured_sibling_binary, create_bundle, fetch_to_file, normalized_sha256,
+    publish_result, sha256_file,
+};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -211,14 +208,20 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     let input_dir = args.work_dir.join("input");
     let artifact_dir = args.work_dir.join("artifacts");
     let results_dir = args.work_dir.join("results");
-    data_mission::ensure_real_directory(&args.work_dir, "prediction work")?;
-    data_mission::ensure_real_directory(&input_dir, "prediction input")?;
-    data_mission::ensure_real_directory(&artifact_dir, "prediction artifact")?;
+    hft_research_artifacts::ensure_real_directory(&args.work_dir, "prediction work")?;
+    hft_research_artifacts::ensure_real_directory(&input_dir, "prediction input")?;
+    hft_research_artifacts::ensure_real_directory(&artifact_dir, "prediction artifact")?;
     ensure_empty_results_directory(&results_dir)?;
     let stdout_path = artifact_dir.join("runner.stdout");
     let stderr_path = artifact_dir.join("runner.stderr");
-    data_mission::ensure_output_path_is_not_symlink(&stdout_path, "prediction runner stdout")?;
-    data_mission::ensure_output_path_is_not_symlink(&stderr_path, "prediction runner stderr")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(
+        &stdout_path,
+        "prediction runner stdout",
+    )?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(
+        &stderr_path,
+        "prediction runner stderr",
+    )?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
@@ -268,8 +271,10 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
         None
     };
 
-    let stdout = data_mission::temporary_output_file(&stdout_path, ".monday-artifact-log-")?;
-    let stderr = data_mission::temporary_output_file(&stderr_path, ".monday-artifact-log-")?;
+    let stdout =
+        hft_research_artifacts::temporary_output_file(&stdout_path, ".monday-artifact-log-")?;
+    let stderr =
+        hft_research_artifacts::temporary_output_file(&stderr_path, ".monday-artifact-log-")?;
     let mut command = Command::new(runner);
     command.arg(if mission.is_pipeline_smoke() {
         "--pipeline-smoke"
@@ -303,8 +308,8 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
         .with_context(|| format!("start prediction research runner {}", runner.display()))?;
     stdout.as_file().sync_all()?;
     stderr.as_file().sync_all()?;
-    data_mission::persist_output_file(stdout, &stdout_path, "prediction runner stdout")?;
-    data_mission::persist_output_file(stderr, &stderr_path, "prediction runner stderr")?;
+    hft_research_artifacts::persist_output_file(stdout, &stdout_path, "prediction runner stdout")?;
+    hft_research_artifacts::persist_output_file(stderr, &stderr_path, "prediction runner stderr")?;
     let pipeline_smoke = if mission.is_pipeline_smoke() && status.success() {
         Some(read_pipeline_smoke_completion(
             &stdout_path,
@@ -343,7 +348,10 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
         resume_bundle_sha256: resume_bundle_sha256.as_deref(),
         runner_exit_code: status.code(),
     };
-    data_mission::write_json_atomic(&artifact_dir.join("execution-evidence.json"), &evidence)?;
+    hft_research_artifacts::write_json_atomic(
+        &artifact_dir.join("execution-evidence.json"),
+        &evidence,
+    )?;
 
     let bundle = args.work_dir.join("results.zip");
     create_bundle(&args.work_dir, &bundle, [&results_dir, &artifact_dir])?;
@@ -371,7 +379,10 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     // The readback hash proves the published bundle is the exact bundle whose smoke
     // report was verified before publication. Keep local status evidence outside that
     // hash cycle after readback is verified.
-    data_mission::write_json_atomic(&artifact_dir.join("execution-evidence.json"), &report)?;
+    hft_research_artifacts::write_json_atomic(
+        &artifact_dir.join("execution-evidence.json"),
+        &report,
+    )?;
     print_json(&report)?;
     if !status.success() {
         bail!(
@@ -788,7 +799,7 @@ fn validate_snapshot_digest(value: &str) -> anyhow::Result<()> {
 }
 
 fn ensure_empty_results_directory(results_dir: &Path) -> anyhow::Result<()> {
-    data_mission::ensure_real_directory(results_dir, "prediction results")?;
+    hft_research_artifacts::ensure_real_directory(results_dir, "prediction results")?;
     if std::fs::read_dir(results_dir)?
         .next()
         .transpose()?

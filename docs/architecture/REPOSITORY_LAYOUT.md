@@ -69,6 +69,24 @@ The build boundary does not grant product or execution authority. Existing
 Monday names. Legacy prediction risk and execution contracts remain migration
 debt; they cannot gain another concrete venue adapter.
 
+## Research product boundaries
+
+`hft-research-artifacts` is a shared crate for bounded input transport, safe
+filesystem outputs, and immutable result publication. It has no acquisition,
+model, market-specific task, database, or execution dependency.
+
+`hft-prediction-research-worker` belongs to the Prediction workspace. It owns
+snapshot transport and execution through the existing event-settlement research
+binaries. It cannot import the CEX harness, training engine, backtest, collector,
+or control platform. CEX uses the same artifact interface without importing
+Prediction's worker.
+
+The product catalog publishes CEX `research-runner`, Prediction
+`prediction-research-runner`, and CEX `campaign-cycle-controller` independently.
+Each image contains only its catalog programs. The operator's Prediction dispatch
+command still lives in `alpha-harness`; that control entry remains split debt.
+It renders Jobs that launch `monday-prediction-worker` in the Prediction image.
+
 ## Enforced invariants
 
 - `products/ploy` must not exist.

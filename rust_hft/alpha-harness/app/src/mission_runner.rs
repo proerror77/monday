@@ -45,6 +45,10 @@ use hft_backtest::{
         TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
     },
 };
+use hft_research_artifacts::{
+    checked_result_bundle_bytes, configured_sibling_binary, create_bundle, fetch_to_file,
+    normalized_sha256, publish_immutable_file, publish_result, sha256_file,
+};
 use hft_research_manifest::{
     CexInstrumentRulesV2, CexReplayDatasetManifestV5, CexReplaySnapshotV1, CexReplaySnapshotV2,
     CexReplaySnapshotV3, CexReplaySnapshotV4, CexReplaySnapshotV5, ManifestId,
@@ -54,7 +58,6 @@ use hft_research_manifest::{
 };
 use reqwest::{
     blocking::Client,
-    header::{HeaderValue, CONTENT_TYPE},
     redirect::Policy,
     StatusCode,
 };
@@ -66,7 +69,9 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
+use zip::ZipArchive;
+#[cfg(test)]
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 const MATERIALIZATION_KIND: &str = "lob_point_in_time_materialization";
 const CEX_BASELINE_POLICY_REGISTRY_KIND: &str = "cex_baseline_policy";
@@ -425,7 +430,7 @@ fn persist_supervised_model_attempts(
     results_dir: &Path,
     attempts: &[CexSupervisedModelAttemptV1],
 ) -> anyhow::Result<()> {
-    data_mission::write_json_atomic(
+    hft_research_artifacts::write_json_atomic(
         &results_dir.join("supervised-model-attempts.json"),
         &serde_json::json!({
             "schema_version": CEX_SUPERVISED_MODEL_ATTEMPTS_SCHEMA_VERSION,
@@ -961,14 +966,20 @@ pub(crate) fn execute_report(
     let gp_policy = bound_gp_policy(&control_mission)?;
     let supervised_ml = is_supervised_gp_policy(&gp_policy);
     let supervised_decision_policy = bound_supervised_decision_policy(&control_mission)?;
-    data_mission::write_json_atomic(&results_dir.join("gp-policy.json"), &gp_policy)?;
+    hft_research_artifacts::write_json_atomic(&results_dir.join("gp-policy.json"), &gp_policy)?;
     let baseline_policy = bound_baseline_policy(&control_mission)?;
-    data_mission::write_json_atomic(&results_dir.join("baseline-policy.json"), &baseline_policy)?;
+    hft_research_artifacts::write_json_atomic(
+        &results_dir.join("baseline-policy.json"),
+        &baseline_policy,
+    )?;
     let weight_policy = CexEqualAbsoluteWeightPolicyV1::controlled_v1(
         control_mission.spec.policies.weight.id.clone(),
     )?;
     weight_policy.validate_binding(&control_mission.spec.policies.weight)?;
-    data_mission::write_json_atomic(&results_dir.join("weight-policy.json"), &weight_policy)?;
+    hft_research_artifacts::write_json_atomic(
+        &results_dir.join("weight-policy.json"),
+        &weight_policy,
+    )?;
     let mission_id = control_mission.semantic_id()?;
     if mission_id != args.mission_id {
         bail!("CEX Research Mission semantic ID does not match the requested Mission ID");
@@ -1043,7 +1054,10 @@ pub(crate) fn execute_report(
             .observation_frequency_millis,
     )?;
     replay_policy.validate_binding(&control_mission.spec.policies.replay)?;
-    data_mission::write_json_atomic(&results_dir.join("replay-policy.json"), &replay_policy)?;
+    hft_research_artifacts::write_json_atomic(
+        &results_dir.join("replay-policy.json"),
+        &replay_policy,
+    )?;
     let (_, fetched_replay_artifact_sha256) = fetch_to_file(
         &client,
         &args.replay_artifact_url,
@@ -1093,9 +1107,9 @@ pub(crate) fn execute_report(
         &materialization.snapshot,
     )?;
     validate_mission_dataset_binding(&control_mission, &feature_manifest, &dataset_manifest)?;
-    data_mission::write_json_atomic(&feature_manifest_path, &feature_manifest)?;
-    data_mission::write_json_atomic(&dataset_manifest_path, &dataset_manifest)?;
-    data_mission::write_json_atomic(
+    hft_research_artifacts::write_json_atomic(&feature_manifest_path, &feature_manifest)?;
+    hft_research_artifacts::write_json_atomic(&dataset_manifest_path, &dataset_manifest)?;
+    hft_research_artifacts::write_json_atomic(
         &results_dir.join("data-import.json"),
         &serde_json::json!({
             "manifest": &dataset_manifest,
@@ -1126,7 +1140,7 @@ pub(crate) fn execute_report(
         &materialization_path,
         results_dir.join("materialization.json"),
     )?;
-    data_mission::write_json_atomic(
+    hft_research_artifacts::write_json_atomic(
         &results_dir.join("execution-model.json"),
         &ExecutionModelEvidence::from(&evaluation_protocol.costs),
     )?;
@@ -1153,7 +1167,7 @@ pub(crate) fn execute_report(
         payload: serde_json::to_value(&baseline_policy)?,
         created_at: now,
     })?;
-    data_mission::write_json_atomic(
+    hft_research_artifacts::write_json_atomic(
         &results_dir.join("control-plane-mission.json"),
         &control_mission,
     )?;
@@ -1169,7 +1183,7 @@ pub(crate) fn execute_report(
         ExecutionBinding::Direct => None,
         ExecutionBinding::Campaign { request_sha256, .. } => Some(request_sha256.clone()),
     };
-    data_mission::write_json_atomic(
+    hft_research_artifacts::write_json_atomic(
         &results_dir.join("mission-admission.json"),
         &serde_json::json!({
             "schema_version": &control_mission.schema_version,
@@ -1217,9 +1231,15 @@ pub(crate) fn execute_report(
     {
         bail!("Mission screening policy does not match the evaluator configuration");
     }
-    data_mission::write_json_atomic(&results_dir.join("mission.json"), &research_mission)?;
+    hft_research_artifacts::write_json_atomic(
+        &results_dir.join("mission.json"),
+        &research_mission,
+    )?;
     store.create_mission(&research_mission)?;
-    data_mission::write_json_atomic(&results_dir.join("mission-create.json"), &research_mission)?;
+    hft_research_artifacts::write_json_atomic(
+        &results_dir.join("mission-create.json"),
+        &research_mission,
+    )?;
     let baseline_dataset_manifest =
         data_mission::read_registered_research_dataset(&store, &dataset_manifest_path)?;
     let baseline_rows = baseline_dataset_manifest.load_rows(&evaluation_protocol.costs)?;
@@ -1235,7 +1255,10 @@ pub(crate) fn execute_report(
             &supervised_decision_policy,
         )
         .map_err(anyhow::Error::msg)?;
-        data_mission::write_json_atomic(&results_dir.join("label-space-precheck.json"), &precheck)?;
+        hft_research_artifacts::write_json_atomic(
+            &results_dir.join("label-space-precheck.json"),
+            &precheck,
+        )?;
         research_event(
             "alpha-harness",
             "label_space_precheck_completed",
@@ -1291,7 +1314,7 @@ pub(crate) fn execute_report(
             bail!("resumed mission made no progress");
         }
     }
-    data_mission::write_json_atomic(&results_dir.join("mission-run.json"), &run_report)?;
+    hft_research_artifacts::write_json_atomic(&results_dir.join("mission-run.json"), &run_report)?;
     research_event(
         "alpha-harness",
         "factor_search_stage_completed",
@@ -1355,7 +1378,7 @@ pub(crate) fn execute_report(
         payload: factor_bank_payload,
         created_at: Utc::now(),
     })?;
-    data_mission::write_json_atomic(&results_dir.join("factor-bank.json"), &factor_bank)?;
+    hft_research_artifacts::write_json_atomic(&results_dir.join("factor-bank.json"), &factor_bank)?;
     research_event(
         "alpha-harness",
         "baseline_training_started",
@@ -1464,7 +1487,7 @@ pub(crate) fn execute_report(
                     &model.candidate.decision_policy,
                 )
                 .map_err(anyhow::Error::msg)?;
-            data_mission::write_json_atomic(
+            hft_research_artifacts::write_json_atomic(
                 &results_dir.join(alpha_engine::prediction_diagnostics::CALENDAR_DIAGNOSTICS_FILE),
                 &diagnostics,
             )?;
@@ -1483,7 +1506,7 @@ pub(crate) fn execute_report(
                     &args.replay_manifest_sha256,
                 )?;
             }
-            data_mission::write_json_atomic(
+            hft_research_artifacts::write_json_atomic(
                 &results_dir.join("calendar-validation.json"),
                 &validation,
             )?;
@@ -1637,7 +1660,7 @@ pub(crate) fn execute_report(
         Err(StoreError::NotFound) => None,
         Err(error) => return Err(error.into()),
     };
-    data_mission::write_json_atomic(
+    hft_research_artifacts::write_json_atomic(
         &results_dir.join("mission-status.json"),
         &serde_json::json!({
             "mission": lineage.mission,
@@ -1647,7 +1670,7 @@ pub(crate) fn execute_report(
             "checkpoint": checkpoint,
         }),
     )?;
-    data_mission::write_json_atomic(
+    hft_research_artifacts::write_json_atomic(
         &results_dir.join("candidates.json"),
         &serde_json::json!({
             "mission_id": &mission_id,
@@ -1981,7 +2004,10 @@ fn finalize_cex_candidate(
         &evaluation_record,
         &precommit,
     )?;
-    data_mission::write_json_atomic(&results_dir.join("final-precommit.json"), &precommit)?;
+    hft_research_artifacts::write_json_atomic(
+        &results_dir.join("final-precommit.json"),
+        &precommit,
+    )?;
 
     let claim = CexSealedHoldoutClaimV1::from_precommit(&precommit)?;
     let sealed_revision = open_cex_holdout(
@@ -1997,7 +2023,7 @@ fn finalize_cex_candidate(
                 .map_err(anyhow::Error::msg)
         },
     )?;
-    data_mission::write_json_atomic(
+    hft_research_artifacts::write_json_atomic(
         &results_dir.join("sealed-holdout-receipt.json"),
         &sealed_revision,
     )?;
@@ -2027,7 +2053,10 @@ fn finalize_cex_candidate(
         strategy_bundle_id,
         promotion_id,
     };
-    data_mission::write_json_atomic(&results_dir.join("finalization-report.json"), &report)?;
+    hft_research_artifacts::write_json_atomic(
+        &results_dir.join("finalization-report.json"),
+        &report,
+    )?;
     Ok(report)
 }
 
@@ -2041,7 +2070,7 @@ pub(crate) fn open_cex_holdout(
     evaluate: impl FnOnce() -> anyhow::Result<CandidateEvaluation>,
 ) -> anyhow::Result<RegistryRevision> {
     let claim_path = results_dir.join("sealed-holdout-claim.json");
-    data_mission::write_json_atomic(&claim_path, claim)?;
+    hft_research_artifacts::write_json_atomic(&claim_path, claim)?;
     let claim_sha256 = sha256_file(&claim_path)?;
     // This create-once write is the at-most-once boundary. If it succeeds but
     // local claim or evaluation fails, the Mission is terminal and inconclusive.
@@ -2148,8 +2177,14 @@ pub(crate) fn promote_sealed_candidate(
         } else {
             store.promote_candidate(&bundle, &promotion)?;
         }
-        data_mission::write_json_atomic(&results_dir.join("strategy-bundle.json"), &bundle)?;
-        data_mission::write_json_atomic(&results_dir.join("promotion-record.json"), &promotion)?;
+        hft_research_artifacts::write_json_atomic(
+            &results_dir.join("strategy-bundle.json"),
+            &bundle,
+        )?;
+        hft_research_artifacts::write_json_atomic(
+            &results_dir.join("promotion-record.json"),
+            &promotion,
+        )?;
         (Some(bundle_id), Some(promotion_id))
     } else {
         if !matches!(
@@ -2272,11 +2307,12 @@ fn replay_trace_artifact_path(receipt_name: &str) -> String {
 }
 
 fn write_trace_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    data_mission::ensure_output_path_is_not_symlink(path, "replay trace")?;
-    let mut temporary = data_mission::temporary_output_file(path, ".monday-replay-trace-")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(path, "replay trace")?;
+    let mut temporary =
+        hft_research_artifacts::temporary_output_file(path, ".monday-replay-trace-")?;
     temporary.as_file_mut().write_all(bytes)?;
     temporary.as_file().sync_all()?;
-    data_mission::persist_output_file(temporary, path, "replay trace")
+    hft_research_artifacts::persist_output_file(temporary, path, "replay trace")
 }
 
 fn registry_content_reference(
@@ -2383,7 +2419,7 @@ fn persist_baseline_evidence(
             payload: serde_json::to_value(gate)?,
             created_at: Utc::now(),
         })?;
-        data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), &gate)?;
+        hft_research_artifacts::write_json_atomic(&results_dir.join("baseline-gate.json"), &gate)?;
         return Ok(());
     }
 
@@ -2412,7 +2448,7 @@ fn persist_baseline_evidence(
                 payload: serde_json::to_value(artifact)?,
                 created_at: Utc::now(),
             })?;
-            data_mission::write_json_atomic(
+            hft_research_artifacts::write_json_atomic(
                 &results_dir.join(format!("{name}-baseline.json")),
                 artifact,
             )?;
@@ -2426,7 +2462,7 @@ fn persist_baseline_evidence(
         payload: serde_json::to_value(gate)?,
         created_at: Utc::now(),
     })?;
-    data_mission::write_json_atomic(&results_dir.join("baseline-gate.json"), gate)?;
+    hft_research_artifacts::write_json_atomic(&results_dir.join("baseline-gate.json"), gate)?;
     Ok(())
 }
 
@@ -2491,11 +2527,11 @@ fn run_cex_supervised_model_research(
             payload: serde_json::to_value(&evaluation.candidate)?,
             created_at: Utc::now(),
         })?;
-        data_mission::write_json_atomic(
+        hft_research_artifacts::write_json_atomic(
             &results_dir.join(format!("{name}-supervised-backtest.json")),
             evaluation,
         )?;
-        data_mission::write_json_atomic(
+        hft_research_artifacts::write_json_atomic(
             &results_dir.join(format!("{name}-supervised-candidate.json")),
             &evaluation.candidate,
         )?;
@@ -2565,7 +2601,7 @@ fn run_cex_supervised_model_research(
         &results_dir.join(crate::mission_metrics::METRICS_JSON),
         &results_dir.join(crate::mission_metrics::METRICS_CSV),
     )?;
-    data_mission::write_json_atomic(
+    hft_research_artifacts::write_json_atomic(
         &results_dir.join("supervised-model-selection.json"),
         &selection,
     )?;
@@ -2687,7 +2723,7 @@ fn run_factor_bank_subset_search(
             .map_err(anyhow::Error::msg)?;
         let checkpoint =
             MctsCheckpointArtifactV1::new(search.checkpoint().map_err(anyhow::Error::msg)?)?;
-        data_mission::write_json_atomic_bounded(
+        hft_research_artifacts::write_json_atomic_bounded(
             &results_dir.join("factor-subset-mcts-checkpoint.json"),
             &checkpoint,
             MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
@@ -2695,12 +2731,12 @@ fn run_factor_bank_subset_search(
         if stop == CexFactorBankMctsStopReasonV1::Paused {
             continue;
         }
-        data_mission::write_json_atomic(
+        hft_research_artifacts::write_json_atomic(
             &results_dir.join("factor-subset-mcts-trace.json"),
             &search.trace().map_err(anyhow::Error::msg)?,
         )?;
         let result = search.result().map_err(anyhow::Error::msg)?;
-        data_mission::write_json_atomic(
+        hft_research_artifacts::write_json_atomic(
             &results_dir.join("factor-subset-mcts-result.json"),
             &result,
         )?;
@@ -2708,7 +2744,7 @@ fn run_factor_bank_subset_search(
             .combination_artifact(control_mission, ridge, cart, &baselines.gate)
             .map_err(anyhow::Error::msg)?
         {
-            data_mission::write_json_atomic(
+            hft_research_artifacts::write_json_atomic(
                 &results_dir.join("combination-walk-forward.json"),
                 &strategy,
             )?;
@@ -3440,7 +3476,7 @@ fn run_cex_target_position_replay(
         order_submission_authority: false,
     }
     .finalize()?;
-    data_mission::write_json_atomic(&results_dir.join(receipt_name), &receipt)?;
+    hft_research_artifacts::write_json_atomic(&results_dir.join(receipt_name), &receipt)?;
     research_event(
         "alpha-harness",
         "event_replay_completed",
@@ -4039,14 +4075,6 @@ pub(crate) fn validate_materialization(
     Ok(())
 }
 
-pub(crate) fn normalized_sha256(label: &str, value: &str) -> anyhow::Result<String> {
-    let value = value.trim().to_ascii_lowercase();
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("{label} SHA256 is invalid");
-    }
-    Ok(value)
-}
-
 pub(crate) fn validate_cex_mission_id(value: &str) -> anyhow::Result<()> {
     let suffix = value
         .strip_prefix("cex-mission-")
@@ -4073,49 +4101,6 @@ pub(crate) fn valid_git_revision(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-pub(crate) fn fetch_to_file(
-    client: &Client,
-    source: &str,
-    destination: &Path,
-    max_bytes: u64,
-) -> anyhow::Result<(u64, String)> {
-    let mut reader: Box<dyn Read> =
-        if source.starts_with("http://") || source.starts_with("https://") {
-            let response = client
-                .get(source)
-                .send()
-                .map_err(reqwest::Error::without_url)?
-                .error_for_status()
-                .map_err(reqwest::Error::without_url)?;
-            if response
-                .content_length()
-                .is_some_and(|length| length > max_bytes)
-            {
-                bail!("source exceeds the allowed size");
-            }
-            Box::new(response)
-        } else {
-            let path = Path::new(source.strip_prefix("file://").unwrap_or(source));
-            let file = File::open(path)
-                .with_context(|| format!("failed to open local source {}", path.display()))?;
-            if file.metadata()?.len() > max_bytes {
-                bail!("source exceeds the allowed size");
-            }
-            Box::new(file)
-        };
-    let mut temporary = data_mission::temporary_output_file(destination, ".monday-fetch-")?;
-    let bytes = std::io::copy(
-        &mut reader.by_ref().take(max_bytes + 1),
-        temporary.as_file_mut(),
-    )?;
-    temporary.as_file().sync_all()?;
-    if bytes > max_bytes {
-        bail!("source exceeds the allowed size");
-    }
-    data_mission::persist_output_file(temporary, destination, "fetched source")?;
-    Ok((bytes, sha256_file(destination)?))
 }
 
 pub(crate) fn recover_execution_report_from_published_result(
@@ -4429,7 +4414,8 @@ fn fetch_optional_to_file(
         {
             bail!("source exceeds the allowed size");
         }
-        let mut temporary = data_mission::temporary_output_file(destination, ".monday-fetch-")?;
+        let mut temporary =
+            hft_research_artifacts::temporary_output_file(destination, ".monday-fetch-")?;
         let mut reader = response;
         let bytes = std::io::copy(
             &mut reader.by_ref().take(max_bytes + 1),
@@ -4439,7 +4425,7 @@ fn fetch_optional_to_file(
         if bytes > max_bytes {
             bail!("source exceeds the allowed size");
         }
-        data_mission::persist_output_file(temporary, destination, "fetched source")?;
+        hft_research_artifacts::persist_output_file(temporary, destination, "fetched source")?;
         return Ok(Some((bytes, sha256_file(destination)?)));
     }
 
@@ -5065,7 +5051,7 @@ fn read_local_replay_trace(
 ) -> anyhow::Result<Vec<u8>> {
     let relative = replay_trace_relative_path(receipt)?;
     let path = results_dir.join(relative);
-    data_mission::ensure_output_path_is_not_symlink(&path, "replay trace")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(&path, "replay trace")?;
     let mut file = File::open(&path)
         .with_context(|| format!("open local CEX replay trace {}", path.display()))?;
     if file.metadata()?.len() > MAX_RESULT_BUNDLE_BYTES {
@@ -5264,134 +5250,6 @@ fn validate_replay_trace_bytes(
         bail!("CEX replay trace accounting readback does not match its receipt");
     }
     Ok(())
-}
-
-pub(crate) fn create_bundle<'a>(
-    work_dir: &Path,
-    bundle: &Path,
-    roots: impl IntoIterator<Item = &'a PathBuf>,
-) -> anyhow::Result<()> {
-    let mut files = Vec::new();
-    for root in roots {
-        collect_files(root, &mut files)?;
-    }
-    files.sort();
-    let temporary = data_mission::temporary_output_file(bundle, ".monday-bundle-")?;
-    let mut archive = ZipWriter::new(temporary.reopen()?);
-    let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o600);
-    for path in files {
-        let name = path
-            .strip_prefix(work_dir)
-            .with_context(|| format!("bundle path escapes work directory: {}", path.display()))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        archive.start_file(name, options)?;
-        std::io::copy(&mut File::open(path)?, &mut archive)?;
-    }
-    let file = archive.finish()?;
-    file.sync_all()?;
-    drop(file);
-    data_mission::persist_output_file(temporary, bundle, "bundle")?;
-    Ok(())
-}
-
-fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let metadata = entry.path().symlink_metadata()?;
-        if metadata.file_type().is_symlink() {
-            bail!("bundle input cannot contain symbolic links");
-        }
-        if metadata.is_dir() {
-            collect_files(&entry.path(), files)?;
-        } else if metadata.is_file() {
-            files.push(entry.path());
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn publish_result(
-    client: &Client,
-    destination: &str,
-    bundle: &Path,
-) -> anyhow::Result<()> {
-    checked_result_bundle_bytes(bundle)?;
-    publish_immutable_file(client, destination, bundle, "application/zip")
-}
-
-fn checked_result_bundle_bytes(bundle: &Path) -> anyhow::Result<u64> {
-    let bundle_bytes = bundle.metadata()?.len();
-    if bundle_bytes > MAX_RESULT_BUNDLE_BYTES {
-        bail!(
-            "result bundle exceeds the allowed size: {} bytes > {} bytes",
-            bundle_bytes,
-            MAX_RESULT_BUNDLE_BYTES
-        );
-    }
-    Ok(bundle_bytes)
-}
-
-pub(crate) fn publish_immutable_file(
-    client: &Client,
-    destination: &str,
-    source: &Path,
-    content_type: &'static str,
-) -> anyhow::Result<()> {
-    if destination.starts_with("http://") || destination.starts_with("https://") {
-        client
-            .put(destination)
-            .header(CONTENT_TYPE, HeaderValue::from_static(content_type))
-            .header("x-oss-forbid-overwrite", "true")
-            .body(File::open(source)?)
-            .send()
-            .map_err(reqwest::Error::without_url)?
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)?;
-        return Ok(());
-    }
-    let path = Path::new(destination.strip_prefix("file://").unwrap_or(destination));
-    let mut output = data_mission::temporary_output_file(path, ".monday-result-")?;
-    std::io::copy(&mut File::open(source)?, output.as_file_mut())?;
-    output.as_file().sync_all()?;
-    match output.persist_noclobber(path) {
-        Ok(_) => Ok(()),
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            bail!("result destination already exists: {}", path.display())
-        }
-        Err(error) => Err(error.error)
-            .with_context(|| format!("atomically publish result to {}", path.display())),
-    }
-}
-
-pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    let mut file = File::open(path)?;
-    let mut digest = Sha256::new();
-    std::io::copy(&mut file, &mut digest)?;
-    Ok(hex::encode(digest.finalize()))
-}
-
-pub(crate) fn configured_sibling_binary(environment: &str, name: &str) -> anyhow::Result<PathBuf> {
-    let path = std::env::var_os(environment)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(Ok)
-        .unwrap_or_else(|| {
-            let current = std::env::current_exe().context("resolve alpha-harness executable")?;
-            let parent = current
-                .parent()
-                .context("alpha-harness executable has no parent directory")?;
-            Ok::<_, anyhow::Error>(parent.join(name))
-        })?;
-    if !path.is_file() {
-        bail!(
-            "configured sibling binary does not exist: {}",
-            path.display()
-        );
-    }
-    Ok(path)
 }
 
 #[cfg(test)]
@@ -5875,7 +5733,7 @@ pub(crate) mod tests {
 
             let envelope_path = directory.join(format!("cex-{suffix}-envelope.json"));
             let signed_path = directory.join(format!("cex-{suffix}-signed.json"));
-            data_mission::write_json_atomic(&envelope_path, &envelope).unwrap();
+            hft_research_artifacts::write_json_atomic(&envelope_path, &envelope).unwrap();
             governance::sign_deployment(SignDeploymentArgs {
                 db: db.to_path_buf(),
                 envelope: envelope_path,
@@ -5964,7 +5822,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let wrong_scope_path = directory.join("cex-cross-scope-feedback.json");
-        data_mission::write_json_atomic(&wrong_scope_path, &wrong_scope).unwrap();
+        hft_research_artifacts::write_json_atomic(&wrong_scope_path, &wrong_scope).unwrap();
         assert!(governance::ingest_feedback(FeedbackRecordArgs {
             db: db.to_path_buf(),
             record: wrong_scope_path,

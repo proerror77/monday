@@ -76,7 +76,9 @@ Recommended first production shape:
   nodes or `nvidia.com/gpu` to speed training; see
   [ACK research accelerator](../../../docs/research/ACK_RESEARCH_ACCELERATOR.md).
 - One backtest Pod per worker; each Pod processes a batch of parameters.
-- A prebuilt runner image from `rust_hft/deployment/docker/Dockerfile.research`.
+- A prebuilt CEX runner from `rust_hft/deployment/docker/Dockerfile.research`.
+- An independent Prediction runner from
+  `rust_hft/deployment/docker/Dockerfile.prediction-research`.
 - A separate ACK controller image from
   `deployment/aliyun/research/Dockerfile.campaign-cycle-controller`.
 
@@ -366,12 +368,20 @@ cloud resources:
 
 ## Build discipline
 
+The ACR publisher consumes the exact binaries already built and smoke-tested by
+native CI. Its product catalog separates CEX, Prediction, and Campaign controller
+programs; publishing an image does not submit a Job. Explicit source builds use
+the owning Dockerfile and target `runtime`. The command below builds CEX only;
+Prediction uses `Dockerfile.prediction-research` and repository
+`prediction-research-runner`.
+
 Build once for each source revision:
 
 ```bash
 docker buildx build \
   --platform linux/amd64 \
   --file rust_hft/deployment/docker/Dockerfile.research \
+  --target runtime \
   --tag REPLACE_REGISTRY/research-runner:REPLACE_GIT_SHA \
   --push \
   rust_hft
@@ -1291,8 +1301,10 @@ terminal Job/Pod state, Mission readback SHA, result readback SHA, and Campaign
 result readback SHA. This path may emit a research promotion lineage, but it
 does not prove or authorize Paper, Shadow, or Live runtime.
 
-`k8s/prediction-mission-job.example.yaml` uses the same image, restricted Pod
-security context, signed-URL input transport, and immutable result upload for one
+`k8s/prediction-mission-job.example.yaml` uses the independently published
+`prediction-research-runner` image and its `monday-prediction-worker execute`
+entrypoint. It retains the restricted Pod security context, signed-URL input
+transport, and immutable result upload for one
 event-settlement mission. Its evaluator remains the prediction-specific
 event-disjoint binary and the Job contains no exchange credential or execution
 entrypoint. Mission v4 uses the built-in deterministic research profile and the

@@ -7,7 +7,7 @@
 use crate::{
     cli::{print_json, PrepareFreshInputsArgs, BUILD_SOURCE_REVISION},
     data_mission,
-    mission_runner::sha256_file,
+    hft_research_artifacts::sha256_file,
 };
 use anyhow::{bail, Context};
 use hft_collector::research_inventory::{
@@ -191,8 +191,11 @@ pub fn prepare(args: PrepareFreshInputsArgs) -> anyhow::Result<()> {
     validate_args(&args)?;
     let raw_root = read_only_root(&args.raw_root, "raw archive")?;
     let reference_root = read_only_root(&args.reference_root, "reference archive")?;
-    data_mission::ensure_real_directory(&args.output_root, "fresh input output")?;
-    data_mission::ensure_real_directory(&args.materializer_work_dir, "materializer work")?;
+    hft_research_artifacts::ensure_real_directory(&args.output_root, "fresh input output")?;
+    hft_research_artifacts::ensure_real_directory(
+        &args.materializer_work_dir,
+        "materializer work",
+    )?;
     ensure_output_parent(&args.inventory_out, "frozen inventory")?;
     ensure_output_parent(&args.request_out, "fresh preparation request")?;
     if let Some(report) = &args.report_out {
@@ -518,7 +521,7 @@ fn ensure_output_parent(path: &Path, label: &str) -> anyhow::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    data_mission::ensure_real_directory(parent, label)
+    hft_research_artifacts::ensure_real_directory(parent, label)
 }
 
 fn normalize_for_compare(path: &Path) -> anyhow::Result<PathBuf> {
@@ -1812,8 +1815,8 @@ fn write_report_create_once(path: Option<&Path>, report: &PreparationReport) -> 
 
 fn write_bytes_create_once(path: &Path, bytes: &[u8], label: &str) -> anyhow::Result<()> {
     ensure_output_parent(path, label)?;
-    data_mission::ensure_output_path_is_not_symlink(path, label)?;
-    let mut temporary = data_mission::temporary_output_file(path, ".fresh-inputs-")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(path, label)?;
+    let mut temporary = hft_research_artifacts::temporary_output_file(path, ".fresh-inputs-")?;
     std::io::Write::write_all(temporary.as_file_mut(), bytes)?;
     temporary.as_file().sync_all()?;
     match temporary.persist_noclobber(path) {

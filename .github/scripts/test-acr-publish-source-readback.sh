@@ -43,7 +43,7 @@ reset_fixtures() {
   jq -n '[{jobs:[{run_id:100,run_attempt:2,name:"Research image binaries",status:"completed",conclusion:"success"},
     {run_id:100,run_attempt:2,name:"Research image smoke",status:"completed",conclusion:"success"}]}]' > "$work/jobs"
   jq -n '[{workflow_runs:[]}]' > "$work/publishers"
-  jq -n --arg sha "$source_sha" '[{artifacts:[{name:("research-image-release-"+$sha+"-paired"),expired:false,workflow_run:{id:100,head_sha:$sha}}]}]' > "$work/artifacts"
+  jq -n --arg sha "$source_sha" '[{artifacts:[{name:("research-image-release-"+$sha+"-cex-runner,controller,prediction-runner"),expired:false,workflow_run:{id:100,head_sha:$sha}}]}]' > "$work/artifacts"
 }
 edit_fixture() {
   jq "$2" "$work/$1" > "$work/edited"
@@ -123,11 +123,16 @@ reject wrong-producer-artifact
 reset_fixtures
 jq -n --arg sha "$source_sha" '[{workflow_runs:[{id:80,run_attempt:3,head_sha:$sha,head_branch:"main",event:"workflow_run",path:".github/workflows/acr-publish.yml",head_repository:{full_name:"owner/repo"},status:"completed",conclusion:"success"}]}]' > "$work/publishers"
 cp "$work/publishers" "$work/publisher-base"
-jq -n --arg sha "$source_sha" '[{jobs:[{run_id:80,run_attempt:3,name:("Research release complete [paired] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' > "$work/prior-jobs"
+jq -n --arg sha "$source_sha" '[{jobs:[{run_id:80,run_attempt:3,name:("Research products published [cex-runner,controller,prediction-runner] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' > "$work/prior-jobs"
 cp "$work/prior-jobs" "$work/marker-base"
+# A manual CEX-only publication cannot suppress the pending Prediction product.
+edit_fixture prior-jobs '.[0].jobs[0].name="Research products published [cex-runner] (1111111111111111111111111111111111111111)"'
+read_state ready
+cp "$work/marker-base" "$work/prior-jobs"
+rm "$work/out"
 read_state already_published
-if grep -Fq /artifacts "$work/calls"; then
-  echo 'completed publication needlessly revisited binary artifacts' >&2; exit 1
+if ! grep -Fq /artifacts "$work/calls"; then
+  echo 'product coverage was not checked against the producer artifact metadata' >&2; exit 1
 fi
 # Rerunning an older publisher must still recognize a newer completed run.
 edit_fixture publishers '.[0].workflow_runs[0].id=300'
@@ -145,7 +150,7 @@ for mismatch in skipped-marker other-source previous-attempt wrong-run untrusted
   rm "$work/out"
   case "$mismatch" in
     skipped-marker) edit_fixture prior-jobs '.[0].jobs[0].conclusion="skipped"' ;;
-    other-source) edit_fixture prior-jobs '.[0].jobs[0].name="Research release complete (different)"' ;;
+    other-source) edit_fixture prior-jobs '.[0].jobs[0].name="Research products published [cex-runner,controller,prediction-runner] (2222222222222222222222222222222222222222)"' ;;
     previous-attempt) edit_fixture prior-jobs '.[0].jobs[0].run_attempt=2' ;;
     wrong-run) edit_fixture prior-jobs '.[0].jobs[0].run_id=79' ;;
     untrusted-workflow) edit_fixture publishers '.[0].workflow_runs[0].path=".github/workflows/foreign.yml"' ;;
@@ -196,6 +201,22 @@ manual_reuse() {
 manual_reuse ready success
 grep -Fqx research_mode=artifact "$work/manual-reuse"
 grep -Fqx artifact_run_id=100 "$work/manual-reuse"
+grep -Fqx published_products=cex-runner "$work/manual-reuse"
+# The same verified union may publish only Prediction. A CEX-only producer
+# cannot be reused for that target or for an all-products publication.
+"$script_dir/select-acr-publish-source.sh" --event workflow_dispatch --target prediction-research-runner \
+  --product prediction-runner --rebuild false --current-ref refs/heads/main --current-sha "$source_sha" --current-run-id 200 \
+  --main-sha "$source_sha" --monorepo-conclusion success --prediction-conclusion success --security-conclusion success \
+  --run-id 100 --automation-state ready --binaries-conclusion success --smoke-conclusion success --output "$work/prediction-reuse"
+grep -Fqx published_products=prediction-runner "$work/prediction-reuse"
+for target in prediction-research-runner all; do
+  if "$script_dir/select-acr-publish-source.sh" --event workflow_dispatch --target "$target" \
+    --product cex-runner --rebuild false --current-ref refs/heads/main --current-sha "$source_sha" --current-run-id 200 \
+    --main-sha "$source_sha" --monorepo-conclusion success --prediction-conclusion success --security-conclusion success \
+    --run-id 100 --automation-state ready --binaries-conclusion success --smoke-conclusion success --output "$work/wrong-product" >"$work/rejection" 2>&1; then
+    echo 'foreign product reuse accepted' >&2; exit 1
+  fi
+done
 for state in deferred stale out_of_scope; do
   if manual_reuse "$state" success; then exit 1; fi
 done

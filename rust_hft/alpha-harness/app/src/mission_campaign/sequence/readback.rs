@@ -44,7 +44,7 @@ pub(crate) fn readback(
         &result_path,
         MAX_REQUEST_BYTES,
     )?;
-    let hash = crate::mission_runner::sha256_file(&result_path)?;
+    let hash = hft_research_artifacts::sha256_file(&result_path)?;
     if settled_hash.is_some_and(|expected| expected != hash) {
         bail!("settled sequence result changed");
     }
@@ -62,7 +62,7 @@ pub(crate) fn readback(
         let temporary = tempfile::tempdir_in(cache)?;
         let extracted = temporary.path().join("extracted");
         extract_bundle_with_file_limit(&bundle, &extracted, 64)?;
-        if crate::mission_runner::sha256_file(&extracted.join("result.json"))? != hash {
+        if hft_research_artifacts::sha256_file(&extracted.join("result.json"))? != hash {
             bail!("sequence archive result differs from published result");
         }
         verify_artifact_set(&bundle, &extracted, &result)?;
@@ -153,7 +153,9 @@ pub(crate) fn verify_artifact_inventory(
         bail!("sequence archive inventory differs from result");
     }
     for (name, hash) in artifacts {
-        if crate::mission_runner::sha256_file(&extracted.join(directory).join(name))? != *hash {
+        if hft_research_artifacts::sha256_file(&extracted.join(directory).join(name))?
+            != *hash
+        {
             bail!("sequence result artifact bytes changed");
         }
     }

@@ -1051,7 +1051,7 @@ pub(crate) fn write_submission(
         image: image.to_string(),
         request,
     })?;
-    data_mission::write_json_atomic(path, &validated.submission)?;
+    hft_research_artifacts::write_json_atomic(path, &validated.submission)?;
     Ok(SubmissionRenderReport {
         request_sha256: validated.request_sha256,
         submission_identity_sha256: validated.submission_identity_sha256,
@@ -1939,7 +1939,7 @@ mod tests {
             )
             .unwrap();
             submission.request.campaign_inputs_sha256 =
-                crate::mission_runner::sha256_file(&campaign_inputs_path).unwrap();
+                hft_research_artifacts::sha256_file(&campaign_inputs_path).unwrap();
             submission.request.research_plan.label_horizon =
                 Some(alpha_domain::campaign_horizon::CampaignLabelHorizonV1::canonical());
             submission.request.campaign_id =

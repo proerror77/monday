@@ -1,11 +1,9 @@
-use crate::{
-    cli::{
-        print_json, PredictionDispatchRenderArgs, PredictionDispatchStatusArgs,
-        PredictionDispatchSubmitArgs,
-    },
-    mission_runner::{configured_sibling_binary, fetch_to_file, normalized_sha256},
+use crate::cli::{
+    print_json, PredictionDispatchRenderArgs, PredictionDispatchStatusArgs,
+    PredictionDispatchSubmitArgs,
 };
 use anyhow::{bail, Context};
+use hft_research_artifacts::{configured_sibling_binary, fetch_to_file, normalized_sha256};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1087,7 +1085,6 @@ fn render_validated_submission(
         "research.monday/lane": "prediction_market",
     });
     let container_args = json!([
-        "prediction",
         "execute",
         "--work-dir",
         "/work",
@@ -1182,7 +1179,7 @@ fn render_validated_submission(
                                 "name": "prediction-mission",
                                 "image": validated.submission.image,
                                 "imagePullPolicy": "IfNotPresent",
-                                "command": ["/usr/local/bin/alpha-harness"],
+                                "command": ["/usr/local/bin/monday-prediction-worker"],
                                 "args": container_args,
                                 "env": prediction_environment(&validated, &admission),
                                 "resources": {
@@ -1659,6 +1656,8 @@ mod tests {
             "research_trial"
         );
         let container = &job["spec"]["template"]["spec"]["containers"][0];
+        assert_eq!(container["command"], json!(["/usr/local/bin/monday-prediction-worker"]));
+        assert_eq!(container["args"][0], "execute");
         assert!(container["args"].as_array().is_some_and(|args| {
             [
                 "--snapshot-contract-id",

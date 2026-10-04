@@ -273,7 +273,7 @@ pub(crate) fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
         signing_plan: request.signing_plan()?,
         canonical_request: request,
     };
-    data_mission::write_json_atomic(&args.output, &plan)?;
+    hft_research_artifacts::write_json_atomic(&args.output, &plan)?;
     print_json(
         &serde_json::json!({"phase":"final_evaluation", "campaign_id":plan.canonical_request.campaign_id,
         "family_id":grant.grant().family_id, "sources":plan.canonical_request.sources.len(), "max_candidates":grant.grant().max_candidates,
@@ -297,7 +297,7 @@ pub(crate) fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     {
         bail!("finalized request differs from its frozen inputs");
     }
-    data_mission::write_json_atomic(&args.request_out, &request)?;
+    hft_research_artifacts::write_json_atomic(&args.request_out, &request)?;
     let report = mission_dispatch::final_admission::write_submission(
         &args.submission_out,
         &args.attempt_id,
@@ -600,7 +600,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         &dataset_manifest,
     )?;
     let dataset_path = inputs.join("dataset-manifest.json");
-    data_mission::write_json_atomic(&dataset_path, &dataset_manifest)?;
+    hft_research_artifacts::write_json_atomic(&dataset_path, &dataset_manifest)?;
     let registered = data_mission::read_registered_research_dataset(&data_store, &dataset_path)?;
     let dataset = prepare_dataset(
         registered.load_rows(&mission.spec.evaluation_protocol.costs)?,
@@ -631,11 +631,11 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             Ok((frozen, report)) => {
                 evaluated += 1;
                 let reference = content_ref(&frozen.artifact_id, &frozen)?;
-                data_mission::write_json_atomic(
+                hft_research_artifacts::write_json_atomic(
                     &results.join(format!("{}-model.json", frozen.artifact_id)),
                     &frozen,
                 )?;
-                data_mission::write_json_atomic(
+                hft_research_artifacts::write_json_atomic(
                     &results.join(format!("{}-selection.json", frozen.artifact_id)),
                     &report,
                 )?;
@@ -665,7 +665,10 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         }
     }
     let selection = ModelSelectionReportV1::new(&grant, entries).map_err(anyhow::Error::msg)?;
-    data_mission::write_json_atomic(&results.join("independent-selection.json"), &selection)?;
+    hft_research_artifacts::write_json_atomic(
+        &results.join("independent-selection.json"),
+        &selection,
+    )?;
     let mut outcome = CampaignFinalOutcomeV1::NoSelectionCandidate;
     let mut precommit_ref = None;
     let mut sealed_ref = None;
@@ -716,11 +719,14 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             let now = Utc::now();
             let (authority_ref, selection_ref) =
                 store.put_model_final_authority(&grant, &selection, now)?;
-            data_mission::write_json_atomic(
+            hft_research_artifacts::write_json_atomic(
                 &results.join("final-authority.json"),
                 &store.get_registry_revision(&authority_ref.id)?,
             )?;
-            data_mission::write_json_atomic(&results.join("source-mission.json"), &source.mission)?;
+            hft_research_artifacts::write_json_atomic(
+                &results.join("source-mission.json"),
+                &source.mission,
+            )?;
             let replay_reference =
                 content_ref(&replay.receipt_id, &serde_json::to_value(&replay)?)?;
             store.put_registry_revision(&RegistryRevision {
@@ -807,8 +813,14 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
                 &record,
                 &precommit,
             )?;
-            data_mission::write_json_atomic(&results.join("final-precommit.json"), &precommit)?;
-            data_mission::write_json_atomic(&results.join("final-candidate.json"), &candidate)?;
+            hft_research_artifacts::write_json_atomic(
+                &results.join("final-precommit.json"),
+                &precommit,
+            )?;
+            hft_research_artifacts::write_json_atomic(
+                &results.join("final-candidate.json"),
+                &candidate,
+            )?;
             let claim = CexSealedHoldoutClaimV1::from_model_precommit(&precommit)?;
             grant.validate_active_at(Utc::now())?;
             let sealed = crate::mission_runner::open_cex_holdout(
@@ -824,7 +836,10 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
                         .map_err(anyhow::Error::msg)
                 },
             )?;
-            data_mission::write_json_atomic(&results.join("sealed-holdout-receipt.json"), &sealed)?;
+            hft_research_artifacts::write_json_atomic(
+                &results.join("sealed-holdout-receipt.json"),
+                &sealed,
+            )?;
             let (bundle_id, promotion_id) = crate::mission_runner::promote_sealed_candidate(
                 &mut store,
                 &results,
@@ -848,12 +863,12 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         }
     }
     let bundle_path = work.join("final-result.zip");
-    crate::mission_runner::create_bundle(&work, &bundle_path, [&results])?;
+    hft_research_artifacts::create_bundle(&work, &bundle_path, [&results])?;
     let bundle_bytes = std::fs::metadata(&bundle_path)?.len();
     if bundle_bytes > MAX_RESULT_BUNDLE_BYTES {
         bail!("final result bundle exceeds publication limit");
     }
-    let bundle_sha256 = crate::mission_runner::sha256_file(&bundle_path)?;
+    let bundle_sha256 = hft_research_artifacts::sha256_file(&bundle_path)?;
     let result = FinalResult {
         schema_version: "monday.campaign_final_result.v1".into(),
         campaign_id: request.campaign_id.clone(),
@@ -877,7 +892,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     };
     result.validate_identity(&request, &result.request_sha256)?;
     let result_path = work.join("final-result.json");
-    data_mission::write_json_atomic(&result_path, &result)?;
+    hft_research_artifacts::write_json_atomic(&result_path, &result)?;
     publish_immutable_file(
         &client,
         &request.bundle_put_url,
@@ -898,7 +913,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         &result_path,
         "application/json",
     )?;
-    let result_hash = crate::mission_runner::sha256_file(&result_path)?;
+    let result_hash = hft_research_artifacts::sha256_file(&result_path)?;
     fetch_verified(
         &client,
         "final result readback",
@@ -1139,7 +1154,9 @@ pub(crate) fn readback_terminal(
             "global holdout claim",
             &request.holdout_claim_readback_url,
             &global,
-            &crate::mission_runner::sha256_file(&results.join("sealed-holdout-claim.json"))?,
+            &hft_research_artifacts::sha256_file(
+                &results.join("sealed-holdout-claim.json"),
+            )?,
             64 * 1024,
         )
         .map_err(terminal_readback_error)?;

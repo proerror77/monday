@@ -2,7 +2,7 @@
 # CI builds bytes and provenance; it never acquires research compute or runs a
 # Campaign. Release admission and authorized deployment remain separate.
 set -euo pipefail
-product=${1:-paired}
+product=$(bash "$(dirname "${BASH_SOURCE[0]}")/research-release-products.sh" normalize "${1:-all}")
 cd "$(dirname "$0")/../../rust_hft"
 source_sha=$(../.github/scripts/research-release-source-sha.sh)
 export MONDAY_RELEASE_JOB_ID
