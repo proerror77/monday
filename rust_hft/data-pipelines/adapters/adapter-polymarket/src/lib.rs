@@ -497,15 +497,14 @@ impl PolymarketBook {
         let Some(size) = entry.size else {
             return false;
         };
-        let best_bid = self
-            .bids
-            .last_key_value()
-            .map_or(rust_decimal::Decimal::ZERO, |(price, _)| *price);
-        let best_ask = self
-            .asks
-            .first_key_value()
-            .map_or(rust_decimal::Decimal::ONE, |(price, _)| *price);
-        if entry.best_bid != Some(best_bid) || entry.best_ask != Some(best_ask) {
+        // Empty-side sentinels cannot prove a healthy replay. Require actual
+        // depth on both sides before comparing the provider's complete BBA.
+        let Some(((best_bid, _), (best_ask, _))) =
+            self.bids.last_key_value().zip(self.asks.first_key_value())
+        else {
+            return false;
+        };
+        if entry.best_bid != Some(*best_bid) || entry.best_ask != Some(*best_ask) {
             return false;
         }
         let levels = match entry.side {
@@ -1891,18 +1890,42 @@ mod tests {
     }
 
     #[test]
-    fn stale_absent_deletion_respects_empty_side_bba_sentinels() {
+    fn stale_replay_rejects_empty_book_sentinel_rollback() {
         let symbols = symbols();
-        let mut state = BookState::default();
-        convert_message(parse_one(
-            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"2000","bids":[],"asks":[]}"#,
-        ), &symbols, &mut state).unwrap();
-        let wire = r#"{"event_type":"price_change","market":"$MARKET","timestamp":"1000","price_changes":[{"asset_id":"123","price":"0.4","size":"0","side":"BUY","best_bid":"0","best_ask":"1"}]}"#;
-        assert!(convert_message(parse_one(wire), &symbols, &mut state)
-            .unwrap()
-            .is_empty());
-        assert_eq!(state.timestamps["123"], 2_000);
-        assert_eq!(state.sequences["123"], 1);
+        for (bids, asks, best_bid, best_ask) in [
+            ("[]", "[]", "0", "1"),
+            ("[]", r#"[{"price":"0.6","size":"3"}]"#, "0", "0.6"),
+            (r#"[{"price":"0.4","size":"2"}]"#, "[]", "0.4", "1"),
+        ] {
+            let mut state = BookState::default();
+            let snapshot = format!(
+                r#"{{"event_type":"book","asset_id":"123","market":"$MARKET","hash":"seed","timestamp":"2000","bids":{bids},"asks":{asks}}}"#
+            );
+            convert_message(parse_one(&snapshot), &symbols, &mut state).unwrap();
+            let before = state.books["123"].clone();
+            for side in ["BUY", "SELL"] {
+                let wire = format!(
+                    r#"{{"event_type":"price_change","market":"$MARKET","timestamp":"1000","price_changes":[{{"asset_id":"123","price":"0.5","size":"0","side":"{side}","best_bid":"{best_bid}","best_ask":"{best_ask}"}}]}}"#
+                );
+                let error = convert_message(parse_one(&wire), &symbols, &mut state)
+                    .expect_err("empty-side sentinels must not mask a source-clock rollback");
+                assert!(
+                    matches!(error, HftError::Parse(reason) if reason.contains("source time moved backwards"))
+                );
+                assert_eq!(state.timestamps["123"], 2_000);
+                assert_eq!(state.sequences["123"], 1);
+                let current = &state.books["123"];
+                assert_eq!(current.sequence, before.sequence);
+                assert_eq!(current.bids, before.bids);
+                assert_eq!(current.asks, before.asks);
+                assert_eq!(current.is_ready(), before.is_ready());
+                assert_eq!(current.is_dirty(), before.is_dirty());
+                assert_eq!(
+                    current.provider_identity.as_ref().unwrap().book_hash,
+                    before.provider_identity.as_ref().unwrap().book_hash
+                );
+            }
+        }
     }
 
     #[test]
