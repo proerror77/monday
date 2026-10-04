@@ -60,7 +60,7 @@
 #      breach. The five-minute host timer latches an increase until the
 #      GitHub alerting poll observes it; the local timer must not consume
 #      the counter. Session changes and counter regressions rebaseline
-#      instead of fabricating a delta.
+#      instead of fabricating a delta, but never clear a pending breach.
 # The raw-ops Gate template has no [Install] section, so systemd reports it as
 # static. Static is healthy only when no Gate instance, running lock, or
 # residual EnvironmentFile remains on the host. State-persistence failures
@@ -81,7 +81,7 @@
 #
 # Usage: monday-collector-health.sh [--json] [--dry-run] [--monitor-release]
 #   --json     emit a single JSON object to stdout (nothing else on stdout)
-#   --dry-run  do not read or write the persistent upload-failure/restart state
+#   --dry-run  read persistent state; do not write it or acknowledge breaches
 #
 # Test/override environment:
 #   MONDAY_COLLECTOR_SPOOL_ROOT  spool root (default /data/monday/spool)
@@ -235,9 +235,9 @@ if [ "$MONITOR_RELEASE" = 1 ]; then
 fi
 
 # The local monday-collector-health.timer must not consume a sequence-gap
-# increase. The GitHub monitor-collector-host workflow invokes this script
-# through Cloud Assistant without this env, observes the latched delta, and
-# then persists the new baseline.
+# increase. Pending evidence is independent of the session/counter baseline.
+# The GitHub workflow invokes this script without this env, reports the pending
+# breach once, and consumes it using the existing alerting-poll contract.
 SEQUENCE_GAP_LATCH=0
 case "${MONDAY_COLLECTOR_HEALTH_LATCH_SEQUENCE_GAPS:-}" in
   1|true|yes) SEQUENCE_GAP_LATCH=1 ;;
@@ -264,6 +264,8 @@ delay_gate_json='{}'
 disk_json='{}'
 mount_json='{}'
 state_lines=""
+prior_state=""
+state_locked=0
 
 log() {
   logger -t "$TAG" -p "daemon.$1" -- "$2" 2>/dev/null || true
@@ -298,9 +300,7 @@ $msg"
 
 read_prior() {
   # $1 = state key (e.g. "nrestarts|<unit>"); prints prior value or empty
-  if [ -f "$STATE_FILE" ]; then
-    grep "^$1=" "$STATE_FILE" 2>/dev/null | head -n1 | cut -d= -f2-
-  fi
+  printf '%s\n' "$prior_state" | grep "^$1=" | head -n1 | cut -d= -f2-
 }
 
 write_sequence_prior() {
@@ -458,7 +458,7 @@ check_service() {
     [ "$result" = "success" ] || record_warning "$label: last systemd Result='$result'"
   fi
   prior=$(read_prior "nrestarts|$unit")
-  if [ "$DRY_RUN" -eq 0 ] && [ -n "$prior" ]; then
+  if [ -n "$prior" ]; then
     case "$prior" in (*[!0-9]*|'') prior="" ;; esac
     if [ -n "$prior" ]; then
       delta=$((nrestarts - prior))
@@ -712,6 +712,8 @@ check_binance_health() {
   sequence_gap_delta_json=null
   sequence_gap_previous_total_json=null
   sequence_gap_session_json=null
+  sequence_gap_pending_json=null
+  sequence_gap_pending_state=''
   sequence_gap_observed=0
   sequence_gap_baseline=missing
   hwarn=false
@@ -719,12 +721,37 @@ check_binance_health() {
   archive_coverage='{"status":"not_observed","native_tape_verification":"pending","calendar_admission":"pending"}'
   prior_session=''
   prior_total=''
-  if [ "$DRY_RUN" -eq 0 ]; then
-    prior_session=$(read_prior "sequence_gap_session|$label")
-    prior_total=$(read_prior "sequence_gap_total|$label")
-    case "$prior_total" in
-      '' | *[!0-9]*) prior_total='' ;;
-    esac
+  prior_session=$(read_prior "sequence_gap_session|$label")
+  prior_total=$(read_prior "sequence_gap_total|$label")
+  case "$prior_total" in
+    '' | *[!0-9]*) prior_total='' ;;
+  esac
+  sequence_gap_pending_state=$(read_prior "sequence_gap_pending|$label")
+  if [ -n "$sequence_gap_pending_state" ]; then
+    if sequence_gap_pending_json=$(printf '%s' "$sequence_gap_pending_state" | jq -cse '
+      def valid_breach:
+        type == "object" and (.session_id | type) == "string"
+        and (.session_id | test("^[A-Za-z0-9._:-]+$"))
+        and (.previous_total | type) == "number" and (.total | type) == "number"
+        and (.previous_total | floor) == .previous_total
+        and (.total | floor) == .total
+        and .previous_total >= 0 and .total > .previous_total;
+      if length == 1 and (.[0] | valid_breach)
+        and (.[0] | if has("additional_breaches") then
+          (.additional_breaches | type) == "array"
+          and (.additional_breaches | all(valid_breach)) else true end)
+      then .[0] | {session_id,previous_total,total}
+        + (if (.additional_breaches | length) > 0 then
+            {additional_breaches: [.additional_breaches[] | {session_id,previous_total,total}]}
+          else {} end)
+      else error("invalid pending sequence-gap breach") end' 2>/dev/null); then
+      sequence_gap_pending_state=$sequence_gap_pending_json
+    else
+      # Unknown evidence is not an acknowledgment. Keep the state breached
+      # even on an alerting poll until the malformed record is repaired.
+      sequence_gap_pending_json=null
+      sequence_gap_pending_state=invalid
+    fi
   fi
   if [ ! -f "$health_file" ] || [ -L "$health_file" ]; then
     record_breach "$label: health.json missing or a symbolic link ($health_file)"
@@ -803,9 +830,7 @@ check_binance_health() {
       preserve_sequence_prior
     elif [ "$session_valid" -eq 1 ] && [ "$total_valid" -eq 1 ]; then
       sequence_gap_observed=1
-      if [ "$DRY_RUN" -eq 1 ]; then
-        sequence_gap_baseline=dry_run
-      elif [ -z "$prior_session" ] || [ -z "$prior_total" ]; then
+      if [ -z "$prior_session" ] || [ -z "$prior_total" ]; then
         sequence_gap_baseline=baseline
         sequence_gap_previous_total_json=null
       else
@@ -818,6 +843,25 @@ check_binance_health() {
           sequence_gap_delta_json=$sequence_gap_delta
           sequence_gap_baseline=increased
           record_breach "$label: sequence_gap_total increased $prior_total -> $sequence_gap_total (delta=$sequence_gap_delta)"
+          if [ "$sequence_gap_pending_state" != invalid ]; then
+            # Extend this baseline's pending interval. Keep other sessions
+            # and regression baselines until an alerting poll reports them.
+            if sequence_gap_pending_json=$(jq -cn --argjson pending "$sequence_gap_pending_json" \
+              --arg s "$session_id" \
+              --argjson p "$prior_total" --argjson t "$sequence_gap_total" \
+              '(if $pending == null then [] else
+                  [$pending | {session_id,previous_total,total}] + ($pending.additional_breaches // []) end)
+               | if any(.session_id == $s and .previous_total == $p) then
+                   map(if .session_id == $s and .previous_total == $p
+                     then .total = ([.total,$t] | max) else . end)
+                 else . + [{session_id:$s,previous_total:$p,total:$t}] end
+               | .[0] + (if length > 1 then {additional_breaches: .[1:]} else {} end)'); then
+              sequence_gap_pending_state=$sequence_gap_pending_json
+            else
+              sequence_gap_pending_json=null
+              sequence_gap_pending_state=invalid
+            fi
+          fi
         elif [ "$sequence_gap_total" -lt "$prior_total" ]; then
           sequence_gap_baseline=regressed
           record_warning "$label: sequence_gap_total regressed $prior_total -> $sequence_gap_total; baseline reset"
@@ -843,11 +887,22 @@ check_binance_health() {
       preserve_sequence_prior
     fi
   fi
+  if [ -n "$sequence_gap_pending_state" ]; then
+    if [ "$sequence_gap_pending_state" = invalid ]; then
+      record_breach "$label: unacknowledged sequence-gap breach (pending state malformed)"
+    else
+      record_breach "$label: unacknowledged sequence-gap breach $sequence_gap_pending_json"
+    fi
+    if [ "$SEQUENCE_GAP_LATCH" -eq 1 ] || [ "$sequence_gap_pending_state" = invalid ]; then
+      state_lines="$state_lines sequence_gap_pending|$label=$sequence_gap_pending_state"
+    fi
+  fi
   hobj=$(jq -n --argjson age "$age" --argjson gaps "$gaps" \
     --argjson total "$sequence_gap_total_json" \
     --argjson delta "$sequence_gap_delta_json" \
     --argjson previous "$sequence_gap_previous_total_json" \
     --argjson session "$sequence_gap_session_json" \
+    --argjson pending "$sequence_gap_pending_json" \
     --arg baseline "$sequence_gap_baseline" \
     --argjson observed "$sequence_gap_observed" \
     --argjson archive "$archive_coverage" \
@@ -855,6 +910,7 @@ check_binance_health() {
     '{age_seconds: $age, sequence_gaps: $gaps,
       sequence_gap_total: $total, sequence_gap_delta: $delta,
       sequence_gap_previous_total: $previous, session_id: $session,
+      sequence_gap_pending: $pending,
       sequence_gap_observed: ($observed == 1),
       sequence_gap_baseline: $baseline,
       archive_coverage: $archive, disk_warning: ($hw == "true"), status: $s}')
@@ -1424,15 +1480,13 @@ check_upload_lane() {
     record_breach "$label: upload last_error=$err_msg"
   fi
   prior=$(read_prior "failure_count|$label")
-  if [ "$DRY_RUN" -eq 0 ]; then
-    case "$prior" in (*[!0-9]*|'') prior="" ;; esac
-    if [ -z "$prior" ] && [ "$failure_count" -gt 0 ]; then
-      failure_delta=1
-      record_breach "$label: initial upload failure_count=$failure_count"
-    elif [ -n "$prior" ] && [ "$failure_count" -gt "$prior" ]; then
-      failure_delta=1
-      record_breach "$label: upload failure_count increased $prior -> $failure_count"
-    fi
+  case "$prior" in (*[!0-9]*|'') prior="" ;; esac
+  if [ -z "$prior" ] && [ "$failure_count" -gt 0 ]; then
+    failure_delta=1
+    record_breach "$label: initial upload failure_count=$failure_count"
+  elif [ -n "$prior" ] && [ "$failure_count" -gt "$prior" ]; then
+    failure_delta=1
+    record_breach "$label: upload failure_count increased $prior -> $failure_count"
   fi
   state_lines="$state_lines failure_count|$label=$failure_count"
 
@@ -1458,7 +1512,7 @@ mark_delay_gate_replaced() {
 }
 
 write_state() {
-  [ "$DRY_RUN" -eq 1 ] && return 0
+  [ "$state_locked" -eq 1 ] || return 0
   # A state-persistence failure means the next poll can lose restart/upload
   # deltas while the monitor reports healthy, so record it as a breach rather
   # than only logging: gate 4 delta detection depends on this state.
@@ -1480,63 +1534,100 @@ write_state() {
   fi
 }
 
-NOW_SEC=$(date +%s)
-CHECKED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+run_health_checks() {
+  # Read one snapshot. Writers hold state.lock until write_state completes.
+  if [ -f "$STATE_FILE" ] && ! prior_state=$(cat "$STATE_FILE" 2>/dev/null); then
+    record_breach "state: cannot read state file $STATE_FILE"
+    state_locked=0
+  fi
+  NOW_SEC=$(date +%s)
+  CHECKED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-check_mount
-check_disk
+  check_mount
+  check_disk
 
-check_service "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot" 1
-check_service "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm" 1
-check_timer "$RECOVERY_SPOT_TIMER" "binance-lob-archiver-recovery@spot.timer" "$ARCHIVER_SPOT"
-check_timer "$RECOVERY_USDM_TIMER" "binance-lob-archiver-recovery@usdm.timer" "$ARCHIVER_USDM"
-check_service "$REFERENCE_COLLECTOR" "binance-usdm-reference-collector"
-check_service "$BYBIT_ARCHIVER" "bybit-options-archiver"
+  check_service "$ARCHIVER_SPOT" "binance-lob-archiver-production@spot" 1
+  check_service "$ARCHIVER_USDM" "binance-lob-archiver-production@usdm" 1
+  check_timer "$RECOVERY_SPOT_TIMER" "binance-lob-archiver-recovery@spot.timer" "$ARCHIVER_SPOT"
+  check_timer "$RECOVERY_USDM_TIMER" "binance-lob-archiver-recovery@usdm.timer" "$ARCHIVER_USDM"
+  check_service "$REFERENCE_COLLECTOR" "binance-usdm-reference-collector"
+  check_service "$BYBIT_ARCHIVER" "bybit-options-archiver"
 
-check_scheduled_timer "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer" "$POLY_MARKET_UPLOAD_SERVICE"
-check_oneshot_result "$POLY_MARKET_UPLOAD_SERVICE" "polymarket-market-tape-upload.service"
-check_scheduled_timer "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer" "$POLY_REF_UPLOAD_SERVICE"
-check_oneshot_result "$POLY_REF_UPLOAD_SERVICE" "polymarket-reference-upload.service"
-check_upload_timer_backed "$POLY_MARKET_COLLECTOR" "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer"
-check_upload_timer_backed "$POLY_REF_COLLECTOR" "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
-check_scheduled_timer "$WATCHDOG_TIMER" "polymarket-market-tape-upload-watchdog.timer"
-check_oneshot_result "$WATCHDOG_SERVICE" "polymarket-market-tape-upload-watchdog.service"
-check_timer "$BYBIT_UPLOAD_TIMER" "bybit-options-upload.timer"
-check_oneshot_result "$BYBIT_UPLOAD_SERVICE" "bybit-options-upload.service"
-check_timer "$USDM_REF_UPLOAD_TIMER" "binance-usdm-reference-upload.timer"
-check_oneshot_result "$USDM_REF_UPLOAD_SERVICE" "binance-usdm-reference-upload.service"
-check_timer "$FEE_SPOT_TIMER" "binance-fee-snapshot-spot.timer"
-check_oneshot_result "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
-check_timer "$FEE_USDM_TIMER" "binance-fee-snapshot-usdm.timer"
-check_oneshot_result "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
-check_timer "$FEE_UPLOAD_TIMER" "binance-fee-upload.timer"
-check_oneshot_result "$FEE_UPLOAD_SERVICE" "binance-fee-upload.service"
+  check_scheduled_timer "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer" "$POLY_MARKET_UPLOAD_SERVICE"
+  check_oneshot_result "$POLY_MARKET_UPLOAD_SERVICE" "polymarket-market-tape-upload.service"
+  check_scheduled_timer "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer" "$POLY_REF_UPLOAD_SERVICE"
+  check_oneshot_result "$POLY_REF_UPLOAD_SERVICE" "polymarket-reference-upload.service"
+  check_upload_timer_backed "$POLY_MARKET_COLLECTOR" "$POLY_MARKET_UPLOAD_TIMER" "polymarket-market-tape-upload.timer"
+  check_upload_timer_backed "$POLY_REF_COLLECTOR" "$POLY_REF_UPLOAD_TIMER" "polymarket-reference-upload.timer"
+  check_scheduled_timer "$WATCHDOG_TIMER" "polymarket-market-tape-upload-watchdog.timer"
+  check_oneshot_result "$WATCHDOG_SERVICE" "polymarket-market-tape-upload-watchdog.service"
+  check_timer "$BYBIT_UPLOAD_TIMER" "bybit-options-upload.timer"
+  check_oneshot_result "$BYBIT_UPLOAD_SERVICE" "bybit-options-upload.service"
+  check_timer "$USDM_REF_UPLOAD_TIMER" "binance-usdm-reference-upload.timer"
+  check_oneshot_result "$USDM_REF_UPLOAD_SERVICE" "binance-usdm-reference-upload.service"
+  check_timer "$FEE_SPOT_TIMER" "binance-fee-snapshot-spot.timer"
+  check_oneshot_result "$FEE_SPOT_SERVICE" "binance-fee-snapshot-spot.service"
+  check_timer "$FEE_USDM_TIMER" "binance-fee-snapshot-usdm.timer"
+  check_oneshot_result "$FEE_USDM_SERVICE" "binance-fee-snapshot-usdm.service"
+  check_timer "$FEE_UPLOAD_TIMER" "binance-fee-upload.timer"
+  check_oneshot_result "$FEE_UPLOAD_SERVICE" "binance-fee-upload.service"
 
-check_raw_ops_gate "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
+  check_raw_ops_gate "$POLY_RAW_OPS_GATE" "polymarket-raw-ops-gate"
 
-check_binance_health "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot"
-check_binance_health "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance-lob/usdm"
-mark_delay_gate_replaced
-check_recovery_queue_root
-check_recovery_queue_market spot
-check_recovery_queue_market usdm
+  check_binance_health "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot"
+  check_binance_health "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance-lob/usdm"
+  mark_delay_gate_replaced
+  check_recovery_queue_root
+  check_recovery_queue_market spot
+  check_recovery_queue_market usdm
 
-check_upload_lane "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot" \
-  1 "$LOB_SUCCESS_MAX_AGE" "$LOB_PENDING_MAX" "$LOB_PENDING_MAX_AGE" manifests
-check_upload_lane "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance-lob/usdm" \
-  1 "$LOB_SUCCESS_MAX_AGE" "$LOB_PENDING_MAX" "$LOB_PENDING_MAX_AGE" manifests
-check_upload_lane "binance-usdm-reference-collector" "$SPOOL_ROOT/binance-usdm-reference" \
-  0 "$REF_SUCCESS_MAX_AGE" "$REF_PENDING_MAX" "$REF_PENDING_MAX_AGE" lake
-check_upload_lane "bybit-options-upload" "$SPOOL_ROOT/bybit-options" \
-  0 "$BYBIT_SUCCESS_MAX_AGE" "$BYBIT_PENDING_MAX" "$BYBIT_PENDING_MAX_AGE" bybit-raw
-check_upload_lane "polymarket-market-tape-upload" "$SPOOL_ROOT/polymarket" \
-  0 "$POLY_SUCCESS_MAX_AGE" "$POLY_PENDING_MAX" "$POLY_PENDING_MAX_AGE" tapes "$POLY_PENDING_STALE_MAX_AGE"
-check_upload_lane "polymarket-reference-upload" "$SPOOL_ROOT/polymarket-reference" \
-  0 "$POLY_SUCCESS_MAX_AGE" "$POLY_PENDING_MAX" "$POLY_PENDING_MAX_AGE" tapes "$POLY_PENDING_STALE_MAX_AGE"
-check_upload_lane "binance-fee-upload" "$SPOOL_ROOT/binance-fee" \
-  1 "$FEE_SUCCESS_MAX_AGE" "$FEE_PENDING_MAX" "$FEE_PENDING_MAX_AGE" lake
+  check_upload_lane "binance-lob-archiver-production@spot" "$SPOOL_ROOT/binance-lob/spot" \
+    1 "$LOB_SUCCESS_MAX_AGE" "$LOB_PENDING_MAX" "$LOB_PENDING_MAX_AGE" manifests
+  check_upload_lane "binance-lob-archiver-production@usdm" "$SPOOL_ROOT/binance-lob/usdm" \
+    1 "$LOB_SUCCESS_MAX_AGE" "$LOB_PENDING_MAX" "$LOB_PENDING_MAX_AGE" manifests
+  check_upload_lane "binance-usdm-reference-collector" "$SPOOL_ROOT/binance-usdm-reference" \
+    0 "$REF_SUCCESS_MAX_AGE" "$REF_PENDING_MAX" "$REF_PENDING_MAX_AGE" lake
+  check_upload_lane "bybit-options-upload" "$SPOOL_ROOT/bybit-options" \
+    0 "$BYBIT_SUCCESS_MAX_AGE" "$BYBIT_PENDING_MAX" "$BYBIT_PENDING_MAX_AGE" bybit-raw
+  check_upload_lane "polymarket-market-tape-upload" "$SPOOL_ROOT/polymarket" \
+    0 "$POLY_SUCCESS_MAX_AGE" "$POLY_PENDING_MAX" "$POLY_PENDING_MAX_AGE" tapes "$POLY_PENDING_STALE_MAX_AGE"
+  check_upload_lane "polymarket-reference-upload" "$SPOOL_ROOT/polymarket-reference" \
+    0 "$POLY_SUCCESS_MAX_AGE" "$POLY_PENDING_MAX" "$POLY_PENDING_MAX_AGE" tapes "$POLY_PENDING_STALE_MAX_AGE"
+  check_upload_lane "binance-fee-upload" "$SPOOL_ROOT/binance-fee" \
+    1 "$FEE_SUCCESS_MAX_AGE" "$FEE_PENDING_MAX" "$FEE_PENDING_MAX_AGE" lake
 
-write_state
+  write_state
+}
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  run_health_checks
+elif ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+  record_breach "state: state directory unavailable: $STATE_DIR"
+  run_health_checks
+elif ! command -v flock >/dev/null 2>&1; then
+  record_breach "state: cannot acquire state lock (flock unavailable)"
+  run_health_checks
+elif [ -L "$STATE_DIR/state.lock" ] || { [ -e "$STATE_DIR/state.lock" ] && [ ! -f "$STATE_DIR/state.lock" ]; }; then
+  record_breach "state: state lock is not a regular file ($STATE_DIR/state.lock)"
+  run_health_checks
+else
+  # Lock a stable inode, not state.json: atomic replacement changes its inode.
+  # Descriptor closure releases the lock on normal exit, errors, and signals.
+  state_lock_group_ran=0
+  {
+    state_lock_group_ran=1
+    if flock -w 60 8; then
+      state_locked=1
+    else
+      record_breach "state: cannot acquire state lock ($STATE_DIR/state.lock)"
+    fi
+    run_health_checks
+  } 2>/dev/null 8>"$STATE_DIR/state.lock"
+  if [ "$state_lock_group_ran" -eq 0 ]; then
+    record_breach "state: cannot open state lock ($STATE_DIR/state.lock)"
+    run_health_checks
+  fi
+fi
 
 if [ "$breach_count" -gt 0 ]; then
   ok_str=false
