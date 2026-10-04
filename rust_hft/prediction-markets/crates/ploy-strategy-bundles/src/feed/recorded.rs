@@ -655,6 +655,18 @@ impl<F> RecordingFeed<F> {
         &mut self,
         update: &'a MarketUpdate,
     ) -> Option<Cow<'a, MarketUpdate>> {
+        // Lifecycle state describes the selected tape, so skipped boundary
+        // updates must not change quote eligibility or rotation checkpoints.
+        if !self.policy.include_kinds.is_empty()
+            && !self
+                .policy
+                .include_kinds
+                .iter()
+                .any(|kind| kind.matches(update))
+        {
+            return None;
+        }
+
         match update {
             MarketUpdate::EventDiscovered { event_id, .. } => {
                 self.active_event_updates
@@ -700,16 +712,6 @@ impl<F> RecordingFeed<F> {
                 }
                 _ => {}
             }
-        }
-
-        if !self.policy.include_kinds.is_empty()
-            && !self
-                .policy
-                .include_kinds
-                .iter()
-                .any(|kind| kind.matches(update))
-        {
-            return None;
         }
 
         match update {
@@ -1397,6 +1399,94 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<RecordedMarketUpdate>(line).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn skipped_lifecycle_range_does_not_advance_recorder_state() {
+        let now = Utc::now();
+        let discovery =
+            |event_id: &str, up_token: &str, down_token: &str| MarketUpdate::EventDiscovered {
+                event_id: event_id.into(),
+                symbol: "BTCUSDT".into(),
+                up_token: up_token.into(),
+                down_token: down_token.into(),
+                end_time: now + Duration::minutes(5),
+                window_secs: 300,
+                price_to_beat: Some(dec!(100000)),
+                resolved_up_won: None,
+            };
+        let quote = |token_id: &str| MarketUpdate::Quote {
+            token_id: token_id.into(),
+            bid: Some(dec!(0.49)),
+            ask: Some(dec!(0.51)),
+            bid_size: Some(dec!(10)),
+            ask_size: Some(dec!(11)),
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            ts: now + Duration::seconds(1),
+        };
+        let active = discovery("active", "active-up", "active-down");
+        let updates = vec![
+            active.clone(),
+            discovery("skipped", "skipped-up", "skipped-down"),
+            MarketUpdate::EventExpired {
+                event_id: "active".into(),
+                end_time: now + Duration::minutes(5),
+                resolved_up_won: None,
+            },
+            quote("skipped-up"),
+            quote("active-up"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tape.ndjson");
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingPolicy {
+                rotate_seconds: Some(3600),
+                event_scoped_quotes: true,
+                ..RecordingPolicy::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(feed.next().await, Some(active.clone()));
+        let active_events = feed.active_event_updates.clone();
+        let event_tokens = feed.event_tokens.clone();
+        let token_end_times = feed.quote_token_end_times.clone();
+        feed.policy.include_kinds = vec![RecordingKind::Quote];
+
+        // Both boundary updates are forwarded, but neither belongs to the tape.
+        for skipped in &updates[1..3] {
+            assert_eq!(feed.next().await.as_ref(), Some(skipped));
+            assert_eq!(feed.active_event_updates, active_events);
+            assert_eq!(feed.event_tokens, event_tokens);
+            assert_eq!(feed.quote_token_end_times, token_end_times);
+            assert_eq!(feed.writer.as_ref().unwrap().next_sequence, 1);
+        }
+        assert_eq!(feed.next().await, Some(updates[3].clone()));
+        assert_eq!(feed.writer.as_ref().unwrap().next_sequence, 1);
+
+        // Re-enable discovery checkpoints and rotate. Only the recorded event
+        // may be checkpointed, and its quote must survive the skipped expiry.
+        feed.policy.include_kinds = vec![RecordingKind::EventDiscovered, RecordingKind::Quote];
+        let writer = feed.writer.as_mut().unwrap();
+        writer.rotation_bucket = writer.rotation_bucket.map(|bucket| bucket - 1);
+        assert_eq!(feed.next().await, Some(updates[4].clone()));
+        assert!(feed.next().await.is_none());
+        drop(feed);
+
+        let rotated = rotated_tapes_for(&path);
+        assert_eq!(rotated.len(), 1);
+        let first_tape = recorded_updates(&rotated[0]);
+        assert_eq!(first_tape.len(), 1);
+        assert_eq!(first_tape[0].update, active);
+        let second_tape = recorded_updates(&path);
+        assert_eq!(second_tape.len(), 2);
+        assert_eq!(second_tape[0].sequence, 0);
+        assert_eq!(second_tape[0].update, updates[0]);
+        assert_eq!(second_tape[1].sequence, 1);
+        assert_eq!(second_tape[1].update, updates[4]);
     }
 
     #[tokio::test]
