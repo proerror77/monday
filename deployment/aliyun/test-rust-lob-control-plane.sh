@@ -1924,7 +1924,38 @@ cp -p -- "$SCRIPT_DIR/$production_slice_asset" "$production_verify_dir/$producti
 production_runtime=$(monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha")
 jq -e '.schema == "monday.rust_lob_production_runtime.v3"
   and .runtime_max_sec == "infinity" and .restart == "always"
+  and .cpu_quota == "80%" and .upload.cpu_quota == "50%" and .upload.nice == 10
   and .memory_high == "2048M" and .memory_max == "2560M"' <<<"$production_runtime" >/dev/null
+# Upload limits remain exact, required values in both the unit and Gate receipt.
+production_upload="$production_verify_dir/binance-lob-archiver-upload@.service"
+for upload_mutation in quota priority missing_priority; do
+  chmod u+w "$production_upload"
+  case $upload_mutation in
+    quota) sed -i.bak 's/^CPUQuota=50%$/CPUQuota=80%/' "$production_upload" ;;
+    priority) sed -i.bak 's/^Nice=10$/Nice=0/' "$production_upload" ;;
+    missing_priority) sed -i.bak '/^Nice=10$/d' "$production_upload" ;;
+  esac
+  rm -f -- "$production_upload.bak"
+  if monday_verify_production_runtime_assets "$ROOT" "$production_verify_dir" "$p0_sha" >/dev/null; then
+    printf 'production runtime verifier accepted invalid upload setting: %s\n' "$upload_mutation" >&2
+    exit 1
+  fi
+  cp -p -- "$SCRIPT_DIR/binance-lob-archiver-upload@.service" "$production_upload"
+done
+for upload_mutation in \
+  '.production_runtime.upload.cpu_quota = "80%"' \
+  '.production_runtime.upload.nice = 0' \
+  'del(.production_runtime.upload.nice)'; do
+  jq "$upload_mutation" "$gate" >"$tampered"
+  if monday_validate_v2_gate "$tampered" direct "$c0" "$(monday_sha256_file "$tampered")" >/dev/null 2>&1; then
+    printf 'Gate validator accepted invalid upload receipt: %s\n' "$upload_mutation" >&2
+    exit 1
+  fi
+  if jq -e -f "$SCRIPT_DIR/rust-lob-shadow-gate-policy.jq" "$tampered" >/dev/null 2>&1; then
+    printf 'Gate policy accepted invalid upload receipt: %s\n' "$upload_mutation" >&2
+    exit 1
+  fi
+done
 for invalid_lifetime in 21600 43200 0; do
   chmod u+w "$production_verify_dir/binance-lob-archiver-production@.service"
   sed -i.bak "s/^RuntimeMaxSec=.*/RuntimeMaxSec=$invalid_lifetime/" \
