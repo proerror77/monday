@@ -248,9 +248,10 @@ done
 printf '%s\n' deployment/aliyun/research/Dockerfile.research-data >"$tmp_dir/research-data-dockerfile.txt"
 for event in pull_request push; do
   image_scope=$(run_case research-data-dockerfile "$event" research-data-dockerfile.txt)
-  expected='ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
+  expected='ci/ci-contracts'
   [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
   assert_jobs "$image_scope" "$expected"
+  grep -Fqx research_product=none "$image_scope"
   for flag in loop handoff json ondo collector control focused toolchain; do assert_flag "$image_scope" "$flag" false; done
 done
 for helper in verify-research-controller-image.sh test-research-controller-image.sh; do
