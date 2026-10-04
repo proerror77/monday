@@ -9,12 +9,14 @@ use anyhow::{bail, Context};
 use hft_research_manifest::{
     market_encoder::{
         MarketDataReadRequestV1, MarketFeatureDatasetV1, MarketTargetDatasetV1,
-        MarketTrainingAnchorSetV1, TASK_HORIZON_MS,
+        MarketTrainingAnchorSetV1, FEATURE_PARQUET_SCHEMA, TARGET_PARQUET_SCHEMA, TASK_HORIZON_MS,
     },
+    prepared_market::{validate_prepared_producer, PreparedMarketReadyReceiptV2},
     sequence::{valid_sha256, SequenceInputSpecV1, SequenceViewV1},
 };
 use hft_research_ml::market_encoder::data::{
-    derive_market_training_anchors, MarketFeatureReader, MarketTaskReader,
+    derive_market_training_anchors, verify_prepared_feature_equivalence,
+    verify_prepared_target_equivalence, MarketFeatureReader, MarketTaskReader,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,7 +25,10 @@ use std::{
 };
 
 pub const INPUTS_SCHEMA: &str = "monday.sol_market_encoder_inputs.v1";
+pub const PREPARED_INPUTS_SCHEMA: &str = "monday.sol_market_encoder_inputs.v2";
 pub const SOURCES_SCHEMA: &str = "monday.sol_market_encoder_sources.v1";
+pub const PREPARED_SOURCES_SCHEMA: &str = "monday.sol_market_encoder_sources.v2";
+pub(crate) const PREPARED_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +61,23 @@ pub struct MarketCampaignInputs {
 pub struct MarketSourceIndex {
     pub schema_version: String,
     pub sources: Vec<MarketSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared: Option<Artifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MarketPreparedConversion {
+    pub schema_version: String,
+    pub producer_source_revision: String,
+    pub producer_image: String,
+    pub ready_receipt: Artifact,
+    pub ready_features: Artifact,
+    pub ready_targets: Artifact,
+    pub feature_decoded_sha256: String,
+    pub target_decoded_sha256: String,
+    pub feature_rows: u64,
+    pub target_rows: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,8 +100,10 @@ impl MarketCampaignInputs {
             &self.sub_path,
             self.fold_id,
         )?;
-        if self.schema_version != INPUTS_SCHEMA
-            || self.train.qualified_anchors.is_none()
+        if !matches!(
+            self.schema_version.as_str(),
+            INPUTS_SCHEMA | PREPARED_INPUTS_SCHEMA
+        ) || self.train.qualified_anchors.is_none()
             || self.validation.qualified_anchors.is_some()
             || self.train == self.validation
         {
@@ -122,26 +146,46 @@ impl MarketCampaignInputs {
             bail!("market cohort feature provenance differs from its source index");
         }
         let index = read_source_index(root, location)?;
+        if (self.schema_version == INPUTS_SCHEMA && index.prepared.is_some())
+            || (self.schema_version == PREPARED_INPUTS_SCHEMA
+                && (index.prepared.is_some() != (location == &self.train)))
+        {
+            bail!("market cohort schema does not admit this prepared training location");
+        }
         if location == &self.validation && index.sources.len() != 1 {
             bail!("market validation must use one original contiguous replay");
         }
         let mut expected_features = Vec::new();
         let mut expected_targets = Vec::new();
         let mut receipts = BTreeSet::new();
+        let mut original_features = Vec::new();
+        let mut original_targets = Vec::new();
         for source in &index.sources {
             if !receipts.insert(&source.receipt.sha256) {
                 bail!("duplicate market source receipt");
             }
-            let (original_features, original_targets) = verify_original_source(
+            let (source_features, source_targets) = verify_original_source(
                 root,
                 source,
                 &self.producer_source_revision,
                 &self.producer_image,
             )?;
-            expected_features.extend(original_features.shards);
-            expected_targets.extend(original_targets.shards);
+            expected_features.extend(source_features.shards.clone());
+            expected_targets.extend(source_targets.shards.clone());
+            original_features.push((dataset_root(root, &source.features)?, source_features));
+            original_targets.push((dataset_root(root, &source.targets)?, source_targets));
         }
-        if features.shards != expected_features || targets.shards != expected_targets {
+        if let Some(conversion) = &index.prepared {
+            verify_prepared_conversion(
+                root,
+                location,
+                conversion,
+                &features,
+                &targets,
+                &original_features,
+                &original_targets,
+            )?;
+        } else if features.shards != expected_features || targets.shards != expected_targets {
             bail!("market cohort rewrites, reorders or omits original feature or target shards");
         }
         Ok((features, targets))
@@ -167,6 +211,34 @@ impl MarketCampaignInputs {
                     &source.feature_sources,
                     &source.features,
                     &source.targets,
+                ] {
+                    admitted.insert(artifact.path(root)?);
+                }
+                for original in [&source.features, &source.targets] {
+                    let source_dataset: serde_json::Value =
+                        serde_json::from_slice(&original.read(root, MANIFEST_BYTES)?)?;
+                    let shards: Vec<hft_research_manifest::sequence::SequenceShardV1> =
+                        serde_json::from_value(source_dataset["shards"].clone())?;
+                    let parent = dataset_root(root, original)?;
+                    for shard in shards {
+                        admitted.insert(
+                            Artifact {
+                                file: shard.file,
+                                sha256: shard.sha256,
+                            }
+                            .path(&parent)?,
+                        );
+                    }
+                }
+            }
+            if let Some(reference) = read_source_index(root, location)?.prepared {
+                admitted.insert(reference.path(root)?);
+                let conversion: MarketPreparedConversion =
+                    serde_json::from_slice(&reference.read(root, MANIFEST_BYTES)?)?;
+                for artifact in [
+                    &conversion.ready_receipt,
+                    &conversion.ready_features,
+                    &conversion.ready_targets,
                 ] {
                     admitted.insert(artifact.path(root)?);
                 }
@@ -203,6 +275,17 @@ impl MarketCampaignInputs {
             bail!("market view changed its exact feature, target or anchor identity");
         }
         let request = read_request(location, view.view);
+        if let Some(reference) = read_source_index(root, location)?.prepared {
+            let conversion: MarketPreparedConversion =
+                serde_json::from_slice(&reference.read(root, MANIFEST_BYTES)?)?;
+            let ready: PreparedMarketReadyReceiptV2 =
+                serde_json::from_slice(&conversion.ready_receipt.read(root, 16 * 1024 * 1024)?)?;
+            if ready.request.view != view.view
+                || ready.request.anchor_end_ms != request.anchor_end_ms
+            {
+                bail!("prepared training view escaped the admitted Campaign clocks");
+            }
+        }
         request.validate().map_err(anyhow::Error::msg)?;
         // The source report can include label-only lookahead beyond a feature
         // partition, but that lookahead must remain inside the admitted view.
@@ -316,13 +399,124 @@ pub(crate) fn read_source_index(
 ) -> anyhow::Result<MarketSourceIndex> {
     let index: MarketSourceIndex =
         serde_json::from_slice(&location.sources.read(root, MANIFEST_BYTES)?)?;
-    if index.schema_version != SOURCES_SCHEMA
+    if !matches!(
+        index.schema_version.as_str(),
+        SOURCES_SCHEMA | PREPARED_SOURCES_SCHEMA
+    ) || (index.schema_version == PREPARED_SOURCES_SCHEMA) != index.prepared.is_some()
         || index.sources.is_empty()
         || index.sources.len() > 512
     {
         bail!("invalid market source index");
     }
     Ok(index)
+}
+
+pub(crate) fn verify_prepared_conversion(
+    root: &Path,
+    location: &MarketDatasetLocation,
+    reference: &Artifact,
+    features: &MarketFeatureDatasetV1,
+    targets: &MarketTargetDatasetV1,
+    originals: &[(PathBuf, MarketFeatureDatasetV1)],
+    original_targets: &[(PathBuf, MarketTargetDatasetV1)],
+) -> anyhow::Result<()> {
+    let conversion: MarketPreparedConversion =
+        serde_json::from_slice(&reference.read(root, MANIFEST_BYTES)?)?;
+    validate_prepared_producer(
+        &conversion.producer_source_revision,
+        &conversion.producer_image,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let ready: PreparedMarketReadyReceiptV2 =
+        serde_json::from_slice(&conversion.ready_receipt.read(root, 16 * 1024 * 1024)?)?;
+    ready.validate().map_err(anyhow::Error::msg)?;
+    let ready_features: MarketFeatureDatasetV1 =
+        serde_json::from_slice(&conversion.ready_features.read(root, MANIFEST_BYTES)?)?;
+    let ready_targets: MarketTargetDatasetV1 =
+        serde_json::from_slice(&conversion.ready_targets.read(root, MANIFEST_BYTES)?)?;
+    ready
+        .prepared_view
+        .validate_datasets(&ready_features, Some(&ready_targets))
+        .map_err(anyhow::Error::msg)?;
+    if conversion.schema_version != "monday.market_prepared_conversion.v1"
+        || !valid_sha256(&conversion.feature_decoded_sha256)
+        || !valid_sha256(&conversion.target_decoded_sha256)
+        || conversion.feature_rows == 0
+        || conversion.target_rows == 0
+        || ready.producer_source_revision != conversion.producer_source_revision
+        || ready.producer_image != conversion.producer_image
+        || ready.feature_manifest.sha256 != conversion.ready_features.sha256
+        || ready.target_manifest.as_ref().map(|r| &r.sha256)
+            != Some(&conversion.ready_targets.sha256)
+        || ready.request.purpose != "pre_holdout_supervised"
+        || ready.request.qualified_anchors
+        || ready.request.input != features.input
+        || features.schema_version != FEATURE_PARQUET_SCHEMA
+        || targets.schema_version != TARGET_PARQUET_SCHEMA
+        || features.input != ready_features.input
+        || ready.request.sources.len() != originals.len()
+        || originals.len() != original_targets.len()
+    {
+        bail!("prepared Campaign conversion does not bind the converter or original sources");
+    }
+    let prepared_bytes = features
+        .shards
+        .iter()
+        .chain(&targets.shards)
+        .try_fold(0_u64, |sum, shard| sum.checked_add(shard.bytes))
+        .context("prepared byte count overflow")?;
+    if prepared_bytes > PREPARED_CACHE_BYTES {
+        bail!("prepared numerical cache exceeds the admitted SOL cohort byte budget");
+    }
+    for ((source, (_, feature)), (_, target)) in ready
+        .prepared_view
+        .sources
+        .iter()
+        .zip(originals)
+        .zip(original_targets)
+    {
+        if source.feature_dataset_sha256 != feature.digest().map_err(anyhow::Error::msg)?
+            || source.target_dataset_sha256 != Some(target.digest().map_err(anyhow::Error::msg)?)
+            || source.source_manifest_sha256 != feature.source_manifest_sha256
+        {
+            bail!("prepared conversion replaced or reordered native source identities");
+        }
+    }
+    let rebind = |shards: &[hft_research_manifest::sequence::SequenceShardV1]| {
+        shards
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                s.file = format!("{}.parquet", s.sha256);
+                s
+            })
+            .collect::<Vec<_>>()
+    };
+    if features.shards != rebind(&ready_features.shards)
+        || targets.shards != rebind(&ready_targets.shards)
+    {
+        bail!("prepared conversion rewrote its immutable shard mapping");
+    }
+    let feature_proof = verify_prepared_feature_equivalence(
+        originals,
+        &dataset_root(root, &location.features)?,
+        features,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let target_proof = verify_prepared_target_equivalence(
+        original_targets,
+        &dataset_root(root, &location.targets)?,
+        targets,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if feature_proof.decoded_sha256 != conversion.feature_decoded_sha256
+        || target_proof.decoded_sha256 != conversion.target_decoded_sha256
+        || feature_proof.rows != conversion.feature_rows
+        || target_proof.rows != conversion.target_rows
+    {
+        bail!("prepared conversion differs from the complete native numerical proof");
+    }
+    Ok(())
 }
 
 fn read_datasets(
@@ -999,6 +1193,7 @@ pub(super) mod tests {
             &MarketSourceIndex {
                 schema_version: SOURCES_SCHEMA.into(),
                 sources: originals,
+                prepared: None,
             },
             "market-sources.json",
         );

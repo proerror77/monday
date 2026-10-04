@@ -1,0 +1,75 @@
+# One background ingestion owner. Enqueue native publication receipts first;
+# then freeze the queue SHA returned by that operation into this Job.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: monday-data-ingest-REPLACE_RUN
+  namespace: monday-research
+  labels:
+    research.monday/contract: research-data-platform-1256
+    research.monday/controller: REPLACE_CONTROLLER
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        research.monday/contract: research-data-platform-1256
+        research.monday/data-access: admitted
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      imagePullSecrets: [{name: monday-acr}]
+      nodeSelector: {kubernetes.io/arch: amd64, workload: research-data}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: ingest
+          image: REPLACE_IMMUTABLE_DATA_IMAGE
+          args:
+            - --state-root
+            - /work/data-service
+            - --clickhouse-url
+            - http://monday-clickhouse:8123
+            - --database
+            - monday_analytics
+            - --user
+            - monday_writer
+            - drain
+            - --queue
+            - /work/data-service/receipt-queue.json
+            - --queue-sha256
+            - "REPLACE_QUEUE_SHA256"
+            - --artifact-root
+            - /canonical
+            - --max-partitions
+            - "16"
+          env:
+            - {name: MONDAY_ACK_DATA_PLANE, value: "1"}
+            - {name: MONDAY_DATA_PLATFORM_IMAGE, value: REPLACE_IMMUTABLE_DATA_IMAGE}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: monday-clickhouse-writer, key: password}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - {name: state, mountPath: /work}
+            - {name: canonical, mountPath: /canonical, readOnly: true}
+      volumes:
+        - name: state
+          persistentVolumeClaim: {claimName: REPLACE_STATE_PVC}
+        - name: canonical
+          persistentVolumeClaim: {claimName: REPLACE_CANONICAL_PVC, readOnly: true}
