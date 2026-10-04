@@ -19,6 +19,33 @@ pub struct Ledger {
     pool: PgPool,
 }
 
+pub const SESSION_DELIVERY_MIGRATION: &str = include_str!("../sql/session_deliveries.sql");
+
+pub fn completion_message(intent: &Value) -> Result<String> {
+    for name in ["session_sha256", "run_sha256", "task_id"] {
+        ensure!(
+            intent
+                .get(name)
+                .and_then(Value::as_str)
+                .is_some_and(crate::valid_digest),
+            "invalid completion identity"
+        );
+    }
+    let state = intent
+        .get("state")
+        .and_then(Value::as_str)
+        .context("completion state missing")?;
+    ensure!(
+        matches!(state, "succeeded" | "failed" | "cancelled" | "timed_out")
+            && intent
+                .get("terminal_revision")
+                .and_then(Value::as_i64)
+                .is_some_and(|v| v > 0),
+        "completion must bind a terminal revision"
+    );
+    Ok(format!("Research Run {} finished with state {state}. Read research.status and research.artifacts for verified results. Completion intent: {}.", intent["run_sha256"].as_str().context("completion Run missing")?, identity(intent)?))
+}
+
 /// An opaque, live PG admission plus a session-scoped lock for one DataView.
 /// Dropping the detached connection releases the lock; it never returns to a pool.
 pub struct PreparationPermit {
@@ -335,6 +362,71 @@ impl Ledger {
         ensure!(owner == tenant, "session belongs to another principal");
         tx.commit().await?;
         Ok(id)
+    }
+    pub async fn session_for_tenant(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<crate::research::Session> {
+        let value: Value = query_scalar(
+            "SELECT document FROM research.sessions WHERE session_sha256=$1 AND tenant=$2",
+        )
+        .bind(id)
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await?;
+        let session: crate::research::Session = serde_json::from_value(value)?;
+        ensure!(session.id()? == id, "corrupt session identity");
+        Ok(session)
+    }
+    /// Native terminal intents only. The exact terminal task revision is read
+    /// back before delivery; a success-shaped caller payload cannot create one.
+    pub async fn pending_completions(
+        &self,
+        tenant: &str,
+        session: &str,
+    ) -> Result<Vec<(String, Value)>> {
+        self.session_for_tenant(tenant, session).await?;
+        let rows: Vec<(String, Value)> = sqlx_core::query_as::query_as("SELECT i.intent_sha256,i.document FROM research.completion_intents i JOIN research.tasks t ON t.task_id=i.task_id AND t.tenant=$2 AND t.revision=i.terminal_revision WHERE i.session_sha256=$1 AND t.state IN ('succeeded','failed','cancelled','timed_out') AND NOT EXISTS(SELECT 1 FROM research.completion_deliveries d WHERE d.intent_sha256=i.intent_sha256) ORDER BY i.intent_sha256 LIMIT 32")
+            .bind(session).bind(tenant).fetch_all(&self.pool).await?;
+        for (id, value) in &rows {
+            ensure!(
+                identity(value)? == *id
+                    && value.get("session_sha256").and_then(Value::as_str) == Some(session),
+                "corrupt completion intent"
+            );
+        }
+        Ok(rows)
+    }
+    pub async fn record_completion_delivery(
+        &self,
+        tenant: &str,
+        session: &str,
+        verified: &crate::session::VerifiedDelivery,
+    ) -> Result<()> {
+        let provider = self.session_for_tenant(tenant, session).await?;
+        let record = verified.record();
+        ensure!(
+            provider.provider_thread_id == record.thread_id
+                && provider.provider_binary_sha256 == verified.provider_binary_sha256(),
+            "delivery belongs to another provider session"
+        );
+        let readback = record
+            .native_readback_sha256
+            .as_ref()
+            .context("missing native readback")?;
+        let mut tx = self.pool.begin().await?;
+        let intent: Value = query_scalar("SELECT document FROM research.completion_intents WHERE intent_sha256=$1 AND session_sha256=$2 FOR UPDATE")
+            .bind(&record.intent_sha256).bind(session).fetch_one(&mut *tx).await?;
+        ensure!(
+            identity(&intent)? == record.intent_sha256
+                && crate::sha256(completion_message(&intent)?.as_bytes()) == record.payload_sha256,
+            "completion payload identity changed"
+        );
+        query("INSERT INTO research.completion_deliveries(intent_sha256,process_generation,native_readback_sha256,document) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+            .bind(&record.intent_sha256).bind(&record.process_generation).bind(readback).bind(serde_json::to_value(record)?).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
     }
     pub async fn snapshot_session(
         &self,
