@@ -1353,6 +1353,10 @@ if grep -Eq \
 fi
 grep -Fq 'docker logout "$ACR_REGISTRY"' "$WORKFLOW"
 grep -Fq 'rm -f -- "$docker_config_root/config.json"' "$WORKFLOW"
+# Native trading publication acquires credentials; ACK research publication
+# does not. Cleanup must run after every native outcome, including failure,
+# while preserving the public research job's no-credentials boundary.
+assert_native_acr_cleanup_guard() {
 awk '
   /- name: Remove ACR credentials/ {
     if (getline <= 0) exit 1
@@ -1369,7 +1373,25 @@ awk '
       exit 1
     }
   }
-' "$WORKFLOW"
+' "$1"
+}
+assert_native_acr_cleanup_guard "$WORKFLOW"
+for bad_cleanup_condition in \
+  '        if: ${{ success() && !matrix.research_artifact }}' \
+  '        if: ${{ (always()) && matrix.research_artifact }}'; do
+  awk -v replacement="$bad_cleanup_condition" '
+    { print }
+    /- name: Remove ACR credentials/ {
+      if (getline <= 0) exit 1
+      print replacement
+    }
+  ' "$WORKFLOW" >"$tmp_dir/unsafe-cleanup.yml"
+  if assert_native_acr_cleanup_guard "$tmp_dir/unsafe-cleanup.yml"; then
+    printf 'ACR cleanup contract accepted an unsafe outcome or matrix guard\n' >&2
+    exit 1
+  fi
+done
+
 grep -Fq 'hft-trading-ecs-linux-amd64-${{ github.sha }}' "$WORKFLOW"
 grep -Fq 'IMAGE_DIGEST: ${{ steps.build.outputs.digest }}' "$WORKFLOW"
 grep -Fq ':run-${{ github.run_id }}-${{ github.run_attempt }}' "$WORKFLOW"

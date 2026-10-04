@@ -1,109 +1,135 @@
 CREATE DATABASE IF NOT EXISTS monday_analytics;
 
-CREATE TABLE IF NOT EXISTS monday_analytics.dataset_partitions
+-- Immutable source versions have a single ingestion controller. FINAL is required
+-- when reading a ready version: retries can leave physical duplicate parts until
+-- ReplacingMergeTree merges them. Readback verifies the actual data before ready.
+-- Retention must be explicit and reference-aware; no TTL deletes pinned runs.
+CREATE TABLE IF NOT EXISTS monday_analytics.cex_analytics_partitions
 (
-    dataset_id String,
+    partition_identity String,
+    manifest_sha256 String,
+    artifact_sha256 String,
+    source_revision String,
     venue LowCardinality(String),
     market LowCardinality(String),
-    dataset LowCardinality(String),
-    symbol LowCardinality(String) DEFAULT '',
+    symbol LowCardinality(String),
+    start_time_us Int64,
+    end_time_us Int64,
     schema_version LowCardinality(String),
-    format LowCardinality(String),
-    start_event_time DateTime64(6, 'UTC'),
-    end_event_time DateTime64(6, 'UTC'),
-    available_time DateTime64(6, 'UTC'),
-    event_count UInt64,
-    compressed_bytes UInt64,
-    replay_safe Bool,
-    sequence_gap_count UInt32,
-    oss_uri String,
-    sha256 FixedString(64),
-    indexed_at DateTime64(6, 'UTC') DEFAULT now64(6)
+    dataset_kind LowCardinality(String),
+    row_count UInt64,
+    materialization_state LowCardinality(String),
+    materialization_version UInt64
 )
-ENGINE = ReplacingMergeTree(indexed_at)
-PARTITION BY toYYYYMM(start_event_time)
-ORDER BY
-(
-    venue,
-    market,
-    dataset,
-    symbol,
-    start_event_time,
-    oss_uri
-);
+ENGINE = ReplacingMergeTree(materialization_version)
+ORDER BY (partition_identity);
 
-CREATE TABLE IF NOT EXISTS monday_analytics.lob_features_100ms
+CREATE TABLE IF NOT EXISTS monday_analytics.cex_replay_events
 (
-    event_time DateTime64(6, 'UTC'),
-    available_time DateTime64(6, 'UTC'),
-    ingest_time DateTime64(6, 'UTC'),
+    partition_identity String,
+    manifest_sha256 String,
+    artifact_sha256 String,
+    source_revision String,
     venue LowCardinality(String),
     market LowCardinality(String),
     symbol LowCardinality(String),
-    source_sequence UInt64,
-    best_bid Float64,
-    best_ask Float64,
-    mid_price Float64,
+    start_time_us Int64,
+    end_time_us Int64,
+    schema_version LowCardinality(String),
+    row_identity String,
+    materialization_version UInt64,
+    event_time_us Int64,
+    sequence UInt64,
+    event LowCardinality(String),
+    payload_json String
+)
+ENGINE = ReplacingMergeTree(materialization_version)
+ORDER BY (partition_identity, row_identity);
+
+CREATE TABLE IF NOT EXISTS monday_analytics.cex_pit_features
+(
+    partition_identity String,
+    manifest_sha256 String,
+    artifact_sha256 String,
+    source_revision String,
+    venue LowCardinality(String),
+    market LowCardinality(String),
+    symbol LowCardinality(String),
+    start_time_us Int64,
+    end_time_us Int64,
+    schema_version LowCardinality(String),
+    row_identity String,
+    materialization_version UInt64,
+    event_time_us Int64,
+    feature_available_time_us Int64,
+    label_available_time_us Int64,
+    ingestion_time_us Int64,
+    features_json String,
+    label Float64
+)
+ENGINE = ReplacingMergeTree(materialization_version)
+ORDER BY (partition_identity, row_identity);
+
+CREATE TABLE IF NOT EXISTS monday_analytics.cex_backtest_results
+(
+    partition_identity String,
+    manifest_sha256 String,
+    artifact_sha256 String,
+    source_revision String,
+    venue LowCardinality(String),
+    market LowCardinality(String),
+    symbol LowCardinality(String),
+    start_time_us Int64,
+    end_time_us Int64,
+    schema_version LowCardinality(String),
+    row_identity String,
+    materialization_version UInt64,
+    result_json String
+)
+ENGINE = ReplacingMergeTree(materialization_version)
+ORDER BY (partition_identity, row_identity);
+
+-- Numerical training inputs are separate from the historical PIT JSON format.
+-- Features cannot expose targets through their table or column projection.
+CREATE TABLE IF NOT EXISTS monday_analytics.cex_market_feature_frames
+(
+    dataset_identity String,
+    row_identity String,
+    series_id UInt64,
+    observed_at_ms Int64,
+    feature_max_available_at_ms Int64,
+    channels Array(Float32),
+    materialization_version UInt64
+)
+ENGINE = ReplacingMergeTree(materialization_version)
+ORDER BY (dataset_identity, observed_at_ms, series_id);
+
+CREATE TABLE IF NOT EXISTS monday_analytics.cex_market_target_frames
+(
+    dataset_identity String,
+    row_identity String,
+    series_id UInt64,
+    observed_at_ms Int64,
+    available_at_ms Int64,
+    simple_return Float32,
     spread_bps Float64,
-    bid_depth_10 Float64,
-    ask_depth_10 Float64,
-    depth_imbalance_10 Float64,
-    order_flow_imbalance Float64,
-    trade_count UInt32,
-    buy_volume Float64,
-    sell_volume Float64,
-    realized_volatility Float64,
-    feature_version LowCardinality(String),
-    source_manifest_sha256 FixedString(64)
+    materialization_version UInt64
 )
-ENGINE = MergeTree
-PARTITION BY toYYYYMMDD(event_time)
-ORDER BY (venue, market, symbol, event_time, source_sequence)
-TTL event_time + INTERVAL 30 DAY DELETE
-SETTINGS index_granularity = 8192;
+ENGINE = ReplacingMergeTree(materialization_version)
+ORDER BY (dataset_identity, observed_at_ms, series_id);
 
-CREATE TABLE IF NOT EXISTS monday_analytics.lob_snapshots_1s
+CREATE TABLE IF NOT EXISTS monday_analytics.cex_market_datasets
 (
-    event_time DateTime64(6, 'UTC'),
-    available_time DateTime64(6, 'UTC'),
-    venue LowCardinality(String),
-    market LowCardinality(String),
-    symbol LowCardinality(String),
-    source_sequence UInt64,
-    bid_prices Array(Float64),
-    bid_quantities Array(Float64),
-    ask_prices Array(Float64),
-    ask_quantities Array(Float64),
-    source_manifest_sha256 FixedString(64)
+    dataset_identity String,
+    dataset_kind LowCardinality(String),
+    source_manifest_sha256 String,
+    manifest_json String,
+    row_count UInt64,
+    content_sha256 String,
+    first_observed_at_ms Int64,
+    last_observed_at_ms Int64,
+    materialization_state LowCardinality(String),
+    materialization_version UInt64
 )
-ENGINE = MergeTree
-PARTITION BY toYYYYMMDD(event_time)
-ORDER BY (venue, market, symbol, event_time, source_sequence)
-TTL event_time + INTERVAL 14 DAY DELETE
-SETTINGS index_granularity = 4096;
-
-CREATE TABLE IF NOT EXISTS monday_analytics.analytics_backtest_metrics
-(
-    run_id String,
-    experiment_id String,
-    strategy_version String,
-    image_digest String,
-    dataset_manifest_sha256 FixedString(64),
-    started_at DateTime64(6, 'UTC'),
-    finished_at DateTime64(6, 'UTC'),
-    venue LowCardinality(String),
-    market LowCardinality(String),
-    symbol LowCardinality(String),
-    parameter_json String,
-    total_pnl Float64,
-    trades UInt64,
-    win_rate Float64,
-    max_drawdown Float64,
-    max_position Float64,
-    result_oss_uri String,
-    result_manifest_sha256 FixedString(64),
-    indexed_at DateTime64(6, 'UTC') DEFAULT now64(6)
-)
-ENGINE = ReplacingMergeTree(indexed_at)
-PARTITION BY toYYYYMM(started_at)
-ORDER BY (experiment_id, run_id);
+ENGINE = ReplacingMergeTree(materialization_version)
+ORDER BY (dataset_identity);

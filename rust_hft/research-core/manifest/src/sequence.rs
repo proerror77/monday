@@ -172,6 +172,13 @@ impl SequenceDatasetV1 {
 }
 
 pub(crate) fn validate_sequence_shards(shards: &[SequenceShardV1]) -> Result<(), String> {
+    validate_sequence_shards_with_extension(shards, ".jsonl")
+}
+
+pub(crate) fn validate_sequence_shards_with_extension(
+    shards: &[SequenceShardV1],
+    extension: &str,
+) -> Result<(), String> {
     if shards.is_empty() || shards.len() > MAX_SEQUENCE_SHARDS {
         return Err("invalid sequence shard count".into());
     }
@@ -184,7 +191,7 @@ pub(crate) fn validate_sequence_shards(shards: &[SequenceShardV1]) -> Result<(),
                 .file
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-            || !shard.file.ends_with(".jsonl")
+            || !shard.file.ends_with(extension)
             || shard.file.starts_with('.')
             || !valid_sha256(&shard.sha256)
             || shard.bytes == 0
