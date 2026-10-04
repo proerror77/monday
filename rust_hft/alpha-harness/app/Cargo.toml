@@ -6,6 +6,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+hft-research-artifacts = { path = "../../research-core/artifacts" }
 alpha-domain = { path = "../domain" }
 alpha-engine = { path = "../engine" }
 alpha-onnx-evaluator = { path = "../onnx-evaluator" }

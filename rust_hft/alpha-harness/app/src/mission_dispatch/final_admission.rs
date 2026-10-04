@@ -197,7 +197,7 @@ pub(crate) fn write_submission(
         image: image.into(),
         request,
     })?;
-    data_mission::write_json_atomic(path, &validated.submission)?;
+    hft_research_artifacts::write_json_atomic(path, &validated.submission)?;
     Ok(SubmissionRenderReport {
         request_sha256: validated.request_sha256,
         submission_identity_sha256: validated.submission_identity_sha256,
@@ -756,7 +756,7 @@ mod tests {
             source_submissions: BTreeMap::new(),
             receipt_access: BTreeMap::new(),
         };
-        data_mission::write_json_atomic(&control_path, &control).unwrap();
+        hft_research_artifacts::write_json_atomic(&control_path, &control).unwrap();
         let control_error = read_control(&control_path).err().unwrap();
         assert!(control_error
             .to_string()
@@ -788,7 +788,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let keys = root.path().join("keys.json");
         let wrong_key = SigningKey::from_bytes(&[18; 32]);
-        data_mission::write_json_atomic(
+        hft_research_artifacts::write_json_atomic(
             &keys,
             &BTreeMap::from([(
                 "different-key",

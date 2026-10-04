@@ -153,7 +153,7 @@ pub(crate) fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     if canonical != frozen.canonical_request {
         bail!("signed sequence request changed its frozen semantics");
     }
-    data_mission::write_json_atomic(&args.request_out, &signed)?;
+    hft_research_artifacts::write_json_atomic(&args.request_out, &signed)?;
     let rendered = crate::mission_dispatch::sequence_admission::write_submission(
         &args.submission_out,
         &args.attempt_id,
@@ -279,7 +279,7 @@ pub(crate) fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
         canonical_request: request,
         signing_plan: CampaignSigningPlan { actions },
     };
-    data_mission::write_json_atomic(&args.output, &frozen)?;
+    hft_research_artifacts::write_json_atomic(&args.output, &frozen)?;
     print_json(
         &serde_json::json!({"schema_version":FREEZE_SCHEMA,"campaign_id":frozen.canonical_request.campaign_id,
         "policy_id":frozen.canonical_request.policy_id()?,"declared_primary_fits":7,"declared_verification_fits":7,

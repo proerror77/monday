@@ -131,7 +131,7 @@ fn retain<T: Serialize + DeserializeOwned + PartialEq>(
     path: &Path,
     value: &T,
 ) -> anyhow::Result<()> {
-    crate::data_mission::ensure_output_path_is_not_symlink(path, "authority metadata output")?;
+    hft_research_artifacts::ensure_output_path_is_not_symlink(path, "authority metadata output")?;
     let bytes = serde_json::to_vec_pretty(value)?;
     if bytes.len() as u64 > MAX_METADATA_BYTES {
         bail!("authority output exceeds byte limit");

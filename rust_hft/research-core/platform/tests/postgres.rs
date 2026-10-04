@@ -1,11 +1,12 @@
 #![cfg(feature = "control")]
+use hft_cex_research_input::data::{BlockRef, DataViewSpec, Exit, PublishedView, Split, Window};
 use hft_research_platform::{
-    data::{BlockRef, DataViewSpec, Exit, PublishedView, Split, Window},
     execution::{Acceptance, Backend, Profile},
     identity,
     orchestrator::{State, TaskKind, TaskSpec},
-    postgres::{Ledger, MIGRATION},
+    postgres::{Ledger, BUILD_RELEASE_MIGRATION, MIGRATION},
 };
+mod common;
 
 fn hash(c: char) -> String {
     c.to_string().repeat(64)
@@ -24,6 +25,19 @@ fn researchctl_rejects_direct_view_publication() {
     assert!(!error.contains("publish-view MANIFEST"));
 }
 
+#[test]
+fn researchctl_rejects_unsigned_build_registration_before_connecting_to_pg() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_researchctl"))
+        .args(["register-build", "unverified.json"])
+        .env_remove("MONDAY_RESEARCH_DATABASE_URL")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("SIGNED_RELEASE"));
+}
+
 /// Only the explicitly named disposable test database is permitted. This test
 /// never targets production, imports business data, or connects to Kubernetes.
 #[tokio::test]
@@ -37,6 +51,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     );
     let pool = sqlx_postgres::PgPool::connect(&url).await?;
     sqlx_core::raw_sql::raw_sql(MIGRATION)
+        .execute(&pool)
+        .await?;
+    sqlx_core::raw_sql::raw_sql(BUILD_RELEASE_MIGRATION)
         .execute(&pool)
         .await?;
     let ledger = Ledger::connect(&url).await?;
@@ -72,14 +89,14 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         producer_image: format!("fixture@sha256:{}", hash('e')),
         source_receipt_sha256: hash('f'),
     };
-    let mut plan = hft_research_platform::data::PreparationPlan {
+    let mut plan = hft_research_platform::preparation::PreparationPlan {
         spec: view.spec.clone(),
         source_receipt_sha256: view.source_receipt_sha256.clone(),
         producer_image: view.producer_image.clone(),
         recipe_sql: None,
     };
     plan.spec.feature_sql_sha256 =
-        hft_research_platform::sha256(hft_research_platform::data::PREPARE_SQL.as_bytes());
+        hft_research_platform::sha256(hft_research_platform::preparation::PREPARE_SQL.as_bytes());
     assert!(ledger.register_plan(&plan).await.is_err());
     // Test-only activation fixture. No application path performs this UPDATE.
     sqlx_core::query::query("UPDATE research.authority SET mode='postgres',legacy_quiescence_sha256=$1,migration_receipt_sha256=$2").bind(hash('a')).bind(hash('b')).execute(&pool).await?;
@@ -178,7 +195,54 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
             },
         }],
     };
-    let artifact_id = ledger.register_build(&artifact).await?;
+    // Historical unsigned rows remain readable by auditors, but cannot become
+    // the Build of a new scientific Run.
+    let unsigned_id = artifact.id()?;
+    sqlx_core::query::query("INSERT INTO research.build_artifacts VALUES($1,$2,$3)")
+        .bind(&unsigned_id)
+        .bind(artifact.build.id()?)
+        .bind(serde_json::to_value(&artifact)?)
+        .execute(&pool)
+        .await?;
+    assert!(ledger.build_artifact(&unsigned_id).await.is_err());
+    let (artifact, signed, trust) = common::attest(artifact);
+    spec.source_sha256 = artifact.build.source_manifest_sha256.clone();
+    let verified = trust.verify(&artifact, &signed)?;
+    sqlx_core::query::query("UPDATE research.authority SET mode='paused'")
+        .execute(&pool)
+        .await?;
+    let artifact_id = ledger.register_build(&verified).await?;
+    assert_eq!(ledger.register_build(&verified).await?, artifact_id);
+    assert_eq!(ledger.build_artifact(&artifact_id).await?, artifact);
+    let mode: String = sqlx_core::query_scalar::query_scalar("SELECT mode FROM research.authority")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(mode, "paused");
+    assert!(
+        sqlx_core::query::query("UPDATE research.build_releases SET trust_sha256=$1")
+            .bind(hash('f'))
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx_core::query::query("DELETE FROM research.build_releases")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let release: serde_json::Value = sqlx_core::query_scalar::query_scalar(
+        "SELECT document FROM research.build_releases WHERE artifact_sha256=$1",
+    )
+    .bind(&artifact_id)
+    .fetch_one(&pool)
+    .await?;
+    let readback: hft_research_platform::release::SignedBuildRelease =
+        serde_json::from_value(release)?;
+    trust.verify(&artifact, &readback)?;
+    sqlx_core::query::query("UPDATE research.authority SET mode='postgres'")
+        .execute(&pool)
+        .await?;
     let mut run = hft_research_platform::research::Run {
         schema: 1,
         experiment_sha256: experiment_sha,
@@ -311,7 +375,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.build_artifacts")
             .fetch_one(&pool)
             .await?;
-    assert_eq!(build_count, 1);
+    assert_eq!(build_count, 2);
     let claim = |owner: &'static str| async {
         match ledger.lock_next(owner, 30000).await? {
             Some(locked) => {

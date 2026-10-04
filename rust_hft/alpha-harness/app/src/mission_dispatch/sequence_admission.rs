@@ -270,7 +270,7 @@ pub(crate) fn write_submission(
         image: image.into(),
         request: (&request).into(),
     })?;
-    data_mission::write_json_atomic(path, &validated.submission)?;
+    hft_research_artifacts::write_json_atomic(path, &validated.submission)?;
     Ok(SubmissionRenderReport {
         request_sha256: validated.request_sha256,
         submission_identity_sha256: validated.identity,
@@ -291,7 +291,7 @@ pub(crate) fn write_market_submission(
         image: image.into(),
         request: (&request).into(),
     })?;
-    data_mission::write_json_atomic(path, &validated.submission)?;
+    hft_research_artifacts::write_json_atomic(path, &validated.submission)?;
     Ok(SubmissionRenderReport {
         request_sha256: validated.request_sha256,
         submission_identity_sha256: validated.identity,
@@ -1007,7 +1007,7 @@ pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             bail!("cancelled terminal cache differs from settled evidence");
         }
         if record.settlement.is_none() {
-            data_mission::write_json_atomic(&report_path, &report)?;
+            hft_research_artifacts::write_json_atomic(&report_path, &report)?;
             admitted.settle(
                 &alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
                     completion_provenance: None,
@@ -1094,7 +1094,7 @@ pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
                     consumed_trials: Some(admitted.reservation.declared_trials),
                 },
             };
-            data_mission::write_json_atomic(&report_path, &report)?;
+            hft_research_artifacts::write_json_atomic(&report_path, &report)?;
             admitted.settle_at_completion(&evidence, completion)?;
             admitted.publish_receipts()?;
             return print_json(&report);
@@ -1141,7 +1141,7 @@ pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
             )?
         }
     };
-    data_mission::write_json_atomic(&report_path, &report)?;
+    hft_research_artifacts::write_json_atomic(&report_path, &report)?;
     if let Some(terminal) = terminal {
         let evidence = alpha_store::campaign_ledger::CampaignDispatchSettlementV1 {
             completion_provenance: None,
