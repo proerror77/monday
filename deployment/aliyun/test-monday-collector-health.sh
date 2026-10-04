@@ -461,24 +461,7 @@ case "$*" in
   '-w 60 8')
     [ "${STUB_STATE_LOCK_ERROR:-0}" != 1 ] || exit 2
     # Use a real descriptor lock on macOS and Linux. The monitor retains fd 8.
-    exec python3 - <<'PY'
-import fcntl
-import os
-import time
-
-attempt = os.environ.get("STUB_STATE_LOCK_ATTEMPT")
-if attempt:
-    open(attempt, "w").close()
-deadline = time.monotonic() + 60
-while True:
-    try:
-        fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        break
-    except BlockingIOError:
-        if time.monotonic() >= deadline:
-            raise SystemExit(1)
-        time.sleep(0.02)
-PY
+    exec perl -MFcntl=:flock -MTime::HiRes=time,sleep -e 'if (my $attempt = $ENV{STUB_STATE_LOCK_ATTEMPT}) { open my $mark, ">", $attempt or exit 1; close $mark; } open my $fh, ">&=8" or exit 1; my $deadline = time() + 60; while (1) { exit 0 if flock($fh, LOCK_EX | LOCK_NB); exit 1 if time() >= $deadline; sleep(0.02); }'
     ;;
   '-s -n 9' | '-n 9') ;;
   *) exit 2 ;;
@@ -493,19 +476,12 @@ EOF
 cat > "$stub_dir/mv" <<'EOF'
 #!/bin/sh
 if [ -n "${STUB_STATE_WRITE_PAUSE:-}" ] && [ "$2" = "$MONDAY_COLLECTOR_STATE_DIR/state.json" ]; then
-  python3 - <<'PY'
-import os
-import time
-
-pause = os.environ["STUB_STATE_WRITE_PAUSE"]
-open(pause + ".reached", "w").close()
-deadline = time.monotonic() + 20
-while not os.path.exists(pause + ".release"):
-    if time.monotonic() >= deadline:
-        raise SystemExit(1)
-    time.sleep(0.02)
-PY
-  [ "$?" -eq 0 ] || exit 1
+  : > "$STUB_STATE_WRITE_PAUSE.reached"
+  deadline=$(( $(date +%s) + 20 ))
+  while [ ! -e "$STUB_STATE_WRITE_PAUSE.release" ]; do
+    [ "$(date +%s)" -ge "$deadline" ] && exit 1
+    sleep 0.02
+  done
 fi
 exec "$STUB_REAL_MV" "$@"
 EOF
@@ -1202,17 +1178,11 @@ expect 'health invalid pending: dry-run preserves state' "$(cmp -s "$state_dir/s
 
 wait_for_fixture() {
   # A bounded barrier makes the overlapping invocations deterministic.
-  python3 - "$1" <<'PY'
-import os
-import sys
-import time
-
-deadline = time.monotonic() + 10
-while not os.path.exists(sys.argv[1]):
-    if time.monotonic() >= deadline:
-        raise SystemExit(1)
-    time.sleep(0.02)
-PY
+  deadline=$(( $(date +%s) + 10 ))
+  while [ ! -e "$1" ]; do
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep 0.02
+  done
 }
 
 reset_env
