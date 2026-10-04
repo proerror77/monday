@@ -583,6 +583,98 @@ if sh "$ENTRYPOINT" --inventory "$market_root/inventory.env" --raw-root "$RAW_RO
 fi
 grep -q 'market encoder output differs from requested preparation mode' "$market_root/mode.log"
 
+# The shared data publisher is opt-in and fails before source work when only
+# part of its admission contract is configured.
+if MONDAY_ACK_DATA_PLANE=1 MONDAY_DATA_PLATFORM_STATE_ROOT=/work/test-unconfigured-data sh "$ENTRYPOINT" \
+  --inventory "$market_root/inventory.env" --raw-root "$RAW_ROOT" --reference-root "$REF_ROOT" \
+  --output-root "$market_root/output" --work-dir "$market_root/partial-work" --binary-dir "$BIN_DIR" \
+  --market-encoder-output >"$market_root/partial.stdout" 2>"$market_root/partial.log"; then
+  printf 'expected partial shared data admission to fail\n' >&2; exit 1
+fi
+grep -q 'data publication admission fields must be supplied together' "$market_root/partial.log"
+[ ! -e "$market_root/partial-work" ]
+
+# Positive callback/retry checks run on the admitted ACK /work filesystem.
+# The double exercises the shell handoff only; Rust ingestion and real-source
+# acceptance run separately and cannot use these fixture payloads.
+case "$ROOT" in
+  /work/*)
+    data_root=$ROOT/data-platform
+    mkdir -p "$data_root/output" "$data_root/work" "$data_root/state"
+    sed 's/market-test/data-platform-test/g' "$market_root/inventory.env" >"$data_root/inventory.env"
+    printf '{"schema_version":"monday.market_data_admission.v1"}\n' >"$data_root/admission.json"
+    data_admission_sha=$(sha256sum "$data_root/admission.json" | awk '{print $1}')
+    cat >"$BIN_DIR/research-data-service" <<'EOF'
+#!/bin/sh
+set -eu
+state_root= command= campaign_inputs= campaign_sha= native_receipt= native_sha= admission= admission_sha= queue= queue_sha= expected_start= expected_end=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    enqueue|drain) command=$1; shift ;;
+    --state-root) state_root=$2; shift 2 ;;
+    --campaign-inputs) campaign_inputs=$2; shift 2 ;;
+    --campaign-inputs-sha256) campaign_sha=$2; shift 2 ;;
+    --materialization-receipt) native_receipt=$2; shift 2 ;;
+    --materialization-receipt-sha256) native_sha=$2; shift 2 ;;
+    --admission) admission=$2; shift 2 ;;
+    --admission-sha256) admission_sha=$2; shift 2 ;;
+    --queue) queue=$2; shift 2 ;;
+    --queue-sha256) queue_sha=$2; shift 2 ;;
+    --user) [ "$2" = monday_writer ]; shift 2 ;;
+    --max-partitions) [ "$2" = 16 ]; shift 2 ;;
+    --expected-feature-start-received-at-ns) expected_start=$2; [ "$expected_start" = 30000000000 ]; shift 2 ;;
+    --expected-feature-end-received-at-ns) expected_end=$2; [ "$expected_end" = 90000000000 ]; shift 2 ;;
+    --clickhouse-url|--artifact-root|--run-root) shift 2 ;;
+    *) exit 64 ;;
+  esac
+done
+[ "${MONDAY_ACK_DATA_PLANE-}" = 1 ]
+printf '%s\n' "$command" >>"$MONDAY_TEST_DATA_CALLS"
+case "$command" in
+  enqueue)
+    [ "$expected_start" = 30000000000 ] && [ "$expected_end" = 90000000000 ]
+    [ "$(sha256sum "$campaign_inputs" | awk '{print $1}')" = "$campaign_sha" ]
+    [ "$(sha256sum "$native_receipt" | awk '{print $1}')" = "$native_sha" ]
+    [ "$(sha256sum "$admission" | awk '{print $1}')" = "$admission_sha" ]
+    mkdir -p "$state_root"; printf '[{}]\n' >"$state_root/receipt-queue.json"
+    printf '{"state":"queued"}\n'
+    ;;
+  drain)
+    [ "$(sha256sum "$queue" | awk '{print $1}')" = "$queue_sha" ]
+    [ "${MONDAY_TEST_DATA_DRAIN_FAILURE-0}" != 1 ] || exit 17
+    printf '{"state":"ready","committed_partitions":1}\n'
+    ;;
+  *) exit 64 ;;
+esac
+EOF
+    chmod +x "$BIN_DIR/research-data-service"
+    data_callback() {
+      MONDAY_ACK_DATA_PLANE=1 MONDAY_DATA_PLATFORM_STATE_ROOT="$data_root/state" \
+      MONDAY_DATA_PLATFORM_ADMISSION="$data_root/admission.json" MONDAY_DATA_PLATFORM_ADMISSION_SHA256="$data_admission_sha" \
+      MONDAY_TEST_DATA_CALLS="$data_root/calls" sh "$ENTRYPOINT" \
+        --inventory "$data_root/inventory.env" --output-root "$data_root/output" --binary-dir "$BIN_DIR" \
+        --market-encoder-output --market-feature-start-received-at-ns 30000000000 --market-feature-end-received-at-ns 90000000000 "$@"
+    }
+    if MONDAY_TEST_DATA_DRAIN_FAILURE=1 data_callback --raw-root "$RAW_ROOT" --reference-root "$REF_ROOT" --work-dir "$data_root/work" \
+      >"$data_root/first.stdout" 2>"$data_root/first.log"; then
+      printf 'expected data ingestion failure after successful native publication\n' >&2; exit 1
+    fi
+    grep -q 'shared data ingestion failed' "$data_root/first.log"
+    [ -f "$data_root/output/data-platform-test/receipts/campaign-inputs.json" ]
+    published_data_sha=$(sha256sum "$data_root/output/data-platform-test/receipts/campaign-inputs.json" | awk '{print $1}')
+    # A fresh work directory and unavailable raw/reference roots still recover
+    # through exactly the same published receipt identity.
+    data_callback --raw-root "$ROOT/absent-raw" --reference-root "$ROOT/absent-reference" --work-dir "$data_root/restarted-work" \
+      >"$data_root/retry.stdout" 2>"$data_root/retry.log"
+    [ ! -e "$data_root/restarted-work" ]
+    [ "$(sha256sum "$data_root/output/data-platform-test/receipts/campaign-inputs.json" | awk '{print $1}')" = "$published_data_sha" ]
+    grep -q 'stage=shared_data_reuse.*raw_discovery=0 slicing=0 normalization=0' "$data_root/retry.log"
+    [ "$(grep -c '^enqueue$' "$data_root/calls")" -eq 2 ]
+    [ "$(grep -c '^drain$' "$data_root/calls")" -eq 2 ]
+    ;;
+  *) printf 'ACK-only positive shared-data callback fixtures require TMPDIR under /work\n' >&2 ;;
+esac
+
 # A receipt from another run cannot claim an existing prefix. This fails
 # before creating a staged work directory or running any materializer.
 foreign_root="$ROOT/foreign"

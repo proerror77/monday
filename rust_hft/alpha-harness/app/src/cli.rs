@@ -1334,7 +1334,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 tokio::task::spawn_blocking(move || {
                     let request: serde_json::Value =
                         mission_campaign::sequence::read_json(&args.request)?;
-                    if request["schema_version"] == "monday.sol_market_encoder_cohort_request.v1" {
+                    if matches!(
+                        request["schema_version"].as_str(),
+                        Some(
+                            "monday.sol_market_encoder_cohort_request.v1"
+                                | "monday.sol_market_encoder_cohort_request.v2"
+                        )
+                    ) {
                         mission_campaign::market_encoder::cohort::prepare(args)
                     } else {
                         mission_campaign::sequence::cohort::prepare(args)

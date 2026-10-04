@@ -15,6 +15,14 @@ usage: cex-materialization-entrypoint.sh \
   [--shard-count N] \
   [--sequence-output] [--market-encoder-output] [--market-feature-start-received-at-ns <ns>] [--market-feature-end-received-at-ns <ns>] \
   [--dry-run]
+
+Optional ACK background data publication requires all of:
+  MONDAY_DATA_PLATFORM_STATE_ROOT=/work/data-service
+  MONDAY_DATA_PLATFORM_ADMISSION=<controller-owned admitted JSON>
+  MONDAY_DATA_PLATFORM_ADMISSION_SHA256=<independently pinned SHA-256>
+  MONDAY_ACK_DATA_PLANE=1
+Optional ClickHouse endpoint/user: MONDAY_DATA_PLATFORM_CLICKHOUSE_URL,
+MONDAY_DATA_PLATFORM_USER (default monday_writer); password: CLICKHOUSE_PASSWORD.
 EOF
   exit 2
 }
@@ -502,6 +510,10 @@ SHARD_INDEX=
 SHARD_COUNT=
 publish_count=0
 fail_after_publish=${CEX_MATERIALIZATION_FAIL_AFTER_PUBLISH:-0}
+DATA_PLATFORM_ENABLED=0
+DATA_PLATFORM_STATE_ROOT=${MONDAY_DATA_PLATFORM_STATE_ROOT-}
+DATA_PLATFORM_ADMISSION=${MONDAY_DATA_PLATFORM_ADMISSION-}
+DATA_PLATFORM_ADMISSION_SHA256=${MONDAY_DATA_PLATFORM_ADMISSION_SHA256-}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -587,6 +599,7 @@ SLICER_BIN=$BINARY_DIR/binance-market-tape-slicer
 ALPHA_BIN=$BINARY_DIR/alpha-harness
 PIT_BIN=$BINARY_DIR/lob-pit-materializer
 REPLAY_BIN=$BINARY_DIR/binance-replay-parquet-materializer
+DATA_PLATFORM_BIN=$BINARY_DIR/research-data-service
 
 inventory_load
 
@@ -679,6 +692,24 @@ case "$ROLE" in
     die "ROLE must be all, slice, or reduce"
     ;;
 esac
+
+# Only the explicitly configured background data job enters this hook. An
+# ordinary scientific Campaign does not acquire another writer or grant.
+if [ -n "$DATA_PLATFORM_STATE_ROOT$DATA_PLATFORM_ADMISSION$DATA_PLATFORM_ADMISSION_SHA256" ]; then
+  DATA_PLATFORM_ENABLED=1
+  [ "${MONDAY_ACK_DATA_PLANE-}" = 1 ] || die "data publication requires the admitted ACK workload"
+  [ "$ROLE" != slice ] || die "a slice shard cannot publish shared data receipts"
+  [ "$MARKET_ENCODER_OUTPUT" -eq 1 ] || die "data publication requires market encoder output"
+  [ "$market" = usdm ] && [ "$symbol" = SOLUSDT ] || die "data publication requires canonical SOL USDM inputs"
+  case "$DATA_PLATFORM_STATE_ROOT" in /work/*) ;; *) die "data state must be on the admitted /work block volume" ;; esac
+  case "$DATA_PLATFORM_STATE_ROOT" in *'..'*) die "data state path contains traversal" ;; esac
+  [ -n "$DATA_PLATFORM_ADMISSION" ] && [ -n "$DATA_PLATFORM_ADMISSION_SHA256" ] || die "data publication admission fields must be supplied together"
+  [ ${#DATA_PLATFORM_ADMISSION_SHA256} -eq 64 ] || die "data admission digest must be SHA-256"
+  case "$DATA_PLATFORM_ADMISSION_SHA256" in *[!a-f0-9]*) die "data admission digest is not canonical hex" ;; esac
+  [ -f "$DATA_PLATFORM_ADMISSION" ] || die "data publication admission file is missing"
+  [ "$(sha256_file "$DATA_PLATFORM_ADMISSION")" = "$DATA_PLATFORM_ADMISSION_SHA256" ] || die "data publication admission checksum mismatch"
+  [ "$DRY_RUN" -eq 1 ] || [ -x "$DATA_PLATFORM_BIN" ] || die "research-data-service is not executable"
+fi
 case "$ROLE" in
   all)
     [ -z "$SHARD_INDEX" ] || die "shard-index is only valid with --role slice"
@@ -721,6 +752,53 @@ SHARD_RECEIPT_PATH=
 if [ "$ROLE" = "slice" ]; then
   SHARD_DIR=$SHARD_ROOT/$SHARD_INDEX
   SHARD_RECEIPT_PATH=$SHARD_DIR/receipt.json
+fi
+
+publish_data_platform() {
+  [ "$DATA_PLATFORM_ENABLED" -eq 1 ] || return 0
+  stage_event stage_start shared_data_publication 0 1
+  native_inputs=$RECEIPT_DIR/campaign-inputs.json
+  native_receipt=$RECEIPT_DIR/materialization-receipt.json
+  [ -f "$native_inputs" ] && [ -f "$native_receipt" ] || die "native publication receipts are incomplete"
+  native_inputs_sha=$(sha256_file "$native_inputs")
+  native_receipt_sha=$(sha256_file "$native_receipt")
+  # Enqueue validates the paired native receipts, original PIT snapshot, source
+  # manifests and admission again. It creates no new experiment or raw scan.
+  set -- "$DATA_PLATFORM_BIN" --state-root "$DATA_PLATFORM_STATE_ROOT" enqueue \
+      --campaign-inputs "$native_inputs" --campaign-inputs-sha256 "$native_inputs_sha" \
+      --materialization-receipt "$native_receipt" --materialization-receipt-sha256 "$native_receipt_sha" \
+      --run-root "$RUN_ROOT" --artifact-root "$OUTPUT_ROOT" \
+      --admission "$DATA_PLATFORM_ADMISSION" --admission-sha256 "$DATA_PLATFORM_ADMISSION_SHA256"
+  if [ -n "$MARKET_FEATURE_START" ]; then set -- "$@" --expected-feature-start-received-at-ns "$MARKET_FEATURE_START"; fi
+  if [ -n "$MARKET_FEATURE_END" ]; then set -- "$@" --expected-feature-end-received-at-ns "$MARKET_FEATURE_END"; fi
+  if ! "$@"; then
+    die "shared data receipt enqueue failed; native publication identity retained for retry"
+  fi
+  data_queue=$DATA_PLATFORM_STATE_ROOT/receipt-queue.json
+  [ -f "$data_queue" ] || die "shared data queue publication is missing"
+  data_queue_sha=$(sha256_file "$data_queue")
+  if ! "$DATA_PLATFORM_BIN" --state-root "$DATA_PLATFORM_STATE_ROOT" \
+      --clickhouse-url "${MONDAY_DATA_PLATFORM_CLICKHOUSE_URL:-http://monday-clickhouse.monday-research.svc:8123}" \
+      --user "${MONDAY_DATA_PLATFORM_USER:-monday_writer}" drain \
+      --queue "$data_queue" --queue-sha256 "$data_queue_sha" --artifact-root "$OUTPUT_ROOT" --max-partitions 16; then
+    die "shared data ingestion failed; queued source identity and committed cursor retained for retry"
+  fi
+  stage_event stage_complete shared_data_publication 1 1 "campaign_inputs_sha256=$native_inputs_sha"
+}
+
+# A complete native publication is an immutable reusable input. Scheduled retry
+# of the same fixed inventory must not slice or normalize its raw objects again.
+# The Rust enqueue/drain boundary still verifies metadata and any new payload
+# before a ready dataset can become visible.
+if [ "$DATA_PLATFORM_ENABLED" -eq 1 ] && [ "$DRY_RUN" -ne 1 ] \
+    && [ -f "$RECEIPT_DIR/campaign-inputs.json" ] && [ -f "$RECEIPT_DIR/materialization-receipt.json" ]; then
+  [ "$(json_string_field run_id "$RECEIPT_DIR/campaign-inputs.json")" = "$run_id" ] || die "background data retry run identity changed"
+  [ "$(json_string_field source_revision "$RECEIPT_DIR/campaign-inputs.json")" = "$source_revision" ] || die "background data retry source identity changed"
+  [ "$(json_string_field image_ref "$RECEIPT_DIR/campaign-inputs.json")" = "$image_ref" ] || die "background data retry image identity changed"
+  [ "$(sha256_file "$RECEIPT_DIR/frozen-inventory.env")" = "$inventory_sha256" ] || die "background data retry frozen inventory changed"
+  publish_data_platform
+  stage_event stage_complete shared_data_reuse 1 1 "raw_discovery=0 slicing=0 normalization=0"
+  exit 0
 fi
 
 case "$ROLE" in
@@ -1206,5 +1284,7 @@ publish_verified_file frozen_inventory "$LOCAL_RECEIPT_DIR/frozen-inventory.env"
 publish_verified_file campaign_inputs "$LOCAL_RECEIPT_DIR/campaign-inputs.json" "$RECEIPT_DIR/campaign-inputs.json" "$campaign_inputs_sha"
 publish_verified_file materialization_receipt "$LOCAL_RECEIPT_DIR/materialization-receipt.json" "$RECEIPT_DIR/materialization-receipt.json" "$materialization_receipt_sha"
 stage_event stage_complete publish 1 1 "artifact_count=7 campaign_inputs_sha256=$campaign_inputs_sha materialization_receipt_sha256=$materialization_receipt_sha"
+
+publish_data_platform
 
 log "schema_version=monday.research_event.v1 component=cex-materialization event=run_complete run_id=$run_id mission_id=$mission_id feature_sha256=$feature_sha materialization_sha256=$materialization_sha replay_artifact_sha256=$replay_artifact_sha replay_manifest_sha256=$replay_manifest_sha campaign_inputs_sha256=$campaign_inputs_sha materialization_receipt_sha256=$materialization_receipt_sha"
