@@ -62,7 +62,6 @@ pub struct BinanceExecutionClient {
     resilient_executor: Option<Arc<ResilientExecutor>>,
     // 告警回調
     alert_callback: Option<AlertCallback>,
-    next_client_order_id: Option<String>,
     ws_order: Option<BinanceWsOrderClient>,
     shutdown_tx: Option<watch::Sender<bool>>,
     last_submission_timing: Option<(Option<u64>, Option<u64>, Option<u64>)>,
@@ -694,7 +693,6 @@ impl BinanceExecutionClient {
             listen_key: None,
             resilient_executor: None,
             alert_callback: None,
-            next_client_order_id: None,
             ws_order: None,
             shutdown_tx: None,
             last_submission_timing: None,
@@ -834,14 +832,20 @@ impl BinanceExecutionClient {
 #[async_trait]
 impl ExecutionClient for BinanceExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
+        self.place_order_envelope(&OrderIntentEnvelope::new(intent, Default::default()))
+            .await
+    }
+
+    async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
         self.last_submission_timing = None;
-        let client_order_id = self.next_client_order_id.take().unwrap_or_else(|| {
-            if matches!(self.mode, ExecutionMode::Paper) {
-                format!("BINANCE_PAPER_{:x}", hft_core::now_micros())
-            } else {
-                format!("BINANCE_{:x}", hft_core::now_micros())
-            }
-        });
+        let intent = &envelope.intent;
+        self.validate_product_gate(intent)?;
+        envelope
+            .validate_cex_pre_execution(hft_core::now_micros(), None)
+            .map_err(|reason| {
+                hft_core::HftError::Execution(format!("execution envelope rejected: {reason:?}"))
+            })?;
+        let client_order_id = envelope.client_order_id.clone();
         if client_order_id.is_empty()
             || client_order_id.len() > 36
             || !client_order_id
@@ -853,7 +857,6 @@ impl ExecutionClient for BinanceExecutionClient {
                     .to_string(),
             ));
         }
-        self.validate_product_gate(&intent)?;
 
         // Live/Testnet 模式都必須有 signer，不能靜默退回 Paper。
         if uses_exchange_api(self.mode) && self.signer.is_none() {
@@ -866,7 +869,7 @@ impl ExecutionClient for BinanceExecutionClient {
             self.order_symbol
                 .insert(client_order_id.clone(), intent.symbol.as_str().to_string());
             let signer = self.get_signer()?;
-            let payload = build_binance_ws_order_request(signer, &intent, &client_order_id);
+            let payload = build_binance_ws_order_request(signer, intent, &client_order_id);
             let ws_order = self.ws_order.as_ref().ok_or_else(|| {
                 hft_core::HftError::Network("Binance WS order channel is not connected".to_string())
             })?;
@@ -943,27 +946,11 @@ impl ExecutionClient for BinanceExecutionClient {
         Ok(order_id)
     }
 
-    async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
-        envelope
-            .validate_cex_pre_execution(hft_core::now_micros(), None)
-            .map_err(|reason| {
-                hft_core::HftError::Execution(format!("execution envelope rejected: {reason:?}"))
-            })?;
-        self.next_client_order_id = Some(envelope.client_order_id.clone());
-        self.place_order(envelope.intent.clone()).await
-    }
-
     async fn place_order_envelope_traced(
         &mut self,
         envelope: &OrderIntentEnvelope,
     ) -> ExecutionSubmissionAttempt {
-        if let Err(reason) = envelope.validate_cex_pre_execution(hft_core::now_micros(), None) {
-            return ExecutionSubmissionAttempt::without_transport_timing(Err(
-                hft_core::HftError::Execution(format!("execution envelope rejected: {reason:?}")),
-            ));
-        }
-        self.next_client_order_id = Some(envelope.client_order_id.clone());
-        let outcome = self.place_order(envelope.intent.clone()).await;
+        let outcome = self.place_order_envelope(envelope).await;
         let Some((write_started, write_returned, response_received)) =
             self.last_submission_timing.take()
         else {
@@ -1390,6 +1377,88 @@ impl ExecutionClient for BinanceExecutionClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cex_bounded_envelope(mut intent: OrderIntent) -> OrderIntentEnvelope {
+        let now = hft_core::now_micros();
+        let venue = *intent
+            .target_venue
+            .get_or_insert(hft_core::VenueId::BINANCE_SPOT);
+        let mut envelope = OrderIntentEnvelope::new(
+            intent.clone(),
+            ports::OrderIntentLifecycle {
+                created_ts: now,
+                max_slippage_bps: Some(25),
+                max_order_notional: Some(rust_decimal::Decimal::from(1_000_000)),
+                max_order_quantity: Some(rust_decimal::Decimal::from(10)),
+                max_latency_us: Some(60_000_000),
+                ..Default::default()
+            },
+        );
+        envelope.price_reference = Some(ports::ExecutionPriceReference {
+            venue,
+            symbol: intent.symbol,
+            side: intent.side,
+            price: intent.price.expect("bounded test intent has a price"),
+            book_sequence: 1,
+            received_at: hft_core::LocalReceiveTimestamp::new(now),
+        });
+        envelope
+    }
+
+    #[tokio::test]
+    async fn cex_envelope_limits_reject_bare_and_unbounded_orders_before_submission() {
+        let intent = OrderIntent::crypto_spot(
+            Symbol::new("BTCUSDT"),
+            Side::Buy,
+            Quantity::from_f64(0.001).unwrap(),
+            OrderType::Limit,
+            Some(Price::from_f64(50_000.0).unwrap()),
+            TimeInForce::GTC,
+            "envelope-limits".to_string(),
+            Some(hft_core::VenueId::BINANCE_SPOT),
+        );
+        for mode in [
+            ExecutionMode::Paper,
+            ExecutionMode::Live,
+            ExecutionMode::Testnet,
+        ] {
+            let mut client = BinanceExecutionClient::new(make_test_config(mode));
+            let (tx, mut rx) = broadcast::channel(8);
+            client.event_tx = Some(tx);
+            let error = client.place_order(intent.clone()).await.unwrap_err();
+            assert!(
+                matches!(error, hft_core::HftError::Execution(message) if message.contains("MissingMaxSlippage"))
+            );
+            for missing in [
+                "MissingMaxSlippage",
+                "MissingMaxOrderNotional",
+                "MissingMaxOrderQuantity",
+            ] {
+                let mut envelope = cex_bounded_envelope(intent.clone());
+                match missing {
+                    "MissingMaxSlippage" => envelope.lifecycle.max_slippage_bps = None,
+                    "MissingMaxOrderNotional" => envelope.lifecycle.max_order_notional = None,
+                    _ => envelope.lifecycle.max_order_quantity = None,
+                }
+                let error = client.place_order_envelope(&envelope).await.unwrap_err();
+                assert!(
+                    matches!(error, hft_core::HftError::Execution(message) if message.contains(missing))
+                );
+                client.last_submission_timing = Some((Some(1), Some(2), Some(3)));
+                let attempt = client.place_order_envelope_traced(&envelope).await;
+                assert!(
+                    matches!(attempt.outcome, Err(hft_core::HftError::Execution(message)) if message.contains(missing))
+                );
+                assert!(attempt.userspace_write_started_mono_us.is_none());
+                assert!(attempt.userspace_write_returned_mono_us.is_none());
+                assert!(attempt.response_received_mono_us.is_none());
+            }
+            assert!(matches!(
+                rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
 
     #[tokio::test]
     async fn signed_slippage_is_checked_before_both_adapter_entrypoints() {
@@ -1845,7 +1914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_paper_mode_place_order() {
+    async fn test_paper_mode_place_order_envelope() {
         let config = make_test_config(ExecutionMode::Paper);
         let mut client = BinanceExecutionClient::new(config);
         client.connect().await.unwrap();
@@ -1864,11 +1933,12 @@ mod tests {
             target_venue: None,
         };
 
-        let result = client.place_order(intent).await;
+        let envelope = cex_bounded_envelope(intent);
+        let result = client.place_order_envelope(&envelope).await;
         assert!(result.is_ok());
 
         let order_id = result.unwrap();
-        assert!(order_id.0.starts_with("BINANCE_PAPER_"));
+        assert_eq!(order_id.0, envelope.client_order_id);
     }
 
     #[tokio::test]
@@ -1890,7 +1960,10 @@ mod tests {
             target_venue: None,
         };
 
-        let err = client.place_order(intent).await.unwrap_err();
+        let err = client
+            .place_order_envelope(&cex_bounded_envelope(intent))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("requires API credentials"));
     }
 
@@ -1912,7 +1985,10 @@ mod tests {
             target_venue: None,
         };
 
-        let err = client.place_order(intent).await.unwrap_err();
+        let err = client
+            .place_order_envelope(&cex_bounded_envelope(intent))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("requires API credentials"));
     }
 
@@ -2070,7 +2146,10 @@ mod tests {
             target_venue: Some(hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES),
         };
 
-        assert!(client.place_order(intent).await.is_ok());
+        assert!(client
+            .place_order_envelope(&cex_bounded_envelope(intent))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
