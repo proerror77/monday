@@ -1,6 +1,5 @@
 //! Small TCN and flattened MLP fitting on identical bounded causal batches.
 //! This module has no execution authority.
-use super::{SequenceExample, SequenceReader, MAX_SEQUENCE_BATCH};
 use crate::{lock_ndarray_backend, CpuAutodiffBackend, CpuBackend};
 use burn::{
     module::{AutodiffModule, Module, ModuleVisitor, Param},
@@ -14,6 +13,7 @@ use burn::{
 };
 use burn_ndarray::NdArrayDevice;
 use burn_store::{BurnpackStore, ModuleSnapshot};
+use hft_cex_research_input::sequence::{SequenceExample, SequenceReader, MAX_SEQUENCE_BATCH};
 use hft_research_manifest::sequence::{valid_sha256, SequenceInputSpecV1, SequenceViewV1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -388,8 +388,8 @@ pub fn train_sequence_model(
     request: SequenceTrainingRequestV1,
 ) -> Result<TrainedSequenceModel, String> {
     request.validate()?;
-    if reader.dataset.digest()? != request.dataset_sha256
-        || reader.view != request.view
+    if reader.dataset_digest()? != request.dataset_sha256
+        || reader.view() != request.view
         || reader.input_spec() != &request.input
     {
         return Err("sequence training request differs from admitted dataset or view".into());

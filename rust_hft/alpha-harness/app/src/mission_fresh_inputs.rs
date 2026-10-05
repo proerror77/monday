@@ -1405,8 +1405,9 @@ fn verify_sequence_output(
             .context("sequence clock overflow")?,
         decision_stride_ms: 1000,
     };
-    let mut reader = hft_research_ml::sequence::SequenceReader::open(parent, dataset, hash, view)
-        .map_err(anyhow::Error::msg)?;
+    let mut reader =
+        hft_cex_research_input::sequence::SequenceReader::open(parent, dataset, hash, view)
+            .map_err(anyhow::Error::msg)?;
     reader.finish_pass().map_err(anyhow::Error::msg)
 }
 
@@ -1415,11 +1416,11 @@ fn verify_market_encoder_output(
     root: &Path,
     materialization: &CampaignInputItem,
 ) -> anyhow::Result<()> {
+    use hft_cex_research_input::market_encoder::{MarketFeatureReader, MarketTaskReader};
     use hft_research_manifest::{
         market_encoder::{MarketDataReadRequestV1, MarketFeatureDatasetV1, MarketTargetDatasetV1},
         sequence::{valid_sha256, SequenceInputSpecV1, SequenceViewV1},
     };
-    use hft_research_ml::market_encoder::data::{MarketFeatureReader, MarketTaskReader};
     let path = root.join(&materialization.relative_path);
     ensure_regular_file(&path, "market materialization report")?;
     if file_contains_pattern(&path, br#""market_encoder""#)? != args.market_encoder_output {

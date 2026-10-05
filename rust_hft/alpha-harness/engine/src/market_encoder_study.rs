@@ -2,13 +2,12 @@
 //! cumulative reservations and verified source/replay admission; this library
 //! exposes no dispatch, holdout, publication or order path.
 use alpha_domain::{canonical_json_hash, market_encoder_study::*};
+use hft_cex_research_input::market_encoder::{MarketFeatureReader, MarketTaskReader};
 use hft_research_manifest::{
     market_encoder::*, model::CexBaselineModelV1, sequence::SequenceInputSpecV1,
 };
 use hft_research_ml::market_encoder::{
-    adapt_market_encoder,
-    data::{MarketFeatureReader, MarketTaskReader},
-    pretrain_market_encoder, MarketEncoderCheckpoint, MarketTaskModel,
+    adapt_market_encoder, pretrain_market_encoder, MarketEncoderCheckpoint, MarketTaskModel,
 };
 use serde::{Deserialize, Serialize};
 

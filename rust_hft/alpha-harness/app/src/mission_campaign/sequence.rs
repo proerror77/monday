@@ -200,7 +200,7 @@ pub(crate) fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
     ] {
         let dataset = inputs.verify_view(&args.input_root, location, view)?;
         let manifest_path = location.manifest.path(&args.input_root)?;
-        let mut reader = hft_research_ml::sequence::SequenceReader::open(
+        let mut reader = hft_cex_research_input::sequence::SequenceReader::open(
             manifest_path
                 .parent()
                 .context("sequence manifest has no directory")?,

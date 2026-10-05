@@ -1,9 +1,9 @@
-use super::data::UnlabeledSequenceExample;
 use super::network::*;
 use super::training::input_tensor;
 use crate::{lock_ndarray_backend, CpuBackend};
 use burn::nn::LinearConfig;
 use burn_ndarray::NdArrayDevice;
+use hft_cex_research_input::market_encoder::UnlabeledSequenceExample;
 use hft_research_manifest::market_encoder::*;
 use serde::{Deserialize, Serialize};
 

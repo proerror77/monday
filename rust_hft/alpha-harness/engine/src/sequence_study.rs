@@ -2,12 +2,10 @@
 //! this library neither dispatches, publishes, opens holdouts nor executes orders.
 use crate::baselines::fit_ridge;
 use alpha_domain::sequence_study::{SequenceStudyModelV1, SolSequenceStudyV1};
+use hft_cex_research_input::sequence::SequenceReader;
 use hft_research_manifest::{model::CexBaselineModelV1, sequence::SequenceInputSpecV1};
-use hft_research_ml::sequence::{
-    training::{
-        train_sequence_model, SequenceNeuralKindV1, SequenceTrainingRequestV1, TrainedSequenceModel,
-    },
-    SequenceReader,
+use hft_research_ml::sequence::training::{
+    train_sequence_model, SequenceNeuralKindV1, SequenceTrainingRequestV1, TrainedSequenceModel,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -1,11 +1,4 @@
-use super::{
-    artifacts::*,
-    data::{
-        fit_market_scaling, MarketFeatureReader, MarketTaskReader, Moments,
-        UnlabeledSequenceExample,
-    },
-    network::*,
-};
+use super::{artifacts::*, network::*};
 use crate::{lock_ndarray_backend, CpuAutodiffBackend, CpuBackend};
 use burn::{
     module::AutodiffModule,
@@ -17,6 +10,9 @@ use burn::{
     tensor::{backend::Backend, Tensor, TensorData},
 };
 use burn_ndarray::NdArrayDevice;
+use hft_cex_research_input::market_encoder::{
+    fit_market_scaling, MarketFeatureReader, MarketTaskReader, Moments, UnlabeledSequenceExample,
+};
 use hft_research_manifest::market_encoder::*;
 use sha2::{Digest, Sha256};
 use std::time::Instant;
@@ -407,17 +403,13 @@ pub fn adapt_market_encoder(
 ) -> Result<MarketTaskModel, String> {
     request.validate()?;
     check_parent(&request, parent)?;
-    if reader.features.request() != &request.fit.read_request()
-        || !reader.features.is_at_start()
+    if reader.feature_request() != &request.fit.read_request()
+        || !reader.is_at_start()
         || reader.target_digest() != request.target_dataset_sha256
     {
         return Err("adaptation reader differs from request".into());
     }
-    let scaling = fit_market_scaling(
-        &mut reader.features,
-        request.fit.min_examples,
-        request.fit.max_examples,
-    )?;
+    let scaling = reader.fit_feature_scaling(request.fit.min_examples, request.fit.max_examples)?;
     if parent.is_some_and(|p| p.scaling() != &scaling) {
         return Err("adaptation changed its parent normalization".into());
     }

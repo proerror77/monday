@@ -13,6 +13,11 @@ and `fitting`; control consumers must explicitly disable default features.
 This separates compilation ownership. It does not change Campaign admission,
 trial/resource budgets, final evaluation, holdout isolation or settlement.
 
+`hft-cex-research-input` owns immutable sequence and market-encoder readers.
+Its `streaming` feature pins files, verifies each consumed pass, and preserves
+causal windows and label maturity. Operator and fitting code use these readers.
+The platform's default input contract does not enable columnar readers.
+
 ## Packages
 
 - `alpha-domain`: typed missions, candidates, feedback, learning, approvals, and signed envelopes.

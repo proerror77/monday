@@ -6,7 +6,6 @@
 
 pub mod market_encoder;
 pub mod sequence;
-mod sequence_storage;
 
 use burn::{
     backend::{Autodiff, NdArray},

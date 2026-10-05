@@ -19,11 +19,11 @@ use hft_backtest::{
         TargetPositionReplayTraceEvent,
     },
 };
+use hft_cex_research_input::sequence::SequenceReader;
 use hft_research_manifest::{
     model::{HorizonHoldingPolicyV1, HorizonPositionState},
     sequence::{SequenceDatasetV1, SequenceViewV1},
 };
-use hft_research_ml::sequence::SequenceReader;
 use std::{collections::BTreeMap, fs::OpenOptions, io::BufWriter};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

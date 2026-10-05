@@ -1,9 +1,9 @@
 use super::{
-    data::*,
     training::{input_tensor, masked_positions},
     *,
 };
 use crate::{lock_ndarray_backend, CpuBackend};
+use hft_cex_research_input::market_encoder::*;
 use hft_research_manifest::{
     market_encoder::*,
     sequence::{SequenceInputSpecV1, SequenceShardV1, SequenceViewV1},

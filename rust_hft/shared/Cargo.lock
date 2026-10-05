@@ -700,9 +700,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "hft-research-manifest",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
