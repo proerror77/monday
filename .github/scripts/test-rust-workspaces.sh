@@ -35,7 +35,7 @@ for profile in default db full; do
   fi
 done
 cargo tree --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" \
-  -p hft-research-platform --features control --locked --edges normal --prefix none >"$work/control.tree"
+  -p hft-research-platform --features control,gateway --locked --edges normal --prefix none >"$work/control.tree"
 if grep -E '^(burn|ort |hft-(collector|research-ml|data) |parquet )' "$work/control.tree"; then
   echo 'control pulls acquisition, training or Parquet' >&2; exit 1
 fi
