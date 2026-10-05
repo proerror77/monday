@@ -128,7 +128,7 @@ fn verify_snapshot(
         .as_ref()
         .context("terminal snapshot lost original execution event")?;
     let executed = &event.document;
-    let lease = executed
+    let execution_lease = executed
         .lease
         .as_ref()
         .context("recorded execution event lacks original lease")?;
@@ -145,6 +145,25 @@ fn verify_snapshot(
             && executed.fence == task.fence,
         "historical execution event changed original request or attempt fence"
     );
+    // Heartbeats renew PG authority, while the provider keeps its launch
+    // context. The controlled reference records the actual original context,
+    // including POST-unknown recovery; never infer its expires_ms from a later
+    // heartbeat. Canonical CEX launch requires this controlled identity.
+    let identity = executed
+        .attempt_identity
+        .as_ref()
+        .context("canonical terminal event lost controlled launch identity")?;
+    identity.validate(spec, execution_lease)?;
+    ensure!(
+        identity.native_evidence_sha256 == snapshot.native_admission.evidence_sha256
+            && identity.deadline_ms <= evidence.expires_ms
+            && executed
+                .deadline_ms
+                .is_some_and(|deadline| identity.deadline_ms <= deadline)
+            && task.attempt_identity.as_ref() == Some(identity),
+        "terminal controlled identity changed native evidence, deadline or original reference"
+    );
+    let lease = &identity.launch_lease;
     AttemptContext {
         spec: spec.clone(),
         lease: lease.clone(),
