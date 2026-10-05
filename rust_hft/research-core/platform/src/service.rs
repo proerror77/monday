@@ -20,6 +20,8 @@ pub struct ServiceConfig {
     pub kubernetes_token_file: String,
     pub artifact_gateway: String,
     pub artifact_token_file: String,
+    #[serde(default)]
+    pub artifact_tls: crate::transport::TlsConfig,
     pub lease_ms: i64,
     pub agent_api: Option<crate::agent_api::AgentApiConfig>,
 }
@@ -34,21 +36,27 @@ pub struct ArtifactGateway {
 
 impl ArtifactGateway {
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
+        Self::with_tls(endpoint, token, &crate::transport::TlsConfig::default())
+    }
+    pub fn with_tls(
+        endpoint: &str,
+        token: String,
+        tls: &crate::transport::TlsConfig,
+    ) -> Result<Self> {
         let base = reqwest::Url::parse(endpoint)?;
         ensure!(
             base.scheme() == "https"
                 && base.username().is_empty()
                 && base.password().is_none()
                 && base.query().is_none()
+                && base.fragment().is_none()
+                && base.host_str().is_some()
                 && base.path().ends_with('/'),
             "invalid artifact gateway"
         );
         ensure!(!token.is_empty(), "missing artifact identity");
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            client: tls.client(std::time::Duration::from_secs(15), true)?,
             base,
             token,
         })

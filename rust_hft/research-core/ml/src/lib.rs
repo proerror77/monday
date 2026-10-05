@@ -7,6 +7,7 @@
 pub mod market_encoder;
 pub mod sequence;
 mod sequence_storage;
+pub mod shared_input;
 
 use burn::{
     backend::{Autodiff, NdArray},

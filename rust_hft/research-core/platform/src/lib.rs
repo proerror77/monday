@@ -44,3 +44,6 @@ pub fn valid_digest(value: &str) -> bool {
 
 #[cfg(feature = "control")]
 pub mod worker;
+
+#[cfg(feature = "control")]
+pub mod transport;
