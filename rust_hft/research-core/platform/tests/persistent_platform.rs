@@ -14,15 +14,18 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
         "test database identity mismatch"
     );
     let pool = sqlx_postgres::PgPool::connect(&url).await?;
-    let native_admission = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sql/native_admission.sql"),
-    )?;
+    let native_path = std::env::var_os("MONDAY_TEST_NATIVE_ADMISSION_SQL")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sql/native_admission.sql")
+        });
+    let native_admission = std::fs::read_to_string(native_path)?;
     for migration in [
         MIGRATION,
-        native_admission.as_str(),
         BUILD_RELEASE_MIGRATION,
         SESSION_DELIVERY_MIGRATION,
         include_str!("../sql/artifact_gateway.sql"),
+        native_admission.as_str(),
         include_str!("../../../../deployment/aliyun/research/foundation/postgres/roles.sql"),
     ] {
         sqlx_core::raw_sql::raw_sql(migration)

@@ -24,8 +24,9 @@ PVC 在缩容和 StatefulSet 删除后保留。PG/CH/objects/native-state/delive
 
 ## PG 与 CH 的离线安装
 
-用独立 schema owner 安装 platform `sql/postgres.sql`、`native_admission.sql`、`verified_build_release.sql`、
-`session_deliveries.sql`、`artifact_gateway.sql`，再安装 `postgres/roles.sql`。
+用独立 schema owner 按顺序安装 platform `sql/postgres.sql`、`verified_build_release.sql`、
+`session_deliveries.sql`、`artifact_gateway.sql`、`native_admission.sql`，再安装 `postgres/roles.sql`。
+Native admission 迁移最后替换 artifact permit，保留 fence、lease、deadline、撤销与暂停检查，并加原生有效期和租户检查。
 `authority.mode` 必须仍为 `paused`；所有 backend 仍为 disabled。
 NOLOGIN 角色没有密码，也没有互相继承。经过独立审查的 login identity 才能获得对应角色。
 
