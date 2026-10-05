@@ -299,6 +299,7 @@ impl FormulaEvaluator {
         )
     }
 
+    #[cfg(any(feature = "fitting", test))]
     pub(crate) fn evaluate_signals(
         &self,
         rows: &[ResearchRow],

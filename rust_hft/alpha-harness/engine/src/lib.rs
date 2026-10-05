@@ -10,10 +10,12 @@ pub mod formula_evaluator;
 #[cfg(feature = "kernel")]
 pub mod learning;
 pub mod llm;
+#[cfg(feature = "fitting")]
 pub mod market_encoder_study;
 pub mod model_metrics;
 pub mod prediction_diagnostics;
 pub mod sec_orderflow;
+#[cfg(feature = "fitting")]
 pub mod sequence_study;
 
 #[cfg(feature = "kernel")]
@@ -43,6 +45,7 @@ fn kernel_research_event(event: &str, details: serde_json::Value) {
     research_event("alpha-engine-kernel", event, details);
 }
 
+#[cfg(any(feature = "fitting", feature = "kernel"))]
 pub(crate) fn research_event(component: &str, event: &str, details: serde_json::Value) {
     eprintln!(
         "{}",
