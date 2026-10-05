@@ -2,7 +2,26 @@
 # Dedicated CI issuer/importer. No science, provisioning or service signing keys.
 set +x
 set -euo pipefail
-mode=${1:?expected check-config, publish or import}
+mode=${1:?expected check-presence, check-config, publish or import}
+if [[ $mode == check-presence ]]; then
+  # This cheap check receives only GitHub presence booleans, never credentials.
+  # The native signer/policy/TLS check below remains the publication authority.
+  missing=()
+  [[ ${MONDAY_RELEASE_POLICY_PRESENT:-false} == true ]] || missing+=("variable MONDAY_RESEARCH_RELEASE_POLICY")
+  [[ ${MONDAY_RELEASE_SIGNING_KEY_PRESENT:-false} == true ]] || missing+=("secret MONDAY_RESEARCH_RELEASE_SIGNING_KEY")
+  [[ ${MONDAY_RELEASE_GATEWAY_PRESENT:-false} == true ]] || missing+=("variable MONDAY_RESEARCH_RELEASE_GATEWAY")
+  [[ ${MONDAY_RELEASE_GATEWAY_TOKEN_PRESENT:-false} == true ]] || missing+=("secret MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN")
+  if [[ ${MONDAY_RELEASE_IMPORT_ENABLED:-false} == true && ${MONDAY_RELEASE_IMPORT_DATABASE_URL_PRESENT:-false} != true ]]; then
+    missing+=("secret MONDAY_RESEARCH_RELEASE_IMPORT_DATABASE_URL (PG import is enabled)")
+  fi
+  if ((${#missing[@]})); then
+    printf 'Research publication configuration missing: %s\n' "${missing[@]}" >&2
+    printf 'Configure the named repository settings through the approved operator; native signing and TLS admission remain required.\n' >&2
+    exit 1
+  fi
+  printf 'Research publication settings are present; native signer, policy and TLS validation remain required.\n'
+  exit 0
+fi
 : "${MONDAY_RELEASE_POLICY_JSON:?operator public publisher policy required}"
 : "${MONDAY_RELEASE_GATEWAY:?scoped HTTPS artifact gateway required}"
 : "${MONDAY_RELEASE_GATEWAY_TOKEN:?exact Build/source capability required}"

@@ -106,12 +106,25 @@ end
 publication=acr.fetch('jobs').fetch('publish')
 abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']
 steps=publication.fetch('steps')
+presence=steps.index { |s|s.fetch('name','')=='Require research publication settings before preparation' }
+download=steps.index { |s|s.fetch('name','')=='Download authenticated research release' }
 preflight=steps.index { |s|s.fetch('name','')=='Require independent Build signer configuration' }
 compile=steps.index { |s|s.fetch('name','')=='Compile independent release issuer before secret injection' }
 login=steps.index { |s|s.fetch('name','')=='Log in to ACR' }
 push=steps.index { |s|s.fetch('name','')=='Build and push' }
 abort 'issuer policy/TLS validation occurs after registry mutation' unless preflight && login && push && preflight<login && preflight<push
 abort 'issuer compilation can access injected release credentials' unless compile && compile<preflight && steps.fetch(compile).fetch('if')=='matrix.research_artifact' && steps.fetch(compile).fetch('env').keys==['CARGO_TARGET_DIR'] && steps.fetch(compile).fetch('run').include?('cargo build')
+abort 'missing settings can reach expensive publication preparation' unless presence && download && presence<download && presence<compile && steps.fetch(presence).fetch('if')=='matrix.research_artifact' && steps.fetch(presence).fetch('run').include?('publish-research-build-release.sh check-presence')
+presence_env=steps.fetch(presence).fetch('env')
+expected_presence={
+  'MONDAY_RELEASE_POLICY_PRESENT'=>"${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}",
+  'MONDAY_RELEASE_SIGNING_KEY_PRESENT'=>"${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}",
+  'MONDAY_RELEASE_GATEWAY_PRESENT'=>"${{ vars.MONDAY_RESEARCH_RELEASE_GATEWAY != '' }}",
+  'MONDAY_RELEASE_GATEWAY_TOKEN_PRESENT'=>"${{ secrets.MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN != '' }}",
+  'MONDAY_RELEASE_IMPORT_ENABLED'=>"${{ vars.MONDAY_RESEARCH_RELEASE_IMPORT_ENABLED == 'true' }}",
+  'MONDAY_RELEASE_IMPORT_DATABASE_URL_PRESENT'=>"${{ secrets.MONDAY_RESEARCH_RELEASE_IMPORT_DATABASE_URL != '' }}"
+}
+abort 'cheap configuration check receives credentials or loses optional importer binding' unless presence_env==expected_presence
 wrapper=File.read(File.join(File.dirname(ARGV[0]),'../scripts/publish-research-build-release.sh'))
 abort 'issuer wrapper compiles while holding release credentials' if wrapper.match?(/\bcargo\s+(?:build|run)\b/)
 config=steps.fetch(preflight)
@@ -122,6 +135,39 @@ logout=publication.fetch('steps').index { |s|s.fetch('name','')=='Remove ACR cre
 abort 'registry identity removed before image readback' unless logout && logout>publication.fetch('steps').index(readback)
 source=acr.fetch('jobs').fetch('publish-source-test')
 abort 'source test lost offline fixed profile' unless source.fetch('steps').any? { |s|s.fetch('run','').include?('docker run --rm --network none') }
+RUBY
+# Missing names fail before files, external tools or the native issuer are used.
+# Presence alone must never satisfy the later native configuration gate.
+ruby -ropen3 -rtmpdir - "$script_dir/publish-research-build-release.sh" <<'RUBY'
+wrapper=File.expand_path(ARGV.fetch(0))
+Dir.mktmpdir('release-presence-contract') do |sandbox|
+  base={'PATH'=>sandbox,'TMPDIR'=>sandbox,'RUNNER_TEMP'=>sandbox,
+    'MONDAY_RELEASE_SIGNING_KEY'=>'private-key-must-not-appear',
+    'MONDAY_RELEASE_GATEWAY_TOKEN'=>'private-token-must-not-appear'}
+  present=%w[POLICY SIGNING_KEY GATEWAY GATEWAY_TOKEN].to_h { |name| ["MONDAY_RELEASE_#{name}_PRESENT",'true'] }
+  run=lambda do |env,mode|
+    stdout,stderr,status=Open3.capture3(base.merge(env),'/bin/bash',wrapper,mode,unsetenv_others:true)
+    abort 'configuration preflight wrote private files' unless Dir.children(sandbox).empty?
+    abort 'configuration diagnostic exposed a credential' if (stdout+stderr).include?('private-key-must-not-appear') || (stdout+stderr).include?('private-token-must-not-appear')
+    [stdout+stderr,status.success?]
+  end
+  text,ok=run.call({},'check-presence')
+  abort 'missing release settings were admitted' if ok
+  %w[POLICY SIGNING_KEY GATEWAY GATEWAY_TOKEN].each do |name|
+    abort "operator diagnostic omitted repository setting #{name}" unless text.include?("MONDAY_RESEARCH_RELEASE_#{name}")
+  end
+  _,ok=run.call(present,'check-presence')
+  abort 'configured publication requires a compiler or credentials during cheap preflight' unless ok
+  text,ok=run.call(present.merge('MONDAY_RELEASE_IMPORT_ENABLED'=>'true'),'check-presence')
+  abort 'enabled PG import can fail only after publication' if ok
+  abort 'missing importer setting was not identified' unless text.include?('MONDAY_RESEARCH_RELEASE_IMPORT_DATABASE_URL')
+  _,ok=run.call(present.merge('MONDAY_RELEASE_IMPORT_ENABLED'=>'true','MONDAY_RELEASE_IMPORT_DATABASE_URL_PRESENT'=>'true'),'check-presence')
+  abort 'present enabled importer was rejected' unless ok
+  _,ok=run.call(present.merge('MONDAY_RELEASE_POLICY_PRESENT'=>'yes'),'check-presence')
+  abort 'invalid presence flag was treated as present' if ok
+  _,ok=run.call(present,'check-config')
+  abort 'presence booleans bypassed native credential validation' if ok
+end
 RUBY
 # Exercise the actual target matrix together with the controller step predicate.
 # This catches a valid-looking predicate that is false for every selected row.
