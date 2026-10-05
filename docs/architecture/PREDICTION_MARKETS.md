@@ -45,6 +45,39 @@ transitional `StrategyLogic`/`TradingIntent` simulation contract still needs an
 explicit governed runtime handoff; removal of a dead callback does not complete
 that migration or enable a live strategy.
 
+### First canonical probability strategy
+
+`hft-strategy-probability-reversal` owns the existing `ProbReversal` threshold
+algorithm. The historical registry uses a concrete replay adapter to this same
+implementation. Other prediction algorithms remain in the research simulator;
+generic Formula support does not mean they have migrated.
+
+The fixed `ProbabilityReversalSpecV1` binds a finite episode list, exact UP/DOWN
+decimal token IDs, Polymarket venue, episode clocks, original thresholds, USD
+stake and bounded share orders. Runtime accepts this artifact only through the
+explicit `LoadProbabilityReversal` Paper/Shadow intent and exact signed token
+scope. `SystemBuilder` constructs the shared Strategy implementation. Every
+output crosses the existing engine envelope, shared Risk, OMS and execution
+queue. The episode end tightens the engine deadline; it cannot extend latency
+or deployment limits. Settlement prices of 0 or 1 do not create orders.
+When an UP book triggers a DOWN IOC, arrival price comes from the actual
+canonical DOWN book at the target venue and side. Missing, foreign, future or
+stale target quotes are rejected. The original UP decision book identity stays
+separate from the DOWN execution quote.
+
+After canonical OMS, Portfolio and Risk accept an execution report, the engine
+offers a state-only strategy notification. It cannot submit an order. Replayed
+accounting reports are suppressed before notification. Unknown and partially
+filled orders remain pending until the canonical terminal report. The next
+market event reads authoritative account state and uses the normal risk path.
+
+The fixed specification establishes inference configuration only. It does not
+establish episode readiness, scientific evaluation, sealed holdout, promotion,
+or Live authority. AlphaStore's recorded protocol and evaluation checks still
+reject a configuration-only promotion. A real prediction scientific producer
+and its governed promotion evidence remain separate work. Local signed-intake
+fixtures prove configuration binding, not a scientific result or deployment.
+
 ## Research framework boundary
 
 Monday intentionally keeps two evaluation frameworks because the labels, sampling units, and promotion evidence are different:

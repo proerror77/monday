@@ -517,6 +517,12 @@ pub struct StrategyContext<'a> {
 }
 
 pub trait Strategy: Send + Sync {
+    /// Narrow semantic expiry, such as an episode end. The engine always
+    /// takes the minimum with its own latency and deployment limits.
+    fn intent_semantic_deadline(&self, _intent: &OrderIntent) -> Option<Timestamp> {
+        None
+    }
+
     /// 處理市場事件，返回交易意圖
     fn on_market_event(&mut self, event: &MarketEvent, account: &AccountView) -> Vec<OrderIntent>;
 
@@ -547,6 +553,11 @@ pub trait Strategy: Send + Sync {
         event: &ExecutionEvent,
         account: &AccountView,
     ) -> Vec<OrderIntent>;
+
+    /// Observe execution state after canonical OMS, Portfolio and Risk accept it.
+    /// This notification cannot submit intents. A later market/clock decision
+    /// uses the normal envelope and shared-risk path.
+    fn observe_execution_state(&mut self, _event: &ExecutionEvent, _account: &AccountView) {}
 
     /// 策略名稱
     fn name(&self) -> &str;

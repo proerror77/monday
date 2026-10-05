@@ -18,6 +18,7 @@ snapshot = { package = "hft-snapshot", path = "../snapshot" }
 shared_config = { package = "hft-shared-config", path = "../../shared/config" }
 shared_instrument = { package = "hft-shared-instrument", path = "../../shared/instrument" }
 hft-factor-dsl = { path = "../../research-core/factor-dsl" }
+hft-research-manifest = { path = "../../research-core/manifest" }
 # 🔥 P0: 依賴注入所需 - Runtime 需要創建 OMS 與 Portfolio 實例
 oms_core = { package = "hft-oms-core", path = "../../risk-control/oms-core" }
 portfolio_core = { package = "hft-portfolio-core", path = "../../risk-control/portfolio-core" }
@@ -51,6 +52,7 @@ strategy-dl = { package = "hft-strategy-dl", path = "../../strategy-framework/st
 strategy-imbalance = { package = "hft-strategy-imbalance", path = "../../strategy-framework/strategies/imbalance", optional = true }
 strategy-formula = { package = "hft-strategy-formula", path = "../../strategy-framework/strategies/formula", optional = true }
 strategy-lob-flow-grid = { package = "hft-strategy-lob-flow-grid", path = "../../strategy-framework/strategies/lob_flow_grid", optional = true }
+strategy-probability-reversal = { package = "hft-strategy-probability-reversal", path = "../../strategy-framework/strategies/probability_reversal", optional = true }
 
 # Infrastructure (optional)
 infra-clickhouse = { package = "hft-infra-clickhouse", path = "../../infra-services/core/clickhouse", optional = true }
@@ -128,6 +130,7 @@ strategy-dl = ["dep:strategy-dl"]
 strategy-imbalance = ["dep:strategy-imbalance"]
 strategy-formula = ["dep:strategy-formula"]
 strategy-lob-flow-grid = ["dep:strategy-lob-flow-grid"]
+strategy-probability-reversal = ["dep:strategy-probability-reversal"]
 
 # Infrastructure
 clickhouse = ["dep:infra-clickhouse", "dep:clickhouse"]

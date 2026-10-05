@@ -1,23 +1,28 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-
-use chrono::{DateTime, NaiveDate, Utc};
+//! Research-only adapter for the canonical probability-reversal implementation.
+use super::{
+    common::{fees::crypto_fee_cost, guards::active_order_exists},
+    directional::DirectionalConfig,
+};
+use crate::traits::{MarketUpdate, SignalRecord, StrategyDecision, StrategyLogic};
+use chrono::{DateTime, Utc};
+use hft_core::{
+    LocalReceiveTimestamp, MarketDataTimestamps, OrderId, Price, Quantity, Side, Symbol, VenueId,
+};
+use hft_research_manifest::prediction_probability::{
+    BinaryEpisodeV1, ProbabilityReversalSpecV1, PROBABILITY_REVERSAL_SCHEMA,
+};
 use portfolio_core::prediction::{
     FillRecord, IntentPurpose, OrderLedger, PositionLedger, TradeSide, TradingIntent,
 };
-use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::Decimal;
+use ports::{
+    AccountView, BookLevel, ExecutionEvent, MarketEvent, MarketSnapshot, ProviderBookIdentity,
+    Strategy,
+};
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
-
-use super::common::event::EventWindow;
-use super::common::fees::crypto_fee_cost;
-use super::common::guards::active_order_exists;
-use super::common::holding::BasicHoldingState;
-use super::common::quote::QuoteState;
-use super::directional::DirectionalConfig;
-use crate::traits::{MarketUpdate, SignalRecord, StrategyDecision, StrategyLogic};
-
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use strategy_probability_reversal::{ProbabilityReversalStrategy, ProbabilityStrategyConfig};
 // ── Config ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -118,7 +123,7 @@ impl From<DirectionalConfig> for ProbReversalConfig {
             min_time_remaining_secs: config.min_time_remaining_secs,
             max_time_remaining_secs: config.max_time_remaining_secs,
             stake_usd: config.stake_usd,
-            max_positions: config.max_positions as usize,
+            max_positions: config.max_positions,
             max_daily_trades: config.max_daily_trades,
             allowed_window_secs: config.allowed_window_secs,
             ..Self::default()
@@ -126,355 +131,123 @@ impl From<DirectionalConfig> for ProbReversalConfig {
     }
 }
 
-// ── State ───────────────────────────────────────────────
-
-// ── Strategy ────────────────────────────────────────────
-
+struct EpisodeAdapter {
+    binding: BinaryEpisodeV1,
+    strategy: ProbabilityReversalStrategy,
+    sequence: HashMap<String, u64>,
+}
 pub struct ProbReversalStrategy {
     config: ProbReversalConfig,
-    events: HashMap<Arc<str>, Vec<EventWindow>>,
-    quotes: HashMap<Arc<str>, QuoteState>,
-    prev_up_prob: HashMap<Arc<str>, f64>,
-    holdings: HashMap<Arc<str>, BasicHoldingState>,
-    token_symbol: HashMap<Arc<str>, Arc<str>>,
-    token_event: HashMap<Arc<str>, Arc<str>>,
-    retired_events: HashSet<Arc<str>>,
-    daily_trade_count: u32,
-    daily_reset_date: Option<NaiveDate>,
+    episodes: HashMap<String, EpisodeAdapter>,
+    token_episode: HashMap<String, String>,
+    last_account: AccountView,
+    filled_entries: HashSet<String>,
+    day: Option<i64>,
+    daily_entries: u32,
 }
-
 impl ProbReversalStrategy {
     pub fn new(config: ProbReversalConfig) -> Self {
         Self {
             config,
-            events: HashMap::new(),
-            quotes: HashMap::new(),
-            prev_up_prob: HashMap::new(),
-            holdings: HashMap::new(),
-            token_symbol: HashMap::new(),
-            token_event: HashMap::new(),
-            retired_events: HashSet::new(),
-            daily_trade_count: 0,
-            daily_reset_date: None,
+            episodes: HashMap::new(),
+            token_episode: HashMap::new(),
+            last_account: AccountView::default(),
+            filled_entries: HashSet::new(),
+            day: None,
+            daily_entries: 0,
         }
     }
-
-    fn reset_daily_counter(&mut self, now: DateTime<Utc>) {
-        let today = now.date_naive();
-        if self.daily_reset_date != Some(today) {
-            self.daily_trade_count = 0;
-            self.daily_reset_date = Some(today);
+    fn account(positions: &PositionLedger) -> AccountView {
+        let mut account = AccountView::default();
+        for p in positions.positions() {
+            let symbol = Symbol::new(&p.token_id);
+            account.positions.insert(
+                symbol.clone(),
+                ports::Position {
+                    symbol,
+                    quantity: Quantity(p.net_qty),
+                    avg_price: Price(p.avg_entry_price),
+                    unrealized_pnl: Decimal::ZERO,
+                    realized_pnl: p.realized_pnl,
+                },
+            );
         }
+        account
     }
-
-    fn window_allowed(&self, window_secs: u64) -> bool {
-        self.config.allowed_window_secs.is_empty()
-            || self.config.allowed_window_secs.contains(&window_secs)
-    }
-    fn find_event_for_token(&self, token_id: &Arc<str>) -> Option<&EventWindow> {
-        let event_id = self.token_event.get(token_id)?;
-        self.events
-            .values()
-            .flatten()
-            .find(|event| event.event_id == *event_id && event.contains_token(token_id))
-    }
-
-    fn entry_quantity(&self, entry_price: Decimal) -> Decimal {
-        if entry_price <= Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-        (self.config.stake_usd / entry_price).round_dp(6)
-    }
-
-    fn resolve_up_won(&self, _event: &EventWindow, settlement: Option<bool>) -> Option<bool> {
-        if settlement.is_some() {
-            return settlement;
-        }
-        // Without spot data we cannot infer settlement for this strategy.
-        None
-    }
-
-    fn build_settlement_exits(
-        &self,
-        event: &EventWindow,
-        up_won: bool,
-        created_at: DateTime<Utc>,
-        positions: &PositionLedger,
-    ) -> Vec<StrategyDecision> {
-        let mut exits = Vec::new();
-        for token_id in [&event.up_token, &event.down_token] {
-            let wins = event
-                .token_wins(token_id, up_won)
-                .expect("event token list is built from event sides");
-            let qty = positions.net_qty(token_id);
-            if qty > Decimal::ZERO {
-                exits.push(StrategyDecision::Exit(TradingIntent {
-                    intent_id: format!("prob_reversal_settle_{}_{}", event.event_id, token_id),
-                    deployment_id: String::new(),
-                    market_id: event.event_id.to_string(),
-                    token_id: token_id.to_string(),
-                    side: TradeSide::Sell,
-                    quantity: qty,
-                    limit_price: Some(if wins {
-                        Decimal::new(1, 0)
-                    } else {
-                        Decimal::ZERO
-                    }),
-                    purpose: IntentPurpose::Exit,
-                    created_at,
-                }));
-            }
-        }
-        exits
-    }
-    fn handle_quote(
+    fn discover(
         &mut self,
-        token_id: &Arc<str>,
-        bid: Option<Decimal>,
-        ask: Option<Decimal>,
-        ts: &DateTime<Utc>,
-        positions: &PositionLedger,
-        orders: &OrderLedger,
-    ) -> Vec<StrategyDecision> {
-        // 1. Update quote state.
-        self.quotes
-            .insert(token_id.clone(), QuoteState { bid, ask, ts: *ts });
-        self.reset_daily_counter(*ts);
-
-        // 2. Resolve event for this token.
-        let event = match self.find_event_for_token(token_id) {
-            Some(e) => e.clone(),
-            None => return Vec::new(),
+        event_id: &str,
+        symbol: &str,
+        up: &str,
+        down: &str,
+        end: DateTime<Utc>,
+        window_secs: u64,
+    ) {
+        if self.episodes.len() >= 1024
+            || self.episodes.contains_key(event_id)
+            || self.token_episode.contains_key(up)
+            || self.token_episode.contains_key(down)
+            || !self.config.symbols.iter().any(|s| s == symbol)
+            || (!self.config.allowed_window_secs.is_empty()
+                && !self.config.allowed_window_secs.contains(&window_secs))
+        {
+            return;
+        }
+        let Ok(end_us) = u64::try_from(end.timestamp_micros()) else {
+            return;
         };
-        if self.retired_events.contains(&event.event_id) {
-            return Vec::new();
-        }
-
-        let remaining = (event.end_time - *ts).num_seconds();
-        let is_up_token = *token_id == event.up_token;
-
-        // Current probability: use ask price as implied probability.
-        let current_prob = match ask.and_then(|a| a.to_f64()) {
-            Some(p) if p > 0.0 && p < 1.0 => p,
-            _ => {
-                // Still store prev for next tick.
-                if is_up_token {
-                    if let Some(a) = ask.and_then(|a| a.to_f64()) {
-                        self.prev_up_prob.insert(token_id.clone(), a);
-                    }
-                }
-                return Vec::new();
-            }
+        let Some(start_us) = window_secs
+            .checked_mul(1_000_000)
+            .and_then(|window| end_us.checked_sub(window))
+        else {
+            return;
         };
-
-        // For UP token: up_prob = current_prob.
-        // For DOWN token: up_prob = 1 - current_prob.
-        let up_prob = if is_up_token {
-            current_prob
-        } else {
-            1.0 - current_prob
+        // Historical discovery has no provider condition receipt. This label is
+        // local replay identity; it cannot produce a runtime admission artifact.
+        let binding = BinaryEpisodeV1 {
+            episode_id: event_id.into(),
+            condition_id: event_id.into(),
+            underlying: symbol.into(),
+            venue: "POLYMARKET".into(),
+            up_token: up.into(),
+            down_token: down.into(),
+            start_us,
+            end_us,
         };
-
-        // 3. Check exit conditions for any holding on this token.
-        let mut decisions = Vec::new();
-        if self.holdings.contains_key(token_id) {
-            let Some(exit_bid) = bid else {
-                return decisions;
-            };
-            let held_prob = current_prob; // probability of the token we hold
-            if held_prob >= self.config.take_profit_prob {
-                let qty = positions.net_qty(token_id);
-                if qty > Decimal::ZERO {
-                    info!(
-                        token_id = %token_id,
-                        prob = held_prob,
-                        "prob_reversal take-profit"
-                    );
-                    decisions.push(StrategyDecision::Exit(TradingIntent {
-                        intent_id: format!(
-                            "prob_reversal_tp_{}_{}",
-                            token_id,
-                            ts.timestamp_millis()
-                        ),
-                        deployment_id: String::new(),
-                        market_id: event.event_id.to_string(),
-                        token_id: token_id.to_string(),
-                        side: TradeSide::Sell,
-                        quantity: qty,
-                        limit_price: Some(exit_bid),
-                        purpose: IntentPurpose::Exit,
-                        created_at: *ts,
-                    }));
-                }
-            } else if held_prob <= self.config.stop_loss_prob {
-                let qty = positions.net_qty(token_id);
-                if qty > Decimal::ZERO {
-                    info!(
-                        token_id = %token_id,
-                        prob = held_prob,
-                        "prob_reversal stop-loss"
-                    );
-                    decisions.push(StrategyDecision::Exit(TradingIntent {
-                        intent_id: format!(
-                            "prob_reversal_sl_{}_{}",
-                            token_id,
-                            ts.timestamp_millis()
-                        ),
-                        deployment_id: String::new(),
-                        market_id: event.event_id.to_string(),
-                        token_id: token_id.to_string(),
-                        side: TradeSide::Sell,
-                        quantity: qty,
-                        limit_price: Some(exit_bid),
-                        purpose: IntentPurpose::Exit,
-                        created_at: *ts,
-                    }));
-                }
-            }
-        }
-
-        if !decisions.is_empty() {
-            // Update prev before returning.
-            if is_up_token {
-                self.prev_up_prob.insert(token_id.clone(), up_prob);
-            }
-            return decisions;
-        }
-        // 4. Entry logic — only on UP token quotes (we track up_prob).
-        if is_up_token {
-            let prev = self.prev_up_prob.get(token_id).copied();
-            // Update prev for next tick.
-            self.prev_up_prob.insert(token_id.clone(), up_prob);
-
-            if let Some(prev_up) = prev {
-                // Time window check: 1s to 5s remaining.
-                if remaining >= self.config.min_time_remaining_secs as i64
-                    && remaining <= self.config.max_time_remaining_secs as i64
-                    && self.daily_trade_count < self.config.max_daily_trades
-                    && positions.positions().count() < self.config.max_positions
-                {
-                    // Buy UP: prev < 30% AND current > 60%
-                    if prev_up < self.config.prev_prob_low
-                        && up_prob > self.config.curr_prob_high
-                        && positions.net_qty(&event.up_token) <= Decimal::ZERO
-                        && !active_order_exists(&event.up_token, orders)
-                    {
-                        let entry_price = ask.unwrap(); // safe: we checked above
-                        let quantity = self.entry_quantity(entry_price);
-                        if quantity > Decimal::ZERO {
-                            let direction_str = "up";
-                            let fee = crypto_fee_cost(current_prob);
-                            let edge = up_prob - current_prob - fee;
-                            info!(
-                                event_id = %event.event_id,
-                                prev_up = prev_up,
-                                curr_up = up_prob,
-                                remaining,
-                                edge,
-                                "prob_reversal BUY UP"
-                            );
-                            return vec![StrategyDecision::Enter {
-                                intent: TradingIntent {
-                                    intent_id: format!(
-                                        "prob_reversal_{}_{}_{}",
-                                        event.event_id,
-                                        direction_str,
-                                        ts.timestamp_millis()
-                                    ),
-                                    deployment_id: String::new(),
-                                    market_id: event.event_id.to_string(),
-                                    token_id: event.up_token.to_string(),
-                                    side: TradeSide::Buy,
-                                    quantity,
-                                    limit_price: Some(entry_price),
-                                    purpose: IntentPurpose::Entry,
-                                    created_at: *ts,
-                                },
-                                signal: Some(SignalRecord {
-                                    strategy: self.name().to_string(),
-                                    event_id: Some(event.event_id.to_string()),
-                                    token_id: Some(event.up_token.to_string()),
-                                    intent_id: None,
-                                    symbol: event.symbol.to_string(),
-                                    direction: "UP".to_string(),
-                                    p_hat: up_prob,
-                                    edge,
-                                    entry_price,
-                                    decision: "enter".to_string(),
-                                    ts: *ts,
-                                }),
-                            }];
-                        }
-                    }
-
-                    // Buy DOWN: prev > 70% AND current < 40%
-                    if prev_up > self.config.prev_prob_high
-                        && up_prob < self.config.curr_prob_low
-                        && positions.net_qty(&event.down_token) <= Decimal::ZERO
-                        && !active_order_exists(&event.down_token, orders)
-                    {
-                        let down_ask = self.quotes.get(&event.down_token).and_then(|q| q.ask);
-                        if let Some(entry_price) = down_ask {
-                            let quantity = self.entry_quantity(entry_price);
-                            if quantity > Decimal::ZERO {
-                                let direction_str = "down";
-                                let down_prob = 1.0 - up_prob;
-                                let ep_f = entry_price.to_f64().unwrap_or(0.0);
-                                let fee = crypto_fee_cost(ep_f);
-                                let edge = down_prob - ep_f - fee;
-                                info!(
-                                    event_id = %event.event_id,
-                                    prev_up = prev_up,
-                                    curr_up = up_prob,
-                                    remaining,
-                                    edge,
-                                    "prob_reversal BUY DOWN"
-                                );
-                                return vec![StrategyDecision::Enter {
-                                    intent: TradingIntent {
-                                        intent_id: format!(
-                                            "prob_reversal_{}_{}_{}",
-                                            event.event_id,
-                                            direction_str,
-                                            ts.timestamp_millis()
-                                        ),
-                                        deployment_id: String::new(),
-                                        market_id: event.event_id.to_string(),
-                                        token_id: event.down_token.to_string(),
-                                        side: TradeSide::Buy,
-                                        quantity,
-                                        limit_price: Some(entry_price),
-                                        purpose: IntentPurpose::Entry,
-                                        created_at: *ts,
-                                    },
-                                    signal: Some(SignalRecord {
-                                        strategy: self.name().to_string(),
-                                        event_id: Some(event.event_id.to_string()),
-                                        token_id: Some(event.down_token.to_string()),
-                                        intent_id: None,
-                                        symbol: event.symbol.to_string(),
-                                        direction: "DOWN".to_string(),
-                                        p_hat: down_prob,
-                                        edge,
-                                        entry_price,
-                                        decision: "enter".to_string(),
-                                        ts: *ts,
-                                    }),
-                                }];
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // DOWN token quote — just update prev_up_prob indirectly.
-            // We derive up_prob = 1 - down_ask for tracking.
-            self.prev_up_prob
-                .entry(event.up_token.clone())
-                .or_insert(up_prob);
-        }
-
-        Vec::new()
+        let spec = ProbabilityReversalSpecV1 {
+            schema: PROBABILITY_REVERSAL_SCHEMA.into(),
+            episodes: vec![binding.clone()],
+            prev_prob_low: self.config.prev_prob_low,
+            curr_prob_high: self.config.curr_prob_high,
+            prev_prob_high: self.config.prev_prob_high,
+            curr_prob_low: self.config.curr_prob_low,
+            take_profit_prob: self.config.take_profit_prob,
+            stop_loss_prob: self.config.stop_loss_prob,
+            min_time_remaining_secs: self.config.min_time_remaining_secs,
+            max_time_remaining_secs: self.config.max_time_remaining_secs,
+            stake_usd: self.config.stake_usd,
+            max_positions: self.config.max_positions,
+            max_daily_trades: self.config.max_daily_trades,
+            quote_max_age_us: 5_000_000,
+        };
+        let Ok(strategy) = ProbabilityReversalStrategy::new(ProbabilityStrategyConfig {
+            name: "prob_reversal".into(),
+            spec,
+            max_order_notional: Decimal::MAX,
+            max_order_quantity: Decimal::MAX,
+        }) else {
+            return;
+        };
+        self.token_episode.insert(up.into(), event_id.into());
+        self.token_episode.insert(down.into(), event_id.into());
+        self.episodes.insert(
+            event_id.into(),
+            EpisodeAdapter {
+                binding,
+                strategy,
+                sequence: HashMap::new(),
+            },
+        );
     }
 }
 impl StrategyLogic for ProbReversalStrategy {
@@ -484,15 +257,46 @@ impl StrategyLogic for ProbReversalStrategy {
         positions: &PositionLedger,
         orders: &OrderLedger,
     ) -> Vec<StrategyDecision> {
+        self.last_account = Self::account(positions);
+        for order in orders.orders() {
+            let Some(episode_id) = self.token_episode.get(&order.token_id) else {
+                continue;
+            };
+            let Some(adapter) = self.episodes.get_mut(episode_id) else {
+                continue;
+            };
+            let id = OrderId(order.order_id.clone());
+            let event = match order.state {
+                portfolio_core::prediction::OrderState::Filled => {
+                    Some(ExecutionEvent::OrderCompleted {
+                        order_id: id,
+                        final_price: Price(order.limit_price.unwrap_or(Decimal::ZERO)),
+                        total_filled: Quantity(order.filled_qty),
+                        timestamp: 0,
+                    })
+                }
+                portfolio_core::prediction::OrderState::Canceled => {
+                    Some(ExecutionEvent::OrderCanceled {
+                        order_id: id,
+                        timestamp: 0,
+                    })
+                }
+                portfolio_core::prediction::OrderState::Rejected => {
+                    Some(ExecutionEvent::OrderReject {
+                        order_id: id,
+                        reason: order.rejection_reason.clone().unwrap_or_default(),
+                        timestamp: 0,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(event) = event {
+                adapter
+                    .strategy
+                    .on_execution_event(&event, &self.last_account);
+            }
+        }
         match update {
-            MarketUpdate::Quote {
-                token_id,
-                bid,
-                ask,
-                ts,
-                ..
-            } => self.handle_quote(token_id, *bid, *ask, ts, positions, orders),
-
             MarketUpdate::EventDiscovered {
                 event_id,
                 symbol,
@@ -500,110 +304,180 @@ impl StrategyLogic for ProbReversalStrategy {
                 down_token,
                 end_time,
                 window_secs,
-                price_to_beat,
                 ..
             } => {
-                if !self
-                    .config
-                    .symbols
-                    .iter()
-                    .any(|s| s.as_str() == symbol.as_ref())
-                    || !self.window_allowed(*window_secs)
-                {
-                    return Vec::new();
-                }
-
-                self.token_symbol.insert(up_token.clone(), symbol.clone());
-                self.token_symbol.insert(down_token.clone(), symbol.clone());
-                self.token_event.insert(up_token.clone(), event_id.clone());
-                self.token_event
-                    .insert(down_token.clone(), event_id.clone());
-
-                self.events
-                    .entry(symbol.clone())
-                    .or_default()
-                    .push(EventWindow {
-                        event_id: event_id.clone(),
-                        symbol: symbol.clone(),
-                        up_token: up_token.clone(),
-                        down_token: down_token.clone(),
-                        end_time: *end_time,
-                        window_secs: *window_secs,
-                        price_to_beat: *price_to_beat,
-                    });
-                debug!(event_id = %event_id, "prob_reversal registered event");
+                self.discover(
+                    event_id,
+                    symbol,
+                    up_token,
+                    down_token,
+                    *end_time,
+                    *window_secs,
+                );
                 Vec::new()
             }
-
-            MarketUpdate::EventExpired {
-                event_id,
-                end_time,
-                resolved_up_won,
-            } => {
-                let mut decisions = Vec::new();
-                let mut resolved = Vec::new();
-
-                for events in self.events.values() {
-                    for event in events {
-                        if event.event_id != *event_id {
-                            continue;
-                        }
-                        if let Some(up_won) = self.resolve_up_won(event, *resolved_up_won) {
-                            decisions.extend(
-                                self.build_settlement_exits(event, up_won, *end_time, positions),
-                            );
-                            resolved.push(event.event_id.clone());
-                        }
-                    }
+            MarketUpdate::EventExpired { event_id, .. } => {
+                if let Some(e) = self.episodes.remove(event_id.as_ref()) {
+                    self.token_episode.remove(&e.binding.up_token);
+                    self.token_episode.remove(&e.binding.down_token);
                 }
-
-                for eid in &resolved {
-                    self.retired_events.insert(eid.clone());
-                }
-                if !resolved.is_empty() {
-                    for events in self.events.values_mut() {
-                        events.retain(|e| !resolved.contains(&e.event_id));
-                    }
-                }
-                decisions
+                Vec::new()
             }
-
+            MarketUpdate::Quote {
+                token_id,
+                bid: Some(bid),
+                ask: Some(ask),
+                ts,
+                ..
+            } => {
+                let Some(event_id) = self.token_episode.get(token_id.as_ref()).cloned() else {
+                    return Vec::new();
+                };
+                let Some(adapter) = self.episodes.get_mut(&event_id) else {
+                    return Vec::new();
+                };
+                let Ok(observed) = u64::try_from(ts.timestamp_micros()) else {
+                    return Vec::new();
+                };
+                let day = ts.timestamp() / 86_400;
+                if self.day != Some(day) {
+                    self.day = Some(day);
+                    self.daily_entries = 0;
+                    self.filled_entries.clear();
+                }
+                let sequence = adapter.sequence.entry(token_id.to_string()).or_default();
+                *sequence = sequence.saturating_add(1);
+                let event = MarketEvent::Snapshot(MarketSnapshot {
+                    symbol: Symbol::new(token_id.as_ref()),
+                    timestamp: observed,
+                    bids: vec![BookLevel {
+                        price: Price(*bid),
+                        quantity: Quantity(Decimal::ONE),
+                    }],
+                    asks: vec![BookLevel {
+                        price: Price(*ask),
+                        quantity: Quantity(Decimal::ONE),
+                    }],
+                    sequence: *sequence,
+                    source_venue: Some(VenueId::POLYMARKET),
+                    timestamps: MarketDataTimestamps::local_only(LocalReceiveTimestamp::new(
+                        observed,
+                    )),
+                    provider_identity: Some(ProviderBookIdentity {
+                        market: event_id.clone(),
+                        book_hash: None,
+                    }),
+                });
+                adapter
+                    .strategy
+                    .on_market_event(&event, &self.last_account)
+                    .into_iter()
+                    .filter(|i| {
+                        !active_order_exists(&Arc::from(i.symbol.as_str()), orders)
+                            && (i.side == Side::Sell
+                                || self.daily_entries < self.config.max_daily_trades)
+                    })
+                    .map(|intent| {
+                        let token = intent.symbol.as_str().to_owned();
+                        let buying = intent.side == Side::Buy;
+                        let trading = TradingIntent {
+                            intent_id: format!("prob_reversal_{}_{}_{}", event_id, token, observed),
+                            deployment_id: String::new(),
+                            market_id: event_id.clone(),
+                            token_id: token.clone(),
+                            side: if buying {
+                                TradeSide::Buy
+                            } else {
+                                TradeSide::Sell
+                            },
+                            quantity: intent.quantity.0,
+                            limit_price: intent.price.map(|p| p.0),
+                            purpose: if buying {
+                                IntentPurpose::Entry
+                            } else {
+                                IntentPurpose::Exit
+                            },
+                            created_at: *ts,
+                        };
+                        if !buying {
+                            return StrategyDecision::Exit(trading);
+                        }
+                        let price = intent.price.unwrap().0;
+                        let up = token == adapter.binding.up_token;
+                        let probability = if up {
+                            ask.to_f64().unwrap_or(0.0)
+                        } else {
+                            1.0 - ask.to_f64().unwrap_or(0.0)
+                        };
+                        StrategyDecision::Enter {
+                            intent: trading,
+                            signal: Some(SignalRecord {
+                                strategy: "prob_reversal".into(),
+                                event_id: Some(event_id.clone()),
+                                token_id: Some(token),
+                                intent_id: None,
+                                symbol: adapter.binding.underlying.clone(),
+                                direction: if up { "UP".into() } else { "DOWN".into() },
+                                p_hat: probability,
+                                edge: probability
+                                    - price.to_f64().unwrap_or(0.0)
+                                    - crypto_fee_cost(price.to_f64().unwrap_or(0.0)),
+                                entry_price: price,
+                                decision: "enter".into(),
+                                ts: *ts,
+                            }),
+                        }
+                    })
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
-
     fn on_fill(&mut self, fill: &FillRecord) {
-        let token_id: Arc<str> = Arc::from(fill.token_id.as_str());
-        match fill.side {
-            TradeSide::Buy => {
-                self.daily_trade_count += 1;
-                let direction = if self
-                    .find_event_for_token(&token_id)
-                    .map(|e| e.up_token == token_id)
-                    .unwrap_or(false)
-                {
-                    "UP"
-                } else {
-                    "DOWN"
-                };
-                self.holdings.insert(
-                    token_id,
-                    BasicHoldingState {
-                        token_id: Arc::from(fill.token_id.as_str()),
-                        direction: direction.to_string(),
-                        entry_time: fill.timestamp,
-                    },
-                );
-            }
-            TradeSide::Sell => {
-                self.holdings.remove(&token_id);
-                if let Some(event_id) = self.token_event.get(&token_id).cloned() {
-                    self.retired_events.insert(event_id);
-                }
-            }
+        if fill.side == TradeSide::Buy && self.filled_entries.insert(fill.order_id.clone()) {
+            self.daily_entries = self.daily_entries.saturating_add(1);
         }
+        let Some(event_id) = self.token_episode.get(&fill.token_id).cloned() else {
+            return;
+        };
+        let Some(adapter) = self.episodes.get_mut(&event_id) else {
+            return;
+        };
+        let symbol = Symbol::new(&fill.token_id);
+        let side = if fill.side == TradeSide::Buy {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
+        let timestamp = u64::try_from(fill.timestamp.timestamp_micros()).unwrap_or(0);
+        let order_id = OrderId(fill.order_id.clone());
+        adapter.strategy.on_execution_event(
+            &ExecutionEvent::OrderNew {
+                order_id: order_id.clone(),
+                client_order_id: None,
+                account_id: None,
+                symbol,
+                side,
+                quantity: Quantity(fill.quantity),
+                requested_price: Some(Price(fill.price)),
+                arrival_price: None,
+                timestamp,
+                venue: Some(VenueId::POLYMARKET),
+                strategy_id: "prob_reversal".into(),
+            },
+            &self.last_account,
+        );
+        adapter.strategy.on_execution_event(
+            &ExecutionEvent::Fill {
+                order_id,
+                price: Price(fill.price),
+                quantity: Quantity(fill.quantity),
+                timestamp,
+                fill_id: fill.fill_id.clone(),
+            },
+            &self.last_account,
+        );
     }
-
     fn name(&self) -> &str {
         "prob_reversal"
     }
@@ -637,8 +511,8 @@ mod tests {
             &MarketUpdate::EventDiscovered {
                 event_id: "evt1".into(),
                 symbol: "BTCUSDT".into(),
-                up_token: "up1".into(),
-                down_token: "dn1".into(),
+                up_token: "101".into(),
+                down_token: "201".into(),
                 end_time: now + Duration::seconds(3),
                 window_secs: 300,
                 price_to_beat: Some(dec!(100.0)),
@@ -651,7 +525,7 @@ mod tests {
         // First tick: UP ask = 0.25 (prev_up = 0.25, below 0.30).
         strategy.on_update(
             &MarketUpdate::Quote {
-                token_id: "up1".into(),
+                token_id: "101".into(),
                 bid: Some(dec!(0.23)),
                 ask: Some(dec!(0.25)),
                 bid_size: None,
@@ -667,7 +541,7 @@ mod tests {
         // Second tick: UP ask = 0.65 (dramatic reversal, above 0.60).
         let decisions = strategy.on_update(
             &MarketUpdate::Quote {
-                token_id: "up1".into(),
+                token_id: "101".into(),
                 bid: Some(dec!(0.63)),
                 ask: Some(dec!(0.65)),
                 bid_size: None,
@@ -687,7 +561,7 @@ mod tests {
             "expected UP reversal entry, got {decisions:?}"
         );
         if let StrategyDecision::Enter { intent, signal } = &decisions[0] {
-            assert_eq!(intent.token_id, "up1");
+            assert_eq!(intent.token_id, "101");
             assert_eq!(intent.side, TradeSide::Buy);
             assert_eq!(signal.as_ref().unwrap().direction, "UP");
         }
@@ -708,8 +582,8 @@ mod tests {
             &MarketUpdate::EventDiscovered {
                 event_id: "evt2".into(),
                 symbol: "BTCUSDT".into(),
-                up_token: "up2".into(),
-                down_token: "dn2".into(),
+                up_token: "102".into(),
+                down_token: "202".into(),
                 end_time: now + Duration::seconds(3),
                 window_secs: 300,
                 price_to_beat: Some(dec!(100.0)),
@@ -722,7 +596,7 @@ mod tests {
         // Seed DOWN token quote so entry_price is available.
         strategy.on_update(
             &MarketUpdate::Quote {
-                token_id: "dn2".into(),
+                token_id: "202".into(),
                 bid: Some(dec!(0.18)),
                 ask: Some(dec!(0.20)),
                 bid_size: None,
@@ -738,7 +612,7 @@ mod tests {
         // First UP tick: ask = 0.75 (prev_up = 0.75, above 0.70).
         strategy.on_update(
             &MarketUpdate::Quote {
-                token_id: "up2".into(),
+                token_id: "102".into(),
                 bid: Some(dec!(0.73)),
                 ask: Some(dec!(0.75)),
                 bid_size: None,
@@ -754,7 +628,7 @@ mod tests {
         // Second UP tick: ask = 0.35 (dramatic drop, below 0.40).
         let decisions = strategy.on_update(
             &MarketUpdate::Quote {
-                token_id: "up2".into(),
+                token_id: "102".into(),
                 bid: Some(dec!(0.33)),
                 ask: Some(dec!(0.35)),
                 bid_size: None,
@@ -774,7 +648,7 @@ mod tests {
             "expected DOWN reversal entry, got {decisions:?}"
         );
         if let StrategyDecision::Enter { intent, signal } = &decisions[0] {
-            assert_eq!(intent.token_id, "dn2");
+            assert_eq!(intent.token_id, "202");
             assert_eq!(signal.as_ref().unwrap().direction, "DOWN");
         }
     }
@@ -795,8 +669,8 @@ mod tests {
             &MarketUpdate::EventDiscovered {
                 event_id: "evt3".into(),
                 symbol: "BTCUSDT".into(),
-                up_token: "up3".into(),
-                down_token: "dn3".into(),
+                up_token: "103".into(),
+                down_token: "203".into(),
                 end_time: now + Duration::seconds(60),
                 window_secs: 300,
                 price_to_beat: Some(dec!(100.0)),
@@ -810,7 +684,7 @@ mod tests {
         let fill = FillRecord {
             fill_id: "f1".into(),
             order_id: "o1".into(),
-            token_id: "up3".into(),
+            token_id: "103".into(),
             side: TradeSide::Buy,
             quantity: dec!(10),
             price: dec!(0.65),
@@ -818,18 +692,18 @@ mod tests {
             timestamp: now,
         };
         let positions = crate::canonical_test_support::position_projection(
-            crate::canonical_test_support::entry_intent("up3", dec!(10)),
+            crate::canonical_test_support::entry_intent("103", dec!(10)),
             "o1",
             "venue-o1",
             [fill.clone()],
         );
-        assert_eq!(positions.net_qty("up3"), dec!(10));
+        assert_eq!(positions.net_qty("103"), dec!(10));
         strategy.on_fill(&fill);
 
         // Quote at 0.90 — above take_profit_prob.
         let decisions = strategy.on_update(
             &MarketUpdate::Quote {
-                token_id: "up3".into(),
+                token_id: "103".into(),
                 bid: Some(dec!(0.88)),
                 ask: Some(dec!(0.90)),
                 bid_size: None,
@@ -845,11 +719,26 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         match &decisions[0] {
             StrategyDecision::Exit(intent) => {
-                assert_eq!(intent.token_id, "up3");
+                assert_eq!(intent.token_id, "103");
                 assert_eq!(intent.quantity, dec!(10));
             }
             other => panic!("expected exit, got {other:?}"),
         }
+        assert!(
+            strategy
+                .on_update(
+                    &MarketUpdate::EventExpired {
+                        event_id: "evt3".into(),
+                        end_time: now + Duration::seconds(3),
+                        resolved_up_won: Some(true),
+                    },
+                    &positions,
+                    &orders
+                )
+                .is_empty(),
+            "settlement is evidence, never a 0/1 sell order"
+        );
+        assert_eq!(positions.net_qty("103"), dec!(10));
     }
 
     #[test]
@@ -869,8 +758,8 @@ mod tests {
             &MarketUpdate::EventDiscovered {
                 event_id: "evt4".into(),
                 symbol: "BTCUSDT".into(),
-                up_token: "up4".into(),
-                down_token: "dn4".into(),
+                up_token: "104".into(),
+                down_token: "204".into(),
                 end_time: now + Duration::seconds(30), // 30s remaining — outside 1-5s window
                 window_secs: 300,
                 price_to_beat: Some(dec!(100.0)),
@@ -882,7 +771,7 @@ mod tests {
 
         strategy.on_update(
             &MarketUpdate::Quote {
-                token_id: "up4".into(),
+                token_id: "104".into(),
                 bid: Some(dec!(0.23)),
                 ask: Some(dec!(0.25)),
                 bid_size: None,
@@ -897,7 +786,7 @@ mod tests {
 
         let decisions = strategy.on_update(
             &MarketUpdate::Quote {
-                token_id: "up4".into(),
+                token_id: "104".into(),
                 bid: Some(dec!(0.63)),
                 ask: Some(dec!(0.65)),
                 bid_size: None,

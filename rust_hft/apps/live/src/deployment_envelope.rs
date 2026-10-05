@@ -52,6 +52,7 @@ pub enum ActivationMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActivationArtifact {
+    ProbabilityReversal,
     Formula,
     Onnx,
     FrozenModel,
@@ -326,6 +327,37 @@ fn apply_strategy_bundle(
     };
 
     let (strategy, strategy_ids) = match (&request.artifact, &bundle.artifact) {
+        (
+            ActivationArtifact::ProbabilityReversal,
+            RuntimeArtifact::ProbabilityReversal { spec },
+        ) => {
+            if request.mode == ActivationMode::LiveSmall || request.venue != "POLYMARKET" {
+                return Err("probability reversal is limited to Polymarket Paper/Shadow".into());
+            }
+            spec.validate().map_err(|error| error.to_string())?;
+            let expected = spec
+                .episodes
+                .iter()
+                .flat_map(|e| [e.up_token.clone(), e.down_token.clone()])
+                .collect::<BTreeSet<_>>();
+            if request.instruments.iter().cloned().collect::<BTreeSet<_>>() != expected {
+                return Err("deployment instruments differ from fixed episode outcomes".into());
+            }
+            (
+                runtime::StrategyConfig {
+                    name: strategy_name.clone(),
+                    strategy_type: runtime::StrategyType::ProbabilityReversal,
+                    symbols,
+                    risk_limits,
+                    params: runtime::StrategyParams::ProbabilityReversal {
+                        spec: spec.clone(),
+                        max_order_notional: total_notional,
+                        max_order_quantity: requested_order_quantity,
+                    },
+                },
+                vec![strategy_name.clone()],
+            )
+        }
         (ActivationArtifact::Formula, artifact) => {
             let (ast, target_position, signal_threshold, interval_ms, execution_contract) =
                 match artifact {
@@ -982,6 +1014,9 @@ fn activation_request(
         .filter_map(|intent| match intent {
             AllowedIntentType::LoadFactor => Some(ActivationArtifact::Formula),
             AllowedIntentType::LoadModel => Some(ActivationArtifact::Onnx),
+            AllowedIntentType::LoadProbabilityReversal => {
+                Some(ActivationArtifact::ProbabilityReversal)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1102,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_spread_cex_execution_is_not_admitted() {
+    fn canonical_cross_spread_is_supported_but_nonzero_funding_is_not() {
         let mut costs = RuntimeCosts {
             fee_bps: 2.0,
             rebate_bps: 0.0,
@@ -1116,14 +1151,14 @@ mod tests {
         };
         assert!(require_supported_cex_execution(&costs).is_ok());
         costs.cross_spread = true;
-        assert!(require_supported_cex_execution(&costs)
-            .unwrap_err()
-            .contains("does not support cross-spread execution"));
-        costs.cross_spread = false;
+        assert!(require_supported_cex_execution(&costs).is_ok());
         costs.funding_bps = 0.1;
-        assert!(require_supported_cex_execution(&costs)
-            .unwrap_err()
-            .contains("does not support non-zero funding costs"));
+        for crossing in [false, true] {
+            costs.cross_spread = crossing;
+            assert!(require_supported_cex_execution(&costs)
+                .unwrap_err()
+                .contains("does not support non-zero funding costs"));
+        }
     }
 
     #[test]

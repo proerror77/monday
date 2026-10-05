@@ -1907,6 +1907,14 @@ impl Engine {
             );
         }
 
+        let account = self.portfolio_manager.as_ref().map_or_else(
+            || self.get_account_view(),
+            |portfolio| portfolio.reader().load(),
+        );
+        for strategy in &mut self.strategies {
+            strategy.observe_execution_state(event, &account);
+        }
+
         Ok(())
     }
 
@@ -2092,6 +2100,9 @@ impl Engine {
                 let emitted_at = monotonic_micros();
                 intents_work_buf.extend(intents.into_iter().map(|intent| {
                     let mut lifecycle = ports::OrderIntentLifecycle::default();
+                    if let Some(deadline) = strategy.intent_semantic_deadline(&intent) {
+                        lifecycle.valid_until = lifecycle.valid_until.min(deadline);
+                    }
                     lifecycle.timing.intent_emitted_mono_us = Some(emitted_at);
                     let account_id = strategy_account_mapping
                         .get(&intent.strategy_id)
@@ -2144,7 +2155,21 @@ impl Engine {
                     if !Self::requires_arrival_quote(&envelope.intent) {
                         return true;
                     }
-                    let arrival_price = Self::capture_arrival_price(&mut envelope.intent, l2_book);
+                    let arrival_price = if envelope.intent.asset_class
+                        == hft_core::AssetClass::PredictionMarket
+                        && envelope.intent.product_type == hft_core::ProductType::PredictionMarket
+                        && envelope.intent.time_in_force == hft_core::TimeInForce::IOC
+                        && l2_book.is_some_and(|book| book.symbol != &envelope.intent.symbol)
+                    {
+                        Self::capture_prediction_arrival_price(
+                            &envelope.intent,
+                            &current_market,
+                            now_micros(),
+                            self.config.intent_max_latency_us,
+                        )
+                    } else {
+                        Self::capture_arrival_price(&mut envelope.intent, l2_book)
+                    };
                     envelope.lifecycle.arrival_price = arrival_price;
                     if matches!(envelope.intent.order_type, OrderType::Market) {
                         envelope.intent.price = arrival_price;
@@ -2593,6 +2618,20 @@ impl Engine {
                 }
             }
         })
+    }
+
+    fn capture_prediction_arrival_price(
+        intent: &ports::OrderIntent,
+        market: &MarketView,
+        now: Timestamp,
+        max_age_us: u64,
+    ) -> Option<hft_core::Price> {
+        if intent.target_venue != Some(VenueId::POLYMARKET) {
+            return None;
+        }
+        let reference = market.execution_price_reference(intent)?;
+        let age = now.checked_sub(reference.received_at.as_micros())?;
+        (age <= max_age_us).then_some(reference.price)
     }
 
     /// 從市場事件中提取時間戳
@@ -3377,6 +3416,82 @@ mod tests {
         let mut without_book = test_intent();
         without_book.time_in_force = hft_core::TimeInForce::IOC;
         assert_eq!(Engine::capture_arrival_price(&mut without_book, None), None);
+    }
+
+    #[test]
+    fn prediction_arrival_requires_exact_target_and_fresh_local_receipt() {
+        let mut intent = ports::OrderIntent::prediction_market(
+            Symbol::new("456"),
+            Side::Buy,
+            hft_core::Quantity(Decimal::from(50)),
+            OrderType::Limit,
+            Some(Price(Decimal::new(20, 2))),
+            hft_core::TimeInForce::IOC,
+            "probability".into(),
+            VenueId::POLYMARKET,
+        );
+        let mut market = MarketView {
+            orderbooks: FxHashMap::default(),
+            arbitrage_opportunities: Vec::new(),
+            timestamp: 100,
+            version: 1,
+        };
+        assert_eq!(
+            Engine::capture_prediction_arrival_price(&intent, &market, 100, 10),
+            None
+        );
+        let mut book = TopNSnapshot::new(intent.symbol.clone(), 1);
+        book.bid_prices
+            .push(hft_core::FixedPrice::from(Price(Decimal::new(18, 2))));
+        book.ask_prices
+            .push(hft_core::FixedPrice::from(Price(Decimal::new(20, 2))));
+        book.bid_quantities
+            .push(hft_core::FixedQuantity::from(hft_core::Quantity(
+                Decimal::ONE,
+            )));
+        book.ask_quantities
+            .push(hft_core::FixedQuantity::from(hft_core::Quantity(
+                Decimal::ONE,
+            )));
+        book.local_receive = Some(hft_core::LocalReceiveTimestamp::new(90));
+        market.orderbooks.insert(
+            VenueSymbol::new(VenueId::BYBIT, intent.symbol.clone()),
+            Arc::new(book.clone()),
+        );
+        assert_eq!(
+            Engine::capture_prediction_arrival_price(&intent, &market, 100, 10),
+            None,
+            "a foreign venue cannot fill the target book gap"
+        );
+        let key = VenueSymbol::new(VenueId::POLYMARKET, intent.symbol.clone());
+        market
+            .orderbooks
+            .insert(key.clone(), Arc::new(book.clone()));
+        assert_eq!(
+            Engine::capture_prediction_arrival_price(&intent, &market, 100, 10),
+            intent.price
+        );
+        intent.side = Side::Sell;
+        assert_eq!(
+            Engine::capture_prediction_arrival_price(&intent, &market, 100, 10),
+            Some(Price(Decimal::new(18, 2)))
+        );
+        intent.target_venue = Some(VenueId::BYBIT);
+        assert_eq!(
+            Engine::capture_prediction_arrival_price(&intent, &market, 100, 10),
+            None
+        );
+        intent.target_venue = Some(VenueId::POLYMARKET);
+        for received in [None, Some(89), Some(101)] {
+            book.local_receive = received.map(hft_core::LocalReceiveTimestamp::new);
+            market
+                .orderbooks
+                .insert(key.clone(), Arc::new(book.clone()));
+            assert_eq!(
+                Engine::capture_prediction_arrival_price(&intent, &market, 100, 10),
+                None
+            );
+        }
     }
 
     struct EmittingStrategy {

@@ -37,6 +37,7 @@ impl StrategyBundle {
     pub fn to_runtime_bundle(&self) -> Result<RuntimeBundle, DomainError> {
         self.validate()?;
         let artifact = match &self.artifact {
+            StrategyBundleArtifact::ProbabilityReversal {spec}=> RuntimeArtifact::ProbabilityReversal {spec:spec.clone()},
             StrategyBundleArtifact::Formula { ast } => {
                 RuntimeArtifact::Formula { ast: ast.clone() }
             }
