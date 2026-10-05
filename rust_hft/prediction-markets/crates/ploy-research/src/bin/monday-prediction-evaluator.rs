@@ -42,10 +42,10 @@ use ploy_research::{
     walk_forward_settlement_probability_report_with_prior,
     walk_forward_settlement_verdict_report_with_prior,
     write_alpha_search_artifacts_with_runtime_feedback,
-    write_side_bound_alpha_search_artifacts_with_runtime_feedback, AlphaSearchArtifactSummary,
-    AlphaSearchRuntimeFeedback, AlphaZooSnapshot, AutoFactorOptions, AutoFactorV2Target,
-    CandidateReplayFactorIdentity, FactorComboV1Options, FactorObservation, FactorObservationV2,
-    FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
+    write_side_bound_alpha_search_artifacts_with_runtime_feedback, AlphaSearchArtifactError,
+    AlphaSearchArtifactSummary, AlphaSearchRuntimeFeedback, AlphaZooSnapshot, AutoFactorOptions,
+    AutoFactorV2Target, CandidateReplayFactorIdentity, FactorComboV1Options, FactorObservation,
+    FactorObservationV2, FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
     FillabilityReviewOptions, FullDepthExecutionMatrixOptions, FullDepthExecutionMatrixReport,
     LiquidityGateV1Options, LiquidityGatedAlphaV1Options, LlmPriorSpec,
     MetaLabelWalkForwardOptions, RepricePilotMetrics, RepricePilotSelection, RepricingIcOptions,
@@ -998,17 +998,21 @@ fn replay_parity_evidence(path: &str) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_time_cohort_boundary, replay_parity_evidence, require_report_identity,
-        runtime_feedback_for_lane, settlement_time_cohort_from_args,
-        sorted_distinct_reprice_pilot_market_ids, validate_expected_prediction_policy,
-        validate_pipeline_smoke_args, validate_prediction_snapshot_contract_id,
-        validate_prediction_snapshot_profile, validate_report_observation_count,
-        validate_reprice_pilot_config, validate_time_cohort_range, write_pipeline_smoke_report,
-        write_report_set, ReportArtifactContext, RepricePilotConfig,
+        parse_time_cohort_boundary, reject_retired_search_inputs, replay_parity_evidence,
+        report_alpha_search_artifact_write, require_report_identity, runtime_feedback_for_lane,
+        settlement_time_cohort_from_args, sorted_distinct_reprice_pilot_market_ids,
+        validate_expected_prediction_policy, validate_pipeline_smoke_args,
+        validate_prediction_snapshot_contract_id, validate_prediction_snapshot_profile,
+        validate_report_observation_count, validate_reprice_pilot_config,
+        validate_time_cohort_range, write_pipeline_smoke_report, write_report_set,
+        ReportArtifactContext, RepricePilotConfig,
     };
     use chrono::{TimeZone, Utc};
     use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
-    use ploy_research::{AlphaSearchRuntimeFeedback, ReviewSide};
+    use ploy_research::{
+        write_alpha_search_artifacts_with_runtime_feedback, AlphaSearchRuntimeFeedback,
+        AutoFactorOptions, ReviewSide,
+    };
     use sha2::{Digest, Sha256};
     use std::fs;
 
@@ -1041,6 +1045,60 @@ mod tests {
         }
         reject_retired_search_inputs(&["--prediction-mcts-training-candidate-json".into()])
             .expect("the official training adapter still accepts its typed candidate");
+    }
+
+    #[test]
+    fn alpha_search_stale_output_directory_exits_2() {
+        const OUTPUT_DIR_ENV: &str = "MONDAY_TEST_ALPHA_SEARCH_OUTPUT_DIR";
+        const TARGET: &str = "full_depth_settlement_executable_pnl";
+        const LATER_REPORT: &str = "later evaluator report must not run";
+
+        if let Some(output_dir) = std::env::var_os(OUTPUT_DIR_ENV) {
+            let result = write_alpha_search_artifacts_with_runtime_feedback(
+                std::path::Path::new(&output_dir),
+                TARGET,
+                &[],
+                &[],
+                &AutoFactorOptions::default(),
+                None,
+                None,
+                None,
+            );
+            report_alpha_search_artifact_write(TARGET, result);
+            println!("{LATER_REPORT}");
+            return;
+        }
+
+        for retired in [
+            "formula-mcts-checkpoint.json",
+            "mcts-state.json",
+            "mcts-expansion-plan.json",
+        ] {
+            let temp = tempfile::tempdir().expect("create output root");
+            let output_dir = temp.path().join(TARGET);
+            fs::create_dir_all(&output_dir).expect("create stale output directory");
+            let stale_path = output_dir.join(retired);
+            let legacy = b"{\"version\":\"unknown_legacy_v999\"}";
+            fs::write(&stale_path, legacy).expect("write stale search artifact");
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::alpha_search_stale_output_directory_exits_2",
+                    "--nocapture",
+                ])
+                .env(OUTPUT_DIR_ENV, temp.path())
+                .output()
+                .expect("run evaluator artifact error path in a subprocess");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{retired}: {stderr}");
+            assert!(stderr.contains("alpha search artifact write failed"));
+            assert!(stderr.contains("retired Alpha Search state"));
+            assert!(stderr.contains(retired));
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(LATER_REPORT));
+            assert_eq!(fs::read(&stale_path).unwrap(), legacy);
+            assert!(!output_dir.join("node-metrics.json").exists());
+        }
     }
 
     #[test]
@@ -1518,6 +1576,26 @@ fn reject_retired_search_inputs(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn report_alpha_search_artifact_write(
+    target_name: &str,
+    write_result: Result<AlphaSearchArtifactSummary, AlphaSearchArtifactError>,
+) {
+    match write_result {
+        Ok(summary) => eprintln!(
+            "alpha search artifacts written target={} candidates={} rejected={} best={} dir={}",
+            summary.target,
+            summary.candidate_count,
+            summary.rejected_count,
+            summary.best_candidate.as_deref().unwrap_or("<none>"),
+            summary.output_dir
+        ),
+        Err(err) => {
+            eprintln!("alpha search artifact write failed for {target_name}: {err}");
+            std::process::exit(2);
+        }
+    }
 }
 
 fn read_llm_prior(path: &str) -> LlmPriorSpec {
@@ -2470,20 +2548,7 @@ async fn main() {
                         )),
                     };
                     if let Some(write_result) = write_result {
-                        match write_result {
-                            Ok(summary) => eprintln!(
-                                "alpha search artifacts written target={} candidates={} rejected={} best={} dir={}",
-                                summary.target,
-                                summary.candidate_count,
-                                summary.rejected_count,
-                                summary.best_candidate.as_deref().unwrap_or("<none>"),
-                                summary.output_dir
-                            ),
-                            Err(err) => eprintln!(
-                                "alpha search artifact write failed for {}: {err}",
-                                target_name
-                            ),
-                        }
+                        report_alpha_search_artifact_write(target_name, write_result);
                     }
                 }
             }
