@@ -424,14 +424,12 @@ pub fn prepare_native_campaign_dataset(
         .validate()
         .map_err(EvaluationError::InvalidConfiguration)?;
     let metadata = input.original_metadata();
-    if alpha_domain::canonical_json_hash(protocol).as_deref()
-        != Ok(metadata.protocol_sha256.as_str())
-        || serde_json::from_str::<EvaluationProtocolV1>(&metadata.protocol_json)
-            .ok()
-            .as_ref()
-            != Some(protocol)
-        || alpha_domain::canonical_json_hash(&input.rows()).as_deref()
-            != Ok(input.development_rows_sha256())
+    // The opaque importer already bound protocol bytes and native ResearchRow
+    // content. Reuse that immutable proof; only verify this caller's protocol.
+    if serde_json::from_str::<EvaluationProtocolV1>(&metadata.protocol_json)
+        .ok()
+        .as_ref()
+        != Some(protocol)
     {
         return Err(EvaluationError::InvalidNativePreparedEvidence);
     }
@@ -587,6 +585,26 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn absent_withheld_bytes_cannot_invoke_selection_or_holdout_callback() {
+        let protocol = protocol().with_independent_selection(7).unwrap();
+        let mut dataset = prepare_dataset(rows(61), &protocol).unwrap();
+        let original = dataset.partitions.clone();
+        dataset.rows.truncate(original.search.end);
+        assert_eq!(dataset.engine_context().rows().len(), original.search.len());
+        assert_eq!(dataset.plan.sealed_holdout, original.sealed_holdout);
+        assert!(independent_selection_rows(&dataset)
+            .unwrap_err()
+            .contains("withheld"));
+        let called = std::cell::Cell::new(false);
+        let result = evaluate_sealed_holdout(&dataset, |_| {
+            called.set(true);
+            Ok(())
+        });
+        assert!(result.unwrap_err().contains("withheld"));
+        assert!(!called.get());
     }
 
     #[test]

@@ -946,6 +946,13 @@ impl PreparedCexInputs {
         })
     }
 
+    pub(crate) fn native_metadata(&self) -> anyhow::Result<PreparedCexInputMetadata> {
+        let mut metadata = self.metadata()?;
+        // The importer staging file is not an allowed worker transport. Preserve
+        // every original content, row, clock and provenance fact independently.
+        metadata.feature_manifest.artifact_path = std::path::PathBuf::new();
+        Ok(metadata)
+    }
     /// The preparation controller must first authenticate the enclosing receipt
     /// against its independently retained digest and source/input bindings.
     pub(crate) fn restore_metadata(
@@ -978,6 +985,13 @@ impl PreparedCexInputs {
         })
     }
 
+    #[cfg(feature = "scientific")]
+    pub(crate) fn materialization_bytes(&self) -> &[u8] {
+        &self.materialization_bytes
+    }
+    pub(crate) fn feature_manifest(&self) -> &FeatureDatasetManifest {
+        &self.feature_manifest
+    }
     pub(crate) fn materialization(&self) -> &crate::mission_runner::Materialization {
         &self.materialization
     }
