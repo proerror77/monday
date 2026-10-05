@@ -3368,12 +3368,15 @@ dependencies = [
 name = "hft-research-ml"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "burn",
  "burn-ndarray",
  "burn-store",
  "clap",
  "hex",
+ "hft-cex-research-input",
  "hft-research-manifest",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "sha2",
