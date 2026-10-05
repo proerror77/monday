@@ -1254,14 +1254,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .context("platform Campaign budget preparation task failed")?
                 }
                 MissionDispatchCommand::ExportPlatform(args) => {
-                    tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::export(args))
-                        .await
-                        .context("native platform signed export task failed")?
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_admission::export(args)
+                    })
+                    .await
+                    .context("native platform signed export task failed")?
                 }
                 MissionDispatchCommand::ExportPlatformRevocations(args) => {
-                    tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::export_revocations(args))
-                        .await
-                        .context("native platform revocation export task failed")?
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_admission::export_revocations(args)
+                    })
+                    .await
+                    .context("native platform revocation export task failed")?
                 }
                 MissionDispatchCommand::DescribeStudy(args) => {
                     mission_dispatch::sequence_admission::describe(args)
