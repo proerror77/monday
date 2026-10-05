@@ -485,6 +485,7 @@ pub enum StrategyType {
     MarketMaking,
     Formula,
     FrozenModel,
+    ProbabilityReversal,
     Onnx,
     Imbalance,
     LobFlowGrid,
@@ -499,6 +500,11 @@ pub struct FormulaExecutionContract {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StrategyParams {
+    ProbabilityReversal {
+        spec: Box<hft_research_manifest::prediction_probability::ProbabilityReversalSpecV1>,
+        max_order_notional: Decimal,
+        max_order_quantity: Decimal,
+    },
     Trend {
         ema_fast: u32,
         ema_slow: u32,

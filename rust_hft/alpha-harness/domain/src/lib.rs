@@ -5327,6 +5327,9 @@ impl CexSealedHoldoutClaimV1 {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CandidateArtifact {
+    ProbabilityReversal(
+        Box<hft_research_manifest::prediction_probability::ProbabilityReversalSpecV1>,
+    ),
     Formula(FactorAst),
     OnnxModel(RuntimeOnnxModel),
     CexFourStage(CexFourStageStrategyCandidateV1),
@@ -5343,6 +5346,11 @@ impl CandidateArtifact {
         &self,
     ) -> Result<StrategyBundleArtifact, DomainError> {
         match self {
+            Self::ProbabilityReversal(spec) => {
+                spec.validate()
+                    .map_err(|_| DomainError::InvalidStrategyBundle)?;
+                Ok(StrategyBundleArtifact::ProbabilityReversal { spec: spec.clone() })
+            }
             Self::Formula(ast) => {
                 if validate_live_formula(ast)?.history_rows > 1 {
                     return Err(DomainError::ResearchOnlyArtifact);
@@ -5379,6 +5387,9 @@ impl CandidateArtifact {
 /// Runtime-loadable artifact schema produced by governed promotion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StrategyBundleArtifact {
+    ProbabilityReversal {
+        spec: Box<hft_research_manifest::prediction_probability::ProbabilityReversalSpecV1>,
+    },
     FrozenModel {
         strategy: Box<frozen_model::FrozenModelStrategyV1>,
     },
@@ -5396,6 +5407,9 @@ pub enum StrategyBundleArtifact {
 impl StrategyBundleArtifact {
     pub fn validate(&self) -> Result<(), DomainError> {
         match self {
+            Self::ProbabilityReversal { spec } => spec
+                .validate()
+                .map_err(|_| DomainError::InvalidStrategyBundle),
             Self::Formula { ast } => validate_live_formula(ast)
                 .map_err(DomainError::from)
                 .and_then(|capability| {
@@ -5413,6 +5427,9 @@ impl StrategyBundleArtifact {
 
     fn validate_for_readback(&self) -> Result<(), DomainError> {
         match self {
+            Self::ProbabilityReversal { spec } => spec
+                .validate()
+                .map_err(|_| DomainError::InvalidStrategyBundle),
             Self::Formula { ast } => ast
                 .validate()
                 .map_err(|_| DomainError::InvalidStrategyBundle),
