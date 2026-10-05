@@ -62,6 +62,8 @@ requires actual GET bytes. `cex-campaign.json` binds the original request,
 collection, source, trials and decoded archive entries. `receipt.json` binds the
 same artifacts to the admitted Task, Attempt and fence. Successful transport
 keeps the scientific status `insufficient_evidence`.
+The worker uses the receiver's 512 MiB archive byte limits. It rejects input
+blocks that cannot fit before fitting, then checks actual expanded entries.
 
 Platform CexCampaign admission, its transferred native budget, the platform
 lease/attempt fence and terminal settlement are separate enforced boundaries.

@@ -13,6 +13,8 @@ mod transport_fixture;
 #[cfg(test)]
 pub(super) use transport_fixture::assert_publication;
 
+const MAX_PLATFORM_ARCHIVE_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactConfig {
@@ -55,6 +57,21 @@ impl BoundOutput {
         identity: &Path,
     ) -> anyhow::Result<Self> {
         validate_context(&context, loaded, native)?;
+        let manifest = native.prepared().manifest();
+        let archived_blocks = manifest
+            .features
+            .manifest
+            .blocks
+            .iter()
+            .chain(&manifest.future_marks.manifest.blocks)
+            .chain(&manifest.replay.manifest.blocks)
+            .try_fold(0_u64, |sum, block| {
+                sum.checked_add(block.bytes)
+                    .context("native archive block byte overflow")
+            })?;
+        if archived_blocks >= MAX_PLATFORM_ARCHIVE_EXPANDED_BYTES {
+            bail!("native input blocks exceed the platform result archive budget");
+        }
         let expected = context
             .spec
             .worker_configuration
@@ -235,8 +252,15 @@ pub(super) fn validate_context(
 }
 
 fn actual_archive_entries(path: &Path) -> anyhow::Result<Vec<ArchiveEntry>> {
+    actual_archive_entries_with_limit(path, MAX_PLATFORM_ARCHIVE_EXPANDED_BYTES)
+}
+
+fn actual_archive_entries_with_limit(
+    path: &Path,
+    expanded_limit: u64,
+) -> anyhow::Result<Vec<ArchiveEntry>> {
     let file = File::open(path)?;
-    if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_RESULT_BUNDLE_BYTES {
+    if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_PLATFORM_ARCHIVE_EXPANDED_BYTES {
         bail!("native result archive exceeds its bound");
     }
     let mut archive = ZipArchive::new(file)?;
@@ -267,7 +291,7 @@ fn actual_archive_entries(path: &Path) -> anyhow::Result<Vec<ArchiveEntry>> {
         total = total
             .checked_add(entry.size())
             .context("native archive size overflow")?;
-        if total > 1024 * 1024 * 1024 {
+        if total > expanded_limit {
             bail!("native archive expanded bytes exceed bound");
         }
         let mut hash = Sha256::new();
@@ -476,6 +500,7 @@ mod tests {
         make(false, false)?;
         let entries = actual_archive_entries(&path)?;
         assert_eq!(entries.len(), 4);
+        assert!(actual_archive_entries_with_limit(&path, entries[0].bytes * 3).is_err());
         assert!(entries.iter().all(|entry| entry.sha256
             == hft_cex_research_input::sha256(b"{\"source\":\"actual-archive-fixture\"}")
             && entry.bytes == b"{\"source\":\"actual-archive-fixture\"}".len() as u64));
