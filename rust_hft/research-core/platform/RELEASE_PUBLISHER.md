@@ -5,6 +5,11 @@ Research services only verify releases using operator public trust. They do not
 load the issuer's private key. Issuance and import do not issue scientific grants,
 charge budgets, submit tasks, enable providers, open holdout or activate runtime.
 
+The `release-verification` feature exposes only existing public trust and opaque
+`VerifiedBuildRelease` verification. It adds no issuer, PG or HTTP dependencies.
+Signature verification does not prove independent source/program or OCI readback;
+the actual producer still consumes those checks through its own Gate.
+
 The native issuer accepts selectors, never claimed artifact hashes. It reads the
 three authenticated GitHub Actions checks for exact current-main source. It
 binds the original software workflow/run/attempt/job and the current ACR
