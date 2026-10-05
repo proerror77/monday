@@ -76,8 +76,8 @@ async fn signed_paper_and_shadow_consume_exact_fixed_probability_config() {
             now,
         )
         .unwrap();
-        let bundle=scientific.to_runtime_bundle().unwrap();
-        assert_eq!(bundle.source_bundle_hash,scientific.bundle_hash);
+        let bundle = scientific.to_runtime_bundle().unwrap();
+        assert_eq!(bundle.source_bundle_hash, scientific.bundle_hash);
         let envelope = DeploymentEnvelope {
             deployment_id: "paper-probability".into(),
             asset_revision_id: bundle.candidate_id.clone(),
@@ -132,7 +132,8 @@ async fn signed_paper_and_shadow_consume_exact_fixed_probability_config() {
         config.risk.max_orders_per_second = 100;
         config.risk.staleness_threshold_us = 10_000_000;
         let keys = BTreeMap::from([("fixture-signer".into(), key.verifying_key())]);
-        let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, root.path());
+        let mut adapter =
+            SystemConfigActivationAdapter::new(&mut config, bundle.clone(), root.path());
         let ledger = RuntimeNonceLedger::open(root.path().join("nonce.jsonl")).unwrap();
         let audit = RuntimeAuditLog::open(root.path().join("audit.jsonl")).unwrap();
         let intake = DeploymentIntake::new(&keys, &policy, false, ledger, audit, &mut adapter);
@@ -255,8 +256,11 @@ async fn signed_paper_and_shadow_consume_exact_fixed_probability_config() {
                 rejected_config.venues[0]
                     .symbol_catalog
                     .push(serde_json::from_value(serde_json::json!("999@POLYMARKET")).unwrap());
-                let mut adapter =
-                    SystemConfigActivationAdapter::new(&mut rejected_config, &bundle, root.path());
+                let mut adapter = SystemConfigActivationAdapter::new(
+                    &mut rejected_config,
+                    bundle.clone(),
+                    root.path(),
+                );
                 let ledger = RuntimeNonceLedger::open(root.path().join("nonce.jsonl")).unwrap();
                 let audit = RuntimeAuditLog::open(root.path().join("audit.jsonl")).unwrap();
                 let intake = DeploymentIntake::new(

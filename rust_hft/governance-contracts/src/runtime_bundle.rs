@@ -259,7 +259,9 @@ pub enum RuntimeArtifact {
 impl RuntimeArtifact {
     fn validate(&self) -> Result<(), RuntimeBundleError> {
         match self {
-            Self::ProbabilityReversal {spec}=>spec.validate().map_err(|_|RuntimeBundleError::Invalid),
+            Self::ProbabilityReversal { spec } => {
+                spec.validate().map_err(|_| RuntimeBundleError::Invalid)
+            }
             Self::Formula { ast } => require(
                 validate_live_formula(ast)
                     .map_err(|_| RuntimeBundleError::Invalid)?
