@@ -13,6 +13,34 @@ fn commit(s: &str) -> bool {
         && s.bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
+
+/// Read-only ledger facts for the independently governed native terminal reader.
+/// Deserializing these facts grants no authority. The reader authenticates this
+/// transport, verifies signatures, reads the provider and original scientific
+/// outputs, and constructs its own opaque terminal evidence.
+#[cfg(feature = "native-admission")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTerminalSnapshot {
+    pub schema: String,
+    pub tenant: String,
+    pub task: crate::orchestrator::Task,
+    pub run: Run,
+    pub native_admission: crate::admission::SignedNativeAdmission,
+    pub native_trust: crate::admission::NativeAdmissionTrust,
+    pub terminal_revision: i64,
+    pub terminal_event: TerminalLedgerEvent,
+    pub execution_event: Option<TerminalLedgerEvent>,
+    pub result: Option<crate::orchestrator::ResultReceipt>,
+}
+#[cfg(feature = "native-admission")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalLedgerEvent {
+    pub revision: i64,
+    pub event: String,
+    pub document: crate::orchestrator::Task,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Experiment {
