@@ -17,6 +17,7 @@ axum = { workspace = true, optional = true }
 rustix = { version = "0.38", features = ["fs"], optional = true }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 futures-util = { version = "0.3", optional = true }
+tempfile = { version = "3", optional = true }
 # PG only: the umbrella crate resolves unused MySQL/RSA and SQLite drivers.
 sqlx-core = { version = "=0.8.6", optional = true, default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json"] }
 sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false, features = ["json"] }
@@ -24,7 +25,7 @@ sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false,
 [features]
 default = []
 control = ["dep:tokio", "dep:reqwest", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:ed25519-dalek", "dep:rustix"]
-publisher = ["control", "dep:rustix", "dep:tokio-util", "tokio/fs", "reqwest/stream"]
+publisher = ["control", "dep:rustix", "dep:tokio-util", "dep:tempfile", "tokio/fs", "reqwest/stream"]
 gateway = ["control", "dep:rustix", "dep:tokio-util", "dep:futures-util", "tokio/fs", "reqwest/stream"]
 
 [[bin]]

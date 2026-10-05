@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
 };
 const MAX_OBJECT: u64 = 512 * 1024 * 1024;
@@ -472,23 +472,13 @@ fn measure(path: &Path, key: String) -> Result<Artifact> {
     })
 }
 
-struct Scratch(PathBuf);
+struct Scratch(tempfile::TempDir);
 impl Scratch {
     fn new() -> Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "monday-release-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        std::fs::create_dir(&path)?;
-        Ok(Self(path))
+        Ok(Self(tempfile::tempdir()?))
     }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+    fn join(&self, path: &str) -> std::path::PathBuf {
+        self.0.path().join(path)
     }
 }
 
@@ -710,7 +700,7 @@ pub async fn publish(
     );
     let check_ids = authenticate(root, request, policy)?;
     let scratch = Scratch::new()?;
-    let software = scratch.0.join("software");
+    let software = scratch.join("software");
     command(
         root,
         "bash",
@@ -789,7 +779,7 @@ pub async fn publish(
         "product not built"
     );
     // Measure the complete committed source archive, not a caller-owned tar/hash.
-    let source_path = scratch.0.join("source.tar");
+    let source_path = scratch.join("source.tar");
     command(
         root,
         "git",
@@ -1073,7 +1063,7 @@ pub fn plan(
     );
     authenticate(root, request, policy)?;
     let scratch = Scratch::new()?;
-    let software = scratch.0.join("software");
+    let software = scratch.join("software");
     command(
         root,
         "bash",
@@ -1109,7 +1099,7 @@ pub fn plan(
         .lines()
         .map(str::to_owned)
         .collect();
-    let archive = scratch.0.join("source.tar");
+    let archive = scratch.join("source.tar");
     command(
         root,
         "git",
