@@ -65,7 +65,7 @@ Runtime experiment configuration and ordinary Job manifests do not rebuild
 research binaries. Scripts/templates copied into the controller image remain
 image inputs; changes to that COPY boundary must update the scope mapping.
 
-Research release v5 binds an exact product set to source, compiler/native inputs,
+Research release v6 binds an exact product set to source, compiler/native inputs,
 producer run, attempt, job, owning lockfiles, and executable hashes. The catalog
 has three independently published images: CEX `research-runner`, Prediction
 `prediction-research-runner`, and CEX `campaign-cycle-controller`. A producer
@@ -77,8 +77,16 @@ Controller asset changes build only its four required executables. CEX and
 Prediction source changes select their owning products through the Cargo graph.
 Each image has its own authenticated publication baseline, so unpublished work
 survives later main commits and another product's successful publication. Old
-mixed runner markers do not prove publication of the split images. The v5
+mixed runner markers do not prove publication of the split images. The v6
 migration bootstraps each product until its own readback succeeds.
+
+The separate native issuer signs each Build only after authenticated CI,
+original software producer, immutable OCI programs and gateway bytes agree.
+Preflight binds operator policy and TLS to the selected publication before
+registry writes. Keys remain outside research services and the PG ledger.
+Signed proofs use `research/builds/{build}/releases/{oci}/{proof}/`; shared
+executable blobs keep their Build prefix. PG projection requires explicit
+import enablement and the dedicated importer role.
 
 Collector publication loads the successful Monorepo CI image. It checks the
 producer, platform, archive hash, image ID and source before promotion. The
