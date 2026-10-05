@@ -1016,7 +1016,11 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .bind(revoke_lease.fence)
         .fetch_one(&mut *permit)
         .await?;
-        let import = ledger.register_native_request_revocation(&due);
+        let mut during_upload = evidence.clone();
+        during_upload.reason_receipt_sha256 = hash('5');
+        during_upload.effective_ms = cap + 1_000;
+        let during_upload = witness(during_upload)?;
+        let import = ledger.register_native_request_revocation(&during_upload);
         tokio::pin!(import);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut import)
@@ -1025,16 +1029,49 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         );
         permit.rollback().await?;
         import.await?;
-        assert!(sqlx_core::query_scalar::query_scalar::<_, String>(
-            "SELECT research.artifact_write_permit($1,$2,$3,$4)"
+        // Reverse ordering: an upload waiting on import must see its new cap.
+        // Pause the validated import transaction at its pre-commit boundary.
+        due.evidence().matches_admission(&native.evidence)?;
+        let mut import_tx = pool.begin().await?;
+        sqlx_core::query::query("SET LOCAL ROLE monday_revocation_importer")
+            .execute(&mut *import_tx)
+            .await?;
+        sqlx_core::query::query(
+            "SELECT request_sha256 FROM research.admissions WHERE request_sha256=$1 FOR UPDATE",
+        )
+        .bind(&revoke_task)
+        .fetch_one(&mut *import_tx)
+        .await?;
+        sqlx_core::query::query("INSERT INTO research.native_request_revocations(evidence_sha256,request_sha256,tenant,operation_sha256,family_id,root_grant_sha256,reason_receipt_sha256,effective_ms,issued_ms,trust_sha256,document,trust_document) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
+            .bind(due.evidence().id()?).bind(&revoke_task).bind(&due.evidence().tenant).bind(&due.evidence().operation_sha256)
+            .bind(&due.evidence().family_id).bind(&due.evidence().root_grant_sha256).bind(&due.evidence().reason_receipt_sha256)
+            .bind(due.evidence().effective_ms).bind(due.evidence().issued_ms).bind(due.trust_sha256())
+            .bind(serde_json::to_value(due.signed())?).bind(serde_json::to_value(&native_trust)?)
+            .execute(&mut *import_tx).await?;
+        let upload = sqlx_core::query_scalar::query_scalar::<_, String>(
+            "SELECT research.artifact_write_permit($1,$2,$3,$4)",
         )
         .bind("fixture")
         .bind(&revoke_task)
         .bind(revoke_lease.attempt as i32)
         .bind(revoke_lease.fence)
-        .fetch_one(&pool)
-        .await
-        .is_err());
+        .fetch_one(&pool);
+        tokio::pin!(upload);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut upload)
+                .await
+                .is_err()
+        );
+        import_tx.commit().await?;
+        assert!(upload
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("native artifact admission absent, revoked or expired"));
+        assert_eq!(
+            ledger.register_native_request_revocation(&due).await?,
+            due.evidence().id()?
+        );
     }
     #[cfg(not(feature = "gateway"))]
     ledger.register_native_request_revocation(&due).await?;
