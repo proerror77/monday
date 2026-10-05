@@ -8,7 +8,7 @@ use data::binance_market_tape::{
     LobContinuitySummary, LobContinuitySummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT,
     LEGACY_LOB_TAPE_SCHEMA, MARKET_TAPE_SCHEMA_V2,
 };
-use engine::binance_md::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
+use hft_binance_depth::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
 use rand::random;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
