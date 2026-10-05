@@ -1,17 +1,16 @@
-use super::network::*;
-use super::training::input_tensor;
-use crate::{lock_ndarray_backend, CpuBackend};
-use hft_cex_research_input::market_encoder::UnlabeledSequenceExample;
-use hft_research_manifest::market_encoder::*;
-use hft_research_manifest::portable_market::{FrozenMarketEncoderV1, FrozenMarketTaskModelV1};
-use hft_research_manifest::portable_network::FrozenLinearV1;
+//! Frozen market encoder, task head and reconstruction receipts. No training backend.
+use crate::{
+    market_encoder::*,
+    portable_network::{FrozenLinearV1, FrozenNetworkV1},
+};
 use serde::{Deserialize, Serialize};
-
-pub(super) const MASK_POLICY: &str = "causal-whole-frame-3s-30pct-prefix6s-v1";
+pub const ENCODER_PORTABLE_SCHEMA: &str = "monday.market_encoder_portable.v1";
+pub const TASK_PORTABLE_SCHEMA: &str = "monday.market_task_portable.v1";
+pub const MASK_POLICY: &str = "causal-whole-frame-3s-30pct-prefix6s-v1";
 pub type MarketArtifactBytes = (Vec<u8>, Vec<u8>);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct EncoderManifest {
+pub struct EncoderManifest {
     pub schema_version: String,
     pub request: MarketFitRequestV1,
     pub mask_policy: String,
@@ -21,7 +20,7 @@ pub(super) struct EncoderManifest {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ReconstructionAuditManifest {
+pub struct ReconstructionAuditManifest {
     pub schema_version: String,
     pub encoder_checkpoint_sha256: String,
     pub mask_policy: String,
@@ -33,14 +32,14 @@ pub(super) struct ReconstructionAuditManifest {
     pub diagnostic_elapsed_micros: Option<u64>,
 }
 
-pub(super) const RECONSTRUCTION_AUDIT_SCHEMA: &str = "monday.market_reconstruction_audit.v2";
-pub(super) const DIAGNOSTIC_SAMPLE_LIMIT: usize = 256;
-pub(super) const DIAGNOSTIC_SAMPLING: &str = "uniform-eligible-rank-endpoints-max256-v1";
-pub(super) const DIAGNOSTIC_GROUPING: &str = "sol-lob-24-price11-depth10-trade3-v1";
+pub const RECONSTRUCTION_AUDIT_SCHEMA: &str = "monday.market_reconstruction_audit.v2";
+pub const DIAGNOSTIC_SAMPLE_LIMIT: usize = 256;
+pub const DIAGNOSTIC_SAMPLING: &str = "uniform-eligible-rank-endpoints-max256-v1";
+pub const DIAGNOSTIC_GROUPING: &str = "sol-lob-24-price11-depth10-trade3-v1";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ReconstructionGroupMse {
+pub struct ReconstructionGroupMse {
     pub group: String,
     pub channels: u64,
     pub masked_scalar_count: u64,
@@ -49,7 +48,7 @@ pub(super) struct ReconstructionGroupMse {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ReconstructionDiagnostics {
+pub struct ReconstructionDiagnostics {
     pub schema_version: String,
     pub sampling_policy: String,
     pub grouping_policy: String,
@@ -70,10 +69,10 @@ pub(super) struct ReconstructionDiagnostics {
 }
 /// Only the verified registry is classified. Generic ML fixtures with other
 /// channels never acquire misleading SOL price/depth/trade labels.
-pub(super) fn reconstruction_channel_groups(
-    input: &hft_research_manifest::sequence::SequenceInputSpecV1,
+pub fn reconstruction_channel_groups(
+    input: &crate::sequence::SequenceInputSpecV1,
 ) -> Option<[Vec<usize>; 3]> {
-    if *input != hft_research_manifest::sequence::SequenceInputSpecV1::sol_lob() {
+    if *input != crate::sequence::SequenceInputSpecV1::sol_lob() {
         return None;
     }
     let mut groups: [Vec<usize>; 3] = Default::default();
@@ -91,7 +90,7 @@ pub(super) fn reconstruction_channel_groups(
     }
     (groups.iter().map(Vec::len).collect::<Vec<_>>() == [11, 10, 3]).then_some(groups)
 }
-pub(super) fn diagnostic_ordinals(examples: u64) -> Vec<u64> {
+pub fn diagnostic_ordinals(examples: u64) -> Vec<u64> {
     let count = examples.min(DIAGNOSTIC_SAMPLE_LIMIT as u64);
     if count < 2 {
         return (0..count).collect();
@@ -101,7 +100,7 @@ pub(super) fn diagnostic_ordinals(examples: u64) -> Vec<u64> {
         .collect()
 }
 impl ReconstructionDiagnostics {
-    pub(super) fn validate(
+    pub fn validate(
         &self,
         request: &MarketFitRequestV1,
         scaling: &MarketFeatureScalingV1,
@@ -118,7 +117,7 @@ impl ReconstructionDiagnostics {
             || self.eligible_training_anchors != scaling.examples
             || self.scanned_training_anchors != scaling.examples
             || self.sampled_ordinals != expected
-            || !hft_research_manifest::sequence::valid_sha256(&self.sampled_anchor_keys_sha256)
+            || !crate::sequence::valid_sha256(&self.sampled_anchor_keys_sha256)
             || self.additional_feature_passes != 1
             || self.forward_batch_size != request.batch_size
             || self.cpu_forward_batches != count.div_ceil(request.batch_size as u64)
@@ -153,43 +152,27 @@ impl ReconstructionDiagnostics {
         Ok(())
     }
 }
-pub(super) struct ReconstructionAudit {
+pub struct ReconstructionAudit {
     pub metadata: ReconstructionAuditManifest,
-    pub weights: Vec<u8>,
+    weights: Vec<u8>,
 }
 /// Immutable encoder only, with no predictive or trading interface.
-pub struct MarketEncoderCheckpoint {
-    pub(super) model: Encoder<CpuBackend>,
-    pub(super) manifest: EncoderManifest,
-    pub(super) weights: Vec<u8>,
-    pub(super) reconstruction: Option<ReconstructionAudit>,
+pub struct FrozenMarketEncoderV1 {
+    model: FrozenNetworkV1,
+    manifest: EncoderManifest,
+    weights: Vec<u8>,
+    reconstruction: Option<ReconstructionAudit>,
 }
-impl MarketEncoderCheckpoint {
+impl FrozenMarketEncoderV1 {
+    pub fn network(&self) -> &FrozenNetworkV1 {
+        &self.model
+    }
     /// Last causal hidden state; no task head or decision policy is applied.
     pub fn encode(&self, inputs: &[f32]) -> Result<Vec<f32>, String> {
-        let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
-        let example = UnlabeledSequenceExample {
-            series_id: 0,
-            observed_at_ms: 0,
-            inputs: inputs.to_vec(),
-        };
-        let x = input_tensor::<CpuBackend>(
-            &[example],
-            &self.manifest.request,
-            &self.manifest.scaling,
-            None,
-        )?;
-        let hidden = self.model.forward(x);
-        let [batch, channels, length] = hidden.dims();
-        let values = hidden
-            .slice([0..batch, 0..channels, length - 1..length])
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|e| e.to_string())?;
-        if values.iter().any(|x| !x.is_finite()) {
-            return Err("nonfinite market representation".into());
-        }
-        Ok(values)
+        self.model.predict(
+            &normalized_inputs(inputs, &self.manifest.request, &self.manifest.scaling)?,
+            self.manifest.request.spec.input.context_rows,
+        )
     }
     /// Auxiliary reconstruction head is separate from the reusable encoder.
     pub fn reconstruction_bundle(&self) -> Result<Option<MarketArtifactBytes>, String> {
@@ -276,7 +259,6 @@ impl MarketEncoderCheckpoint {
         digest(&self.manifest)
     }
     pub fn bundle(&self) -> Result<(Vec<u8>, Vec<u8>), String> {
-        let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
         let weights = self.weights.clone();
         if bytes_digest(&weights) != self.manifest.weights_sha256 {
             return Err("encoder serialization changed".into());
@@ -286,29 +268,34 @@ impl MarketEncoderCheckpoint {
             weights,
         ))
     }
-    pub fn portable(&self) -> Result<FrozenMarketEncoderV1, String> {
-        let manifest = serde_json::to_vec(&self.manifest).map_err(|e| e.to_string())?;
-        let mut frozen = FrozenMarketEncoderV1::restore(
-            &manifest,
-            &bytes_digest(&manifest),
-            self.weights.clone(),
-        )?;
-        if let Some(audit) = &self.reconstruction {
-            let metadata = serde_json::to_vec(&audit.metadata).map_err(|e| e.to_string())?;
-            frozen.attach_reconstruction_audit(
-                &metadata,
-                &bytes_digest(&metadata),
-                audit.weights.clone(),
-            )?;
-        }
-        Ok(frozen)
-    }
     pub fn restore(manifest: &[u8], expected: &str, weights: Vec<u8>) -> Result<Self, String> {
-        let frozen = FrozenMarketEncoderV1::restore(manifest, expected, weights.clone())?;
-        let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
+        verify_bytes(manifest, expected, &weights)?;
+        let meta: EncoderManifest = serde_json::from_slice(manifest).map_err(|e| e.to_string())?;
+        meta.request.validate()?;
+        meta.scaling.validate(&meta.request)?;
+        meta.diagnostics.validate(&meta.request)?;
+        if meta.schema_version != ENCODER_PORTABLE_SCHEMA
+            || meta.mask_policy != MASK_POLICY
+            || bytes_digest(&weights) != meta.weights_sha256
+        {
+            return Err("encoder manifest or weight binding differs".into());
+        }
+        let model: FrozenNetworkV1 = serde_json::from_slice(&weights).map_err(|e| e.to_string())?;
+        model.validate(
+            meta.request.spec.input.ordered_channels.len() + 1,
+            meta.request.spec.input.context_rows,
+            meta.request.spec.hidden_channels,
+            None,
+        )?;
+        if !matches!(model, FrozenNetworkV1::Tcn { .. })
+            || model.parameter_digest(b"monday.market-parameter-values.v1")
+                != meta.diagnostics.final_encoder_values_sha256
+        {
+            return Err("encoder values differ from receipt".into());
+        }
         Ok(Self {
-            model: Encoder::from_portable(frozen.network())?,
-            manifest: serde_json::from_slice(manifest).map_err(|e| e.to_string())?,
+            model,
+            manifest: meta,
             weights,
             reconstruction: None,
         })
@@ -316,7 +303,7 @@ impl MarketEncoderCheckpoint {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct TaskManifest {
+pub struct TaskManifest {
     pub schema_version: String,
     pub request: MarketAdaptationRequestV1,
     pub scaling: MarketFeatureScalingV1,
@@ -326,12 +313,15 @@ pub(super) struct TaskManifest {
     pub weights_sha256: String,
     pub parameter_values_sha256: String,
 }
-pub struct MarketTaskModel {
-    pub(super) model: TaskNetwork<CpuBackend>,
-    pub(super) manifest: TaskManifest,
-    pub(super) weights: Vec<u8>,
+pub struct FrozenMarketTaskModelV1 {
+    model: FrozenNetworkV1,
+    manifest: TaskManifest,
+    weights: Vec<u8>,
 }
-impl MarketTaskModel {
+impl FrozenMarketTaskModelV1 {
+    pub fn network(&self) -> &FrozenNetworkV1 {
+        &self.model
+    }
     pub fn request(&self) -> &MarketAdaptationRequestV1 {
         &self.manifest.request
     }
@@ -348,24 +338,12 @@ impl MarketTaskModel {
         &self.manifest.parameter_values_sha256
     }
     pub fn predict(&self, inputs: &[f32]) -> Result<f32, String> {
-        let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
-        let example = UnlabeledSequenceExample {
-            series_id: 0,
-            observed_at_ms: 0,
-            inputs: inputs.to_vec(),
-        };
-        let x = input_tensor::<CpuBackend>(
-            &[example],
-            &self.manifest.request.fit,
-            &self.manifest.scaling,
-            None,
-        )?;
-        let y = self
-            .model
-            .forward(x, false)
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|e| e.to_string())?[0];
+        let normalized =
+            normalized_inputs(inputs, &self.manifest.request.fit, &self.manifest.scaling)?;
+        let y = self.model.predict(
+            &normalized,
+            self.manifest.request.fit.spec.input.context_rows,
+        )?[0];
         let raw = (f64::from(y) * self.manifest.target_scale + self.manifest.target_mean) as f32;
         if !raw.is_finite() {
             return Err("nonfinite raw market prediction".into());
@@ -373,7 +351,6 @@ impl MarketTaskModel {
         Ok(raw)
     }
     pub fn bundle(&self) -> Result<(Vec<u8>, Vec<u8>), String> {
-        let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
         let weights = self.weights.clone();
         if bytes_digest(&weights) != self.manifest.weights_sha256 {
             return Err("market task serialization changed".into());
@@ -384,43 +361,79 @@ impl MarketTaskModel {
         ))
     }
     /// Inherited models require the verified parent, not only its claimed hash.
-    pub fn portable(
-        &self,
-        parent: Option<&MarketEncoderCheckpoint>,
-    ) -> Result<FrozenMarketTaskModelV1, String> {
-        let manifest = serde_json::to_vec(&self.manifest).map_err(|e| e.to_string())?;
-        let parent = parent.map(MarketEncoderCheckpoint::portable).transpose()?;
-        FrozenMarketTaskModelV1::restore(
-            &manifest,
-            &bytes_digest(&manifest),
-            self.weights.clone(),
-            parent.as_ref(),
-        )
-    }
     pub fn restore(
         manifest: &[u8],
         expected: &str,
         weights: Vec<u8>,
-        parent: Option<&MarketEncoderCheckpoint>,
+        parent: Option<&FrozenMarketEncoderV1>,
     ) -> Result<Self, String> {
-        let frozen_parent = parent.map(MarketEncoderCheckpoint::portable).transpose()?;
-        let frozen = FrozenMarketTaskModelV1::restore(
-            manifest,
-            expected,
-            weights.clone(),
-            frozen_parent.as_ref(),
+        verify_bytes(manifest, expected, &weights)?;
+        let meta: TaskManifest = serde_json::from_slice(manifest).map_err(|e| e.to_string())?;
+        meta.request.validate()?;
+        meta.scaling.validate(&meta.request.fit)?;
+        meta.diagnostics.validate(&meta.request.fit)?;
+        check_parent(&meta.request, parent)?;
+        if let Some(p) = parent {
+            if meta.scaling != p.manifest.scaling
+                || meta.diagnostics.initial_encoder_values_sha256
+                    != p.manifest.diagnostics.final_encoder_values_sha256
+            {
+                return Err("task did not inherit its declared parent scaling and values".into());
+            }
+        }
+        if meta.schema_version != TASK_PORTABLE_SCHEMA
+            || bytes_digest(&weights) != meta.weights_sha256
+            || !meta.target_mean.is_finite()
+            || !meta.target_scale.is_finite()
+            || meta.target_scale <= 0.0
+            || (meta.request.mode == AdaptationModeV1::LinearProbe
+                && meta.diagnostics.initial_encoder_values_sha256
+                    != meta.diagnostics.final_encoder_values_sha256)
+        {
+            return Err("invalid market task artifact or frozen encoder".into());
+        }
+        if meta.request.mode == AdaptationModeV1::FullFineTune
+            && meta.diagnostics.initial_encoder_values_sha256
+                == meta.diagnostics.final_encoder_values_sha256
+        {
+            return Err("fine-tuning artifact did not update encoder values".into());
+        }
+        let model: FrozenNetworkV1 = serde_json::from_slice(&weights).map_err(|e| e.to_string())?;
+        model.validate(
+            meta.request.fit.spec.input.ordered_channels.len() + 1,
+            meta.request.fit.spec.input.context_rows,
+            meta.request.fit.spec.hidden_channels,
+            Some(1),
         )?;
-        let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
+        if !matches!(model, FrozenNetworkV1::Tcn { .. })
+            || model.parameter_digest(b"monday.market-parameter-values.v1")
+                != meta.parameter_values_sha256
+            || model
+                .encoder()?
+                .parameter_digest(b"monday.market-parameter-values.v1")
+                != meta.diagnostics.final_encoder_values_sha256
+        {
+            return Err("task values differ from receipt".into());
+        }
         Ok(Self {
-            model: TaskNetwork::from_portable(frozen.network())?,
-            manifest: serde_json::from_slice(manifest).map_err(|e| e.to_string())?,
+            model,
+            manifest: meta,
             weights,
         })
     }
 }
-pub(super) fn check_parent(
+fn verify_bytes(manifest: &[u8], expected: &str, weights: &[u8]) -> Result<(), String> {
+    if manifest.len() > 2 * 1024 * 1024
+        || weights.len() > 16 * 1024 * 1024
+        || bytes_digest(manifest) != expected
+    {
+        return Err("market bundle size or external manifest hash mismatch".into());
+    }
+    Ok(())
+}
+pub fn check_parent(
     request: &MarketAdaptationRequestV1,
-    parent: Option<&MarketEncoderCheckpoint>,
+    parent: Option<&FrozenMarketEncoderV1>,
 ) -> Result<(), String> {
     match (request.mode, parent) {
         (AdaptationModeV1::Scratch, None) => Ok(()),
@@ -447,4 +460,30 @@ pub(super) fn check_parent(
             Ok(())
         }
     }
+}
+
+fn normalized_inputs(
+    inputs: &[f32],
+    request: &MarketFitRequestV1,
+    scaling: &MarketFeatureScalingV1,
+) -> Result<Vec<f32>, String> {
+    let channels = request.spec.input.ordered_channels.len();
+    let context = request.spec.input.context_rows;
+    if inputs.len() != channels * context {
+        return Err("market input shape differs".into());
+    }
+    let mut values = Vec::with_capacity((channels + 1) * context);
+    for channel in 0..channels {
+        for time in 0..context {
+            let raw = inputs[time * channels + channel];
+            let value =
+                ((f64::from(raw) - scaling.means[channel]) / scaling.scales[channel]) as f32;
+            if !raw.is_finite() || !value.is_finite() {
+                return Err("nonfinite normalized market input".into());
+            }
+            values.push(value);
+        }
+    }
+    values.extend(std::iter::repeat_n(0.0, context));
+    Ok(values)
 }

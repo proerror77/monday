@@ -457,6 +457,7 @@ pub(super) fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
     )
 }
 
+#[cfg(any(feature = "scientific", test))]
 pub(crate) fn verify_worker_grant(
     signed: &SignedCampaignFinalEvaluationGrantV1,
     keys: &Path,
@@ -468,6 +469,7 @@ pub(crate) fn verify_worker_grant(
     )?)
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn source_execution_binding(
     source: &CampaignRequest,
     materialization: &Path,
@@ -492,6 +494,7 @@ pub(crate) fn source_execution_binding(
     .execution)
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn validate_worker_dataset_binding(
     request: &FinalRequest,
     materialization: &Path,

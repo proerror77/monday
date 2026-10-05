@@ -365,10 +365,10 @@ fn market_worker_archive_bound_and_inventory_follow_stage_plan() {
 /// Controlled sparse training windows exercise the actual CPU trainer, artifacts
 /// and restore path. These bytes are test inputs and never stand in for real data.
 fn training_fixture(root: &Path) -> MarketRequest {
-    use hft_research_manifest::{market_encoder::*, sequence::SequenceShardV1};
-    use hft_research_ml::market_encoder::data::{
+    use hft_cex_research_input::market_encoder::{
         derive_market_training_anchors, MarketFeatureReader,
     };
+    use hft_research_manifest::{market_encoder::*, sequence::SequenceShardV1};
     let mut request = request();
     request.plan.training.pretraining_updates = 2;
     request.plan.training.task_updates = 2;
@@ -867,10 +867,10 @@ fn market_worker_real_stage_bundles_restore_resume_and_reject_tampering() {
 #[test]
 fn market_worker_native_missing_validation_grid_stops_before_any_fit() {
     use alpha_domain::campaign_control::*;
-    use hft_research_manifest::market_encoder::{MarketFeatureDatasetV1, MarketTargetDatasetV1};
-    use hft_research_ml::market_encoder::data::{
+    use hft_cex_research_input::market_encoder::{
         derive_market_training_anchors, MarketFeatureReader,
     };
+    use hft_research_manifest::market_encoder::{MarketFeatureDatasetV1, MarketTargetDatasetV1};
     let root = tempfile::tempdir().unwrap();
     let output = tempfile::tempdir().unwrap();
     let mut request = request();

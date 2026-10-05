@@ -312,27 +312,40 @@ pub(crate) fn is_final_freeze(path: &Path) -> anyhow::Result<bool> {
     Ok(value["schema_version"] == FREEZE_SCHEMA)
 }
 
-use alpha_domain::frozen_model::{
-    FrozenModelStrategyV1, FrozenSupervisedCandidateV1, ModelFinalPrecommitV1,
-    ModelSelectionEntryV1, ModelSelectionReportV1, FROZEN_FORMULA_SELECTION_PREFIX,
+use alpha_domain::frozen_model::FrozenSupervisedCandidateV1;
+use alpha_domain::frozen_model::ModelFinalPrecommitV1;
+use alpha_domain::frozen_model::ModelSelectionReportV1;
+use alpha_domain::frozen_model::FROZEN_FORMULA_SELECTION_PREFIX;
+use alpha_domain::CexBaselineArtifactV1;
+use alpha_domain::CexBaselineModelKindV1;
+use alpha_domain::CexFinalPrecommitV1;
+use alpha_domain::CexResearchContentRefV1;
+use alpha_domain::CexSealedHoldoutClaimV1;
+use alpha_engine::engines::CexCombinationResearchArtifactV1;
+use alpha_store::campaign_ledger::CampaignFinalOutcomeV1;
+use alpha_store::AlphaStore;
+#[cfg(feature = "scientific")]
+use alpha_store::EvaluationRecord;
+use alpha_store::RegistryRevision;
+#[cfg(feature = "scientific")]
+use {
+    alpha_domain::frozen_model::FrozenModelStrategyV1,
+    alpha_domain::frozen_model::ModelSelectionEntryV1,
 };
-use alpha_domain::{
-    CandidateArtifact, CexBaselineArtifactV1, CexBaselineModelKindV1, CexFinalPrecommitV1,
-    CexResearchContentRefV1, CexSealedHoldoutClaimV1, EngineKind, IterationVerdict,
-    ResearchIteration,
+#[cfg(feature = "scientific")]
+use {
+    alpha_domain::CandidateArtifact, alpha_domain::EngineKind, alpha_domain::IterationVerdict,
+    alpha_domain::ResearchIteration,
 };
-use alpha_engine::{
-    engines::CexCombinationResearchArtifactV1,
-    evaluation::prepare_dataset,
-    final_models::{
-        evaluate_frozen_holdout, evaluate_frozen_selection, freeze_supervised_candidate,
-    },
-    formula_evaluator::FormulaEvaluator,
-    EngineProposal,
+#[cfg(feature = "scientific")]
+use {
+    alpha_engine::evaluation::prepare_dataset, alpha_engine::final_models::evaluate_frozen_holdout,
+    alpha_engine::final_models::evaluate_frozen_selection,
+    alpha_engine::final_models::freeze_supervised_candidate,
+    alpha_engine::formula_evaluator::FormulaEvaluator, alpha_engine::EngineProposal,
 };
-use alpha_store::{
-    campaign_ledger::CampaignFinalOutcomeV1, AlphaStore, EvaluationRecord, RegistryRevision,
-};
+
+#[cfg(feature = "scientific")]
 use chrono::Utc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,6 +400,7 @@ enum ClosedFamily {
 struct SupervisedWinner {
     operation: String,
     result_sha256: String,
+    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
     results_dir: PathBuf,
     mission: alpha_domain::CexResearchMissionArtifactV1,
     research_mission: alpha_domain::ResearchMission,
@@ -398,14 +412,19 @@ struct SupervisedWinner {
 struct FormulaWinner {
     operation: String,
     result_sha256: String,
+    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
     results_dir: PathBuf,
+    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
     mission: alpha_domain::CexResearchMissionArtifactV1,
+    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
     research_mission: alpha_domain::ResearchMission,
     strategy: CexCombinationResearchArtifactV1,
+    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
     factor_bank: CexFactorBankRevisionV2,
 }
 
 impl ClosedFamily {
+    #[cfg(feature = "scientific")]
     fn first_mission(&self) -> &alpha_domain::CexResearchMissionArtifactV1 {
         match self {
             Self::Supervised(sources) => &sources[0].mission,
@@ -597,6 +616,7 @@ fn collect_sources(
     }
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     if args.pre_holdout || !args.final_evaluation {
@@ -805,6 +825,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     )
 }
 
+#[cfg(feature = "scientific")]
 type FamilyOutcome = (
     ModelSelectionReportV1,
     u32,
@@ -815,6 +836,7 @@ type FamilyOutcome = (
     Option<CexResearchContentRefV1>,
 );
 
+#[cfg(feature = "scientific")]
 fn copy_source_store(source_results: &Path, results: &Path) -> anyhow::Result<()> {
     for name in [
         "alpha.duckdb",
@@ -840,6 +862,7 @@ fn formula_frozen_ref(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn finalize_supervised_family(
     grant: &alpha_domain::campaign_finalization::VerifiedCampaignFinalEvaluationGrant,
     sources: &[SupervisedWinner],
@@ -1110,6 +1133,7 @@ fn finalize_supervised_family(
     ))
 }
 
+#[cfg(feature = "scientific")]
 fn finalize_formula_family(
     grant: &alpha_domain::campaign_finalization::VerifiedCampaignFinalEvaluationGrant,
     sources: &[FormulaWinner],
@@ -1608,7 +1632,7 @@ fn canonical_final_object(label: &str, value: &str) -> anyhow::Result<String> {
     canonical_tokyo_oss_internal_object(label, value)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 mod tests {
     use super::*;
     use alpha_domain::campaign_control::{

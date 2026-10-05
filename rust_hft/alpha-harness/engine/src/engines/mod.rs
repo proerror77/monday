@@ -1,4 +1,4 @@
-mod bayesian;
+pub(crate) mod bayesian;
 mod factor_bank_mcts;
 mod gp;
 mod mcts;

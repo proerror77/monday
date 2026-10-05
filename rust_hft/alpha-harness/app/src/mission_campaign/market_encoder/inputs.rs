@@ -6,6 +6,10 @@ use crate::mission_render::approved_validation;
 use crate::mission_runner::{decode_materialization, validate_materialization};
 use alpha_domain::market_encoder_study::MarketDataViewV1;
 use anyhow::{bail, Context};
+use hft_cex_research_input::market_encoder::{
+    derive_market_training_anchors, verify_prepared_feature_equivalence,
+    verify_prepared_target_equivalence, MarketFeatureReader, MarketTaskReader,
+};
 use hft_research_manifest::{
     market_encoder::{
         MarketDataReadRequestV1, MarketFeatureDatasetV1, MarketTargetDatasetV1,
@@ -13,10 +17,6 @@ use hft_research_manifest::{
     },
     prepared_market::{validate_prepared_producer, PreparedMarketReadyReceiptV2},
     sequence::{valid_sha256, SequenceInputSpecV1, SequenceViewV1},
-};
-use hft_research_ml::market_encoder::data::{
-    derive_market_training_anchors, verify_prepared_feature_equivalence,
-    verify_prepared_target_equivalence, MarketFeatureReader, MarketTaskReader,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -913,7 +913,7 @@ pub fn open_task_reader(
     .map_err(anyhow::Error::msg)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 pub(super) mod tests {
     use super::*;
     use crate::mission_campaign::sequence::cohort::put_metadata;
