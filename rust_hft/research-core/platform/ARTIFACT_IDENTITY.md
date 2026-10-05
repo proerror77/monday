@@ -47,3 +47,27 @@ verify current imported signatures, lease/fence/state, future native expiry,
 namespace, same-transaction locking, recovery and owned cleanup. File fixtures
 verify concurrency, permissions and rollback after a bounded projection fails.
 These checks prove neither a live source ledger nor an actual Kubernetes Secret.
+
+## Controlled Campaign launcher
+
+The reconciler requires a configured host issuer for CEX Campaign tasks. The
+static configuration must contain native trust matching the verified PG import.
+The launcher creates one immutable late Secret under the deterministic Attempt
+name. It reads back UID, scope and exact bytes before mounting the initialization
+container. It checks lease and native deadline before provider mutations.
+
+The task stores only public resource references. Raw credentials remain outside
+PG. The recorded launch lease comes from the original Job environment, including
+when creation returned an unknown outcome. Later heartbeats do not rewrite that
+context. Recovery validates the original image, command, mounts and CPU resources.
+
+After process-tree stop, cleanup verifies the owned Secret UID and data identity.
+It deletes that Secret with a UID precondition and reads back absence. The issuer
+then removes its own capability and private files. Historical grant expiry or
+revocation cannot prevent mechanical cleanup. Cleanup does not restore authority.
+Natural terminal Jobs and Pods remain available for independent source audit.
+
+Loopback HTTP tests cover creation failure, recovery without a second Job, original
+launch context, foreign UID rejection and exact Secret cleanup. These fixtures
+create no cloud resources. Production deployment and audit-driven Job cleanup
+remain separate requirements.

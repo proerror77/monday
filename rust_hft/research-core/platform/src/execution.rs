@@ -1211,8 +1211,167 @@ fn retained_job_stopped(job: &Value, pods: &Value, handle: &ExecutionHandle) -> 
 mod stop_tests {
     use super::*;
     #[test]
-    fn late_secret_identity_rejects_uid_and_byte_substitution() {
-        let spec = TaskSpec {
+    fn cpu_readback_accepts_api_normalization_and_rejects_resource_expansion() {
+        let spec = cex_spec();
+        let mut worker = json!({"resources":{"requests":{"cpu":"1","memory":"134217728"},"limits":{"cpu":"1000m","memory":"128Mi"}}});
+        verify_cpu_resources(&worker, &spec.profile).unwrap();
+        worker["resources"]["limits"]["cpu"] = json!("1.001");
+        assert!(verify_cpu_resources(&worker, &spec.profile).is_err());
+        worker["resources"]["limits"]["cpu"] = json!("1");
+        worker["resources"]["limits"]["nvidia.com/gpu"] = json!("1");
+        assert!(verify_cpu_resources(&worker, &spec.profile).is_err());
+    }
+    #[derive(Default)]
+    struct ApiFixture {
+        objects: std::collections::BTreeMap<String, Value>,
+        job_posts: u32,
+        deletes: u32,
+    }
+    async fn fixture_api(
+        axum::extract::State(state): axum::extract::State<
+            std::sync::Arc<tokio::sync::Mutex<ApiFixture>>,
+        >,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let mut state = state.lock().await;
+        let path = uri.path().to_owned();
+        match method {
+            axum::http::Method::GET => match state.objects.get(&path) {
+                Some(v) => axum::Json(v.clone()).into_response(),
+                None => axum::http::StatusCode::NOT_FOUND.into_response(),
+            },
+            axum::http::Method::POST => {
+                let mut value: Value = serde_json::from_slice(&body).unwrap();
+                let name = value["metadata"]["name"].as_str().unwrap().to_owned();
+                let is_job = path.ends_with("/jobs");
+                value["metadata"]["uid"] = json!(if is_job {
+                    "original-job"
+                } else {
+                    "original-late-secret"
+                });
+                state.objects.insert(format!("{path}/{name}"), value);
+                if is_job {
+                    state.job_posts += 1;
+                    // The first request creates the Job, then reports failure.
+                    // A later reconciliation must recover the existing object.
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                } else {
+                    axum::http::StatusCode::CREATED.into_response()
+                }
+            }
+            axum::http::Method::DELETE => {
+                let options: Value = serde_json::from_slice(&body).unwrap();
+                if state
+                    .objects
+                    .get(&path)
+                    .is_none_or(|v| v["metadata"]["uid"] != options["preconditions"]["uid"])
+                {
+                    return axum::http::StatusCode::CONFLICT.into_response();
+                }
+                state.deletes += 1;
+                state.objects.remove(&path);
+                axum::http::StatusCode::OK.into_response()
+            }
+            _ => axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn launcher_recovers_original_context_and_cleans_only_owned_secret() -> Result<()> {
+        use base64::Engine;
+        let mut spec = cex_spec();
+        let trust = crate::admission::NativeAdmissionTrust {
+            schema: "transport-fixture".into(),
+            native_reservation_keys: Default::default(),
+        };
+        let data: std::collections::BTreeMap<String, String> = [
+            ("campaign.json".into(), "e30=".into()),
+            ("artifact-io.json".into(), "e30=".into()),
+            (
+                "native-trust.json".into(),
+                base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&trust)?),
+            ),
+        ]
+        .into();
+        spec.worker_configuration = Some(crate::orchestrator::worker_configuration_reference(
+            "research",
+            "configuration",
+            "configuration-original",
+            &data,
+        )?);
+        let mut task = crate::orchestrator::Task::new(spec.clone())?;
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        let lease = task.claim("owner", now, 120_000)?;
+        let (_files, issuer, issued) =
+            crate::artifact_identity::launcher_fixture(&spec, &lease, identity(&trust)?)?;
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(ApiFixture::default()));
+        state.lock().await.objects.insert("/api/v1/namespaces/research/secrets/configuration".into(),json!({"kind":"Secret","type":"Opaque","immutable":true,"metadata":{"name":"configuration","namespace":"research","uid":"configuration-original"},"data":data}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let router = axum::Router::new()
+            .fallback(axum::routing::any(fixture_api))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        // Loopback transport is test-only; the production constructor pins HTTPS.
+        let kubernetes = Kubernetes {
+            client: reqwest::Client::builder().no_proxy().build()?,
+            endpoint: reqwest::Url::parse(&format!("http://{address}"))?,
+            token: "fixture".into(),
+            cluster: spec.profile.cluster.clone(),
+        };
+        let acceptance = Acceptance {
+            profile: spec.profile.clone(),
+            ready: true,
+            process_tree_stop: true,
+            immutable_prepared_mount: false,
+            command_reattach: false,
+            artifact_readback: true,
+        };
+        assert!(kubernetes
+            .launch(&spec, &lease, &acceptance, None, 5000, Some(&issued))
+            .await
+            .is_err());
+        let mut renewed = lease.clone();
+        renewed.expires_ms += 4000;
+        let (handle, reference) = kubernetes
+            .launch(&spec, &renewed, &acceptance, None, 4000, Some(&issued))
+            .await?;
+        let reference = reference.unwrap();
+        assert_eq!(handle.uid, "original-job");
+        assert_eq!(reference.launch_lease, lease);
+        assert_ne!(reference.launch_lease.expires_ms, renewed.expires_ms);
+        assert_eq!(state.lock().await.job_posts, 1);
+        let path = format!(
+            "/api/v1/namespaces/research/secrets/{}",
+            reference.secret_name
+        );
+        let original = state.lock().await.objects[&path].clone();
+        state.lock().await.objects.get_mut(&path).unwrap()["metadata"]["uid"] = json!("foreign");
+        assert!(kubernetes
+            .cleanup_attempt_identity(&spec, &renewed, Some(&reference), Some(&issued))
+            .await
+            .is_err());
+        assert_eq!(state.lock().await.deletes, 0);
+        state.lock().await.objects.insert(path.clone(), original);
+        assert!(
+            kubernetes
+                .cleanup_attempt_identity(&spec, &renewed, Some(&reference), Some(&issued))
+                .await?
+        );
+        assert!(!state.lock().await.objects.contains_key(&path));
+        issuer.cleanup(issued)?;
+        server.abort();
+        Ok(())
+    }
+    fn cex_spec() -> TaskSpec {
+        TaskSpec {
             schema: 1,
             kind: crate::orchestrator::TaskKind::CexCampaign,
             run_manifest_sha256: "a".repeat(64),
@@ -1244,7 +1403,12 @@ mod stop_tests {
                 secret_uid: "static-uid".into(),
                 configuration_sha256: "f".repeat(64),
             }),
-        };
+        }
+    }
+
+    #[test]
+    fn late_secret_identity_rejects_uid_and_byte_substitution() {
+        let spec = cex_spec();
         let mut task = crate::orchestrator::Task::new(spec.clone()).unwrap();
         let lease = task.claim("owner", 1000, 1000).unwrap();
         let name = format!("{}-identity", resource_name(&lease));
