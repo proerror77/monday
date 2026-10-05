@@ -1,16 +1,22 @@
 //! One admitted development fold: fit, independently refit, predict and replay.
 use super::*;
-use alpha_domain::{
-    campaign_control::{
-        verify_campaign_root_grant, CampaignAttemptReservationV1, SignedCampaignRootGrantV1,
-        VerifiedCampaignRootGrant,
-    },
-    sequence_study::SequenceStudyModelV1,
+use alpha_domain::sequence_study::SequenceStudyModelV1;
+#[cfg(feature = "scientific")]
+use alpha_engine::sequence_study::fit_sequence_comparison;
+use alpha_engine::sequence_study::predict_sequence_validation;
+use alpha_engine::sequence_study::SequenceEnsemble;
+use alpha_engine::sequence_study::SequenceValidationCoverageV1;
+#[cfg(feature = "scientific")]
+use alpha_engine::sequence_study::SOL_SEQUENCE_POSITION_POLICY;
+#[cfg(feature = "scientific")]
+use {
+    alpha_domain::campaign_control::verify_campaign_root_grant,
+    alpha_domain::campaign_control::CampaignAttemptReservationV1,
+    alpha_domain::campaign_control::SignedCampaignRootGrantV1,
+    alpha_domain::campaign_control::VerifiedCampaignRootGrant,
 };
-use alpha_engine::sequence_study::{
-    fit_sequence_comparison, predict_sequence_validation, SequenceEnsemble,
-    SequenceValidationCoverageV1, SOL_SEQUENCE_POSITION_POLICY,
-};
+
+#[cfg(feature = "scientific")]
 use chrono::Utc;
 use hft_backtest::{
     config::verify_and_replay_canonical_target_positions_with_trace,
@@ -19,11 +25,11 @@ use hft_backtest::{
         TargetPositionReplayTraceEvent,
     },
 };
+use hft_cex_research_input::sequence::SequenceReader;
 use hft_research_manifest::{
     model::{HorizonHoldingPolicyV1, HorizonPositionState},
     sequence::{SequenceDatasetV1, SequenceViewV1},
 };
-use hft_research_ml::sequence::SequenceReader;
 use std::{collections::BTreeMap, fs::OpenOptions, io::BufWriter};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -58,6 +64,7 @@ pub(crate) struct FoldResult {
     pub deployment_authority: bool,
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     let request_bytes = crate::mission_dispatch::final_admission::read_bounded_json::<
         serde_json::Value,
@@ -163,6 +170,7 @@ pub(super) fn open_reader(
     .map_err(anyhow::Error::msg)
 }
 
+#[cfg(feature = "scientific")]
 fn run_fold(
     request: &SequenceRequest,
     request_hash: &str,
@@ -939,10 +947,12 @@ pub(crate) fn write_new_json(path: &Path, value: &impl Serialize) -> anyhow::Res
     write_new(path, &serde_json::to_vec_pretty(value)?)
 }
 
+#[cfg(feature = "scientific")]
 fn pack_results(root: &Path, destination: &Path, result: &FoldResult) -> anyhow::Result<()> {
     pack_result_artifacts(root, destination, "sequence-results", &result.artifacts)
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn pack_result_artifacts(
     root: &Path,
     destination: &Path,
@@ -970,7 +980,7 @@ pub(crate) fn pack_result_artifacts(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 mod tests {
     use super::*;
     #[test]
