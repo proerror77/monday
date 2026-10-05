@@ -686,7 +686,7 @@ mod tests {
     fn executable_workflow_rejects_diagnostic_defaults_and_inadequate_training_budgets() {
         let mut research = CexCampaignResearchPlanV1::canonical();
         assert!(validate_workflow_training(&[research.clone()]).is_err());
-        let mut training = super::super::tests::paired_mlp_plan_for_tests();
+        let mut training = super::super::test_support::paired_mlp_plan_for_tests();
         training.updates = 4096;
         training.optimization = Some(alpha_domain::mlp_training::CexMlpOptimizationV1 {
             learning_rate: 0.0003,

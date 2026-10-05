@@ -8,7 +8,7 @@ use alpha_domain::{
     CexResearchMissionArtifactV1, MissionStatus, ResearchMission,
 };
 use alpha_engine::{
-    baselines::verify_cex_baseline_artifact,
+    baselines::verify_cex_classic_baseline_artifact,
     engines::{GeneticProgrammingEngine, OfflineRlEngine, OfflineTrace},
     evaluation::{prepare_dataset, EngineContext},
     formula_evaluator::FormulaEvaluator,
@@ -61,6 +61,7 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
     execute_mission_inner(args, resume, None)
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn execute_governed_gp_mission(
     args: &RunMissionArgs,
     resume: bool,
@@ -332,7 +333,7 @@ fn read_mcts_baseline_artifact(
     {
         bail!("MCTS baseline artifact identity drifted");
     }
-    verify_cex_baseline_artifact(research_context, factor_bank, &artifact)
+    verify_cex_classic_baseline_artifact(research_context, factor_bank, &artifact)
         .map_err(anyhow::Error::msg)?;
     Ok(artifact)
 }
