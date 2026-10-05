@@ -24,7 +24,7 @@ pub(super) fn publish(
     super::retained_files::verify(retained, &audit.retained_manifest_sha256)?;
     let prefix = format!(
         "research/native-terminal-audits/{operation}/{}",
-        alpha_domain::canonical_json_hash(audit)?
+        super::audit_package_id(audit)?
     );
     let objects = super::retained_files::objects(retained)?;
     ensure!(

@@ -54,3 +54,12 @@ pub fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
 
 #[cfg(all(test, feature = "scientific"))]
 pub(in crate::mission_dispatch) mod tests;
+
+#[cfg(feature = "scientific")]
+fn audit_package_id(
+    audit: &alpha_store::campaign_ledger::CampaignPlatformTerminalAuditV1,
+) -> anyhow::Result<String> {
+    // Generic readonly receivers can reproduce this sorted JSON object identity
+    // without importing the source ledger's typed serializers.
+    hft_research_platform::identity(&serde_json::to_value(audit)?)
+}

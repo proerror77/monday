@@ -123,7 +123,7 @@ pub(super) fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
             &source,
             &audit,
             &original_receipt,
-            &output.join(alpha_domain::canonical_json_hash(&audit)?),
+            &output.join(super::audit_package_id(&audit)?),
         )?;
         let signed_path = output.join(format!(
             "{}-signed-terminal-audit.json",
@@ -187,7 +187,7 @@ pub(super) fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
         let prefix = format!(
             "research/native-terminal-audits/{}/{}",
             source.operation_sha256()?,
-            alpha_domain::canonical_json_hash(&evidence.audit)?
+            super::audit_package_id(&evidence.audit)?
         );
         let publication_keys = super::retained_files::objects(&evidence.retained)?
             .into_iter()
@@ -398,7 +398,7 @@ fn verify_unsigned_retry(inspect: RetryInspection<'_>) -> anyhow::Result<()> {
             request,
             &source.reservation().request_sha256,
             &facts.snapshot.run.evaluation_protocol_sha256,
-            &output.join(alpha_domain::canonical_json_hash(audit)?),
+            &output.join(super::audit_package_id(audit)?),
         )?;
         ensure!(
             audit.platform_state == CampaignPlatformTerminalStateV1::Succeeded
@@ -538,7 +538,7 @@ fn construct(
     ] {
         platform_admission::retain(&root.join(name), &bytes)?;
     }
-    let retained = output.join(alpha_domain::canonical_json_hash(&audit)?);
+    let retained = output.join(super::audit_package_id(&audit)?);
     ensure!(
         !retained.exists(),
         "uncommitted terminal observation already occupies immutable output"
@@ -555,7 +555,7 @@ fn restore(
     trust: &NativeAdmissionTrust,
     release: &hft_research_platform::release::VerifiedBuildRelease,
 ) -> anyhow::Result<VerifiedPlatformTerminalEvidence> {
-    let retained = output.join(alpha_domain::canonical_json_hash(&audit)?);
+    let retained = output.join(super::audit_package_id(&audit)?);
     ensure_private_directory(&retained)?;
     super::retained_files::verify(&retained, &audit.retained_manifest_sha256)?;
     let bytes =
