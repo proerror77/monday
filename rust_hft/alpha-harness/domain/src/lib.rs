@@ -6440,6 +6440,16 @@ mod tests {
             governance::attribution::AttributionError::UnknownAttributionSigningKey
         );
 
+        let mut keyless = signed.clone();
+        let identity = format!("01{}", "00".repeat(31));
+        keyless.signature_hex = format!("{identity}{}", "00".repeat(32));
+        let identity_bytes: [u8; 32] = hex::decode(identity).unwrap().try_into().unwrap();
+        let weak = BTreeMap::from([(
+            "feedback-1".to_string(),
+            VerifyingKey::from_bytes(&identity_bytes).unwrap(),
+        )]);
+        assert!(verify_runtime_attribution_event(&keyless, &weak).is_err());
+
         let mut tampered = signed;
         tampered.event.asset_revision_id = "candidate-forged".to_string();
         assert_eq!(

@@ -1,7 +1,7 @@
 //! Signed, scoped runtime observations shared with governance readers.
 use crate::runtime_bundle::canonical_hash;
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -213,7 +213,7 @@ pub fn verify_runtime_attribution_event(
         .map_err(|_| AttributionError::InvalidAttributionSignatureEncoding)?;
     let signature = Signature::from_slice(&signature_bytes)
         .map_err(|_| AttributionError::InvalidAttributionSignatureEncoding)?;
-    key.verify(signed.content_hash.as_bytes(), &signature)
+    key.verify_strict(signed.content_hash.as_bytes(), &signature)
         .map_err(|_| AttributionError::InvalidAttributionSignature)?;
     Ok(VerifiedRuntimeAttributionEvent(signed.event.clone()))
 }

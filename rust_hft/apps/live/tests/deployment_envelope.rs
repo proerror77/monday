@@ -988,6 +988,24 @@ fn runtime_rejects_forgery_time_binding_key_and_limit_failures() {
     let mut adapter = RecordingAdapter::default();
     let runtime_policy = policy(&base);
 
+    let mut keyless = sign_envelope(base.clone(), "weak", &key).unwrap();
+    let identity = format!("01{}", "00".repeat(31));
+    keyless.signature_hex = format!("{identity}{}", "00".repeat(32));
+    let identity_bytes: [u8; 32] = hex::decode(identity).unwrap().try_into().unwrap();
+    let weak = BTreeMap::from([(
+        "weak".to_string(),
+        VerifyingKey::from_bytes(&identity_bytes).unwrap(),
+    )]);
+    assert!(intake(
+        &keyless,
+        &weak,
+        &runtime_policy,
+        now,
+        &directory,
+        &mut adapter
+    )
+    .is_err());
+
     let mut forged = sign_envelope(base.clone(), "key-1", &key).unwrap();
     forged.envelope.max_notional += 1.0;
     assert!(intake(
