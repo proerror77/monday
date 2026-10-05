@@ -1,8 +1,8 @@
 //! Independent Kubernetes observation of the original admitted Attempt. A
 //! missing resource, unknown ownership or running process yields no proof.
-use crate::prediction_dispatch::{kubectl_binary, kubectl_json};
 use anyhow::{ensure, Context};
 use chrono::{DateTime, Utc};
+use hft_research_dispatch_io::{kubectl_binary, kubectl_json};
 use hft_research_platform::{
     execution::ExecutionHandle,
     orchestrator::{Lease, TaskSpec},
@@ -149,15 +149,11 @@ fn verify(
         "terminal observer rejects extra or ambiguous executors"
     );
     let worker = &job_containers[0];
+    hft_research_platform::execution::verify_cpu_resources(worker, &spec.profile)?;
     ensure!(
         worker["name"] == "worker"
             && worker["image"] == spec.image
-            && worker["command"] == serde_json::to_value(&spec.command)?
-            && worker["resources"]["limits"]["cpu"] == format!("{}m", spec.profile.cpu_millis)
-            && worker["resources"]["requests"]["cpu"] == format!("{}m", spec.profile.cpu_millis)
-            && worker["resources"]["limits"]["memory"] == format!("{}Mi", spec.profile.memory_mib)
-            && worker["resources"]["requests"]["memory"]
-                == format!("{}Mi", spec.profile.memory_mib),
+            && worker["command"] == serde_json::to_value(&spec.command)?,
         "terminal Job changed admitted command, image or resources"
     );
     let contexts = worker["env"]
@@ -268,7 +264,6 @@ fn verify(
         "image",
         "command",
         "args",
-        "resources",
         "env",
         "envFrom",
         "securityContext",
@@ -279,6 +274,7 @@ fn verify(
             "terminal Pod changed admitted executor field {field}"
         );
     }
+    hft_research_platform::execution::verify_cpu_resources(&containers[0], &spec.profile)?;
     ensure!(
         pod["spec"]["initContainers"] == expected["initContainers"]
             && pod["spec"]["ephemeralContainers"].is_null(),

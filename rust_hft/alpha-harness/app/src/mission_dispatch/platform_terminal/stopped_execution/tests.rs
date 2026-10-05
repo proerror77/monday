@@ -117,6 +117,23 @@ fn original_job_owner_and_all_processes_must_be_stopped() {
     // Historical lease expiry does not renew execution or erase stop evidence.
     assert!(lease.expires_ms < observed.timestamp_millis());
     assert!(read("foreign-cluster", &spec, &lease, &handle).is_err());
+    let mut normalized_job = job.clone();
+    let mut normalized_pod = pod.clone();
+    for object in [&mut normalized_job["spec"]["template"], &mut normalized_pod] {
+        for section in ["requests", "limits"] {
+            object["spec"]["containers"][0]["resources"][section]["cpu"] = json!("2");
+            object["spec"]["containers"][0]["resources"][section]["memory"] = json!("2Gi");
+        }
+    }
+    verify(
+        &spec,
+        &lease,
+        &handle,
+        &normalized_job,
+        &normalized_pod,
+        observed,
+    )
+    .unwrap();
 
     for (pointer, value) in [
         (
