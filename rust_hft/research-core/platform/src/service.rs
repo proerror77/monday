@@ -24,6 +24,8 @@ pub struct ServiceConfig {
     pub artifact_tls: crate::transport::TlsConfig,
     pub lease_ms: i64,
     pub agent_api: Option<crate::agent_api::AgentApiConfig>,
+    #[serde(default)]
+    pub attempt_identity: Option<crate::artifact_identity::AttemptIdentityConfig>,
 }
 
 /// Gateway credentials are controller-only, scoped to result prefix readback.
@@ -32,6 +34,14 @@ pub struct ArtifactGateway {
     client: reqwest::Client,
     base: reqwest::Url,
     token: String,
+}
+
+/// Request-local verified bytes and parsed evidence are reused through the
+/// terminal transaction. A later poll starts its own independent readback.
+#[derive(Debug)]
+pub struct ResultReadback {
+    receipt: ResultReceipt,
+    campaign: Option<crate::campaign_result::CexCampaignResultReceipt>,
 }
 
 impl ArtifactGateway {
@@ -62,7 +72,7 @@ impl ArtifactGateway {
         })
     }
 
-    async fn get(&self, key: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn get(&self, key: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
         ensure!(
             key.starts_with("research/")
                 && !key.contains("..")
@@ -99,7 +109,7 @@ impl ArtifactGateway {
         Ok(Some(bytes))
     }
 
-    pub async fn receipt(&self, task: &Task) -> Result<Option<ResultReceipt>> {
+    pub async fn receipt(&self, task: &Task) -> Result<Option<ResultReadback>> {
         let key = format!(
             "{}/{}/{}/receipt.json",
             task.spec.output_prefix, task.id, task.attempt
@@ -115,6 +125,40 @@ impl ArtifactGateway {
         // Prepared blocks are checked on the exact bytes being decoded. Reuse
         // that readback within this receipt, including its object key and size.
         let mut verified = std::collections::BTreeSet::new();
+        let mut campaign = None;
+        if task.spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+            let artifact = receipt
+                .artifacts
+                .iter()
+                .find(|a| a.key.ends_with("/cex-campaign.json"))
+                .context("Campaign result lacks native evidence receipt")?;
+            ensure!(
+                artifact.bytes <= 16 * 1024 * 1024,
+                "Campaign evidence receipt exceeds bound"
+            );
+            let bytes = self
+                .get(&artifact.key, artifact.bytes)
+                .await?
+                .context("Campaign evidence receipt missing")?;
+            ensure!(
+                bytes.len() as u64 == artifact.bytes && sha256(&bytes) == artifact.sha256,
+                "Campaign evidence receipt changed"
+            );
+            let science: crate::campaign_result::CexCampaignResultReceipt =
+                serde_json::from_slice(&bytes)?;
+            science.validate(&task.spec, &receipt.artifacts)?;
+            for round in &science.rounds {
+                let archive = receipt
+                    .artifacts
+                    .iter()
+                    .find(|a| **a == round.result_zip.artifact)
+                    .context("native archive missing from fixed result")?;
+                self.verify_native_archive(archive, &round.entries).await?;
+                verified.insert((&archive.key, &archive.sha256, archive.bytes));
+            }
+            campaign = Some(science);
+            verified.insert((&artifact.key, &artifact.sha256, artifact.bytes));
+        }
         if let Some(view) = &receipt.prepared_view {
             let mut orders = std::collections::BTreeMap::<
                 hft_cex_research_input::data::Exit,
@@ -154,7 +198,7 @@ impl ArtifactGateway {
                 self.verify_artifact(artifact).await?;
             }
         }
-        Ok(Some(receipt))
+        Ok(Some(ResultReadback { receipt, campaign }))
     }
 
     pub async fn checkpoint(&self, task: &Task) -> Result<Option<crate::orchestrator::Checkpoint>> {
@@ -212,6 +256,50 @@ impl ArtifactGateway {
         );
         Ok(())
     }
+
+    async fn verify_native_archive(
+        &self,
+        artifact: &crate::orchestrator::Artifact,
+        entries: &[crate::campaign_result::ArchiveEntry],
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        ensure!(
+            artifact.bytes > 0 && artifact.bytes <= 512 * 1024 * 1024,
+            "native archive exceeds gateway budget"
+        );
+        let mut response = self
+            .client
+            .get(self.base.join(&artifact.key)?)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("native archive readback unavailable"))?
+            .error_for_status()
+            .map_err(|_| anyhow::anyhow!("native archive readback rejected"))?;
+        let mut file = tempfile::NamedTempFile::new()?;
+        let mut digest = Sha256::new();
+        let mut count = 0_u64;
+        while let Some(bytes) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow::anyhow!("native archive readback interrupted"))?
+        {
+            count = count
+                .checked_add(bytes.len() as u64)
+                .context("native archive size overflow")?;
+            ensure!(count <= artifact.bytes, "native archive size changed");
+            digest.update(&bytes);
+            file.write_all(&bytes)?;
+        }
+        ensure!(
+            count == artifact.bytes && format!("{:x}", digest.finalize()) == artifact.sha256,
+            "native archive content changed"
+        );
+        file.as_file().sync_all()?;
+        crate::campaign_result::verify_archive_entries(file.reopen()?, entries, 512 * 1024 * 1024)?;
+        Ok(())
+    }
 }
 
 pub struct Reconciler {
@@ -220,6 +308,7 @@ pub struct Reconciler {
     pub artifacts: ArtifactGateway,
     pub owner: String,
     pub lease_ms: i64,
+    pub issuer: Option<crate::artifact_identity::AttemptIdentityIssuer>,
 }
 
 impl Reconciler {
@@ -254,6 +343,29 @@ impl Reconciler {
                 .stop(&locked.task.spec, &lease, locked.task.execution.as_ref())
                 .await?
             {
+                if locked.task.spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+                    let issuer = self
+                        .issuer
+                        .as_ref()
+                        .context("Campaign cleanup lacks controlled issuer")?;
+                    let issued = locked.recover_attempt_identity_for_cleanup(issuer).await?;
+                    if !self
+                        .kubernetes
+                        .cleanup_attempt_identity(
+                            &locked.task.spec,
+                            &lease,
+                            locked.task.attempt_identity.as_ref(),
+                            issued.as_ref(),
+                        )
+                        .await?
+                    {
+                        locked.commit("identity_cleanup_pending").await?;
+                        return Ok(true);
+                    }
+                    if let Some(issued) = issued {
+                        issuer.cleanup(issued)?;
+                    }
+                }
                 if self.ledger.admission(&locked.task.spec).await?.is_none() {
                     locked.task.stop(State::Cancelled, false)?;
                 }
@@ -290,7 +402,19 @@ impl Reconciler {
                 return Ok(true);
             }
             let acceptance = self.ledger.acceptance(&locked.task.spec).await?;
-            let handle = self
+            let issued =
+                if locked.task.spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+                    Some(
+                        locked
+                            .issue_attempt_identity(self.issuer.as_ref().context(
+                                "native Campaign requires controlled per-Attempt issuer",
+                            )?)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+            let (handle, attempt_identity) = self
                 .kubernetes
                 .launch(
                     &locked.task.spec,
@@ -298,8 +422,10 @@ impl Reconciler {
                     &acceptance,
                     locked.task.checkpoint.as_ref(),
                     locked.task.deadline_ms.context("launch lacks deadline")? - locked.now_ms,
+                    issued.as_ref(),
                 )
                 .await?;
+            locked.task.attempt_identity = attempt_identity;
             let now = locked.refresh_clock().await?;
             if locked.task.expire(now)? {
                 // Resource identity is still recovered by name during stopping.
@@ -325,10 +451,15 @@ impl Reconciler {
                 let complete = observed == Observation::Succeeded
                     || locked.task.spec.profile.backend == Backend::AgentSandbox;
                 if complete {
-                    if let Some(receipt) = self.artifacts.receipt(&locked.task).await? {
+                    if let Some(readback) = self.artifacts.receipt(&locked.task).await? {
+                        if let Some(science) = &readback.campaign {
+                            self.ledger
+                                .validate_campaign_result(&locked.task, science)
+                                .await?;
+                        }
                         let now = locked.refresh_clock().await?;
                         if !locked.task.expire(now)? {
-                            locked.task.stage_result(&lease, now, receipt)?;
+                            locked.task.stage_result(&lease, now, readback.receipt)?;
                         }
                     }
                 }
@@ -428,6 +559,7 @@ mod tests {
             max_attempts: 1,
             output_prefix: "research/fixture".into(),
             fit_identity_sha256: None,
+            worker_configuration: None,
         };
         let mut task = Task::new(spec)?;
         let lease = task.claim("owner", 1000, 1000)?;
