@@ -74,6 +74,7 @@ fn task_spec() -> TaskSpec {
         max_attempts: 2,
         output_prefix: "research/results".into(),
         fit_identity_sha256: Some(hash('e')),
+        worker_configuration: None,
     }
 }
 fn acceptance(task: &TaskSpec) -> Acceptance {

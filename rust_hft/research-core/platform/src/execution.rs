@@ -212,6 +212,34 @@ pub fn render(spec: &TaskSpec, lease: &Lease, acceptance: &Acceptance) -> Result
             "volumes": [{"name": "scratch", "emptyDir": {"sizeLimit": format!("{}Mi", spec.profile.scratch_mib)}}]
         }
     });
+    if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+        ensure!(
+            spec.profile.gpu == 0 && spec.profile.backend != Backend::AgentSandbox,
+            "native CEX Campaign requires admitted CPU Job compute"
+        );
+        pod["spec"]["nodeSelector"]["workload"] = json!("backtest");
+        ensure!(
+            spec.profile.scratch_mib > 8,
+            "private configuration exceeds reserved scratch budget"
+        );
+        pod["spec"]["volumes"][0]["emptyDir"]["sizeLimit"] =
+            json!(format!("{}Mi", spec.profile.scratch_mib - 8));
+        pod["spec"]["volumes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"private-state","emptyDir":{"sizeLimit":"8Mi"}}));
+        // Native scientific libraries use temporary files. Both mount points
+        // share one bounded volume, not two independent scratch allocations.
+        pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"scratch", "mountPath":"/tmp"}));
+        let mounts = pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array_mut()
+            .unwrap();
+        mounts.push(json!({"name":"private-state","mountPath":"/config","subPath":"config","readOnly":true}));
+        mounts.push(json!({"name":"private-state","mountPath":"/identity","subPath":"identity","readOnly":true}));
+    }
     if let Some(pvc) = &spec.profile.prepared_pvc {
         pod["spec"]["volumes"].as_array_mut().unwrap().push(
             json!({"name":"prepared", "persistentVolumeClaim":{"claimName":pvc,"readOnly":true}}),
@@ -222,14 +250,27 @@ pub fn render(spec: &TaskSpec, lease: &Lease, acceptance: &Acceptance) -> Result
             .push(json!({"name":"prepared","mountPath":"/prepared","readOnly":true}));
     }
     if let Some(secret) = &spec.profile.worker_secret {
-        pod["spec"]["volumes"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"name":"identity","secret":{"secretName":secret,"defaultMode":288}}));
-        pod["spec"]["containers"][0]["volumeMounts"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"name":"identity","mountPath":"/config","readOnly":true}));
+        if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+            pod["spec"]["volumes"].as_array_mut().unwrap().push(json!({"name":"configuration-inputs","secret":{"secretName":secret,"defaultMode":288}}));
+            pod["spec"]["initContainers"] = json!([{
+                "name":"stage-configuration", "image":spec.image, "command":[spec.command[0],"--stage-configuration"],
+                "env":[{"name":"MONDAY_ATTEMPT_CONTEXT","value":context_json}],
+                "resources":pod["spec"]["containers"][0]["resources"],
+                "securityContext":pod["spec"]["containers"][0]["securityContext"],
+                "volumeMounts":[{"name":"configuration-inputs","mountPath":"/configuration-inputs","readOnly":true},{"name":"private-state","mountPath":"/private-state"}]
+            }]);
+            // The controlled launcher supplies a separate exact per-Attempt
+            // identity mount. No caller credential or static Secret can do so.
+        } else {
+            pod["spec"]["volumes"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name":"identity","secret":{"secretName":secret,"defaultMode":288}}));
+            pod["spec"]["containers"][0]["volumeMounts"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name":"identity","mountPath":"/config","readOnly":true}));
+        }
     }
     match spec.profile.backend {
         Backend::KubernetesJob | Backend::AcsJob => {
@@ -273,6 +314,41 @@ pub struct Kubernetes {
 
 #[cfg(feature = "control")]
 impl Kubernetes {
+    /// Read-only configuration check on the exact accepted Kubernetes target.
+    /// A name, digest supplied by a caller, or immutable flag alone is insufficient.
+    pub async fn verify_worker_configuration(&self, spec: &TaskSpec) -> Result<()> {
+        if let Some(expected) = &spec.worker_configuration {
+            let path = format!(
+                "/api/v1/namespaces/{}/secrets/{}",
+                spec.profile.namespace, expected.secret_name
+            );
+            let value = self
+                .read(&path)
+                .await?
+                .context("immutable worker configuration missing")?;
+            ensure!(
+                value["kind"] == "Secret"
+                    && value["type"] == "Opaque"
+                    && value["immutable"] == true
+                    && value["metadata"]["namespace"] == spec.profile.namespace
+                    && value["metadata"]["name"] == expected.secret_name
+                    && value["metadata"]["uid"] == expected.secret_uid,
+                "worker configuration resource changed"
+            );
+            let data: std::collections::BTreeMap<String, String> =
+                serde_json::from_value(value["data"].clone())?;
+            ensure!(
+                crate::orchestrator::worker_configuration_reference(
+                    &spec.profile.namespace,
+                    &expected.secret_name,
+                    &expected.secret_uid,
+                    &data
+                )? == *expected,
+                "worker configuration contents changed"
+            );
+        }
+        Ok(())
+    }
     pub fn new(endpoint: &str, token: String, cluster: String, ca_pem: &[u8]) -> Result<Self> {
         let endpoint = reqwest::Url::parse(endpoint)?;
         ensure!(
@@ -347,6 +423,11 @@ impl Kubernetes {
         ensure!(
             remaining_ms > 0 && remaining_ms <= spec.timeout_ms,
             "invalid remaining deadline"
+        );
+        self.verify_worker_configuration(spec).await?;
+        ensure!(
+            spec.kind != crate::orchestrator::TaskKind::CexCampaign,
+            "native Campaign launch requires controlled per-Attempt identity issuance"
         );
         let mut resource = render(spec, lease, acceptance)?;
         resource["spec"]["template"]["spec"]["activeDeadlineSeconds"] =

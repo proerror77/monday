@@ -108,6 +108,7 @@ fn parameter_experiments_and_retry_reuse_one_verified_build() {
         max_attempts: 2,
         output_prefix: "research/results".into(),
         fit_identity_sha256: None,
+        worker_configuration: None,
     };
     first.admit(&spec).unwrap();
     let mut task = Task::new(spec).unwrap();

@@ -30,6 +30,8 @@ pub mod research;
 pub mod service;
 #[cfg(feature = "control")]
 pub mod session;
+#[cfg(feature = "artifact-io")]
+pub mod worker_configuration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
