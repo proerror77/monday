@@ -15,6 +15,8 @@ use crate::{
 pub const MIGRATION: &str = include_str!("../sql/postgres.sql");
 pub const BUILD_RELEASE_MIGRATION: &str = include_str!("../sql/verified_build_release.sql");
 pub const NATIVE_ADMISSION_MIGRATION: &str = include_str!("../sql/native_admission.sql");
+pub const NATIVE_CAMPAIGN_INPUTS_MIGRATION: &str =
+    include_str!("../sql/native_campaign_inputs.sql");
 
 #[derive(Clone)]
 pub struct Ledger {
@@ -666,6 +668,24 @@ impl Ledger {
                 "preparation worker supports only the training split"
             );
             plan.spec.split
+        } else if task.spec.kind == TaskKind::CexCampaign {
+            ensure!(
+                input.get::<String, _>("kind") == "cex_campaign",
+                "native Campaign requires its typed collection"
+            );
+            let exists: bool = query_scalar("SELECT EXISTS(SELECT 1 FROM research.native_campaign_inputs WHERE request_sha256=$1 AND manifest_sha256=$2 AND tenant=$3)")
+                .bind(&task.id).bind(&task.spec.view_manifest_sha256).bind(tenant).fetch_one(&mut *tx).await?;
+            ensure!(
+                exists,
+                "native Campaign collection lacks exact tenant/request readback"
+            );
+            let collection: hft_cex_research_input::campaign::CampaignPreparedInputsV1 =
+                serde_json::from_value(input.get("document"))?;
+            ensure!(
+                collection.id()? == task.spec.view_manifest_sha256,
+                "native Campaign collection identity changed"
+            );
+            hft_cex_research_input::data::Split::Validation
         } else {
             ensure!(
                 input.get::<String, _>("kind") == "prepared",

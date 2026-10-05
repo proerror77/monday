@@ -166,6 +166,16 @@ fn task_label(task_id: &str) -> String {
 
 pub fn render(spec: &TaskSpec, lease: &Lease, acceptance: &Acceptance) -> Result<Value> {
     acceptance.admit(spec)?;
+    let context = crate::orchestrator::AttemptContext {
+        spec: spec.clone(),
+        lease: lease.clone(),
+    };
+    context.validate()?;
+    let context_json = serde_json::to_string(&context)?;
+    ensure!(
+        context_json.len() <= 64 * 1024,
+        "Attempt context exceeds worker environment bound"
+    );
     ensure!(
         valid_digest(&lease.task_id)
             && lease.task_id == spec.id()?
@@ -187,6 +197,7 @@ pub fn render(spec: &TaskSpec, lease: &Lease, acceptance: &Acceptance) -> Result
             "containers": [{
                 "name": "worker", "image": spec.image, "command": spec.command,
                 "env": [
+                    {"name": "MONDAY_ATTEMPT_CONTEXT", "value": context_json},
                     {"name": "MONDAY_TASK_ID", "value": lease.task_id},
                     {"name": "MONDAY_RUN_MANIFEST", "value": spec.run_manifest_sha256},
                     {"name": "MONDAY_ATTEMPT", "value": lease.attempt.to_string()},

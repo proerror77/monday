@@ -5,9 +5,14 @@ pub mod admission;
 pub mod agent_api;
 #[cfg(feature = "gateway")]
 pub mod artifact_gateway;
+#[cfg(feature = "artifact-io")]
+pub mod artifact_io;
 #[cfg(feature = "control")]
 pub mod block_objects;
 pub mod build;
+#[cfg(feature = "native-admission")]
+pub mod campaign;
+pub mod campaign_result;
 #[cfg(feature = "control")]
 pub mod clickhouse;
 pub mod coding_agent;
@@ -45,5 +50,5 @@ pub fn valid_digest(value: &str) -> bool {
 #[cfg(feature = "control")]
 pub mod worker;
 
-#[cfg(feature = "control")]
+#[cfg(feature = "artifact-io")]
 pub mod transport;

@@ -13,6 +13,9 @@ pub enum TaskKind {
     Prepare,
     Train,
     Backtest,
+    /// The finalized canonical CEX Campaign consumes development-only typed
+    /// input roles. It cannot be submitted as a generic Train/Backtest view.
+    CexCampaign,
     Explore,
 }
 
@@ -173,6 +176,44 @@ pub struct Lease {
     pub expires_ms: i64,
 }
 
+/// Fixed context supplied by the reconciler's admitted Job. Workers cannot
+/// claim an Attempt; PG and the artifact gateway independently enforce it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptContext {
+    pub spec: TaskSpec,
+    pub lease: Lease,
+}
+impl AttemptContext {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.lease.task_id == self.spec.id()?
+                && self.lease.attempt > 0
+                && self.lease.attempt <= self.spec.max_attempts
+                && self.lease.fence > 0
+                && self.lease.expires_ms > 0
+                && !self.lease.owner.is_empty()
+                && self.lease.owner.len() <= 256,
+            "invalid admitted Attempt context"
+        );
+        Ok(())
+    }
+    pub fn output_prefix(&self) -> String {
+        format!(
+            "{}/{}/{}/",
+            self.spec.output_prefix, self.lease.task_id, self.lease.attempt
+        )
+    }
+    pub fn from_environment() -> Result<Self> {
+        let value = std::env::var("MONDAY_ATTEMPT_CONTEXT")
+            .context("admitted Attempt context is required")?;
+        ensure!(value.len() <= 64 * 1024, "Attempt context exceeds bound");
+        let context: Self = serde_json::from_str(&value)?;
+        context.validate()?;
+        Ok(context)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
@@ -258,6 +299,16 @@ impl ResultReceipt {
             ensure!(
                 self.prepared_view.is_none(),
                 "non-preparation task cannot publish data"
+            );
+        }
+        if spec.kind == TaskKind::CexCampaign {
+            ensure!(
+                self.artifacts
+                    .iter()
+                    .filter(|a| a.key.ends_with("/cex-campaign.json"))
+                    .count()
+                    == 1,
+                "native Campaign lacks typed scientific evidence receipt"
             );
         }
         Ok(())

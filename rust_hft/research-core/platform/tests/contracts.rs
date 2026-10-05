@@ -428,6 +428,25 @@ fn job_admission_is_pinned_and_resources_are_bounded() {
     let lease = task.claim("owner", 1000, 1000).unwrap();
     let accepted = acceptance(&task.spec);
     let job = execution::render(&task.spec, &lease, &accepted).unwrap();
+    let environment = job["spec"]["template"]["spec"]["containers"][0]["env"]
+        .as_array()
+        .unwrap();
+    let encoded = environment
+        .iter()
+        .find(|value| value["name"] == "MONDAY_ATTEMPT_CONTEXT")
+        .unwrap()["value"]
+        .as_str()
+        .unwrap();
+    let mut context: hft_research_platform::orchestrator::AttemptContext =
+        serde_json::from_str(encoded).unwrap();
+    context.validate().unwrap();
+    assert_eq!(context.spec, task.spec);
+    assert_eq!(context.lease, lease);
+    context.lease.task_id = hash('f');
+    assert!(context.validate().is_err());
+    context.lease = lease.clone();
+    context.lease.attempt = task.spec.max_attempts + 1;
+    assert!(context.validate().is_err());
     assert_eq!(job["spec"]["backoffLimit"], 0);
     assert_eq!(
         job["spec"]["template"]["spec"]["automountServiceAccountToken"],
