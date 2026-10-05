@@ -5700,7 +5700,7 @@ pub(crate) mod tests {
                 promotion_id: promotion.promotion_id.clone(),
                 promotion_manifest_hash: canonical_json_hash(promotion).unwrap(),
                 bundle_id: bundle.bundle_id.clone(),
-                bundle_hash: bundle.bundle_hash.clone(),
+                bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
                 runtime_config_hash: "d".repeat(64),
                 risk_policy_hash: "e".repeat(64),
                 account_id: "binance-paper-shadow".to_string(),
