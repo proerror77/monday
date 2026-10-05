@@ -59,6 +59,11 @@ name = "research-artifact-gateway"
 path = "src/bin/research-artifact-gateway.rs"
 required-features = ["gateway"]
 
+[[bin]]
+name = "research-release-publisher"
+path = "src/bin/research-release-publisher.rs"
+required-features = ["publisher"]
+
 [dev-dependencies]
 tempfile = "3"
 

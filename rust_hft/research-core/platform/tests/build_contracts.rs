@@ -5,7 +5,7 @@ use hft_research_platform::{
     research::Run,
     sha256,
 };
-#[cfg(feature = "control")]
+#[cfg(any(feature = "control", feature = "release-verification"))]
 mod common;
 fn hash(c: char) -> String {
     c.to_string().repeat(64)
@@ -195,7 +195,7 @@ fn compiler_inputs_invalidate_build_and_cache_never_proves_executable_bytes() {
 }
 
 #[test]
-#[cfg(feature = "control")]
+#[cfg(any(feature = "control", feature = "release-verification"))]
 fn signed_release_import_binds_source_compiler_image_and_executables() {
     let (artifact, signed, trust) = common::attest(artifact());
     let verified = trust.verify(&artifact, &signed).unwrap();
@@ -242,7 +242,7 @@ fn signed_release_import_binds_source_compiler_image_and_executables() {
 }
 
 #[test]
-#[cfg(feature = "control")]
+#[cfg(any(feature = "control", feature = "release-verification"))]
 fn untrusted_or_tampered_release_cannot_be_repaired_with_new_hashes() {
     let (artifact, signed, trust) = common::attest(artifact());
     let mut wrong_key = trust.clone();
@@ -283,7 +283,7 @@ fn untrusted_or_tampered_release_cannot_be_repaired_with_new_hashes() {
 }
 
 #[test]
-#[cfg(feature = "control")]
+#[cfg(any(feature = "control", feature = "release-verification"))]
 fn trusted_signature_cannot_admit_an_incomplete_or_wrong_source_receipt() {
     use ed25519_dalek::{Signer, SigningKey};
     let (artifact, signed, trust) = common::attest(artifact());

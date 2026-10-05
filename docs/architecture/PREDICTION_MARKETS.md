@@ -37,6 +37,14 @@ and typed intents; Monday runtime returns deterministic acceptance, rejection,
 and attribution. Venue-specific authentication, fee metadata, settlement rules,
 and wire formats remain hidden inside their Adapters.
 
+Prediction's strategy package exports its research simulator. It cannot provide
+an arbitrary callback that submits an intent directly to a venue. Production
+construction belongs to Monday's `SystemBuilder`, shared `hft-ports` strategy and
+execution interfaces, risk manager, OMS, and account reconciliation. The
+transitional `StrategyLogic`/`TradingIntent` simulation contract still needs an
+explicit governed runtime handoff; removal of a dead callback does not complete
+that migration or enable a live strategy.
+
 ## Research framework boundary
 
 Monday intentionally keeps two evaluation frameworks because the labels, sampling units, and promotion evidence are different:

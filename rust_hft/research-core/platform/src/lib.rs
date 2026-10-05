@@ -23,8 +23,10 @@ pub mod orchestrator;
 #[cfg(feature = "control")]
 pub mod postgres;
 pub mod preparation;
-#[cfg(feature = "control")]
+#[cfg(any(feature = "control", feature = "release-verification"))]
 pub mod release;
+#[cfg(feature = "publisher")]
+pub mod release_publisher;
 pub mod research;
 #[cfg(feature = "native-admission")]
 pub mod revocation;
