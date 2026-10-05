@@ -6,12 +6,10 @@ trap 'rm -rf "$work"' EXIT
 export MOCK_WORK=$work GITHUB_REPOSITORY=fixture/monday GITHUB_RUN_ATTEMPT=2 MONDAY_RELEASE_JOB_ID=567
 source_sha=1111111111111111111111111111111111111111
 mkdir -p "$work/release/research-bin" "$work/bin"
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer \
-  binance-replay-parquet-materializer clickhouse-analytics-materializer \
-  monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot monday-prediction-worker; do
+while IFS= read -r binary; do
   printf 'fixture %s\n' "$binary" >"$work/release/research-bin/$binary"
   chmod 0755 "$work/release/research-bin/$binary"
-done
+done < <(bash "$root/.github/scripts/research-release-products.sh" binaries all)
 export MONDAY_BUILD_INPUTS_FILE="$work/build-inputs.json"
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
 jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" '{schema:"monday.compilation-inputs.v2",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks}' >"$MONDAY_BUILD_INPUTS_FILE"
