@@ -13,7 +13,7 @@ registered tenant-owned Run and verified Build to match. One source operation
 cannot authorize another request. Imports are immutable and exact retransmission
 is idempotent. Plausible receipt-hash rows without this signed import remain audit
 history and cannot launch work. The receiver checks signature, exact identities,
-expiry and native revocation before launch and terminal publication. The upload
+expiry and PG request revocation before launch and terminal publication. The upload
 permit also checks tenant and expiry under its original authority/task/admission
 locks, lease/fence/deadline and cancellation guards.
 
@@ -38,7 +38,7 @@ approval, debit cumulative budgets in the existing source ledger, bind the exact
 finalized Campaign request and typed prepared-input roles, durably transfer its
 execution ownership, and independently read back the source receipts before
 signing. This receiver and transfer primitive do not implement that complete
-producer or prove data equivalence. The Campaign shared-input collection and
+producer, source-ledger revocation projection or data equivalence. The Campaign shared-input collection and
 canonical worker adapter remain required: search workers must not receive
 selection or holdout bytes, and a whole native dataset must not be relabeled as a
 Train view. Source metadata and signatures are not scientific terminal evidence.
