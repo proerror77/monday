@@ -32,6 +32,16 @@ read-back native result ZIPs must retain the same request, collection, source,
 protocol and trial bindings. A development result remains insufficient evidence
 for a full scientific conclusion or budget refund.
 
+Each native result ZIP stores the actual descriptor and its allowed encoded
+blocks under `results/native-prepared-blocks/<sha256>.mondaybin`. Independent
+recovery requires the finalized native request and its independently bound
+SHA256. It decodes those archived blocks through the same opaque input inspector,
+rebuilds the metadata-only dataset, and reuses the original model ledger and
+replay validators. The original feature, materialization, and dataset manifests
+remain exact lineage metadata. Development bytes never use the original
+full-source feature SHA filename. Recovery rejects altered or missing blocks,
+foreign lineage metadata, and withheld evaluation artifacts.
+
 Platform CexCampaign admission, its transferred native budget, the platform
 lease/attempt fence and terminal settlement are separate enforced boundaries.
 The data inspector is not a substitute for any of them. Sequence and market

@@ -13,7 +13,8 @@
       "monday-prediction-research",
       "monday-prediction-evaluator",
       "monday-prediction-snapshot",
-      "monday-prediction-worker"
+      "monday-prediction-worker",
+      "monday-prediction-operator"
     ],
     "controller": [
       "alpha-harness",
@@ -74,6 +75,14 @@
       "features": "",
       "binaries": [
         "monday-prediction-worker"
+      ]
+    },
+    {
+      "manifest": "prediction-markets/Cargo.toml",
+      "package": "hft-prediction-research-operator",
+      "features": "",
+      "binaries": [
+        "monday-prediction-operator"
       ]
     }
   ],

@@ -44,16 +44,22 @@ impl AlphaStore {
         reservation: &CampaignAttemptReservationV1,
         transfer: &CampaignPlatformTransferV1,
     ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
-        self.transfer_campaign_execution_to_platform_with_clock(
-            verified,
-            reservation,
-            transfer,
-            Utc::now,
-        )
+        self.transfer_campaign_execution_to_platform_impl(verified, reservation, transfer, Utc::now)
     }
 
     // Tests may inject a clock, but callers cannot backdate execution ownership.
+    #[cfg(test)]
     pub(super) fn transfer_campaign_execution_to_platform_with_clock(
+        &mut self,
+        verified: &VerifiedCampaignRootGrant,
+        reservation: &CampaignAttemptReservationV1,
+        transfer: &CampaignPlatformTransferV1,
+        now: impl FnOnce() -> DateTime<Utc>,
+    ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
+        self.transfer_campaign_execution_to_platform_impl(verified, reservation, transfer, now)
+    }
+
+    fn transfer_campaign_execution_to_platform_impl(
         &mut self,
         verified: &VerifiedCampaignRootGrant,
         reservation: &CampaignAttemptReservationV1,

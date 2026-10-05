@@ -374,7 +374,7 @@ fn validate_export_urls(
     native_result_url: &str,
     operation: &str,
 ) -> anyhow::Result<()> {
-    let result = crate::prediction_dispatch::canonical_tokyo_oss_internal_object(
+    let result = hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
         "native result",
         native_result_url,
     )?;
@@ -391,7 +391,7 @@ fn validate_export_urls(
         &projection.signed_admission_readback_url,
     ] {
         ensure!(
-            crate::prediction_dispatch::canonical_tokyo_oss_internal_object(
+            hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
                 "native admission export",
                 url
             )? == expected,

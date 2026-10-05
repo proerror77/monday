@@ -1210,7 +1210,7 @@ mod tests {
         let (mut store, verified) = registered();
         let reservation = reservation(&verified, 0, 40);
         let read = |store: &mut AlphaStore, reservation: &CampaignAttemptReservationV1| {
-            store.with_campaign_platform_budget(&verified, reservation, t0, |value| {
+            store.with_campaign_platform_budget_with_clock(&verified, reservation, t0, |value| {
                 Ok::<_, StoreError>(value.clone())
             })
         };
@@ -1311,7 +1311,7 @@ mod tests {
             at
         };
         store
-            .with_campaign_platform_budget(
+            .with_campaign_platform_budget_with_clock(
                 &verified,
                 &reservation,
                 || clock(t0()),
@@ -1361,7 +1361,7 @@ mod tests {
             request_sha256: "b".repeat(64),
         };
         let read = |store: &mut AlphaStore, transfer: &CampaignPlatformTransferV1| {
-            store.with_campaign_platform_export(&verified, &reservation, transfer, t0, |value| {
+            store.with_campaign_platform_export_with_clock(&verified, &reservation, transfer, t0, |value| {
                 Ok::<_, StoreError>(value.clone())
             })
         };
@@ -1383,7 +1383,7 @@ mod tests {
         different.request_sha256 = "c".repeat(64);
         assert!(read(&mut store, &different).is_err());
         let unknown =
-            store.with_campaign_platform_export(&verified, &reservation, &transfer, t0, |_| {
+            store.with_campaign_platform_export_with_clock(&verified, &reservation, &transfer, t0, |_| {
                 Err::<(), _>(err("unknown PG import outcome"))
             });
         assert!(unknown.is_err());
@@ -1432,7 +1432,7 @@ mod tests {
             }
             let mut called = false;
             let result =
-                store.with_campaign_platform_export(&verified, &reservation, &transfer, t0, |_| {
+                store.with_campaign_platform_export_with_clock(&verified, &reservation, &transfer, t0, |_| {
                     called = true;
                     Ok::<_, StoreError>(())
                 });
@@ -1445,7 +1445,7 @@ mod tests {
             .unwrap();
         let mut called = false;
         assert!(store
-            .with_campaign_platform_export(&verified, &reservation, &transfer, t0, |_| {
+            .with_campaign_platform_export_with_clock(&verified, &reservation, &transfer, t0, |_| {
                 called = true;
                 Ok::<_, StoreError>(())
             })

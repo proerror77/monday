@@ -1,7 +1,7 @@
 //! Independently observed immutable worker configuration. Caller hashes and
 //! `immutable: true` alone cannot construct this proof.
 use super::super::decode_base64;
-use crate::prediction_dispatch::{kubectl_binary, kubectl_json};
+use hft_research_dispatch_io::{kubectl_binary, kubectl_json};
 use anyhow::{ensure, Context};
 use serde::Deserialize;
 use serde_json::Value;

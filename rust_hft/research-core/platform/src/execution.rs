@@ -131,6 +131,51 @@ pub struct ExecutionHandle {
     pub request_sha256: String,
 }
 
+/// Public resource identity only. Credential bytes never enter the task ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptIdentityRef {
+    pub secret_name: String,
+    pub secret_uid: String,
+    pub scope_sha256: String,
+    pub native_evidence_sha256: String,
+    pub data_sha256: String,
+    pub attempt: u32,
+    pub fence: i64,
+    pub deadline_ms: i64,
+    pub launch_lease: Lease,
+}
+impl AttemptIdentityRef {
+    pub fn validate(&self, spec: &TaskSpec, lease: &Lease) -> Result<()> {
+        ensure!(
+            spec.kind == crate::orchestrator::TaskKind::CexCampaign
+                && self.secret_name == format!("{}-identity", resource_name(lease))
+                && !self.secret_uid.is_empty()
+                && self.secret_uid.len() <= 128
+                && [
+                    &self.scope_sha256,
+                    &self.native_evidence_sha256,
+                    &self.data_sha256
+                ]
+                .into_iter()
+                .all(|v| valid_digest(v))
+                && self.attempt == lease.attempt
+                && self.fence == lease.fence
+                && self.deadline_ms > 0,
+            "late identity changed Attempt scope"
+        );
+        ensure!(
+            self.launch_lease.task_id == lease.task_id
+                && self.launch_lease.attempt == lease.attempt
+                && self.launch_lease.fence == lease.fence
+                && self.launch_lease.owner == lease.owner
+                && self.launch_lease.expires_ms > 0,
+            "late identity changed launch context"
+        );
+        Ok(())
+    }
+}
+
 impl ExecutionHandle {
     pub fn validate(&self, lease: &Lease, spec: &TaskSpec) -> Result<()> {
         ensure!(
@@ -316,7 +361,8 @@ pub struct Kubernetes {
 impl Kubernetes {
     /// Read-only configuration check on the exact accepted Kubernetes target.
     /// A name, digest supplied by a caller, or immutable flag alone is insufficient.
-    pub async fn verify_worker_configuration(&self, spec: &TaskSpec) -> Result<()> {
+    pub async fn verify_worker_configuration(&self, spec: &TaskSpec) -> Result<Option<String>> {
+        let mut native_trust_sha256 = None;
         if let Some(expected) = &spec.worker_configuration {
             let path = format!(
                 "/api/v1/namespaces/{}/secrets/{}",
@@ -346,8 +392,17 @@ impl Kubernetes {
                 )? == *expected,
                 "worker configuration contents changed"
             );
+            if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(
+                    data.get("native-trust.json")
+                        .context("Campaign configuration lacks native trust")?,
+                )?;
+                let trust: crate::admission::NativeAdmissionTrust = serde_json::from_slice(&bytes)?;
+                native_trust_sha256 = Some(identity(&trust)?);
+            }
         }
-        Ok(())
+        Ok(native_trust_sha256)
     }
     pub fn new(endpoint: &str, token: String, cluster: String, ca_pem: &[u8]) -> Result<Self> {
         let endpoint = reqwest::Url::parse(endpoint)?;
@@ -355,7 +410,9 @@ impl Kubernetes {
             endpoint.scheme() == "https"
                 && endpoint.username().is_empty()
                 && endpoint.password().is_none()
-                && endpoint.query().is_none(),
+                && endpoint.query().is_none()
+                && endpoint.fragment().is_none()
+                && endpoint.host_str().is_some(),
             "invalid Kubernetes endpoint"
         );
         ensure!(
@@ -365,6 +422,9 @@ impl Kubernetes {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
+            .https_only(true)
+            .no_proxy()
+            .tls_built_in_root_certs(false)
             .add_root_certificate(reqwest::Certificate::from_pem(ca_pem)?)
             .build()?;
         Ok(Self {
@@ -415,7 +475,8 @@ impl Kubernetes {
         acceptance: &Acceptance,
         checkpoint: Option<&crate::orchestrator::Checkpoint>,
         remaining_ms: i64,
-    ) -> Result<ExecutionHandle> {
+        identity: Option<&crate::artifact_identity::IssuedAttemptIdentity>,
+    ) -> Result<(ExecutionHandle, Option<AttemptIdentityRef>)> {
         ensure!(
             self.cluster == spec.profile.cluster,
             "target cluster mismatch"
@@ -424,12 +485,28 @@ impl Kubernetes {
             remaining_ms > 0 && remaining_ms <= spec.timeout_ms,
             "invalid remaining deadline"
         );
-        self.verify_worker_configuration(spec).await?;
-        ensure!(
-            spec.kind != crate::orchestrator::TaskKind::CexCampaign,
-            "native Campaign launch requires controlled per-Attempt identity issuance"
-        );
+        let native_trust = self.verify_worker_configuration(spec).await?;
+        let mut attempt_identity = if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+            let issued = identity.context(
+                "native Campaign launch requires controlled per-Attempt identity issuance",
+            )?;
+            issued.matches_context(&crate::orchestrator::AttemptContext {
+                spec: spec.clone(),
+                lease: lease.clone(),
+            })?;
+            ensure!(
+                native_trust.as_deref() == Some(issued.native_trust_sha256()),
+                "static native trust differs from verified PG admission"
+            );
+            Some(self.prepare_attempt_identity(spec, lease, issued).await?)
+        } else {
+            ensure!(identity.is_none(), "unexpected late Campaign identity");
+            None
+        };
         let mut resource = render(spec, lease, acceptance)?;
+        if let Some(reference) = &attempt_identity {
+            install_attempt_identity(&mut resource, reference)?;
+        }
         resource["spec"]["template"]["spec"]["activeDeadlineSeconds"] =
             json!((remaining_ms + 999) / 1000);
         if spec.profile.backend != Backend::AgentSandbox {
@@ -451,6 +528,12 @@ impl Kubernetes {
         let object = if let Some(existing) = existing {
             existing
         } else {
+            if let Some(issued) = identity {
+                let remaining = identity_remaining_ms(issued, lease)?.min(remaining_ms);
+                resource["spec"]["activeDeadlineSeconds"] = json!((remaining + 999) / 1000);
+                resource["spec"]["template"]["spec"]["activeDeadlineSeconds"] =
+                    json!((remaining + 999) / 1000);
+            }
             let response = self
                 .client
                 .post(self.endpoint.join(&collection)?)
@@ -470,7 +553,165 @@ impl Kubernetes {
                 .await?
                 .context("launch outcome unresolved; reconcile same resource")?
         };
-        self.handle(&object, spec, lease)
+        if let Some(reference) = &mut attempt_identity {
+            let worker = object["spec"]["template"]["spec"]["containers"]
+                .as_array()
+                .and_then(|cs| cs.iter().find(|c| c["name"] == "worker"))
+                .context("worker missing")?;
+            let context = read_launch_context(worker)?;
+            ensure!(
+                context.spec == *spec
+                    && context.lease.task_id == lease.task_id
+                    && context.lease.attempt == lease.attempt
+                    && context.lease.fence == lease.fence
+                    && context.lease.owner == lease.owner,
+                "recovered Job changed launch context"
+            );
+            reference.launch_lease = context.lease;
+            reference.validate(spec, lease)?;
+            let mut original = render(spec, &reference.launch_lease, acceptance)?;
+            install_attempt_identity(&mut original, reference)?;
+            for pointer in [
+                "/metadata/annotations",
+                "/spec/template/metadata/annotations",
+            ] {
+                ensure!(
+                    object
+                        .pointer(pointer)
+                        .is_some_and(|annotations| annotations["monday.io/identity-secret-uid"]
+                            == reference.secret_uid
+                            && annotations["monday.io/identity-scope-sha256"]
+                                == reference.scope_sha256),
+                    "Job late identity drift"
+                );
+            }
+            ensure!(
+                object["spec"]["template"]["spec"]["volumes"]
+                    == original["spec"]["template"]["spec"]["volumes"],
+                "Job late mount drift"
+            );
+            let actual = object["spec"]["template"]["spec"]["initContainers"]
+                .as_array()
+                .context("Job initializer missing")?;
+            ensure!(actual.len() == 1, "unexpected Job initializer");
+            let expected = &original["spec"]["template"]["spec"]["initContainers"][0];
+            for field in [
+                "name",
+                "image",
+                "command",
+                "env",
+                "securityContext",
+                "volumeMounts",
+            ] {
+                ensure!(actual[0][field] == expected[field], "Job initializer drift");
+            }
+            verify_cpu_resources(worker, &spec.profile)?;
+            verify_cpu_resources(&actual[0], &spec.profile)?;
+            let pod_spec = &object["spec"]["template"]["spec"];
+            ensure!(
+                pod_spec["serviceAccountName"] == spec.profile.service_account
+                    && pod_spec["automountServiceAccountToken"] == false
+                    && pod_spec["nodeSelector"]["kubernetes.io/arch"] == spec.profile.architecture
+                    && pod_spec["nodeSelector"]["workload"] == "backtest"
+                    && object["spec"]["backoffLimit"] == 0,
+                "Job admission resources changed"
+            );
+            for value in [
+                &object["spec"]["activeDeadlineSeconds"],
+                &pod_spec["activeDeadlineSeconds"],
+            ] {
+                ensure!(
+                    value
+                        .as_i64()
+                        .is_some_and(|n| n > 0 && n <= (spec.timeout_ms + 999) / 1000),
+                    "Job deadline drift"
+                );
+            }
+        }
+        Ok((self.handle(&object, spec, lease)?, attempt_identity))
+    }
+
+    async fn prepare_attempt_identity(
+        &self,
+        spec: &TaskSpec,
+        lease: &Lease,
+        issued: &crate::artifact_identity::IssuedAttemptIdentity,
+    ) -> Result<AttemptIdentityRef> {
+        use base64::Engine;
+        let name = format!("{}-identity", resource_name(lease));
+        let data: std::collections::BTreeMap<String, String> = issued
+            .late_files()
+            .iter()
+            .map(|(name, bytes)| {
+                (
+                    name.clone(),
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                )
+            })
+            .collect();
+        let collection = format!("/api/v1/namespaces/{}/secrets", spec.profile.namespace);
+        let path = format!("{collection}/{name}");
+        let resource = json!({"apiVersion":"v1","kind":"Secret","type":"Opaque","immutable":true,"metadata":{"name":name,"namespace":spec.profile.namespace,"labels":{"monday.io/task":task_label(&lease.task_id),"monday.io/attempt":lease.attempt.to_string(),"monday.io/fence":lease.fence.to_string()},"annotations":{"monday.io/identity-scope-sha256":issued.scope_id(),"monday.io/native-evidence-sha256":issued.native_evidence_sha256(),"monday.io/identity-deadline-ms":issued.deadline_ms().to_string()}},"data":data});
+        if self.read(&path).await?.is_none() {
+            identity_remaining_ms(issued, lease)?;
+            match self
+                .client
+                .post(self.endpoint.join(&collection)?)
+                .bearer_auth(&self.token)
+                .json(&resource)
+                .send()
+                .await
+            {
+                Ok(response)
+                    if response.status().is_success()
+                        || response.status() == reqwest::StatusCode::CONFLICT => {}
+                Ok(response) => {
+                    response.error_for_status()?;
+                }
+                Err(_) => {} // Private journal and deterministic name arm recovery.
+            }
+        }
+        let object = self
+            .read(&path)
+            .await?
+            .context("late identity outcome unresolved; reconcile same Secret")?;
+        identity_reference(&object, spec, lease, issued)
+    }
+
+    /// Call only after the original process tree stopped. UID preconditions
+    /// protect another writer's resource; absence is read back before cleanup.
+    pub async fn cleanup_attempt_identity(
+        &self,
+        spec: &TaskSpec,
+        lease: &Lease,
+        known: Option<&AttemptIdentityRef>,
+        issued: Option<&crate::artifact_identity::IssuedAttemptIdentity>,
+    ) -> Result<bool> {
+        let path = format!(
+            "/api/v1/namespaces/{}/secrets/{}-identity",
+            spec.profile.namespace,
+            resource_name(lease)
+        );
+        let Some(object) = self.read(&path).await? else {
+            return Ok(true);
+        };
+        let mut reference = if let Some(issued) = issued {
+            identity_reference(&object, spec, lease, issued)?
+        } else {
+            known
+                .context("orphan late identity lacks owned journal or ledger reference")?
+                .clone()
+        };
+        if let Some(known) = known {
+            reference.launch_lease = known.launch_lease.clone();
+        }
+        reference.validate(spec, lease)?;
+        if let Some(known) = known {
+            ensure!(known == &reference, "late identity cleanup UID drift");
+        }
+        verify_identity_reference(&object, spec, &reference)?;
+        self.client.delete(self.endpoint.join(&path)?).bearer_auth(&self.token).json(&json!({"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":reference.secret_uid}})).send().await?.error_for_status()?;
+        Ok(self.read(&path).await?.is_none())
     }
 
     fn handle(&self, object: &Value, spec: &TaskSpec, lease: &Lease) -> Result<ExecutionHandle> {
@@ -634,6 +875,222 @@ impl Kubernetes {
 }
 
 #[cfg(feature = "control")]
+fn read_launch_context(worker: &Value) -> Result<crate::orchestrator::AttemptContext> {
+    let env = worker["env"]
+        .as_array()
+        .context("launch environment missing")?;
+    let values: Vec<_> = env
+        .iter()
+        .filter(|v| v["name"] == "MONDAY_ATTEMPT_CONTEXT")
+        .collect();
+    ensure!(values.len() == 1, "ambiguous launch context");
+    let value = values[0]["value"]
+        .as_str()
+        .context("launch context missing")?;
+    ensure!(value.len() <= 64 * 1024, "launch context exceeds bound");
+    let context: crate::orchestrator::AttemptContext = serde_json::from_str(value)?;
+    context.validate()?;
+    Ok(context)
+}
+
+#[cfg(feature = "control")]
+fn verify_cpu_resources(container: &Value, profile: &Profile) -> Result<()> {
+    for section in ["requests", "limits"] {
+        let map = container["resources"][section]
+            .as_object()
+            .context("worker resource contract missing")?;
+        ensure!(
+            map.len() == 2 && map.contains_key("cpu") && map.contains_key("memory"),
+            "unadmitted worker resource"
+        );
+        let cpu = map["cpu"].as_str().context("CPU quantity missing")?;
+        let millis = if let Some(value) = cpu.strip_suffix('m') {
+            value.parse::<u64>()?
+        } else {
+            let (whole, fraction) = cpu.split_once('.').unwrap_or((cpu, ""));
+            ensure!(
+                fraction.len() <= 3 && fraction.bytes().all(|c| c.is_ascii_digit()),
+                "invalid CPU quantity"
+            );
+            let whole = whole
+                .parse::<u64>()?
+                .checked_mul(1000)
+                .context("CPU quantity overflow")?;
+            let sub = if fraction.is_empty() {
+                0
+            } else {
+                fraction
+                    .parse::<u64>()?
+                    .checked_mul(10_u64.pow(u32::try_from(3 - fraction.len())?))
+                    .context("CPU quantity overflow")?
+            };
+            whole.checked_add(sub).context("CPU quantity overflow")?
+        };
+        let memory = map["memory"].as_str().context("memory quantity missing")?;
+        let bytes = if let Some(value) = memory.strip_suffix("Mi") {
+            value
+                .parse::<u64>()?
+                .checked_mul(1024 * 1024)
+                .context("memory overflow")?
+        } else if let Some(value) = memory.strip_suffix("Gi") {
+            value
+                .parse::<u64>()?
+                .checked_mul(1024 * 1024 * 1024)
+                .context("memory overflow")?
+        } else {
+            memory.parse::<u64>()?
+        };
+        ensure!(
+            millis == u64::from(profile.cpu_millis)
+                && bytes == u64::from(profile.memory_mib) * 1024 * 1024,
+            "worker resources exceed signed profile"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "control")]
+fn identity_remaining_ms(
+    issued: &crate::artifact_identity::IssuedAttemptIdentity,
+    lease: &Lease,
+) -> Result<i64> {
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    ensure!(
+        lease.expires_ms > now,
+        "Attempt lease expired before provider mutation"
+    );
+    let remaining = issued
+        .deadline_ms()
+        .checked_sub(now)
+        .context("Attempt identity deadline overflow")?;
+    ensure!(
+        remaining > 0,
+        "Attempt identity expired before provider mutation"
+    );
+    Ok(remaining)
+}
+
+#[cfg(feature = "control")]
+fn identity_reference(
+    object: &Value,
+    spec: &TaskSpec,
+    lease: &Lease,
+    issued: &crate::artifact_identity::IssuedAttemptIdentity,
+) -> Result<AttemptIdentityRef> {
+    use base64::Engine;
+    let data: std::collections::BTreeMap<String, String> = issued
+        .late_files()
+        .iter()
+        .map(|(name, bytes)| {
+            (
+                name.clone(),
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            )
+        })
+        .collect();
+    ensure!(
+        object["data"] == serde_json::to_value(&data)?,
+        "late identity bytes differ from owned journal"
+    );
+    let uid = object["metadata"]["uid"]
+        .as_str()
+        .context("late identity UID missing")?
+        .to_owned();
+    let name = format!("{}-identity", resource_name(lease));
+    let reference = AttemptIdentityRef {
+        secret_name: name.clone(),
+        secret_uid: uid.clone(),
+        scope_sha256: issued.scope_id().into(),
+        native_evidence_sha256: issued.native_evidence_sha256().into(),
+        data_sha256: identity(&(
+            "monday.attempt_identity_secret_contents.v1",
+            &spec.profile.namespace,
+            &name,
+            &uid,
+            &data,
+        ))?,
+        attempt: lease.attempt,
+        fence: lease.fence,
+        deadline_ms: issued.deadline_ms(),
+        launch_lease: lease.clone(),
+    };
+    reference.validate(spec, lease)?;
+    verify_identity_reference(object, spec, &reference)?;
+    Ok(reference)
+}
+
+#[cfg(feature = "control")]
+fn verify_identity_reference(
+    object: &Value,
+    spec: &TaskSpec,
+    reference: &AttemptIdentityRef,
+) -> Result<()> {
+    ensure!(
+        object["kind"] == "Secret"
+            && object["type"] == "Opaque"
+            && object["immutable"] == true
+            && object["metadata"]["name"] == reference.secret_name
+            && object["metadata"]["namespace"] == spec.profile.namespace
+            && object["metadata"]["uid"] == reference.secret_uid
+            && object["metadata"]["labels"]["monday.io/task"] == task_label(&spec.id()?)
+            && object["metadata"]["labels"]["monday.io/attempt"]
+                .as_str()
+                .and_then(|v| v.parse::<u32>().ok())
+                == Some(reference.attempt)
+            && object["metadata"]["labels"]["monday.io/fence"]
+                .as_str()
+                .and_then(|v| v.parse::<i64>().ok())
+                == Some(reference.fence)
+            && object["metadata"]["annotations"]["monday.io/identity-scope-sha256"]
+                == reference.scope_sha256
+            && object["metadata"]["annotations"]["monday.io/native-evidence-sha256"]
+                == reference.native_evidence_sha256
+            && object["metadata"]["annotations"]["monday.io/identity-deadline-ms"]
+                .as_str()
+                .and_then(|v| v.parse::<i64>().ok())
+                == Some(reference.deadline_ms),
+        "late identity metadata drift"
+    );
+    let data: std::collections::BTreeMap<String, String> =
+        serde_json::from_value(object["data"].clone())?;
+    ensure!(
+        identity(&(
+            "monday.attempt_identity_secret_contents.v1",
+            &spec.profile.namespace,
+            &reference.secret_name,
+            &reference.secret_uid,
+            &data
+        ))? == reference.data_sha256,
+        "late identity contents drift"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "control")]
+fn install_attempt_identity(resource: &mut Value, reference: &AttemptIdentityRef) -> Result<()> {
+    for pointer in [
+        "/metadata/annotations",
+        "/spec/template/metadata/annotations",
+    ] {
+        let annotations = resource
+            .pointer_mut(pointer)
+            .context("Job annotations missing")?;
+        annotations["monday.io/identity-secret-uid"] = json!(reference.secret_uid);
+        annotations["monday.io/identity-scope-sha256"] = json!(reference.scope_sha256);
+    }
+    resource["spec"]["template"]["spec"]["volumes"].as_array_mut().context("Job volumes missing")?.push(json!({"name":"identity-inputs","secret":{"secretName":reference.secret_name,"defaultMode":288}}));
+    resource["spec"]["template"]["spec"]["initContainers"][0]["volumeMounts"]
+        .as_array_mut()
+        .context("Job initialization missing")?
+        .push(json!({"name":"identity-inputs","mountPath":"/identity-inputs","readOnly":true}));
+    Ok(())
+}
+
+#[cfg(feature = "control")]
 fn job_has_terminal_condition(job: &Value) -> bool {
     job["status"]["conditions"]
         .as_array()
@@ -753,6 +1210,253 @@ fn retained_job_stopped(job: &Value, pods: &Value, handle: &ExecutionHandle) -> 
 #[cfg(all(test, feature = "control"))]
 mod stop_tests {
     use super::*;
+    #[test]
+    fn cpu_readback_accepts_api_normalization_and_rejects_resource_expansion() {
+        let spec = cex_spec();
+        let mut worker = json!({"resources":{"requests":{"cpu":"1","memory":"134217728"},"limits":{"cpu":"1000m","memory":"128Mi"}}});
+        verify_cpu_resources(&worker, &spec.profile).unwrap();
+        worker["resources"]["limits"]["cpu"] = json!("1.001");
+        assert!(verify_cpu_resources(&worker, &spec.profile).is_err());
+        worker["resources"]["limits"]["cpu"] = json!("1");
+        worker["resources"]["limits"]["nvidia.com/gpu"] = json!("1");
+        assert!(verify_cpu_resources(&worker, &spec.profile).is_err());
+    }
+    #[derive(Default)]
+    struct ApiFixture {
+        objects: std::collections::BTreeMap<String, Value>,
+        job_posts: u32,
+        deletes: u32,
+    }
+    async fn fixture_api(
+        axum::extract::State(state): axum::extract::State<
+            std::sync::Arc<tokio::sync::Mutex<ApiFixture>>,
+        >,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let mut state = state.lock().await;
+        let path = uri.path().to_owned();
+        match method {
+            axum::http::Method::GET => match state.objects.get(&path) {
+                Some(v) => axum::Json(v.clone()).into_response(),
+                None => axum::http::StatusCode::NOT_FOUND.into_response(),
+            },
+            axum::http::Method::POST => {
+                let mut value: Value = serde_json::from_slice(&body).unwrap();
+                let name = value["metadata"]["name"].as_str().unwrap().to_owned();
+                let is_job = path.ends_with("/jobs");
+                value["metadata"]["uid"] = json!(if is_job {
+                    "original-job"
+                } else {
+                    "original-late-secret"
+                });
+                state.objects.insert(format!("{path}/{name}"), value);
+                if is_job {
+                    state.job_posts += 1;
+                    // The first request creates the Job, then reports failure.
+                    // A later reconciliation must recover the existing object.
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                } else {
+                    axum::http::StatusCode::CREATED.into_response()
+                }
+            }
+            axum::http::Method::DELETE => {
+                let options: Value = serde_json::from_slice(&body).unwrap();
+                if state
+                    .objects
+                    .get(&path)
+                    .is_none_or(|v| v["metadata"]["uid"] != options["preconditions"]["uid"])
+                {
+                    return axum::http::StatusCode::CONFLICT.into_response();
+                }
+                state.deletes += 1;
+                state.objects.remove(&path);
+                axum::http::StatusCode::OK.into_response()
+            }
+            _ => axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn launcher_recovers_original_context_and_cleans_only_owned_secret() -> Result<()> {
+        use base64::Engine;
+        let mut spec = cex_spec();
+        let trust = crate::admission::NativeAdmissionTrust {
+            schema: "transport-fixture".into(),
+            native_reservation_keys: Default::default(),
+        };
+        let data: std::collections::BTreeMap<String, String> = [
+            ("campaign.json".into(), "e30=".into()),
+            ("artifact-io.json".into(), "e30=".into()),
+            (
+                "native-trust.json".into(),
+                base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&trust)?),
+            ),
+        ]
+        .into();
+        spec.worker_configuration = Some(crate::orchestrator::worker_configuration_reference(
+            "research",
+            "configuration",
+            "configuration-original",
+            &data,
+        )?);
+        let mut task = crate::orchestrator::Task::new(spec.clone())?;
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        let lease = task.claim("owner", now, 120_000)?;
+        let (_files, issuer, issued) =
+            crate::artifact_identity::launcher_fixture(&spec, &lease, identity(&trust)?)?;
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(ApiFixture::default()));
+        state.lock().await.objects.insert("/api/v1/namespaces/research/secrets/configuration".into(),json!({"kind":"Secret","type":"Opaque","immutable":true,"metadata":{"name":"configuration","namespace":"research","uid":"configuration-original"},"data":data}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let router = axum::Router::new()
+            .fallback(axum::routing::any(fixture_api))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        // Loopback transport is test-only; the production constructor pins HTTPS.
+        let kubernetes = Kubernetes {
+            client: reqwest::Client::builder().no_proxy().build()?,
+            endpoint: reqwest::Url::parse(&format!("http://{address}"))?,
+            token: "fixture".into(),
+            cluster: spec.profile.cluster.clone(),
+        };
+        let acceptance = Acceptance {
+            profile: spec.profile.clone(),
+            ready: true,
+            process_tree_stop: true,
+            immutable_prepared_mount: false,
+            command_reattach: false,
+            artifact_readback: true,
+        };
+        assert!(kubernetes
+            .launch(&spec, &lease, &acceptance, None, 5000, Some(&issued))
+            .await
+            .is_err());
+        let mut renewed = lease.clone();
+        renewed.expires_ms += 4000;
+        let (handle, reference) = kubernetes
+            .launch(&spec, &renewed, &acceptance, None, 4000, Some(&issued))
+            .await?;
+        let reference = reference.unwrap();
+        assert_eq!(handle.uid, "original-job");
+        assert_eq!(reference.launch_lease, lease);
+        assert_ne!(reference.launch_lease.expires_ms, renewed.expires_ms);
+        assert_eq!(state.lock().await.job_posts, 1);
+        let path = format!(
+            "/api/v1/namespaces/research/secrets/{}",
+            reference.secret_name
+        );
+        let original = state.lock().await.objects[&path].clone();
+        state.lock().await.objects.get_mut(&path).unwrap()["metadata"]["uid"] = json!("foreign");
+        assert!(kubernetes
+            .cleanup_attempt_identity(&spec, &renewed, Some(&reference), Some(&issued))
+            .await
+            .is_err());
+        assert_eq!(state.lock().await.deletes, 0);
+        state.lock().await.objects.insert(path.clone(), original);
+        assert!(
+            kubernetes
+                .cleanup_attempt_identity(&spec, &renewed, Some(&reference), Some(&issued))
+                .await?
+        );
+        assert!(!state.lock().await.objects.contains_key(&path));
+        issuer.cleanup(issued)?;
+        server.abort();
+        Ok(())
+    }
+    fn cex_spec() -> TaskSpec {
+        TaskSpec {
+            schema: 1,
+            kind: crate::orchestrator::TaskKind::CexCampaign,
+            run_manifest_sha256: "a".repeat(64),
+            view_manifest_sha256: "b".repeat(64),
+            source_sha256: "c".repeat(64),
+            image: format!("fixture@sha256:{}", "d".repeat(64)),
+            command: vec!["/app/worker".into()],
+            profile: Profile {
+                backend: Backend::KubernetesJob,
+                cluster: "fixture".into(),
+                namespace: "research".into(),
+                service_account: "worker".into(),
+                architecture: "amd64".into(),
+                cpu_millis: 1000,
+                memory_mib: 128,
+                scratch_mib: 32,
+                gpu: 0,
+                acceptance_sha256: "e".repeat(64),
+                prepared_pvc: None,
+                worker_secret: Some("configuration".into()),
+            },
+            timeout_ms: 10_000,
+            max_attempts: 1,
+            output_prefix: "research/results".into(),
+            fit_identity_sha256: None,
+            worker_configuration: Some(crate::orchestrator::WorkerConfigurationRef {
+                schema: "monday.worker_configuration.v1".into(),
+                secret_name: "configuration".into(),
+                secret_uid: "static-uid".into(),
+                configuration_sha256: "f".repeat(64),
+            }),
+        }
+    }
+
+    #[test]
+    fn late_secret_identity_rejects_uid_and_byte_substitution() {
+        let spec = cex_spec();
+        let mut task = crate::orchestrator::Task::new(spec.clone()).unwrap();
+        let lease = task.claim("owner", 1000, 1000).unwrap();
+        let name = format!("{}-identity", resource_name(&lease));
+        let data: std::collections::BTreeMap<String, String> = [
+            ("artifact.token".into(), "Zml4dHVyZS10b2tlbg==".into()),
+            ("native-admission.json".into(), "e30=".into()),
+        ]
+        .into();
+        let reference = AttemptIdentityRef {
+            secret_name: name.clone(),
+            secret_uid: "original".into(),
+            scope_sha256: "a".repeat(64),
+            native_evidence_sha256: "b".repeat(64),
+            data_sha256: identity(&(
+                "monday.attempt_identity_secret_contents.v1",
+                &spec.profile.namespace,
+                &name,
+                "original",
+                &data,
+            ))
+            .unwrap(),
+            attempt: lease.attempt,
+            fence: lease.fence,
+            deadline_ms: 11000,
+            launch_lease: lease.clone(),
+        };
+        let object = json!({"kind":"Secret","type":"Opaque","immutable":true,"metadata":{"name":name,"namespace":"research","uid":"original","labels":{"monday.io/task":task_label(&task.id),"monday.io/attempt":"1","monday.io/fence":"1"},"annotations":{"monday.io/identity-scope-sha256":reference.scope_sha256,"monday.io/native-evidence-sha256":reference.native_evidence_sha256,"monday.io/identity-deadline-ms":"11000"}},"data":data});
+        verify_identity_reference(&object, &spec, &reference).unwrap();
+        let mut changed = object.clone();
+        changed["metadata"]["uid"] = json!("foreign");
+        assert!(verify_identity_reference(&changed, &spec, &reference).is_err());
+        let mut changed = object.clone();
+        changed["data"]["artifact.token"] = json!("Y2hhbmdlZA==");
+        assert!(verify_identity_reference(&changed, &spec, &reference).is_err());
+        let mut changed = object.clone();
+        changed["immutable"] = json!(false);
+        assert!(verify_identity_reference(&changed, &spec, &reference).is_err());
+        let mut changed = object;
+        changed["metadata"]["labels"]["monday.io/fence"] = json!("2");
+        assert!(verify_identity_reference(&changed, &spec, &reference).is_err());
+        let context = crate::orchestrator::AttemptContext { spec, lease };
+        let value = serde_json::to_string(&context).unwrap();
+        let mut worker = json!({"env":[{"name":"MONDAY_ATTEMPT_CONTEXT","value":value}]});
+        assert_eq!(read_launch_context(&worker).unwrap(), context);
+        let duplicate = worker["env"][0].clone();
+        worker["env"].as_array_mut().unwrap().push(duplicate);
+        assert!(read_launch_context(&worker).is_err());
+    }
     fn fixture() -> (Value, Value, ExecutionHandle) {
         let metadata = json!({"labels":{"monday.io/task":"task","monday.io/attempt":"1","monday.io/fence":"2"},"annotations":{"monday.io/request-sha256":"request"}});
         let spec = json!({"containers":[{"name":"worker","image":"fixture@sha256:abc"}],"initContainers":[{"name":"configuration","image":"fixture@sha256:abc"}]});

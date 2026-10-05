@@ -179,7 +179,7 @@ impl Ledger {
             terminal_event.document == task && terminal_event.event == "stop_reconciled",
             "terminal lacks reconciled process-tree stop event"
         );
-        let execution = query("SELECT revision,event,document FROM research.events WHERE task_id=$1 AND revision<$2 AND document->'execution' IS NOT NULL AND document->'execution'<>'null'::jsonb AND (document->>'attempt')::integer=$3 ORDER BY revision DESC LIMIT 1")
+        let execution = query("SELECT revision,event,document FROM research.events WHERE task_id=$1 AND revision<$2 AND document->'execution' IS NOT NULL AND document->'execution'<>'null'::jsonb AND (document->>'attempt')::integer=$3 ORDER BY revision ASC LIMIT 1")
             .bind(request).bind(revision).bind(i32::try_from(task.attempt)?).fetch_optional(&mut *tx).await?;
         let execution_event = execution
             .map(|row| -> Result<_> {
@@ -971,6 +971,18 @@ impl Ledger {
 }
 
 impl LockedTask {
+    pub async fn issue_attempt_identity(
+        &mut self,
+        issuer: &crate::artifact_identity::AttemptIdentityIssuer,
+    ) -> Result<crate::artifact_identity::IssuedAttemptIdentity> {
+        issuer.issue_for_task(&mut self.tx, &self.task).await
+    }
+    pub async fn recover_attempt_identity_for_cleanup(
+        &mut self,
+        issuer: &crate::artifact_identity::AttemptIdentityIssuer,
+    ) -> Result<Option<crate::artifact_identity::IssuedAttemptIdentity>> {
+        issuer.recover_for_cleanup(&mut self.tx, &self.task).await
+    }
     /// Order provider reconciliation against native/manual revocation imports.
     /// A scheduled future witness caps execution without cancelling it early.
     pub async fn native_request_deadline_ms(&mut self) -> Result<Option<i64>> {

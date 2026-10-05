@@ -3,6 +3,8 @@ use hft_research_artifacts::publish_immutable_file;
 use hft_research_artifacts::{fetch_to_file, normalized_sha256};
 pub(crate) mod final_evaluation;
 pub(crate) mod market_encoder;
+#[cfg(feature = "scientific")]
+mod platform_output;
 pub(crate) mod preparation;
 pub(crate) mod prepared_inputs;
 pub(crate) mod sequence;
@@ -17,6 +19,8 @@ use crate::cli::CampaignLearnArgs;
 use crate::cli::CampaignStudyProposeArgs;
 use crate::cli::BUILD_SOURCE_REVISION;
 use crate::mission_dispatch;
+use crate::mission_objects::cex_campaign_round_root;
+use crate::mission_objects::cex_global_holdout_claim_object;
 use crate::mission_render::allowed_research_feature_fields;
 use crate::mission_render::render_cex_bundle;
 use crate::mission_render::render_prepared_cex_bundle;
@@ -44,10 +48,6 @@ use crate::mission_runner::CexSupervisedModelSelectionV1;
 use crate::mission_runner::ExecutionBinding;
 use crate::mission_runner::CEX_SUPERVISED_MODEL_NAMES;
 use crate::mission_runner::MAX_RESULT_BUNDLE_BYTES;
-use crate::prediction_dispatch::canonical_tokyo_oss_internal_object;
-use crate::prediction_dispatch::cex_campaign_round_root;
-use crate::prediction_dispatch::cex_global_holdout_claim_object;
-use crate::prediction_dispatch::validate_dns_label;
 use alpha_domain::{
     campaign_horizon::{
         CampaignLabelHorizonV1, CampaignNextFamilyInputWindowV1, CampaignNextFamilyParentV1,
@@ -59,6 +59,8 @@ use alpha_domain::{
 use alpha_engine::{baselines::CexSupervisedModelCandidateV2, engines::CexFactorBankMctsResultV1};
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
+use hft_research_dispatch_io::canonical_tokyo_oss_internal_object;
+use hft_research_dispatch_io::validate_dns_label;
 #[cfg(feature = "scientific")]
 use reqwest::StatusCode;
 use reqwest::{blocking::Client, redirect::Policy};
@@ -482,6 +484,19 @@ struct LoadedRequest {
 
 #[cfg(feature = "scientific")]
 pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
+    if std::env::var_os("MONDAY_ATTEMPT_CONTEXT").is_some() {
+        let plain = load_request(&args.request)
+            .context("platform CexCampaign requires the plain finalized native V6 request")?;
+        if args.final_evaluation
+            || !args.pre_holdout
+            || plain.request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V6
+            || plain.request.prepared_inputs.is_none()
+        {
+            bail!(
+                "platform CexCampaign cannot execute another native schema or withheld evaluation"
+            );
+        }
+    }
     if args.final_evaluation {
         return final_evaluation::execute(args);
     }
@@ -1425,6 +1440,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         &client,
         &shared_input_dir,
     )?;
+    let platform_output = platform_output::BoundOutput::from_environment(&loaded, &native_inputs)?;
     let render_inputs = native_inputs.render_inputs();
     research_event(
         "alpha-harness",
@@ -1504,6 +1520,10 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
                 &rendered.mission_id,
                 &mission_sha256,
                 &binding,
+                Some((
+                    native_inputs.finalized_request(),
+                    native_inputs.request_sha256(),
+                )),
             )? {
             extract_bundle(&recovered_result_path, &execute_dir)?;
             (report, true)
@@ -1534,6 +1554,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
                     binding,
                     &native_inputs,
                     render_inputs,
+                    &shared_input_dir,
                 )?,
                 false,
             )
@@ -1687,6 +1708,17 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             "consumed_trials": result.consumed_trials,
         }),
     );
+    if let Some(output) = platform_output {
+        tokio::runtime::Handle::try_current()
+            .context("platform worker requires the admitted async runtime")?
+            .block_on(output.publish(
+                &loaded,
+                &native_inputs,
+                &result,
+                &result_sha256,
+                &args.work_dir,
+            ))?;
+    }
     print_json(&serde_json::json!({
         "campaign_id": result.campaign_id,
         "request_sha256": result.request_sha256,
@@ -2110,7 +2142,7 @@ fn canonical_https_object_prefix(label: &str, value: &str) -> anyhow::Result<Str
         .context("campaign inputs output root host is missing")?;
     if !host.ends_with(&format!(
         ".{}",
-        crate::prediction_dispatch::TOKYO_OSS_INTERNAL_ENDPOINT
+        hft_research_dispatch_io::TOKYO_OSS_INTERNAL_ENDPOINT
     )) {
         bail!("{label} must target the Tokyo OSS internal endpoint");
     }
@@ -2739,7 +2771,7 @@ fn campaign_round_claim_urls(
             request.holdout_claim_readback_url.clone(),
         ))
     } else {
-        let claim = crate::prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+        let claim = crate::mission_objects::cex_campaign_round_result_and_holdout_claim(
             &round.result_put_url,
             &request.campaign_id,
             &round.round_id,
@@ -3339,6 +3371,10 @@ fn readback_pre_holdout_terminal_impl(
                 &expected.mission_id,
                 &expected.mission_sha256,
                 &binding,
+                request
+                    .prepared_inputs
+                    .as_ref()
+                    .map(|_| (request, request_sha256)),
             )?
         } else {
             recover_execution_report_from_published_result(
@@ -3348,6 +3384,10 @@ fn readback_pre_holdout_terminal_impl(
                 &expected.mission_id,
                 &expected.mission_sha256,
                 &binding,
+                request
+                    .prepared_inputs
+                    .as_ref()
+                    .map(|_| (request, request_sha256)),
             )
             .map_err(terminal_readback_error)?
             .context("terminal round bundle is absent")?
@@ -6021,6 +6061,181 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn execute_native_prepared_development_retains_exact_round_readbacks() {
+        let fixture = native_prepared_fixture_for_tests();
+        // Preparation is complete. Neither execution nor scientific ZIP
+        // recovery may reopen the original files containing withheld data.
+        for path in [
+            &fixture._source._render_fixture.feature_path,
+            &fixture._source._render_fixture.materialization_path,
+            &fixture._source.replay_artifact_path,
+            &fixture._source.replay_manifest_path,
+        ] {
+            std::fs::remove_file(path).unwrap();
+        }
+        let request_path = fixture._root.path().join("native-execute-request.json");
+        let request_bytes = serialize_request(&fixture.request).unwrap();
+        std::fs::write(&request_path, &request_bytes).unwrap();
+        let work_dir = fixture._root.path().join("native-execute");
+        execute(CampaignExecuteArgs {
+            final_evaluation: false,
+            final_trusted_keys: None,
+            pre_holdout: true,
+            work_dir: work_dir.clone(),
+            campaign_id: fixture.request.campaign_id.clone(),
+            image_identity: fixture.request.image_identity.clone(),
+            request: request_path,
+            request_sha256: hft_cex_research_input::sha256(&request_bytes),
+        })
+        .unwrap();
+
+        let result: CampaignResultV1 = serde_json::from_slice(
+            &std::fs::read(work_dir.join("campaign-result-readback.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.request_sha256, fixture.inputs.request_sha256());
+        assert_eq!(result.rounds.len(), fixture.request.rounds.len());
+        assert!(result.finalization.is_none());
+        assert!(!fixture._source.global_claim_path.exists());
+        for name in ["features.jsonl", "materialization.json", "replay.parquet"] {
+            assert!(!work_dir.join("shared-inputs").join(name).exists());
+        }
+        for round in &fixture.request.rounds {
+            let execute_dir = work_dir.join(format!("mission/{}/execute", round.round_id));
+            crate::mission_runner::validate_native_campaign_result_binding(
+                &execute_dir.join("results"),
+                &fixture.inputs,
+            )
+            .unwrap();
+            let report = recover_round_report(&work_dir, &fixture.request, round);
+            let ledger = collect_round_ledger(&execute_dir, round, &report).unwrap();
+            let published = result
+                .rounds
+                .iter()
+                .find(|item| item.round_id == round.round_id)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(ledger).unwrap(),
+                serde_json::to_value(published).unwrap()
+            );
+        }
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let (_, consumed, hash) = readback_pre_holdout_terminal(
+            &client,
+            &fixture.request,
+            fixture.inputs.request_sha256(),
+            fixture.inputs.evaluation_protocol_sha256(),
+        )
+        .unwrap();
+        assert_eq!(consumed, result.consumed_trials as u64);
+        assert_eq!(
+            hash,
+            hft_research_artifacts::sha256_file(&work_dir.join("campaign-result-readback.json"))
+                .unwrap()
+        );
+
+        let round = &result.rounds[0];
+        let binding = ExecutionBinding::Campaign {
+            campaign_id: fixture.request.campaign_id.clone(),
+            round_id: round.round_id.clone(),
+            request_sha256: fixture.inputs.request_sha256().into(),
+        };
+        let source_zip = Path::new(&fixture.request.rounds[0].result_readback_url);
+        let expected_native = Some((
+            fixture.inputs.finalized_request(),
+            fixture.inputs.request_sha256(),
+        ));
+        assert!(
+            recover_execution_report_from_cached_result(
+                source_zip,
+                &round.result_bundle_sha256,
+                &round.mission_id,
+                &round.mission_sha256,
+                &binding,
+                None,
+            )
+            .is_err(),
+            "a native collection cannot fall through the generic full-source verifier"
+        );
+        let block_entry = format!(
+            "results/native-prepared-blocks/{}.mondaybin",
+            fixture
+                .inputs
+                .prepared()
+                .manifest()
+                .features
+                .manifest
+                .blocks[0]
+                .sha256
+        );
+        for mutation in 0..7 {
+            let changed = fixture
+                ._root
+                .path()
+                .join(format!("changed-native-{mutation}.zip"));
+            let mut source = ZipArchive::new(File::open(source_zip).unwrap()).unwrap();
+            let mut output = zip::ZipWriter::new(File::create(&changed).unwrap());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for index in 0..source.len() {
+                let mut entry = source.by_index(index).unwrap();
+                let name = entry.name().to_string();
+                if mutation == 0 && name == block_entry {
+                    continue;
+                }
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                if mutation == 1 && name == block_entry {
+                    bytes[0] ^= 1;
+                }
+                if mutation == 2 && name == "results/native-prepared-admission.json" {
+                    let mut admission: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    admission["loaded_development_rows"] = serde_json::json!(
+                        admission["loaded_development_rows"].as_u64().unwrap() + 1
+                    );
+                    bytes = serde_json::to_vec(&admission).unwrap();
+                }
+                if mutation == 4 && name == "results/feature-manifest.json" {
+                    let mut metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    metadata["symbol"] = serde_json::json!("FOREIGNUSDT");
+                    bytes = serde_json::to_vec(&metadata).unwrap();
+                }
+                if mutation == 5 && name == "results/materialization.json" {
+                    bytes.push(b' ');
+                }
+                if mutation == 6 && name == "results/cex-replay-dataset-manifest.json" {
+                    let mut metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    metadata["manifest_id"] = serde_json::json!("foreign-dataset");
+                    bytes = serde_json::to_vec(&metadata).unwrap();
+                }
+                output.start_file(name, options).unwrap();
+                output.write_all(&bytes).unwrap();
+            }
+            if mutation == 3 {
+                output
+                    .start_file("results/sealed-holdout-receipt.json", options)
+                    .unwrap();
+                output.write_all(b"{}").unwrap();
+            }
+            output.finish().unwrap();
+            // Use the actual changed archive hash: rejection must come from
+            // independently decoded scientific evidence, not a stale ZIP hash.
+            assert!(
+                recover_execution_report_from_cached_result(
+                    &changed,
+                    &hft_research_artifacts::sha256_file(&changed).unwrap(),
+                    &round.mission_id,
+                    &round.mission_sha256,
+                    &binding,
+                    expected_native,
+                )
+                .is_err(),
+                "native evidence mutation {mutation} was accepted"
+            );
+        }
+    }
+
+    #[test]
     fn native_collection_rebuilds_actual_rows_preserves_original_schedule_and_rejects_false_label()
     {
         use hft_cex_research_input::{
@@ -6794,7 +7009,7 @@ pub(crate) mod tests {
         .unwrap();
         request.holdout_claim_put_url = format!(
             "{campaign_root}/holdout-id-sha256={}/sealed-holdout-claim.json",
-            crate::prediction_dispatch::sha256_text(&request.holdout_id)
+            hft_research_dispatch_io::sha256_text(&request.holdout_id)
         );
         request.holdout_claim_readback_url = request.holdout_claim_put_url.clone();
 
@@ -8420,7 +8635,7 @@ pub(crate) mod tests {
         let binding = ExecutionBinding::Campaign {
             campaign_id: request.campaign_id.clone(),
             round_id: round.round_id.clone(),
-            request_sha256,
+            request_sha256: request_sha256.clone(),
         };
         let client = Client::builder().redirect(Policy::none()).build().unwrap();
         recover_execution_report_from_published_result(
@@ -8430,6 +8645,10 @@ pub(crate) mod tests {
             &mission_id,
             &mission_sha256,
             &binding,
+            request
+                .prepared_inputs
+                .as_ref()
+                .map(|_| (request, request_sha256.as_str())),
         )
         .unwrap()
         .unwrap()

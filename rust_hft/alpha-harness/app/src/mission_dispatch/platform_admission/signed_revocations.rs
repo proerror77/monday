@@ -103,17 +103,17 @@ pub(super) fn export(args: PlatformRevocationsArgs) -> anyhow::Result<()> {
             .get(&object_key)
             .context("source reason lacks exact controlled publication access")?;
         ensure!(
-            crate::prediction_dispatch::canonical_tokyo_oss_internal_object(
+            hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
                 "source revocation",
                 &publication.put_url
-            )? == crate::prediction_dispatch::canonical_tokyo_oss_internal_object(
+            )? == hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
                 "source revocation",
                 &publication.readback_url
             )?,
             "source revocation PUT and readback buckets differ"
         );
         for url in [&publication.put_url, &publication.readback_url] {
-            let canonical = crate::prediction_dispatch::canonical_tokyo_oss_internal_object(
+            let canonical = hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
                 "source revocation",
                 url,
             )?;

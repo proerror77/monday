@@ -41,6 +41,10 @@ async fn main() -> Result<()> {
         )?,
         owner: config.owner,
         lease_ms: config.lease_ms,
+        issuer: config
+            .attempt_identity
+            .map(hft_research_platform::artifact_identity::AttemptIdentityIssuer::new)
+            .transpose()?,
     };
     let api_handle = if let Some(api) = config.agent_api {
         api.validate()?;

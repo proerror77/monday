@@ -5,8 +5,6 @@ use crate::cli::BUILD_SOURCE_REVISION;
 use crate::data_mission;
 #[cfg(feature = "scientific")]
 use crate::mission;
-#[cfg(feature = "scientific")]
-use crate::prediction_dispatch;
 use alpha_domain::canonical_json_hash;
 #[cfg(feature = "scientific")]
 use alpha_domain::CandidateArtifact;
@@ -79,7 +77,6 @@ use hft_research_artifacts::normalized_sha256;
 #[cfg(feature = "scientific")]
 use hft_research_artifacts::publish_immutable_file;
 use hft_research_artifacts::sha256_file;
-#[cfg(feature = "scientific")]
 use hft_research_manifest::CexReplayDatasetManifestV5;
 use hft_research_manifest::CexReplaySnapshotV1;
 use hft_research_manifest::CexReplaySnapshotV2;
@@ -571,7 +568,6 @@ struct PreparedReplayBindingV1 {
     replay_rows_sha256: String,
     source: hft_cex_research_input::campaign::NativeSourceBindingV1,
 }
-#[cfg(feature = "scientific")]
 impl PreparedReplayBindingV1 {
     fn from_verified(
         input: &hft_cex_research_input::campaign::VerifiedCampaignPreparedInputsV1,
@@ -891,6 +887,69 @@ impl CexEventReplayReceiptV1 {
     }
 }
 
+fn native_prepared_admission(
+    native: &crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version":"monday.native_campaign_prepared_admission.v1",
+        "request_sha256": native.request_sha256(),
+        "campaign_inputs_sha256": native.campaign_inputs_sha256(),
+        "evaluation_protocol_sha256": native.evaluation_protocol_sha256(),
+        "collection_sha256": native.collection_id(),
+        "view_sha256": native.view_ids(),
+        "source_revision": native.source_revision(),
+        "runner_image_identity": native.runner_image_identity(),
+        "declared_trials": native.declared_trials(),
+        "source": native.prepared().manifest().source,
+        "original": native.prepared().original_metadata(),
+        "loaded_development_rows": native.prepared().rows().len(),
+        "selection_bytes_loaded":false, "holdout_bytes_loaded":false,
+    })
+}
+
+#[cfg(feature = "scientific")]
+fn archive_native_prepared_blocks(
+    native: &crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+    block_directory: &Path,
+    results_dir: &Path,
+) -> anyhow::Result<()> {
+    let target = results_dir.join("native-prepared-blocks");
+    std::fs::create_dir(&target)?;
+    let collection = native.prepared().manifest();
+    for block in collection
+        .features
+        .manifest
+        .blocks
+        .iter()
+        .chain(&collection.future_marks.manifest.blocks)
+        .chain(&collection.replay.manifest.blocks)
+    {
+        let name = format!("{}.mondaybin", block.sha256);
+        let source = block_directory.join(&name);
+        let metadata = std::fs::symlink_metadata(&source)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() != block.bytes
+            || block.bytes > 16 * 1024 * 1024
+        {
+            bail!("native archive input is not its exact bounded readback block");
+        }
+        let mut bytes = Vec::new();
+        File::open(&source)?
+            .take(block.bytes + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != block.bytes
+            || hft_cex_research_input::sha256(&bytes) != block.sha256
+        {
+            bail!("native archive input changed its admitted block bytes");
+        }
+        // The destination uses the actual prepared block identity, never the
+        // original full-source feature SHA or a synthesized withheld suffix.
+        std::fs::write(target.join(name), bytes)?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "scientific")]
 pub(crate) fn validate_native_campaign_result_binding(
     results_dir: &Path,
@@ -899,22 +958,7 @@ pub(crate) fn validate_native_campaign_result_binding(
     let admission: serde_json::Value = serde_json::from_slice(&std::fs::read(
         results_dir.join("native-prepared-admission.json"),
     )?)?;
-    if admission["request_sha256"].as_str() != Some(native.request_sha256())
-        || admission["campaign_inputs_sha256"].as_str() != Some(native.campaign_inputs_sha256())
-        || admission["collection_sha256"].as_str() != Some(native.collection_id())
-        || admission["evaluation_protocol_sha256"].as_str()
-            != Some(native.evaluation_protocol_sha256())
-        || admission["source_revision"].as_str() != Some(native.source_revision())
-        || admission["runner_image_identity"].as_str() != Some(native.runner_image_identity())
-        || admission["declared_trials"].as_u64() != Some(native.declared_trials() as u64)
-        || admission["view_sha256"] != serde_json::to_value(native.view_ids())?
-        || admission["source"] != serde_json::to_value(&native.prepared().manifest().source)?
-        || admission["original"] != serde_json::to_value(native.prepared().original_metadata())?
-        || admission["loaded_development_rows"].as_u64()
-            != Some(native.prepared().rows().len() as u64)
-        || admission["selection_bytes_loaded"] != false
-        || admission["holdout_bytes_loaded"] != false
-    {
+    if admission != native_prepared_admission(native) {
         bail!("native published result admission differs from the actual finalized request/collection");
     }
     let manifest: hft_cex_research_input::campaign::CampaignPreparedInputsV1 =
@@ -1074,13 +1118,18 @@ pub(crate) fn execute_prepared_report(
     binding: ExecutionBinding,
     native: &crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs,
     render_inputs: &crate::mission_render::PreparedCexInputs,
+    block_directory: &Path,
 ) -> anyhow::Result<ExecutionReport> {
     match &binding {
         ExecutionBinding::Campaign { request_sha256, .. }
             if request_sha256 == native.request_sha256() => {}
         _ => bail!("native prepared execution requires its exact Campaign request binding"),
     }
-    execute_report_inner(args, binding, Some((native, render_inputs)))
+    execute_report_inner(
+        args,
+        binding,
+        Some((native, render_inputs, block_directory)),
+    )
 }
 
 #[cfg(feature = "scientific")]
@@ -1090,6 +1139,7 @@ fn execute_report_inner(
     native: Option<(
         &crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs,
         &crate::mission_render::PreparedCexInputs,
+        &Path,
     )>,
 ) -> anyhow::Result<ExecutionReport> {
     let binding_log = match &binding {
@@ -1267,7 +1317,8 @@ fn execute_report_inner(
     let dataset_manifest_path = results_dir.join("cex-replay-dataset-manifest.json");
     let mut store = AlphaStore::open(&db)?;
     let (materialization, feature_manifest, dataset_manifest, materialization_sha256) =
-        if let Some((native, render)) = native {
+        if let Some((native, render, block_directory)) = native {
+            archive_native_prepared_blocks(native, block_directory, &results_dir)?;
             let materialization = decode_materialization(render.materialization_bytes())?;
             let feature_manifest = render.feature_manifest().clone();
             let materialization_sha256 = native
@@ -1313,21 +1364,7 @@ fn execute_report_inner(
                 &results_dir.join("native-prepared-inputs.json"),
                 native.prepared().manifest(),
             )?;
-            let admission = serde_json::json!({
-                "schema_version":"monday.native_campaign_prepared_admission.v1",
-                "request_sha256": native.request_sha256(),
-                "campaign_inputs_sha256": native.campaign_inputs_sha256(),
-                "evaluation_protocol_sha256": native.evaluation_protocol_sha256(),
-                "collection_sha256": native.collection_id(),
-                "view_sha256": native.view_ids(),
-                "source_revision": native.source_revision(),
-                "runner_image_identity": native.runner_image_identity(),
-                "declared_trials": native.declared_trials(),
-                "source": native.prepared().manifest().source,
-                "original": native.prepared().original_metadata(),
-                "loaded_development_rows": native.prepared().rows().len(),
-                "selection_bytes_loaded":false, "holdout_bytes_loaded":false,
-            });
+            let admission = native_prepared_admission(native);
             hft_research_artifacts::write_json_atomic(
                 &results_dir.join("native-prepared-admission.json"),
                 &admission,
@@ -1584,7 +1621,7 @@ fn execute_report_inner(
         &results_dir.join("mission-create.json"),
         &research_mission,
     )?;
-    let (baseline_dataset, feature_decision_clocks) = if let Some((native, _)) = native {
+    let (baseline_dataset, feature_decision_clocks) = if let Some((native, _, _)) = native {
         let dataset = alpha_engine::evaluation::prepare_native_campaign_dataset(
             native.prepared(),
             &evaluation_protocol,
@@ -1911,7 +1948,7 @@ fn execute_report_inner(
                 &replay_artifact_sha256,
                 &replay_manifest_path,
                 &args.replay_manifest_sha256,
-                native.map(|(binding, _)| binding.prepared()),
+                native.map(|(binding, _, _)| binding.prepared()),
             )
         })
         .transpose()?;
@@ -1981,7 +2018,7 @@ fn execute_report_inner(
                 &replay_artifact_sha256,
                 &replay_manifest_path,
                 &args.replay_manifest_sha256,
-                native.map(|(binding, _)| binding.prepared()),
+                native.map(|(binding, _, _)| binding.prepared()),
             )
         })
         .transpose()?;
@@ -4281,11 +4318,11 @@ fn validate_holdout_claim_binding(
         bail!("CEX result and holdout claim transports must match");
     }
     if put_is_remote {
-        let claim_object = prediction_dispatch::canonical_https_object(
+        let claim_object = hft_research_dispatch_io::canonical_https_object(
             "CEX holdout claim",
             &args.holdout_claim_put_url,
         )?;
-        let claim_readback_object = prediction_dispatch::canonical_https_object(
+        let claim_readback_object = hft_research_dispatch_io::canonical_https_object(
             "CEX holdout claim readback",
             &args.holdout_claim_readback_url,
         )?;
@@ -4293,7 +4330,7 @@ fn validate_holdout_claim_binding(
             bail!("CEX holdout claim readback URL must identify the same immutable object");
         }
         let expected_claim_object =
-            prediction_dispatch::cex_global_holdout_claim_object(holdout_id)?;
+            crate::mission_objects::cex_global_holdout_claim_object(holdout_id)?;
         if claim_object != expected_claim_object {
             bail!("CEX holdout claim object must use the global holdout claim path");
         }
@@ -4327,17 +4364,19 @@ fn expected_local_holdout_claim_object(
     binding: &ExecutionBinding,
 ) -> anyhow::Result<String> {
     match binding {
-        ExecutionBinding::Direct => Ok(prediction_dispatch::cex_result_attempt_and_holdout_claim(
-            result_object,
-            mission_id,
-            holdout_id,
-        )?
-        .1),
+        ExecutionBinding::Direct => Ok(
+            crate::mission_objects::cex_result_attempt_and_holdout_claim(
+                result_object,
+                mission_id,
+                holdout_id,
+            )?
+            .1,
+        ),
         ExecutionBinding::Campaign {
             campaign_id,
             round_id,
             ..
-        } => prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+        } => crate::mission_objects::cex_campaign_round_result_and_holdout_claim(
             result_object,
             campaign_id,
             round_id,
@@ -4422,8 +4461,8 @@ fn validate_result_readback_binding(
         result_readback_url.starts_with("http://") || result_readback_url.starts_with("https://");
     let same_object = match (put_is_remote, readback_is_remote) {
         (true, true) => {
-            prediction_dispatch::canonical_https_object("CEX result", result_put_url)?
-                == prediction_dispatch::canonical_https_object(
+            hft_research_dispatch_io::canonical_https_object("CEX result", result_put_url)?
+                == hft_research_dispatch_io::canonical_https_object(
                     "CEX result readback",
                     result_readback_url,
                 )?
@@ -4447,7 +4486,6 @@ fn validate_result_readback_binding(
     Ok(())
 }
 
-#[cfg(feature = "scientific")]
 pub(crate) fn validate_mission_materialization_binding(
     mission: &CexResearchMissionArtifactV1,
     materialization: &Materialization,
@@ -4484,7 +4522,6 @@ pub(crate) fn validate_mission_materialization_binding(
     Ok(())
 }
 
-#[cfg(feature = "scientific")]
 pub(crate) fn validate_mission_dataset_binding(
     mission: &CexResearchMissionArtifactV1,
     features: &hft_collector::FeatureDatasetManifest,
@@ -4626,6 +4663,7 @@ pub(crate) fn recover_execution_report_from_published_result(
     expected_mission_id: &str,
     expected_mission_sha256: &str,
     binding: &ExecutionBinding,
+    native_expected: Option<(&crate::mission_campaign::CampaignRequest, &str)>,
 ) -> anyhow::Result<Option<ExecutionReport>> {
     let Some((bundle_bytes, bundle_sha256)) = fetch_optional_to_file(
         client,
@@ -4643,6 +4681,7 @@ pub(crate) fn recover_execution_report_from_published_result(
         expected_mission_id,
         expected_mission_sha256,
         binding,
+        native_expected,
     )
     .map(Some)
 }
@@ -4655,6 +4694,7 @@ pub(crate) fn recover_execution_report_from_cached_result(
     expected_mission_id: &str,
     expected_mission_sha256: &str,
     binding: &ExecutionBinding,
+    native_expected: Option<(&crate::mission_campaign::CampaignRequest, &str)>,
 ) -> anyhow::Result<ExecutionReport> {
     let metadata = std::fs::symlink_metadata(path).context("inspect cached result bundle")?;
     if !metadata.is_file()
@@ -4674,6 +4714,7 @@ pub(crate) fn recover_execution_report_from_cached_result(
         expected_mission_id,
         expected_mission_sha256,
         binding,
+        native_expected,
     )
 }
 
@@ -4684,6 +4725,7 @@ fn decode_verified_execution_report(
     expected_mission_id: &str,
     expected_mission_sha256: &str,
     binding: &ExecutionBinding,
+    native_expected: Option<(&crate::mission_campaign::CampaignRequest, &str)>,
 ) -> anyhow::Result<ExecutionReport> {
     let mut archive = ZipArchive::new(File::open(readback_destination)?)
         .context("open published result bundle")?;
@@ -4707,6 +4749,62 @@ fn decode_verified_execution_report(
     if control_mission.semantic_id()? != expected_mission_id {
         bail!("published result bundle Mission artifact does not match the Campaign Mission");
     }
+    let native = match native_expected {
+        Some((request, request_sha256)) => {
+            let native = load_native_archive_input(&mut archive, request, request_sha256)?;
+            let request = native.finalized_request();
+            match binding {
+                ExecutionBinding::Campaign {
+                    campaign_id,
+                    request_sha256,
+                    ..
+                } if campaign_id == &request.campaign_id
+                    && request_sha256 == native.request_sha256() => {}
+                _ => bail!("native archive requires its exact Campaign/finalized request binding"),
+            }
+            if admission.request_sha256.as_deref() != Some(native.request_sha256()) {
+                bail!("native archive changed the exact finalized request binding");
+            }
+            let render = native.render_inputs();
+            if control_mission.spec.evaluation_protocol.content_hash()?
+                != native.evaluation_protocol_sha256()
+                || control_mission.spec.holdout.holdout_id != request.holdout_id
+                || control_mission.spec.search.multiple_testing_trials
+                    != request
+                        .research_plan
+                        .effective_multiple_testing_trials(native.declared_trials())?
+            {
+                bail!(
+                    "native archive Mission changed the finalized protocol, holdout or trial scope"
+                );
+            }
+            let materialization = render.materialization();
+            validate_mission_materialization_binding(
+                &control_mission,
+                materialization,
+                &native.prepared().manifest().source.materialization_sha256,
+                &native.prepared().manifest().source.feature_sha256,
+            )?;
+            validate_mission_dataset_binding(
+                &control_mission,
+                render.feature_manifest(),
+                &CexReplayDatasetManifestV5::new(
+                    render.feature_manifest().manifest_id.clone(),
+                    materialization.snapshot.clone(),
+                )?,
+            )?;
+            Some(native)
+        }
+        None => {
+            if archive
+                .file_names()
+                .any(|name| name == "results/native-prepared-inputs.json")
+            {
+                bail!("native result readback requires its independently bound finalized request");
+            }
+            None
+        }
+    };
     let supervised_ml = is_supervised_gp_policy(&bound_gp_policy(&control_mission)?);
 
     let replay_receipt: Option<CexEventReplayReceiptV1> = read_bundle_json(
@@ -4715,6 +4813,7 @@ fn decode_verified_execution_report(
         512 * 1024,
     )?;
     if let Some(receipt) = &replay_receipt {
+        validate_native_replay_input(receipt, native.as_ref())?;
         validate_replay_trace_readback(&mut archive, receipt)?;
     }
     if let Some(receipt) = &replay_receipt {
@@ -4748,6 +4847,7 @@ fn decode_verified_execution_report(
         512 * 1024,
     )?;
     if let Some(receipt) = &supervised_replay_receipt {
+        validate_native_replay_input(receipt, native.as_ref())?;
         validate_replay_trace_readback(&mut archive, receipt)?;
     }
     if !supervised_ml && (supervised_selection.is_some() || supervised_replay_receipt.is_some()) {
@@ -4837,6 +4937,7 @@ fn decode_verified_execution_report(
         &control_mission,
         supervised_selection.as_ref(),
         &metric_candidate_refs,
+        native.as_ref(),
     )?;
 
     let finalization: Option<CexFinalizationReportV1> =
@@ -5261,6 +5362,7 @@ fn validate_model_metric_readback(
     mission: &CexResearchMissionArtifactV1,
     selection: Option<&CexSupervisedModelSelectionV1>,
     candidates: &std::collections::BTreeMap<&str, CexResearchContentRefV1>,
+    native: Option<&crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs>,
 ) -> anyhow::Result<()> {
     let calendar_artifacts_present = archive.file_names().any(|name| {
         matches!(
@@ -5287,7 +5389,14 @@ fn validate_model_metric_readback(
     )?;
     let verification_dataset =
         if !mission.spec.supervised_model_scope.is_default() || selection.is_some() {
-            Some(load_metric_verification_dataset(archive, mission)?)
+            Some(match native {
+                Some(native) => alpha_engine::evaluation::prepare_native_campaign_dataset(
+                    native.prepared(),
+                    &mission.spec.evaluation_protocol,
+                )
+                .map_err(anyhow::Error::msg)?,
+                None => load_metric_verification_dataset(archive, mission)?,
+            })
         } else {
             None
         };
@@ -5323,6 +5432,13 @@ fn validate_model_metric_readback(
         bail!("published model metric cohort is incomplete or mismatched");
     }
     let dataset = verification_dataset.context("model metric verification dataset missing")?;
+    if native.is_some()
+        && mission.spec.evaluation_protocol.calendar.is_some()
+        && dataset.calendar_validation_rows().is_none()
+        && (calendar_artifacts_present || selection.replay_eligible)
+    {
+        bail!("native development-only result cannot claim withheld calendar evaluation");
+    }
     let context = dataset.engine_context();
     let cohort = &report.groups[0].cohort;
     if cohort.evaluation_protocol != *context.protocol()
@@ -5359,7 +5475,10 @@ fn validate_model_metric_readback(
             &baseline_policy.evaluator_config,
         )
         .map_err(anyhow::Error::msg)?;
-        if name == "ridge" && mission.spec.evaluation_protocol.calendar.is_some() {
+        if name == "ridge"
+            && mission.spec.evaluation_protocol.calendar.is_some()
+            && dataset.calendar_validation_rows().is_some()
+        {
             let bank: CexFactorBankRevisionV2 = read_bundle_json(
                 archive,
                 "results/factor-bank.json",
@@ -5444,6 +5563,135 @@ fn validate_model_metric_readback(
         bail!("published model metrics differ from their original backtest evidence");
     }
     Ok(())
+}
+
+fn validate_native_replay_input(
+    receipt: &CexEventReplayReceiptV1,
+    native: Option<&crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs>,
+) -> anyhow::Result<()> {
+    if receipt.prepared_inputs.as_ref()
+        != native
+            .map(|input| PreparedReplayBindingV1::from_verified(input.prepared()))
+            .as_ref()
+    {
+        bail!("replay readback changed its actual native collection/source binding");
+    }
+    Ok(())
+}
+
+fn load_native_archive_input(
+    archive: &mut ZipArchive<File>,
+    request: &crate::mission_campaign::CampaignRequest,
+    independently_expected_request_sha256: &str,
+) -> anyhow::Result<crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs>
+{
+    let collection: hft_cex_research_input::campaign::CampaignPreparedInputsV1 = read_bundle_json(
+        archive,
+        "results/native-prepared-inputs.json",
+        128 * 1024 * 1024,
+    )?
+    .context("native archive is missing its actual prepared collection")?;
+    let names = archive
+        .file_names()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    if names.len() != archive.len() {
+        bail!("native archive contains duplicate entry names");
+    }
+    let expected = collection
+        .features
+        .manifest
+        .blocks
+        .iter()
+        .chain(&collection.future_marks.manifest.blocks)
+        .chain(&collection.replay.manifest.blocks)
+        .map(|block| format!("results/native-prepared-blocks/{}.mondaybin", block.sha256))
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual = names
+        .iter()
+        .filter(|name| name.starts_with("results/native-prepared-blocks/"))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if expected != actual {
+        bail!("native archive block entries differ from its allowed development views");
+    }
+    struct ArchiveBlocks<'a>(&'a mut ZipArchive<File>);
+    impl hft_cex_research_input::data::BlockSource for ArchiveBlocks<'_> {
+        fn read(
+            &mut self,
+            block: &hft_cex_research_input::data::BlockRef,
+        ) -> anyhow::Result<Vec<u8>> {
+            let bytes = read_bundle_bytes(
+                self.0,
+                &format!("results/native-prepared-blocks/{}.mondaybin", block.sha256),
+                16 * 1024 * 1024,
+            )?;
+            if bytes.len() as u64 != block.bytes {
+                bail!("native archive changed a declared block length");
+            }
+            Ok(bytes)
+        }
+    }
+    let native =
+        crate::mission_campaign::prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+            request,
+            independently_expected_request_sha256,
+            collection,
+            &mut ArchiveBlocks(archive),
+            1024 * 1024 * 1024,
+        )?;
+    let admission: serde_json::Value = read_bundle_json(
+        archive,
+        "results/native-prepared-admission.json",
+        128 * 1024 * 1024,
+    )?
+    .context("native archive is missing its finalized admission binding")?;
+    if admission != native_prepared_admission(&native) {
+        bail!(
+            "native archive admission differs from the exact finalized request/collection/source"
+        );
+    }
+    let render = native.render_inputs();
+    let features: hft_collector::FeatureDatasetManifest = read_bundle_json(
+        archive,
+        "results/feature-manifest.json",
+        MAX_MATERIALIZATION_BYTES,
+    )?
+    .context("native archive is missing original feature lineage metadata")?;
+    let materialization = read_bundle_bytes(
+        archive,
+        "results/materialization.json",
+        MAX_MATERIALIZATION_BYTES,
+    )?;
+    let dataset: CexReplayDatasetManifestV5 = read_bundle_json(
+        archive,
+        "results/cex-replay-dataset-manifest.json",
+        MAX_MATERIALIZATION_BYTES,
+    )?
+    .context("native archive is missing original dataset lineage metadata")?;
+    if &features != render.feature_manifest()
+        || hft_cex_research_input::sha256(&materialization)
+            != native.prepared().manifest().source.materialization_sha256
+        || dataset
+            != CexReplayDatasetManifestV5::new(
+                render.feature_manifest().manifest_id.clone(),
+                render.materialization().snapshot.clone(),
+            )?
+    {
+        bail!("native archive changed its original feature/materialization/dataset metadata");
+    }
+    for name in [
+        "results/calendar-validation.json",
+        "results/calendar-validation-event-replay-receipt.json",
+        "results/sealed-holdout-receipt.json",
+        "results/sealed-evaluations.jsonl",
+        "results/finalization-report.json",
+    ] {
+        if names.contains(name) {
+            bail!("native development-only archive contains withheld evaluation evidence");
+        }
+    }
+    Ok(native)
 }
 
 fn load_metric_verification_dataset(
@@ -9156,7 +9404,8 @@ pub(crate) mod tests {
         fixture.args.result_put_url = "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/anything/results.zip".to_string();
         fixture.args.result_readback_url = fixture.args.result_put_url.clone();
         fixture.args.holdout_claim_put_url =
-            prediction_dispatch::cex_global_holdout_claim_object(&fixture.args.holdout_id).unwrap();
+            crate::mission_objects::cex_global_holdout_claim_object(&fixture.args.holdout_id)
+                .unwrap();
         fixture.args.holdout_claim_readback_url = fixture.args.holdout_claim_put_url.clone();
 
         validate_holdout_claim_binding(
@@ -9199,6 +9448,7 @@ pub(crate) mod tests {
             &fixture.args.mission_id,
             &fixture.args.mission_sha256,
             &binding,
+            None,
         )
         .unwrap()
         .expect("existing published result must recover");
@@ -9350,6 +9600,7 @@ pub(crate) mod tests {
             &fixture.args.mission_id,
             &fixture.args.mission_sha256,
             &binding,
+            None,
         )
         .unwrap_err();
 
@@ -9377,6 +9628,7 @@ pub(crate) mod tests {
             &fixture.args.mission_id,
             &fixture.args.mission_sha256,
             &renewed_binding,
+            None,
         )
         .unwrap()
         .expect("renewed request SHA should still recover the same Campaign result");
@@ -9552,6 +9804,7 @@ pub(crate) mod tests {
             &fixture.args.mission_id,
             &fixture.args.mission_sha256,
             &wrong_binding,
+            None,
         )
         .unwrap_err();
 
@@ -9604,6 +9857,7 @@ pub(crate) mod tests {
             &primary.args.mission_id,
             &primary.args.mission_sha256,
             &binding,
+            None,
         )
         .unwrap_err();
 
@@ -9643,6 +9897,7 @@ pub(crate) mod tests {
             &primary.args.mission_id,
             &primary.args.mission_sha256,
             &binding,
+            None,
         )
         .unwrap_err();
 
@@ -9659,7 +9914,7 @@ pub(crate) mod tests {
             "campaign-root/campaign-id={campaign_id}/round={round_id}/results.zip"
         ));
         std::fs::create_dir_all(result_path.parent().unwrap()).unwrap();
-        let holdout_claim = prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+        let holdout_claim = crate::mission_objects::cex_campaign_round_result_and_holdout_claim(
             &result_path.to_string_lossy(),
             campaign_id,
             round_id,
@@ -10305,7 +10560,7 @@ message binance_replay {
         let attempt_result_dir = mission_result_dir.join("attempt=test");
         std::fs::create_dir_all(&attempt_result_dir).unwrap();
         let result_path = attempt_result_dir.join("results.zip");
-        let (_, holdout_claim_path) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+        let (_, holdout_claim_path) = crate::mission_objects::cex_result_attempt_and_holdout_claim(
             &result_path.to_string_lossy(),
             &mission_id,
             &mission.spec.holdout.holdout_id,
@@ -10897,7 +11152,7 @@ message binance_replay {
         fixture.result_path = attempt_dir.join("results.zip");
         fixture.args.result_put_url = fixture.result_path.to_string_lossy().into_owned();
         fixture.args.result_readback_url = fixture.args.result_put_url.clone();
-        let (_, claim_path) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+        let (_, claim_path) = crate::mission_objects::cex_result_attempt_and_holdout_claim(
             &fixture.args.result_put_url,
             &fixture.args.mission_id,
             &fixture.args.holdout_id,
