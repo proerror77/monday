@@ -1,10 +1,8 @@
 //! One bounded preparation worker. It neither claims tasks nor publishes PG
 //! results; the reconciler independently reads artifacts and commits completion.
 use crate::{
-    clickhouse::ClickHouse,
-    orchestrator::{Artifact, ResultReceipt, Task},
-    postgres::PreparationPermit,
-    sha256,
+    artifact_io::Writer, clickhouse::ClickHouse, orchestrator::ResultReceipt,
+    postgres::PreparationPermit, sha256,
 };
 use anyhow::{ensure, Context, Result};
 use hft_cex_research_input::{
@@ -29,106 +27,7 @@ pub struct PrepareConfig {
     pub rows_per_block: u16,
     pub max_blocks: u16,
 }
-/// The gateway must enforce per-attempt write identity and immutable object keys.
-/// No bucket-wide key, signing key, deployment or database write key is needed.
-pub struct Writer {
-    client: reqwest::Client,
-    base: reqwest::Url,
-    token: String,
-    prefix: String,
-}
-impl Writer {
-    pub fn new(endpoint: &str, token: String, task: &Task) -> Result<Self> {
-        Self::with_tls(
-            endpoint,
-            token,
-            task,
-            &crate::transport::TlsConfig::default(),
-        )
-    }
-    pub fn with_tls(
-        endpoint: &str,
-        token: String,
-        task: &Task,
-        tls: &crate::transport::TlsConfig,
-    ) -> Result<Self> {
-        let base = reqwest::Url::parse(endpoint)?;
-        ensure!(
-            base.scheme() == "https"
-                && base.username().is_empty()
-                && base.password().is_none()
-                && base.query().is_none()
-                && base.path().ends_with('/')
-                && !token.is_empty(),
-            "invalid worker artifact identity"
-        );
-        Ok(Self {
-            client: tls.client(std::time::Duration::from_secs(30), true)?,
-            base,
-            token,
-            prefix: format!("{}/{}/{}/", task.spec.output_prefix, task.id, task.attempt),
-        })
-    }
-    async fn put(&self, name: &str, bytes: Vec<u8>) -> Result<Artifact> {
-        ensure!(
-            name.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-                && !name.contains("..")
-                && !bytes.is_empty()
-                && bytes.len() <= 16 * 1024 * 1024,
-            "invalid worker output"
-        );
-        let artifact = Artifact {
-            key: format!("{}{name}", self.prefix),
-            sha256: sha256(&bytes),
-            bytes: bytes.len() as u64,
-        };
-        let url = self.base.join(&artifact.key)?;
-        let response = self
-            .client
-            .put(url.clone())
-            .bearer_auth(&self.token)
-            .header("If-None-Match", "*")
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("artifact upload unavailable"))?;
-        if response.status() == reqwest::StatusCode::CONFLICT
-            || response.status() == reqwest::StatusCode::PRECONDITION_FAILED
-        {
-            let mut response = self
-                .client
-                .get(url)
-                .bearer_auth(&self.token)
-                .send()
-                .await
-                .map_err(|_| anyhow::anyhow!("artifact upload recovery unavailable"))?
-                .error_for_status()
-                .map_err(|_| anyhow::anyhow!("artifact upload recovery rejected"))?;
-            let mut actual = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| anyhow::anyhow!("artifact upload recovery interrupted"))?
-            {
-                ensure!(
-                    actual.len() as u64 + chunk.len() as u64 <= artifact.bytes,
-                    "conflicting output size"
-                );
-                actual.extend_from_slice(&chunk);
-            }
-            ensure!(
-                actual.len() as u64 == artifact.bytes && sha256(&actual) == artifact.sha256,
-                "conflicting immutable output"
-            );
-        } else {
-            response
-                .error_for_status()
-                .map_err(|_| anyhow::anyhow!("artifact upload rejected"))?;
-        }
-        Ok(artifact)
-    }
-}
+
 fn rows(block: &TypedBlock) -> usize {
     match block {
         TypedBlock::Features(v) => v.len(),

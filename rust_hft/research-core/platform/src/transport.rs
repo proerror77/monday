@@ -54,7 +54,9 @@ fn pem(path: &Path, private: bool) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
-pub(crate) fn read_private_file(path: &Path) -> Result<Vec<u8>> {
+/// Host-owned or Attempt-scoped configuration; requires a private canonical
+/// directory and regular file. This does not discover or issue credentials.
+pub fn read_private_file(path: &Path) -> Result<Vec<u8>> {
     pem(path, true)
 }
 impl TlsConfig {
