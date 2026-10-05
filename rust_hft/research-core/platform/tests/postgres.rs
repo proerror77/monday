@@ -169,6 +169,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         max_attempts: 2,
         output_prefix: "research/fixture".into(),
         fit_identity_sha256: None,
+        worker_configuration: None,
     };
     let experiment = hft_research_platform::research::Experiment {
         schema: 1,

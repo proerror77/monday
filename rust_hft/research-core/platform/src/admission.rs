@@ -363,6 +363,7 @@ mod tests {
             max_attempts: 2,
             output_prefix: "research/fixture".into(),
             fit_identity_sha256: None,
+            worker_configuration: None,
         };
         let admission = Admission {
             schema: 1,

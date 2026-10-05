@@ -19,6 +19,80 @@ pub enum TaskKind {
     Explore,
 }
 
+/// Actual immutable scientific/public configuration read back from Kubernetes.
+/// Per-Attempt credentials and native admission signatures are late-bound;
+/// including them here would make their task identity circular.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerConfigurationRef {
+    pub schema: String,
+    pub secret_name: String,
+    pub secret_uid: String,
+    pub configuration_sha256: String,
+}
+impl WorkerConfigurationRef {
+    pub fn validate(&self, profile: &Profile) -> Result<()> {
+        ensure!(
+            self.schema == "monday.worker_configuration.v1"
+                && profile.worker_secret.as_deref() == Some(self.secret_name.as_str())
+                && !self.secret_uid.is_empty()
+                && self.secret_uid.len() <= 128
+                && self
+                    .secret_uid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && valid_digest(&self.configuration_sha256),
+            "worker configuration identity missing or changed"
+        );
+        Ok(())
+    }
+}
+
+/// One wire identity shared by the native producer, launcher, and initializer.
+/// The caller must obtain this map from an actual immutable Secret readback;
+/// computing a digest alone is not a source witness or admission.
+pub fn worker_configuration_reference(
+    namespace: &str,
+    secret_name: &str,
+    secret_uid: &str,
+    data: &std::collections::BTreeMap<String, String>,
+) -> Result<WorkerConfigurationRef> {
+    ensure!(
+        !namespace.is_empty()
+            && namespace.len() <= 63
+            && !secret_name.is_empty()
+            && secret_name.len() <= 63
+            && !secret_uid.is_empty()
+            && secret_uid.len() <= 128,
+        "configuration scope missing"
+    );
+    ensure!(
+        data.contains_key("campaign.json")
+            && data.contains_key("artifact-io.json")
+            && data.keys().all(|k| matches!(
+                k.as_str(),
+                "campaign.json" | "artifact-io.json" | "ca.pem" | "native-trust.json"
+            ))
+            && data
+                .values()
+                .all(|v| !v.is_empty() && v.len() <= 2 * 1024 * 1024)
+            && data.values().map(String::len).sum::<usize>() <= 2 * 1024 * 1024,
+        "configuration requires bounded static inputs; late credentials are forbidden"
+    );
+    Ok(WorkerConfigurationRef {
+        schema: "monday.worker_configuration.v1".into(),
+        secret_name: secret_name.to_owned(),
+        secret_uid: secret_uid.to_owned(),
+        configuration_sha256: identity(&(
+            "monday.worker_configuration_contents.v1",
+            namespace,
+            secret_name,
+            secret_uid,
+            data,
+        ))?,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskSpec {
@@ -34,6 +108,7 @@ pub struct TaskSpec {
     pub max_attempts: u32,
     pub output_prefix: String,
     pub fit_identity_sha256: Option<String>,
+    pub worker_configuration: Option<WorkerConfigurationRef>,
 }
 
 impl TaskSpec {
@@ -88,6 +163,13 @@ impl TaskSpec {
             ensure!(valid_digest(fit), "invalid fit identity");
         }
         self.profile.validate()?;
+        if let Some(configuration) = &self.worker_configuration {
+            configuration.validate(&self.profile)?;
+        }
+        if self.kind == TaskKind::CexCampaign {
+            ensure!(self.max_attempts == 1 && self.worker_configuration.is_some(),
+                "native Campaign requires one reserved Attempt and verified immutable configuration");
+        }
         Ok(())
     }
     pub fn id(&self) -> Result<String> {
