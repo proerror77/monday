@@ -43,7 +43,7 @@ done < <(env | awk -F= '$1 ~ /^CARGO_(PROFILE_(RELEASE|RESEARCH)_|TARGET_.*_(LIN
 for variable in RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER; do
   if [[ -n ${!variable-} ]]; then sha256sum "$(command -v "${!variable}")" >>"$work/compiler"; fi
 done
-printf '%s\n' "${RUSTFLAGS:-}" "${CARGO_ENCODED_RUSTFLAGS:-}" "${RUSTC_WRAPPER:-}" "${CARGO_PROFILE_RELEASE_DEBUG:-}" >"$work/flags"
+printf '%s\n' "${RUSTFLAGS:-}" "${CARGO_ENCODED_RUSTFLAGS:-}" "${RUSTC_WRAPPER:-}" "${CARGO_PROFILE_RELEASE_DEBUG:-}" >>"$work/flags"
 for config in "$root/.cargo/config.toml" "$root/rust_hft/.cargo/config.toml" "$root/rust_hft/prediction-markets/.cargo/config.toml"; do
   if [[ -f $config ]]; then cat "$config" >>"$work/flags"; fi
 done
