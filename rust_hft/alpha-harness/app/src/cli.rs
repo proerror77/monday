@@ -173,6 +173,8 @@ enum PredictionDispatchCommand {
 enum MissionDispatchCommand {
     /// Reserve the inspected canonical request and independently publish/read back native receipts.
     PreparePlatform(mission_dispatch::platform_admission::PlatformPrepareArgs),
+    /// Export one source-reserved Campaign after actual software/data/configuration readback.
+    ExportPlatform(mission_dispatch::platform_admission::PlatformExportArgs),
     CloseFamily(CampaignCloseFamilyArgs),
     Inspect(MissionDispatchInspectArgs),
     /// Read authenticated historical dispatch identity without submitting or settling.
@@ -1296,6 +1298,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::prepare(args))
                         .await
                         .context("platform Campaign budget preparation task failed")?
+                }
+                MissionDispatchCommand::ExportPlatform(args) => {
+                    tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::export(args))
+                        .await
+                        .context("native platform signed export task failed")?
                 }
                 MissionDispatchCommand::DescribeStudy(args) => {
                     mission_dispatch::sequence_admission::describe(args)

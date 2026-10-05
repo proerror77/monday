@@ -1127,6 +1127,16 @@ pub(super) fn check_running_member(
     reservation: &CampaignAttemptReservationV1,
     at: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, StoreError> {
+    running_member_authority(conn, key, verified, reservation, at).map(|(expires, _)| expires)
+}
+
+pub(super) fn running_member_authority(
+    conn: &Connection,
+    key: &[u8; 32],
+    verified: &VerifiedCampaignRootGrant,
+    reservation: &CampaignAttemptReservationV1,
+    at: DateTime<Utc>,
+) -> Result<(DateTime<Utc>, [u8; 32]), StoreError> {
     let (study_id, root_hash, binding) = read_member_projection(conn, key, &reservation.family_id)?
         .ok_or_else(|| err("running attempt lacks a Study"))?;
     if root_hash != verified.content_sha256()
@@ -1179,7 +1189,7 @@ pub(super) fn check_running_member(
     {
         deadline = deadline.min(when);
     }
-    Ok(deadline)
+    Ok((deadline, *grant.verifying_key().as_bytes()))
 }
 
 fn study_prepare_reservation(

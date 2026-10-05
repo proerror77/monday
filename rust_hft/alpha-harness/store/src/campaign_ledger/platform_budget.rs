@@ -10,6 +10,7 @@ pub struct VerifiedCampaignPlatformBudget {
     reservation_receipt: AuthenticatedCampaignReceiptV1,
     approval_sha256: String,
     authority_expires_at: DateTime<Utc>,
+    authority_public_keys: Vec<[u8; 32]>,
     existing_transfer: Option<CampaignPlatformTransferV1>,
 }
 impl VerifiedCampaignPlatformBudget {
@@ -30,6 +31,11 @@ impl VerifiedCampaignPlatformBudget {
     }
     pub fn authority_expires_at(&self) -> DateTime<Utc> {
         self.authority_expires_at
+    }
+    /// Actual registered Root/Study public keys. A native witness must not reuse
+    /// any signer that can grant the underlying scientific authority.
+    pub fn authority_public_keys(&self) -> &[[u8; 32]] {
+        &self.authority_public_keys
     }
     pub fn existing_transfer(&self) -> Option<&CampaignPlatformTransferV1> {
         self.existing_transfer.as_ref()
@@ -303,14 +309,12 @@ fn budget_evidence(
     {
         expires = expires.min(when);
     }
+    let mut authority_public_keys = vec![*verified.verifying_key().as_bytes()];
     if state.study_member_binding.is_some() {
-        expires = expires.min(study::check_running_member(
-            conn,
-            key,
-            verified,
-            reservation,
-            at,
-        )?);
+        let (study_expires, study_public_key) =
+            study::running_member_authority(conn, key, verified, reservation, at)?;
+        expires = expires.min(study_expires);
+        authority_public_keys.push(study_public_key);
     }
     let duration = chrono::TimeDelta::try_seconds(
         i64::try_from(reservation.reserved_job_seconds).map_err(err)?,
@@ -337,6 +341,7 @@ fn budget_evidence(
         reservation_receipt: reservation_receipt.clone(),
         approval_sha256: root.approval_hash.clone(),
         authority_expires_at: expires,
+        authority_public_keys,
         existing_transfer: attempt.platform_transfer.clone(),
     })
 }
