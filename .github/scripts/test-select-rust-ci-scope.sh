@@ -167,6 +167,12 @@ for job_case in "${job_cases[@]}"; do
   assert_flag "$output" selection_complete true
 done
 
+# The fixed probability inference is a runtime owner with a real live-intake consumer.
+printf '%s\n' rust_hft/strategy-framework/strategies/probability_reversal/src/lib.rs >"$tmp_dir/probability-strategy.txt"
+probability_scope=$(run_case probability-strategy pull_request probability-strategy.txt)
+assert_owning_packages "$probability_scope" hft-strategy-probability-reversal
+assert_flag "$probability_scope" handoff true
+
 # Known ACK metadata helpers must select their owning shell/workflow contracts
 # without setting Cargo-impact flags or selecting images on main push. The
 # production image/dependency inputs retain their own build coverage.

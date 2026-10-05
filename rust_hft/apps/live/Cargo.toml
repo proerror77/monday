@@ -58,6 +58,7 @@ trend-strategy = ["runtime/strategy-trend"]
 arbitrage-strategy = ["runtime/strategy-arbitrage"]
 imbalance-strategy = ["runtime/strategy-imbalance"]
 formula-strategy = ["runtime/strategy-formula"]
+probability-reversal-strategy = ["runtime/strategy-probability-reversal"]
 dl-strategy = ["runtime/strategy-dl"]
 lob-flow-grid-strategy = ["runtime/strategy-lob-flow-grid"]
 all-strategies = [
@@ -65,6 +66,7 @@ all-strategies = [
   "arbitrage-strategy",
   "imbalance-strategy",
   "formula-strategy",
+  "probability-reversal-strategy",
   "dl-strategy",
   "lob-flow-grid-strategy"
 ]
@@ -94,3 +96,5 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 alpha-domain = { path = "../../alpha-harness/domain" }
+hft-research-manifest = { path = "../../research-core/manifest" }
+tempfile = "3"
