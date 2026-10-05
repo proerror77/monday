@@ -2907,6 +2907,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-binance-depth"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hft-core"
 version = "0.1.0"
 dependencies = [

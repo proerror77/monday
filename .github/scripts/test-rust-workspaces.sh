@@ -46,6 +46,15 @@ for features in formula-strategy,binance full; do
     echo 'live imports research control, evaluation or training' >&2; exit 1
   fi
 done
+# Depth acquisition and book sequencing must not compile the order-loop engine.
+for selection in 'data-pipelines/Cargo.toml hft-collector' 'data-pipelines/Cargo.toml hft-binance-md' 'runtime/Cargo.toml hft-binance-depth'; do
+  read -r manifest package <<<"$selection"
+  cargo tree --manifest-path "$root/rust_hft/$manifest" -p "$package" \
+    --locked --edges normal --prefix none >"$work/depth.tree"
+  if grep -E '^(hft-engine |alpha-(domain|engine|onnx-evaluator|harness) |burn |ort |hft-(research-ml|research-platform|execution-adapter-[a-z-]+) )' "$work/depth.tree"; then
+    echo 'depth acquisition imports runtime engine, science or execution authority' >&2; exit 1
+  fi
+done
 cargo tree --manifest-path "$root/rust_hft/data-pipelines/Cargo.toml" \
   -p hft-data --locked --edges normal --prefix none >"$work/data.tree"
 if grep -E '^(burn|ort |hft-(collector|research-ml|execution-adapter-[a-z-]+) )' "$work/data.tree"; then
