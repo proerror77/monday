@@ -6,7 +6,7 @@ edition = "2021"
 description = "Binance low-latency market-data fast-lane runner"
 
 [dependencies]
-engine = { package = "hft-engine", path = "../../market-core/engine" }
+hft-binance-depth = { path = "../../market-core/binance-depth" }
 hft-core = { package = "hft-core", path = "../../market-core/core" }
 data-adapter-binance = { package = "hft-data-adapter-binance", path = "../../data-pipelines/adapters/adapter-binance" }
 tokio = { workspace = true, features = ["full"] }
