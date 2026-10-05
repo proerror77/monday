@@ -374,22 +374,22 @@ impl MarketTaskReader {
 }
 
 #[derive(Default, Clone, Copy)]
-pub(crate) struct Moments {
+pub struct Moments {
     count: u64,
     mean: f64,
     m2: f64,
 }
 impl Moments {
-    pub(crate) fn push(&mut self, x: f64) {
+    pub fn push(&mut self, x: f64) {
         self.count += 1;
         let d = x - self.mean;
         self.mean += d / self.count as f64;
         self.m2 += d * (x - self.mean);
     }
-    pub(crate) fn mean(&self) -> f64 {
+    pub fn mean(&self) -> f64 {
         self.mean
     }
-    pub(crate) fn scale(&self) -> f64 {
+    pub fn scale(&self) -> f64 {
         let sd = (self.m2 / self.count.max(1) as f64).max(0.0).sqrt();
         if sd > 0.0 {
             sd

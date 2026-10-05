@@ -701,9 +701,12 @@ dependencies = [
  "anyhow",
  "chrono",
  "bincode",
+ "chrono",
+ "hft-research-manifest",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

@@ -1,7 +1,14 @@
-use crate::{
-    data_mission, governance, loop_control, mission, mission_campaign, mission_dispatch,
-    mission_fresh_inputs, mission_metrics, mission_runner, prediction_dispatch,
-};
+use crate::data_mission;
+use crate::governance;
+use crate::loop_control;
+use crate::mission;
+use crate::mission_campaign;
+use crate::mission_dispatch;
+use crate::mission_fresh_inputs;
+use crate::mission_metrics;
+#[cfg(feature = "scientific")]
+use crate::mission_runner;
+use crate::prediction_dispatch;
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
 };
@@ -98,8 +105,8 @@ enum MissionCommand {
     #[command(hide = true)]
     Create(CreateMissionArgs),
     #[command(hide = true)]
+    #[cfg(feature = "scientific")]
     Execute(Box<ExecuteMissionArgs>),
-    CampaignExecute(CampaignExecuteArgs),
     CampaignFreeze(CampaignFreezeArgs),
     /// Emit a development-only label report and bound plan before any freeze or fit.
     CampaignPrecheck(CampaignPrecheckArgs),
@@ -682,6 +689,7 @@ pub struct PredictionDispatchStatusArgs {
 enum CandidateCommand {
     List(MissionStatusArgs),
     Show(CandidateShowArgs),
+    #[cfg(feature = "onnx-compatibility")]
     RegisterOnnx(Box<RegisterOnnxArgs>),
 }
 
@@ -803,6 +811,7 @@ pub struct ValidationArgs {
 }
 
 impl ValidationArgs {
+    #[cfg(any(feature = "scientific", test))]
     pub fn from_protocol(protocol: &EvaluationProtocolV1) -> Self {
         Self {
             initial_train_rows: protocol.walk_forward.initial_train_rows,
@@ -1225,16 +1234,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 store.create_mission(&mission)?;
                 print_json(&mission)
             }
+            #[cfg(feature = "scientific")]
             MissionCommand::Execute(args) => {
                 tokio::task::spawn_blocking(move || mission_runner::execute(*args))
                     .await
                     .context("mission execution worker failed")?
-            }
-            MissionCommand::CampaignExecute(args) => {
-                require_cloud_data_host(std::env::consts::OS)?;
-                tokio::task::spawn_blocking(move || mission_campaign::execute(args))
-                    .await
-                    .context("campaign execution worker failed")?
             }
             MissionCommand::CampaignFreeze(args) => {
                 require_cloud_data_host(std::env::consts::OS)?;
@@ -1431,6 +1435,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Candidate { command } => match command {
             CandidateCommand::List(args) => governance::candidate_list(args),
             CandidateCommand::Show(args) => governance::candidate_show(args),
+            #[cfg(feature = "onnx-compatibility")]
             CandidateCommand::RegisterOnnx(args) => governance::register_onnx_candidate(*args),
         },
         Command::Evaluate(args) => governance::evaluate(args),
@@ -2078,6 +2083,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "scientific")]
     fn mission_execute_accepts_only_content_bound_mission_transport() {
         let cli = Cli::try_parse_from([
             "alpha-harness",
@@ -2348,4 +2354,35 @@ mod tests {
         ])
         .is_ok());
     }
+}
+
+#[cfg(feature = "scientific")]
+#[derive(Debug, Parser)]
+#[command(name = "monday-cex-worker", version = BUILD_SOURCE_REVISION, about = "Admitted CEX Campaign scientific worker")]
+pub struct WorkerCli {
+    #[command(subcommand)]
+    command: WorkerCommand,
+}
+#[cfg(feature = "scientific")]
+#[derive(Debug, Subcommand)]
+enum WorkerCommand {
+    Mission {
+        #[command(subcommand)]
+        command: WorkerMissionCommand,
+    },
+}
+#[cfg(feature = "scientific")]
+#[derive(Debug, Subcommand)]
+enum WorkerMissionCommand {
+    CampaignExecute(CampaignExecuteArgs),
+}
+#[cfg(feature = "scientific")]
+pub async fn run_worker(cli: WorkerCli) -> anyhow::Result<()> {
+    let WorkerCommand::Mission {
+        command: WorkerMissionCommand::CampaignExecute(args),
+    } = cli.command;
+    require_cloud_data_host(std::env::consts::OS)?;
+    tokio::task::spawn_blocking(move || mission_campaign::execute(args))
+        .await
+        .context("Campaign scientific worker failed")?
 }

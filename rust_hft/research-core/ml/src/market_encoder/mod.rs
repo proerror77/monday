@@ -1,6 +1,5 @@
 //! Two-stage market representation learning. No order, dispatch or holdout authority.
 mod artifacts;
-pub mod data;
 mod network;
 mod training;
 pub use artifacts::{MarketEncoderCheckpoint, MarketTaskModel};

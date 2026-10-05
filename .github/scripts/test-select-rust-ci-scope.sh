@@ -422,7 +422,7 @@ assert_jobs "$import_driver" 'ci/research-foundation,ci/ci-contracts,ploy/workfl
 # including control -> backtest -> Alpha. Keep the smaller fixture for its existing
 # scenarios, which deliberately model a different dependency graph.
 owners_metadata="$fixtures/workspace-owners.fixture"
-jq -e '.packages | length == 92 and (map(.name) | unique | length == 92)' "$owners_metadata" >/dev/null
+jq -e '.packages | length == 93 and (map(.name) | unique | length == 93)' "$owners_metadata" >/dev/null
 workspace_inputs=(
   rust_hft/Cargo.toml
   rust_hft/workspaces.json
@@ -446,7 +446,7 @@ for event in pull_request push; do
   printf '%s\n' rust_hft/research-core/platform/src/build.rs >"$tmp_dir/control-owner.txt"
   control_owner=$(run_case "control-owner-$event" "$event" control-owner.txt "$owners_metadata")
   assert_owning_packages "$control_owner" hft-research-platform
-  grep -Fqx 'loop_packages=,alpha-harness,' "$control_owner"
+  grep -Fqx 'loop_packages=,alpha-harness,hft-cex-research-worker,' "$control_owner"
   grep -Eq '^jobs=.*,(ci/research-foundation),' "$control_owner"
   grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$control_owner"
   if [[ $event == push ]]; then grep -Eq '^jobs=.*,(ploy/research-image-smoke),' "$control_owner"; fi
@@ -906,7 +906,7 @@ assert_flag "$collector" clippy_loop true
 # retain reverse-dependency coverage. The same list feeds tests and Clippy.
 printf '%s\n' rust_hft/alpha-harness/app/src/main.rs >"$tmp_dir/alpha-leaf.txt"
 output=$(run_case alpha-leaf pull_request alpha-leaf.txt)
-assert_flag "$output" loop_packages ',alpha-harness,'
+assert_flag "$output" loop_packages ',alpha-harness,hft-cex-research-worker,'
 assert_flag "$output" clippy_loop true
 output=$(run_case schedule schedule alpha-leaf.txt)
-assert_flag "$output" loop_packages ',alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-harnessctl,hft-research-ml,'
+assert_flag "$output" loop_packages ',alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-cex-research-worker,hft-harnessctl,hft-research-ml,'

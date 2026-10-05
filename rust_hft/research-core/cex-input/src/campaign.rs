@@ -261,6 +261,23 @@ impl CampaignPreparedInputsV1 {
             self.expected_native()? == *expected,
             "native prepared source/protocol/rows binding changed"
         );
+        // The three batches remain alive together during reconstruction. Cache
+        // eviction cannot release their external Arcs, so admit their total.
+        let resident_bytes = self
+            .features
+            .manifest
+            .blocks
+            .iter()
+            .chain(&self.future_marks.manifest.blocks)
+            .chain(&self.replay.manifest.blocks)
+            .try_fold(0_u64, |sum, block| {
+                sum.checked_add(block.decoded_bytes)
+                    .context("native aggregate decoded byte overflow")
+            })?;
+        ensure!(
+            resident_bytes <= max_bytes,
+            "native aggregate batch exceeds decoded byte budget"
+        );
         let mut cache = VerifiedCache::new(max_bytes)?;
         let features = cache.load(
             &self.features.manifest,
@@ -392,7 +409,7 @@ impl CampaignPreparedInputsV1 {
                     && anchor.observed_at_ns >= meta.development_window.start_ns
                     && anchor.observed_at_ns < meta.development_window.end_ns
                     && anchor.future_at_ns > anchor.observed_at_ns
-                    && anchor.mature_at_ns >= anchor.future_at_ns
+                    && anchor.mature_at_ns == anchor.future_at_ns
                     && anchor.future_at_ns < meta.authorized_context_end_ns
                     && anchor.mature_at_ns < meta.authorized_context_end_ns,
                 "native label requires an unauthorized future price or maturity"
@@ -474,10 +491,15 @@ fn decode_rows(
         frames.len() == manifest.anchors.len(),
         "native development row coverage changed"
     );
-    let prices = feature_rows(marks)?
-        .into_iter()
-        .map(|row| ((row.segment.as_str(), row.available_ns), row.values[0]))
-        .collect::<BTreeMap<_, _>>();
+    let mut prices = BTreeMap::new();
+    for row in feature_rows(marks)? {
+        ensure!(
+            prices
+                .insert((row.segment.as_str(), row.available_ns), row.values[0])
+                .is_none(),
+            "native actual future price clock is duplicated"
+        );
+    }
     let mut rows = Vec::with_capacity(frames.len());
     for (frame, anchor) in frames.into_iter().zip(&manifest.anchors) {
         ensure!(

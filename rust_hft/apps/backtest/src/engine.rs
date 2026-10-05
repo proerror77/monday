@@ -250,6 +250,26 @@ pub fn replay_shared_target_positions(
     config: &TargetPositionReplayConfig,
     spot_instrument_rules: Option<&CexSpotInstrumentRulesV1>,
 ) -> Result<TargetPositionReplayOutput> {
+    replay_shared_target_positions_bounded(
+        input,
+        expected_manifest_sha256,
+        decisions,
+        config,
+        spot_instrument_rules,
+        None,
+    )
+}
+
+/// Bound the causal replay tail inside the already admitted DataView. This does
+/// not grant access to another split or manufacture events at the endpoint.
+pub fn replay_shared_target_positions_bounded(
+    input: &hft_cex_research_input::data::SharedInput,
+    expected_manifest_sha256: &str,
+    decisions: &[TargetPositionDecision],
+    config: &TargetPositionReplayConfig,
+    spot_instrument_rules: Option<&CexSpotInstrumentRulesV1>,
+    end_time_us: Option<i64>,
+) -> Result<TargetPositionReplayOutput> {
     use hft_cex_research_input::data::{ReplayPayload, TypedBlock};
     anyhow::ensure!(
         input.manifest_sha256() == expected_manifest_sha256,
@@ -268,6 +288,14 @@ pub fn replay_shared_target_positions(
             && i128::from(d.timestamp_us) * 1000 < i128::from(input.spec().window.end_ns)),
         "decision outside admitted split"
     );
+    if let Some(end) = end_time_us {
+        anyhow::ensure!(
+            i128::from(end) * 1000 >= i128::from(input.spec().window.start_ns)
+                && i128::from(end) * 1000 < i128::from(input.spec().window.end_ns)
+                && decisions.iter().all(|d| d.timestamp_us <= end),
+            "replay endpoint exceeds admitted context or precedes a decision"
+        );
+    }
     let mut replay =
         TargetPositionReplay::new_with_spot_rules(decisions, config, spot_instrument_rules)?;
     let mut segment: Option<&str> = None;
@@ -316,6 +344,9 @@ pub fn replay_shared_target_positions(
             // clock cannot represent a nanosecond. Never expose an event early.
             let ts = row.available_ns.div_euclid(1000)
                 + i64::from(row.available_ns.rem_euclid(1000) != 0);
+            if end_time_us.is_some_and(|end| ts > end) {
+                return replay.finish_with_trace();
+            }
             replay.observe(&EventEnvelope {
                 ts,
                 sequence: Some(row.ordinal),
@@ -2882,6 +2913,34 @@ mod tests {
         let second =
             replay_shared_target_positions(&input.clone(), &manifest, &decisions, &config, None)
                 .unwrap();
+        let bounded = replay_shared_target_positions_bounded(
+            &input,
+            &manifest,
+            &decisions,
+            &config,
+            None,
+            Some(3000),
+        )
+        .unwrap();
+        assert_eq!(first, bounded);
+        assert!(replay_shared_target_positions_bounded(
+            &input,
+            &manifest,
+            &decisions,
+            &config,
+            None,
+            Some(2000)
+        )
+        .is_err());
+        assert!(replay_shared_target_positions_bounded(
+            &input,
+            &manifest,
+            &decisions,
+            &config,
+            None,
+            Some(input.spec().window.end_ns / 1000)
+        )
+        .is_err());
         assert_eq!(first, second);
         assert!(
             replay_shared_target_positions(&input, &"a".repeat(64), &decisions, &config, None)

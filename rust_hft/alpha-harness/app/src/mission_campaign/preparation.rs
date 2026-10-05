@@ -294,12 +294,27 @@ fn restore_inputs(
     {
         bail!("prepared input receipt source, image or dataset identity differs");
     }
-    let render_inputs = PreparedCexInputs::restore_metadata(
+    let _restored_metadata = PreparedCexInputs::restore_metadata(
         shared.render_metadata,
         &receipt.feature.sha256,
         &receipt.materialization.sha256,
     )?;
+    // A preparation snapshot has metadata, not source bytes. Native export re-admits
+    // the actual mounted source and retains its genuine rows before publishing.
+    let render_inputs = PreparedCexInputs::load(
+        &plan.input_root.join(&receipt.feature.relative_path),
+        &plan.input_root.join(&receipt.materialization.relative_path),
+        true,
+    )?;
+    if render_inputs.feature_sha256() != receipt.feature.sha256
+        || render_inputs.materialization_sha256() != receipt.materialization.sha256
+    {
+        bail!("native restored source differs from its immutable receipt");
+    }
     Ok(ValidatedCampaignInputSet {
+        input_root: plan.input_root.clone(),
+        replay_artifact_path: plan.input_root.join(&receipt.replay_artifact.relative_path),
+        replay_manifest_path: plan.input_root.join(&receipt.replay_manifest.relative_path),
         feature_url: receipt.feature.object_url.clone(),
         feature_sha256: receipt.feature.sha256.clone(),
         materialization_url: receipt.materialization.object_url.clone(),
@@ -686,7 +701,7 @@ mod tests {
     fn executable_workflow_rejects_diagnostic_defaults_and_inadequate_training_budgets() {
         let mut research = CexCampaignResearchPlanV1::canonical();
         assert!(validate_workflow_training(&[research.clone()]).is_err());
-        let mut training = super::super::tests::paired_mlp_plan_for_tests();
+        let mut training = super::super::test_support::paired_mlp_plan_for_tests();
         training.updates = 4096;
         training.optimization = Some(alpha_domain::mlp_training::CexMlpOptimizationV1 {
             learning_rate: 0.0003,

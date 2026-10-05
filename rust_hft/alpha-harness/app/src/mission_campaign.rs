@@ -1,35 +1,53 @@
-use hft_research_artifacts::{fetch_to_file, normalized_sha256, publish_immutable_file};
+#[cfg(feature = "scientific")]
+use hft_research_artifacts::publish_immutable_file;
+use hft_research_artifacts::{fetch_to_file, normalized_sha256};
 pub(crate) mod final_evaluation;
 pub(crate) mod market_encoder;
 pub(crate) mod preparation;
+pub(crate) mod prepared_inputs;
 pub(crate) mod sequence;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod workflow;
-use crate::{
-    cli::{
-        print_json, CampaignExecuteArgs, CampaignFinalizeArgs, CampaignFreezeArgs, CampaignIdArgs,
-        CampaignLearnArgs, CampaignStudyProposeArgs, ExecuteMissionArgs, BUILD_SOURCE_REVISION,
-    },
-    data_mission, mission_dispatch,
-    mission_render::{
-        allowed_research_feature_fields, render_cex_bundle, render_prepared_cex_bundle,
-        validate_render_instrument_scope, CexCampaignFailureClassV1,
-        CexCampaignLearningDirectiveV1, CexCampaignPositionPolicyV1, CexCampaignResearchDeltaV1,
-        CexCampaignResearchEvidenceSignatureV2, CexCampaignResearchParentV1,
-        CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1, PreparedCexInputs,
-        MAX_RESEARCH_PLAN_GENERATION,
-    },
-    mission_runner::{
-        decode_materialization, execute_report, recover_execution_report_from_cached_result,
-        recover_execution_report_from_published_result, research_event, valid_git_revision,
-        validate_cex_holdout_id, validate_supervised_candidate_binding,
-        validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
-        ExecutionBinding, CEX_SUPERVISED_MODEL_NAMES, MAX_RESULT_BUNDLE_BYTES,
-    },
-    prediction_dispatch::{
-        canonical_tokyo_oss_internal_object, cex_campaign_round_root,
-        cex_global_holdout_claim_object, validate_dns_label,
-    },
-};
+use crate::cli::print_json;
+use crate::cli::CampaignFinalizeArgs;
+use crate::cli::CampaignFreezeArgs;
+use crate::cli::CampaignIdArgs;
+use crate::cli::CampaignLearnArgs;
+use crate::cli::CampaignStudyProposeArgs;
+use crate::cli::BUILD_SOURCE_REVISION;
+use crate::mission_dispatch;
+use crate::mission_render::allowed_research_feature_fields;
+use crate::mission_render::render_cex_bundle;
+use crate::mission_render::render_prepared_cex_bundle;
+use crate::mission_render::validate_render_instrument_scope;
+use crate::mission_render::CexCampaignFailureClassV1;
+use crate::mission_render::CexCampaignLearningDirectiveV1;
+use crate::mission_render::CexCampaignPositionPolicyV1;
+use crate::mission_render::CexCampaignResearchDeltaV1;
+use crate::mission_render::CexCampaignResearchEvidenceSignatureV2;
+use crate::mission_render::CexCampaignResearchParentV1;
+use crate::mission_render::CexCampaignResearchPlanV1;
+use crate::mission_render::CexCampaignSearchPolicyRevisionV1;
+use crate::mission_render::PreparedCexInputs;
+use crate::mission_render::MAX_RESEARCH_PLAN_GENERATION;
+use crate::mission_runner::decode_materialization;
+use crate::mission_runner::recover_execution_report_from_cached_result;
+use crate::mission_runner::recover_execution_report_from_published_result;
+use crate::mission_runner::research_event;
+use crate::mission_runner::valid_git_revision;
+use crate::mission_runner::validate_cex_holdout_id;
+use crate::mission_runner::validate_supervised_candidate_binding;
+use crate::mission_runner::validate_supervised_replay_binding;
+use crate::mission_runner::CexEventReplayReceiptV1;
+use crate::mission_runner::CexSupervisedModelSelectionV1;
+use crate::mission_runner::ExecutionBinding;
+use crate::mission_runner::CEX_SUPERVISED_MODEL_NAMES;
+use crate::mission_runner::MAX_RESULT_BUNDLE_BYTES;
+use crate::prediction_dispatch::canonical_tokyo_oss_internal_object;
+use crate::prediction_dispatch::cex_campaign_round_root;
+use crate::prediction_dispatch::cex_global_holdout_claim_object;
+use crate::prediction_dispatch::validate_dns_label;
 use alpha_domain::{
     campaign_horizon::{
         CampaignLabelHorizonV1, CampaignNextFamilyInputWindowV1, CampaignNextFamilyParentV1,
@@ -41,7 +59,9 @@ use alpha_domain::{
 use alpha_engine::{baselines::CexSupervisedModelCandidateV2, engines::CexFactorBankMctsResultV1};
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
-use reqwest::{blocking::Client, redirect::Policy, StatusCode};
+#[cfg(feature = "scientific")]
+use reqwest::StatusCode;
+use reqwest::{blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -51,10 +71,13 @@ use std::{
     time::Duration,
 };
 use zip::ZipArchive;
+#[cfg(feature = "scientific")]
+use {crate::cli::CampaignExecuteArgs, crate::cli::ExecuteMissionArgs, crate::data_mission};
 
 const CAMPAIGN_FREEZE_SCHEMA_V1: &str = "cex-campaign-freeze-v1";
 const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
 const CAMPAIGN_REQUEST_SCHEMA_V5: &str = "cex-campaign-request-v5";
+const CAMPAIGN_REQUEST_SCHEMA_V6: &str = "cex-campaign-request-v6-prepared";
 const CAMPAIGN_RESULT_SCHEMA_V8: &str = "cex-campaign-result-v8";
 const CAMPAIGN_IDENTITY_SCHEMA_V5: &str = "cex-campaign-identity-v5";
 const CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1: &str = "cex-campaign-round-identity-v1";
@@ -102,6 +125,8 @@ pub(crate) struct CampaignRequest {
     pub(crate) campaign_inputs_sha256: String,
     pub(crate) producer_source_revision: String,
     pub(crate) producer_image_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prepared_inputs: Option<prepared_inputs::NativePreparedCampaignRefV1>,
     pub(crate) research_plan: CexCampaignResearchPlanV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) study_proposal: Option<CampaignNextFamilyProposalV1>,
@@ -172,6 +197,8 @@ struct CampaignInputsReceipt {
     materialization: CampaignInputReceiptItem,
     replay_artifact: CampaignInputReceiptItem,
     replay_manifest: CampaignInputReceiptItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_inputs: Option<prepared_inputs::NativePreparedCampaignRefV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -453,6 +480,7 @@ struct LoadedRequest {
     sha256: String,
 }
 
+#[cfg(feature = "scientific")]
 pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     if args.final_evaluation {
         return final_evaluation::execute(args);
@@ -1277,6 +1305,31 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
 
     let loaded = load_request(&args.signed_request)?;
     validate_request_matches_freeze(&loaded.request, &plan)?;
+    if loaded.request.prepared_inputs.is_some() {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .redirect(Policy::none())
+            .build()?;
+        let readback = tempfile::tempdir().context("native finalized input readback")?;
+        let verified = prepared_inputs::acquire_native_prepared(
+            &loaded.request,
+            &loaded.sha256,
+            &client,
+            readback.path(),
+        )?;
+        verified.render_inputs();
+        research_event(
+            "alpha-harness",
+            "campaign_prepared_input_readback_verified",
+            serde_json::json!({
+                "request_sha256":verified.request_sha256(), "campaign_inputs_sha256":verified.campaign_inputs_sha256(),
+                "collection_sha256":verified.collection_id(), "view_sha256":verified.view_ids(),
+                "evaluation_protocol_sha256":verified.evaluation_protocol_sha256(),
+                "source_revision":verified.source_revision(), "runner_image_identity":verified.runner_image_identity(),
+                "declared_trials":verified.declared_trials(),
+            }),
+        );
+    }
     hft_research_artifacts::write_json_atomic(&args.request_out, &loaded.request)?;
     let rendered = mission_dispatch::write_submission(
         &args.submission_out,
@@ -1317,6 +1370,7 @@ pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow:
     validate_request(request).or_else(|_| validate_local_test_request(request))
 }
 
+#[cfg(feature = "scientific")]
 fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> anyhow::Result<()> {
     if !args.pre_holdout {
         bail!(
@@ -1365,67 +1419,26 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             },
         }),
     );
-    let feature_path = shared_input_dir.join("features.jsonl");
-    fetch_verified(
+    let native_inputs = prepared_inputs::acquire_native_prepared(
+        &loaded.request,
+        &loaded.sha256,
         &client,
-        "campaign feature",
-        &loaded.request.feature_url,
-        &feature_path,
-        &loaded.request.feature_sha256,
-        crate::mission_runner::MAX_FEATURE_BYTES,
+        &shared_input_dir,
     )?;
-    let materialization_path = shared_input_dir.join("materialization.json");
-    fetch_verified(
-        &client,
-        "campaign materialization",
-        &loaded.request.materialization_url,
-        &materialization_path,
-        &loaded.request.materialization_sha256,
-        crate::mission_runner::MAX_MATERIALIZATION_BYTES,
-    )?;
-    let replay_artifact_path = shared_input_dir.join(format!(
-        "{}.parquet",
-        normalized_sha256(
-            "campaign replay artifact",
-            &loaded.request.replay_artifact_sha256
-        )?
-    ));
-    fetch_verified(
-        &client,
-        "campaign replay artifact",
-        &loaded.request.replay_artifact_url,
-        &replay_artifact_path,
-        &loaded.request.replay_artifact_sha256,
-        1024 * 1024 * 1024,
-    )?;
-    let replay_manifest_path = shared_input_dir.join("replay-manifest.json");
-    fetch_verified(
-        &client,
-        "campaign replay manifest",
-        &loaded.request.replay_manifest_url,
-        &replay_manifest_path,
-        &loaded.request.replay_manifest_sha256,
-        16 * 1024 * 1024,
-    )?;
+    let render_inputs = native_inputs.render_inputs();
     research_event(
         "alpha-harness",
         "campaign_input_download_completed",
         serde_json::json!({
-            "campaign_id": &loaded.request.campaign_id,
-            "feature_sha256": &loaded.request.feature_sha256,
-            "materialization_sha256": &loaded.request.materialization_sha256,
-            "replay_artifact_sha256": &loaded.request.replay_artifact_sha256,
-            "replay_manifest_sha256": &loaded.request.replay_manifest_sha256,
+            "campaign_id":loaded.request.campaign_id,
+            "request_sha256":native_inputs.request_sha256(),
+            "prepared_collection_sha256":native_inputs.collection_id(),
+            "view_sha256":native_inputs.view_ids(),
+            "development_rows":native_inputs.prepared().rows().len(),
+            "original_rows":native_inputs.prepared().original_metadata().total_rows,
+            "selection_bytes_loaded":false,"holdout_bytes_loaded":false,
         }),
     );
-
-    // Independent worker admission happens once; all seeds render from that
-    // same verified snapshot instead of reimporting bulk features per round.
-    let render_inputs = PreparedCexInputs::load(
-        &feature_path,
-        &materialization_path,
-        loaded.request.research_plan.calendar.is_some(),
-    )?;
     let mut ledgers = Vec::with_capacity(loaded.request.rounds.len());
     let mut selected_round = None;
     for (round_index, round) in loaded.request.rounds.iter().enumerate() {
@@ -1443,7 +1456,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             }),
         );
         let rendered = render_prepared_cex_bundle(
-            &render_inputs,
+            render_inputs,
             &loaded.request.research_plan,
             round.seed,
             loaded.request.declared_total_trials,
@@ -1498,18 +1511,18 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             let (round_claim_put_url, round_claim_readback_url) =
                 campaign_round_claim_urls(&loaded.request, round)?;
             (
-                execute_report(
+                crate::mission_runner::execute_prepared_report(
                     ExecuteMissionArgs {
                         work_dir: execute_dir.clone(),
                         mission_id: rendered.mission_id.clone(),
                         holdout_id: loaded.request.holdout_id.clone(),
                         mission_url: mission_readback_path.to_string_lossy().into_owned(),
                         mission_sha256: mission_sha256.clone(),
-                        feature_url: feature_path.to_string_lossy().into_owned(),
-                        materialization_url: materialization_path.to_string_lossy().into_owned(),
-                        replay_artifact_url: replay_artifact_path.to_string_lossy().into_owned(),
+                        feature_url: String::new(),
+                        materialization_url: String::new(),
+                        replay_artifact_url: String::new(),
                         replay_artifact_sha256: loaded.request.replay_artifact_sha256.clone(),
-                        replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
+                        replay_manifest_url: String::new(),
                         replay_manifest_sha256: loaded.request.replay_manifest_sha256.clone(),
                         resume_url: None,
                         resume_sha256: None,
@@ -1519,10 +1532,16 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
                         holdout_claim_readback_url: round_claim_readback_url,
                     },
                     binding,
+                    &native_inputs,
+                    render_inputs,
                 )?,
                 false,
             )
         };
+        crate::mission_runner::validate_native_campaign_result_binding(
+            &execute_dir.join("results"),
+            &native_inputs,
+        )?;
         let ledger = collect_round_ledger(&execute_dir, round, &report)?;
         research_event(
             "alpha-harness",
@@ -1682,6 +1701,9 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
 }
 
 struct ValidatedCampaignInputSet {
+    input_root: PathBuf,
+    replay_artifact_path: PathBuf,
+    replay_manifest_path: PathBuf,
     receipt: CampaignInputsReceipt,
     campaign_inputs_sha256: String,
     build_source_revision: String,
@@ -1767,6 +1789,9 @@ fn validated_campaign_inputs(
         None,
     )?;
     Ok(ValidatedCampaignInputSet {
+        input_root: args.input_root.clone(),
+        replay_artifact_path,
+        replay_manifest_path,
         receipt,
         campaign_inputs_sha256,
         build_source_revision,
@@ -1805,7 +1830,7 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
     if args.reuse.is_some() || args.reuse_sha256.is_some() {
         return reuse_frozen_request(args, &research_plan, study_proposal.as_ref());
     }
-    let inputs = validated_campaign_inputs(args, research_plan.calendar.is_some())?;
+    let inputs = validated_campaign_inputs(args, true)?;
     freeze_prepared_request(
         &inputs,
         &research_plan,
@@ -1839,6 +1864,17 @@ fn freeze_prepared_request(
         probe_seed,
         declared_total_trials,
     )?;
+    let prepared = prepared_inputs::freeze_native_prepared_reference(inputs, research_plan)?;
+    let mut frozen_inputs = inputs.receipt.clone();
+    frozen_inputs.prepared_inputs = Some(prepared.clone());
+    let frozen_inputs_sha =
+        hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&frozen_inputs)?);
+    write_json_create_once(
+        &inputs
+            .input_root
+            .join(format!("native-prepared/{frozen_inputs_sha}.inputs.json")),
+        &frozen_inputs,
+    )?;
     Ok((
         build_request_from_parts(
             &inputs.feature_url,
@@ -1849,9 +1885,10 @@ fn freeze_prepared_request(
             &inputs.replay_artifact_sha256,
             &inputs.replay_manifest_url,
             &inputs.replay_manifest_sha256,
-            &inputs.campaign_inputs_sha256,
+            &frozen_inputs_sha,
             &inputs.receipt.source_revision,
             &inputs.producer_image_identity,
+            Some(&prepared),
             research_plan,
             &inputs.build_source_revision,
             &inputs.image_identity,
@@ -1860,7 +1897,7 @@ fn freeze_prepared_request(
             seeds,
             study_proposal,
         )?,
-        inputs.campaign_inputs_sha256.clone(),
+        frozen_inputs_sha,
     ))
 }
 
@@ -1893,8 +1930,19 @@ fn reuse_frozen_request(
         &frozen,
         frozen.preparation_authentication_tag.as_deref(),
     )?;
-    let (receipt, receipt_sha) = load_campaign_inputs_receipt(&args.campaign_inputs)?;
+    let (mut receipt, original_receipt_sha) = load_campaign_inputs_receipt(&args.campaign_inputs)?;
     validate_campaign_inputs_receipt(&receipt)?;
+    let receipt_sha = if let Some(prepared) = &frozen.canonical_request.prepared_inputs {
+        if receipt.prepared_inputs.is_some()
+            || prepared.expected_native.source.preparation_receipt_sha256 != original_receipt_sha
+        {
+            bail!("authenticated prepared freeze differs from the original native source receipt");
+        }
+        receipt.prepared_inputs = Some(prepared.clone());
+        hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&receipt)?)
+    } else {
+        original_receipt_sha
+    };
     let source = normalized_source_revision("campaign source revision", &args.source_revision)?;
     if source != BUILD_SOURCE_REVISION {
         bail!("campaign source revision does not match this build");
@@ -1911,6 +1959,7 @@ fn reuse_frozen_request(
         &receipt_sha,
         &receipt.source_revision,
         &mission_dispatch::image_digest(&receipt.image_ref)?,
+        receipt.prepared_inputs.as_ref(),
         research_plan,
         &source,
         &mission_dispatch::image_digest(&args.image)?,
@@ -2156,6 +2205,7 @@ struct SupervisedRoundEvidence {
     replay: Option<CexEventReplayReceiptV1>,
     calendar_validation: Option<alpha_engine::final_models::CalendarValidationReportV1>,
     calendar_replay: Option<CexEventReplayReceiptV1>,
+    selection_required: bool,
 }
 
 fn load_supervised_round_evidence(
@@ -2245,21 +2295,30 @@ fn load_supervised_round_evidence(
         bail!("supervised replay report drifted from its receipt");
     }
     let calendar_validation = if let Some(calendar) = &mission.spec.evaluation_protocol.calendar {
-        let validation: alpha_engine::final_models::CalendarValidationReportV1 =
-            serde_json::from_slice(&std::fs::read(results.join("calendar-validation.json"))?)?;
-        validation.report.evaluation.validate()?;
-        if &validation.calendar != calendar
-            || validation.promotion_authority
-            || validation.source_candidate.id != ridge.artifact_id
-            || validation.source_candidate.content_sha256 != canonical_json_hash(&ridge)?
-            || validation.report.evaluation.protocol_binding()?.1
-                != mission.spec.evaluation_protocol.content_hash()?
-            || validation.report.evaluation.evaluator_version
-                != alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION
+        let path = results.join("calendar-validation.json");
+        if !path.try_exists()?
+            && results
+                .join("native-prepared-admission.json")
+                .try_exists()?
         {
-            bail!("calendar validation is not bound to this Ridge and calendar");
+            None
+        } else {
+            let validation: alpha_engine::final_models::CalendarValidationReportV1 =
+                serde_json::from_slice(&std::fs::read(path)?)?;
+            validation.report.evaluation.validate()?;
+            if &validation.calendar != calendar
+                || validation.promotion_authority
+                || validation.source_candidate.id != ridge.artifact_id
+                || validation.source_candidate.content_sha256 != canonical_json_hash(&ridge)?
+                || validation.report.evaluation.protocol_binding()?.1
+                    != mission.spec.evaluation_protocol.content_hash()?
+                || validation.report.evaluation.evaluator_version
+                    != alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION
+            {
+                bail!("calendar validation is not bound to this Ridge and calendar");
+            }
+            Some(validation)
         }
-        Some(validation)
     } else {
         None
     };
@@ -2286,6 +2345,7 @@ fn load_supervised_round_evidence(
         replay,
         calendar_validation,
         calendar_replay,
+        selection_required: mission.spec.evaluation_protocol.calendar.is_some(),
     }))
 }
 
@@ -2478,7 +2538,14 @@ fn collect_round_ledger(
         let evidence = supervised
             .as_ref()
             .context("supervised ML round is missing model selection evidence")?;
-        if evidence
+        if evidence.selection_required && evidence.calendar_validation.is_none() {
+            (
+                "insufficient_selection_evidence".to_string(),
+                None,
+                None,
+                None,
+            )
+        } else if evidence
             .calendar_validation
             .as_ref()
             .is_some_and(|validation| !validation.report.evaluation.passed)
@@ -2634,6 +2701,7 @@ fn campaign_replay_feedback(receipt: &CexEventReplayReceiptV1) -> CampaignReplay
     }
 }
 
+#[cfg(feature = "scientific")]
 fn campaign_round_claim_urls(
     request: &CampaignRequest,
     round: &CampaignRoundRequest,
@@ -3052,6 +3120,7 @@ fn validate_existing_follow_up_plan(
 /// Reconstructs every round from independently read-back immutable artifacts.
 /// This validates evidence only: it does not train, replay, open holdout or promote.
 #[cfg(test)]
+#[cfg_attr(all(test, not(feature = "scientific")), allow(dead_code))]
 pub(crate) fn readback_pre_holdout_terminal(
     client: &Client,
     request: &CampaignRequest,
@@ -3667,7 +3736,7 @@ pub(crate) fn serialize_request(request: &CampaignRequest) -> anyhow::Result<Vec
 
 #[cfg(test)]
 pub(crate) fn valid_request_for_tests() -> CampaignRequest {
-    tests::valid_request_for_other_modules()
+    test_support::valid_request()
 }
 
 #[cfg(test)]
@@ -3687,6 +3756,7 @@ pub(crate) fn request_for_materialization_for_tests(path: &Path) -> CampaignRequ
         &base.campaign_inputs_sha256,
         &base.producer_source_revision,
         &base.producer_image_identity,
+        base.prepared_inputs.as_ref(),
         &base.research_plan,
         BUILD_SOURCE_REVISION,
         &base.image_identity,
@@ -3703,8 +3773,13 @@ pub(crate) fn request_for_materialization_for_tests(path: &Path) -> CampaignRequ
 }
 
 pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V5 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V5}");
+    if !matches!(
+        request.schema_version.as_str(),
+        CAMPAIGN_REQUEST_SCHEMA_V5 | CAMPAIGN_REQUEST_SCHEMA_V6
+    ) || (request.schema_version == CAMPAIGN_REQUEST_SCHEMA_V6)
+        != request.prepared_inputs.is_some()
+    {
+        bail!("campaign request schema and prepared input kind disagree");
     }
     request.research_plan.validate()?;
     if request.research_plan.calendar.is_some() {
@@ -3782,15 +3857,60 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign producer image identity must be a normalized SHA256");
     }
     validate_cex_holdout_id(&request.holdout_id)?;
-    canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?;
+    legacy_input_object(request, "campaign feature", &request.feature_url)?;
     normalized_sha256("campaign feature", &request.feature_sha256)?;
-    canonical_tokyo_oss_internal_object("campaign materialization", &request.materialization_url)?;
+    legacy_input_object(
+        request,
+        "campaign materialization",
+        &request.materialization_url,
+    )?;
     normalized_sha256("campaign materialization", &request.materialization_sha256)?;
-    canonical_tokyo_oss_internal_object("campaign replay artifact", &request.replay_artifact_url)?;
+    legacy_input_object(
+        request,
+        "campaign replay artifact",
+        &request.replay_artifact_url,
+    )?;
     normalized_sha256("campaign replay artifact", &request.replay_artifact_sha256)?;
-    canonical_tokyo_oss_internal_object("campaign replay manifest", &request.replay_manifest_url)?;
+    legacy_input_object(
+        request,
+        "campaign replay manifest",
+        &request.replay_manifest_url,
+    )?;
     normalized_sha256("campaign replay manifest", &request.replay_manifest_sha256)?;
 
+    if let Some(prepared) = &request.prepared_inputs {
+        normalized_sha256("native prepared collection", &prepared.collection_sha256)?;
+        let collection_object = canonical_tokyo_oss_internal_object(
+            "native prepared collection",
+            &prepared.collection_url,
+        )?;
+        let suffix = format!("/native-prepared/{}.json", prepared.collection_sha256);
+        let root = collection_object
+            .strip_suffix(&suffix)
+            .context("native collection object is not content addressed")?;
+        if prepared.block_urls.is_empty() || prepared.block_urls.len() > 50_000 {
+            bail!("native prepared block transport count exceeds its bound");
+        }
+        for (sha, url) in &prepared.block_urls {
+            normalized_sha256("native prepared block", sha)?;
+            if canonical_tokyo_oss_internal_object("native prepared block", url)?
+                != format!("{root}/native-prepared/{sha}.mondaybin")
+            {
+                bail!("native prepared transport does not bind its exact content address and source root");
+            }
+        }
+        let source = &prepared.expected_native.source;
+        if source.feature_sha256 != request.feature_sha256
+            || source.materialization_sha256 != request.materialization_sha256
+            || source.replay_artifact_sha256 != request.replay_artifact_sha256
+            || source.replay_manifest_sha256 != request.replay_manifest_sha256
+            || source.build.source_revision != request.producer_source_revision
+            || mission_dispatch::image_digest(&source.build.image_identity)?
+                != request.producer_image_identity
+        {
+            bail!("native prepared expectation differs from original source Build/input identity");
+        }
+    }
     let claim_object = canonical_tokyo_oss_internal_object(
         "campaign holdout claim",
         &request.holdout_claim_put_url,
@@ -3917,6 +4037,7 @@ fn build_request_from_parts(
     campaign_inputs_sha256: &str,
     producer_source_revision: &str,
     producer_image_identity: &str,
+    prepared_inputs: Option<&prepared_inputs::NativePreparedCampaignRefV1>,
     research_plan: &CexCampaignResearchPlanV1,
     build_source_revision: &str,
     image_identity: &str,
@@ -3939,7 +4060,13 @@ fn build_request_from_parts(
         replay_manifest_sha256,
     )?;
     let mut request = CampaignRequest {
-        schema_version: CAMPAIGN_REQUEST_SCHEMA_V5.to_string(),
+        prepared_inputs: prepared_inputs.cloned(),
+        schema_version: if prepared_inputs.is_some() {
+            CAMPAIGN_REQUEST_SCHEMA_V6
+        } else {
+            CAMPAIGN_REQUEST_SCHEMA_V5
+        }
+        .to_string(),
         campaign_id: "placeholder".to_string(),
         build_source_revision: build_source_revision.to_string(),
         image_identity: image_identity.to_string(),
@@ -3948,13 +4075,29 @@ fn build_request_from_parts(
         producer_image_identity: producer_image_identity.to_string(),
         research_plan: research_plan.clone(),
         study_proposal: study_proposal.cloned(),
-        feature_url: feature_url.to_string(),
+        feature_url: if prepared_inputs.is_some() {
+            String::new()
+        } else {
+            feature_url.to_string()
+        },
         feature_sha256: feature_sha256.to_string(),
-        materialization_url: materialization_url.to_string(),
+        materialization_url: if prepared_inputs.is_some() {
+            String::new()
+        } else {
+            materialization_url.to_string()
+        },
         materialization_sha256: materialization_sha256.to_string(),
-        replay_artifact_url: replay_artifact_url.to_string(),
+        replay_artifact_url: if prepared_inputs.is_some() {
+            String::new()
+        } else {
+            replay_artifact_url.to_string()
+        },
         replay_artifact_sha256: replay_artifact_sha256.to_string(),
-        replay_manifest_url: replay_manifest_url.to_string(),
+        replay_manifest_url: if prepared_inputs.is_some() {
+            String::new()
+        } else {
+            replay_manifest_url.to_string()
+        },
         replay_manifest_sha256: replay_manifest_sha256.to_string(),
         holdout_id: holdout_id.to_string(),
         declared_total_trials: declared_total_trials_for_rounds(research_plan, seeds.len())?,
@@ -4074,20 +4217,30 @@ fn canonicalize_request_transport(request: &CampaignRequest) -> anyhow::Result<C
         "campaign producer image identity",
         &canonical.producer_image_identity,
     )?;
-    canonical.feature_url =
-        canonical_tokyo_oss_internal_object("campaign feature", &canonical.feature_url)?;
-    canonical.materialization_url = canonical_tokyo_oss_internal_object(
-        "campaign materialization",
-        &canonical.materialization_url,
-    )?;
-    canonical.replay_artifact_url = canonical_tokyo_oss_internal_object(
-        "campaign replay artifact",
-        &canonical.replay_artifact_url,
-    )?;
-    canonical.replay_manifest_url = canonical_tokyo_oss_internal_object(
-        "campaign replay manifest",
-        &canonical.replay_manifest_url,
-    )?;
+    if let Some(prepared) = &mut canonical.prepared_inputs {
+        prepared.collection_url = canonical_tokyo_oss_internal_object(
+            "native prepared collection",
+            &prepared.collection_url,
+        )?;
+        for url in prepared.block_urls.values_mut() {
+            *url = canonical_tokyo_oss_internal_object("native prepared block", url)?;
+        }
+    } else {
+        canonical.feature_url =
+            canonical_tokyo_oss_internal_object("campaign feature", &canonical.feature_url)?;
+        canonical.materialization_url = canonical_tokyo_oss_internal_object(
+            "campaign materialization",
+            &canonical.materialization_url,
+        )?;
+        canonical.replay_artifact_url = canonical_tokyo_oss_internal_object(
+            "campaign replay artifact",
+            &canonical.replay_artifact_url,
+        )?;
+        canonical.replay_manifest_url = canonical_tokyo_oss_internal_object(
+            "campaign replay manifest",
+            &canonical.replay_manifest_url,
+        )?;
+    }
     canonical.holdout_claim_put_url = canonical_tokyo_oss_internal_object(
         "campaign holdout claim",
         &canonical.holdout_claim_put_url,
@@ -4120,20 +4273,6 @@ fn canonicalize_request_transport(request: &CampaignRequest) -> anyhow::Result<C
 }
 
 fn signing_plan(request: &CampaignRequest) -> anyhow::Result<CampaignSigningPlan> {
-    let feature_object =
-        canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?;
-    let materialization_object = canonical_tokyo_oss_internal_object(
-        "campaign materialization",
-        &request.materialization_url,
-    )?;
-    let replay_artifact_object = canonical_tokyo_oss_internal_object(
-        "campaign replay artifact",
-        &request.replay_artifact_url,
-    )?;
-    let replay_manifest_object = canonical_tokyo_oss_internal_object(
-        "campaign replay manifest",
-        &request.replay_manifest_url,
-    )?;
     let holdout_claim_object = canonical_tokyo_oss_internal_object(
         "campaign holdout claim",
         &request.holdout_claim_put_url,
@@ -4141,12 +4280,46 @@ fn signing_plan(request: &CampaignRequest) -> anyhow::Result<CampaignSigningPlan
     let campaign_result_object =
         canonical_tokyo_oss_internal_object("campaign result", &request.campaign_result_put_url)?;
     let _campaign_root = campaign_output_root(&campaign_result_object)?;
-    let mut actions = vec![
-        signing_action_get("feature_get", feature_object),
-        signing_action_get("materialization_get", materialization_object),
-        signing_action_get("replay_artifact_get", replay_artifact_object),
-        signing_action_get("replay_manifest_get", replay_manifest_object),
-    ];
+    let mut actions = Vec::new();
+    if let Some(prepared) = &request.prepared_inputs {
+        actions.push(signing_action_get(
+            "prepared_collection_get",
+            canonical_tokyo_oss_internal_object(
+                "native prepared collection",
+                &prepared.collection_url,
+            )?,
+        ));
+        for (sha, url) in &prepared.block_urls {
+            actions.push(signing_action_get(
+                &format!("prepared_block_{sha}_get"),
+                canonical_tokyo_oss_internal_object("native prepared block", url)?,
+            ));
+        }
+    } else {
+        for (name, label, url) in [
+            ("feature_get", "campaign feature", &request.feature_url),
+            (
+                "materialization_get",
+                "campaign materialization",
+                &request.materialization_url,
+            ),
+            (
+                "replay_artifact_get",
+                "campaign replay artifact",
+                &request.replay_artifact_url,
+            ),
+            (
+                "replay_manifest_get",
+                "campaign replay manifest",
+                &request.replay_manifest_url,
+            ),
+        ] {
+            actions.push(signing_action_get(
+                name,
+                canonical_tokyo_oss_internal_object(label, url)?,
+            ));
+        }
+    }
     for round in &request.rounds {
         actions.push(signing_action_put_json(
             &format!("{}_mission_put", round.round_id),
@@ -4246,7 +4419,7 @@ fn signing_action_put(name: &str, object: String, content_type: &str) -> Campaig
 }
 
 pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<String> {
-    let identity = serde_json::json!({
+    let mut identity = serde_json::json!({
         "identity_schema_version": CAMPAIGN_IDENTITY_SCHEMA_V5,
         "request_schema_version": request.schema_version,
         "build_source_revision": normalized_source_revision(
@@ -4267,20 +4440,21 @@ pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<
             &request.producer_image_identity,
         )?,
         "research_plan": &request.research_plan,
+        "prepared_inputs": request.prepared_inputs.as_ref().map(|p| serde_json::json!({"collection":p.collection_sha256,"expected_native":p.expected_native})),
         "feature": {
-            "object": canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?,
+            "object": legacy_input_object(request,"campaign feature", &request.feature_url)?,
             "sha256": normalized_sha256("campaign feature", &request.feature_sha256)?,
         },
         "materialization": {
-            "object": canonical_tokyo_oss_internal_object("campaign materialization", &request.materialization_url)?,
+            "object": legacy_input_object(request,"campaign materialization", &request.materialization_url)?,
             "sha256": normalized_sha256("campaign materialization", &request.materialization_sha256)?,
         },
         "replay_artifact": {
-            "object": canonical_tokyo_oss_internal_object("campaign replay artifact", &request.replay_artifact_url)?,
+            "object": legacy_input_object(request,"campaign replay artifact", &request.replay_artifact_url)?,
             "sha256": normalized_sha256("campaign replay artifact", &request.replay_artifact_sha256)?,
         },
         "replay_manifest": {
-            "object": canonical_tokyo_oss_internal_object("campaign replay manifest", &request.replay_manifest_url)?,
+            "object": legacy_input_object(request,"campaign replay manifest", &request.replay_manifest_url)?,
             "sha256": normalized_sha256("campaign replay manifest", &request.replay_manifest_sha256)?,
         },
         "holdout_id": request.holdout_id,
@@ -4300,6 +4474,12 @@ pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<
             .collect::<Vec<_>>(),
         "stop_rule": STOP_RULE_V2,
     });
+    if request.prepared_inputs.is_none() {
+        identity
+            .as_object_mut()
+            .context("Campaign identity object")?
+            .remove("prepared_inputs");
+    }
     Ok(format!(
         "cex-campaign-{}",
         &canonical_json_hash(&identity)?[..32]
@@ -4352,6 +4532,7 @@ fn fetch_verified(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn publish_create_once_json(
     client: &Client,
     label: &str,
@@ -4382,6 +4563,7 @@ fn publish_create_once_json(
     Ok(published_sha256)
 }
 
+#[cfg(feature = "scientific")]
 fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
     error
         .to_string()
@@ -4396,8 +4578,13 @@ fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V5 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V5}");
+    if !matches!(
+        request.schema_version.as_str(),
+        CAMPAIGN_REQUEST_SCHEMA_V5 | CAMPAIGN_REQUEST_SCHEMA_V6
+    ) || (request.schema_version == CAMPAIGN_REQUEST_SCHEMA_V6)
+        != request.prepared_inputs.is_some()
+    {
+        bail!("local test request input kind is invalid");
     }
     request.research_plan.validate()?;
     validate_campaign_id(&request.campaign_id)?;
@@ -4439,10 +4626,6 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
         &request.replay_manifest_sha256,
     )?;
     for path in [
-        &request.feature_url,
-        &request.materialization_url,
-        &request.replay_artifact_url,
-        &request.replay_manifest_url,
         &request.holdout_claim_put_url,
         &request.holdout_claim_readback_url,
         &request.campaign_result_put_url,
@@ -4451,6 +4634,18 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
         if path.trim().is_empty() {
             bail!("local test request paths must be non-empty");
         }
+    }
+    if request.prepared_inputs.is_none()
+        && [
+            &request.feature_url,
+            &request.materialization_url,
+            &request.replay_artifact_url,
+            &request.replay_manifest_url,
+        ]
+        .iter()
+        .any(|url| url.is_empty())
+    {
+        bail!("legacy test input paths are required");
     }
     if request.holdout_claim_put_url != request.holdout_claim_readback_url
         || request.campaign_result_put_url != request.campaign_result_readback_url
@@ -4479,8 +4674,9 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 mod tests {
+    use super::test_support::{paired_mlp_plan_for_tests, valid_request};
     use super::*;
     use crate::mission_render;
     use parquet::{
@@ -4571,29 +4767,6 @@ mod tests {
             assert_ne!(expected_campaign_id(&drifted).unwrap(), original);
             drifted.campaign_id = expected_campaign_id(&drifted).unwrap();
             assert!(validate_request(&drifted).is_err());
-        }
-    }
-
-    pub(super) fn paired_mlp_plan_for_tests() -> alpha_domain::CexMlpTrainingPlanV1 {
-        use alpha_domain::mlp_training::CexMlpInitializationV1;
-        alpha_domain::CexMlpTrainingPlanV1 {
-            schema_version: "cex-mlp-training-plan-v1".into(),
-            updates: 64,
-            target_scale: hft_research_manifest::mlp_training::MlpTargetScaleV1::TrainStandardized,
-            optimization: None,
-            initializations: [(7, vec![71, 72, 73]), (11, vec![111, 112, 113])]
-                .into_iter()
-                .map(|(seed, fold_seeds)| {
-                    (
-                        seed,
-                        CexMlpInitializationV1 {
-                            fold_seeds,
-                            expected_factor_ids: vec!["cex-factor-1".into()],
-                            expected_factor_columns_sha256: "a".repeat(64),
-                        },
-                    )
-                })
-                .collect(),
         }
     }
 
@@ -4827,6 +5000,7 @@ mod tests {
                     target_inputs,
                     &loaded.request.producer_source_revision,
                     &loaded.request.producer_image_identity,
+                    loaded.request.prepared_inputs.as_ref(),
                     target_plan,
                     &loaded.request.build_source_revision,
                     &loaded.request.image_identity,
@@ -5599,6 +5773,113 @@ mod tests {
     }
 
     #[test]
+    fn native_collection_rebuilds_actual_rows_preserves_original_schedule_and_rejects_false_label()
+    {
+        use hft_cex_research_input::{
+            campaign::NativeSourceBindingV1, campaign::SourceBuildRefV1, prepared::AcquiredBlocks,
+        };
+        let fixture = campaign_e2e_fixture("native-prepared-rows", false, false, true);
+        let loaded = load_request(&fixture.args.request).unwrap();
+        let render = PreparedCexInputs::load(
+            &fixture._render_fixture.feature_path,
+            &fixture._render_fixture.materialization_path,
+            true,
+        )
+        .unwrap();
+        let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+            render.materialization(),
+            &loaded.request.research_plan,
+        )
+        .unwrap();
+        let original_rows = render.native_source_rows(&protocol).unwrap();
+        let partitions = protocol.row_partitions(original_rows.len()).unwrap();
+        let end = original_rows[partitions
+            .selection
+            .as_ref()
+            .map_or(partitions.sealed_holdout.start, |p| p.start)]
+        .available_time
+        .timestamp_micros()
+            - 1;
+        let canonical = || {
+            hft_backtest::config::verify_canonical_replay_artifact(
+                &fixture.replay_artifact_path,
+                &fixture.replay_manifest_path,
+                Some(&loaded.request.replay_artifact_sha256),
+                &loaded.request.replay_manifest_sha256,
+                None,
+                Some(end),
+            )
+            .unwrap()
+        };
+        let source = NativeSourceBindingV1 {
+            build: SourceBuildRefV1 {
+                source_revision: loaded.request.producer_source_revision.clone(),
+                image_identity: format!(
+                    "registry/native@sha256:{}",
+                    loaded.request.producer_image_identity
+                ),
+            },
+            preparation_run_id: "native-source-test".into(),
+            preparation_receipt_sha256: loaded.request.campaign_inputs_sha256.clone(),
+            feature_sha256: loaded.request.feature_sha256.clone(),
+            materialization_sha256: loaded.request.materialization_sha256.clone(),
+            replay_artifact_sha256: loaded.request.replay_artifact_sha256.clone(),
+            replay_manifest_sha256: loaded.request.replay_manifest_sha256.clone(),
+        };
+        let artifacts = prepared_inputs::export_trusted_source(
+            source.clone(),
+            original_rows.clone(),
+            &protocol,
+            canonical(),
+        )
+        .unwrap();
+        let expected = artifacts.manifest.expected_native().unwrap();
+        let verified = artifacts
+            .manifest
+            .verify(
+                &artifacts.id,
+                &expected,
+                &mut AcquiredBlocks {
+                    bytes: artifacts.blocks,
+                },
+                1024 * 1024 * 1024,
+            )
+            .unwrap();
+        assert_eq!(verified.rows(), &original_rows[..partitions.search.end]);
+        let native =
+            alpha_engine::evaluation::prepare_native_campaign_dataset(&verified, &protocol)
+                .unwrap();
+        let original =
+            alpha_engine::evaluation::prepare_dataset(original_rows.clone(), &protocol).unwrap();
+        assert_eq!(
+            native.engine_context().rows(),
+            original.engine_context().rows()
+        );
+        assert_eq!(
+            native.engine_context().folds(),
+            original.engine_context().folds()
+        );
+        assert_eq!(
+            native.withheld_metadata().unwrap().total_rows,
+            original_rows.len()
+        );
+        assert_eq!(
+            native.withheld_metadata().unwrap().holdout.original_rows,
+            partitions.sealed_holdout
+        );
+        assert!(native.calendar_validation_rows().is_none());
+        let mut false_rows = original_rows;
+        false_rows[0].label += 0.01;
+        assert!(
+            prepared_inputs::export_trusted_source(source, false_rows, &protocol, canonical())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("label")
+        );
+    }
+
+    #[test]
     fn finalize_preserves_frozen_campaign_identity() {
         let root = tempfile::tempdir().unwrap();
         let freeze_path = root.path().join("freeze.json");
@@ -5686,6 +5967,7 @@ mod tests {
             &"5".repeat(64),
             &"a".repeat(40),
             &"6".repeat(64),
+            None,
             &CexCampaignResearchPlanV1::canonical(),
             BUILD_SOURCE_REVISION,
             &"1".repeat(64),
@@ -5743,6 +6025,7 @@ mod tests {
         .unwrap();
         let receipt_path = root.path().join("campaign-inputs.json");
         let receipt = CampaignInputsReceipt {
+            prepared_inputs: None,
             schema_version: CAMPAIGN_INPUTS_SCHEMA_V1.to_string(),
             run_id: "20260819t000000z-1".to_string(),
             source_revision: producer_revision.clone(),
@@ -7958,127 +8241,6 @@ mod tests {
         assert!(immutable_publish_conflict(&error.into()));
     }
 
-    pub(crate) fn valid_request_for_other_modules() -> CampaignRequest {
-        valid_request()
-    }
-
-    fn valid_request() -> CampaignRequest {
-        const TEST_ROOT: &str =
-            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
-        let research_plan = CexCampaignResearchPlanV1::canonical();
-        let round_identity = CampaignRoundIdentityV1 {
-            schema_version: CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1.to_string(),
-            data_window_hours: CAMPAIGN_DATA_WINDOW_HOURS,
-            data_fingerprint_sha256: campaign_data_fingerprint_sha256(
-                &"f".repeat(64),
-                &"b".repeat(40),
-                &"1".repeat(64),
-                &"2".repeat(64),
-                &"3".repeat(64),
-                &"4".repeat(64),
-            )
-            .unwrap(),
-            image_identity: "1".repeat(64),
-            build_source_revision: "a".repeat(40),
-        };
-        let mut request = CampaignRequest {
-            schema_version: CAMPAIGN_REQUEST_SCHEMA_V5.to_string(),
-            campaign_id: String::new(),
-            build_source_revision: "a".repeat(40),
-            image_identity: "1".repeat(64),
-            campaign_inputs_sha256: "f".repeat(64),
-            producer_source_revision: "b".repeat(40),
-            producer_image_identity: "e".repeat(64),
-            research_plan: research_plan.clone(),
-            study_proposal: None,
-            feature_url: format!("{TEST_ROOT}/features.jsonl"),
-            feature_sha256: "1".repeat(64),
-            materialization_url: format!("{TEST_ROOT}/materialization.json"),
-            materialization_sha256: "2".repeat(64),
-            replay_artifact_url: format!("{TEST_ROOT}/replay.parquet"),
-            replay_artifact_sha256: "3".repeat(64),
-            replay_manifest_url: format!("{TEST_ROOT}/replay-manifest.json"),
-            replay_manifest_sha256: "4".repeat(64),
-            holdout_id: "cex-holdout-test".to_string(),
-            declared_total_trials: declared_total_trials_for_rounds(&research_plan, 2).unwrap(),
-            rounds: vec![
-                CampaignRoundRequest {
-                    round_id: "r1".to_string(),
-                    seed: 11,
-                    identity: round_identity.clone(),
-                    mission_put_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json"
-                    ),
-                    mission_readback_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json?readback=1"
-                    ),
-                    result_put_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip"
-                    ),
-                    result_readback_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip?readback=1"
-                    ),
-                },
-                CampaignRoundRequest {
-                    round_id: "r2".to_string(),
-                    seed: 17,
-                    identity: round_identity,
-                    mission_put_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/mission.json"
-                    ),
-                    mission_readback_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/mission.json?readback=1"
-                    ),
-                    result_put_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/results.zip"
-                    ),
-                    result_readback_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/results.zip?readback=1"
-                    ),
-                },
-            ],
-            holdout_claim_put_url: String::new(),
-            holdout_claim_readback_url: String::new(),
-            campaign_result_put_url: format!(
-                "{TEST_ROOT}/campaign-id=placeholder/campaign-result.json"
-            ),
-            campaign_result_readback_url: format!(
-                "{TEST_ROOT}/campaign-id=placeholder/campaign-result.json?readback=1"
-            ),
-        };
-        request.campaign_id = expected_campaign_id(&request).unwrap();
-        for round in &mut request.rounds {
-            round.mission_put_url = format!(
-                "{TEST_ROOT}/campaign-id={}/round={}/mission.json",
-                request.campaign_id, round.round_id
-            );
-            round.mission_readback_url = format!(
-                "{TEST_ROOT}/campaign-id={}/round={}/mission.json?readback=1",
-                request.campaign_id, round.round_id
-            );
-            round.result_put_url = format!(
-                "{TEST_ROOT}/campaign-id={}/round={}/results.zip",
-                request.campaign_id, round.round_id
-            );
-            round.result_readback_url = format!(
-                "{TEST_ROOT}/campaign-id={}/round={}/results.zip?readback=1",
-                request.campaign_id, round.round_id
-            );
-        }
-        request.holdout_claim_put_url =
-            cex_global_holdout_claim_object(&request.holdout_id).unwrap();
-        request.holdout_claim_readback_url = request.holdout_claim_put_url.clone();
-        request.campaign_result_put_url = format!(
-            "{TEST_ROOT}/campaign-id={}/campaign-result.json",
-            request.campaign_id
-        );
-        request.campaign_result_readback_url = format!(
-            "{TEST_ROOT}/campaign-id={}/campaign-result.json?readback=1",
-            request.campaign_id
-        );
-        request
-    }
-
     fn loaded_request_for_learning() -> LoadedRequest {
         let request = valid_request();
         let sha256 = hex::encode(Sha256::digest(serialize_request(&request).unwrap()));
@@ -8489,6 +8651,7 @@ mod tests {
             build_source_revision: BUILD_SOURCE_REVISION.to_string(),
         };
         CampaignRequest {
+            prepared_inputs: None,
             schema_version: CAMPAIGN_REQUEST_SCHEMA_V5.to_string(),
             campaign_id: campaign_id.clone(),
             build_source_revision: BUILD_SOURCE_REVISION.to_string(),
@@ -8805,5 +8968,20 @@ message binance_replay {
             request.campaign_id
         );
         request
+    }
+}
+
+fn legacy_input_object(
+    request: &CampaignRequest,
+    label: &str,
+    value: &str,
+) -> anyhow::Result<Option<String>> {
+    if request.prepared_inputs.is_some() {
+        if !value.is_empty() {
+            bail!("native request exposes whole-source/withheld input URI");
+        }
+        Ok(None)
+    } else {
+        Ok(Some(canonical_tokyo_oss_internal_object(label, value)?))
     }
 }

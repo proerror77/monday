@@ -1,94 +1,175 @@
-use crate::{
-    cli::{
-        print_json, DatasetArgs, EngineChoice, ExecuteMissionArgs, RunMissionArgs, ValidationArgs,
-        BUILD_SOURCE_REVISION,
-    },
-    data_mission, mission, prediction_dispatch,
-};
-use alpha_domain::{
-    canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselineArtifactV1,
-    CexBaselineGateV1, CexBaselineModelKindV1, CexBaselinePolicyV1, CexEqualAbsoluteWeightPolicyV1,
-    CexEventReplayPolicyV1, CexFactorBankRevisionV2, CexFactorEvaluationEvidenceV2,
-    CexFactorRejectionCodeV1, CexFactorScreeningAttemptV2, CexFactorScreeningVerdictV1,
-    CexFinalPrecommitV1, CexFourStageStrategyCandidateV1, CexGpPolicyV1, CexResearchContentRefV1,
-    CexResearchHoldoutStateV1, CexResearchMissionArtifactV1, CexSealedHoldoutClaimV1, EngineKind,
-    EvaluationCostsV1, FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy,
-    MissionStatus, PromotionRecord, ResearchIteration, ResearchMission, SearchBudgetUsage,
-    StrategyBundle, ValidatorMode, CEX_EVENT_REPLAY_POLICY_SCHEMA_V2,
-    CEX_FINAL_PRECOMMIT_SCHEMA_V1, CEX_GP_POLICY_SCHEMA_V4, CEX_GP_POLICY_SCHEMA_V5,
-    MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES, SEALED_HOLDOUT_EVALUATOR_VERSION,
-};
-use alpha_engine::{
-    baselines::{
-        prepare_cex_baselines, CexBurnFitIdentity, CexSupervisedDecisionPolicyV2,
-        CexSupervisedModelCandidateV2, CexSupervisedModelEvaluationV2, VerifiedCexBaselineRun,
-    },
-    engines::{
-        CexCombinationResearchArtifactV1, CexFactorBankMcts, CexFactorBankMctsCheckpointV1,
-        CexFactorBankMctsResultV1, CexFactorBankMctsStopReasonV1,
-    },
-    evaluation::{prepare_dataset, EngineContext},
-    formula_evaluator::FormulaEvaluator,
-    CandidateEvaluator, EngineProposal,
-};
-use alpha_store::{AlphaStore, EvaluationRecord, MissionLineage, RegistryRevision, StoreError};
+#[cfg(feature = "scientific")]
+use crate::cli::ExecuteMissionArgs;
+use crate::cli::ValidationArgs;
+use crate::cli::BUILD_SOURCE_REVISION;
+use crate::data_mission;
+#[cfg(feature = "scientific")]
+use crate::mission;
+#[cfg(feature = "scientific")]
+use crate::prediction_dispatch;
+use alpha_domain::canonical_json_hash;
+#[cfg(feature = "scientific")]
+use alpha_domain::CandidateArtifact;
+use alpha_domain::CandidateEvaluation;
+use alpha_domain::CexBaselineArtifactV1;
+use alpha_domain::CexBaselineModelKindV1;
+use alpha_domain::CexBaselinePolicyV1;
+#[cfg(feature = "scientific")]
+use alpha_domain::CexEventReplayPolicyV1;
+use alpha_domain::CexFactorBankRevisionV2;
+#[cfg(feature = "scientific")]
+use alpha_domain::CexFactorEvaluationEvidenceV2;
+#[cfg(feature = "scientific")]
+use alpha_domain::CexFactorRejectionCodeV1;
+#[cfg(feature = "scientific")]
+use alpha_domain::CexFactorScreeningAttemptV2;
+#[cfg(feature = "scientific")]
+use alpha_domain::CexFactorScreeningVerdictV1;
+use alpha_domain::CexFinalPrecommitV1;
+use alpha_domain::CexGpPolicyV1;
+use alpha_domain::CexResearchContentRefV1;
+use alpha_domain::CexResearchHoldoutStateV1;
+use alpha_domain::CexResearchMissionArtifactV1;
+use alpha_domain::CexSealedHoldoutClaimV1;
+use alpha_domain::EvaluationCostsV1;
+#[cfg(feature = "scientific")]
+use alpha_domain::IterationVerdict;
+use alpha_domain::PromotionRecord;
+use alpha_domain::ResearchMission;
+use alpha_domain::StrategyBundle;
+#[cfg(feature = "scientific")]
+use alpha_domain::CEX_EVENT_REPLAY_POLICY_SCHEMA_V2;
+use alpha_domain::CEX_GP_POLICY_SCHEMA_V4;
+use alpha_domain::CEX_GP_POLICY_SCHEMA_V5;
+use alpha_domain::SEALED_HOLDOUT_EVALUATOR_VERSION;
+use alpha_engine::baselines::CexSupervisedDecisionPolicyV2;
+use alpha_engine::baselines::CexSupervisedModelCandidateV2;
+use alpha_engine::baselines::CexSupervisedModelEvaluationV2;
+#[cfg(feature = "scientific")]
+use alpha_engine::baselines::{prepare_cex_baselines, CexBurnFitIdentity, VerifiedCexBaselineRun};
+use alpha_engine::engines::CexCombinationResearchArtifactV1;
+#[cfg(feature = "scientific")]
+use alpha_engine::engines::CexFactorBankMctsCheckpointV1;
+use alpha_engine::evaluation::prepare_dataset;
+#[cfg(feature = "scientific")]
+use alpha_engine::evaluation::EngineContext;
+#[cfg(feature = "scientific")]
+use alpha_store::AlphaStore;
+#[cfg(feature = "scientific")]
+use alpha_store::EvaluationRecord;
+#[cfg(feature = "scientific")]
+use alpha_store::MissionLineage;
+use alpha_store::RegistryRevision;
+#[cfg(feature = "scientific")]
+use alpha_store::StoreError;
 use anyhow::{bail, Context};
 use chrono::Utc;
-use hft_backtest::{
-    config::{
-        verify_and_replay_canonical_target_positions_with_trace_and_spot_rules,
-        CanonicalReplayEvidence, CanonicalSourceSegmentEvidence,
-    },
-    engine::{
-        TargetPositionDecision, TargetPositionReplayConfig, TargetPositionReplayMetrics,
-        TargetPositionReplayTraceEvent, LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
-        TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
-    },
+#[cfg(feature = "scientific")]
+use hft_backtest::config::{
+    verify_and_replay_canonical_target_positions_with_trace_and_spot_rules,
+    CanonicalReplayEvidence, CanonicalSourceSegmentEvidence,
 };
-use hft_research_artifacts::{
-    checked_result_bundle_bytes, create_bundle, fetch_to_file, normalized_sha256,
-    publish_immutable_file, publish_result, sha256_file,
+use hft_backtest::engine::{
+    TargetPositionDecision, TargetPositionReplayConfig, TargetPositionReplayMetrics,
+    TargetPositionReplayTraceEvent, LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
+    TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
 };
-use hft_research_manifest::{
-    CexInstrumentRulesV2, CexReplayDatasetManifestV5, CexReplaySnapshotV1, CexReplaySnapshotV2,
-    CexReplaySnapshotV3, CexReplaySnapshotV4, CexReplaySnapshotV5, ManifestId,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
-};
-use reqwest::{blocking::Client, redirect::Policy, StatusCode};
+use hft_research_artifacts::fetch_to_file;
+use hft_research_artifacts::normalized_sha256;
+#[cfg(feature = "scientific")]
+use hft_research_artifacts::publish_immutable_file;
+use hft_research_artifacts::sha256_file;
+#[cfg(feature = "scientific")]
+use hft_research_manifest::CexReplayDatasetManifestV5;
+use hft_research_manifest::CexReplaySnapshotV1;
+use hft_research_manifest::CexReplaySnapshotV2;
+use hft_research_manifest::CexReplaySnapshotV3;
+use hft_research_manifest::CexReplaySnapshotV4;
+use hft_research_manifest::CexReplaySnapshotV5;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7;
+use reqwest::blocking::Client;
+#[cfg(feature = "scientific")]
+use reqwest::redirect::Policy;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    fs::File,
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::fs::File;
+use std::io::Read;
+#[cfg(feature = "scientific")]
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(feature = "scientific")]
+use std::time::Duration;
 use zip::ZipArchive;
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+#[cfg(feature = "scientific")]
+use {
+    crate::cli::print_json, crate::cli::DatasetArgs, crate::cli::EngineChoice,
+    crate::cli::RunMissionArgs,
+};
+#[cfg(feature = "scientific")]
+use {
+    alpha_domain::CexBaselineGateV1, alpha_domain::CexEqualAbsoluteWeightPolicyV1,
+    alpha_domain::CexFourStageStrategyCandidateV1, alpha_domain::EngineKind,
+    alpha_domain::FormulaEvaluatorConfig, alpha_domain::MissionCompletionPolicy,
+    alpha_domain::MissionStatus, alpha_domain::ResearchIteration, alpha_domain::SearchBudgetUsage,
+    alpha_domain::ValidatorMode, alpha_domain::CEX_FINAL_PRECOMMIT_SCHEMA_V1,
+    alpha_domain::MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
+};
+#[cfg(feature = "scientific")]
+use {
+    alpha_engine::engines::CexFactorBankMcts, alpha_engine::engines::CexFactorBankMctsResultV1,
+    alpha_engine::engines::CexFactorBankMctsStopReasonV1,
+    alpha_engine::formula_evaluator::FormulaEvaluator, alpha_engine::CandidateEvaluator,
+    alpha_engine::EngineProposal,
+};
+#[cfg(feature = "scientific")]
+use {
+    hft_research_artifacts::checked_result_bundle_bytes, hft_research_artifacts::create_bundle,
+    hft_research_artifacts::publish_result,
+};
+#[cfg(feature = "scientific")]
+use {hft_research_manifest::CexInstrumentRulesV2, hft_research_manifest::ManifestId};
 
 const MATERIALIZATION_KIND: &str = "lob_point_in_time_materialization";
+#[cfg(feature = "scientific")]
 const CEX_BASELINE_POLICY_REGISTRY_KIND: &str = "cex_baseline_policy";
+#[cfg(feature = "scientific")]
 const CEX_BASELINE_RIDGE_REGISTRY_KIND: &str = "cex_baseline_ridge";
+#[cfg(feature = "scientific")]
 const CEX_BASELINE_BURN_REGISTRY_KIND: &str = "cex_baseline_burn_mlp";
+#[cfg(feature = "scientific")]
 const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
+#[cfg(feature = "scientific")]
 const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
+#[cfg(feature = "scientific")]
 const CEX_SUPERVISED_MODEL_REGISTRY_KIND: &str = "cex_supervised_model_candidate";
+#[cfg(feature = "scientific")]
 const CEX_EVENT_REPLAY_RECEIPT_REGISTRY_KIND: &str = "cex_event_replay_receipt";
+#[cfg(feature = "scientific")]
 const CEX_SUPERVISED_EVENT_REPLAY_RECEIPT_REGISTRY_KIND: &str =
     "cex_supervised_event_replay_receipt";
 const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(feature = "scientific")]
 const MAX_CEX_SEALED_HOLDOUT_CLAIM_BYTES: u64 = 64 * 1024;
 // ponytail: one Mission is capped at 1 GiB; raise this only when staged partitions exceed it.
 pub(crate) const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "scientific")]
 const MAX_REPLAY_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(feature = "scientific")]
 const MAX_REPLAY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_RESULT_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 // Long, bounded MLP loss/gradient histories accompany predictions in this artifact.
 pub(crate) const MAX_MLP_BASELINE_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(feature = "scientific")]
 const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
     "cex-factor-bank-subset-mcts-checkpoint-artifact-v1";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1: &str = "cex-event-replay-receipt-v1";
@@ -96,9 +177,11 @@ const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2: &str = "cex-event-replay-receipt-v2";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3: &str = "cex-event-replay-receipt-v3";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4: &str = "cex-event-replay-receipt-v4";
 const CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION: &str = "cex-supervised-model-selection-v1";
+#[cfg(feature = "scientific")]
 const CEX_SUPERVISED_MODEL_ATTEMPTS_SCHEMA_VERSION: &str = "cex-supervised-model-attempts-v1";
 pub(crate) const CEX_SUPERVISED_MODEL_NAMES: [&str; 3] = ["ridge", "cart", "burn_mlp"];
 // ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
+#[cfg(feature = "scientific")]
 const MCTS_CHECKPOINT_INTERVAL: u64 = 256;
 
 fn research_event_value(
@@ -120,6 +203,7 @@ pub(crate) fn research_event(component: &str, event: &str, details: serde_json::
     eprintln!("{}", research_event_value(component, event, details));
 }
 
+#[cfg(feature = "scientific")]
 fn evaluation_log_summary(evaluation: &CandidateEvaluation) -> serde_json::Value {
     serde_json::json!({
         "passed": evaluation.passed,
@@ -291,6 +375,7 @@ const fn default_series_count() -> usize {
 
 #[derive(Debug, Deserialize)]
 struct SourceSegment {
+    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
     path: PathBuf,
     sha256: String,
     collector_manifest_sha256: String,
@@ -340,10 +425,12 @@ pub(crate) struct ExecutionReport {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ExecutionBinding {
+    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
     Direct,
     Campaign {
         campaign_id: String,
         round_id: String,
+        #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
         request_sha256: String,
     },
 }
@@ -421,11 +508,13 @@ impl CexSupervisedModelSelectionV1 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "scientific")]
 struct CexSupervisedModelAttemptV1 {
     model: String,
     outcome: String,
 }
 
+#[cfg(feature = "scientific")]
 fn persist_supervised_model_attempts(
     results_dir: &Path,
     attempts: &[CexSupervisedModelAttemptV1],
@@ -439,6 +528,7 @@ fn persist_supervised_model_attempts(
     )
 }
 
+#[cfg(feature = "scientific")]
 fn update_supervised_model_attempt(
     results_dir: &Path,
     attempts: &mut [CexSupervisedModelAttemptV1],
@@ -453,6 +543,7 @@ fn update_supervised_model_attempt(
     persist_supervised_model_attempts(results_dir, attempts)
 }
 
+#[cfg(feature = "scientific")]
 fn run_supervised_model_attempt(
     results_dir: &Path,
     attempts: &mut [CexSupervisedModelAttemptV1],
@@ -472,6 +563,28 @@ fn run_supervised_model_attempt(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedReplayBindingV1 {
+    collection_sha256: String,
+    replay_view_sha256: String,
+    replay_rows_sha256: String,
+    source: hft_cex_research_input::campaign::NativeSourceBindingV1,
+}
+#[cfg(feature = "scientific")]
+impl PreparedReplayBindingV1 {
+    fn from_verified(
+        input: &hft_cex_research_input::campaign::VerifiedCampaignPreparedInputsV1,
+    ) -> Self {
+        Self {
+            collection_sha256: input.id().to_string(),
+            replay_view_sha256: input.manifest().replay.manifest_sha256.clone(),
+            replay_rows_sha256: input.manifest().replay_rows_sha256.clone(),
+            source: input.manifest().source.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CexEventReplayReceiptV1 {
@@ -481,6 +594,8 @@ pub(crate) struct CexEventReplayReceiptV1 {
     pub(crate) strategy: CexResearchContentRefV1,
     dataset: CexResearchContentRefV1,
     materialization: CexResearchContentRefV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_inputs: Option<PreparedReplayBindingV1>,
     tape_artifact: CexResearchContentRefV1,
     tape_manifest: CexResearchContentRefV1,
     source: CexResearchContentRefV1,
@@ -531,6 +646,7 @@ impl CexEventReplayReceiptV1 {
         Ok(())
     }
 
+    #[cfg(feature = "scientific")]
     fn finalize(mut self) -> anyhow::Result<Self> {
         self.capabilities_sha256 = canonical_json_hash(&self.capabilities)?;
         self.receipt_id = self.expected_receipt_id()?;
@@ -688,6 +804,25 @@ impl CexEventReplayReceiptV1 {
         {
             bail!("CEX event replay receipt is invalid");
         }
+        if let Some(prepared) = &self.prepared_inputs {
+            for sha in [
+                &prepared.collection_sha256,
+                &prepared.replay_view_sha256,
+                &prepared.replay_rows_sha256,
+                &prepared.source.preparation_receipt_sha256,
+                &prepared.source.feature_sha256,
+                &prepared.source.materialization_sha256,
+                &prepared.source.replay_artifact_sha256,
+                &prepared.source.replay_manifest_sha256,
+            ] {
+                normalized_sha256("native replay binding", sha)?;
+            }
+            if self.tape_manifest.content_sha256 != prepared.replay_view_sha256
+                || self.tape_artifact.content_sha256 != prepared.replay_rows_sha256
+            {
+                bail!("native replay receipt differs from the actual consumed typed view");
+            }
+        }
         normalized_sha256("CEX replay decisions", &self.decision_sha256)?;
         Ok(())
     }
@@ -756,6 +891,64 @@ impl CexEventReplayReceiptV1 {
     }
 }
 
+#[cfg(feature = "scientific")]
+pub(crate) fn validate_native_campaign_result_binding(
+    results_dir: &Path,
+    native: &crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+) -> anyhow::Result<()> {
+    let admission: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        results_dir.join("native-prepared-admission.json"),
+    )?)?;
+    if admission["request_sha256"].as_str() != Some(native.request_sha256())
+        || admission["campaign_inputs_sha256"].as_str() != Some(native.campaign_inputs_sha256())
+        || admission["collection_sha256"].as_str() != Some(native.collection_id())
+        || admission["evaluation_protocol_sha256"].as_str()
+            != Some(native.evaluation_protocol_sha256())
+        || admission["source_revision"].as_str() != Some(native.source_revision())
+        || admission["runner_image_identity"].as_str() != Some(native.runner_image_identity())
+        || admission["declared_trials"].as_u64() != Some(native.declared_trials() as u64)
+        || admission["view_sha256"] != serde_json::to_value(native.view_ids())?
+        || admission["source"] != serde_json::to_value(&native.prepared().manifest().source)?
+        || admission["original"] != serde_json::to_value(native.prepared().original_metadata())?
+        || admission["loaded_development_rows"].as_u64()
+            != Some(native.prepared().rows().len() as u64)
+        || admission["selection_bytes_loaded"] != false
+        || admission["holdout_bytes_loaded"] != false
+    {
+        bail!("native published result admission differs from the actual finalized request/collection");
+    }
+    let manifest: hft_cex_research_input::campaign::CampaignPreparedInputsV1 =
+        serde_json::from_slice(&std::fs::read(
+            results_dir.join("native-prepared-inputs.json"),
+        )?)?;
+    if &manifest != native.prepared().manifest() {
+        bail!("published native prepared collection changed");
+    }
+    for name in [
+        "cex-event-replay-receipt.json",
+        "supervised-event-replay-receipt.json",
+    ] {
+        let path = results_dir.join(name);
+        if path.try_exists()? {
+            let receipt: CexEventReplayReceiptV1 = serde_json::from_slice(&std::fs::read(path)?)?;
+            receipt.validate()?;
+            if receipt.prepared_inputs.as_ref()
+                != Some(&PreparedReplayBindingV1::from_verified(native.prepared()))
+            {
+                bail!("published native replay receipt lost its actual collection/source binding");
+            }
+        }
+    }
+    if results_dir.join("calendar-validation.json").try_exists()?
+        || results_dir
+            .join("calendar-validation-event-replay-receipt.json")
+            .try_exists()?
+    {
+        bail!("development-only native worker result cannot contain withheld selection evidence");
+    }
+    Ok(())
+}
+
 fn replay_config_content_hash(
     config: &TargetPositionReplayConfig,
     legacy: bool,
@@ -773,13 +966,16 @@ fn replay_config_content_hash(
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "scientific")]
 struct MctsCheckpointArtifactV1 {
     schema_version: String,
     checkpoint_sha256: String,
     checkpoint: CexFactorBankMctsCheckpointV1,
 }
 
+#[cfg(feature = "scientific")]
 impl MctsCheckpointArtifactV1 {
+    #[cfg(feature = "scientific")]
     fn new(checkpoint: CexFactorBankMctsCheckpointV1) -> anyhow::Result<Self> {
         let checkpoint_sha256 = checkpoint.content_hash().map_err(anyhow::Error::msg)?;
         Ok(Self {
@@ -806,6 +1002,7 @@ impl MctsCheckpointArtifactV1 {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(feature = "scientific")]
 struct ExecutionModelEvidence {
     schema_version: &'static str,
     fee_bps: f64,
@@ -827,6 +1024,7 @@ struct ExecutionModelEvidence {
     max_book_depth_fraction: f64,
 }
 
+#[cfg(feature = "scientific")]
 impl From<&EvaluationCostsV1> for ExecutionModelEvidence {
     fn from(costs: &EvaluationCostsV1) -> Self {
         let capacity_gate_enabled = costs.capacity_enabled();
@@ -857,13 +1055,42 @@ impl From<&EvaluationCostsV1> for ExecutionModelEvidence {
     }
 }
 
+#[cfg(feature = "scientific")]
 pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     print_json(&execute_report(args, ExecutionBinding::Direct)?)
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn execute_report(
     args: ExecuteMissionArgs,
     binding: ExecutionBinding,
+) -> anyhow::Result<ExecutionReport> {
+    execute_report_inner(args, binding, None)
+}
+
+#[cfg(feature = "scientific")]
+pub(crate) fn execute_prepared_report(
+    args: ExecuteMissionArgs,
+    binding: ExecutionBinding,
+    native: &crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+    render_inputs: &crate::mission_render::PreparedCexInputs,
+) -> anyhow::Result<ExecutionReport> {
+    match &binding {
+        ExecutionBinding::Campaign { request_sha256, .. }
+            if request_sha256 == native.request_sha256() => {}
+        _ => bail!("native prepared execution requires its exact Campaign request binding"),
+    }
+    execute_report_inner(args, binding, Some((native, render_inputs)))
+}
+
+#[cfg(feature = "scientific")]
+fn execute_report_inner(
+    args: ExecuteMissionArgs,
+    binding: ExecutionBinding,
+    native: Option<(
+        &crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+        &crate::mission_render::PreparedCexInputs,
+    )>,
 ) -> anyhow::Result<ExecutionReport> {
     let binding_log = match &binding {
         ExecutionBinding::Direct => serde_json::json!({"kind": "direct_diagnostic"}),
@@ -888,7 +1115,11 @@ pub(crate) fn execute_report(
             "binding": binding_log,
         }),
     );
-    validate_args(&args, &binding)?;
+    if native.is_some() {
+        validate_native_args(&args, &binding)?;
+    } else {
+        validate_args(&args, &binding)?;
+    }
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
         .redirect(Policy::none())
@@ -1030,22 +1261,220 @@ pub(crate) fn execute_report(
             "replay_manifest_sha256": &args.replay_manifest_sha256,
         }),
     );
-    let (_, feature_sha256) =
-        fetch_to_file(&client, &args.feature_url, &feature_path, MAX_FEATURE_BYTES)?;
-    let (_, materialization_sha256) = fetch_to_file(
-        &client,
-        &args.materialization_url,
-        &materialization_path,
-        MAX_MATERIALIZATION_BYTES,
-    )?;
-    let materialization = decode_materialization(&std::fs::read(&materialization_path)?)?;
-    validate_materialization(&materialization, &feature_sha256, &validation)?;
-    validate_mission_materialization_binding(
-        &control_mission,
-        &materialization,
-        &materialization_sha256,
-        &feature_sha256,
-    )?;
+    let evaluation_protocol = control_mission.spec.evaluation_protocol.clone();
+    let db = results_dir.join("alpha.duckdb");
+    let feature_manifest_path = results_dir.join("feature-manifest.json");
+    let dataset_manifest_path = results_dir.join("cex-replay-dataset-manifest.json");
+    let mut store = AlphaStore::open(&db)?;
+    let (materialization, feature_manifest, dataset_manifest, materialization_sha256) =
+        if let Some((native, render)) = native {
+            let materialization = decode_materialization(render.materialization_bytes())?;
+            let feature_manifest = render.feature_manifest().clone();
+            let materialization_sha256 = native
+                .prepared()
+                .manifest()
+                .source
+                .materialization_sha256
+                .clone();
+            let dataset_manifest = CexReplayDatasetManifestV5::new(
+                feature_manifest.manifest_id.clone(),
+                materialization.snapshot.clone(),
+            )?;
+            validate_mission_materialization_binding(
+                &control_mission,
+                &materialization,
+                &materialization_sha256,
+                &native.prepared().manifest().source.feature_sha256,
+            )?;
+            validate_mission_dataset_binding(
+                &control_mission,
+                &feature_manifest,
+                &dataset_manifest,
+            )?;
+            alpha_engine::evaluation::prepare_native_campaign_dataset(
+                native.prepared(),
+                &evaluation_protocol,
+            )?;
+            let replay_policy = CexEventReplayPolicyV1::controlled_v2(
+                control_mission.spec.policies.replay.id.clone(),
+                materialization.top_depth,
+                control_mission
+                    .spec
+                    .instrument
+                    .horizon
+                    .observation_frequency_millis,
+            )?;
+            replay_policy.validate_binding(&control_mission.spec.policies.replay)?;
+            hft_research_artifacts::write_json_atomic(
+                &results_dir.join("replay-policy.json"),
+                &replay_policy,
+            )?;
+            hft_research_artifacts::write_json_atomic(
+                &results_dir.join("native-prepared-inputs.json"),
+                native.prepared().manifest(),
+            )?;
+            let admission = serde_json::json!({
+                "schema_version":"monday.native_campaign_prepared_admission.v1",
+                "request_sha256": native.request_sha256(),
+                "campaign_inputs_sha256": native.campaign_inputs_sha256(),
+                "evaluation_protocol_sha256": native.evaluation_protocol_sha256(),
+                "collection_sha256": native.collection_id(),
+                "view_sha256": native.view_ids(),
+                "source_revision": native.source_revision(),
+                "runner_image_identity": native.runner_image_identity(),
+                "declared_trials": native.declared_trials(),
+                "source": native.prepared().manifest().source,
+                "original": native.prepared().original_metadata(),
+                "loaded_development_rows": native.prepared().rows().len(),
+                "selection_bytes_loaded":false, "holdout_bytes_loaded":false,
+            });
+            hft_research_artifacts::write_json_atomic(
+                &results_dir.join("native-prepared-admission.json"),
+                &admission,
+            )?;
+            // Register the actual collection identity. The original full-data manifest
+            // remains lineage metadata and is never presented as locally imported bytes.
+            store.put_registry_revision(&RegistryRevision {
+                revision_id: native.collection_id().to_string(),
+                registry_kind: "cex_campaign_prepared_inputs".into(),
+                asset_id: materialization.symbol.clone(),
+                parent_revision_id: Some(dataset_manifest.manifest_id.clone()),
+                payload: admission,
+                created_at: Utc::now(),
+            })?;
+            hft_research_artifacts::write_json_atomic(&dataset_manifest_path, &dataset_manifest)?;
+            hft_research_artifacts::write_json_atomic(&feature_manifest_path, &feature_manifest)?;
+            std::fs::write(
+                results_dir.join("materialization.json"),
+                render.materialization_bytes(),
+            )?;
+            (
+                materialization,
+                feature_manifest,
+                dataset_manifest,
+                materialization_sha256,
+            )
+        } else {
+            let (_, feature_sha256) =
+                fetch_to_file(&client, &args.feature_url, &feature_path, MAX_FEATURE_BYTES)?;
+            let (_, materialization_sha256) = fetch_to_file(
+                &client,
+                &args.materialization_url,
+                &materialization_path,
+                MAX_MATERIALIZATION_BYTES,
+            )?;
+            let materialization = decode_materialization(&std::fs::read(&materialization_path)?)?;
+            validate_materialization(&materialization, &feature_sha256, &validation)?;
+            validate_mission_materialization_binding(
+                &control_mission,
+                &materialization,
+                &materialization_sha256,
+                &feature_sha256,
+            )?;
+            let replay_policy = CexEventReplayPolicyV1::controlled_v2(
+                control_mission.spec.policies.replay.id.clone(),
+                materialization.top_depth,
+                control_mission
+                    .spec
+                    .instrument
+                    .horizon
+                    .observation_frequency_millis,
+            )?;
+            replay_policy.validate_binding(&control_mission.spec.policies.replay)?;
+            hft_research_artifacts::write_json_atomic(
+                &results_dir.join("replay-policy.json"),
+                &replay_policy,
+            )?;
+            let (_, fetched_replay_artifact_sha256) = fetch_to_file(
+                &client,
+                &args.replay_artifact_url,
+                &replay_artifact_path,
+                MAX_REPLAY_ARTIFACT_BYTES,
+            )?;
+            if fetched_replay_artifact_sha256 != replay_artifact_sha256 {
+                bail!("CEX replay artifact SHA256 mismatch");
+            }
+            let (_, fetched_replay_manifest_sha256) = fetch_to_file(
+                &client,
+                &args.replay_manifest_url,
+                &replay_manifest_path,
+                MAX_REPLAY_MANIFEST_BYTES,
+            )?;
+            if fetched_replay_manifest_sha256
+                != normalized_sha256("CEX replay manifest", &args.replay_manifest_sha256)?
+            {
+                bail!("CEX replay manifest SHA256 mismatch");
+            }
+
+            let feature_manifest = data_mission::import_and_register_features(
+                &mut store,
+                &control_mission.spec.data_mission_id,
+                &feature_path,
+                &artifact_dir,
+            )?;
+            let source_key = format!("binance-{}-lob", materialization.market);
+            if feature_manifest.symbol != materialization.symbol
+                || feature_manifest.source_revisions.get(&source_key)
+                    != Some(&materialization.source_revision)
+                || feature_manifest.artifact_sha256 != feature_sha256
+                || feature_manifest.label_spec.horizon_buckets
+                    != materialization.label_horizon_buckets
+                || feature_manifest.label_spec.observation_frequency_millis
+                    != materialization.bucket_ms
+                || feature_manifest.series_count != materialization.series_count
+            {
+                bail!("registered feature lineage or label facts do not match the materialization");
+            }
+            let dataset_manifest = data_mission::admit_cex_replay_dataset(
+                &mut store,
+                &feature_manifest,
+                &materialization.snapshot,
+            )?;
+            validate_mission_dataset_binding(
+                &control_mission,
+                &feature_manifest,
+                &dataset_manifest,
+            )?;
+            hft_research_artifacts::write_json_atomic(&feature_manifest_path, &feature_manifest)?;
+            hft_research_artifacts::write_json_atomic(&dataset_manifest_path, &dataset_manifest)?;
+            hft_research_artifacts::write_json_atomic(
+                &results_dir.join("data-import.json"),
+                &serde_json::json!({
+                    "manifest": &dataset_manifest,
+                    "manifest_path": &dataset_manifest_path,
+                    "feature_manifest": &feature_manifest,
+                    "feature_manifest_path": &feature_manifest_path,
+                }),
+            )?;
+            research_event(
+                "alpha-harness",
+                "input_admission_completed",
+                serde_json::json!({
+                    "mission_id": &mission_id,
+                    "market": &materialization.market,
+                    "symbol": &materialization.symbol,
+                    "rows": materialization.rows,
+                    "series_count": materialization.series_count,
+                    "first_event_time": materialization.first_event_time,
+                    "last_event_time": materialization.last_event_time,
+                    "dataset_manifest_id": &dataset_manifest.manifest_id,
+                    "feature_sha256": &feature_sha256,
+                    "materialization_sha256": &materialization_sha256,
+                    "replay_artifact_sha256": &replay_artifact_sha256,
+                    "replay_manifest_sha256": &fetched_replay_manifest_sha256,
+                }),
+            );
+            std::fs::copy(
+                &materialization_path,
+                results_dir.join("materialization.json"),
+            )?;
+            (
+                materialization,
+                feature_manifest,
+                dataset_manifest,
+                materialization_sha256,
+            )
+        };
     let replay_policy = CexEventReplayPolicyV1::controlled_v2(
         control_mission.spec.policies.replay.id.clone(),
         materialization.top_depth,
@@ -1054,93 +1483,6 @@ pub(crate) fn execute_report(
             .instrument
             .horizon
             .observation_frequency_millis,
-    )?;
-    replay_policy.validate_binding(&control_mission.spec.policies.replay)?;
-    hft_research_artifacts::write_json_atomic(
-        &results_dir.join("replay-policy.json"),
-        &replay_policy,
-    )?;
-    let (_, fetched_replay_artifact_sha256) = fetch_to_file(
-        &client,
-        &args.replay_artifact_url,
-        &replay_artifact_path,
-        MAX_REPLAY_ARTIFACT_BYTES,
-    )?;
-    if fetched_replay_artifact_sha256 != replay_artifact_sha256 {
-        bail!("CEX replay artifact SHA256 mismatch");
-    }
-    let (_, fetched_replay_manifest_sha256) = fetch_to_file(
-        &client,
-        &args.replay_manifest_url,
-        &replay_manifest_path,
-        MAX_REPLAY_MANIFEST_BYTES,
-    )?;
-    if fetched_replay_manifest_sha256
-        != normalized_sha256("CEX replay manifest", &args.replay_manifest_sha256)?
-    {
-        bail!("CEX replay manifest SHA256 mismatch");
-    }
-    let evaluation_protocol = control_mission.spec.evaluation_protocol.clone();
-
-    let db = results_dir.join("alpha.duckdb");
-    let feature_manifest_path = results_dir.join("feature-manifest.json");
-    let dataset_manifest_path = results_dir.join("cex-replay-dataset-manifest.json");
-    let mut store = AlphaStore::open(&db)?;
-    let feature_manifest = data_mission::import_and_register_features(
-        &mut store,
-        &control_mission.spec.data_mission_id,
-        &feature_path,
-        &artifact_dir,
-    )?;
-    let source_key = format!("binance-{}-lob", materialization.market);
-    if feature_manifest.symbol != materialization.symbol
-        || feature_manifest.source_revisions.get(&source_key)
-            != Some(&materialization.source_revision)
-        || feature_manifest.artifact_sha256 != feature_sha256
-        || feature_manifest.label_spec.horizon_buckets != materialization.label_horizon_buckets
-        || feature_manifest.label_spec.observation_frequency_millis != materialization.bucket_ms
-        || feature_manifest.series_count != materialization.series_count
-    {
-        bail!("registered feature lineage or label facts do not match the materialization");
-    }
-    let dataset_manifest = data_mission::admit_cex_replay_dataset(
-        &mut store,
-        &feature_manifest,
-        &materialization.snapshot,
-    )?;
-    validate_mission_dataset_binding(&control_mission, &feature_manifest, &dataset_manifest)?;
-    hft_research_artifacts::write_json_atomic(&feature_manifest_path, &feature_manifest)?;
-    hft_research_artifacts::write_json_atomic(&dataset_manifest_path, &dataset_manifest)?;
-    hft_research_artifacts::write_json_atomic(
-        &results_dir.join("data-import.json"),
-        &serde_json::json!({
-            "manifest": &dataset_manifest,
-            "manifest_path": &dataset_manifest_path,
-            "feature_manifest": &feature_manifest,
-            "feature_manifest_path": &feature_manifest_path,
-        }),
-    )?;
-    research_event(
-        "alpha-harness",
-        "input_admission_completed",
-        serde_json::json!({
-            "mission_id": &mission_id,
-            "market": &materialization.market,
-            "symbol": &materialization.symbol,
-            "rows": materialization.rows,
-            "series_count": materialization.series_count,
-            "first_event_time": materialization.first_event_time,
-            "last_event_time": materialization.last_event_time,
-            "dataset_manifest_id": &dataset_manifest.manifest_id,
-            "feature_sha256": &feature_sha256,
-            "materialization_sha256": &materialization_sha256,
-            "replay_artifact_sha256": &replay_artifact_sha256,
-            "replay_manifest_sha256": &fetched_replay_manifest_sha256,
-        }),
-    );
-    std::fs::copy(
-        &materialization_path,
-        results_dir.join("materialization.json"),
     )?;
     hft_research_artifacts::write_json_atomic(
         &results_dir.join("execution-model.json"),
@@ -1242,14 +1584,32 @@ pub(crate) fn execute_report(
         &results_dir.join("mission-create.json"),
         &research_mission,
     )?;
-    let baseline_dataset_manifest =
-        data_mission::read_registered_research_dataset(&store, &dataset_manifest_path)?;
-    let baseline_rows = baseline_dataset_manifest.load_rows(&evaluation_protocol.costs)?;
-    let feature_decision_clocks = data_mission::feature_decision_clocks(&feature_manifest)?;
-    if feature_decision_clocks.len() != baseline_rows.len() {
-        bail!("CEX feature availability clock does not match the admitted dataset");
-    }
-    let baseline_dataset = prepare_dataset(baseline_rows, &evaluation_protocol)?;
+    let (baseline_dataset, feature_decision_clocks) = if let Some((native, _)) = native {
+        let dataset = alpha_engine::evaluation::prepare_native_campaign_dataset(
+            native.prepared(),
+            &evaluation_protocol,
+        )?;
+        let clocks = native
+            .prepared()
+            .rows()
+            .iter()
+            .map(|row| data_mission::FeatureDecisionClock {
+                series_id: row.series_id,
+                feature_available_time: row.available_time,
+                series_close_time: row.label_available_time,
+            })
+            .collect::<Vec<_>>();
+        (dataset, clocks)
+    } else {
+        let manifest =
+            data_mission::read_registered_research_dataset(&store, &dataset_manifest_path)?;
+        let rows = manifest.load_rows(&evaluation_protocol.costs)?;
+        let clocks = data_mission::feature_decision_clocks(&feature_manifest)?;
+        if clocks.len() != rows.len() {
+            bail!("CEX feature availability clock does not match the admitted dataset");
+        }
+        (prepare_dataset(rows, &evaluation_protocol)?, clocks)
+    };
     let baseline_context = baseline_dataset.engine_context();
     if !control_mission.spec.supervised_model_scope.is_default() {
         let precheck = alpha_engine::label_precheck::dataset_label_space_precheck(
@@ -1296,20 +1656,29 @@ pub(crate) fn execute_report(
             "multiple_testing_trials": control_mission.spec.search.multiple_testing_trials,
         }),
     );
-    let mut run_report = mission::execute_governed_gp_mission(
-        &run_args,
-        false,
-        &gp_policy,
-        &control_mission.spec.search_lineage_id,
-    )?;
+    let run_search = |resume| {
+        if native.is_some() {
+            mission::execute_native_governed_gp_mission(
+                &run_args,
+                resume,
+                &gp_policy,
+                &control_mission.spec.search_lineage_id,
+                &baseline_dataset,
+                &dataset_manifest.manifest_id,
+            )
+        } else {
+            mission::execute_governed_gp_mission(
+                &run_args,
+                resume,
+                &gp_policy,
+                &control_mission.spec.search_lineage_id,
+            )
+        }
+    };
+    let mut run_report = run_search(false)?;
     while run_report.status == MissionStatus::Paused {
         let previous_iterations = run_report.total_iterations;
-        run_report = mission::execute_governed_gp_mission(
-            &run_args,
-            true,
-            &gp_policy,
-            &control_mission.spec.search_lineage_id,
-        )?;
+        run_report = run_search(true)?;
         if run_report.total_iterations <= previous_iterations
             && run_report.status == MissionStatus::Paused
         {
@@ -1469,7 +1838,7 @@ pub(crate) fn execute_report(
         })
         .transpose()?
         .flatten();
-    if evaluation_protocol.calendar.is_some() {
+    if evaluation_protocol.calendar.is_some() && native.is_none() {
         if let (Some(model), Some(ridge)) = (&supervised_model, &baseline_run.ridge) {
             let validation = alpha_engine::final_models::evaluate_calendar_validation(
                 &baseline_dataset,
@@ -1542,6 +1911,7 @@ pub(crate) fn execute_report(
                 &replay_artifact_sha256,
                 &replay_manifest_path,
                 &args.replay_manifest_sha256,
+                native.map(|(binding, _)| binding.prepared()),
             )
         })
         .transpose()?;
@@ -1611,6 +1981,7 @@ pub(crate) fn execute_report(
                 &replay_artifact_sha256,
                 &replay_manifest_path,
                 &args.replay_manifest_sha256,
+                native.map(|(binding, _)| binding.prepared()),
             )
         })
         .transpose()?;
@@ -1766,6 +2137,7 @@ fn ensure_promotable_cex_costs(costs: &EvaluationCostsV1) -> anyhow::Result<()> 
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn finalize_cex_candidate(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -2036,6 +2408,7 @@ fn finalize_cex_candidate(
     Ok(report)
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn open_cex_holdout(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -2076,6 +2449,7 @@ pub(crate) fn open_cex_holdout(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 pub(crate) fn promote_sealed_candidate(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -2181,6 +2555,7 @@ pub(crate) fn promote_sealed_candidate(
 /// signed `--final-evaluation` worker; Direct execute and `--pre-holdout`
 /// Campaign rounds never call this.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 pub(crate) fn finalize_formula_search_round(
     round_results: &Path,
     finalization_dir: &Path,
@@ -2256,6 +2631,7 @@ pub(crate) fn finalize_formula_search_round(
 }
 
 #[cfg(test)]
+#[cfg(feature = "scientific")]
 pub(crate) fn finalize_existing_search_round(
     round_execute_dir: &Path,
     finalization_dir: &Path,
@@ -2302,6 +2678,7 @@ fn content_reference(
     })
 }
 
+#[cfg(feature = "scientific")]
 fn replay_trace_artifact_path(receipt_name: &str) -> String {
     let stem = Path::new(receipt_name)
         .file_stem()
@@ -2310,6 +2687,7 @@ fn replay_trace_artifact_path(receipt_name: &str) -> String {
     format!("{stem}-trace.ndjson")
 }
 
+#[cfg(feature = "scientific")]
 fn write_trace_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     hft_research_artifacts::ensure_output_path_is_not_symlink(path, "replay trace")?;
     let mut temporary =
@@ -2319,6 +2697,7 @@ fn write_trace_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     hft_research_artifacts::persist_output_file(temporary, path, "replay trace")
 }
 
+#[cfg(feature = "scientific")]
 fn registry_content_reference(
     id: &str,
     artifact: &impl Serialize,
@@ -2395,6 +2774,7 @@ pub(crate) fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materializa
     }
 }
 
+#[cfg(feature = "scientific")]
 fn persist_baseline_evidence(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -2470,6 +2850,7 @@ fn persist_baseline_evidence(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn run_cex_supervised_model_research(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -2626,7 +3007,7 @@ fn run_cex_supervised_model_research(
     Ok(Some(selected))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 fn select_supervised_model(
     ridge: CexSupervisedModelEvaluationV2,
     cart: CexSupervisedModelEvaluationV2,
@@ -2643,6 +3024,7 @@ fn select_supervised_model(
     selected
 }
 
+#[cfg(feature = "scientific")]
 fn supervised_model_ranks_ahead(
     left: &CexSupervisedModelEvaluationV2,
     right: &CexSupervisedModelEvaluationV2,
@@ -2671,6 +3053,7 @@ fn supervised_model_ranks_ahead(
     }
 }
 
+#[cfg(feature = "scientific")]
 fn supervised_model_kind_rank(kind: CexBaselineModelKindV1) -> u8 {
     match kind {
         CexBaselineModelKindV1::Ridge => 0,
@@ -2679,6 +3062,7 @@ fn supervised_model_kind_rank(kind: CexBaselineModelKindV1) -> u8 {
     }
 }
 
+#[cfg(feature = "scientific")]
 fn run_factor_bank_subset_search(
     results_dir: &Path,
     control_mission: &CexResearchMissionArtifactV1,
@@ -2782,6 +3166,7 @@ fn holding_opening_signals(
     Ok(Some(signals))
 }
 
+#[cfg(feature = "scientific")]
 struct CexReplayCandidateInput {
     openings: Option<std::collections::BTreeMap<i64, f64>>,
     holding: Option<hft_research_manifest::model::HorizonHoldingPolicyV1>,
@@ -2800,6 +3185,7 @@ struct CexReplayCandidateInput {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn run_cex_event_replay(
     results_dir: &Path,
     mission_id: &str,
@@ -2815,6 +3201,7 @@ fn run_cex_event_replay(
     replay_artifact_sha256: &str,
     replay_manifest_path: &Path,
     replay_manifest_sha256: &str,
+    native: Option<&hft_cex_research_input::campaign::VerifiedCampaignPreparedInputsV1>,
 ) -> anyhow::Result<CexEventReplayReceiptV1> {
     let positions = strategy
         .target_positions(factor_bank, context.rows())
@@ -2853,10 +3240,12 @@ fn run_cex_event_replay(
         replay_artifact_sha256,
         replay_manifest_path,
         replay_manifest_sha256,
+        native,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn run_cex_supervised_event_replay(
     results_dir: &Path,
     mission_id: &str,
@@ -2872,6 +3261,7 @@ fn run_cex_supervised_event_replay(
     replay_artifact_sha256: &str,
     replay_manifest_path: &Path,
     replay_manifest_sha256: &str,
+    native: Option<&hft_cex_research_input::campaign::VerifiedCampaignPreparedInputsV1>,
 ) -> anyhow::Result<CexEventReplayReceiptV1> {
     evaluation.validate().map_err(anyhow::Error::msg)?;
     if evaluation.candidate.mission_id != mission_id
@@ -2917,10 +3307,12 @@ fn run_cex_supervised_event_replay(
         replay_artifact_sha256,
         replay_manifest_path,
         replay_manifest_sha256,
+        native,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 pub(crate) fn run_frozen_model_event_replay(
     results_dir: &Path,
     mission: &CexResearchMissionArtifactV1,
@@ -3003,6 +3395,7 @@ pub(crate) fn run_frozen_model_event_replay(
         replay_artifact_sha256,
         replay_manifest_path,
         replay_manifest_sha256,
+        None,
     )
 }
 
@@ -3018,6 +3411,7 @@ pub(crate) fn calendar_replay_required(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn run_calendar_validation_replay(
     results: &Path,
     mission: &CexResearchMissionArtifactV1,
@@ -3089,6 +3483,7 @@ fn run_calendar_validation_replay(
         tape_sha256,
         manifest,
         manifest_sha256,
+        None,
     )
 }
 
@@ -3177,6 +3572,7 @@ fn validate_calendar_replay_decisions(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn frozen_selection_replay_clocks(
     all: &[data_mission::FeatureDecisionClock],
     selection: std::ops::Range<usize>,
@@ -3218,6 +3614,7 @@ fn frozen_selection_replay_clocks(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn run_cex_target_position_replay(
     results_dir: &Path,
     receipt_name: &str,
@@ -3233,6 +3630,7 @@ fn run_cex_target_position_replay(
     replay_artifact_sha256: &str,
     replay_manifest_path: &Path,
     replay_manifest_sha256: &str,
+    native: Option<&hft_cex_research_input::campaign::VerifiedCampaignPreparedInputsV1>,
 ) -> anyhow::Result<CexEventReplayReceiptV1> {
     if policy.schema_version != CEX_EVENT_REPLAY_POLICY_SCHEMA_V2 || !policy.require_partial_fills {
         bail!("current CEX event replay requires the V2 partial-fill policy");
@@ -3337,18 +3735,63 @@ fn run_cex_target_position_replay(
             },
         }),
     );
-    let (replay_evidence, replay_output) =
-        verify_and_replay_canonical_target_positions_with_trace_and_spot_rules(
-            replay_artifact_path,
-            replay_manifest_path,
-            replay_artifact_sha256,
-            &replay_manifest_sha256,
-            None,
-            Some(replay_end_time),
+    let (replay_output, modalities) = if let Some(native) = native {
+        if i128::from(replay_end_time) * 1000
+            >= i128::from(native.original_metadata().authorized_context_end_ns)
+            || native.manifest().source.materialization_sha256 != materialization_sha256
+            || native.manifest().source.replay_artifact_sha256 != replay_artifact_sha256
+            || native.manifest().source.replay_manifest_sha256 != replay_manifest_sha256
+        {
+            bail!("native replay tail/source exceeds the frozen development context");
+        }
+        let output = hft_backtest::engine::replay_shared_target_positions_bounded(
+            native.replay(),
+            &native.manifest().replay.manifest_sha256,
             &decisions,
             &replay_config,
             materialization.snapshot.spot_instrument_rules.as_ref(),
+            Some(replay_end_time),
         )?;
+        let mut modalities = std::collections::BTreeSet::new();
+        for block in native.replay().blocks() {
+            let hft_cex_research_input::data::TypedBlock::Replay(events) = block.as_ref() else {
+                bail!("native replay block type changed");
+            };
+            for event in events {
+                modalities.insert(match event.payload {
+                    hft_cex_research_input::data::ReplayPayload::Snapshot { .. }
+                    | hft_cex_research_input::data::ReplayPayload::Delta { .. } => {
+                        "lob".to_string()
+                    }
+                    hft_cex_research_input::data::ReplayPayload::Trade { .. } => {
+                        "trade".to_string()
+                    }
+                });
+            }
+        }
+        (output, modalities.into_iter().collect())
+    } else {
+        let (evidence, output) =
+            verify_and_replay_canonical_target_positions_with_trace_and_spot_rules(
+                replay_artifact_path,
+                replay_manifest_path,
+                replay_artifact_sha256,
+                &replay_manifest_sha256,
+                None,
+                Some(replay_end_time),
+                &decisions,
+                &replay_config,
+                materialization.snapshot.spot_instrument_rules.as_ref(),
+            )?;
+        validate_replay_materialization_binding(
+            &evidence,
+            mission,
+            materialization,
+            first_decision_time,
+            last_decision_time,
+        )?;
+        (output, evidence.modalities)
+    };
     let trace_artifact_path = replay_trace_artifact_path(receipt_name);
     write_trace_atomic(
         &results_dir.join(&trace_artifact_path),
@@ -3359,16 +3802,9 @@ fn run_cex_target_position_replay(
         content_sha256: replay_output.trace_sha256.clone(),
     };
     let metrics = replay_output.metrics.clone();
-    validate_replay_materialization_binding(
-        &replay_evidence,
-        mission,
-        materialization,
-        first_decision_time,
-        last_decision_time,
-    )?;
     let capabilities = CexReplayCapabilitiesV1 {
         clock_semantics: policy.clock_semantics.clone(),
-        modalities: replay_evidence.modalities.clone(),
+        modalities,
         min_bid_depth_levels: metrics.min_bid_depth_levels,
         max_bid_depth_levels: metrics.max_bid_depth_levels,
         min_ask_depth_levels: metrics.min_ask_depth_levels,
@@ -3446,13 +3882,35 @@ fn run_cex_target_position_replay(
         strategy: candidate.reference,
         dataset: mission.spec.inputs.dataset.clone(),
         materialization: mission.spec.inputs.materialization.clone(),
+        prepared_inputs: native.map(PreparedReplayBindingV1::from_verified),
         tape_artifact: CexResearchContentRefV1 {
-            id: format!("cex-event-replay-tape-{replay_artifact_sha256}"),
-            content_sha256: replay_artifact_sha256.to_string(),
+            id: format!(
+                "cex-event-replay-tape-{}",
+                native.map_or(replay_artifact_sha256, |input| input
+                    .manifest()
+                    .replay_rows_sha256
+                    .as_str())
+            ),
+            content_sha256: native
+                .map_or(replay_artifact_sha256, |input| {
+                    input.manifest().replay_rows_sha256.as_str()
+                })
+                .to_string(),
         },
         tape_manifest: CexResearchContentRefV1 {
-            id: format!("cex-event-replay-manifest-{replay_manifest_sha256}"),
-            content_sha256: replay_manifest_sha256,
+            id: format!(
+                "cex-event-replay-manifest-{}",
+                native.map_or(replay_manifest_sha256.as_str(), |input| input
+                    .manifest()
+                    .replay
+                    .manifest_sha256
+                    .as_str())
+            ),
+            content_sha256: native
+                .map_or(replay_manifest_sha256.as_str(), |input| {
+                    input.manifest().replay.manifest_sha256.as_str()
+                })
+                .to_string(),
         },
         source: mission.spec.inputs.source.clone(),
         replay_policy: mission.spec.policies.replay.clone(),
@@ -3498,6 +3956,7 @@ fn run_cex_target_position_replay(
     Ok(receipt)
 }
 
+#[cfg(feature = "scientific")]
 fn validate_market_compatible_target_positions(
     market: &str,
     positions: Vec<f64>,
@@ -3565,6 +4024,7 @@ fn canonical_target_position_decisions(
     Ok((decisions, ordinary_decisions))
 }
 
+#[cfg(feature = "scientific")]
 fn validate_replay_materialization_binding(
     replay: &CanonicalReplayEvidence,
     mission: &CexResearchMissionArtifactV1,
@@ -3594,6 +4054,7 @@ fn validate_replay_materialization_binding(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn same_replay_segment(
     replay: &CanonicalSourceSegmentEvidence,
     materialized: &SourceSegment,
@@ -3607,6 +4068,7 @@ fn same_replay_segment(
         && replay.events == materialized.events
 }
 
+#[cfg(feature = "scientific")]
 fn build_factor_bank(
     control_mission: &CexResearchMissionArtifactV1,
     gp_policy: &CexGpPolicyV1,
@@ -3730,18 +4192,59 @@ fn build_factor_bank(
     )?)
 }
 
+#[cfg(feature = "scientific")]
 fn validate_args(args: &ExecuteMissionArgs, binding: &ExecutionBinding) -> anyhow::Result<()> {
+    validate_common_args(args, binding)?;
+    if [
+        &args.feature_url,
+        &args.materialization_url,
+        &args.replay_artifact_url,
+        &args.replay_manifest_url,
+    ]
+    .iter()
+    .any(|url| url.trim().is_empty())
+    {
+        bail!("diagnostic Mission input transports are required");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "scientific")]
+fn validate_native_args(
+    args: &ExecuteMissionArgs,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<()> {
+    validate_common_args(args, binding)?;
+    if [
+        &args.feature_url,
+        &args.materialization_url,
+        &args.replay_artifact_url,
+        &args.replay_manifest_url,
+    ]
+    .iter()
+    .any(|url| !url.is_empty())
+        || args.resume_url.is_some()
+        || args.resume_sha256.is_some()
+    {
+        bail!(
+            "native prepared worker rejects whole-source transports and legacy checkpoint resume"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "scientific")]
+fn validate_common_args(
+    args: &ExecuteMissionArgs,
+    binding: &ExecutionBinding,
+) -> anyhow::Result<()> {
     if args.work_dir.as_os_str().is_empty()
         || [
-            args.mission_url.as_str(),
-            args.feature_url.as_str(),
-            args.materialization_url.as_str(),
-            args.replay_artifact_url.as_str(),
-            args.replay_manifest_url.as_str(),
-            args.result_put_url.as_str(),
-            args.result_readback_url.as_str(),
-            args.holdout_claim_put_url.as_str(),
-            args.holdout_claim_readback_url.as_str(),
+            &args.mission_url,
+            &args.result_put_url,
+            &args.result_readback_url,
+            &args.holdout_claim_put_url,
+            &args.holdout_claim_readback_url,
         ]
         .iter()
         .any(|value| value.trim().is_empty())
@@ -3762,6 +4265,7 @@ fn validate_args(args: &ExecuteMissionArgs, binding: &ExecutionBinding) -> anyho
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn validate_holdout_claim_binding(
     args: &ExecuteMissionArgs,
     holdout_id: &str,
@@ -3815,6 +4319,7 @@ fn validate_holdout_claim_binding(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn expected_local_holdout_claim_object(
     result_object: &str,
     mission_id: &str,
@@ -3841,6 +4346,7 @@ fn expected_local_holdout_claim_object(
     }
 }
 
+#[cfg(feature = "scientific")]
 fn normalized_local_object(value: &str) -> anyhow::Result<String> {
     let path = Path::new(value.strip_prefix("file://").unwrap_or(value));
     if path.as_os_str().is_empty()
@@ -3859,6 +4365,7 @@ fn normalized_local_object(value: &str) -> anyhow::Result<String> {
     ))
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn ensure_holdout_claim_absent(client: &Client, source: &str) -> anyhow::Result<()> {
     let exists = if source.starts_with("http://") || source.starts_with("https://") {
         let response = client
@@ -3884,6 +4391,7 @@ pub(crate) fn ensure_holdout_claim_absent(client: &Client, source: &str) -> anyh
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn resume_source(args: &ExecuteMissionArgs) -> anyhow::Result<Option<(&str, &str)>> {
     let url = args
         .resume_url
@@ -3903,6 +4411,7 @@ fn resume_source(args: &ExecuteMissionArgs) -> anyhow::Result<Option<(&str, &str
     }
 }
 
+#[cfg(feature = "scientific")]
 fn validate_result_readback_binding(
     result_put_url: &str,
     result_readback_url: &str,
@@ -3938,6 +4447,7 @@ fn validate_result_readback_binding(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn validate_mission_materialization_binding(
     mission: &CexResearchMissionArtifactV1,
     materialization: &Materialization,
@@ -3974,6 +4484,7 @@ pub(crate) fn validate_mission_materialization_binding(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn validate_mission_dataset_binding(
     mission: &CexResearchMissionArtifactV1,
     features: &hft_collector::FeatureDatasetManifest,
@@ -4079,6 +4590,7 @@ pub(crate) fn validate_materialization(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn validate_cex_mission_id(value: &str) -> anyhow::Result<()> {
     let suffix = value
         .strip_prefix("cex-mission-")
@@ -5049,6 +5561,7 @@ fn replay_trace_relative_path(receipt: &CexEventReplayReceiptV1) -> anyhow::Resu
     Ok(relative)
 }
 
+#[cfg(feature = "scientific")]
 fn read_local_replay_trace(
     results_dir: &Path,
     receipt: &CexEventReplayReceiptV1,
@@ -5256,7 +5769,7 @@ fn validate_replay_trace_bytes(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 pub(crate) mod tests {
     use super::*;
     use crate::{
@@ -5482,6 +5995,7 @@ pub(crate) mod tests {
             strategy: reference("strategy", 'a'),
             dataset: reference("dataset", 'b'),
             materialization: reference("materialization", 'c'),
+            prepared_inputs: None,
             tape_artifact: reference("tape", 'd'),
             tape_manifest: reference("manifest", 'e'),
             source: reference("source", 'f'),
@@ -10182,6 +10696,7 @@ message binance_replay {
             &fixture.args.replay_artifact_sha256,
             &fixture.replay_manifest_path,
             &fixture.args.replay_manifest_sha256,
+            None,
         )
         .unwrap();
 
