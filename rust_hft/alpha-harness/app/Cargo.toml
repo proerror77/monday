@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 hft-research-artifacts = { path = "../../research-core/artifacts" }
+hft-research-dispatch-io = { path = "../../research-core/dispatch-io" }
 alpha-domain = { path = "../domain" }
 alpha-engine = { path = "../engine" }
 alpha-onnx-evaluator = { path = "../onnx-evaluator" }

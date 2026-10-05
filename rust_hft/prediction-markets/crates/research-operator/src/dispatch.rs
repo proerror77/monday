@@ -4,16 +4,20 @@ use crate::cli::{
 };
 use anyhow::{bail, Context};
 use hft_research_artifacts::{configured_binary, fetch_to_file, normalized_sha256};
+use hft_research_dispatch_io::{
+    canonical_https_object, ensure_kubectl_success, kubectl_binary, kubectl_json,
+    kubectl_with_input, result_object_binds_attempt, sha256_text, validate_cluster_target,
+    validate_dns_label, validate_identifier,
+};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::File,
     io::{Read, Write},
-    path::{Component, Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
+    path::{Component, Path},
+    process::{Child, Command, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -27,9 +31,6 @@ const SNAPSHOT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCE_PROFILE: &str = "standard-v1";
 const ACTIVE_DEADLINE_SECONDS: u64 = 1800;
 const SNAPSHOT_ADMISSION_SCHEMA_VERSION: &str = "monday.prediction.snapshot_admission.v2";
-pub(crate) const TOKYO_OSS_INTERNAL_ENDPOINT: &str = "oss-ap-northeast-1-internal.aliyuncs.com";
-pub(crate) const CEX_GLOBAL_HOLDOUT_CLAIM_ROOT: &str =
-    "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/artifacts/alpha-results/cex-holdout-claims";
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1255,135 +1256,6 @@ fn image_digest(image: &str) -> anyhow::Result<String> {
     normalized_sha256("prediction image", digest)
 }
 
-pub(crate) fn canonical_https_object(label: &str, value: &str) -> anyhow::Result<String> {
-    if value != value.trim() || value.chars().any(char::is_control) {
-        bail!("{label} URL must not contain surrounding whitespace or control characters");
-    }
-    if !value.starts_with("https://") {
-        bail!("{label} URL must start with canonical https://");
-    }
-    let mut url = reqwest::Url::parse(value).with_context(|| format!("{label} URL is invalid"))?;
-    if url.scheme() != "https" || url.host_str().is_none() {
-        bail!("{label} URL must be HTTPS with a host");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!("{label} URL must not contain userinfo credentials");
-    }
-    if url.fragment().is_some() || url.path() == "/" || url.path().ends_with('/') {
-        bail!("{label} URL must identify one object without a fragment");
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string())
-}
-
-pub(crate) fn canonical_tokyo_oss_internal_object(
-    label: &str,
-    value: &str,
-) -> anyhow::Result<String> {
-    let canonical = canonical_https_object(label, value)?;
-    let url = reqwest::Url::parse(&canonical).expect("canonical HTTPS object must parse");
-    if url.port().is_some() {
-        bail!("{label} URL must not override the OSS port");
-    }
-    let host = url
-        .host_str()
-        .context("canonical HTTPS object must retain a host")?;
-    let bucket = if let Some(bucket) = host.strip_suffix(&format!(".{TOKYO_OSS_INTERNAL_ENDPOINT}"))
-    {
-        bucket
-    } else {
-        bail!("{label} URL must target the Tokyo OSS internal endpoint");
-    };
-    validate_dns_label("OSS bucket", bucket)?;
-    Ok(canonical)
-}
-
-pub(crate) fn result_object_binds_attempt(object: &str, attempt_id: &str) -> anyhow::Result<bool> {
-    let url = reqwest::Url::parse(object)?;
-    Ok(url.path_segments().into_iter().flatten().any(|segment| {
-        segment == attempt_id
-            || segment.strip_prefix("attempt=") == Some(attempt_id)
-            || segment.strip_suffix(".zip") == Some(attempt_id)
-    }))
-}
-
-pub(crate) fn cex_result_attempt_and_holdout_claim(
-    result_object: &str,
-    mission_id: &str,
-    holdout_id: &str,
-) -> anyhow::Result<(String, String)> {
-    let segment = format!("/mission-id={mission_id}/");
-    let mut matches = result_object.match_indices(&segment);
-    let (index, _) = matches
-        .next()
-        .context("result object must bind the exact Mission ID")?;
-    if matches.next().is_some() || result_object[..index].contains("/mission-id=") {
-        bail!("result object contains duplicate Mission ID bindings");
-    }
-    let attempt_id = result_object[index + segment.len()..]
-        .strip_prefix("attempt=")
-        .and_then(|value| value.strip_suffix("/results.zip"))
-        .context("CEX result object must end with mission-id=<id>/attempt=<id>/results.zip")?;
-    validate_dns_label("attempt id", attempt_id)?;
-    Ok((
-        attempt_id.to_string(),
-        format!(
-            "{}/holdout-id-sha256={}/sealed-holdout-claim.json",
-            result_object[..index].trim_end_matches('/'),
-            sha256_text(holdout_id),
-        ),
-    ))
-}
-
-pub(crate) fn cex_campaign_round_root(
-    object: &str,
-    campaign_id: &str,
-    round_id: &str,
-    file_name: &str,
-) -> anyhow::Result<String> {
-    let suffix = format!("/campaign-id={campaign_id}/round={round_id}/{file_name}");
-    let root = object.strip_suffix(&suffix).with_context(|| {
-        format!("CEX campaign object must end with campaign-id=<id>/round=<id>/{file_name}")
-    })?;
-    if root.is_empty() || root.contains("/campaign-id=") || root.contains("/round=") {
-        bail!("CEX campaign object contains duplicate Campaign ID bindings");
-    }
-    Ok(root.trim_end_matches('/').to_string())
-}
-
-pub(crate) fn cex_campaign_round_result_and_holdout_claim(
-    result_object: &str,
-    campaign_id: &str,
-    round_id: &str,
-    holdout_id: &str,
-) -> anyhow::Result<String> {
-    Ok(format!(
-        "{}/holdout-id-sha256={}/sealed-holdout-claim.json",
-        cex_campaign_round_root(result_object, campaign_id, round_id, "results.zip")?,
-        sha256_text(holdout_id),
-    ))
-}
-
-pub(crate) fn cex_global_holdout_claim_object(holdout_id: &str) -> anyhow::Result<String> {
-    Ok(format!(
-        "{}/holdout-id-sha256={}/sealed-holdout-claim.json",
-        canonical_tokyo_oss_internal_object(
-            "CEX sealed holdout claim root",
-            CEX_GLOBAL_HOLDOUT_CLAIM_ROOT,
-        )?,
-        sha256_text(holdout_id),
-    ))
-}
-
-fn validate_identifier(label: &str, value: &str) -> anyhow::Result<()> {
-    let value = value.trim();
-    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
-        bail!("{label} is invalid");
-    }
-    Ok(())
-}
-
 fn validate_task_capability(value: &str) -> anyhow::Result<()> {
     let bytes = value.as_bytes();
     if bytes.is_empty()
@@ -1452,36 +1324,6 @@ fn validate_catalog_partition_artifact_path(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_dns_label(label: &str, value: &str) -> anyhow::Result<()> {
-    let bytes = value.as_bytes();
-    if bytes.is_empty()
-        || bytes.len() > 63
-        || !bytes[0].is_ascii_alphanumeric()
-        || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
-        || !bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-    {
-        bail!("{label} must be a lowercase Kubernetes DNS label");
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_cluster_target(context: &str, namespace: &str) -> anyhow::Result<()> {
-    validate_identifier("Kubernetes context", context)?;
-    validate_dns_label("namespace", namespace)
-}
-
-pub(crate) fn sha256_text(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
-}
-
-pub(crate) fn kubectl_binary() -> PathBuf {
-    std::env::var_os("MONDAY_KUBECTL_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("kubectl"))
-}
-
 fn existing_result_jobs(
     kubectl: &Path,
     context: &str,
@@ -1539,51 +1381,6 @@ fn create_failure_recovered(
     }
 }
 
-pub(crate) fn kubectl_json<const N: usize>(
-    kubectl: &Path,
-    context: &str,
-    namespace: &str,
-    args: [&str; N],
-    action: &str,
-) -> anyhow::Result<Value> {
-    let output = Command::new(kubectl)
-        .arg("--context")
-        .arg(context)
-        .arg("--namespace")
-        .arg(namespace)
-        .args(args)
-        .output()
-        .with_context(|| format!("start kubectl to {action}"))?;
-    let stdout = ensure_kubectl_success(output, action)?;
-    serde_json::from_slice(&stdout).with_context(|| format!("parse kubectl output for {action}"))
-}
-
-pub(crate) fn kubectl_with_input<const N: usize>(
-    kubectl: &Path,
-    context: &str,
-    namespace: &str,
-    args: [&str; N],
-    input: &[u8],
-) -> anyhow::Result<Output> {
-    let mut child = Command::new(kubectl)
-        .arg("--context")
-        .arg(context)
-        .arg("--namespace")
-        .arg(namespace)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start kubectl prediction Job creation")?;
-    child
-        .stdin
-        .take()
-        .context("kubectl stdin is unavailable")?
-        .write_all(input)?;
-    child.wait_with_output().context("wait for kubectl")
-}
-
 fn delete_input_secret(
     kubectl: &Path,
     context: &str,
@@ -1600,16 +1397,6 @@ fn delete_input_secret(
         .context("start prediction input Secret cleanup")?;
     ensure_kubectl_success(output, "clean up prediction input Secret")?;
     Ok(())
-}
-
-pub(crate) fn ensure_kubectl_success(output: Output, action: &str) -> anyhow::Result<Vec<u8>> {
-    if !output.status.success() {
-        bail!(
-            "kubectl failed to {action}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -1761,31 +1548,6 @@ mod tests {
             let mut submission = valid_submission();
             submission.mission_url = url.to_owned();
             assert!(validate_submission(submission).is_err());
-        }
-    }
-
-    #[test]
-    fn canonical_tokyo_oss_internal_object_keeps_virtual_host_and_strips_queries() {
-        let canonical = canonical_tokyo_oss_internal_object(
-            "result",
-            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaign-id=test/campaign-result.json?signature=x",
-        )
-        .unwrap();
-
-        assert_eq!(
-            canonical,
-            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/campaign-id=test/campaign-result.json"
-        );
-    }
-
-    #[test]
-    fn canonical_tokyo_oss_internal_object_rejects_non_internal_hosts() {
-        for url in [
-            "https://example.com/research/campaign-id=test/campaign-result.json",
-            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1.aliyuncs.com/research/campaign-id=test/campaign-result.json",
-            "https://oss-ap-northeast-1-internal.aliyuncs.com/monday-lob-apne1-1045353359/research/campaign-id=test/campaign-result.json",
-        ] {
-            assert!(canonical_tokyo_oss_internal_object("result", url).is_err());
         }
     }
 

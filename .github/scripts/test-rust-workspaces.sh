@@ -68,12 +68,16 @@ for feature in default import; do
     echo 'conversion/import pulls acquisition, scheduling, training or execution' >&2; exit 1
   fi
 done
-for package in hft-research-artifacts hft-prediction-research-worker; do
-  if [[ $package == hft-research-artifacts ]]; then owner=shared; else owner=prediction-markets; fi
+for package in hft-research-artifacts hft-research-dispatch-io hft-prediction-research-worker hft-prediction-research-operator; do
+  case $package in hft-research-artifacts|hft-research-dispatch-io) owner=shared ;; *) owner=prediction-markets ;; esac
   cargo tree --manifest-path "$root/rust_hft/$owner/Cargo.toml" \
     -p "$package" --locked --edges normal --prefix none >"$work/worker.tree"
   if grep -E '^(alpha-(domain|engine|harness|onnx-evaluator) |burn |ort |hft-(collector|backtest|research-platform|research-ml|execution-adapter-[a-z-]+) )' "$work/worker.tree"; then
     echo 'Prediction/artifact worker imports acquisition, CEX research, control, training or execution' >&2; exit 1
+  fi
+  if [[ $package == hft-research-artifacts || $package == hft-prediction-research-worker ]] &&
+    grep -E '^hft-research-dispatch-io ' "$work/worker.tree"; then
+    echo 'artifact transport or scientific worker imports cluster operations' >&2; exit 1
   fi
 done
 printf 'workspace ownership, scoped commands, feature rejection and thin closures passed\n'
