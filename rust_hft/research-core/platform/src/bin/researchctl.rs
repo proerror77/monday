@@ -30,13 +30,13 @@ async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     match args.iter().skip(1).map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["tool",endpoint,token_path,path] => {
-            let url=reqwest::Url::parse(endpoint)?;
-            anyhow::ensure!(url.scheme()=="http" && matches!(url.host_str(),Some("127.0.0.1"|"::1")) && url.path()=="/research" && url.query().is_none() && url.username().is_empty() && url.password().is_none(),"tool client requires explicit local endpoint");
-            let tool:ResearchTool=read(path)?;tool.validate()?;
-            let token=hft_research_platform::service::read_secret(token_path)?;
-            let mut response=reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build()?.post(url).bearer_auth(token).json(&tool).send().await.map_err(|_|anyhow::anyhow!("research tool API unavailable"))?.error_for_status().map_err(|_|anyhow::anyhow!("research tool request rejected"))?;
-            let mut bytes=Vec::new();while let Some(chunk)=response.chunk().await?{anyhow::ensure!(bytes.len()+chunk.len()<=1024*1024,"tool response too large");bytes.extend_from_slice(&chunk);}
-            println!("{}",std::str::from_utf8(&bytes)?);
+            let tool: ResearchTool = read(path)?;
+            let tls = hft_research_platform::transport::TlsConfig {
+                ca_file: std::env::var_os("MONDAY_RESEARCH_TOOL_CA_FILE").map(Into::into),
+                identity_file: std::env::var_os("MONDAY_RESEARCH_TOOL_IDENTITY_FILE").map(Into::into),
+            };
+            let client = hft_research_platform::session::ResearchClient::from_file(endpoint, token_path.into(), &tls)?;
+            println!("{}", client.execute(&tool).await?);
         }
         ["plan-build",path]=>{let build:hft_research_platform::build::BuildSpec=read(path)?;println!("{}",serde_json::to_string(&build.cargo_arguments()?)?);}
         ["register-build",path,release]=>{

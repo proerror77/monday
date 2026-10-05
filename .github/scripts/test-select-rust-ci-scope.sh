@@ -191,6 +191,7 @@ release_metadata_paths=(
   .github/scripts/wait-release-required-checks.sh
   .github/scripts/research-image-release-artifact.sh
   .github/scripts/test-research-image-release-artifact.sh
+  .github/scripts/publish-research-build-release.sh
   .github/scripts/verify-research-runner-binaries.sh
   .github/scripts/read-acr-publish-source.sh
   .github/scripts/select-acr-publish-source.sh
@@ -391,6 +392,12 @@ for path in \
   latency_output=$(run_case engine-latency pull_request engine-latency.txt)
   grep -q '^jobs=.*ci/rust-hft-engine-fast-lane,' "$latency_output"
 done
+
+# Removing the engine dependency must not remove depth's actual 22-test gate.
+"$script_dir/../../rust_hft/scripts/workspace-metadata.sh" >"$tmp_dir/depth-metadata.fixture"
+printf '%s\n' rust_hft/market-core/binance-depth/src/book_sync.rs >"$tmp_dir/depth-leaf.txt"
+depth_output=$(run_case depth-leaf pull_request depth-leaf.txt "$tmp_dir/depth-metadata.fixture")
+grep -q '^jobs=.*ci/rust-hft-engine-fast-lane,' "$depth_output"
 
 printf '%s\n' \
   rust_hft/tools/collector/src/polymarket/reference.rs \
