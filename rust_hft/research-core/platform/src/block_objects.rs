@@ -19,11 +19,11 @@ pub struct Objects {
 
 impl Objects {
     pub fn new() -> Result<Self> {
+        Self::with_tls(&crate::transport::TlsConfig::default())
+    }
+    pub fn with_tls(tls: &crate::transport::TlsConfig) -> Result<Self> {
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            client: tls.client(std::time::Duration::from_secs(30), true)?,
         })
     }
     pub async fn read(&self, descriptor: &ObjectDescriptor, max_bytes: u64) -> Result<Vec<u8>> {
