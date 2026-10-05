@@ -214,7 +214,7 @@ fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
             .unwrap();
     }
     let budget = store
-        .with_campaign_platform_budget(&root, &reservation, Utc::now, |b| {
+        .with_campaign_platform_budget(&root, &reservation, |b| {
             Ok::<_, alpha_store::StoreError>(b.clone())
         })
         .unwrap();

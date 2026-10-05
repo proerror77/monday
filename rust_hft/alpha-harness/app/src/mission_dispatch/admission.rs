@@ -327,7 +327,7 @@ impl Admission {
         }
         let verified = verify(&self.signed, &self.control.trusted_keys_path)?;
         self.store
-            .with_campaign_platform_budget(&verified, &self.reservation, Utc::now, |budget| {
+            .with_campaign_platform_budget(&verified, &self.reservation, |budget| {
                 Ok::<_, anyhow::Error>(budget.clone())
             })
     }
@@ -363,7 +363,6 @@ impl Admission {
             &verified,
             &self.reservation,
             transfer,
-            Utc::now,
             action,
         )
     }
