@@ -10,7 +10,7 @@ use crate::{
     canonical_json_hash,
 };
 use chrono::{DateTime, TimeDelta, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -179,7 +179,7 @@ pub fn verify_campaign_final_evaluation_grant(
         hex::decode(&signed.signature_hex).map_err(|_| CampaignControlError::InvalidSignature)?;
     let signature =
         Signature::from_slice(&bytes).map_err(|_| CampaignControlError::InvalidSignature)?;
-    key.verify(
+    key.verify_strict(
         signing_message(&signed.content_sha256).as_bytes(),
         &signature,
     )
