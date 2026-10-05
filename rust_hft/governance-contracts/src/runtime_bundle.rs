@@ -240,6 +240,9 @@ impl RuntimeOnnxModel {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RuntimeArtifact {
+    ProbabilityReversal {
+        spec: Box<hft_research_manifest::prediction_probability::ProbabilityReversalSpecV1>,
+    },
     Formula {
         ast: FactorAst,
     },
@@ -256,6 +259,9 @@ pub enum RuntimeArtifact {
 impl RuntimeArtifact {
     fn validate(&self) -> Result<(), RuntimeBundleError> {
         match self {
+            Self::ProbabilityReversal { spec } => {
+                spec.validate().map_err(|_| RuntimeBundleError::Invalid)
+            }
             Self::Formula { ast } => require(
                 validate_live_formula(ast)
                     .map_err(|_| RuntimeBundleError::Invalid)?

@@ -1,7 +1,7 @@
 prediction-policy-dependencies.v6
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:816148e8ba08654d402e4257fc0979474c916336cc2c906d46a5d572674c2c2a
+input:Cargo.lock=sha256:101b498a64003c2db24ee2553f612393996833ae35e3756b725a4fafbc97730f
 input:Cargo.toml=sha256:a19d33379eee9a01a9a151f6a7a53997447ae5422895ee846d6b23b43a01be81
 input:crates/ploy-research/Cargo.toml=sha256:3d3cc6e52da9335b915c79d776fa335f21c88cda447daffc097cc9755d6c9291
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
@@ -17,7 +17,7 @@ input:../risk-control/portfolio-core/Cargo.toml=sha256:7aa5c2f8524cf8007bb84733a
 input:../shared/Cargo.toml=sha256:cd278c4e2b5d0bd1b69f42251bc50600189ce49f25e87a97e78f98fc9a4b59e3
 input:../data-pipelines/Cargo.toml=sha256:7771b21350fe2b6fb7ad1588790fa28a4f60a5a0a00874bce897c0f6b4d0442e
 input:../research-core/Cargo.toml=sha256:7659fc66abead81b0069083c06ed163b168717a155ddab68c0a3c765625fb279
-input:../runtime/Cargo.toml=sha256:960ac178b5a2bba414a50f0a75ef3218a7c6b2aa6d31fbdf10a35e3ac77e1e6d
+input:../runtime/Cargo.toml=sha256:11b6cae8ef4fe0019c778a0767016b4cfc0c92fb30e0bea5f051e00522a52cbf
 input:../research-core/search-kernel/Cargo.toml=sha256:d5a4731c11fce22c0e358097bd38fb05a674659ac2afbd7c72112285093bdec6
 package:allocator-api2@0.2.21|source=registry+https://github.com/rust-lang/crates.io-index|checksum=683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923|features=alloc
 package:anyhow@1.0.103|source=registry+https://github.com/rust-lang/crates.io-index|checksum=2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3|features=default,std

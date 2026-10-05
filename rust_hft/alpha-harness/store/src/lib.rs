@@ -2785,6 +2785,20 @@ fn validate_strategy_scope(
         ));
     }
     let expected = match &bundle.artifact {
+        StrategyBundleArtifact::ProbabilityReversal { spec } => {
+            if let Some(symbol) = symbol {
+                if !spec
+                    .episodes
+                    .iter()
+                    .any(|episode| episode.up_token == symbol || episode.down_token == symbol)
+                {
+                    return Err(StoreError::Domain(
+                        "attribution token differs from fixed episode".into(),
+                    ));
+                }
+            }
+            bundle.bundle_id.clone()
+        }
         StrategyBundleArtifact::Formula { .. } => {
             let symbol = symbol.ok_or_else(|| {
                 StoreError::Domain(
@@ -4024,6 +4038,89 @@ mod tests {
             store.get_strategy_bundle("bundle:candidate-1").unwrap(),
             bundle
         );
+    }
+
+    #[test]
+    fn fixed_probability_config_cannot_replace_recorded_scientific_evidence() {
+        use hft_research_manifest::prediction_probability::*;
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let candidate =
+            CandidateArtifact::ProbabilityReversal(Box::new(ProbabilityReversalSpecV1 {
+                schema: PROBABILITY_REVERSAL_SCHEMA.into(),
+                episodes: vec![BinaryEpisodeV1 {
+                    episode_id: "episode".into(),
+                    condition_id: "condition".into(),
+                    underlying: "BTCUSDT".into(),
+                    venue: "POLYMARKET".into(),
+                    up_token: "123".into(),
+                    down_token: "456".into(),
+                    start_us: 1_000_000,
+                    end_us: 301_000_000,
+                }],
+                prev_prob_low: 0.3,
+                curr_prob_high: 0.6,
+                prev_prob_high: 0.7,
+                curr_prob_low: 0.4,
+                take_profit_prob: 0.85,
+                stop_loss_prob: 0.5,
+                min_time_remaining_secs: 1,
+                max_time_remaining_secs: 5,
+                stake_usd: 10.into(),
+                max_positions: 1000,
+                max_daily_trades: 1000,
+                quote_max_age_us: 500_000,
+            }));
+        let record = iteration();
+        store
+            .append_iteration(&record, Some(("candidate-1", &candidate)), None)
+            .unwrap();
+        let hash = store.mission_lineage("mission-1").unwrap().candidates[0]
+            .content_hash
+            .clone();
+        let now = Utc::now();
+        let bundle = StrategyBundle::new(
+            "bundle-1".into(),
+            "candidate-1".into(),
+            hash.clone(),
+            ManifestId::new("dataset-1").unwrap(),
+            "probability-config-only".into(),
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
+            candidate.to_governed_strategy_bundle_artifact().unwrap(),
+            now,
+        )
+        .unwrap();
+        let promotion = PromotionRecord {
+            promotion_id: "promotion-1".into(),
+            mission_id: "mission-1".into(),
+            candidate_id: "candidate-1".into(),
+            candidate_content_hash: hash,
+            dataset_manifest_id: bundle.dataset_manifest_id.clone(),
+            evaluator_version: bundle.evaluator_version.clone(),
+            evaluation_protocol_hash: bundle.evaluation_protocol_hash.clone(),
+            evaluator_config_hash: bundle.evaluator_config_hash.clone(),
+            evaluation_metrics_hash: bundle.evaluation_metrics_hash.clone(),
+            sealed_evaluation_id: "invented-sealed-evidence".into(),
+            sealed_evaluation_hash: bundle.sealed_evaluation_hash.clone(),
+            bundle_id: bundle.bundle_id.clone(),
+            bundle_hash: bundle.bundle_hash.clone(),
+            created_at: now,
+        };
+        let error = store.promote_candidate(&bundle, &promotion).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("canonical walk-forward evidence"));
+        assert!(matches!(
+            store.get_strategy_bundle("bundle-1"),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.get_promotion("promotion-1"),
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[test]
