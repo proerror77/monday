@@ -256,14 +256,23 @@ mod tests {
     async fn cancelled_event_wait_keeps_its_partial_frame() -> Result<()> {
         let (_temp, config) = fixture()?;
         std::fs::write(config.workspace.join("fragment"), "")?;
-        let mut server = AppServer::start(config).await?;
+        let mut server = AppServer::start(config.clone()).await?;
         server.open_thread(None).await?;
         server.send_message(&"e".repeat(64), "completion").await?;
         server.next_event().await?; // queued approval before the response
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !config.workspace.join("fragment.sent").exists() {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "fragment fixture did not send prefix"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert!(timeout(Duration::from_millis(10), server.next_event())
             .await
             .is_err());
         assert!(!server.frame.is_empty());
+        std::fs::write(config.workspace.join("fragment.release"), "")?;
         let event = server.next_event().await?;
         assert_eq!(event["method"], "thread/status/changed");
         server.close().await?;
