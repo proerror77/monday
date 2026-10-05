@@ -1078,7 +1078,9 @@ fn expected_strategy_id(activation: &ActivationRequest, symbol: &str) -> Option<
         ActivationArtifact::Formula | ActivationArtifact::FrozenModel => {
             format!("{}:{symbol}", activation.bundle_id)
         }
-        ActivationArtifact::Onnx => activation.bundle_id.clone(),
+        ActivationArtifact::Onnx | ActivationArtifact::ProbabilityReversal => {
+            activation.bundle_id.clone()
+        }
     })
 }
 
@@ -1105,7 +1107,7 @@ fn strategy_targets(
                 );
             }
         }
-        ActivationArtifact::Onnx => {
+        ActivationArtifact::Onnx | ActivationArtifact::ProbabilityReversal => {
             targets.insert(
                 activation.bundle_id.clone(),
                 StrategyTarget {

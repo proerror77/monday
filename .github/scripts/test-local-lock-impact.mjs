@@ -63,7 +63,8 @@ try {
     const out = readFileSync(`${repo}/scope.out`, 'utf8');
     assert.match(out,/ci\/rust-hft-engine-fast-lane/);
     assert.match(out,/owning_packages=,hft-core,/);
-    assert.match(out,/collector=false/); assert.match(out,/handoff=false/);
+    assert.match(out,/collector=false/); assert.match(out,/handoff=true/);
+    assert.match(out,/focused_packages=,hft-live,/);
     assert.doesNotMatch(out,/research-image-binaries|rust-research-heavy/);
   }
   writeFileSync(`${repo}/rust_hft/Cargo.lock`, lock.replace('checksum = "abc"','checksum = "def"'));
