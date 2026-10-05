@@ -57,7 +57,7 @@ select_security_job() {
 select_all_security_jobs() {
   clippy_loop=true
   clippy_handoff=true
-  loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-harnessctl,hft-research-ml
+  loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-cex-research-worker,hft-harnessctl,hft-research-ml
   select_security_job security/sast-semgrep
   select_security_job security/cargo-audit
   select_security_job security/secret-presence
@@ -168,7 +168,7 @@ select_all() {
   image_live=true
   image_paper=true
   loop=true
-  loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-harnessctl,hft-research-ml
+  loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-cex-research-worker,hft-harnessctl,hft-research-ml
   handoff=true
   json=true
   ondo=true
@@ -735,7 +735,7 @@ select_job_if_affected() {
 }
 
 select_if_affected loop alpha-domain alpha-store alpha-engine alpha-onnx-evaluator \
-  alpha-harness hft-harnessctl hft-research-ml
+  alpha-harness hft-cex-research-worker hft-harnessctl hft-research-ml
 select_if_affected handoff hft-live
 select_if_affected json hft-integration hft-data-adapter-binance hft-infra-redis hft-live
 select_if_affected ondo hft-data-adapter-ondo-perps hft-execution-adapter-ondo-perps hft-live
@@ -786,7 +786,7 @@ if is_affected ploy-research || is_affected hft-prediction-research-worker; then
   research_product=$(bash "$products" merge "$research_product" prediction-runner)
   research_image_relevant=true
 fi
-if is_affected hft-collector || is_affected alpha-harness || is_affected hft-backtest; then
+if is_affected hft-collector || is_affected alpha-harness || is_affected hft-cex-research-worker || is_affected hft-backtest; then
   research_product=$(bash "$products" merge "$research_product" cex-runner)
   research_image_relevant=true
 fi

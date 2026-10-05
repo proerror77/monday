@@ -1,23 +1,24 @@
 //! Immutable fitted-model evidence and deterministic position accounting.
-//! Fitting is compiled only for the scientific worker feature.
+//! Neural fitting stays in the scientific feature. Classic refits verify frozen evidence.
 use crate::{
     evaluation::{EngineContext, ResearchRow},
     formula_evaluator::PositionEvaluationReport,
 };
 use alpha_domain::{canonical_json_hash, CexBaselineArtifactV1, CexBaselineModelV1};
 
+mod classic;
+#[cfg(feature = "fitting")]
+pub(crate) use classic::fit_ridge;
+#[cfg(all(test, feature = "fitting"))]
+pub(crate) use classic::predict_ridge;
+pub use classic::verify_cex_classic_baseline_artifact;
+pub(crate) use classic::{evaluate_factor_features_from_entries, validate_cex_context_bindings};
 #[cfg(feature = "fitting")]
 mod fitting;
-#[cfg(all(test, feature = "fitting"))]
-pub(crate) use fitting::predict_ridge;
 #[cfg(feature = "fitting")]
 pub use fitting::{
     evaluate_cex_baselines, evaluate_cex_supervised_model, prepare_cex_baselines,
     verify_cex_baseline_artifact, CexBaselineRun, CexBurnFitIdentity, VerifiedCexBaselineRun,
-};
-#[cfg(feature = "fitting")]
-pub(crate) use fitting::{
-    evaluate_factor_features_from_entries, fit_ridge, validate_cex_context_bindings,
 };
 
 pub fn baseline_training_admitted(artifact: &CexBaselineArtifactV1) -> bool {

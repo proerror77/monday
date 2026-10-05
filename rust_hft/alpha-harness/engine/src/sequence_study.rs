@@ -1,12 +1,15 @@
 //! Fitted sequence comparisons. The caller must reserve Campaign authority;
 //! this library neither dispatches, publishes, opens holdouts nor executes orders.
+#[cfg(feature = "fitting")]
 use crate::baselines::fit_ridge;
 use alpha_domain::sequence_study::{SequenceStudyModelV1, SolSequenceStudyV1};
 use hft_cex_research_input::sequence::SequenceReader;
-use hft_research_manifest::{model::CexBaselineModelV1, sequence::SequenceInputSpecV1};
-use hft_research_ml::sequence::training::{
-    train_sequence_model, SequenceNeuralKindV1, SequenceTrainingRequestV1, TrainedSequenceModel,
+use hft_research_manifest::portable_sequence::{
+    FrozenSequenceModelV1, SequenceNeuralKindV1, SequenceTrainingRequestV1,
 };
+use hft_research_manifest::{model::CexBaselineModelV1, sequence::SequenceInputSpecV1};
+#[cfg(feature = "fitting")]
+use hft_research_ml::sequence::training::train_sequence_model;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -25,7 +28,7 @@ pub struct SequenceFitIdentityV1 {
 
 enum FittedModel {
     Ridge(Box<[CexBaselineModelV1; 3]>),
-    Neural(Box<TrainedSequenceModel>),
+    Neural(Box<FrozenSequenceModelV1>),
 }
 
 pub struct SequenceFit {
@@ -160,6 +163,7 @@ fn identity(
     })
 }
 
+#[cfg(feature = "fitting")]
 pub fn fit_sequence_comparison(
     plan: &SolSequenceStudyV1,
     fold_id: u8,
@@ -228,12 +232,13 @@ pub fn fit_sequence_comparison(
         }
         Ok(SequenceFit {
             identity,
-            model: FittedModel::Neural(Box::new(fitted)),
+            model: FittedModel::Neural(Box::new(fitted.portable()?)),
             training_examples,
         })
     }
 }
 
+#[cfg(feature = "fitting")]
 pub(crate) fn fit_sequence_ridge(
     inputs: &[Vec<f64>],
     labels: &[f64],
@@ -313,7 +318,7 @@ fn neural_request(
 }
 
 impl SequenceFit {
-    fn scaling(&self) -> Option<&hft_research_ml::sequence::training::SequenceScalingV1> {
+    fn scaling(&self) -> Option<&hft_research_manifest::portable_sequence::SequenceScalingV1> {
         match &self.model {
             FittedModel::Ridge(_) => None,
             FittedModel::Neural(model) => Some(model.scaling()),
@@ -435,7 +440,7 @@ impl SequenceFit {
                     .ok_or("missing neural training metadata")?;
                 let hash = format!("{:x}", Sha256::digest(metadata.as_bytes()));
                 let restored =
-                    TrainedSequenceModel::restore_bundle(metadata.as_bytes(), &hash, model)?;
+                    FrozenSequenceModelV1::restore_bundle(metadata.as_bytes(), &hash, model)?;
                 if restored.request() != &neural_request(plan, &expected)?
                     || restored.scaling().examples != header.training_examples
                 {
@@ -654,6 +659,7 @@ mod tests {
     use hft_research_manifest::sequence::SequenceViewV1;
 
     #[test]
+    #[cfg(feature = "fitting")]
     fn sequence_ridge_constant_column_reduction_matches_the_existing_solver() {
         let inputs = (0..80)
             .map(|i| vec![i as f64 / 80.0, 7.0, (i % 7) as f64])
@@ -739,6 +745,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fitting")]
     fn study() -> SolSequenceStudyV1 {
         use alpha_domain::sequence_study::{SequenceFoldV1, SOL_SEQUENCE_STUDY_SCHEMA};
         use alpha_domain::EvaluationCostsV1;
@@ -814,6 +821,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fitting")]
     fn sequence_restore_rejects_identity_and_weight_drift() {
         let plan = study();
         let width = plan.input.context_rows * plan.input.ordered_channels.len();

@@ -36,6 +36,15 @@ cargo tree --manifest-path "$root/rust_hft/shared/Cargo.toml" \
 if grep -E '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-input.tree"; then
   echo 'Immutable CEX input readers pull a scientific implementation' >&2; exit 1
 fi
+cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
+  -p alpha-harness --locked --edges normal --prefix none >"$work/cex-operator.tree"
+if grep -E '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-operator.tree"; then
+  echo 'CEX operator pulls a training or ONNX implementation' >&2; exit 1
+fi
+cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
+  -p hft-cex-research-worker --locked --edges normal --prefix none >"$work/cex-worker.tree"
+grep -q '^hft-research-ml ' "$work/cex-worker.tree"
+grep -q '^burn ' "$work/cex-worker.tree"
 for profile in default db full; do
   options=()
   [[ $profile == default ]] || options=(--features db)

@@ -3,12 +3,14 @@
 //! exposes no dispatch, holdout, publication or order path.
 use alpha_domain::{canonical_json_hash, market_encoder_study::*};
 use hft_cex_research_input::market_encoder::{MarketFeatureReader, MarketTaskReader};
+use hft_research_manifest::portable_market::{
+    FrozenMarketEncoderV1 as MarketEncoderCheckpoint, FrozenMarketTaskModelV1 as MarketTaskModel,
+};
 use hft_research_manifest::{
     market_encoder::*, model::CexBaselineModelV1, sequence::SequenceInputSpecV1,
 };
-use hft_research_ml::market_encoder::{
-    adapt_market_encoder, pretrain_market_encoder, MarketEncoderCheckpoint, MarketTaskModel,
-};
+#[cfg(feature = "fitting")]
+use hft_research_ml::market_encoder::{adapt_market_encoder, pretrain_market_encoder};
 use serde::{Deserialize, Serialize};
 
 pub enum MarketStageInput<'a> {
@@ -140,6 +142,7 @@ fn adaptation_request(
     Ok(request)
 }
 
+#[cfg(feature = "fitting")]
 pub fn fit_market_stage(
     study: &MarketEncoderStudyV1,
     key: MarketTrainingStageKeyV1,
@@ -154,7 +157,7 @@ pub fn fit_market_stage(
             let request = study.fit_request(key)?;
             let fitted = pretrain_market_encoder(reader, request)?;
             let examples = fitted.scaling().examples;
-            (Fitted::Encoder(Box::new(fitted)), examples)
+            (Fitted::Encoder(Box::new(fitted.portable()?)), examples)
         }
         (MarketTrainingStageKindV1::Ridge, MarketStageInput::Targets(reader)) => {
             if reader.feature_request() != &read_request(study, data)
@@ -199,9 +202,22 @@ pub fn fit_market_stage(
             ) =>
         {
             let request = adaptation_request(study, key, parent)?;
-            let fitted = adapt_market_encoder(reader, request, parent)?;
+            let scientific_parent = parent
+                .map(|p| {
+                    let (metadata, weights) = p.bundle()?;
+                    hft_research_ml::market_encoder::MarketEncoderCheckpoint::restore(
+                        &metadata,
+                        &bytes_digest(&metadata),
+                        weights,
+                    )
+                })
+                .transpose()?;
+            let fitted = adapt_market_encoder(reader, request, scientific_parent.as_ref())?;
             let examples = fitted.scaling().examples;
-            (Fitted::Task(Box::new(fitted)), examples)
+            (
+                Fitted::Task(Box::new(fitted.portable(scientific_parent.as_ref())?)),
+                examples,
+            )
         }
         _ => return Err("market stage received the wrong input role".into()),
     };
@@ -214,6 +230,7 @@ pub fn fit_market_stage(
     })
 }
 
+#[cfg(feature = "fitting")]
 fn fit_market_ridge(
     inputs: &[Vec<f64>],
     targets: &[f64],

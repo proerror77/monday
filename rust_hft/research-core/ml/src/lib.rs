@@ -5,6 +5,7 @@
 //! the declared training cutoff, which keeps model fitting point-in-time.
 
 pub mod market_encoder;
+mod portable;
 pub mod sequence;
 
 use burn::{

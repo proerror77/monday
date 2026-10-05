@@ -913,7 +913,7 @@ pub fn open_task_reader(
     .map_err(anyhow::Error::msg)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 pub(super) mod tests {
     use super::*;
     use crate::mission_campaign::sequence::cohort::put_metadata;

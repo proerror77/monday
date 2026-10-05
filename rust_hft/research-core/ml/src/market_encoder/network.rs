@@ -8,7 +8,6 @@ use burn::{
     optim::GradientsParams,
     tensor::{activation::relu, backend::Backend, Tensor},
 };
-use burn_store::{BurnpackStore, ModuleSnapshot};
 use hft_research_manifest::market_encoder::MarketEncoderSpecV1;
 use sha2::{Digest, Sha256};
 
@@ -81,31 +80,6 @@ impl<B: Backend> TaskNetwork<B> {
                 .reshape([batch, channels]),
         )
     }
-}
-
-pub(super) fn save<B: Backend, M: ModuleSnapshot<B>>(model: &M) -> Result<Vec<u8>, String> {
-    let mut store = BurnpackStore::from_bytes(None);
-    model.save_into(&mut store).map_err(|e| e.to_string())?;
-    Ok(store.get_bytes().map_err(|e| e.to_string())?.to_vec())
-}
-pub(super) fn load<B: Backend, M: ModuleSnapshot<B>>(
-    model: &mut M,
-    bytes: Vec<u8>,
-) -> Result<(), String> {
-    if bytes.len() > 16 * 1024 * 1024 {
-        return Err("market weights exceed bound".into());
-    }
-    let mut store = BurnpackStore::from_bytes(Some(burn::tensor::Bytes::from_bytes_vec(bytes)));
-    let applied = model.load_from(&mut store).map_err(|e| e.to_string())?;
-    if !applied.is_success()
-        || !applied.missing.is_empty()
-        || !applied.unused.is_empty()
-        || !applied.skipped.is_empty()
-        || applied.applied.is_empty()
-    {
-        return Err("market checkpoint tensor names or shapes differ".into());
-    }
-    Ok(())
 }
 
 pub(super) fn values_digest<M: Module<CpuBackend>>(model: &M) -> Result<String, String> {
@@ -217,4 +191,76 @@ pub(super) fn clip<M: Module<CpuAutodiffBackend>>(
         }
     }
     Ok(norm)
+}
+
+impl Encoder<CpuBackend> {
+    pub(super) fn portable(
+        &self,
+    ) -> Result<hft_research_manifest::portable_network::FrozenNetworkV1, String> {
+        Ok(
+            hft_research_manifest::portable_network::FrozenNetworkV1::Tcn {
+                convolutions: self
+                    .convolutions
+                    .iter()
+                    .map(crate::portable::convolution)
+                    .collect::<Result<_, _>>()?,
+                output: None,
+            },
+        )
+    }
+}
+impl TaskNetwork<CpuBackend> {
+    pub(super) fn portable(
+        &self,
+    ) -> Result<hft_research_manifest::portable_network::FrozenNetworkV1, String> {
+        Ok(
+            hft_research_manifest::portable_network::FrozenNetworkV1::Tcn {
+                convolutions: self
+                    .encoder
+                    .convolutions
+                    .iter()
+                    .map(crate::portable::convolution)
+                    .collect::<Result<_, _>>()?,
+                output: Some(crate::portable::linear(&self.head)?),
+            },
+        )
+    }
+    pub(super) fn from_portable(
+        frozen: &hft_research_manifest::portable_network::FrozenNetworkV1,
+    ) -> Result<Self, String> {
+        match frozen {
+            hft_research_manifest::portable_network::FrozenNetworkV1::Tcn {
+                convolutions,
+                output: Some(head),
+            } => Ok(Self {
+                encoder: Encoder {
+                    convolutions: convolutions
+                        .iter()
+                        .map(crate::portable::restore_convolution)
+                        .collect(),
+                },
+                head: crate::portable::restore_linear(head),
+            }),
+            _ => Err("task portable shape changed".into()),
+        }
+    }
+}
+
+impl<B: Backend<Device = burn_ndarray::NdArrayDevice>> Encoder<B> {
+    pub(super) fn from_portable(
+        frozen: &hft_research_manifest::portable_network::FrozenNetworkV1,
+    ) -> Result<Self, String> {
+        match frozen {
+            hft_research_manifest::portable_network::FrozenNetworkV1::Tcn {
+                convolutions,
+                output: None,
+            } => Ok(Self {
+                convolutions: convolutions
+                    .iter()
+                    .map(crate::portable::restore_convolution)
+                    .collect(),
+            }),
+            _ => Err("encoder portable shape changed".into()),
+        }
+    }
 }

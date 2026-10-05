@@ -661,7 +661,7 @@ fn assemble_shards(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 mod tests {
     use super::*;
 

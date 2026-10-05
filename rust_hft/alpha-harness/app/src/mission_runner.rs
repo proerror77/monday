@@ -1,94 +1,175 @@
-use crate::{
-    cli::{
-        print_json, DatasetArgs, EngineChoice, ExecuteMissionArgs, RunMissionArgs, ValidationArgs,
-        BUILD_SOURCE_REVISION,
-    },
-    data_mission, mission, prediction_dispatch,
-};
-use alpha_domain::{
-    canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselineArtifactV1,
-    CexBaselineGateV1, CexBaselineModelKindV1, CexBaselinePolicyV1, CexEqualAbsoluteWeightPolicyV1,
-    CexEventReplayPolicyV1, CexFactorBankRevisionV2, CexFactorEvaluationEvidenceV2,
-    CexFactorRejectionCodeV1, CexFactorScreeningAttemptV2, CexFactorScreeningVerdictV1,
-    CexFinalPrecommitV1, CexFourStageStrategyCandidateV1, CexGpPolicyV1, CexResearchContentRefV1,
-    CexResearchHoldoutStateV1, CexResearchMissionArtifactV1, CexSealedHoldoutClaimV1, EngineKind,
-    EvaluationCostsV1, FormulaEvaluatorConfig, IterationVerdict, MissionCompletionPolicy,
-    MissionStatus, PromotionRecord, ResearchIteration, ResearchMission, SearchBudgetUsage,
-    StrategyBundle, ValidatorMode, CEX_EVENT_REPLAY_POLICY_SCHEMA_V2,
-    CEX_FINAL_PRECOMMIT_SCHEMA_V1, CEX_GP_POLICY_SCHEMA_V4, CEX_GP_POLICY_SCHEMA_V5,
-    MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES, SEALED_HOLDOUT_EVALUATOR_VERSION,
-};
-use alpha_engine::{
-    baselines::{
-        prepare_cex_baselines, CexBurnFitIdentity, CexSupervisedDecisionPolicyV2,
-        CexSupervisedModelCandidateV2, CexSupervisedModelEvaluationV2, VerifiedCexBaselineRun,
-    },
-    engines::{
-        CexCombinationResearchArtifactV1, CexFactorBankMcts, CexFactorBankMctsCheckpointV1,
-        CexFactorBankMctsResultV1, CexFactorBankMctsStopReasonV1,
-    },
-    evaluation::{prepare_dataset, EngineContext},
-    formula_evaluator::FormulaEvaluator,
-    CandidateEvaluator, EngineProposal,
-};
-use alpha_store::{AlphaStore, EvaluationRecord, MissionLineage, RegistryRevision, StoreError};
+#[cfg(feature = "scientific")]
+use crate::cli::ExecuteMissionArgs;
+use crate::cli::ValidationArgs;
+use crate::cli::BUILD_SOURCE_REVISION;
+use crate::data_mission;
+#[cfg(feature = "scientific")]
+use crate::mission;
+#[cfg(feature = "scientific")]
+use crate::prediction_dispatch;
+use alpha_domain::canonical_json_hash;
+#[cfg(feature = "scientific")]
+use alpha_domain::CandidateArtifact;
+use alpha_domain::CandidateEvaluation;
+use alpha_domain::CexBaselineArtifactV1;
+use alpha_domain::CexBaselineModelKindV1;
+use alpha_domain::CexBaselinePolicyV1;
+#[cfg(feature = "scientific")]
+use alpha_domain::CexEventReplayPolicyV1;
+use alpha_domain::CexFactorBankRevisionV2;
+#[cfg(feature = "scientific")]
+use alpha_domain::CexFactorEvaluationEvidenceV2;
+#[cfg(feature = "scientific")]
+use alpha_domain::CexFactorRejectionCodeV1;
+#[cfg(feature = "scientific")]
+use alpha_domain::CexFactorScreeningAttemptV2;
+#[cfg(feature = "scientific")]
+use alpha_domain::CexFactorScreeningVerdictV1;
+use alpha_domain::CexFinalPrecommitV1;
+use alpha_domain::CexGpPolicyV1;
+use alpha_domain::CexResearchContentRefV1;
+use alpha_domain::CexResearchHoldoutStateV1;
+use alpha_domain::CexResearchMissionArtifactV1;
+use alpha_domain::CexSealedHoldoutClaimV1;
+use alpha_domain::EvaluationCostsV1;
+#[cfg(feature = "scientific")]
+use alpha_domain::IterationVerdict;
+use alpha_domain::PromotionRecord;
+use alpha_domain::ResearchMission;
+use alpha_domain::StrategyBundle;
+#[cfg(feature = "scientific")]
+use alpha_domain::CEX_EVENT_REPLAY_POLICY_SCHEMA_V2;
+use alpha_domain::CEX_GP_POLICY_SCHEMA_V4;
+use alpha_domain::CEX_GP_POLICY_SCHEMA_V5;
+use alpha_domain::SEALED_HOLDOUT_EVALUATOR_VERSION;
+use alpha_engine::baselines::CexSupervisedDecisionPolicyV2;
+use alpha_engine::baselines::CexSupervisedModelCandidateV2;
+use alpha_engine::baselines::CexSupervisedModelEvaluationV2;
+#[cfg(feature = "scientific")]
+use alpha_engine::baselines::{prepare_cex_baselines, CexBurnFitIdentity, VerifiedCexBaselineRun};
+use alpha_engine::engines::CexCombinationResearchArtifactV1;
+#[cfg(feature = "scientific")]
+use alpha_engine::engines::CexFactorBankMctsCheckpointV1;
+use alpha_engine::evaluation::prepare_dataset;
+#[cfg(feature = "scientific")]
+use alpha_engine::evaluation::EngineContext;
+#[cfg(feature = "scientific")]
+use alpha_store::AlphaStore;
+#[cfg(feature = "scientific")]
+use alpha_store::EvaluationRecord;
+#[cfg(feature = "scientific")]
+use alpha_store::MissionLineage;
+use alpha_store::RegistryRevision;
+#[cfg(feature = "scientific")]
+use alpha_store::StoreError;
 use anyhow::{bail, Context};
 use chrono::Utc;
-use hft_backtest::{
-    config::{
-        verify_and_replay_canonical_target_positions_with_trace_and_spot_rules,
-        CanonicalReplayEvidence, CanonicalSourceSegmentEvidence,
-    },
-    engine::{
-        TargetPositionDecision, TargetPositionReplayConfig, TargetPositionReplayMetrics,
-        TargetPositionReplayTraceEvent, LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
-        TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
-    },
+#[cfg(feature = "scientific")]
+use hft_backtest::config::{
+    verify_and_replay_canonical_target_positions_with_trace_and_spot_rules,
+    CanonicalReplayEvidence, CanonicalSourceSegmentEvidence,
 };
-use hft_research_artifacts::{
-    checked_result_bundle_bytes, create_bundle, fetch_to_file, normalized_sha256,
-    publish_immutable_file, publish_result, sha256_file,
+use hft_backtest::engine::{
+    TargetPositionDecision, TargetPositionReplayConfig, TargetPositionReplayMetrics,
+    TargetPositionReplayTraceEvent, LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
+    TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
 };
-use hft_research_manifest::{
-    CexInstrumentRulesV2, CexReplayDatasetManifestV5, CexReplaySnapshotV1, CexReplaySnapshotV2,
-    CexReplaySnapshotV3, CexReplaySnapshotV4, CexReplaySnapshotV5, ManifestId,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5,
-    BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6, BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7,
-};
-use reqwest::{blocking::Client, redirect::Policy, StatusCode};
+use hft_research_artifacts::fetch_to_file;
+use hft_research_artifacts::normalized_sha256;
+#[cfg(feature = "scientific")]
+use hft_research_artifacts::publish_immutable_file;
+use hft_research_artifacts::sha256_file;
+#[cfg(feature = "scientific")]
+use hft_research_manifest::CexReplayDatasetManifestV5;
+use hft_research_manifest::CexReplaySnapshotV1;
+use hft_research_manifest::CexReplaySnapshotV2;
+use hft_research_manifest::CexReplaySnapshotV3;
+use hft_research_manifest::CexReplaySnapshotV4;
+use hft_research_manifest::CexReplaySnapshotV5;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6;
+use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7;
+use reqwest::blocking::Client;
+#[cfg(feature = "scientific")]
+use reqwest::redirect::Policy;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    fs::File,
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::fs::File;
+use std::io::Read;
+#[cfg(feature = "scientific")]
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(feature = "scientific")]
+use std::time::Duration;
 use zip::ZipArchive;
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+#[cfg(feature = "scientific")]
+use {
+    crate::cli::print_json, crate::cli::DatasetArgs, crate::cli::EngineChoice,
+    crate::cli::RunMissionArgs,
+};
+#[cfg(feature = "scientific")]
+use {
+    alpha_domain::CexBaselineGateV1, alpha_domain::CexEqualAbsoluteWeightPolicyV1,
+    alpha_domain::CexFourStageStrategyCandidateV1, alpha_domain::EngineKind,
+    alpha_domain::FormulaEvaluatorConfig, alpha_domain::MissionCompletionPolicy,
+    alpha_domain::MissionStatus, alpha_domain::ResearchIteration, alpha_domain::SearchBudgetUsage,
+    alpha_domain::ValidatorMode, alpha_domain::CEX_FINAL_PRECOMMIT_SCHEMA_V1,
+    alpha_domain::MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES,
+};
+#[cfg(feature = "scientific")]
+use {
+    alpha_engine::engines::CexFactorBankMcts, alpha_engine::engines::CexFactorBankMctsResultV1,
+    alpha_engine::engines::CexFactorBankMctsStopReasonV1,
+    alpha_engine::formula_evaluator::FormulaEvaluator, alpha_engine::CandidateEvaluator,
+    alpha_engine::EngineProposal,
+};
+#[cfg(feature = "scientific")]
+use {
+    hft_research_artifacts::checked_result_bundle_bytes, hft_research_artifacts::create_bundle,
+    hft_research_artifacts::publish_result,
+};
+#[cfg(feature = "scientific")]
+use {hft_research_manifest::CexInstrumentRulesV2, hft_research_manifest::ManifestId};
 
 const MATERIALIZATION_KIND: &str = "lob_point_in_time_materialization";
+#[cfg(feature = "scientific")]
 const CEX_BASELINE_POLICY_REGISTRY_KIND: &str = "cex_baseline_policy";
+#[cfg(feature = "scientific")]
 const CEX_BASELINE_RIDGE_REGISTRY_KIND: &str = "cex_baseline_ridge";
+#[cfg(feature = "scientific")]
 const CEX_BASELINE_BURN_REGISTRY_KIND: &str = "cex_baseline_burn_mlp";
+#[cfg(feature = "scientific")]
 const CEX_BASELINE_CART_REGISTRY_KIND: &str = "cex_baseline_cart";
+#[cfg(feature = "scientific")]
 const CEX_BASELINE_GATE_REGISTRY_KIND: &str = "cex_baseline_gate";
+#[cfg(feature = "scientific")]
 const CEX_SUPERVISED_MODEL_REGISTRY_KIND: &str = "cex_supervised_model_candidate";
+#[cfg(feature = "scientific")]
 const CEX_EVENT_REPLAY_RECEIPT_REGISTRY_KIND: &str = "cex_event_replay_receipt";
+#[cfg(feature = "scientific")]
 const CEX_SUPERVISED_EVENT_REPLAY_RECEIPT_REGISTRY_KIND: &str =
     "cex_supervised_event_replay_receipt";
 const MAX_MISSION_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(feature = "scientific")]
 const MAX_CEX_SEALED_HOLDOUT_CLAIM_BYTES: u64 = 64 * 1024;
 // ponytail: one Mission is capped at 1 GiB; raise this only when staged partitions exceed it.
 pub(crate) const MAX_FEATURE_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAX_MATERIALIZATION_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "scientific")]
 const MAX_REPLAY_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(feature = "scientific")]
 const MAX_REPLAY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_RESULT_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 // Long, bounded MLP loss/gradient histories accompany predictions in this artifact.
 pub(crate) const MAX_MLP_BASELINE_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(feature = "scientific")]
 const MCTS_CHECKPOINT_ARTIFACT_SCHEMA_VERSION: &str =
     "cex-factor-bank-subset-mcts-checkpoint-artifact-v1";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V1: &str = "cex-event-replay-receipt-v1";
@@ -96,9 +177,11 @@ const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V2: &str = "cex-event-replay-receipt-v2";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V3: &str = "cex-event-replay-receipt-v3";
 const CEX_EVENT_REPLAY_RECEIPT_SCHEMA_V4: &str = "cex-event-replay-receipt-v4";
 const CEX_SUPERVISED_MODEL_SELECTION_SCHEMA_VERSION: &str = "cex-supervised-model-selection-v1";
+#[cfg(feature = "scientific")]
 const CEX_SUPERVISED_MODEL_ATTEMPTS_SCHEMA_VERSION: &str = "cex-supervised-model-attempts-v1";
 pub(crate) const CEX_SUPERVISED_MODEL_NAMES: [&str; 3] = ["ridge", "cart", "burn_mlp"];
 // ponytail: fixed batching bounds checkpoint I/O; make it configurable only if recovery data requires it.
+#[cfg(feature = "scientific")]
 const MCTS_CHECKPOINT_INTERVAL: u64 = 256;
 
 fn research_event_value(
@@ -120,6 +203,7 @@ pub(crate) fn research_event(component: &str, event: &str, details: serde_json::
     eprintln!("{}", research_event_value(component, event, details));
 }
 
+#[cfg(feature = "scientific")]
 fn evaluation_log_summary(evaluation: &CandidateEvaluation) -> serde_json::Value {
     serde_json::json!({
         "passed": evaluation.passed,
@@ -291,6 +375,7 @@ const fn default_series_count() -> usize {
 
 #[derive(Debug, Deserialize)]
 struct SourceSegment {
+    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
     path: PathBuf,
     sha256: String,
     collector_manifest_sha256: String,
@@ -340,10 +425,12 @@ pub(crate) struct ExecutionReport {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ExecutionBinding {
+    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
     Direct,
     Campaign {
         campaign_id: String,
         round_id: String,
+        #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
         request_sha256: String,
     },
 }
@@ -421,11 +508,13 @@ impl CexSupervisedModelSelectionV1 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "scientific")]
 struct CexSupervisedModelAttemptV1 {
     model: String,
     outcome: String,
 }
 
+#[cfg(feature = "scientific")]
 fn persist_supervised_model_attempts(
     results_dir: &Path,
     attempts: &[CexSupervisedModelAttemptV1],
@@ -439,6 +528,7 @@ fn persist_supervised_model_attempts(
     )
 }
 
+#[cfg(feature = "scientific")]
 fn update_supervised_model_attempt(
     results_dir: &Path,
     attempts: &mut [CexSupervisedModelAttemptV1],
@@ -453,6 +543,7 @@ fn update_supervised_model_attempt(
     persist_supervised_model_attempts(results_dir, attempts)
 }
 
+#[cfg(feature = "scientific")]
 fn run_supervised_model_attempt(
     results_dir: &Path,
     attempts: &mut [CexSupervisedModelAttemptV1],
@@ -531,6 +622,7 @@ impl CexEventReplayReceiptV1 {
         Ok(())
     }
 
+    #[cfg(feature = "scientific")]
     fn finalize(mut self) -> anyhow::Result<Self> {
         self.capabilities_sha256 = canonical_json_hash(&self.capabilities)?;
         self.receipt_id = self.expected_receipt_id()?;
@@ -773,13 +865,16 @@ fn replay_config_content_hash(
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "scientific")]
 struct MctsCheckpointArtifactV1 {
     schema_version: String,
     checkpoint_sha256: String,
     checkpoint: CexFactorBankMctsCheckpointV1,
 }
 
+#[cfg(feature = "scientific")]
 impl MctsCheckpointArtifactV1 {
+    #[cfg(feature = "scientific")]
     fn new(checkpoint: CexFactorBankMctsCheckpointV1) -> anyhow::Result<Self> {
         let checkpoint_sha256 = checkpoint.content_hash().map_err(anyhow::Error::msg)?;
         Ok(Self {
@@ -806,6 +901,7 @@ impl MctsCheckpointArtifactV1 {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(feature = "scientific")]
 struct ExecutionModelEvidence {
     schema_version: &'static str,
     fee_bps: f64,
@@ -827,6 +923,7 @@ struct ExecutionModelEvidence {
     max_book_depth_fraction: f64,
 }
 
+#[cfg(feature = "scientific")]
 impl From<&EvaluationCostsV1> for ExecutionModelEvidence {
     fn from(costs: &EvaluationCostsV1) -> Self {
         let capacity_gate_enabled = costs.capacity_enabled();
@@ -857,10 +954,12 @@ impl From<&EvaluationCostsV1> for ExecutionModelEvidence {
     }
 }
 
+#[cfg(feature = "scientific")]
 pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     print_json(&execute_report(args, ExecutionBinding::Direct)?)
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn execute_report(
     args: ExecuteMissionArgs,
     binding: ExecutionBinding,
@@ -1766,6 +1865,7 @@ fn ensure_promotable_cex_costs(costs: &EvaluationCostsV1) -> anyhow::Result<()> 
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn finalize_cex_candidate(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -2036,6 +2136,7 @@ fn finalize_cex_candidate(
     Ok(report)
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn open_cex_holdout(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -2076,6 +2177,7 @@ pub(crate) fn open_cex_holdout(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 pub(crate) fn promote_sealed_candidate(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -2181,6 +2283,7 @@ pub(crate) fn promote_sealed_candidate(
 /// signed `--final-evaluation` worker; Direct execute and `--pre-holdout`
 /// Campaign rounds never call this.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 pub(crate) fn finalize_formula_search_round(
     round_results: &Path,
     finalization_dir: &Path,
@@ -2256,6 +2359,7 @@ pub(crate) fn finalize_formula_search_round(
 }
 
 #[cfg(test)]
+#[cfg(feature = "scientific")]
 pub(crate) fn finalize_existing_search_round(
     round_execute_dir: &Path,
     finalization_dir: &Path,
@@ -2302,6 +2406,7 @@ fn content_reference(
     })
 }
 
+#[cfg(feature = "scientific")]
 fn replay_trace_artifact_path(receipt_name: &str) -> String {
     let stem = Path::new(receipt_name)
         .file_stem()
@@ -2310,6 +2415,7 @@ fn replay_trace_artifact_path(receipt_name: &str) -> String {
     format!("{stem}-trace.ndjson")
 }
 
+#[cfg(feature = "scientific")]
 fn write_trace_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     hft_research_artifacts::ensure_output_path_is_not_symlink(path, "replay trace")?;
     let mut temporary =
@@ -2319,6 +2425,7 @@ fn write_trace_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     hft_research_artifacts::persist_output_file(temporary, path, "replay trace")
 }
 
+#[cfg(feature = "scientific")]
 fn registry_content_reference(
     id: &str,
     artifact: &impl Serialize,
@@ -2395,6 +2502,7 @@ pub(crate) fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materializa
     }
 }
 
+#[cfg(feature = "scientific")]
 fn persist_baseline_evidence(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -2470,6 +2578,7 @@ fn persist_baseline_evidence(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn run_cex_supervised_model_research(
     store: &mut AlphaStore,
     results_dir: &Path,
@@ -2626,7 +2735,7 @@ fn run_cex_supervised_model_research(
     Ok(Some(selected))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 fn select_supervised_model(
     ridge: CexSupervisedModelEvaluationV2,
     cart: CexSupervisedModelEvaluationV2,
@@ -2643,6 +2752,7 @@ fn select_supervised_model(
     selected
 }
 
+#[cfg(feature = "scientific")]
 fn supervised_model_ranks_ahead(
     left: &CexSupervisedModelEvaluationV2,
     right: &CexSupervisedModelEvaluationV2,
@@ -2671,6 +2781,7 @@ fn supervised_model_ranks_ahead(
     }
 }
 
+#[cfg(feature = "scientific")]
 fn supervised_model_kind_rank(kind: CexBaselineModelKindV1) -> u8 {
     match kind {
         CexBaselineModelKindV1::Ridge => 0,
@@ -2679,6 +2790,7 @@ fn supervised_model_kind_rank(kind: CexBaselineModelKindV1) -> u8 {
     }
 }
 
+#[cfg(feature = "scientific")]
 fn run_factor_bank_subset_search(
     results_dir: &Path,
     control_mission: &CexResearchMissionArtifactV1,
@@ -2782,6 +2894,7 @@ fn holding_opening_signals(
     Ok(Some(signals))
 }
 
+#[cfg(feature = "scientific")]
 struct CexReplayCandidateInput {
     openings: Option<std::collections::BTreeMap<i64, f64>>,
     holding: Option<hft_research_manifest::model::HorizonHoldingPolicyV1>,
@@ -2800,6 +2913,7 @@ struct CexReplayCandidateInput {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn run_cex_event_replay(
     results_dir: &Path,
     mission_id: &str,
@@ -2857,6 +2971,7 @@ fn run_cex_event_replay(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn run_cex_supervised_event_replay(
     results_dir: &Path,
     mission_id: &str,
@@ -2921,6 +3036,7 @@ fn run_cex_supervised_event_replay(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 pub(crate) fn run_frozen_model_event_replay(
     results_dir: &Path,
     mission: &CexResearchMissionArtifactV1,
@@ -3018,6 +3134,7 @@ pub(crate) fn calendar_replay_required(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn run_calendar_validation_replay(
     results: &Path,
     mission: &CexResearchMissionArtifactV1,
@@ -3177,6 +3294,7 @@ fn validate_calendar_replay_decisions(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn frozen_selection_replay_clocks(
     all: &[data_mission::FeatureDecisionClock],
     selection: std::ops::Range<usize>,
@@ -3218,6 +3336,7 @@ fn frozen_selection_replay_clocks(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "scientific")]
 fn run_cex_target_position_replay(
     results_dir: &Path,
     receipt_name: &str,
@@ -3498,6 +3617,7 @@ fn run_cex_target_position_replay(
     Ok(receipt)
 }
 
+#[cfg(feature = "scientific")]
 fn validate_market_compatible_target_positions(
     market: &str,
     positions: Vec<f64>,
@@ -3565,6 +3685,7 @@ fn canonical_target_position_decisions(
     Ok((decisions, ordinary_decisions))
 }
 
+#[cfg(feature = "scientific")]
 fn validate_replay_materialization_binding(
     replay: &CanonicalReplayEvidence,
     mission: &CexResearchMissionArtifactV1,
@@ -3594,6 +3715,7 @@ fn validate_replay_materialization_binding(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn same_replay_segment(
     replay: &CanonicalSourceSegmentEvidence,
     materialized: &SourceSegment,
@@ -3607,6 +3729,7 @@ fn same_replay_segment(
         && replay.events == materialized.events
 }
 
+#[cfg(feature = "scientific")]
 fn build_factor_bank(
     control_mission: &CexResearchMissionArtifactV1,
     gp_policy: &CexGpPolicyV1,
@@ -3730,6 +3853,7 @@ fn build_factor_bank(
     )?)
 }
 
+#[cfg(feature = "scientific")]
 fn validate_args(args: &ExecuteMissionArgs, binding: &ExecutionBinding) -> anyhow::Result<()> {
     if args.work_dir.as_os_str().is_empty()
         || [
@@ -3762,6 +3886,7 @@ fn validate_args(args: &ExecuteMissionArgs, binding: &ExecutionBinding) -> anyho
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn validate_holdout_claim_binding(
     args: &ExecuteMissionArgs,
     holdout_id: &str,
@@ -3815,6 +3940,7 @@ fn validate_holdout_claim_binding(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn expected_local_holdout_claim_object(
     result_object: &str,
     mission_id: &str,
@@ -3841,6 +3967,7 @@ fn expected_local_holdout_claim_object(
     }
 }
 
+#[cfg(feature = "scientific")]
 fn normalized_local_object(value: &str) -> anyhow::Result<String> {
     let path = Path::new(value.strip_prefix("file://").unwrap_or(value));
     if path.as_os_str().is_empty()
@@ -3859,6 +3986,7 @@ fn normalized_local_object(value: &str) -> anyhow::Result<String> {
     ))
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn ensure_holdout_claim_absent(client: &Client, source: &str) -> anyhow::Result<()> {
     let exists = if source.starts_with("http://") || source.starts_with("https://") {
         let response = client
@@ -3884,6 +4012,7 @@ pub(crate) fn ensure_holdout_claim_absent(client: &Client, source: &str) -> anyh
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn resume_source(args: &ExecuteMissionArgs) -> anyhow::Result<Option<(&str, &str)>> {
     let url = args
         .resume_url
@@ -3903,6 +4032,7 @@ fn resume_source(args: &ExecuteMissionArgs) -> anyhow::Result<Option<(&str, &str
     }
 }
 
+#[cfg(feature = "scientific")]
 fn validate_result_readback_binding(
     result_put_url: &str,
     result_readback_url: &str,
@@ -3938,6 +4068,7 @@ fn validate_result_readback_binding(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn validate_mission_materialization_binding(
     mission: &CexResearchMissionArtifactV1,
     materialization: &Materialization,
@@ -3974,6 +4105,7 @@ pub(crate) fn validate_mission_materialization_binding(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn validate_mission_dataset_binding(
     mission: &CexResearchMissionArtifactV1,
     features: &hft_collector::FeatureDatasetManifest,
@@ -4079,6 +4211,7 @@ pub(crate) fn validate_materialization(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn validate_cex_mission_id(value: &str) -> anyhow::Result<()> {
     let suffix = value
         .strip_prefix("cex-mission-")
@@ -5049,6 +5182,7 @@ fn replay_trace_relative_path(receipt: &CexEventReplayReceiptV1) -> anyhow::Resu
     Ok(relative)
 }
 
+#[cfg(feature = "scientific")]
 fn read_local_replay_trace(
     results_dir: &Path,
     receipt: &CexEventReplayReceiptV1,
@@ -5256,7 +5390,7 @@ fn validate_replay_trace_bytes(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 pub(crate) mod tests {
     use super::*;
     use crate::{

@@ -5,8 +5,9 @@ Rust CLI and libraries for the governed CEX Campaign and prediction research pla
 
 `alpha-engine` keeps immutable fitted-model evidence, protocol validation and
 deterministic ledger/replay verification available without default features.
-The `fitting` feature owns baseline fitting, independent refits, sequence
-training and market-encoder training. Only that feature depends on
+The `fitting` feature owns baseline production, neural refits, sequence
+training and market-encoder training. Pure Ridge/CART refits remain available
+for independent frozen-evidence verification. Only that feature depends on
 `hft-research-ml` and Burn. The existing scientific default enables `kernel`
 and `fitting`; control consumers must explicitly disable default features.
 
@@ -17,6 +18,18 @@ trial/resource budgets, final evaluation, holdout isolation or settlement.
 Its `streaming` feature pins files, verifies each consumed pass, and preserves
 causal windows and label maturity. Operator and fitting code use these readers.
 The platform's default input contract does not enable columnar readers.
+
+`alpha-harness` is the operator. Its default graph excludes Burn, ML fitting
+and ONNX. It owns freeze, finalization, dispatch, stopping and independent
+settlement readback. The generated Job invokes `monday-cex-worker mission
+campaign-execute` with the existing admitted arguments. The worker owns the
+scientific feature and accepts only that execution command.
+
+Frozen sequence and market models export explicit f32 parameters. Their pure
+manifest evaluators preserve causal padding, scaling, fitted-value identities,
+parent inheritance and reconstruction receipts. Independent prediction and
+replay readback use these evaluators. Training optimizers and budgets stay in
+the scientific worker.
 
 ## Packages
 

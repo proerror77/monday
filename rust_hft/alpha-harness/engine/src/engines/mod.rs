@@ -6,10 +6,8 @@ mod offline_rl;
 
 use hft_search_kernel::DeterministicRng;
 
-#[cfg(feature = "fitting")]
 pub(crate) use bayesian::solve;
 pub use bayesian::BayesianOptimizerEngine;
-#[cfg(feature = "fitting")]
 pub use factor_bank_mcts::CexFactorBankMcts;
 pub use factor_bank_mcts::{
     CexCombinationResearchArtifactV1, CexFactorBankMctsCheckpointV1, CexFactorBankMctsResultV1,

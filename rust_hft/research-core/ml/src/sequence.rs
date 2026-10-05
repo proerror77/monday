@@ -71,9 +71,9 @@ mod tests {
 
     #[test]
     fn sequence_tcn_trains_reproducibly_and_roundtrips_raw_returns() {
-        use super::training::{
-            train_sequence_model, SequenceNeuralKindV1, SequenceTrainingRequestV1,
-            TrainedSequenceModel,
+        use super::training::{train_sequence_model, TrainedSequenceModel};
+        use hft_research_manifest::portable_sequence::{
+            SequenceNeuralKindV1, SequenceTrainingRequestV1,
         };
         let dir = tempfile::tempdir().unwrap();
         let rows = frames();
@@ -101,6 +101,17 @@ mod tests {
         assert_eq!(trained.diagnostics().completed_updates, 64);
         let sample = [10.0, 11.0, 12.0];
         let predicted = trained.predict(&sample).unwrap();
+        let portable = trained.portable().unwrap();
+        assert_eq!(
+            trained.parameter_digest().unwrap(),
+            portable.parameter_digest().unwrap()
+        );
+        for (original, pure) in predicted.iter().zip(portable.predict(&sample).unwrap()) {
+            assert!(
+                (original - pure).abs() < 1e-8,
+                "pure TCN differs from the trained Burn predictor"
+            );
+        }
         assert!(predicted.iter().all(|v| v.is_finite() && v.abs() < 0.01));
         let (manifest, weights) = trained.bundle().unwrap();
         let digest = format!("{:x}", Sha256::digest(&manifest));
@@ -139,9 +150,9 @@ mod tests {
 
     #[test]
     fn sequence_mlp_uses_the_same_bound_inputs_and_short_budget_covers_recent_rows() {
-        use super::training::{
-            train_sequence_model, SequenceNeuralKindV1, SequenceTrainingRequestV1,
-            TrainedSequenceModel,
+        use super::training::{train_sequence_model, TrainedSequenceModel};
+        use hft_research_manifest::portable_sequence::{
+            SequenceNeuralKindV1, SequenceTrainingRequestV1,
         };
         let dir = tempfile::tempdir().unwrap();
         let mut data = reader(dir.path(), &frames(), 60000);
@@ -162,6 +173,20 @@ mod tests {
         assert_eq!(model.diagnostics().examples_seen, 4);
         assert_eq!(model.diagnostics().last_training_decision_ms, 29000);
         let expected = model.predict(&[1.0, 2.0, 3.0]).unwrap();
+        let portable = model.portable().unwrap();
+        assert_eq!(
+            model.parameter_digest().unwrap(),
+            portable.parameter_digest().unwrap()
+        );
+        for (original, pure) in expected
+            .iter()
+            .zip(portable.predict(&[1.0, 2.0, 3.0]).unwrap())
+        {
+            assert!(
+                (original - pure).abs() < 1e-8,
+                "pure MLP differs from the trained Burn predictor"
+            );
+        }
         let (manifest, weights) = model.bundle().unwrap();
         let digest = format!("{:x}", Sha256::digest(&manifest));
         let restored = TrainedSequenceModel::restore_bundle(&manifest, &digest, weights).unwrap();

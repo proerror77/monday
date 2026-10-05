@@ -6,7 +6,7 @@ trap 'rm -rf "$work"' EXIT
 export MOCK_WORK=$work GITHUB_REPOSITORY=fixture/monday GITHUB_RUN_ATTEMPT=2 MONDAY_RELEASE_JOB_ID=567
 source_sha=1111111111111111111111111111111111111111
 mkdir -p "$work/release/research-bin" "$work/bin"
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer \
+for binary in hft-backtest alpha-harness monday-cex-worker lob-pit-materializer binance-market-tape-slicer \
   binance-replay-parquet-materializer clickhouse-analytics-materializer \
   monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot monday-prediction-worker; do
   printf 'fixture %s\n' "$binary" >"$work/release/research-bin/$binary"

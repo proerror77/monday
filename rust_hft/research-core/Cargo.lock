@@ -108,7 +108,6 @@ dependencies = [
  "hft-governance-contracts",
  "hft-research-artifacts",
  "hft-research-manifest",
- "hft-research-ml",
  "parquet",
  "reqwest",
  "serde",
@@ -3125,6 +3124,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "hft-cex-research-worker"
+version = "0.1.0"
+dependencies = [
+ "alpha-harness",
+ "anyhow",
+ "tokio",
 ]
 
 [[package]]

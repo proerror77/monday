@@ -13,60 +13,13 @@ use burn::{
 };
 use burn_ndarray::NdArrayDevice;
 use burn_store::{BurnpackStore, ModuleSnapshot};
-use hft_cex_research_input::sequence::{SequenceExample, SequenceReader, MAX_SEQUENCE_BATCH};
-use hft_research_manifest::sequence::{valid_sha256, SequenceInputSpecV1, SequenceViewV1};
-use serde::{Deserialize, Serialize};
+use hft_cex_research_input::sequence::{SequenceExample, SequenceReader};
+use hft_research_manifest::portable_network::FrozenNetworkV1;
+use hft_research_manifest::portable_sequence::{
+    FrozenSequenceModelV1, SequenceNeuralKindV1, SequenceScalingV1, SequenceTrainingDiagnosticsV1,
+    SequenceTrainingRequestV1,
+};
 use sha2::{Digest, Sha256};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SequenceNeuralKindV1 {
-    Mlp,
-    Tcn,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SequenceTrainingRequestV1 {
-    pub model_kind: SequenceNeuralKindV1,
-    pub dataset_sha256: String,
-    pub input: SequenceInputSpecV1,
-    pub view: SequenceViewV1,
-    /// Ordered indices for the same-information or price-only input ablation.
-    pub channels: Vec<usize>,
-    pub hidden_channels: usize,
-    pub batch_size: usize,
-    pub updates: usize,
-    pub learning_rate: f64,
-    pub seed: u64,
-    pub min_examples: u64,
-}
-
-impl SequenceTrainingRequestV1 {
-    pub fn validate(&self) -> Result<(), String> {
-        self.input.validate()?;
-        self.view.validate()?;
-        if !valid_sha256(&self.dataset_sha256)
-            || (self.model_kind == SequenceNeuralKindV1::Tcn && self.input.context_rows > 63)
-            || self.channels.is_empty()
-            || self
-                .channels
-                .iter()
-                .any(|i| *i >= self.input.ordered_channels.len())
-            || self.channels.windows(2).any(|p| p[0] >= p[1])
-            || !(2..=64).contains(&self.hidden_channels)
-            || !(1..=MAX_SEQUENCE_BATCH).contains(&self.batch_size)
-            || !(1..=16384).contains(&self.updates)
-            || self.min_examples < 2
-            || !self.learning_rate.is_finite()
-            || !(0.0..=0.01).contains(&self.learning_rate)
-            || self.learning_rate == 0.0
-        {
-            return Err("invalid bounded sequence training request".into());
-        }
-        Ok(())
-    }
-}
 
 #[derive(Module, Debug)]
 struct CausalTcn<B: Backend> {
@@ -148,16 +101,6 @@ impl<B: Backend> CausalTcn<B> {
                 .reshape([batch, channels]),
         )
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SequenceScalingV1 {
-    pub means: Vec<f64>,
-    pub scales: Vec<f64>,
-    pub target_means: [f64; 3],
-    pub target_scales: [f64; 3],
-    pub examples: u64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -322,19 +265,6 @@ fn control_gradients(
     Ok(norm)
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SequenceTrainingDiagnosticsV1 {
-    pub completed_updates: usize,
-    pub examples_seen: u64,
-    pub first_training_decision_ms: i64,
-    pub last_training_decision_ms: i64,
-    /// Pre-update batch loss; not a convergence certificate or validation metric.
-    pub batch_losses: Vec<f64>,
-    pub raw_gradient_l2: Vec<f64>,
-    pub stop_reason: String,
-}
-
 fn sample_batch(
     reader: &mut SequenceReader,
     seen: &mut u64,
@@ -368,16 +298,6 @@ fn sample_batch(
 
 pub struct TrainedSequenceModel {
     model: SequenceNetwork<CpuBackend>,
-    request: SequenceTrainingRequestV1,
-    scaling: SequenceScalingV1,
-    diagnostics: SequenceTrainingDiagnosticsV1,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SequenceBundleV1 {
-    schema_version: String,
-    weights_sha256: String,
     request: SequenceTrainingRequestV1,
     scaling: SequenceScalingV1,
     diagnostics: SequenceTrainingDiagnosticsV1,
@@ -624,112 +544,64 @@ impl TrainedSequenceModel {
         Ok(store.get_bytes().map_err(|e| e.to_string())?.to_vec())
     }
 
-    /// Returns (manifest bytes, Burnpack bytes). The manifest hash must be pinned
-    /// by the caller's Campaign result, rather than supplied by this same file.
-    pub fn bundle(&self) -> Result<(Vec<u8>, Vec<u8>), String> {
-        let weights = self.weights()?;
-        let manifest = SequenceBundleV1 {
-            schema_version: "monday.sequence_neural_bundle.v1".into(),
-            weights_sha256: format!("{:x}", Sha256::digest(&weights)),
-            request: self.request.clone(),
-            scaling: self.scaling.clone(),
-            diagnostics: self.diagnostics.clone(),
+    pub fn portable(&self) -> Result<FrozenSequenceModelV1, String> {
+        let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
+        let network = match &self.model {
+            SequenceNetwork::Mlp(model) => FrozenNetworkV1::Mlp {
+                hidden: crate::portable::linear(&model.hidden)?,
+                output: crate::portable::linear(&model.output)?,
+            },
+            SequenceNetwork::Tcn(model) => FrozenNetworkV1::Tcn {
+                convolutions: model
+                    .convolutions
+                    .iter()
+                    .map(crate::portable::convolution)
+                    .collect::<Result<_, _>>()?,
+                output: Some(crate::portable::linear(&model.output)?),
+            },
         };
-        Ok((
-            serde_json::to_vec(&manifest).map_err(|e| e.to_string())?,
-            weights,
-        ))
-    }
-
-    pub fn restore_bundle(
-        manifest: &[u8],
-        expected_manifest_sha256: &str,
-        weights: Vec<u8>,
-    ) -> Result<Self, String> {
-        if manifest.len() > 2 * 1024 * 1024
-            || !valid_sha256(expected_manifest_sha256)
-            || format!("{:x}", Sha256::digest(manifest)) != expected_manifest_sha256
-        {
-            return Err("sequence model manifest checksum mismatch".into());
-        }
-        let bundle: SequenceBundleV1 =
-            serde_json::from_slice(manifest).map_err(|e| e.to_string())?;
-        if bundle.schema_version != "monday.sequence_neural_bundle.v1" {
-            return Err("unsupported sequence model bundle".into());
-        }
-        Self::restore(
-            weights,
-            &bundle.weights_sha256,
-            bundle.request,
-            bundle.scaling,
-            bundle.diagnostics,
+        FrozenSequenceModelV1::new(
+            self.request.clone(),
+            self.scaling.clone(),
+            self.diagnostics.clone(),
+            network,
         )
     }
-
-    fn restore(
+    /// Frozen f32 parameters and receipt. Independent inference needs no Burnpack loader.
+    pub fn bundle(&self) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.portable()?.bundle()
+    }
+    pub fn restore_bundle(
+        manifest: &[u8],
+        expected: &str,
         weights: Vec<u8>,
-        expected_sha256: &str,
-        request: SequenceTrainingRequestV1,
-        scaling: SequenceScalingV1,
-        diagnostics: SequenceTrainingDiagnosticsV1,
     ) -> Result<Self, String> {
-        request.validate()?;
-        if weights.len() > 16 * 1024 * 1024
-            || !valid_sha256(expected_sha256)
-            || format!("{:x}", Sha256::digest(&weights)) != expected_sha256
-            || scaling.means.len() != request.channels.len()
-            || scaling.scales.len() != request.channels.len()
-            || scaling
-                .means
-                .iter()
-                .chain(&scaling.target_means)
-                .any(|v| !v.is_finite())
-            || scaling
-                .scales
-                .iter()
-                .chain(&scaling.target_scales)
-                .any(|v| !v.is_finite() || *v <= 0.0)
-            || scaling.examples < request.min_examples
-            || diagnostics.completed_updates != request.updates
-            || diagnostics.batch_losses.len() != request.updates
-            || diagnostics.raw_gradient_l2.len() != request.updates
-            || diagnostics.examples_seen < request.updates as u64
-            || diagnostics.examples_seen > (request.updates * request.batch_size) as u64
-            || diagnostics.first_training_decision_ms < request.view.decision_start_ms
-            || diagnostics.last_training_decision_ms < diagnostics.first_training_decision_ms
-            || diagnostics.last_training_decision_ms >= request.view.end_ms
-            || diagnostics
-                .batch_losses
-                .iter()
-                .any(|v| !v.is_finite() || *v < 0.0 || *v > 1_000_000.0)
-            || diagnostics
-                .raw_gradient_l2
-                .iter()
-                .any(|v| !v.is_finite() || *v < 0.0 || *v > 100.0)
-            || diagnostics.stop_reason != "fixed_update_budget_completed"
-        {
-            return Err("sequence weights, normalization or training receipt is invalid".into());
-        }
+        let frozen = FrozenSequenceModelV1::restore_bundle(manifest, expected, weights)?;
         let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
-        let mut model = SequenceNetwork::<CpuBackend>::new(&request, &NdArrayDevice::Cpu);
-        let mut store =
-            BurnpackStore::from_bytes(Some(burn::tensor::Bytes::from_bytes_vec(weights)));
-        let applied = model.load_from(&mut store).map_err(|e| e.to_string())?;
-        if !applied.is_success()
-            || !applied.missing.is_empty()
-            || !applied.unused.is_empty()
-            || applied.applied.is_empty()
-        {
-            return Err("sequence weight load is incomplete".into());
-        }
-        let result = Self {
-            model,
-            request,
-            scaling,
-            diagnostics,
+        let model = match frozen.network() {
+            FrozenNetworkV1::Mlp { hidden, output } => SequenceNetwork::Mlp(FlattenedMlp {
+                hidden: crate::portable::restore_linear(hidden),
+                output: crate::portable::restore_linear(output),
+            }),
+            FrozenNetworkV1::Tcn {
+                convolutions,
+                output,
+            } => SequenceNetwork::Tcn(CausalTcn {
+                convolutions: convolutions
+                    .iter()
+                    .map(crate::portable::restore_convolution)
+                    .collect(),
+                output: crate::portable::restore_linear(
+                    output.as_ref().ok_or("sequence head missing")?,
+                ),
+            }),
         };
-        result.verify_parameters()?;
-        Ok(result)
+        Ok(Self {
+            model,
+            request: frozen.request().clone(),
+            scaling: frozen.scaling().clone(),
+            diagnostics: frozen.diagnostics().clone(),
+        })
     }
 }
 

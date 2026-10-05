@@ -1308,6 +1308,7 @@ pub(crate) fn result_object_binds_attempt(object: &str, attempt_id: &str) -> any
     }))
 }
 
+#[cfg(any(feature = "scientific", test))]
 pub(crate) fn cex_result_attempt_and_holdout_claim(
     result_object: &str,
     mission_id: &str,
@@ -1352,6 +1353,7 @@ pub(crate) fn cex_campaign_round_root(
     Ok(root.trim_end_matches('/').to_string())
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn cex_campaign_round_result_and_holdout_claim(
     result_object: &str,
     campaign_id: &str,

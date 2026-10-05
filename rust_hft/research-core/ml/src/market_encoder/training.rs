@@ -14,6 +14,9 @@ use hft_cex_research_input::market_encoder::{
     fit_market_scaling, MarketFeatureReader, MarketTaskReader, Moments, UnlabeledSequenceExample,
 };
 use hft_research_manifest::market_encoder::*;
+use hft_research_manifest::portable_market::{
+    ENCODER_PORTABLE_SCHEMA as ENCODER_SCHEMA, TASK_PORTABLE_SCHEMA as TASK_SCHEMA,
+};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
@@ -180,9 +183,10 @@ pub fn pretrain_market_encoder(
     let encoder = trained.encoder;
     diag.final_encoder_values_sha256 = values_digest(&encoder)?;
     diag.validate(&request)?;
-    let weights = save(&encoder)?;
+    let weights = serde_json::to_vec(&encoder.portable()?).map_err(|e| e.to_string())?;
     let head = trained.head;
-    let head_weights = save(&head)?;
+    let head_weights =
+        serde_json::to_vec(&crate::portable::linear(&head)?).map_err(|e| e.to_string())?;
     let head_values = values_digest(&head)?;
     let mut checkpoint = MarketEncoderCheckpoint {
         model: encoder,
@@ -437,7 +441,9 @@ pub fn adapt_market_encoder(
     CpuAutodiffBackend::seed(&device, request.fit.seed);
     let mut encoder = Encoder::<CpuAutodiffBackend>::new(&request.fit.spec, &device);
     if let Some(p) = parent {
-        load(&mut encoder, p.weights.clone())?;
+        encoder = Encoder::from_portable(
+            &serde_json::from_slice(&p.weights).map_err(|e| e.to_string())?,
+        )?;
     }
     let initial = values_digest(&encoder.valid())?;
     if parent.is_some_and(|p| p.diagnostics().final_encoder_values_sha256 != initial) {
@@ -506,7 +512,7 @@ pub fn adapt_market_encoder(
     }
     diag.validate(&request.fit)?;
     let parameter_values_sha256 = values_digest(&model)?;
-    let weights = save(&model)?;
+    let weights = serde_json::to_vec(&model.portable()?).map_err(|e| e.to_string())?;
     Ok(MarketTaskModel {
         model,
         weights: weights.clone(),

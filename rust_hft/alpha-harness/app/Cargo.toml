@@ -5,12 +5,17 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = []
+scientific = ["alpha-engine/fitting"]
+onnx-compatibility = ["dep:alpha-onnx-evaluator"]
+
 [dependencies]
 hft-cex-research-input = { path = "../../research-core/cex-input", features = ["streaming"] }
 hft-research-artifacts = { path = "../../research-core/artifacts" }
 alpha-domain = { path = "../domain" }
-alpha-engine = { path = "../engine" }
-alpha-onnx-evaluator = { path = "../onnx-evaluator" }
+alpha-engine = { path = "../engine", default-features = false, features = ["kernel"] }
+alpha-onnx-evaluator = { path = "../onnx-evaluator", optional = true }
 alpha-store = { path = "../store" }
 anyhow = "1"
 chrono = { workspace = true, features = ["serde"] }
@@ -22,7 +27,6 @@ hft-collector = { path = "../../tools/collector", features = ["collector-binance
 hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 hft-backtest = { path = "../../apps/backtest" }
 hft-research-manifest = { path = "../../research-core/manifest" }
-hft-research-ml = { path = "../../research-core/ml" }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

@@ -370,6 +370,18 @@ fn market_encoder_two_stage_inheritance_freeze_learning_and_roundtrip() {
         parent.encode(&sample).unwrap(),
         restored.encode(&sample).unwrap()
     );
+    let portable = parent.portable().unwrap();
+    for (scientific, pure) in parent
+        .encode(&sample)
+        .unwrap()
+        .iter()
+        .zip(portable.encode(&sample).unwrap())
+    {
+        assert!(
+            (scientific - pure).abs() <= 64.0 * f32::EPSILON * (1.0 + scientific.abs()),
+            "pure market encoder differs from Burn"
+        );
+    }
     let mut damaged = weights;
     damaged[0] ^= 1;
     assert!(
@@ -426,6 +438,16 @@ fn market_encoder_two_stage_inheritance_freeze_learning_and_roundtrip() {
             .remove(0)
             .inputs;
         let prediction = trained.predict(&input).unwrap();
+        let portable = trained.portable(p).unwrap();
+        assert_eq!(trained.parameter_digest(), portable.parameter_digest());
+        let (mean, scale) = trained.target_scaling();
+        let tolerance =
+            64.0 * f64::from(f32::EPSILON) * (scale + (f64::from(prediction) - mean).abs());
+        assert!(
+            (f64::from(prediction) - f64::from(portable.predict(&input).unwrap())).abs()
+                <= tolerance,
+            "pure market task differs from Burn"
+        );
         let (meta, weights) = trained.bundle().unwrap();
         let model =
             MarketTaskModel::restore(&meta, &bytes_digest(&meta), weights.clone(), p).unwrap();
@@ -609,7 +631,7 @@ fn market_encoder_rejects_fine_tuning_that_only_updates_the_head() {
         let model =
             network::Encoder::<CpuBackend>::new(&fit.spec, &burn_ndarray::NdArrayDevice::Cpu)
                 .map(&mut Zero);
-        let weights = network::save(&model).unwrap();
+        let weights = serde_json::to_vec(&model.portable().unwrap()).unwrap();
         let hash = network::values_digest(&model).unwrap();
         MarketEncoderCheckpoint {
             model,
