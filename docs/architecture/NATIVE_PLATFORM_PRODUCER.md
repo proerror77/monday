@@ -46,3 +46,26 @@ That complete terminal bridge and signed data-bound export are not claimed by th
 Tests use synthetic native grants, published receipt peers and local source ledgers.
 They verify debit retention, ownership, expiration, revocation and callback ordering.
 They do not prove cloud execution, real native budget issuance or scientific completion.
+
+## Functional ownership and completion review
+
+This review separates source authority, executable publication and actual scientific consumption.
+The source anchor for the preparation interfaces is `267f5c02e`.
+CEX's `d36e05286` checkpoint provides the verified-data inspector; its complete worker wiring is pending.
+Root owns the new CexCampaign/PG input-kind contract and independent revocation receiver.
+
+| Subfunction | Caller and authority owner | Actual consumer | Verified boundary | Remaining gap |
+| --- | --- | --- | --- | --- |
+| Publication | Native software issuer and release verifier; software keys and registry policy own release authority | Verified Build registration; reconciler executable readback; released worker executable | Separate source/build/image/executable identity and signed release checks | Actual publication/registry readback must be recorded per immutable release; it proves no budget or scientific result |
+| Admission | Controlled native importer; original native Root, approval, family and Study remain scientific authority | PG submit, launch, preparation permit, upload permit and terminal commit | Signature/tenant/request/operation/expiry bindings; unsigned and reused-operation rejection | Complete source producer and data-bound import are still being connected |
+| Native budget | Canonical finalized dispatch inspection; native source ledger owns cumulative debit and ownership | prepare-platform; guarded opaque budget/export callbacks | Published authentic receipts, full charge retention, original deadlines, exact transfer and revocation ordering | Exact signed Run/Task/data export and controlled PG import remain pending |
+| Revocation | Native Root/Study revocation receipts; host witness projects only an existing transfer | Source export guards; future effective-time PG launch/prepare/upload/terminal guards | Published reason objects and scheduled times; separate Root/Study causes preserve earlier constraints | Domain-separated receiver and source-to-PG sync need integration; request revocation is not arbitrary approval issuance |
+| Data | Trusted freeze/export reads actual observations and canonical replay; immutable native input receipts own lineage | Shared actual decoder and finalized-request inspector; canonical CEX worker | Exact Features/FutureMarks ResearchRow reconstruction, Replay hash and withheld-role boundaries | Complete freeze/finalize/execute and platform AttemptContext/artifact output wiring require final acceptance |
+| Run | Producer constructs exact Run/Task from source budget, verified Build and verified development collection | PG Run registration and distinct CexCampaign launch path | Source reservation is authentic; software/data opaque objects remain separate | New kind/input registry must reject generic Train/Backtest relabeling and receive the exact data-bound source export |
+| Session | Host-owned native app-server and operator stdin; private native state and broker scopes own access | Research namespace API; PG completion delivery ledger | Existing source transport tests plus separate paused-platform/checkpoint PR evidence | Real native/provider, PVC restore and notification delivery are deployment/readback claims; synthetic peers do not prove them |
+| Results | Trusted controller reads immutable objects and provider state; worker output is evidence, not authority | Artifact gateway readback and PG result/outbox publication | Existing generic result hash/receipt checks; source budget never refunds unknown output | CexCampaign summary must bind native request, collection, model/replay/evaluation receipts and stopped execution |
+| Settlement | Independent native host consumes task, Job, Pod, receipt and stop readback | Native cumulative family/Study settlement under source guards | PlatformTransferred excludes the old claim and legacy settlement paths; unknown consumption retains charge | Dedicated platform-to-native terminal bridge is not implemented by prepare-platform or a worker hash |
+
+Research subfunctions cannot acquire trading authority from a Run, Build, Session or budget witness.
+CEX and Prediction remain market-family research modules behind the shared runtime/risk/execution seams.
+This producer imports no execution adapter and exposes no order, risk-limit or runtime-resume operation.
