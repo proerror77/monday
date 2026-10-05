@@ -1,7 +1,7 @@
 //! Signed runtime admission contracts shared by governance producers and hft-live.
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -276,7 +276,7 @@ pub fn verify_envelope(
         .map_err(|_| GovernanceError::InvalidSignatureEncoding)?;
     let signature = Signature::from_slice(&signature_bytes)
         .map_err(|_| GovernanceError::InvalidSignatureEncoding)?;
-    key.verify(signed.envelope.payload_hash.as_bytes(), &signature)
+    key.verify_strict(signed.envelope.payload_hash.as_bytes(), &signature)
         .map_err(|_| GovernanceError::InvalidSignature)?;
     if now < signed.envelope.valid_from {
         return Err(GovernanceError::NotYetValid);
@@ -509,3 +509,5 @@ fn validate_runtime_policy(policy: &RuntimeEnvelopePolicy) -> Result<(), Governa
     }
     Ok(())
 }
+pub mod attribution;
+pub mod runtime_bundle;
