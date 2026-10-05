@@ -7,7 +7,7 @@ use crate::{
     valid_digest,
 };
 use anyhow::{ensure, Context, Result};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -225,7 +225,7 @@ impl NativeAdmissionTrust {
             "native evidence changed"
         );
         let signature = Signature::from_slice(&decode(&signed.signature_hex)?)?;
-        VerifyingKey::from_bytes(&bytes)?.verify(
+        VerifyingKey::from_bytes(&bytes)?.verify_strict(
             format!("{DOMAIN}:{}", signed.evidence_sha256).as_bytes(),
             &signature,
         )?;
@@ -418,5 +418,22 @@ mod tests {
         evidence.reserved_job_seconds = 20;
         evidence.admission.max_attempts = 3;
         assert!(evidence.validate().is_err());
+    }
+
+    #[test]
+    fn weak_public_key_cannot_forge_a_native_reservation_without_a_signer() {
+        let evidence = fixture();
+        let identity = format!("01{}", "00".repeat(31));
+        let signed = SignedNativeAdmission {
+            evidence_sha256: evidence.id().unwrap(),
+            evidence,
+            key_id: "weak".into(),
+            signature_hex: format!("{identity}{}", "00".repeat(32)),
+        };
+        let trust = NativeAdmissionTrust {
+            schema: "monday.native_reservation_trust.v1".into(),
+            native_reservation_keys: BTreeMap::from([("weak".into(), identity)]),
+        };
+        assert!(trust.verify(&signed).is_err());
     }
 }
