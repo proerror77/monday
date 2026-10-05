@@ -345,7 +345,6 @@ impl Admission {
             &verified,
             &self.reservation,
             transfer,
-            Utc::now(),
         )?;
         Ok(())
     }

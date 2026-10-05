@@ -247,9 +247,16 @@ fn lock_budget(
         .get(verified.content_sha256())
         .ok_or_else(|| err("missing native budget root"))?;
     serialize_approval_mutation(tx, &root.approval.approval_id)?;
-    // Sample after acquiring the approval guard, matching native dispatch.
+    study::lock_campaign_guards(
+        tx,
+        key,
+        verified,
+        &reservation.family_id,
+        verified.grant().valid_from,
+        false,
+    )?;
+    // Current-time reservation checks follow approval, Study and family guards.
     let at = now();
-    study::lock_campaign_guards(tx, key, verified, &reservation.family_id, at, true)?;
     let observed = dispatch::checked_reservation(
         tx,
         key,
