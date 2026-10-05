@@ -134,7 +134,7 @@ pub fn run(args: CampaignWorkflowArgs) -> anyhow::Result<()> {
     {
         bail!("invalid workflow schema or bounded member count");
     }
-    crate::prediction_dispatch::validate_cluster_target(&plan.context, &plan.namespace)?;
+    hft_research_dispatch_io::validate_cluster_target(&plan.context, &plan.namespace)?;
     for member in &plan.members {
         validate_dns_label("workflow member", &member.id)?;
         if !ids.insert(&member.id) {
