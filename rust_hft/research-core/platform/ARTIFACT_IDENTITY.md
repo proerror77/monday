@@ -41,3 +41,9 @@ Explicit cleanup removes only the exact owned capability and verified files.
 Foreign entries or changed ownership cause an error. Failed issuance removes its
 owned local state when the projection can be safely read and reconciled.
 A damaged projection remains closed and requires repair before recovery.
+
+Tests use synthetic grants and a named disposable loopback PG database. They
+verify current imported signatures, lease/fence/state, future native expiry,
+namespace, same-transaction locking, recovery and owned cleanup. File fixtures
+verify concurrency, permissions and rollback after a bounded projection fails.
+These checks prove neither a live source ledger nor an actual Kubernetes Secret.
