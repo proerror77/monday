@@ -12,6 +12,7 @@ pub(crate) use classic::fit_ridge;
 #[cfg(all(test, feature = "fitting"))]
 pub(crate) use classic::predict_ridge;
 pub use classic::verify_cex_classic_baseline_artifact;
+#[cfg(feature = "fitting")]
 pub(crate) use classic::{evaluate_factor_features_from_entries, validate_cex_context_bindings};
 #[cfg(feature = "fitting")]
 mod fitting;
