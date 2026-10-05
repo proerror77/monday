@@ -1315,12 +1315,16 @@ digest-pinned image/evaluator, `standard-v1`, URL+SHA pairs, attempt-bound resul
 catalog partition identity, and an optional complete resume pair. Snapshot
 admission supplies the exact cohort, partition view, policy, snapshot, task, and
 image identities injected into the Job. Render and review offline with
-`alpha-harness prediction dispatch render --submission FILE --namespace NS`.
-Submit with `alpha-harness prediction dispatch submit --submission FILE --context
+`monday-prediction-operator dispatch render --submission FILE --namespace NS`.
+Submit with `monday-prediction-operator dispatch submit --submission FILE --context
 CONTEXT --namespace NS`. The query-free result URL is the duplicate guard; each
 Job has isolated storage. Treat rendered Secret `stringData` as sensitive.
 
-Read Job and Pod milestones without mutation using `alpha-harness prediction
+Run the operator on the existing operator host with its configured cluster client.
+The Prediction operator is built independently of the CEX harness; worker Jobs
+do not receive that host's cluster credentials.
+
+Read Job and Pod milestones without mutation using `monday-prediction-operator
 dispatch status --context CONTEXT --namespace NS --job-name JOB`. Snapshot-ready
 and evaluator-started remain `null` unless `--evidence execution-evidence.json`
 is supplied. Evidence is accepted only when its mission ID, mission SHA, and

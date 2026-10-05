@@ -1,8 +1,10 @@
+use crate::mission_objects::{cex_campaign_round_root, cex_global_holdout_claim_object};
 #[cfg(feature = "scientific")]
 use crate::mission_runner::execute_report;
 #[cfg(feature = "scientific")]
 use hft_research_artifacts::publish_immutable_file;
 use hft_research_artifacts::{fetch_to_file, normalized_sha256};
+use hft_research_dispatch_io::{canonical_tokyo_oss_internal_object, validate_dns_label};
 pub(crate) mod final_evaluation;
 pub(crate) mod market_encoder;
 pub(crate) mod preparation;
@@ -45,10 +47,6 @@ use crate::mission_runner::CexSupervisedModelSelectionV1;
 use crate::mission_runner::ExecutionBinding;
 use crate::mission_runner::CEX_SUPERVISED_MODEL_NAMES;
 use crate::mission_runner::MAX_RESULT_BUNDLE_BYTES;
-use crate::prediction_dispatch::canonical_tokyo_oss_internal_object;
-use crate::prediction_dispatch::cex_campaign_round_root;
-use crate::prediction_dispatch::cex_global_holdout_claim_object;
-use crate::prediction_dispatch::validate_dns_label;
 use alpha_domain::{
     campaign_horizon::{
         CampaignLabelHorizonV1, CampaignNextFamilyInputWindowV1, CampaignNextFamilyParentV1,
@@ -2061,7 +2059,7 @@ fn canonical_https_object_prefix(label: &str, value: &str) -> anyhow::Result<Str
         .context("campaign inputs output root host is missing")?;
     if !host.ends_with(&format!(
         ".{}",
-        crate::prediction_dispatch::TOKYO_OSS_INTERNAL_ENDPOINT
+        hft_research_dispatch_io::TOKYO_OSS_INTERNAL_ENDPOINT
     )) {
         bail!("{label} must target the Tokyo OSS internal endpoint");
     }
@@ -2672,7 +2670,7 @@ fn campaign_round_claim_urls(
             request.holdout_claim_readback_url.clone(),
         ))
     } else {
-        let claim = crate::prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+        let claim = crate::mission_objects::cex_campaign_round_result_and_holdout_claim(
             &round.result_put_url,
             &request.campaign_id,
             &round.round_id,
@@ -6246,7 +6244,7 @@ mod tests {
         .unwrap();
         request.holdout_claim_put_url = format!(
             "{campaign_root}/holdout-id-sha256={}/sealed-holdout-claim.json",
-            crate::prediction_dispatch::sha256_text(&request.holdout_id)
+            hft_research_dispatch_io::sha256_text(&request.holdout_id)
         );
         request.holdout_claim_readback_url = request.holdout_claim_put_url.clone();
 

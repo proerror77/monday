@@ -1,3 +1,7 @@
+use hft_research_dispatch_io::{
+    ensure_kubectl_success, kubectl_binary, kubectl_json, kubectl_with_input,
+    validate_cluster_target, validate_dns_label,
+};
 mod admission;
 pub(crate) mod controller;
 pub(crate) mod final_admission;
@@ -10,10 +14,6 @@ mod terminal;
 use crate::{
     cli::{print_json, MissionDispatchInspectArgs, MissionDispatchSubmitArgs},
     mission_campaign::{serialize_request, validate_request, CampaignRequest},
-    prediction_dispatch::{
-        ensure_kubectl_success, kubectl_binary, kubectl_json, kubectl_with_input,
-        validate_cluster_target, validate_dns_label,
-    },
 };
 use alpha_domain::{
     campaign_control::{verify_campaign_root_grant, SignedCampaignRootGrantV1},
