@@ -24,9 +24,9 @@ sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false,
 
 [features]
 default = []
+native-admission = ["dep:ed25519-dalek"]
 release-verification = ["dep:ed25519-dalek"]
 control = ["dep:tokio", "dep:reqwest", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "native-admission", "release-verification", "dep:rustix"]
-native-admission = ["dep:ed25519-dalek"]
 publisher = ["control", "dep:rustix", "dep:tokio-util", "dep:tempfile", "tokio/fs", "reqwest/stream"]
 gateway = ["control", "dep:rustix", "dep:tokio-util", "dep:futures-util", "tokio/fs", "reqwest/stream"]
 
