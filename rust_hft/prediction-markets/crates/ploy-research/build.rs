@@ -67,7 +67,7 @@ const POLICY_INPUTS: [(&str, &str); 18] = [
         "../research-core/search-kernel/Cargo.toml",
     ),
 ];
-const FORBIDDEN_RUNTIME_PACKAGES: [&str; 7] = [
+const FORBIDDEN_RUNTIME_PACKAGES: [&str; 8] = [
     "ploy-operator-contracts",
     "ploy-strategy-bundles",
     "ploy-platform-runtime",
@@ -75,6 +75,7 @@ const FORBIDDEN_RUNTIME_PACKAGES: [&str; 7] = [
     "hft-engine",
     "hft-execution",
     "hft-execution-adapter-polymarket",
+    "hft-research-dispatch-io",
 ];
 const EXCLUDED_HOST_OR_PROC_MACRO_PACKAGES: [&str; 3] =
     ["core-foundation-sys", "security-framework", "sqlx-macros"];

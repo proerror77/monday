@@ -1,0 +1,19 @@
+[package]
+name = "hft-prediction-research-operator"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+hft-research-artifacts = { path = "../../../research-core/artifacts" }
+hft-research-dispatch-io = { path = "../../../research-core/dispatch-io" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+
+[[bin]]
+name = "monday-prediction-operator"
+path = "src/main.rs"

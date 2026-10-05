@@ -4,14 +4,12 @@
 use super::{
     admission, load_submission, render_manifest, validate_submission, ValidatedSubmission,
 };
-use crate::{
-    cli::{print_json, CampaignControllerHandoffArgs, CampaignControllerPrepareArgs},
-    prediction_dispatch::{validate_cluster_target, validate_dns_label},
-};
+use crate::cli::{print_json, CampaignControllerHandoffArgs, CampaignControllerPrepareArgs};
 use alpha_domain::campaign_control::SignedCampaignRootGrantV1;
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use hft_research_artifacts::temporary_output_file;
+use hft_research_dispatch_io::{validate_cluster_target, validate_dns_label};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{

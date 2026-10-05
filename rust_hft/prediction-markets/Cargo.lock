@@ -4455,6 +4455,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-prediction-research-operator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hft-research-artifacts",
+ "hft-research-dispatch-io",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "hft-prediction-research-worker"
 version = "0.1.0"
 dependencies = [
@@ -4483,6 +4497,16 @@ dependencies = [
  "sha2",
  "tempfile",
  "zip 6.0.0",
+]
+
+[[package]]
+name = "hft-research-dispatch-io"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest 0.12.28",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
