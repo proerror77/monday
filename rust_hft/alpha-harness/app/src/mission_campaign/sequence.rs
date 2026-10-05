@@ -111,11 +111,13 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+#[cfg(any(feature = "scientific", test))]
 pub(crate) fn is_sequence_request(path: &Path) -> anyhow::Result<bool> {
     let value: serde_json::Value = read_json(path)?;
     Ok(value["schema_version"] == REQUEST_SCHEMA)
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     worker::execute(args)
 }
@@ -200,7 +202,7 @@ pub(crate) fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
     ] {
         let dataset = inputs.verify_view(&args.input_root, location, view)?;
         let manifest_path = location.manifest.path(&args.input_root)?;
-        let mut reader = hft_research_ml::sequence::SequenceReader::open(
+        let mut reader = hft_cex_research_input::sequence::SequenceReader::open(
             manifest_path
                 .parent()
                 .context("sequence manifest has no directory")?,

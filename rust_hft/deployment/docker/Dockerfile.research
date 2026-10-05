@@ -26,6 +26,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --locked \
     -p hft-backtest \
     -p alpha-harness \
+    && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo --config 'build.rustc-wrapper=""' build \
+    --manifest-path research-core/Cargo.toml \
+    --release \
+    --locked \
+    -p hft-cex-research-worker \
+    --bin monday-cex-worker \
     && cargo --config 'build.rustc-wrapper=""' build \
     --manifest-path data-pipelines/Cargo.toml \
     --release \
@@ -37,6 +43,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --bin clickhouse-analytics-materializer \
     && install -D -m 0755 /work/target/release/hft-backtest /out/bin/hft-backtest \
     && install -D -m 0755 /work/target/release/alpha-harness /out/bin/alpha-harness \
+    && install -D -m 0755 /work/target/release/monday-cex-worker /out/bin/monday-cex-worker \
     && install -D -m 0755 /work/target/release/lob-pit-materializer /out/bin/lob-pit-materializer \
     && install -D -m 0755 /work/target/release/binance-market-tape-slicer /out/bin/binance-market-tape-slicer \
     && install -D -m 0755 /work/target/release/binance-replay-parquet-materializer /out/bin/binance-replay-parquet-materializer \
@@ -65,6 +72,7 @@ FROM runtime-base AS prebuilt
 
 COPY --chmod=0755 research-bin/hft-backtest /usr/local/bin/hft-backtest
 COPY --chmod=0755 research-bin/alpha-harness /usr/local/bin/alpha-harness
+COPY --chmod=0755 research-bin/monday-cex-worker /usr/local/bin/monday-cex-worker
 COPY --chmod=0755 research-bin/lob-pit-materializer /usr/local/bin/lob-pit-materializer
 COPY --chmod=0755 research-bin/binance-market-tape-slicer /usr/local/bin/binance-market-tape-slicer
 COPY --chmod=0755 research-bin/binance-replay-parquet-materializer /usr/local/bin/binance-replay-parquet-materializer

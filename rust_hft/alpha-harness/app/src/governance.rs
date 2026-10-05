@@ -1,29 +1,48 @@
-use crate::{
-    cli::{
-        print_json, CandidateShowArgs, EnvelopeArgs, EvaluateArgs, FeedbackLogArgs,
-        FeedbackRecordArgs, JsonRecordArgs, MissionStatusArgs, PromoteArgs, RegisterOnnxArgs,
-        RevokeApprovalArgs, SignDeploymentArgs,
-    },
-    data_mission,
+use crate::cli::print_json;
+use crate::cli::CandidateShowArgs;
+use crate::cli::EnvelopeArgs;
+use crate::cli::EvaluateArgs;
+use crate::cli::FeedbackLogArgs;
+use crate::cli::FeedbackRecordArgs;
+use crate::cli::JsonRecordArgs;
+use crate::cli::MissionStatusArgs;
+use crate::cli::PromoteArgs;
+#[cfg(feature = "onnx-compatibility")]
+use crate::cli::RegisterOnnxArgs;
+use crate::cli::RevokeApprovalArgs;
+use crate::cli::SignDeploymentArgs;
+use crate::data_mission;
+use ::governance::attribution::{
+    verify_runtime_attribution_event, SignedRuntimeAttributionEvent,
+    VerifiedRuntimeAttributionEvent,
 };
-use alpha_domain::{
-    canonical_json_hash, verify_runtime_attribution_event, CandidateArtifact, EngineKind,
-    IterationVerdict, MissionStatus, MissionTerminalReason, OnnxModelCandidate, PromotionRecord,
-    ResearchIteration, SearchBudgetLimit, SearchBudgetUsage, SearchPolicyRevision,
-    SignedRuntimeAttributionEvent, StrategyBundle, VerifiedRuntimeAttributionEvent,
-    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
-    SEALED_HOLDOUT_EVALUATOR_VERSION,
-};
-use alpha_engine::{
-    evaluation::prepare_dataset,
-    formula_evaluator::{FormulaEvaluator, WALK_FORWARD_EVALUATOR_VERSION},
-    CandidateEvaluation,
-};
+use ::governance::runtime_bundle::RuntimeOnnxModel as OnnxModelCandidate;
+use ::governance::runtime_bundle::{RuntimeArtifact, RuntimeBundle};
+use alpha_domain::canonical_json_hash;
+use alpha_domain::CandidateArtifact;
+use alpha_domain::IterationVerdict;
+use alpha_domain::PromotionRecord;
+use alpha_domain::SearchPolicyRevision;
+use alpha_domain::StrategyBundle;
+use alpha_domain::ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION;
+use alpha_domain::ONNX_WALK_FORWARD_EVALUATOR_VERSION;
+use alpha_domain::SEALED_HOLDOUT_EVALUATOR_VERSION;
+#[cfg(feature = "onnx-compatibility")]
+use alpha_engine::evaluation::prepare_dataset;
+use alpha_engine::formula_evaluator::FormulaEvaluator;
+use alpha_engine::formula_evaluator::WALK_FORWARD_EVALUATOR_VERSION;
+use alpha_engine::CandidateEvaluation;
+#[cfg(feature = "onnx-compatibility")]
 use alpha_onnx_evaluator::OnnxEvaluator;
-use alpha_store::{
-    AlphaStore, ApprovalRecord, EvaluationRecord, MissionLineage, RegistryRevision, StoreError,
-    StoredCandidate, StoredEvaluation,
-};
+use alpha_store::AlphaStore;
+use alpha_store::ApprovalRecord;
+#[cfg(any(feature = "onnx-compatibility", test))]
+use alpha_store::EvaluationRecord;
+use alpha_store::MissionLineage;
+use alpha_store::RegistryRevision;
+use alpha_store::StoreError;
+use alpha_store::StoredCandidate;
+use alpha_store::StoredEvaluation;
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -34,6 +53,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+};
+#[cfg(any(feature = "onnx-compatibility", test))]
+use {
+    alpha_domain::EngineKind, alpha_domain::MissionStatus, alpha_domain::ResearchIteration,
+    alpha_domain::SearchBudgetUsage,
 };
 
 static NEXT_BUNDLE_STAGE_ID: AtomicU64 = AtomicU64::new(0);
@@ -307,6 +331,7 @@ fn validated_walk_forward_evidence_in_lineage(
     Ok(candidates)
 }
 
+#[cfg(feature = "onnx-compatibility")]
 pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
     let mut store = AlphaStore::open(&args.db)?;
     let mission = store.get_mission(&args.mission_id)?;
@@ -683,7 +708,8 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         materialize_bundle(&stored_bundle, bundle_out.as_deref(), model_root.as_deref())?;
         return print_json(&serde_json::json!({
             "promotion": existing,
-            "bundle": stored_bundle,
+            "bundle": stored_bundle.to_runtime_bundle()?,
+            "scientific_bundle": stored_bundle,
         }));
     }
     let staged = stage_bundle(&bundle, bundle_out.as_deref(), model_root.as_deref())?;
@@ -691,7 +717,8 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
     staged.publish()?;
     print_json(&serde_json::json!({
         "promotion": stored,
-        "bundle": bundle,
+        "bundle": bundle.to_runtime_bundle()?,
+        "scientific_bundle": bundle,
     }))
 }
 
@@ -763,9 +790,9 @@ impl StagedBundle {
                     .clone()
                     .context("staged strategy bundle has no output path")?;
                 if bundle_out.exists() {
-                    let existing: StrategyBundle =
+                    let existing: RuntimeBundle =
                         serde_json::from_slice(&std::fs::read(&bundle_out)?)?;
-                    let requested: StrategyBundle =
+                    let requested: RuntimeBundle =
                         serde_json::from_slice(&std::fs::read(&staged_bundle)?)?;
                     if existing != requested {
                         bail!("existing strategy bundle has different content");
@@ -775,9 +802,9 @@ impl StagedBundle {
                     match std::fs::hard_link(&staged_bundle, &bundle_out) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            let existing: StrategyBundle =
+                            let existing: RuntimeBundle =
                                 serde_json::from_slice(&std::fs::read(&bundle_out)?)?;
-                            let requested: StrategyBundle =
+                            let requested: RuntimeBundle =
                                 serde_json::from_slice(&std::fs::read(&staged_bundle)?)?;
                             if existing != requested {
                                 bail!(
@@ -798,11 +825,11 @@ impl StagedBundle {
                     .bundle_out
                     .as_deref()
                     .and_then(|bundle_out| std::fs::read(bundle_out).ok())
-                    .and_then(|bytes| serde_json::from_slice::<StrategyBundle>(&bytes).ok())
+                    .and_then(|bytes| serde_json::from_slice::<RuntimeBundle>(&bytes).ok())
                     .is_some_and(|bundle| {
                         matches!(
                             bundle.artifact,
-                            alpha_domain::StrategyBundleArtifact::Onnx {
+                            RuntimeArtifact::Onnx {
                                 model: published_model
                             } if published_model == model
                         )
@@ -905,14 +932,15 @@ fn stage_bundle(
     ));
     std::fs::create_dir(&staging_dir)?;
     staged.staging_dir = Some(staging_dir.clone());
+    let runtime_bundle = bundle.to_runtime_bundle()?;
     let staged_bundle = staging_dir.join("bundle.json");
-    std::fs::write(&staged_bundle, serde_json::to_vec_pretty(bundle)?)?;
+    std::fs::write(&staged_bundle, serde_json::to_vec_pretty(&runtime_bundle)?)?;
     std::fs::File::open(&staged_bundle)?.sync_all()?;
     staged.staged_bundle = Some(staged_bundle);
     if canonical_bundle_out.exists() {
-        let existing: StrategyBundle =
+        let existing: RuntimeBundle =
             serde_json::from_slice(&std::fs::read(&canonical_bundle_out)?)?;
-        if &existing != bundle {
+        if existing != runtime_bundle {
             bail!("existing strategy bundle has different content");
         }
     }
@@ -1185,11 +1213,13 @@ fn read_trusted_attribution_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::governance::attribution::{sign_runtime_attribution_event, RuntimeAttributionEvent};
+    use ::governance::runtime_bundle::{
+        TensorElementType, TensorSpec, LOB_ONNX_PREPROCESSING_VERSION,
+    };
     use alpha_domain::{
-        sign_runtime_attribution_event, EvaluationCostsV1, EvaluationLabelSpecV1,
-        EvaluationProtocolV1, EvaluationWalkForwardV1, MissionCompletionPolicy, ResearchMission,
-        RuntimeAttributionEvent, SearchBudget, TensorElementType, TensorSpec, ValidatorMode,
-        LOB_ONNX_PREPROCESSING_VERSION,
+        EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
+        MissionCompletionPolicy, ResearchMission, SearchBudget, ValidatorMode,
     };
     use alpha_engine::evaluation::ResearchRow;
     use alpha_store::{StoredCandidate, StoredEvaluation};
@@ -1468,9 +1498,12 @@ mod tests {
 
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
-        let published: StrategyBundle =
+        let published: RuntimeBundle =
             serde_json::from_slice(&std::fs::read(&bundle_out).unwrap()).unwrap();
-        assert!(published == first || published == second);
+        assert!(
+            published == first.to_runtime_bundle().unwrap()
+                || published == second.to_runtime_bundle().unwrap()
+        );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1512,9 +1545,12 @@ mod tests {
 
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
-        let published: StrategyBundle =
+        let published: RuntimeBundle =
             serde_json::from_slice(&std::fs::read(&bundle_out).unwrap()).unwrap();
-        assert!(published == first || published == second);
+        assert!(
+            published == first.to_runtime_bundle().unwrap()
+                || published == second.to_runtime_bundle().unwrap()
+        );
         assert_eq!(
             std::fs::read(output.join("model.onnx")).unwrap(),
             model_bytes.to_vec()
@@ -1540,12 +1576,16 @@ mod tests {
         let bundle_out = output.join("bundle.json");
         let first_staged = stage_bundle(&first, Some(&bundle_out), Some(&model_root)).unwrap();
 
-        std::fs::write(&bundle_out, serde_json::to_vec_pretty(&second).unwrap()).unwrap();
+        std::fs::write(
+            &bundle_out,
+            serde_json::to_vec_pretty(&second.to_runtime_bundle().unwrap()).unwrap(),
+        )
+        .unwrap();
         assert!(first_staged.publish().is_err());
 
-        let published: StrategyBundle =
+        let published: RuntimeBundle =
             serde_json::from_slice(&std::fs::read(&bundle_out).unwrap()).unwrap();
-        assert_eq!(published, second);
+        assert_eq!(published, second.to_runtime_bundle().unwrap());
         assert_eq!(
             std::fs::read(output.join("model.onnx")).unwrap(),
             model_bytes.to_vec()
@@ -1831,9 +1871,9 @@ mod tests {
             deployment_id: "deployment-1".to_string(),
             asset_revision_id: "candidate-1".to_string(),
             mission_id: None,
-            mode: alpha_domain::AttributionMode::Paper,
-            outcome: alpha_domain::AttributionOutcome::Activated,
-            kind: alpha_domain::AttributionKind::Activation,
+            mode: governance::attribution::AttributionMode::Paper,
+            outcome: governance::attribution::AttributionOutcome::Activated,
+            kind: governance::attribution::AttributionKind::Activation,
             strategy_id: None,
             order_id: None,
             account_id: None,
@@ -2174,3 +2214,6 @@ mod tests {
             .contains("does not match candidate identity"));
     }
 }
+
+#[cfg(feature = "onnx-compatibility")]
+use alpha_domain::{MissionTerminalReason, SearchBudgetLimit};

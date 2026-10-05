@@ -1,12 +1,13 @@
 //! CEX Campaign result and sealed holdout object identities.
 use anyhow::{bail, Context};
-use hft_research_dispatch_io::{
-    canonical_tokyo_oss_internal_object, sha256_text, validate_dns_label,
-};
+#[cfg(any(feature = "scientific", test))]
+use hft_research_dispatch_io::validate_dns_label;
+use hft_research_dispatch_io::{canonical_tokyo_oss_internal_object, sha256_text};
 
 pub(crate) const CEX_GLOBAL_HOLDOUT_CLAIM_ROOT: &str =
     "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/artifacts/alpha-results/cex-holdout-claims";
 
+#[cfg(any(feature = "scientific", test))]
 pub(crate) fn cex_result_attempt_and_holdout_claim(
     result_object: &str,
     mission_id: &str,
@@ -51,6 +52,7 @@ pub(crate) fn cex_campaign_round_root(
     Ok(root.trim_end_matches('/').to_string())
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn cex_campaign_round_result_and_holdout_claim(
     result_object: &str,
     campaign_id: &str,

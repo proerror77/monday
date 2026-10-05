@@ -701,9 +701,11 @@ dependencies = [
  "anyhow",
  "chrono",
  "bincode",
+ "hft-research-manifest",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -733,6 +735,9 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "hex",
+ "hft-factor-dsl",
+ "hft-research-manifest",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2",
