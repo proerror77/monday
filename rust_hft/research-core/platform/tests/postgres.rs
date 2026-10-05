@@ -844,9 +844,38 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     // A later recorded reason can take effect earlier; history is retained.
     evidence.reason_receipt_sha256 = hash('3');
     evidence.effective_ms -= 1_000;
-    ledger
+    sqlx_core::raw_sql::raw_sql("CREATE ROLE monday_revocation_importer; GRANT USAGE ON SCHEMA research TO monday_revocation_importer; GRANT SELECT ON research.admissions,research.native_admission_imports TO monday_revocation_importer; GRANT UPDATE(request_sha256) ON research.admissions TO monday_revocation_importer; GRANT SELECT,INSERT ON research.native_request_revocations TO monday_revocation_importer;").execute(&pool).await?;
+    let importer_url = format!("{url}?options=-c%20role%3Dmonday_revocation_importer");
+    let importer = Ledger::connect(&importer_url).await?;
+    importer
         .register_native_request_revocation(&witness(evidence.clone())?)
         .await?;
+    let importer_pool = sqlx_postgres::PgPool::connect(&importer_url).await?;
+    let error = sqlx_core::query::query(
+        "UPDATE research.admissions SET request_sha256=request_sha256 WHERE request_sha256=$1",
+    )
+    .bind(&revoke_task)
+    .execute(&importer_pool)
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("immutable research record"));
+    let error = sqlx_core::query::query(
+        "INSERT INTO research.revocations(request_sha256,reason_receipt_sha256) VALUES($1,$2)",
+    )
+    .bind(&revoke_task)
+    .bind(hash('5'))
+    .execute(&importer_pool)
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("permission denied"));
+    let error = sqlx_core::query::query(
+        "UPDATE research.native_request_revocations SET effective_ms=effective_ms",
+    )
+    .execute(&importer_pool)
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("permission denied"));
+    importer_pool.close().await;
     assert_eq!(
         ledger.native_request_deadline_ms(&revoke_task).await?,
         Some(evidence.effective_ms)
