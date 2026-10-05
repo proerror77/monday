@@ -135,6 +135,8 @@ struct EpisodeAdapter {
     binding: BinaryEpisodeV1,
     strategy: ProbabilityReversalStrategy,
     sequence: HashMap<String, u64>,
+    proposals: HashMap<String, ports::OrderIntent>,
+    known_orders: HashSet<String>,
 }
 pub struct ProbReversalStrategy {
     config: ProbReversalConfig,
@@ -246,6 +248,8 @@ impl ProbReversalStrategy {
                 binding,
                 strategy,
                 sequence: HashMap::new(),
+                proposals: HashMap::new(),
+                known_orders: HashSet::new(),
             },
         );
     }
@@ -265,6 +269,46 @@ impl StrategyLogic for ProbReversalStrategy {
             let Some(adapter) = self.episodes.get_mut(episode_id) else {
                 continue;
             };
+            let Some(proposal) = adapter.proposals.get(&order.intent_id).cloned() else {
+                continue;
+            };
+            if proposal.symbol.as_str() != order.token_id
+                || order.requested_qty <= Decimal::ZERO
+                || order.requested_qty > proposal.quantity.0
+            {
+                continue;
+            }
+            // Actual simulation OrderLedger registration supplies the original
+            // emitted intent ID; a proposal alone is never a submission.
+            adapter.strategy.observe_intent_submission(
+                &proposal,
+                ports::IntentSubmissionResult::Enqueued {
+                    client_order_id: &order.intent_id,
+                },
+            );
+            adapter.strategy.on_execution_event(
+                &ExecutionEvent::OrderNew {
+                    order_id: OrderId(order.order_id.clone()),
+                    client_order_id: Some(order.intent_id.clone()),
+                    account_id: None,
+                    symbol: proposal.symbol.clone(),
+                    side: proposal.side,
+                    quantity: Quantity(order.requested_qty),
+                    requested_price: order.limit_price.map(Price),
+                    arrival_price: None,
+                    timestamp: 0,
+                    venue: Some(VenueId::POLYMARKET),
+                    strategy_id: "prob_reversal".into(),
+                },
+                &self.last_account,
+            );
+            adapter.known_orders.insert(order.order_id.clone());
+            if proposal.side == Side::Buy
+                && order.filled_qty > Decimal::ZERO
+                && self.filled_entries.insert(order.order_id.clone())
+            {
+                self.daily_entries = self.daily_entries.saturating_add(1);
+            }
             let id = OrderId(order.order_id.clone());
             let event = match order.state {
                 portfolio_core::prediction::OrderState::Filled => {
@@ -294,6 +338,8 @@ impl StrategyLogic for ProbReversalStrategy {
                 adapter
                     .strategy
                     .on_execution_event(&event, &self.last_account);
+                adapter.proposals.remove(&order.intent_id);
+                adapter.known_orders.remove(&order.order_id);
             }
         }
         match update {
@@ -370,6 +416,7 @@ impl StrategyLogic for ProbReversalStrategy {
                 });
                 let binding = &adapter.binding;
                 let strategy = &mut adapter.strategy;
+                let proposals = &mut adapter.proposals;
                 strategy
                     .on_market_event(&event, &self.last_account)
                     .into_iter()
@@ -407,6 +454,7 @@ impl StrategyLogic for ProbReversalStrategy {
                             },
                             created_at: *ts,
                         };
+                        proposals.insert(trading.intent_id.clone(), intent.clone());
                         if !buying {
                             return StrategyDecision::Exit(trading);
                         }
@@ -442,39 +490,20 @@ impl StrategyLogic for ProbReversalStrategy {
         }
     }
     fn on_fill(&mut self, fill: &FillRecord) {
-        if fill.side == TradeSide::Buy && self.filled_entries.insert(fill.order_id.clone()) {
-            self.daily_entries = self.daily_entries.saturating_add(1);
-        }
         let Some(event_id) = self.token_episode.get(&fill.token_id).cloned() else {
             return;
         };
         let Some(adapter) = self.episodes.get_mut(&event_id) else {
             return;
         };
-        let symbol = Symbol::new(&fill.token_id);
-        let side = if fill.side == TradeSide::Buy {
-            Side::Buy
-        } else {
-            Side::Sell
-        };
+        if !adapter.known_orders.contains(&fill.order_id) {
+            return;
+        }
+        if fill.side == TradeSide::Buy && self.filled_entries.insert(fill.order_id.clone()) {
+            self.daily_entries = self.daily_entries.saturating_add(1);
+        }
         let timestamp = u64::try_from(fill.timestamp.timestamp_micros()).unwrap_or(0);
         let order_id = OrderId(fill.order_id.clone());
-        adapter.strategy.on_execution_event(
-            &ExecutionEvent::OrderNew {
-                order_id: order_id.clone(),
-                client_order_id: None,
-                account_id: None,
-                symbol,
-                side,
-                quantity: Quantity(fill.quantity),
-                requested_price: Some(Price(fill.price)),
-                arrival_price: None,
-                timestamp,
-                venue: Some(VenueId::POLYMARKET),
-                strategy_id: "prob_reversal".into(),
-            },
-            &self.last_account,
-        );
         adapter.strategy.on_execution_event(
             &ExecutionEvent::Fill {
                 order_id,
@@ -501,6 +530,77 @@ mod tests {
     fn strategy_name() {
         let s = ProbReversalStrategy::new(ProbReversalConfig::default());
         assert_eq!(s.name(), "prob_reversal");
+    }
+
+    #[test]
+    fn actual_simulation_submission_and_cancel_bind_the_emitted_proposal() {
+        let mut strategy = ProbReversalStrategy::new(ProbReversalConfig {
+            symbols: vec!["BTCUSDT".into()],
+            ..Default::default()
+        });
+        let mut simulation = portfolio_core::prediction::TradingRuntime::default();
+        let now = Utc::now();
+        strategy.on_update(
+            &MarketUpdate::EventDiscovered {
+                event_id: "simulation-event".into(),
+                symbol: "BTCUSDT".into(),
+                up_token: "105".into(),
+                down_token: "205".into(),
+                end_time: now + Duration::seconds(3),
+                window_secs: 300,
+                price_to_beat: None,
+                resolved_up_won: None,
+            },
+            simulation.positions(),
+            simulation.orders(),
+        );
+        let quote = |ask: Decimal, ts| MarketUpdate::Quote {
+            token_id: "105".into(),
+            bid: Some(ask - dec!(0.02)),
+            ask: Some(ask),
+            bid_size: None,
+            ask_size: None,
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            ts,
+        };
+        strategy.on_update(
+            &quote(dec!(0.25), now),
+            simulation.positions(),
+            simulation.orders(),
+        );
+        let decisions = strategy.on_update(
+            &quote(dec!(0.65), now + Duration::milliseconds(1)),
+            simulation.positions(),
+            simulation.orders(),
+        );
+        let StrategyDecision::Enter { intent, .. } = &decisions[0] else {
+            panic!("original reversal entry required")
+        };
+        simulation
+            .submit_intent(intent.clone(), "actual-simulation-order", None)
+            .unwrap();
+        strategy.on_update(
+            &quote(dec!(0.65), now + Duration::milliseconds(2)),
+            simulation.positions(),
+            simulation.orders(),
+        );
+        simulation.cancel_order("actual-simulation-order").unwrap();
+        strategy.on_update(
+            &quote(dec!(0.25), now + Duration::milliseconds(3)),
+            simulation.positions(),
+            simulation.orders(),
+        );
+        assert_eq!(
+            strategy
+                .on_update(
+                    &quote(dec!(0.65), now + Duration::milliseconds(4)),
+                    simulation.positions(),
+                    simulation.orders()
+                )
+                .len(),
+            1
+        );
     }
 
     #[test]

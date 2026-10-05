@@ -75,6 +75,11 @@ unsubmitted proposal. Successful queue delivery pins its actual client order
 ID; an unknown outcome has no timeout-based retry. A correlated worker reject
 or canonical terminal report can release it. All later attempts use the same
 envelope, risk and queue path.
+An unsubmitted proposal cannot associate any OrderNew. The historical replay
+adapter associates only an actual simulation OrderLedger registration whose
+intent ID matches its emitted proposal; an absent client ID is not a fallback.
+The strategy position count covers only tokens in its fixed specification.
+Shared Risk continues to own global portfolio limits.
 
 Only actual, same-episode UP quotes form the UP threshold history. DOWN quotes
 provide their own execution price; their complement never invents a missing UP

@@ -113,6 +113,82 @@ fn down_quote_never_invents_an_unobserved_up_probability() {
 }
 
 #[test]
+fn unsubmitted_foreign_reports_cannot_change_pending_or_daily_count_and_unrelated_positions_do_not_consume_strategy_cap(
+) {
+    let mut cfg = config();
+    cfg.spec.max_daily_trades = 1;
+    cfg.spec.max_positions = 1;
+    let mut strategy = ProbabilityReversalStrategy::new(cfg).unwrap();
+    let mut account = AccountView::default();
+    let symbol = Symbol::new("BTCUSDT");
+    account.positions.insert(
+        symbol.clone(),
+        ports::Position {
+            symbol,
+            quantity: Quantity(Decimal::from(10)),
+            avg_price: Price(Decimal::from(100)),
+            unrealized_pnl: Decimal::ZERO,
+            realized_pnl: Decimal::ZERO,
+        },
+    );
+    let context = ports::StrategyContext {
+        account: &account,
+        book: None,
+    };
+    strategy.on_market_event_with_context(&quote("123", 25, 297_000_000, 1), &context);
+    let proposal = strategy
+        .on_market_event_with_context(&quote("123", 65, 297_100_000, 2), &context)
+        .remove(0);
+    let foreign = OrderId("unsubmitted-foreign".into());
+    strategy.on_execution_event(
+        &ExecutionEvent::OrderNew {
+            order_id: foreign.clone(),
+            client_order_id: None,
+            account_id: None,
+            symbol: proposal.symbol.clone(),
+            side: proposal.side,
+            quantity: proposal.quantity,
+            requested_price: proposal.price,
+            arrival_price: None,
+            timestamp: 297_200_000,
+            venue: Some(VenueId::POLYMARKET),
+            strategy_id: "probability".into(),
+        },
+        &account,
+    );
+    strategy.on_execution_event(
+        &ExecutionEvent::Fill {
+            order_id: foreign.clone(),
+            price: proposal.price.unwrap(),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: 297_300_000,
+            fill_id: "foreign-fill".into(),
+        },
+        &account,
+    );
+    strategy.on_execution_event(
+        &ExecutionEvent::OrderCanceled {
+            order_id: foreign,
+            timestamp: 297_400_000,
+        },
+        &account,
+    );
+    strategy.on_market_event(&quote("123", 25, 297_500_000, 3), &account);
+    assert!(strategy
+        .on_market_event(&quote("123", 65, 297_600_000, 4), &account)
+        .is_empty());
+    strategy.observe_intent_submission(&proposal, ports::IntentSubmissionResult::NotSubmitted);
+    strategy.on_market_event(&quote("123", 25, 297_700_000, 5), &account);
+    assert_eq!(
+        strategy
+            .on_market_event(&quote("123", 65, 297_800_000, 6), &account)
+            .len(),
+        1,
+        "foreign fill did not consume the one-entry daily budget"
+    );
+}
+
+#[test]
 fn known_not_submitted_recovers_but_enqueued_unknown_requires_the_actual_client_id() {
     let mut strategy = ProbabilityReversalStrategy::new(config()).unwrap();
     let account = AccountView::default();
@@ -263,10 +339,16 @@ fn authoritative_partial_position_remains_until_full_close_and_exit_is_bounded()
     assert_eq!(exits[0].side, Side::Sell);
     assert_eq!(exits[0].quantity, Quantity(Decimal::from(3)));
     let order_id = OrderId("exit-1".into());
+    strategy.observe_intent_submission(
+        &exits[0],
+        ports::IntentSubmissionResult::Enqueued {
+            client_order_id: "exit-client",
+        },
+    );
     strategy.on_execution_event(
         &ExecutionEvent::OrderNew {
             order_id: order_id.clone(),
-            client_order_id: None,
+            client_order_id: Some("exit-client".into()),
             account_id: None,
             symbol: symbol.clone(),
             side: Side::Sell,

@@ -202,8 +202,10 @@ impl ProbabilityReversalStrategy {
             || self.daily_entries >= self.config.spec.max_daily_trades
             || account
                 .positions
-                .values()
-                .filter(|p| p.quantity.0 > Decimal::ZERO)
+                .iter()
+                .filter(|(symbol, p)| {
+                    self.tokens.contains_key(*symbol) && p.quantity.0 > Decimal::ZERO
+                })
                 .count()
                 >= self.config.spec.max_positions
         {
@@ -377,7 +379,7 @@ impl Strategy for ProbabilityReversalStrategy {
                         && pending
                             .queued_client_id
                             .as_ref()
-                            .is_none_or(|id| client_order_id.as_ref() == Some(id))
+                            .is_some_and(|id| client_order_id.as_ref() == Some(id))
                 }) =>
             {
                 self.orders.entry(order_id.clone()).or_insert(Pending {

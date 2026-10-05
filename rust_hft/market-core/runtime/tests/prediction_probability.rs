@@ -115,7 +115,7 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     ingester
         .lock()
         .unwrap()
-        .ingest(snapshot(65, received + 1, 2))
+        .ingest(snapshot(65, now_micros(), 2))
         .unwrap();
     engine.tick().unwrap();
     let intents = reader.receive_envelopes();
@@ -136,7 +136,7 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     ingester
         .lock()
         .unwrap()
-        .ingest(snapshot(65, received + 1, 4))
+        .ingest(snapshot(65, now_micros(), 4))
         .unwrap();
     engine.tick().unwrap();
     let recovered = reader.receive_envelopes();
@@ -156,7 +156,7 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     ingester
         .lock()
         .unwrap()
-        .ingest(snapshot(65, received + 1, 6))
+        .ingest(snapshot(65, now_micros(), 6))
         .unwrap();
     engine.tick().unwrap();
     assert!(
@@ -167,6 +167,9 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     let mut config = runtime.config.clone();
     config.engine.intent_max_order_notional = Some(Decimal::from(10));
     config.engine.intent_max_order_quantity = Some(Decimal::from(100));
+    if let StrategyParams::ProbabilityReversal { spec, .. } = &mut config.strategies[0].params {
+        spec.max_positions = 1;
+    }
     let runtime = SystemBuilder::new(config)
         .register_strategies_from_config_strict()
         .unwrap()
@@ -179,16 +182,50 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     engine.update_cash_balance(Decimal::from(1000)).unwrap();
     let ingester = engine.create_event_ingester_pair();
     let received = now_micros();
+    let cex = hft_core::OrderId("unrelated-cex".into());
+    reader
+        .send_event(ports::ExecutionEvent::OrderNew {
+            order_id: cex.clone(),
+            client_order_id: Some("existing-cex-client".into()),
+            account_id: Some(hft_core::AccountId("paper-account".into())),
+            symbol: Symbol::new("BTCUSDT"),
+            side: hft_core::Side::Buy,
+            quantity: Quantity(Decimal::ONE),
+            requested_price: Some(Price(Decimal::from(100))),
+            arrival_price: None,
+            timestamp: received,
+            venue: Some(VenueId::BYBIT),
+            strategy_id: "unrelated-cex".into(),
+        })
+        .unwrap();
+    reader
+        .send_event(ports::ExecutionEvent::Fill {
+            order_id: cex.clone(),
+            price: Price(Decimal::from(100)),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: received,
+            fill_id: "existing-cex-fill".into(),
+        })
+        .unwrap();
+    engine.tick().unwrap();
+    assert_eq!(
+        engine.account_reader().load().positions[&Symbol::new("BTCUSDT")].quantity,
+        Quantity(Decimal::ONE)
+    );
+    assert_eq!(
+        engine.export_oms_state()[&cex].cum_qty,
+        Quantity(Decimal::ONE)
+    );
     ingester
         .lock()
         .unwrap()
-        .ingest(snapshot(25, received, 1))
+        .ingest(snapshot(25, now_micros(), 1))
         .unwrap();
     engine.tick().unwrap();
     ingester
         .lock()
         .unwrap()
-        .ingest(snapshot(65, received + 1, 2))
+        .ingest(snapshot(65, now_micros(), 2))
         .unwrap();
     engine.tick().unwrap();
     let intents = reader.receive_envelopes();
@@ -203,7 +240,8 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
         intents[0].lifecycle.max_order_quantity,
         Some(Decimal::from(100))
     );
-    assert!(engine.export_oms_state().is_empty());
+    assert_eq!(engine.export_oms_state().len(), 1);
+    assert!(engine.export_oms_state().contains_key(&cex));
     // Reports cross the real FIFO queue, then canonical OMS and Portfolio.
     let buy = hft_core::OrderId("paper-buy".into());
     reader
@@ -258,7 +296,7 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     ingester
         .lock()
         .unwrap()
-        .ingest(snapshot(90, received + 4, 3))
+        .ingest(snapshot(90, now_micros(), 3))
         .unwrap();
     engine.tick().unwrap();
     assert!(
@@ -309,7 +347,7 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     ingester
         .lock()
         .unwrap()
-        .ingest(snapshot(65, received + 1, 2))
+        .ingest(snapshot(65, now_micros(), 2))
         .unwrap();
     engine.tick().unwrap();
     let capped = reader.receive_envelopes();
@@ -346,13 +384,13 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     ingester
         .lock()
         .unwrap()
-        .ingest(outcome_snapshot("456", 20, received + 1, 1))
+        .ingest(outcome_snapshot("456", 20, now_micros(), 1))
         .unwrap();
     engine.tick().unwrap();
     ingester
         .lock()
         .unwrap()
-        .ingest(snapshot(35, received + 2, 2))
+        .ingest(snapshot(35, now_micros(), 2))
         .unwrap();
     engine.tick().unwrap();
     let down = reader.receive_envelopes();
@@ -449,7 +487,7 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     ingester
         .lock()
         .unwrap()
-        .ingest(snapshot(65, received + 1, 2))
+        .ingest(snapshot(65, now_micros(), 2))
         .unwrap();
     engine.tick().unwrap();
     let occupied = reader.receive_envelopes();
@@ -466,7 +504,7 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     ingester
         .lock()
         .unwrap()
-        .ingest(snapshot(65, received + 1, 4))
+        .ingest(snapshot(65, now_micros(), 4))
         .unwrap();
     engine.tick().unwrap();
     assert_eq!(
