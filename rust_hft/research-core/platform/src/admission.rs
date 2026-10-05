@@ -65,7 +65,11 @@ impl NativeAdmission {
         );
         // The configuration identity is the finalized canonical Campaign request,
         // not a caller's arbitrary argv or a diagnostic execution surface.
-        if spec.kind == TaskKind::Backtest {
+        if spec.kind == TaskKind::CexCampaign {
+            ensure!(
+                spec.max_attempts == 1,
+                "a native Campaign transfer covers one source reservation"
+            );
             ensure!(
                 spec.command.get(1).map(String::as_str) == Some("mission")
                     && spec.command.get(2).map(String::as_str) == Some("campaign-execute")
@@ -359,6 +363,7 @@ mod tests {
             max_attempts: 2,
             output_prefix: "research/fixture".into(),
             fit_identity_sha256: None,
+            worker_configuration: None,
         };
         let admission = Admission {
             schema: 1,

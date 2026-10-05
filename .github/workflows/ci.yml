@@ -512,6 +512,7 @@ jobs:
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" fmt -p hft-research-platform -- --check
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --locked
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --test postgres --locked -- --ignored
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --test native_attempt_identity --locked -- --ignored
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy -p hft-research-platform --features control,gateway,publisher --all-targets --locked -- -D warnings
       - name: Validate packaged CH SQL against the fixture server
         run: bash .github/scripts/test-clickhouse-preparation.sh

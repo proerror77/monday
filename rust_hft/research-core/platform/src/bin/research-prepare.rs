@@ -1,9 +1,7 @@
 use anyhow::{bail, Context, Result};
 use hft_research_platform::{
-    clickhouse::ClickHouse,
-    postgres::Ledger,
-    service::read_secret,
-    worker::{PrepareConfig, Writer},
+    artifact_io::Writer, clickhouse::ClickHouse, orchestrator::AttemptContext, postgres::Ledger,
+    service::read_secret, worker::PrepareConfig,
 };
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -51,7 +49,10 @@ async fn main() -> Result<()> {
     let writer = Writer::with_tls(
         &config.artifact_gateway,
         read_secret(&config.artifact_token_file)?,
-        permit.task(),
+        &AttemptContext {
+            spec: permit.task().spec.clone(),
+            lease: permit.task().lease.clone().context("worker lacks lease")?,
+        },
         &config.artifact_tls,
     )?;
     hft_research_platform::worker::prepare(
