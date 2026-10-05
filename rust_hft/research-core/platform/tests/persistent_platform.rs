@@ -24,6 +24,7 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
         NATIVE_ADMISSION_MIGRATION,
         NATIVE_REQUEST_REVOCATION_MIGRATION,
         NATIVE_CAMPAIGN_INPUTS_MIGRATION,
+        hft_research_platform::retirement::MIGRATION,
         include_str!("../../../../deployment/aliyun/research/foundation/postgres/roles.sql"),
     ] {
         sqlx_core::raw_sql::raw_sql(migration)
@@ -40,6 +41,32 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
     let session = "f".repeat(64);
     sqlx_core::query::query("INSERT INTO research.experiments(experiment_sha256,tenant,document) VALUES ($1,'role-fixture','{\"schema_fixture\":true}')").bind(&experiment).execute(&pool).await?;
     sqlx_core::query::query("INSERT INTO research.sessions(session_sha256,experiment_sha256,tenant,document) VALUES ($1,$2,'role-fixture','{\"schema_fixture\":true}')").bind(&session).bind(&experiment).execute(&pool).await?;
+    // Schema/permission fixture only; it is not an admitted scientific Task.
+    let build = "a".repeat(64);
+    let run = "b".repeat(64);
+    let input = "c".repeat(64);
+    let task = "d".repeat(64);
+    sqlx_core::query::query(
+        "INSERT INTO research.build_artifacts VALUES($1,$1,'{\"schema_fixture\":true}')",
+    )
+    .bind(&build)
+    .execute(&pool)
+    .await?;
+    sqlx_core::query::query(
+        "INSERT INTO research.runs VALUES($1,$2,$3,'role-fixture','{\"schema_fixture\":true}')",
+    )
+    .bind(&run)
+    .bind(&experiment)
+    .bind(&build)
+    .execute(&pool)
+    .await?;
+    sqlx_core::query::query(
+        "INSERT INTO research.inputs VALUES($1,'prepared','{\"schema_fixture\":true}')",
+    )
+    .bind(&input)
+    .execute(&pool)
+    .await?;
+    sqlx_core::query::query("INSERT INTO research.tasks(task_id,tenant,idempotency_key,request_sha256,run_manifest_sha256,view_manifest_sha256,state,document) VALUES($1,'role-fixture','mechanical-role-fixture',$1,$2,$3,'cancelled',$4)").bind(&task).bind(&run).bind(&input).bind(serde_json::json!({"id":task,"state":"cancelled","schema_fixture":true})).execute(&pool).await?;
     for lock in ["FOR SHARE", "FOR UPDATE"] {
         let mut tx = pool.begin().await?;
         sqlx_core::raw_sql::raw_sql("SET LOCAL ROLE monday_research_session_host")
@@ -106,6 +133,58 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
         "monday_research_submitter",
         "monday_research_reconciler",
         "monday_research_session_host",
+        "monday_research_artifact_gateway",
+        "monday_research_prepare_worker",
+        "monday_research_native_admission",
+    ] {
+        let forbidden:bool=sqlx_core::query_scalar::query_scalar("SELECT has_table_privilege($1,'research.native_terminal_retirement_audits','INSERT') OR has_table_privilege($1,'research.native_terminal_retirement_events','INSERT')").bind(role).fetch_one(&pool).await?;
+        assert!(
+            !forbidden,
+            "application/native importer cannot retire tasks"
+        );
+    }
+    let mut tx = pool.begin().await?;
+    sqlx_core::raw_sql::raw_sql("SET LOCAL ROLE monday_research_terminal_retirement")
+        .execute(&mut *tx)
+        .await?;
+    // Row locking succeeds with the immutable identity column privilege.
+    sqlx_core::query::query("SELECT document FROM research.tasks WHERE task_id=$1 FOR UPDATE")
+        .bind(&task)
+        .fetch_one(&mut *tx)
+        .await?;
+    assert!(
+        sqlx_core::query::query("UPDATE research.tasks SET document='{}'")
+            .execute(&mut *tx)
+            .await
+            .is_err()
+    );
+    tx.rollback().await?;
+    let mut tx = pool.begin().await?;
+    sqlx_core::raw_sql::raw_sql("SET LOCAL ROLE monday_research_terminal_retirement")
+        .execute(&mut *tx)
+        .await?;
+    let rejected = sqlx_core::query::query("UPDATE research.tasks SET task_id=$1 WHERE task_id=$2")
+        .bind("1".repeat(64))
+        .bind(&task)
+        .execute(&mut *tx)
+        .await
+        .unwrap_err();
+    ensure!(
+        rejected.to_string().contains("check constraint"),
+        "retirement key column changed task identity"
+    );
+    tx.rollback().await?;
+    for table in [
+        "native_terminal_retirement_audits",
+        "native_terminal_retirement_events",
+    ] {
+        let privileges:bool=sqlx_core::query_scalar::query_scalar("SELECT has_table_privilege('monday_research_terminal_retirement',$1,'SELECT') AND has_table_privilege('monday_research_terminal_retirement',$1,'INSERT') AND NOT has_table_privilege('monday_research_terminal_retirement',$1,'UPDATE') AND NOT has_table_privilege('monday_research_terminal_retirement',$1,'DELETE')").bind(format!("research.{table}")).fetch_one(&pool).await?;
+        assert!(privileges, "retirement host must remain append-only");
+    }
+    for role in [
+        "monday_research_submitter",
+        "monday_research_reconciler",
+        "monday_research_session_host",
     ] {
         let mut tx = pool.begin().await?;
         sqlx_core::raw_sql::raw_sql(&format!("SET LOCAL ROLE {role}"))
@@ -136,6 +215,7 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
         "monday_research_artifact_gateway",
         "monday_research_prepare_worker",
         "monday_research_session_host",
+        "monday_research_terminal_retirement",
     ] {
         let can_write:bool=sqlx_core::query_scalar::query_scalar("SELECT has_table_privilege($1,'research.tasks','INSERT') OR has_column_privilege($1,'research.tasks','document','UPDATE') OR has_table_privilege($1,'research.results','INSERT')").bind(role).fetch_one(&pool).await?;
         assert!(

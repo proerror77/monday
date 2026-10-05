@@ -20,5 +20,8 @@
     "state_root": "/state/attempt-identities",
     "namespace_prefix": "research/",
     "tls_identity_file": "/run/private/credentials/artifact-writer.pem"
+  },
+  "terminal_retirement": {
+    "enabled": false
   }
 }

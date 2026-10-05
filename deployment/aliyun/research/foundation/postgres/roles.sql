@@ -9,11 +9,12 @@ CREATE ROLE monday_research_prepare_worker NOLOGIN;
 CREATE ROLE monday_research_definition_writer NOLOGIN;
 CREATE ROLE monday_research_release_importer NOLOGIN;
 CREATE ROLE monday_research_native_admission NOLOGIN;
+CREATE ROLE monday_research_terminal_retirement NOLOGIN;
 GRANT USAGE ON SCHEMA research TO monday_research_submitter,
   monday_research_reconciler, monday_research_session_host,
   monday_research_artifact_gateway, monday_research_prepare_worker,
   monday_research_definition_writer, monday_research_release_importer,
-  monday_research_native_admission;
+  monday_research_native_admission, monday_research_terminal_retirement;
 GRANT SELECT ON research.authority, research.inputs, research.backends,
   research.build_artifacts, research.build_releases, research.runs,
   research.admissions, research.revocations, research.tasks
@@ -82,3 +83,14 @@ GRANT SELECT ON research.native_campaign_inputs TO monday_research_reconciler,
   monday_research_submitter, monday_research_session_host,
   monday_research_definition_writer;
 GRANT SELECT, INSERT ON research.native_campaign_inputs TO monday_research_native_admission;
+
+-- A separate trusted mechanical retirement host. The ordinary reconciler,
+-- Agent, Session and worker receive no retirement write or inherited role.
+GRANT SELECT ON research.tasks, research.runs, research.native_admission_imports,
+  research.events, research.results, research.native_campaign_inputs,
+  research.inputs, research.backends TO monday_research_terminal_retirement;
+GRANT SELECT, INSERT ON research.native_terminal_retirement_audits,
+  research.native_terminal_retirement_events TO monday_research_terminal_retirement;
+-- Any column UPDATE permits FOR UPDATE. This key cannot change independently
+-- of request/document identity, which this role cannot write.
+GRANT UPDATE(task_id) ON research.tasks TO monday_research_terminal_retirement;

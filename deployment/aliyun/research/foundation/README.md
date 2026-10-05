@@ -13,7 +13,7 @@
    StorageClass、现有私有 broker PVC、有限容量、cluster/API IP，以及既有
    Experiment、Session policy 和 native executable 身份。示例刻意不能直接渲染。
 3. 运行 `researchctl render-foundation INVENTORY /absolute/new/output-directory`。
-   此命令无 PG/provider 连接。它只写新目录，拒绝覆盖已有目录。配置、ConfigMap、
+   此命令无 PG/provider 连接。它只创建新文件，拒绝覆盖已有文件。配置、ConfigMap、
    StatefulSet、ClusterIP 和 NetworkPolicy 都以可评审文件输出；所有副本固定为 0。
 4. 在部署 Gate 中独立核验 images、预算/保留期、存储与 TLS/RBAC。
    渲染结果没有 `kubectl apply`、StorageClass、Namespace、Secret 或 IAM 创建操作。
@@ -25,7 +25,8 @@ PVC 在缩容和 StatefulSet 删除后保留。PG/CH/objects/native-state/delive
 ## PG 与 CH 的离线安装
 
 用独立 schema owner 按顺序安装 platform `sql/postgres.sql`、`verified_build_release.sql`、
-`session_deliveries.sql`、`artifact_gateway.sql`、`native_admission.sql`，再安装 `postgres/roles.sql`。
+`session_deliveries.sql`、`artifact_gateway.sql`、`native_admission.sql`、
+`native_request_revocation.sql`、`native_campaign_inputs.sql`、`native_terminal_retirement.sql`，最后安装 `postgres/roles.sql`。
 Native admission 迁移最后替换 artifact permit，保留 fence、lease、deadline、撤销与暂停检查，并加原生有效期和租户检查。
 `authority.mode` 必须仍为 `paused`；所有 backend 仍为 disabled。
 NOLOGIN 角色没有密码，也没有互相继承。经过独立审查的 login identity 才能获得对应角色。
@@ -140,6 +141,16 @@ cluster-wide 权限。Kubernetes token 仍由受控 operator 投影并核对主�
 不是另一个 Kubernetes 命名空间授权。
 
 离线安装顺序为 postgres、verified_build_release、session_deliveries、artifact_gateway、
-native_admission、native_request_revocation、native_campaign_inputs，最后安装 roles.sql。
+native_admission、native_request_revocation、native_campaign_inputs、native_terminal_retirement，最后安装 roles.sql。
 应用身份不写 native admission/revocation；Session 仅 UPDATE(session_sha256) 用于行锁。
 immutable_sessions trigger 继续拒绝实际文档修改，DELETE 没有授权。
+
+`terminal_retirement.enabled` 显式为 false。普通 reconciler、Agent、Session、worker 和
+native importer 都没有清理审计写权限。独立 NOLOGIN `monday_research_terminal_retirement`
+只读原 Task/Run/native import、event/result、collection 和 backend 事实，只能追加两个
+retirement 表。`UPDATE(task_id)` 仅支持原 Task 行锁；role 不能改 request/document 或
+revision，因此不能重定向身份或授予执行。真实清理还必须核验原生签名、已发表完整归档，
+以及独立 provider UID/absence 读回。它不改变预算、科学状态或任务终态。
+
+CI 的角色测试使用独立 `monday_foundation_roles_test`。终态清理测试保留自己的
+`monday_foundation_retirement_test`。它们按顺序执行，不共用 migration schema。

@@ -271,6 +271,7 @@ mod tests {
         assert_eq!(assets["broker-tools.paused.json"], "[]\n");
         serde_json::from_str::<crate::service::ServiceConfig>(&assets["service.json"])?;
         let service: crate::service::ServiceConfig = serde_json::from_str(&assets["service.json"])?;
+        assert!(!service.terminal_retirement.enabled);
         let issuer = service
             .attempt_identity
             .context("missing configured issuer")?;
