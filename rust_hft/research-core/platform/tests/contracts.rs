@@ -617,6 +617,56 @@ fn task_admission_preserves_exact_native_grant_and_attempt_budget() {
 }
 
 #[test]
+fn campaign_launch_requires_late_identity_and_preserves_original_context() {
+    let mut spec = task_spec();
+    spec.kind = TaskKind::CexCampaign;
+    spec.max_attempts = 1;
+    spec.profile.worker_secret = Some("static-configuration".into());
+    spec.worker_configuration = Some(
+        hft_research_platform::orchestrator::WorkerConfigurationRef {
+            schema: "monday.worker_configuration.v1".into(),
+            secret_name: "static-configuration".into(),
+            secret_uid: "static-uid".into(),
+            configuration_sha256: hash('a'),
+        },
+    );
+    let mut task = Task::new(spec).unwrap();
+    let launch = task.claim("owner", 1000, 1000).unwrap();
+    assert!(task
+        .launched(&launch, 1001, handle(&task, &launch))
+        .is_err());
+    let reference = execution::AttemptIdentityRef {
+        secret_name: format!("{}-identity", execution::resource_name(&launch)),
+        secret_uid: "owned-secret-uid".into(),
+        scope_sha256: hash('a'),
+        native_evidence_sha256: hash('b'),
+        data_sha256: hash('c'),
+        attempt: launch.attempt,
+        fence: launch.fence,
+        deadline_ms: 6000,
+        launch_lease: launch.clone(),
+    };
+    let mut stale = reference.clone();
+    stale.fence += 1;
+    task.attempt_identity = Some(stale);
+    assert!(task
+        .launched(&launch, 1001, handle(&task, &launch))
+        .is_err());
+    task.attempt_identity = Some(reference.clone());
+    task.launched(&launch, 1001, handle(&task, &launch))
+        .unwrap();
+    let current = task.heartbeat(&launch, 1100, 1000).unwrap();
+    assert_ne!(current.expires_ms, launch.expires_ms);
+    reference.validate(&task.spec, &current).unwrap();
+    let mut foreign = current.clone();
+    foreign.owner = "foreign".into();
+    assert!(reference.validate(&task.spec, &foreign).is_err());
+    task.stop(State::Cancelled, false).unwrap();
+    task.stopped(current.attempt, current.fence).unwrap();
+    assert_eq!(task.attempt_identity.unwrap().launch_lease, launch);
+}
+
+#[test]
 fn reviewed_sql_changes_data_identity_without_rebuilding_the_worker() {
     let image = format!("fixture@sha256:{}", hash('a'));
     let first = PreparationPlan {

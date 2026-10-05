@@ -9,7 +9,6 @@ use crate::{
         validate_render_materialization_scope_for_horizon,
     },
     mission_runner::{decode_materialization, validate_materialization, MAX_MATERIALIZATION_BYTES},
-    prediction_dispatch::canonical_tokyo_oss_internal_object,
 };
 use alpha_domain::{
     campaign_control::{
@@ -31,6 +30,7 @@ use alpha_store::{
 use anyhow::{bail, Context};
 use chrono::Utc;
 use ed25519_dalek::VerifyingKey;
+use hft_research_dispatch_io::canonical_tokyo_oss_internal_object;
 use reqwest::blocking::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};

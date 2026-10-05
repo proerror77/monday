@@ -3,7 +3,7 @@
 resolver = "2"
 members = ["ml", "search-kernel", "../alpha-harness/domain", "../alpha-harness/store", "../alpha-harness/engine", "../alpha-harness/onnx-evaluator", "../alpha-harness/app", "../alpha-harness/worker", "../apps/backtest", "../tools/harnessctl"]
 default-members = ["search-kernel"]
-exclude = ["artifacts", "factor-dsl", "manifest", "platform", "cex-input"]
+exclude = ["artifacts", "dispatch-io", "factor-dsl", "manifest", "platform", "cex-input"]
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive", "rc"] }

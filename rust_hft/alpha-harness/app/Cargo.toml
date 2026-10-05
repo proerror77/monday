@@ -14,6 +14,7 @@ onnx-compatibility = ["dep:alpha-onnx-evaluator"]
 hft-cex-research-input = { path = "../../research-core/cex-input", features = ["streaming"] }
 hft-research-artifacts = { path = "../../research-core/artifacts" }
 hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["native-admission", "release-verification"] }
+hft-research-dispatch-io = { path = "../../research-core/dispatch-io" }
 alpha-domain = { path = "../domain" }
 alpha-engine = { path = "../engine", default-features = false, features = ["kernel"] }
 alpha-onnx-evaluator = { path = "../onnx-evaluator", optional = true }

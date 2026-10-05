@@ -125,6 +125,123 @@ async fn clock(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
 }
 
 impl Ledger {
+    /// No mutation, secret, grant, provider call, or settlement. Snapshot rows
+    /// share one read-only transaction; historical expiry/revocation is retained.
+    pub async fn native_terminal_snapshot(
+        &self,
+        tenant: &str,
+        request: &str,
+    ) -> Result<crate::research::NativeTerminalSnapshot> {
+        ensure!(
+            !tenant.is_empty() && tenant.len() <= 128 && crate::valid_digest(request),
+            "invalid terminal snapshot scope"
+        );
+        let mut tx = self.pool.begin().await?;
+        sqlx_core::raw_sql::raw_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let row = query("SELECT t.document,t.revision,r.document AS run,n.document AS native,n.trust_document,n.trust_sha256,n.evidence_sha256 FROM research.tasks t JOIN research.runs r ON r.run_sha256=t.run_manifest_sha256 AND r.tenant=t.tenant JOIN research.native_admission_imports n ON n.request_sha256=t.request_sha256 AND n.tenant=t.tenant WHERE t.task_id=$1 AND t.tenant=$2")
+            .bind(request).bind(tenant).fetch_one(&mut *tx).await?;
+        let task: Task = serde_json::from_value(row.get("document"))?;
+        let run: crate::research::Run = serde_json::from_value(row.get("run"))?;
+        let native: crate::admission::SignedNativeAdmission =
+            serde_json::from_value(row.get("native"))?;
+        let trust: crate::admission::NativeAdmissionTrust =
+            serde_json::from_value(row.get("trust_document"))?;
+        let verified = trust.verify(&native)?;
+        run.admit(&task.spec)?;
+        ensure!(
+            task.id == request
+                && task.spec.id()? == task.id
+                && task.state.terminal()
+                && native.evidence.tenant == tenant
+                && native.evidence.admission.request_sha256 == task.id
+                && native.evidence.run == run
+                && native.evidence.admission.task_spec == task.spec
+                && native.evidence_sha256 == row.get::<String, _>("evidence_sha256")
+                && verified.trust_sha256() == row.get::<String, _>("trust_sha256"),
+            "terminal snapshot changed native request or principal"
+        );
+        let revision: i64 = row.get("revision");
+        let terminal = query(
+            "SELECT revision,event,document FROM research.events WHERE task_id=$1 AND revision=$2",
+        )
+        .bind(request)
+        .bind(revision)
+        .fetch_one(&mut *tx)
+        .await?;
+        let terminal_event = crate::research::TerminalLedgerEvent {
+            revision: terminal.get("revision"),
+            event: terminal.get("event"),
+            document: serde_json::from_value(terminal.get("document"))?,
+        };
+        ensure!(
+            terminal_event.document == task && terminal_event.event == "stop_reconciled",
+            "terminal lacks reconciled process-tree stop event"
+        );
+        let execution = query("SELECT revision,event,document FROM research.events WHERE task_id=$1 AND revision<$2 AND document->'execution' IS NOT NULL AND document->'execution'<>'null'::jsonb AND (document->>'attempt')::integer=$3 ORDER BY revision ASC LIMIT 1")
+            .bind(request).bind(revision).bind(i32::try_from(task.attempt)?).fetch_optional(&mut *tx).await?;
+        let execution_event = execution
+            .map(|row| -> Result<_> {
+                Ok(crate::research::TerminalLedgerEvent {
+                    revision: row.get("revision"),
+                    event: row.get("event"),
+                    document: serde_json::from_value(row.get("document"))?,
+                })
+            })
+            .transpose()?;
+        if let Some(event) = &execution_event {
+            let executed = &event.document;
+            let lease = executed
+                .lease
+                .as_ref()
+                .context("execution event lacks lease")?;
+            ensure!(
+                executed.id == task.id
+                    && executed.spec == task.spec
+                    && executed.attempt == task.attempt
+                    && executed.fence == task.fence
+                    && event.revision < revision,
+                "terminal execution event changed request or Attempt"
+            );
+            executed
+                .execution
+                .as_ref()
+                .context("execution event lacks handle")?
+                .validate(lease, &task.spec)?;
+        }
+        let value: Option<Value> =
+            query_scalar("SELECT receipt FROM research.results WHERE task_id=$1 AND attempt=$2")
+                .bind(request)
+                .bind(i32::try_from(task.attempt)?)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let result: Option<ResultReceipt> = value.map(serde_json::from_value).transpose()?;
+        ensure!(
+            result == task.receipt,
+            "terminal receipt differs from immutable result"
+        );
+        if let Some(result) = &result {
+            let lease = execution_event
+                .as_ref()
+                .and_then(|event| event.document.lease.as_ref())
+                .context("terminal receipt lacks execution lease")?;
+            result.validate(&task.spec, lease)?;
+        }
+        tx.commit().await?;
+        Ok(crate::research::NativeTerminalSnapshot {
+            schema: "monday.native_platform_terminal_snapshot.v1".into(),
+            tenant: tenant.to_owned(),
+            task,
+            run,
+            native_admission: native,
+            native_trust: trust,
+            terminal_revision: revision,
+            terminal_event,
+            execution_event,
+            result,
+        })
+    }
     #[cfg(feature = "gateway")]
     pub(crate) async fn artifact_write_permit(
         &self,
@@ -854,6 +971,18 @@ impl Ledger {
 }
 
 impl LockedTask {
+    pub async fn issue_attempt_identity(
+        &mut self,
+        issuer: &crate::artifact_identity::AttemptIdentityIssuer,
+    ) -> Result<crate::artifact_identity::IssuedAttemptIdentity> {
+        issuer.issue_for_task(&mut self.tx, &self.task).await
+    }
+    pub async fn recover_attempt_identity_for_cleanup(
+        &mut self,
+        issuer: &crate::artifact_identity::AttemptIdentityIssuer,
+    ) -> Result<Option<crate::artifact_identity::IssuedAttemptIdentity>> {
+        issuer.recover_for_cleanup(&mut self.tx, &self.task).await
+    }
     /// Order provider reconciliation against native/manual revocation imports.
     /// A scheduled future witness caps execution without cancelling it early.
     pub async fn native_request_deadline_ms(&mut self) -> Result<Option<i64>> {

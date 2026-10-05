@@ -5,31 +5,13 @@ Rust CLI and libraries for the governed CEX Campaign and prediction research pla
 
 `alpha-engine` keeps immutable fitted-model evidence, protocol validation and
 deterministic ledger/replay verification available without default features.
-The `fitting` feature owns baseline production, neural refits, sequence
-training and market-encoder training. Pure Ridge/CART refits remain available
-for independent frozen-evidence verification. Only that feature depends on
+The `fitting` feature owns baseline fitting, independent refits, sequence
+training and market-encoder training. Only that feature depends on
 `hft-research-ml` and Burn. The existing scientific default enables `kernel`
 and `fitting`; control consumers must explicitly disable default features.
 
 This separates compilation ownership. It does not change Campaign admission,
 trial/resource budgets, final evaluation, holdout isolation or settlement.
-
-`hft-cex-research-input` owns immutable sequence and market-encoder readers.
-Its `streaming` feature pins files, verifies each consumed pass, and preserves
-causal windows and label maturity. Operator and fitting code use these readers.
-The platform's default input contract does not enable columnar readers.
-
-`alpha-harness` is the operator. Its default graph excludes Burn, ML fitting
-and ONNX. It owns freeze, finalization, dispatch, stopping and independent
-settlement readback. The generated Job invokes `monday-cex-worker mission
-campaign-execute` with the existing admitted arguments. The worker owns the
-scientific feature and accepts only that execution command.
-
-Frozen sequence and market models export explicit f32 parameters. Their pure
-manifest evaluators preserve causal padding, scaling, fitted-value identities,
-parent inheritance and reconstruction receipts. Independent prediction and
-replay readback use these evaluators. Training optimizers and budgets stay in
-the scientific worker.
 
 ## Packages
 
@@ -282,11 +264,13 @@ pauses closed; invoking a diagnostic command never supplies that evidence.
 
 ## Prediction-Market Research
 
-`alpha-harness` is also the single Monday transport and evidence entrypoint for
-prediction-market research. It does not merge the evaluators: continuous
-contracts keep the IC/RankIC/ICIR evaluator above, while binary event contracts
-use the event-disjoint Brier/log-loss/calibration/full-depth settlement evaluator
-compiled as `monday-prediction-evaluator`.
+Prediction research belongs to the Prediction workspace. Its
+`monday-prediction-operator` owns governed submission and status readback;
+`monday-prediction-worker` owns snapshot transport and execution. Neither imports
+the CEX harness. `alpha-harness` accepts only CEX control commands. Continuous
+contracts keep the IC/RankIC/ICIR evaluator above. Binary event contracts use
+the separate event-disjoint Brier/log-loss/calibration/full-depth settlement
+evaluator compiled as `monday-prediction-evaluator`.
 
 Build an immutable snapshot from the governed read-only research database and
 publish it once:

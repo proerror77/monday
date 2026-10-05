@@ -9,12 +9,12 @@ sha=1111111111111111111111111111111111111111
 # executables appear once when a producer builds more than one product.
 products="$root/.github/scripts/research-release-products.sh"
 bash "$products" recipes prediction-runner >"$work/prediction-recipes"
-jq -s -e 'length==2 and all(.[]; .manifest=="prediction-markets/Cargo.toml") and any(.[]; .package=="ploy-research" and (.binaries|length)==3) and any(.[]; .package=="hft-prediction-research-worker" and .binaries==["monday-prediction-worker"])' "$work/prediction-recipes" >/dev/null
+jq -s -e 'length==3 and all(.[]; .manifest=="prediction-markets/Cargo.toml") and any(.[]; .package=="ploy-research" and (.binaries|length)==3) and any(.[]; .package=="hft-prediction-research-worker" and .binaries==["monday-prediction-worker"]) and any(.[]; .package=="hft-prediction-research-operator" and .binaries==["monday-prediction-operator"])' "$work/prediction-recipes" >/dev/null
 bash "$products" recipes cex-runner >"$work/cex-recipes"
-jq -s -e 'length==4 and any(.[]; .package=="hft-cex-research-worker" and .binaries==["monday-cex-worker"]) and all(.[]; .package!="ploy-research" and .manifest!="prediction-markets/Cargo.toml")' "$work/cex-recipes" >/dev/null
-[[ $(bash "$products" binaries cex-runner | wc -l) -eq 7 ]]
+jq -s -e 'length==3 and all(.[]; .package!="ploy-research" and .manifest!="prediction-markets/Cargo.toml")' "$work/cex-recipes" >/dev/null
+[[ $(bash "$products" binaries cex-runner | wc -l) -eq 6 ]]
 [[ $(bash "$products" binaries all | wc -l) -eq 11 ]]
-[[ $(bash "$products" binaries cex-runner,controller | wc -l) -eq 7 ]]
+[[ $(bash "$products" binaries cex-runner,controller | wc -l) -eq 6 ]]
 [[ $(bash "$products" merge controller prediction-runner) == controller,prediction-runner ]]
 for invalid in runner paired '' 'cex-runner,cex-runner' 'prediction-runner,unknown' 'all,controller'; do
   if bash "$products" normalize "$invalid" >"$work/rejection" 2>&1; then
