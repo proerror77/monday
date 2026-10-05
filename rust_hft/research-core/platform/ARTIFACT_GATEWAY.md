@@ -48,3 +48,9 @@ PUT 必须携带 `If-None-Match: *`。文件先流式写入私有临时文件，
 监听地址只允许 loopback。部署方必须在同一隔离环境内提供私有 TLS ingress，再将 HTTPS 端点交给现有客户端。
 网关不会把 bearer capability 发往 OSS 原生 endpoint。
 TLS ingress、broker、持久卷、远端身份和真实数据验收仍属于部署阶段。
+
+默认暂停的持久卷、PG 角色与私有 TLS 包装见
+[foundation assets](../../../deployment/aliyun/research/foundation/README.md)。
+Gateway 可在空 `[]` broker projection 下启动，默认拒绝所有对象请求。
+Controller、prepare worker 和 Session client 可显式配置私有 CA 与 client identity；
+客户端保留标准 hostname 验证，拒绝 redirect 与环境 proxy。

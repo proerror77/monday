@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: Service
+metadata: {name: monday-foundation-control, namespace: monday-research}
+spec:
+  type: ClusterIP
+  selector: {app: monday-foundation-control}
+  ports: [{name: tools-tls, port: 8443, targetPort: 8443}, {name: artifact-tls, port: 8444, targetPort: 8444}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: monday-foundation-control, namespace: monday-research}
+spec:
+  replicas: 0
+  serviceName: monday-foundation-control
+  persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}
+  selector: {matchLabels: {app: monday-foundation-control}}
+  template:
+    metadata: {labels: {app: monday-foundation-control, research.monday/foundation-access: admitted}}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      nodeSelector: {workload: research-data, kubernetes.io/arch: amd64}
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+      initContainers:
+        - name: install-tls
+          image: __INIT_IMAGE__
+          command: [sh, /config/install-tls.sh]
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+          volumeMounts:
+            - {name: tls-secret, mountPath: /projection, readOnly: true}
+            - {name: private, mountPath: /private}
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: credentials, mountPath: /credentials, readOnly: true}
+      containers:
+        - name: orchestrator
+          image: __CONTROL_IMAGE__
+          command: [/usr/local/bin/research-orchestrator, --config, /config/service.json]
+          env:
+            - name: MONDAY_RESEARCH_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: monday-foundation-reconciler-pg, key: url}}
+          resources: {requests: {cpu: '0.25', memory: 256Mi}, limits: {cpu: '1', memory: 1Gi}}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: broker, mountPath: /run/broker, readOnly: true}
+            - {name: private, mountPath: /run/private/credentials, subPath: credentials, readOnly: true}
+        - name: artifact-gateway
+          image: __CONTROL_IMAGE__
+          command: [/usr/local/bin/research-artifact-gateway, --config, /config/gateway.json]
+          env:
+            - name: MONDAY_RESEARCH_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: monday-foundation-gateway-pg, key: url}}
+          resources: {requests: {cpu: '0.25', memory: 128Mi}, limits: {cpu: '1', memory: 512Mi}}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: objects, mountPath: /objects}
+            - {name: broker, mountPath: /run/broker, readOnly: true}
+        - name: private-tls
+          image: __TLS_IMAGE__
+          command: [nginx, -c, /config/nginx.conf, -g, 'daemon off;']
+          ports: [{name: tools-tls, containerPort: 8443}, {name: artifact-tls, containerPort: 8444}]
+          resources: {requests: {cpu: '0.1', memory: 32Mi}, limits: {cpu: '0.5', memory: 128Mi}}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: private, mountPath: /run/private/tls, subPath: tls, readOnly: true}
+            - {name: runtime, mountPath: /tmp}
+      volumes:
+        - {name: runtime, emptyDir: {sizeLimit: 64Mi}}
+        - {name: private, emptyDir: {medium: Memory, sizeLimit: 1Mi}}
+        - {name: config, configMap: {name: monday-foundation-control}}
+        - {name: tls-secret, secret: {secretName: monday-foundation-control-tls, defaultMode: 288}}
+        - {name: credentials, secret: {secretName: monday-foundation-controller-credentials, defaultMode: 288}}
+        # Broker owner projects regular 0600 files under a private 0700 directory.
+        # It issues/renews/removes capabilities; this Pod never writes that PVC.
+        - {name: broker, persistentVolumeClaim: {claimName: __BROKER_CLAIM__, readOnly: true}}
+  volumeClaimTemplates:
+    - metadata: {name: objects}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: __STORAGE_CLASS__
+        resources: {requests: {storage: __ARTIFACT_STORAGE__}}

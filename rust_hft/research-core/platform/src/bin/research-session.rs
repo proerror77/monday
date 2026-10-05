@@ -20,6 +20,7 @@ struct Config {
     capability_policy_receipt_sha256: String,
     research_endpoint: String,
     research_token_file: String,
+    checkpoint_file: std::path::PathBuf,
     #[serde(default)]
     research_tls: hft_research_platform::transport::TlsConfig,
 }
@@ -116,6 +117,7 @@ async fn main() -> Result<()> {
     print(
         &json!({"session_sha256":session_id,"thread_id":server.thread_id(),"generation":server.generation()}),
     )?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut input = BufReader::new(tokio::io::stdin());
     let mut input_frame = Vec::new();
     let mut wake_timer = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -125,10 +127,18 @@ async fn main() -> Result<()> {
         let command = tokio::select! {
             frame = operator_frame(&mut input, &mut input_frame) => {
                 let Some(frame) = frame? else {
-                    print(&serde_json::to_value(server.checkpoint().await?)?)?;
+                    print(&serde_json::to_value(server.checkpoint_to(&config.checkpoint_file).await?)?)?;
                     return Ok(());
                 };
                 serde_json::from_slice::<Command>(&frame)?
+            }
+            _ = terminate.recv() => {
+                print(&serde_json::to_value(server.checkpoint_to(&config.checkpoint_file).await?)?)?;
+                return Ok(());
+            }
+            _ = tokio::signal::ctrl_c() => {
+                print(&serde_json::to_value(server.checkpoint_to(&config.checkpoint_file).await?)?)?;
+                return Ok(());
             }
             event = server.next_event() => {
                 let event = event?;
@@ -178,12 +188,16 @@ async fn main() -> Result<()> {
                 json!({"native_delivery_read_back":wake(&ledger, &config.tenant, &session_id, &mut server).await?})
             }
             Command::Checkpoint => {
-                print(&serde_json::to_value(server.checkpoint().await?)?)?;
+                print(&serde_json::to_value(
+                    server.checkpoint_to(&config.checkpoint_file).await?,
+                )?)?;
                 return Ok(());
             }
             Command::Close => {
-                server.close().await?;
-                print(&json!({"child_stopped":true}))?;
+                let state = server.checkpoint_to(&config.checkpoint_file).await?;
+                print(
+                    &json!({"child_stopped":true,"checkpoint_sha256":hft_research_platform::identity(&state)?}),
+                )?;
                 return Ok(());
             }
         };

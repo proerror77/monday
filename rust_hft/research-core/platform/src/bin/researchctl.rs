@@ -38,6 +38,18 @@ async fn main() -> Result<()> {
             let client = hft_research_platform::session::ResearchClient::from_file(endpoint, token_path.into(), &tls)?;
             println!("{}", client.execute(&tool).await?);
         }
+        ["render-foundation",path,output] => {
+            let inventory: hft_research_platform::foundation::Inventory = read(path)?;
+            let assets = inventory.render()?;
+            let directory = std::path::Path::new(output);
+            anyhow::ensure!(directory.is_absolute(), "absolute new output directory required");
+            std::fs::create_dir(directory)?;
+            for (name,contents) in assets {
+                use std::io::Write;
+                std::fs::OpenOptions::new().write(true).create_new(true).open(directory.join(name))?.write_all(contents.as_bytes())?;
+            }
+            println!("rendered paused offline assets");
+        }
         ["plan-build",path]=>{let build:hft_research_platform::build::BuildSpec=read(path)?;println!("{}",serde_json::to_string(&build.cargo_arguments()?)?);}
         ["register-build",path,release]=>{
             let value:hft_research_platform::build::BuildArtifact=read(path)?;
@@ -58,7 +70,7 @@ async fn main() -> Result<()> {
         ["view",path] => { let spec: hft_cex_research_input::data::DataViewSpec=read(path)?; println!("{}",serde_json::to_string(&ledger().await?.find_view(&spec).await?.context("view has not been published")?)?); }
         ["cancel", id] => { ledger().await?.cancel(id).await?; println!("cancel_requested"); }
         ["status", id] => { println!("{}", serde_json::to_string(&ledger().await?.read(id).await?)?); }
-        _ => bail!("usage: researchctl plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID"),
+        _ => bail!("usage: researchctl render-foundation INVENTORY OUTPUT_DIRECTORY | plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID"),
     }
     Ok(())
 }

@@ -44,9 +44,8 @@ async fn main() -> Result<()> {
     };
     let api_handle = if let Some(api) = config.agent_api {
         api.validate()?;
-        let token = read_secret(&api.token_file)?;
         let ledger = reconciler.ledger.clone();
-        Some(hft_research_platform::agent_api::start(api, token, ledger).await?)
+        Some(hft_research_platform::agent_api::start(api, ledger).await?)
     } else {
         None
     };
