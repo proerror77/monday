@@ -910,6 +910,7 @@ pub(crate) fn allowed_research_feature_fields() -> Vec<String> {
 #[derive(Debug)]
 pub(crate) struct RenderedCexMission {
     pub(crate) mission: CexResearchMissionArtifactV1,
+    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
     pub(crate) mission_id: String,
 }
 
@@ -1529,6 +1530,7 @@ pub(crate) fn approved_validation(
 }
 
 #[cfg(test)]
+#[cfg_attr(all(test, not(feature = "scientific")), allow(dead_code))]
 pub(crate) fn approved_evaluation_protocol(
     materialization: &crate::mission_runner::Materialization,
 ) -> anyhow::Result<EvaluationProtocolV1> {

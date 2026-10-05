@@ -72,6 +72,7 @@ dependencies = [
  "alpha-store",
  "chrono",
  "hex",
+ "hft-cex-research-input",
  "hft-core",
  "hft-factor-dsl",
  "hft-governance-contracts",
@@ -102,13 +103,13 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hft-backtest",
+ "hft-cex-research-input",
  "hft-collector",
  "hft-factor-dsl",
  "hft-governance-contracts",
  "hft-research-artifacts",
  "hft-research-dispatch-io",
  "hft-research-manifest",
- "hft-research-ml",
  "parquet",
  "reqwest",
  "serde",
@@ -3108,9 +3109,19 @@ dependencies = [
  "anyhow",
  "chrono",
  "bincode 1.3.3",
+ "hft-research-manifest",
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "hft-cex-research-worker"
+version = "0.1.0"
+dependencies = [
+ "alpha-harness",
+ "anyhow",
+ "tokio",
 ]
 
 [[package]]
