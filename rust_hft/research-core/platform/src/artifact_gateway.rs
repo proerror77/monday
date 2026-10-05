@@ -1,6 +1,10 @@
 //! Immutable persistent objects behind operator-issued, short-lived capabilities.
 //! TLS termination belongs to the private ingress; the storage listener is loopback.
-use crate::{postgres::Ledger, sha256, valid_digest};
+use crate::{
+    artifact_identity::{read_capabilities, Access, Capability},
+    postgres::Ledger,
+    sha256,
+};
 use anyhow::{ensure, Context, Result};
 use axum::{
     body::Body,
@@ -15,7 +19,6 @@ use rustix::fs::{linkat, mkdirat, openat, unlinkat, AtFlags, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
-    io::Read,
     net::SocketAddr,
     os::fd::{AsFd, OwnedFd},
     path::PathBuf,
@@ -41,32 +44,6 @@ pub struct GatewayConfig {
     pub max_object_bytes: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Capability {
-    pub token_sha256: String,
-    pub expires_ms: u64,
-    pub access: Access,
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Access {
-    Reader {
-        prefixes: Vec<String>,
-    },
-    AttemptWriter {
-        tenant: String,
-        task_id: String,
-        attempt: u32,
-        fence: i64,
-    },
-    /// Existing trusted publisher only; cannot write scientific outputs.
-    Publisher {
-        prefixes: Vec<String>,
-    },
-}
-
 fn key_valid(key: &str) -> bool {
     key.starts_with("research/")
         && key.len() <= 2048
@@ -78,85 +55,11 @@ fn key_valid(key: &str) -> bool {
             .split('/')
             .all(|p| !p.is_empty() && p.len() <= 255 && !p.starts_with('.'))
 }
-fn prefix_valid(prefix: &str) -> bool {
-    prefix.strip_suffix('/').is_some_and(key_valid)
-}
+
 fn now_ms() -> Result<u64> {
     Ok(u64::try_from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
     )?)
-}
-fn read_capabilities(path: &std::path::Path) -> Result<Vec<Capability>> {
-    // The broker owns this file and its private parent, never the Agent.
-    // O_NOFOLLOW excludes a substituted symlink even during atomic reload.
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )?;
-    let file = File::from(fd);
-    let meta = file.metadata()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        ensure!(
-            meta.permissions().mode() & 0o077 == 0,
-            "capability file must be private"
-        );
-    }
-    ensure!(
-        meta.is_file() && meta.len() <= 1024 * 1024,
-        "invalid broker projection"
-    );
-    let mut bytes = Vec::new();
-    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= 1024 * 1024,
-        "broker projection exceeds bound"
-    );
-    let caps: Vec<Capability> = serde_json::from_slice(&bytes)?;
-    ensure!(
-        !caps.is_empty() && caps.len() <= 1024,
-        "invalid capability count"
-    );
-    let mut seen = std::collections::BTreeSet::new();
-    for cap in &caps {
-        ensure!(
-            valid_digest(&cap.token_sha256) && seen.insert(&cap.token_sha256),
-            "invalid or duplicate capability"
-        );
-        match &cap.access {
-            Access::Reader { prefixes } | Access::Publisher { prefixes } => {
-                ensure!(
-                    !prefixes.is_empty()
-                        && prefixes.len() <= 256
-                        && prefixes.iter().all(|p| prefix_valid(p)),
-                    "invalid object scope"
-                );
-                if matches!(cap.access, Access::Publisher { .. }) {
-                    ensure!(prefixes.iter().all(|p| {
-                        let parts: Vec<_> = p.trim_end_matches('/').split('/').collect();
-                        matches!(parts.as_slice(), ["research", "builds", id] if valid_digest(id))
-                            || matches!(parts.as_slice(), ["research", "sources", commit] if commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-                    }), "publisher cannot write outside an exact Build/source");
-                }
-            }
-            Access::AttemptWriter {
-                tenant,
-                task_id,
-                attempt,
-                fence,
-            } => ensure!(
-                !tenant.is_empty()
-                    && tenant.len() <= 128
-                    && valid_digest(task_id)
-                    && *attempt > 0
-                    && *fence > 0,
-                "invalid Attempt capability"
-            ),
-        }
-    }
-    Ok(caps)
 }
 
 pub struct Gateway {
@@ -519,6 +422,7 @@ fn ensure_new_object(headers: &HeaderMap) -> Result<(), StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     fn write_caps(path: &std::path::Path, caps: &[Capability]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, serde_json::to_vec(caps)?)?;
@@ -528,6 +432,8 @@ mod tests {
     fn fixture(max: u64) -> Result<(tempfile::TempDir, Arc<Gateway>, String, String)> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         let token = "publisher-fixture".repeat(4);
         let prefix = format!("research/builds/{}/", "a".repeat(64));
         let cap = Capability {
