@@ -8,6 +8,10 @@ use hft_research_platform::{
     },
     orchestrator::{AttemptContext, ResultReceipt, TaskKind},
 };
+#[cfg(test)]
+mod transport_fixture;
+#[cfg(test)]
+pub(super) use transport_fixture::assert_publication;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +38,22 @@ impl BoundOutput {
             return Ok(None);
         }
         let context = AttemptContext::from_environment()?;
+        Self::from_context_at(
+            loaded,
+            native,
+            context,
+            Path::new("/config"),
+            Path::new("/identity"),
+        )
+        .map(Some)
+    }
+    fn from_context_at(
+        loaded: &LoadedRequest,
+        native: &prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+        context: AttemptContext,
+        configuration: &Path,
+        identity: &Path,
+    ) -> anyhow::Result<Self> {
         validate_context(&context, loaded, native)?;
         let expected = context
             .spec
@@ -42,18 +62,18 @@ impl BoundOutput {
             .context("native static configuration proof missing")?;
         use base64::{engine::general_purpose::STANDARD, Engine};
         let mut encoded = std::collections::BTreeMap::new();
+        let mut raw = std::collections::BTreeMap::new();
         for name in [
             "campaign.json",
             "artifact-io.json",
             "ca.pem",
             "native-trust.json",
         ] {
-            let path = Path::new("/config").join(name);
+            let path = configuration.join(name);
             if path.try_exists()? {
-                encoded.insert(
-                    name.to_string(),
-                    STANDARD.encode(read_private_bounded(&path, 1024 * 1024)?),
-                );
+                let bytes = read_private_bounded(&path, 1024 * 1024)?;
+                encoded.insert(name.to_string(), STANDARD.encode(&bytes));
+                raw.insert(name, bytes);
             }
         }
         let actual = hft_research_platform::orchestrator::worker_configuration_reference(
@@ -65,17 +85,20 @@ impl BoundOutput {
         if &actual != expected {
             bail!("native staged static configuration changed its signed bytes");
         }
-        if hft_cex_research_input::sha256(&read_private_bounded(
-            Path::new("/config/campaign.json"),
-            1024 * 1024,
-        )?) != loaded.sha256
+        if hft_cex_research_input::sha256(
+            raw.get("campaign.json")
+                .context("native static request missing")?,
+        ) != loaded.sha256
         {
             bail!("native static campaign bytes differ from the admitted request");
         }
-        let config: ArtifactConfig = serde_json::from_slice(&read_private_bounded(
-            Path::new("/config/artifact-io.json"),
-            64 * 1024,
-        )?)?;
+        let config_bytes = raw
+            .get("artifact-io.json")
+            .context("native artifact configuration missing")?;
+        if config_bytes.len() > 64 * 1024 {
+            bail!("native artifact configuration exceeds bound");
+        }
+        let config: ArtifactConfig = serde_json::from_slice(config_bytes)?;
         if config.schema_version != "monday.cex_campaign_artifact_io.v1"
             || config.artifact_token_file != Path::new("/identity/artifact.token")
             || config.artifact_tls.ca_file.as_deref() != Some(Path::new("/config/ca.pem"))
@@ -83,12 +106,17 @@ impl BoundOutput {
         {
             bail!("native artifact transport changed its fixed private configuration");
         }
-        let trust: hft_research_platform::admission::NativeAdmissionTrust = serde_json::from_slice(
-            &read_private_bounded(Path::new("/config/native-trust.json"), 64 * 1024)?,
-        )?;
+        let trust_bytes = raw
+            .get("native-trust.json")
+            .context("native issuer trust missing")?;
+        if trust_bytes.len() > 64 * 1024 {
+            bail!("native issuer trust exceeds bound");
+        }
+        let trust: hft_research_platform::admission::NativeAdmissionTrust =
+            serde_json::from_slice(trust_bytes)?;
         let signed: hft_research_platform::admission::SignedNativeAdmission =
             serde_json::from_slice(&read_private_bounded(
-                Path::new("/identity/native-admission.json"),
+                &identity.join("native-admission.json"),
                 64 * 1024,
             )?)?;
         let verified = trust.verify(&signed)?;
@@ -96,8 +124,11 @@ impl BoundOutput {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis();
+        evidence.active_at(i64::try_from(now)?)?;
         if evidence.admission.task_spec != context.spec
             || evidence.run.id()? != context.spec.run_manifest_sha256
+            || evidence.run.code_commit != loaded.request.build_source_revision
+            || evidence.run.evaluation_protocol_sha256 != native.evaluation_protocol_sha256()
             || evidence.native_request_sha256 != native.request_sha256()
             || evidence.declared_trials != native.declared_trials() as u64
             || evidence.expires_ms <= i64::try_from(now)?
@@ -106,16 +137,19 @@ impl BoundOutput {
             bail!("native signed transfer/Attempt does not cover the exact live request/budget");
         }
         let token = String::from_utf8(read_private_bounded(
-            &config.artifact_token_file,
+            &identity.join("artifact.token"),
             64 * 1024,
         )?)?;
         let writer = Writer::with_tls(
             &config.artifact_gateway,
             token.trim().to_string(),
             &context,
-            &config.artifact_tls,
+            &hft_research_platform::transport::TlsConfig {
+                ca_file: Some(configuration.join("ca.pem")),
+                identity_file: Some(identity.join("tls.pem")),
+            },
         )?;
-        Ok(Some(Self { context, writer }))
+        Ok(Self { context, writer })
     }
     pub(super) async fn publish(
         &self,

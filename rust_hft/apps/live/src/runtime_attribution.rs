@@ -5,12 +5,12 @@ use std::time::Duration;
 use crate::deployment_envelope::{
     ActivationArtifact, ActivationMode, ActivationRequest, RuntimeFeedbackLog,
 };
-use alpha_domain::{
-    AttributionKind, AttributionMode, AttributionOutcome, EvaluationCostsV1,
-    RuntimeAttributionEvent,
-};
 use chrono::{DateTime, Utc};
 use engine::{aggregation::MarketView, RuntimeTruthStatus};
+use governance::attribution::{
+    AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
+};
+use governance::runtime_bundle::RuntimeCosts;
 use hft_core::{Side, Symbol, VenueId, VenueSymbol};
 use ports::{AccountView, ExecutionEvent};
 use rust_decimal::prelude::ToPrimitive;
@@ -1078,7 +1078,9 @@ fn expected_strategy_id(activation: &ActivationRequest, symbol: &str) -> Option<
         ActivationArtifact::Formula | ActivationArtifact::FrozenModel => {
             format!("{}:{symbol}", activation.bundle_id)
         }
-        ActivationArtifact::Onnx => activation.bundle_id.clone(),
+        ActivationArtifact::Onnx | ActivationArtifact::ProbabilityReversal => {
+            activation.bundle_id.clone()
+        }
     })
 }
 
@@ -1105,7 +1107,7 @@ fn strategy_targets(
                 );
             }
         }
-        ActivationArtifact::Onnx => {
+        ActivationArtifact::Onnx | ActivationArtifact::ProbabilityReversal => {
             targets.insert(
                 activation.bundle_id.clone(),
                 StrategyTarget {
@@ -1162,7 +1164,7 @@ fn modeled_fill_cost(
 
 fn append_sealed_cost_metrics(
     metrics: &mut BTreeMap<String, f64>,
-    costs: &EvaluationCostsV1,
+    costs: &RuntimeCosts,
 ) -> anyhow::Result<()> {
     for (name, value) in [
         ("sealed_fee_bps", costs.fee_bps),
@@ -1927,7 +1929,7 @@ mod tests {
     #[test]
     fn sealed_cex_costs_reduce_net_runtime_pnl_and_complete_coverage() {
         let mut activation = activation();
-        activation.cex_execution_costs = Some(EvaluationCostsV1 {
+        activation.cex_execution_costs = Some(RuntimeCosts {
             fee_bps: 2.0,
             rebate_bps: 0.0,
             funding_bps: 0.0,
@@ -2373,9 +2375,9 @@ mod tests {
             .unwrap()
             .lines()
             .map(|line| {
-                let signed: alpha_domain::SignedRuntimeAttributionEvent =
+                let signed: governance::attribution::SignedRuntimeAttributionEvent =
                     serde_json::from_str(line).unwrap();
-                alpha_domain::verify_runtime_attribution_event(&signed, &trusted)
+                governance::attribution::verify_runtime_attribution_event(&signed, &trusted)
                     .unwrap()
                     .into_event()
             })

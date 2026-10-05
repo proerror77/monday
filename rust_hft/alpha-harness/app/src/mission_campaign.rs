@@ -1,6 +1,8 @@
+use crate::mission_objects::{cex_campaign_round_root, cex_global_holdout_claim_object};
 #[cfg(feature = "scientific")]
 use hft_research_artifacts::publish_immutable_file;
 use hft_research_artifacts::{fetch_to_file, normalized_sha256};
+use hft_research_dispatch_io::{canonical_tokyo_oss_internal_object, validate_dns_label};
 pub(crate) mod final_evaluation;
 pub(crate) mod market_encoder;
 #[cfg(feature = "scientific")]
@@ -19,8 +21,6 @@ use crate::cli::CampaignLearnArgs;
 use crate::cli::CampaignStudyProposeArgs;
 use crate::cli::BUILD_SOURCE_REVISION;
 use crate::mission_dispatch;
-use crate::mission_objects::cex_campaign_round_root;
-use crate::mission_objects::cex_global_holdout_claim_object;
 use crate::mission_render::allowed_research_feature_fields;
 use crate::mission_render::render_cex_bundle;
 use crate::mission_render::render_prepared_cex_bundle;
@@ -59,8 +59,6 @@ use alpha_domain::{
 use alpha_engine::{baselines::CexSupervisedModelCandidateV2, engines::CexFactorBankMctsResultV1};
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
-use hft_research_dispatch_io::canonical_tokyo_oss_internal_object;
-use hft_research_dispatch_io::validate_dns_label;
 #[cfg(feature = "scientific")]
 use reqwest::StatusCode;
 use reqwest::{blocking::Client, redirect::Policy};
@@ -514,6 +512,11 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     let loaded = load_request(&args.request)?;
     if loaded.sha256 != normalized_sha256("campaign request", &args.request_sha256)? {
         bail!("campaign request SHA256 mismatch");
+    }
+    if loaded.request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V6
+        || loaded.request.prepared_inputs.is_none()
+    {
+        bail!("plain Campaign execution requires the frozen V6 prepared collection");
     }
     validate_request_for_execute(&loaded.request)?;
     if loaded.request.research_plan.calendar.is_some() && !args.pre_holdout {
@@ -5857,10 +5860,26 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn native_prepared_fixture_for_tests() -> NativePreparedFixture {
+        let source_fixture = campaign_e2e_fixture("native-body-equivalence", false, false, true);
+        let (request, inputs, root) = prepare_native_source_fixture(&source_fixture).unwrap();
+        NativePreparedFixture {
+            request,
+            inputs,
+            _source: source_fixture,
+            _root: root,
+        }
+    }
+
+    fn prepare_native_source_fixture(
+        source_fixture: &CampaignE2eFixture,
+    ) -> anyhow::Result<(
+        CampaignRequest,
+        prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+        tempfile::TempDir,
+    )> {
         use hft_cex_research_input::{
             campaign::NativeSourceBindingV1, campaign::SourceBuildRefV1, prepared::AcquiredBlocks,
         };
-        let source_fixture = campaign_e2e_fixture("native-body-equivalence", false, false, true);
         let mut request = load_request(&source_fixture.args.request).unwrap().request;
         let render = PreparedCexInputs::load(
             &source_fixture._render_fixture.feature_path,
@@ -5945,8 +5964,7 @@ pub(crate) mod tests {
             replay_artifact_sha256: request.replay_artifact_sha256.clone(),
             replay_manifest_sha256: request.replay_manifest_sha256.clone(),
         };
-        let artifacts =
-            prepared_inputs::export_trusted_source(source, rows, &protocol, canonical).unwrap();
+        let artifacts = prepared_inputs::export_trusted_source(source, rows, &protocol, canonical)?;
         let collection_path = root.path().join(format!("{}.json", artifacts.id));
         std::fs::write(
             &collection_path,
@@ -6004,12 +6022,15 @@ pub(crate) mod tests {
             1024 * 1024 * 1024,
         )
         .unwrap();
-        NativePreparedFixture {
-            request,
-            inputs,
-            _source: source_fixture,
-            _root: root,
-        }
+        Ok((request, inputs, root))
+    }
+
+    fn prepare_fixture_for_execute(fixture: &mut CampaignE2eFixture) -> anyhow::Result<()> {
+        let (request, inputs, root) = prepare_native_source_fixture(fixture)?;
+        std::fs::write(&fixture.args.request, serialize_request(&request).unwrap()).unwrap();
+        fixture.args.request_sha256 = inputs.request_sha256().into();
+        fixture._prepared_root = Some(root);
+        Ok(())
     }
 
     #[test]
@@ -6233,6 +6254,17 @@ pub(crate) mod tests {
                 "native evidence mutation {mutation} was accepted"
             );
         }
+        platform_output::assert_publication(
+            &LoadedRequest {
+                request: fixture.request.clone(),
+                sha256: fixture.inputs.request_sha256().into(),
+            },
+            &fixture.inputs,
+            &result,
+            &hash,
+            &work_dir,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -7156,8 +7188,32 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn execute_rejects_label_only_edge_before_event_replay() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false, false);
+    fn plain_v5_request_cannot_start_a_worker_or_create_work_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let request = valid_request();
+        let path = root.path().join("legacy-request.json");
+        let bytes = serialize_request(&request).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let work_dir = root.path().join("worker");
+        let error = execute(CampaignExecuteArgs {
+            final_evaluation: false,
+            final_trusted_keys: None,
+            pre_holdout: true,
+            work_dir: work_dir.clone(),
+            campaign_id: request.campaign_id,
+            image_identity: request.image_identity,
+            request: path,
+            request_sha256: hft_cex_research_input::sha256(&bytes),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("frozen V6 prepared collection"));
+        assert!(!work_dir.exists());
+    }
+
+    #[test]
+    fn execute_rejects_prediction_edge_that_fails_actual_event_replay() {
+        let mut fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false, false);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         let request = load_request(&fixture.args.request).unwrap().request;
         execute(fixture.args.clone()).unwrap();
         for round in &request.rounds {
@@ -7174,16 +7230,15 @@ pub(crate) mod tests {
                 recovered.supervised_candidate_id.as_deref(),
                 Some(selection.selected_candidate.id.as_str())
             );
-            assert!(recovered.supervised_replay_receipt_id.is_none());
-        }
-        // Model ranking varies with fitted weights. Controlled negative
-        // selections exercise every recovery path without requiring a winner.
-        for model in ["ridge", "cart", "burn_mlp"] {
-            assert_negative_candidate_recovery(&fixture, &request, &request.rounds[0], model);
+            assert!(recovered.supervised_replay_receipt_id.is_some());
+            assert_eq!(recovered.supervised_replay_gate_passed, Some(false));
         }
         let work_dir = fixture.work_dir;
-        assert!(work_dir.join("shared-inputs/features.jsonl").exists());
-        assert!(work_dir.join("shared-inputs/materialization.json").exists());
+        assert!(work_dir
+            .join("shared-inputs/native-prepared-inputs.json")
+            .exists());
+        assert!(!work_dir.join("shared-inputs/features.jsonl").exists());
+        assert!(!work_dir.join("shared-inputs/materialization.json").exists());
         let result: serde_json::Value =
             serde_json::from_slice(&std::fs::read(work_dir.join("campaign-result.json")).unwrap())
                 .unwrap();
@@ -7226,7 +7281,7 @@ pub(crate) mod tests {
             assert!(results.join("supervised-model-selection.json").exists());
             assert!(results.join("burn-mlp-baseline.json").exists());
             assert!(results.join("burn_mlp-supervised-candidate.json").exists());
-            assert!(!results
+            assert!(results
                 .join("supervised-event-replay-receipt.json")
                 .exists());
             assert!(!results.join("factor-subset-mcts-result.json").exists());
@@ -7234,9 +7289,12 @@ pub(crate) mod tests {
         }
         assert_eq!(result["termination_reason"], "campaign_no_candidate");
         assert!(result["rounds"].as_array().unwrap().iter().all(|round| {
-            round["termination_reason"] == "no_passing_supervised_model"
-                && round["supervised_replay_gate_passed"].is_null()
-                && round["feedback"]["supervised_replay"].is_null()
+            round["termination_reason"] == "supervised_replay_gate_failed"
+                && round["supervised_replay_gate_passed"] == false
+                && round["feedback"]["supervised_replay"]["mean_net_return"]
+                    .as_f64()
+                    .unwrap()
+                    <= 0.0
         }));
         assert!(result["selected_round_id"].is_null());
         assert!(result["finalization"].is_null());
@@ -7267,12 +7325,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn calendar_h1_preserves_negative_validation_and_independent_bundle_readback() {
+    fn calendar_h1_negative_cannot_borrow_a_withheld_future_mark() {
         assert_calendar_h1_readback(true);
     }
 
     #[test]
-    fn calendar_h1_replays_nonzero_validation_without_opening_sealed() {
+    fn calendar_h1_positive_cannot_borrow_a_withheld_future_mark() {
         assert_calendar_h1_readback(false);
     }
 
@@ -7328,7 +7386,6 @@ pub(crate) mod tests {
         )
         .unwrap();
         plan.development_precheck = Some(inputs.development_precheck(plan).unwrap());
-        let protocol = plan.development_precheck.as_ref().unwrap().protocol.clone();
         request.holdout_id = render_prepared_cex_bundle(&inputs, plan, 7, 46)
             .unwrap()
             .mission
@@ -7340,175 +7397,20 @@ pub(crate) mod tests {
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
             hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
-        execute(fixture.args.clone()).unwrap();
-        let loaded = load_request(&fixture.args.request).unwrap();
-        let client = Client::builder().redirect(Policy::none()).build().unwrap();
-        let (_, trials, _) = readback_pre_holdout_terminal(
-            &client,
-            &loaded.request,
-            &loaded.sha256,
-            &protocol.content_hash().unwrap(),
-        )
-        .unwrap();
-        assert!(trials <= 46);
-        let result = load_campaign_result(&fixture.work_dir.join("campaign-result.json")).unwrap();
-        if negative {
-            assert_eq!(result.termination_reason, "campaign_no_candidate");
-        }
+        let error = prepare_fixture_for_execute(&mut fixture).unwrap_err();
+        assert!(
+            error.to_string().contains("withheld selection or holdout"),
+            "{error:#}"
+        );
+        assert!(!fixture.work_dir.exists());
         assert!(!fixture.global_claim_path.exists());
-        for round in &result.rounds {
-            assert!(round.feedback.calendar_validation.is_some());
-            let bank_path = fixture.work_dir.join(format!(
-                "mission/{}/execute/results/factor-bank.json",
-                round.round_id
-            ));
-            let bank: CexFactorBankRevisionV2 =
-                serde_json::from_slice(&std::fs::read(bank_path).unwrap()).unwrap();
-            assert!(
-                bank.entries
-                    .iter()
-                    .any(|entry| entry.source_features.iter().any(|field| field
-                        == alpha_domain::CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD)),
-                "calendar validation must exercise a fitted research-only factor"
-            );
-            let path = fixture.work_dir.join(format!(
-                "mission/{}/execute/results/calendar-validation.json",
-                round.round_id
-            ));
-            let report: alpha_engine::final_models::CalendarValidationReportV1 =
-                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-            assert!(!report.promotion_authority);
-            if negative {
-                assert!(!report.report.evaluation.passed);
-            }
-            assert!(report.last_training_time < report.calendar.calendar.develop_end);
-            assert!(report.report.ledger.iter().all(|row| row.available_time
-                >= report.calendar.calendar.develop_end
-                && row.available_time < report.calendar.calendar.validation_end));
-            let planned = loaded
+        assert_eq!(
+            load_request(&fixture.args.request)
+                .unwrap()
                 .request
-                .rounds
-                .iter()
-                .find(|planned| planned.round_id == round.round_id)
-                .unwrap();
-            let lightweight = crate::mission_metrics::campaign::collect_verified_archive(
-                Path::new(&planned.result_readback_url),
-                &round.round_id,
-                round.seed,
-                &round.mission_id,
-                &round.result_bundle_sha256,
-            )
-            .unwrap();
-            assert_eq!(
-                lightweight.calendar_validation.as_ref(),
-                Some(&report.summary().unwrap())
-            );
-            assert_eq!(
-                lightweight.label_space_precheck.as_ref().unwrap().scope,
-                "calendar_development_only_overlapping_labels"
-            );
-            let diagnostics = lightweight
-                .calendar_prediction_diagnostics
-                .as_ref()
-                .unwrap();
-            assert!(!diagnostics.training_performed && !diagnostics.promotion_authority);
-            assert_eq!(
-                diagnostics.source_validation_sha256,
-                report.summary().unwrap().report_content_sha256
-            );
-            assert_eq!(
-                diagnostics.counts.evaluated_rows,
-                report.report.ledger.len()
-            );
-            assert_eq!(
-                diagnostics.counts.horizon_eligible_rows + diagnostics.counts.tail_rows,
-                diagnostics.counts.evaluated_rows
-            );
-            if negative {
-                assert_eq!(diagnostics.counts.eligible_nonzero_entry_signals, 0);
-            } else {
-                assert!(diagnostics.counts.eligible_nonzero_entry_signals > 0);
-            }
-            assert_eq!(lightweight.calendar_replay.is_some(), !negative);
-            if negative {
-                assert!(report
-                    .report
-                    .ledger
-                    .iter()
-                    .all(|row| row.target_position == 0.0));
-            } else {
-                assert!(report
-                    .report
-                    .ledger
-                    .iter()
-                    .any(|row| row.target_position != 0.0));
-                let replay_path = fixture.work_dir.join(format!(
-                    "mission/{}/execute/results/calendar-validation-event-replay-receipt.json",
-                    round.round_id
-                ));
-                let replay: CexEventReplayReceiptV1 =
-                    serde_json::from_slice(&std::fs::read(replay_path).unwrap()).unwrap();
-                let holding = replay.metrics.holding.as_ref().unwrap();
-                assert!(holding.closed_episodes > 0);
-                assert_eq!(holding.incomplete_exit_orders, 0);
-                assert_eq!(holding.delayed_exit_decisions, 0);
-            }
-        }
-        if negative {
-            assert_metric_bundle_rejected(
-                &loaded,
-                &protocol.content_hash().unwrap(),
-                &client,
-                |entries| {
-                    let mut diagnostics: serde_json::Value = serde_json::from_slice(
-                        &entries["results/calendar-prediction-diagnostics.json"],
-                    )
-                    .unwrap();
-                    diagnostics["counts"]["eligible_predictions_above_cost"] =
-                        serde_json::json!(999);
-                    entries.insert(
-                        "results/calendar-prediction-diagnostics.json".into(),
-                        serde_json::to_vec(&diagnostics).unwrap(),
-                    );
-                },
-                "calendar prediction diagnostics differ from independently evaluated rows",
-            );
-            assert_metric_bundle_rejected(
-                &loaded,
-                &protocol.content_hash().unwrap(),
-                &client,
-                |entries| {
-                    entries.remove("results/calendar-prediction-diagnostics.json");
-                },
-                "calendar prediction diagnostics missing",
-            );
-            assert_metric_bundle_rejected(
-                &loaded,
-                &protocol.content_hash().unwrap(),
-                &client,
-                |entries| {
-                    let mut report: serde_json::Value =
-                        serde_json::from_slice(&entries["results/calendar-validation.json"])
-                            .unwrap();
-                    report["report"]["ledger"][0]["prediction"] = serde_json::json!(9999.0);
-                    entries.insert(
-                        "results/calendar-validation.json".into(),
-                        serde_json::to_vec(&report).unwrap(),
-                    );
-                },
-                "calendar validation differs from independently evaluated fitted weights",
-            );
-        } else {
-            assert_metric_bundle_rejected(
-                &loaded,
-                &protocol.content_hash().unwrap(),
-                &client,
-                |entries| {
-                    entries.remove("results/calendar-validation-event-replay-receipt.json");
-                },
-                "nonzero calendar validation is missing observed event replay",
-            );
-        }
+                .prepared_inputs,
+            None
+        );
     }
 
     fn assert_ridge_holding_campaign(mut fixture: CampaignE2eFixture, negative: bool) {
@@ -7526,6 +7428,7 @@ pub(crate) mod tests {
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
             hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
         let materialization = crate::mission_runner::decode_materialization(
@@ -7627,7 +7530,8 @@ pub(crate) mod tests {
 
     #[test]
     fn execute_keeps_profitable_ml_replay_without_legacy_finalization() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-ml-positive", false, false, true);
+        let mut fixture = campaign_e2e_fixture("campaign-e2e-ml-positive", false, false, true);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
 
         let result: serde_json::Value = serde_json::from_slice(
@@ -7824,28 +7728,27 @@ pub(crate) mod tests {
             |entries| {
                 let path = entries
                     .keys()
-                    .find(|name| name.starts_with("artifacts/") && name.ends_with(".jsonl"))
+                    .find(|name| {
+                        name.starts_with("results/native-prepared-blocks/")
+                            && name.ends_with(".mondaybin")
+                    })
                     .unwrap()
                     .clone();
                 entries.get_mut(&path).unwrap().push(b' ');
             },
-            "model metric feature bytes differ from the admitted Mission input SHA256",
+            "native archive changed a declared block length",
         );
 
         assert_cached_terminal_reporting(&fixture, &loaded, &protocol, &client, &hash);
 
-        assert_final_worker_outcome(
-            &fixture,
-            loaded,
-            hash,
-            &client,
-            alpha_store::campaign_ledger::CampaignFinalOutcomeV1::PromotionReady,
-        );
+        assert_development_request_requires_withheld_inputs(&fixture, loaded, hash);
     }
 
     #[test]
     fn execute_retains_paired_mlp_training_diagnostics() {
-        let control = campaign_e2e_fixture("campaign-e2e-ml-profile-control", false, false, true);
+        let mut control =
+            campaign_e2e_fixture("campaign-e2e-ml-profile-control", false, false, true);
+        prepare_fixture_for_execute(&mut control).unwrap();
         execute(control.args.clone()).unwrap();
         assert_paired_training_roundtrip(&control);
     }
@@ -7912,6 +7815,7 @@ pub(crate) mod tests {
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
             hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
         let materialization = crate::mission_runner::decode_materialization(
@@ -8247,16 +8151,13 @@ pub(crate) mod tests {
         );
     }
 
-    fn assert_final_worker_outcome(
+    fn assert_development_request_requires_withheld_inputs(
         fixture: &CampaignE2eFixture,
         loaded: LoadedRequest,
         hash: String,
-        client: &Client,
-        expected: alpha_store::campaign_ledger::CampaignFinalOutcomeV1,
     ) {
-        // Exercise the final worker with local transport and independent signed
-        // authority, after removing the original execution checkout artifacts.
-        // The controller's close/claim/revocation protocol has separate ledger tests.
+        // A signed final grant is not a withheld data capability. The V6
+        // search request cannot create a final worker that reads those bytes.
         use alpha_domain::campaign_finalization::{
             sign_campaign_final_evaluation_grant, CampaignFinalEvaluationGrantV1,
             FINAL_EVALUATION_GRANT_SCHEMA,
@@ -8294,7 +8195,7 @@ pub(crate) mod tests {
             &final_key,
         )
         .unwrap();
-        let final_request = final_evaluation::FinalRequest::new(
+        let result = final_evaluation::FinalRequest::new(
             signed,
             std::collections::BTreeMap::from([(operation, loaded.request)]),
             fixture
@@ -8303,130 +8204,37 @@ pub(crate) mod tests {
                 .join("final-published")
                 .to_string_lossy()
                 .into_owned(),
-        )
-        .unwrap();
-        let final_request_path = fixture._root.path().join("final-request.json");
-        hft_research_artifacts::write_json_atomic(&final_request_path, &final_request).unwrap();
-        let final_sha = hft_research_artifacts::sha256_file(&final_request_path).unwrap();
-        let keys = fixture._root.path().join("final-keys.json");
-        hft_research_artifacts::write_json_atomic(
-            &keys,
-            &std::collections::BTreeMap::from([(
-                "final-key",
-                hex::encode(final_key.verifying_key().as_bytes()),
-            )]),
-        )
-        .unwrap();
-        let final_work = fixture._root.path().join("final-work");
-        std::fs::remove_dir_all(fixture.work_dir.join("mission")).unwrap();
-        let final_args = CampaignExecuteArgs {
-            final_evaluation: true,
-            final_trusted_keys: Some(keys.clone()),
-            pre_holdout: false,
-            work_dir: final_work.clone(),
-            campaign_id: final_request.campaign_id.clone(),
-            image_identity: final_request.image_identity.clone(),
-            request: final_request_path,
-            request_sha256: final_sha.clone(),
-        };
-        if let Err(error) = execute(final_args.clone()) {
-            let selection = std::fs::read_to_string(
-                final_work
-                    .join(&final_request.campaign_id)
-                    .join("results/independent-selection.json"),
-            )
-            .unwrap_or_default();
-            panic!("final worker failed: {error:#}; selection: {selection}");
-        }
-        let final_result: final_evaluation::FinalResult = serde_json::from_slice(
-            &std::fs::read(
-                final_work
-                    .join(&final_request.campaign_id)
-                    .join("final-result.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            final_result.outcome,
-            expected,
-            "{}",
-            std::fs::read_to_string(
-                final_work
-                    .join(&final_request.campaign_id)
-                    .join("results/independent-selection.json")
-            )
-            .unwrap()
         );
-        assert!(fixture.global_claim_path.is_file());
-        if expected == alpha_store::campaign_ledger::CampaignFinalOutcomeV1::PromotionReady {
-            let bundle: alpha_domain::StrategyBundle = serde_json::from_slice(
-                &std::fs::read(
-                    final_work
-                        .join(&final_request.campaign_id)
-                        .join("results/strategy-bundle.json"),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            let alpha_domain::StrategyBundleArtifact::FrozenModel { strategy } = bundle.artifact
-            else {
-                panic!("expected native model bundle")
-            };
-            assert_eq!(
-                strategy.frozen.evaluator_config.multiple_testing_trials,
-                final_request.first_source().unwrap().declared_total_trials
-            );
-            assert_ne!(
-                strategy.frozen.evaluator_config.multiple_testing_trials, 2,
-                "benchmark comparison is not the final trial family"
-            );
-        } else {
-            assert!(final_result.strategy_bundle.is_none());
-            assert!(final_result.promotion.is_none());
-        }
-        let grant = crate::mission_dispatch::final_admission::verify_worker_grant(
-            &final_request.grant,
-            &keys,
-        )
-        .unwrap();
-        let (readback, _) =
-            final_evaluation::readback_terminal(client, &final_request, &final_sha, &grant)
-                .unwrap();
-        assert_eq!(readback, final_result);
-        assert!(execute(final_args)
-            .unwrap_err()
-            .to_string()
-            .contains("already exists"));
+        assert!(
+            result.is_err(),
+            "development-only source cannot invent withheld read capabilities"
+        );
+        assert!(!fixture.global_claim_path.exists());
+        assert!(!fixture._root.path().join("final-work").exists());
     }
 
     #[test]
-    fn final_model_rejected_holdout_keeps_claim_without_promotion() {
-        let fixture = campaign_e2e_fixture_with_rejected_holdout(
+    fn development_only_request_cannot_open_holdout_with_a_final_grant() {
+        let mut fixture = campaign_e2e_fixture_with_rejected_holdout(
             "campaign-final-negative",
             false,
             false,
             true,
             true,
         );
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
         let hash =
             hft_research_artifacts::sha256_file(&fixture.work_dir.join("campaign-result.json"))
                 .unwrap();
-        let client = Client::builder().redirect(Policy::none()).build().unwrap();
-        assert_final_worker_outcome(
-            &fixture,
-            loaded,
-            hash,
-            &client,
-            alpha_store::campaign_ledger::CampaignFinalOutcomeV1::HoldoutRejected,
-        );
+        assert_development_request_requires_withheld_inputs(&fixture, loaded, hash);
     }
 
     #[test]
     fn execute_negative_campaign_creates_no_claim() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-negative", true, false, false);
+        let mut fixture = campaign_e2e_fixture("campaign-e2e-negative", true, false, false);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
 
         let result: serde_json::Value = serde_json::from_slice(
@@ -8508,7 +8316,8 @@ pub(crate) mod tests {
 
     #[test]
     fn collect_round_ledger_rejects_supervised_replay_report_drift() {
-        let fixture = campaign_e2e_fixture("campaign-ledger-no-selection", false, false, true);
+        let mut fixture = campaign_e2e_fixture("campaign-ledger-no-selection", false, false, true);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
 
         let request = load_request(&fixture.args.request).unwrap().request;
@@ -8526,7 +8335,9 @@ pub(crate) mod tests {
 
     #[test]
     fn collect_round_ledger_rejects_missing_supervised_replay() {
-        let fixture = campaign_e2e_fixture("campaign-ledger-missing-result", false, false, true);
+        let mut fixture =
+            campaign_e2e_fixture("campaign-ledger-missing-result", false, false, true);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
 
         let request = load_request(&fixture.args.request).unwrap().request;
@@ -8549,7 +8360,8 @@ pub(crate) mod tests {
 
     #[test]
     fn supervised_search_does_not_touch_an_existing_global_claim() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-existing-claim", false, true, false);
+        let mut fixture = campaign_e2e_fixture("campaign-e2e-existing-claim", false, true, false);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args).unwrap();
 
         assert_eq!(
@@ -8652,58 +8464,6 @@ pub(crate) mod tests {
         )
         .unwrap()
         .unwrap()
-    }
-
-    fn assert_negative_candidate_recovery(
-        fixture: &CampaignE2eFixture,
-        request: &CampaignRequest,
-        round: &CampaignRoundRequest,
-        model: &str,
-    ) {
-        let mut source =
-            zip::ZipArchive::new(File::open(&round.result_readback_url).unwrap()).unwrap();
-        let mut entries = std::collections::BTreeMap::new();
-        for index in 0..source.len() {
-            let mut entry = source.by_index(index).unwrap();
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes).unwrap();
-            entries.insert(entry.name().to_string(), bytes);
-        }
-        let candidate: CexSupervisedModelCandidateV2 =
-            serde_json::from_slice(&entries[&format!("results/{model}-supervised-candidate.json")])
-                .unwrap();
-        assert!(!candidate.evaluation.passed);
-        let mut selection: CexSupervisedModelSelectionV1 =
-            serde_json::from_slice(&entries["results/supervised-model-selection.json"]).unwrap();
-        selection.selected_candidate = alpha_domain::CexResearchContentRefV1 {
-            id: candidate.artifact_id.clone(),
-            content_sha256: canonical_json_hash(&candidate).unwrap(),
-        };
-        selection.replay_eligible = false;
-        entries.insert(
-            "results/supervised-model-selection.json".into(),
-            serde_json::to_vec(&selection).unwrap(),
-        );
-        regenerate_metric_entries(&mut entries);
-        let bundle = fixture.work_dir.join(format!("negative-{model}.zip"));
-        let mut writer = zip::ZipWriter::new(File::create(&bundle).unwrap());
-        for (name, bytes) in entries {
-            writer
-                .start_file(name, zip::write::SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(&bytes).unwrap();
-        }
-        writer.finish().unwrap();
-        let mut controlled = round.clone();
-        controlled.result_readback_url = bundle.to_string_lossy().into_owned();
-        let recovered = recover_round_report(&fixture.work_dir, request, &controlled);
-        assert_eq!(
-            recovered.supervised_candidate_id.as_deref(),
-            Some(candidate.artifact_id.as_str())
-        );
-        assert!(recovered.supervised_replay_receipt_id.is_none());
-        assert!(recovered.supervised_replay_gate_passed.is_none());
-        assert!(recovered.sealed_receipt_id.is_none());
     }
 
     #[test]
@@ -8890,6 +8650,7 @@ pub(crate) mod tests {
     }
 
     struct CampaignE2eFixture {
+        _prepared_root: Option<tempfile::TempDir>,
         _root: tempfile::TempDir,
         _replay_root: tempfile::TempDir,
         _render_fixture: mission_render::tests::Fixture,
@@ -8964,6 +8725,7 @@ pub(crate) mod tests {
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
         if zero_labels {
             for row in &mut rows {
+                row.features.insert("mid_price".into(), 60_000.0);
                 row.label = 0.0;
             }
         } else {
@@ -8989,24 +8751,16 @@ pub(crate) mod tests {
                     .insert("vwap_center_deviation_top5_bps".to_string(), direction);
                 row.features
                     .insert("weighted_book_imbalance_top5".to_string(), direction);
-                if replay_tracks_features {
-                    row.features.insert("mid_price".to_string(), mid_price);
-                    mid_price *= 1.0 + direction * price_step;
-                } else {
-                    row.label = direction * 0.001;
-                }
+                row.features.insert("mid_price".to_string(), mid_price);
+                mid_price *= 1.0 + direction * price_step;
             }
-            if replay_tracks_features {
-                let mid_prices = rows
-                    .iter()
-                    .map(|row| row.features["mid_price"])
-                    .collect::<Vec<_>>();
-                for (index, row) in rows.iter_mut().enumerate() {
-                    let future = mid_prices
-                        .get(index + 5)
-                        .copied()
-                        .unwrap_or(mid_prices[index]);
-                    row.label = future / mid_prices[index] - 1.0;
+            let observations = rows
+                .iter()
+                .map(|row| (row.feature_available_time, row.features["mid_price"]))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            for row in &mut rows {
+                if let Some(future) = observations.get(&row.label_available_time) {
+                    row.label = future / row.features["mid_price"] - 1.0;
                 }
             }
         }
@@ -9064,6 +8818,7 @@ pub(crate) mod tests {
         let request_sha256 = hex::encode(Sha256::digest(&request_bytes));
         let work_dir = root.path().join("campaign-work");
         CampaignE2eFixture {
+            _prepared_root: None,
             _root: root,
             _replay_root: replay_root,
             _render_fixture: render_fixture,

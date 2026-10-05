@@ -6,6 +6,7 @@ pub mod model;
 pub mod portable_market;
 pub mod portable_network;
 pub mod portable_sequence;
+pub mod prediction_probability;
 pub mod prepared_market;
 pub mod sec_orderflow;
 pub mod sequence;

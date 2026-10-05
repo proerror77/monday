@@ -14,7 +14,9 @@
       "manifest_path": "rust_hft/alpha-harness/worker/Cargo.toml",
       "dependencies": [{ "name": "alpha-harness", "path": "rust_hft/alpha-harness/app" }]
     },
-    { "name": "hft-live", "manifest_path": "rust_hft/apps/live/Cargo.toml", "dependencies": [] },
+    { "name": "hft-strategy-probability-reversal", "manifest_path": "rust_hft/strategy-framework/strategies/probability_reversal/Cargo.toml", "dependencies": [{ "name": "hft-ports", "path": "../../../market-core/ports" }] },
+    { "name": "hft-runtime", "manifest_path": "rust_hft/market-core/runtime/Cargo.toml", "dependencies": [{ "name": "hft-strategy-probability-reversal", "path": "../../../strategy-framework/strategies/probability_reversal" }] },
+    { "name": "hft-live", "manifest_path": "rust_hft/apps/live/Cargo.toml", "dependencies": [{ "name": "hft-runtime", "path": "../../market-core/runtime" }] },
     { "name": "hft-integration", "manifest_path": "rust_hft/market-core/integration/Cargo.toml", "dependencies": [] },
     { "name": "hft-data-adapter-ondo-perps", "manifest_path": "rust_hft/data-pipelines/adapters/adapter-ondo-perps/Cargo.toml", "dependencies": [] },
     { "name": "hft-paper", "manifest_path": "rust_hft/apps/paper/Cargo.toml", "dependencies": [] },

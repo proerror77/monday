@@ -31,6 +31,20 @@ cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
 if grep -E '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-control.tree"; then
   echo 'CEX evidence verification pulls a training or ONNX implementation' >&2; exit 1
 fi
+cargo tree --manifest-path "$root/rust_hft/shared/Cargo.toml" \
+  -p hft-cex-research-input --features streaming --locked --edges normal --prefix none >"$work/cex-input.tree"
+if grep -E '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-input.tree"; then
+  echo 'Immutable CEX input readers pull a scientific implementation' >&2; exit 1
+fi
+cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
+  -p alpha-harness --locked --edges normal --prefix none >"$work/cex-operator.tree"
+if grep -E '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-operator.tree"; then
+  echo 'CEX operator pulls a training or ONNX implementation' >&2; exit 1
+fi
+cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
+  -p hft-cex-research-worker --locked --edges normal --prefix none >"$work/cex-worker.tree"
+grep -q '^hft-research-ml ' "$work/cex-worker.tree"
+grep -q '^burn ' "$work/cex-worker.tree"
 for profile in default db full; do
   options=()
   [[ $profile == default ]] || options=(--features db)
@@ -45,6 +59,13 @@ cargo tree --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" \
 if grep -E '^(burn|ort |hft-(collector|research-ml|data) |parquet )' "$work/control.tree"; then
   echo 'control pulls acquisition, training or Parquet' >&2; exit 1
 fi
+for features in formula-strategy,binance full; do
+  cargo tree --manifest-path "$root/rust_hft/runtime/Cargo.toml" -p hft-live \
+    --no-default-features --features "$features" --locked --edges normal --prefix none >"$work/live.tree"
+  if grep -E '^(alpha-(domain|engine|store|onnx-evaluator|harness) |burn |hft-(collector|research-platform|research-ml) )' "$work/live.tree"; then
+    echo 'live imports research control, evaluation or training' >&2; exit 1
+  fi
+done
 # Depth acquisition and book sequencing must not compile the order-loop engine.
 for selection in 'data-pipelines/Cargo.toml hft-collector' 'data-pipelines/Cargo.toml hft-binance-md' 'runtime/Cargo.toml hft-binance-depth'; do
   read -r manifest package <<<"$selection"
@@ -80,4 +101,9 @@ for package in hft-research-artifacts hft-research-dispatch-io hft-prediction-re
     echo 'artifact transport or scientific worker imports cluster operations' >&2; exit 1
   fi
 done
+cargo tree --manifest-path "$root/rust_hft/runtime/Cargo.toml" \
+  -p hft-strategy-probability-reversal --locked --edges normal --prefix none >"$work/probability.tree"
+if grep -E '^(alpha-(domain|engine|harness|store|onnx-evaluator) |burn |ort |sqlx-|axum |reqwest |hft-(collector|research-platform|research-ml|execution-adapter-[a-z-]+) )' "$work/probability.tree"; then
+  echo 'fixed probability strategy imports science, control, transport or execution' >&2; exit 1
+fi
 printf 'workspace ownership, scoped commands, feature rejection and thin closures passed\n'

@@ -11,6 +11,13 @@ label is reconstructed from the actual future observation at its frozen clock.
 A future mark or maturity in selection or holdout rejects export. No rows or
 prices are invented, interpolated, silently cropped, or relabeled as Train.
 
+The current fixed Calendar contract starts selection at `develop_end`, without
+an authorized future-price gap. Its development tail therefore requires marks
+inside selection. Export rejects that Calendar plan until an explicit learning
+row and observation-tail contract is admitted. Ordinary non-Calendar V6 inputs
+do not inherit that limitation. A final evaluation grant alone cannot restore
+withheld read capabilities removed from a development request.
+
 `hft_cex_research_input::campaign::VerifiedCampaignPreparedInputsV1` is the opaque
 readback result. Its collection identity binds original total/partition metadata,
 protocol, label recipe, native ResearchRow hash, source Build, native preparation
@@ -41,6 +48,20 @@ replay validators. The original feature, materialization, and dataset manifests
 remain exact lineage metadata. Development bytes never use the original
 full-source feature SHA filename. Recovery rejects altered or missing blocks,
 foreign lineage metadata, and withheld evaluation artifacts.
+
+The platform worker verifies the admitted Attempt, exact static configuration,
+native signature, source revision, protocol and expiry before fitting. Static
+files use `/config`; per-Attempt credentials use `/identity`. Credentials never
+enter the static configuration hash. The private reader hashes and parses one
+snapshot of the static files. No signing key or database credential reaches the
+worker.
+
+After independent native ZIP recovery, the worker uploads the actual campaign
+result and round archives through the scoped TLS writer. Immutable PUT recovery
+requires actual GET bytes. `cex-campaign.json` binds the original request,
+collection, source, trials and decoded archive entries. `receipt.json` binds the
+same artifacts to the admitted Task, Attempt and fence. Successful transport
+keeps the scientific status `insufficient_evidence`.
 
 Platform CexCampaign admission, its transferred native budget, the platform
 lease/attempt fence and terminal settlement are separate enforced boundaries.

@@ -18,9 +18,24 @@ pub use evaluation_calendar::{EvaluationCalendarBindingV1, EvaluationCalendarV1}
 pub use evaluation_partition::{EvaluationRowPartitionsV1, EvaluationSelectionV1};
 pub use mlp_training::{CexMlpFoldObservationV1, CexMlpTrainingPlanV1, CexMlpTrainingProfileV1};
 pub mod runtime_latency_evidence;
+mod runtime_projection;
+use governance::attribution::{
+    AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
+};
+use governance::runtime_bundle::RuntimeOnnxModel;
+#[cfg(test)]
+use governance::runtime_bundle::{
+    TensorElementType, TensorSpec, LOB_ONNX_PREPROCESSING_VERSION, MAX_ONNX_ARTIFACT_BYTES,
+    MAX_ONNX_TENSOR_ELEMENTS,
+};
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+#[cfg(test)]
+use ed25519_dalek::{SigningKey, VerifyingKey};
+#[cfg(test)]
+use governance::attribution::{
+    sign_runtime_attribution_event, verify_runtime_attribution_event, SignedRuntimeAttributionEvent,
+};
 use hft_factor_dsl::{
     validate_live_formula, FactorAst, FactorOperator, FactorTerminal, LiveFormulaCapability,
     LiveFormulaCapabilityError,
@@ -31,15 +46,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
-pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
 pub const MAX_CEX_FACTOR_BANK_MCTS_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v5";
 pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v5";
 pub const CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION: &str = "cex-baseline-purged-walk-forward-v2";
 pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-v4";
 pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v4";
-pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
 pub const EVALUATION_PROTOCOL_VERSION_V1: &str = "evaluation-protocol-v1";
 pub const EVALUATION_PROTOCOL_VERSION_V2: &str = "evaluation-protocol-v2";
 pub const EVALUATION_PROTOCOL_VERSION_V3: &str = "evaluation-protocol-v3-calendar";
@@ -65,6 +77,10 @@ pub const CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND: &str = "cex_sealed_holdout_cla
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
+    #[error(transparent)]
+    RuntimeContract(#[from] governance::runtime_bundle::RuntimeBundleError),
+    #[error(transparent)]
+    Attribution(#[from] governance::attribution::AttributionError),
     #[error("{0} cannot be empty")]
     EmptyField(&'static str),
     #[error("search budget must include at least one candidate and one positive limit")]
@@ -79,18 +95,6 @@ pub enum DomainError {
     InvalidLoopRun,
     #[error("canonical serialization failed")]
     CanonicalSerialization,
-    #[error("runtime attribution metrics must be finite")]
-    InvalidAttributionMetric,
-    #[error("runtime attribution outcome does not match its event kind")]
-    InvalidAttributionOutcome,
-    #[error("runtime attribution payload hash does not match")]
-    AttributionPayloadHashMismatch,
-    #[error("runtime attribution signing key is not trusted")]
-    UnknownAttributionSigningKey,
-    #[error("runtime attribution signature is invalid")]
-    InvalidAttributionSignature,
-    #[error("runtime attribution signature encoding is invalid")]
-    InvalidAttributionSignatureEncoding,
     #[error("search-policy validator scores must be finite")]
     InvalidPolicyScore,
     #[error("candidate artifact is research-only and cannot be promoted")]
@@ -4350,187 +4354,6 @@ pub enum EngineKind {
     FinalEvaluation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AttributionMode {
-    Paper,
-    Shadow,
-    LiveSmall,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AttributionOutcome {
-    Activated,
-    Healthy,
-    Decayed,
-    RolledBack,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum AttributionKind {
-    #[default]
-    Activation,
-    Fill,
-    Reject,
-    Cancel,
-    PortfolioSnapshot,
-    StreamGap,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeAttributionEvent {
-    pub event_id: String,
-    pub deployment_id: String,
-    pub asset_revision_id: String,
-    pub mission_id: Option<String>,
-    pub mode: AttributionMode,
-    pub outcome: AttributionOutcome,
-    #[serde(default)]
-    pub kind: AttributionKind,
-    #[serde(default)]
-    pub strategy_id: Option<String>,
-    #[serde(default)]
-    pub order_id: Option<String>,
-    #[serde(default)]
-    pub account_id: Option<String>,
-    #[serde(default)]
-    pub venue: Option<String>,
-    #[serde(default)]
-    pub symbol: Option<String>,
-    pub metrics: BTreeMap<String, f64>,
-    pub reason: Option<String>,
-    pub observed_at: DateTime<Utc>,
-}
-
-impl RuntimeAttributionEvent {
-    pub fn validate(&self) -> Result<(), DomainError> {
-        require_text("attribution event_id", &self.event_id)?;
-        require_text("attribution deployment_id", &self.deployment_id)?;
-        require_text("attribution asset_revision_id", &self.asset_revision_id)?;
-        if self.metrics.values().any(|value| !value.is_finite()) {
-            return Err(DomainError::InvalidAttributionMetric);
-        }
-        for value in [
-            self.strategy_id.as_deref(),
-            self.order_id.as_deref(),
-            self.account_id.as_deref(),
-            self.venue.as_deref(),
-            self.symbol.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if value.trim().is_empty() {
-                return Err(DomainError::EmptyField("attribution scope"));
-            }
-        }
-        match self.kind {
-            AttributionKind::Fill | AttributionKind::Reject | AttributionKind::Cancel
-                if self.strategy_id.is_none()
-                    || self.order_id.is_none()
-                    || self.account_id.is_none()
-                    || self.venue.is_none()
-                    || self.symbol.is_none() =>
-            {
-                return Err(DomainError::EmptyField("attribution order scope"));
-            }
-            AttributionKind::PortfolioSnapshot
-                if self.strategy_id.is_none()
-                    || self.account_id.is_none()
-                    || self.venue.is_none() =>
-            {
-                return Err(DomainError::EmptyField("attribution portfolio scope"));
-            }
-            AttributionKind::StreamGap if self.reason.as_deref().is_none_or(str::is_empty) => {
-                return Err(DomainError::EmptyField("attribution stream gap reason"));
-            }
-            _ => {}
-        }
-        match (&self.kind, &self.outcome) {
-            (AttributionKind::Fill | AttributionKind::Cancel, AttributionOutcome::Healthy)
-            | (AttributionKind::Reject | AttributionKind::StreamGap, AttributionOutcome::Failed)
-            | (
-                AttributionKind::PortfolioSnapshot,
-                AttributionOutcome::Healthy
-                | AttributionOutcome::Decayed
-                | AttributionOutcome::RolledBack
-                | AttributionOutcome::Failed,
-            )
-            | (AttributionKind::Activation, _) => Ok(()),
-            _ => Err(DomainError::InvalidAttributionOutcome),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SignedRuntimeAttributionEvent {
-    pub event: RuntimeAttributionEvent,
-    pub key_id: String,
-    pub content_hash: String,
-    pub signature_hex: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct VerifiedRuntimeAttributionEvent(RuntimeAttributionEvent);
-
-impl VerifiedRuntimeAttributionEvent {
-    pub fn event(&self) -> &RuntimeAttributionEvent {
-        &self.0
-    }
-
-    pub fn into_event(self) -> RuntimeAttributionEvent {
-        self.0
-    }
-}
-
-impl std::ops::Deref for VerifiedRuntimeAttributionEvent {
-    type Target = RuntimeAttributionEvent;
-
-    fn deref(&self) -> &Self::Target {
-        self.event()
-    }
-}
-
-pub fn sign_runtime_attribution_event(
-    event: RuntimeAttributionEvent,
-    key_id: impl Into<String>,
-    signing_key: &SigningKey,
-) -> Result<SignedRuntimeAttributionEvent, DomainError> {
-    event.validate()?;
-    let key_id = key_id.into();
-    require_text("runtime attribution key_id", &key_id)?;
-    let content_hash = canonical_json_hash(&event)?;
-    let signature = signing_key.sign(content_hash.as_bytes());
-    Ok(SignedRuntimeAttributionEvent {
-        event,
-        key_id,
-        content_hash,
-        signature_hex: hex::encode(signature.to_bytes()),
-    })
-}
-
-pub fn verify_runtime_attribution_event(
-    signed: &SignedRuntimeAttributionEvent,
-    trusted_keys: &BTreeMap<String, VerifyingKey>,
-) -> Result<VerifiedRuntimeAttributionEvent, DomainError> {
-    signed.event.validate()?;
-    require_text("runtime attribution key_id", &signed.key_id)?;
-    let expected_hash = canonical_json_hash(&signed.event)?;
-    if expected_hash != signed.content_hash {
-        return Err(DomainError::AttributionPayloadHashMismatch);
-    }
-    let key = trusted_keys
-        .get(&signed.key_id)
-        .ok_or(DomainError::UnknownAttributionSigningKey)?;
-    let signature_bytes = hex::decode(&signed.signature_hex)
-        .map_err(|_| DomainError::InvalidAttributionSignatureEncoding)?;
-    let signature = Signature::from_slice(&signature_bytes)
-        .map_err(|_| DomainError::InvalidAttributionSignatureEncoding)?;
-    key.verify(signed.content_hash.as_bytes(), &signature)
-        .map_err(|_| DomainError::InvalidAttributionSignature)?;
-    Ok(VerifiedRuntimeAttributionEvent(signed.event.clone()))
-}
-
 pub fn runtime_stage_is_healthy(
     events: &[RuntimeAttributionEvent],
     candidate_id: &str,
@@ -4696,70 +4519,6 @@ impl SearchPolicyRevision {
             return Err(DomainError::InvalidPolicyScore);
         }
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TensorSpec {
-    pub name: String,
-    pub element_type: TensorElementType,
-    pub dimensions: Vec<Option<usize>>,
-}
-
-impl TensorSpec {
-    pub fn validate(&self) -> Result<(), DomainError> {
-        require_text("tensor name", &self.name)?;
-        if self.dimensions.is_empty() || self.dimensions.contains(&Some(0)) {
-            return Err(DomainError::InvalidStrategyBundle);
-        }
-        let mut known_elements = 1_usize;
-        for dimension in self.dimensions.iter().flatten() {
-            known_elements = known_elements
-                .checked_mul(*dimension)
-                .ok_or(DomainError::InvalidStrategyBundle)?;
-            if known_elements > MAX_ONNX_TENSOR_ELEMENTS {
-                return Err(DomainError::InvalidStrategyBundle);
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TensorElementType {
-    Float32,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OnnxModelCandidate {
-    pub artifact: ArtifactRef,
-    pub byte_len: u64,
-    pub opset: u32,
-    pub preprocessing_version: String,
-    pub inputs: Vec<TensorSpec>,
-    pub output: TensorSpec,
-}
-
-impl OnnxModelCandidate {
-    pub fn validate(&self) -> Result<(), DomainError> {
-        require_text("onnx artifact uri", &self.artifact.uri)?;
-        if self.artifact.content_type != "application/onnx"
-            || self.byte_len == 0
-            || self.byte_len > MAX_ONNX_ARTIFACT_BYTES
-            || self.opset == 0
-            || self.preprocessing_version != LOB_ONNX_PREPROCESSING_VERSION
-            || self.inputs.is_empty()
-        {
-            return Err(DomainError::InvalidStrategyBundle);
-        }
-        let checksum = self
-            .artifact
-            .checksum
-            .as_deref()
-            .ok_or(DomainError::InvalidStrategyBundle)?;
-        validate_sha256(checksum)?;
-        self.inputs.iter().try_for_each(TensorSpec::validate)?;
-        self.output.validate()
     }
 }
 
@@ -5283,6 +5042,12 @@ impl CexFourStageStrategyCandidateV1 {
 
     pub fn runtime_contract(&self) -> Result<CexRuntimeContractV1, DomainError> {
         self.validate()?;
+        self.runtime_contract_from_validated()
+    }
+
+    pub(crate) fn runtime_contract_from_validated(
+        &self,
+    ) -> Result<CexRuntimeContractV1, DomainError> {
         let strategy: CexFourStageStrategyV1 = serde_json::from_str(&self.strategy_artifact_json)
             .map_err(|_| DomainError::InvalidStrategyBundle)?;
         Ok(CexRuntimeContractV1 {
@@ -5562,8 +5327,11 @@ impl CexSealedHoldoutClaimV1 {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CandidateArtifact {
+    ProbabilityReversal(
+        Box<hft_research_manifest::prediction_probability::ProbabilityReversalSpecV1>,
+    ),
     Formula(FactorAst),
-    OnnxModel(OnnxModelCandidate),
+    OnnxModel(RuntimeOnnxModel),
     CexFourStage(CexFourStageStrategyCandidateV1),
     FrozenModel(Box<frozen_model::FrozenModelStrategyV1>),
     Program(serde_json::Value),
@@ -5578,6 +5346,11 @@ impl CandidateArtifact {
         &self,
     ) -> Result<StrategyBundleArtifact, DomainError> {
         match self {
+            Self::ProbabilityReversal(spec) => {
+                spec.validate()
+                    .map_err(|_| DomainError::InvalidStrategyBundle)?;
+                Ok(StrategyBundleArtifact::ProbabilityReversal { spec: spec.clone() })
+            }
             Self::Formula(ast) => {
                 if validate_live_formula(ast)?.history_rows > 1 {
                     return Err(DomainError::ResearchOnlyArtifact);
@@ -5614,6 +5387,9 @@ impl CandidateArtifact {
 /// Runtime-loadable artifact schema produced by governed promotion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StrategyBundleArtifact {
+    ProbabilityReversal {
+        spec: Box<hft_research_manifest::prediction_probability::ProbabilityReversalSpecV1>,
+    },
     FrozenModel {
         strategy: Box<frozen_model::FrozenModelStrategyV1>,
     },
@@ -5621,7 +5397,7 @@ pub enum StrategyBundleArtifact {
         ast: FactorAst,
     },
     Onnx {
-        model: OnnxModelCandidate,
+        model: RuntimeOnnxModel,
     },
     CexFourStage {
         strategy: CexFourStageStrategyCandidateV1,
@@ -5631,6 +5407,9 @@ pub enum StrategyBundleArtifact {
 impl StrategyBundleArtifact {
     pub fn validate(&self) -> Result<(), DomainError> {
         match self {
+            Self::ProbabilityReversal { spec } => spec
+                .validate()
+                .map_err(|_| DomainError::InvalidStrategyBundle),
             Self::Formula { ast } => validate_live_formula(ast)
                 .map_err(DomainError::from)
                 .and_then(|capability| {
@@ -5638,7 +5417,9 @@ impl StrategyBundleArtifact {
                         .then_some(())
                         .ok_or(DomainError::InvalidStrategyBundle)
                 }),
-            Self::Onnx { model } => model.validate(),
+            Self::Onnx { model } => model
+                .validate()
+                .map_err(|_| DomainError::InvalidStrategyBundle),
             Self::CexFourStage { strategy } => strategy.validate(),
             Self::FrozenModel { strategy } => strategy.validate(),
         }
@@ -5646,10 +5427,15 @@ impl StrategyBundleArtifact {
 
     fn validate_for_readback(&self) -> Result<(), DomainError> {
         match self {
+            Self::ProbabilityReversal { spec } => spec
+                .validate()
+                .map_err(|_| DomainError::InvalidStrategyBundle),
             Self::Formula { ast } => ast
                 .validate()
                 .map_err(|_| DomainError::InvalidStrategyBundle),
-            Self::Onnx { model } => model.validate(),
+            Self::Onnx { model } => model
+                .validate()
+                .map_err(|_| DomainError::InvalidStrategyBundle),
             Self::CexFourStage { strategy } => strategy.validate(),
             Self::FrozenModel { strategy } => strategy.validate(),
         }
@@ -6608,7 +6394,7 @@ mod tests {
         event.outcome = AttributionOutcome::Activated;
         assert_eq!(
             event.validate(),
-            Err(DomainError::InvalidAttributionOutcome)
+            Err(governance::attribution::AttributionError::InvalidAttributionOutcome)
         );
     }
 
@@ -6668,14 +6454,24 @@ mod tests {
         );
         assert_eq!(
             verify_runtime_attribution_event(&signed, &BTreeMap::new()).unwrap_err(),
-            DomainError::UnknownAttributionSigningKey
+            governance::attribution::AttributionError::UnknownAttributionSigningKey
         );
+
+        let mut keyless = signed.clone();
+        let identity = format!("01{}", "00".repeat(31));
+        keyless.signature_hex = format!("{identity}{}", "00".repeat(32));
+        let identity_bytes: [u8; 32] = hex::decode(identity).unwrap().try_into().unwrap();
+        let weak = BTreeMap::from([(
+            "feedback-1".to_string(),
+            VerifyingKey::from_bytes(&identity_bytes).unwrap(),
+        )]);
+        assert!(verify_runtime_attribution_event(&keyless, &weak).is_err());
 
         let mut tampered = signed;
         tampered.event.asset_revision_id = "candidate-forged".to_string();
         assert_eq!(
             verify_runtime_attribution_event(&tampered, &trusted).unwrap_err(),
-            DomainError::AttributionPayloadHashMismatch
+            governance::attribution::AttributionError::AttributionPayloadHashMismatch
         );
     }
 
@@ -8269,7 +8065,7 @@ mod tests {
 
     #[test]
     fn onnx_candidate_rejects_oversized_artifacts_and_tensors() {
-        let candidate = |byte_len, dimensions| OnnxModelCandidate {
+        let candidate = |byte_len, dimensions| RuntimeOnnxModel {
             artifact: ArtifactRef {
                 uri: "model.onnx".to_string(),
                 content_type: "application/onnx".to_string(),
@@ -8296,11 +8092,11 @@ mod tests {
                 vec![Some(1), Some(4), Some(2), Some(2)]
             )
             .validate(),
-            Err(DomainError::InvalidStrategyBundle)
+            Err(governance::runtime_bundle::RuntimeBundleError::Invalid)
         );
         assert_eq!(
             candidate(1, vec![Some(1), Some(4), Some(MAX_ONNX_TENSOR_ELEMENTS)]).validate(),
-            Err(DomainError::InvalidStrategyBundle)
+            Err(governance::runtime_bundle::RuntimeBundleError::Invalid)
         );
     }
 
@@ -8335,7 +8131,7 @@ mod tests {
             artifact.to_governed_strategy_bundle_artifact(),
             Err(DomainError::ResearchOnlyArtifact)
         );
-        let onnx = CandidateArtifact::OnnxModel(OnnxModelCandidate {
+        let onnx = CandidateArtifact::OnnxModel(RuntimeOnnxModel {
             artifact: ArtifactRef {
                 uri: "model.onnx".to_string(),
                 content_type: "application/onnx".to_string(),

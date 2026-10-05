@@ -6,6 +6,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+governance = { package = "hft-governance-contracts", path = "../../governance-contracts" }
 alpha-domain = { path = "../domain" }
 alpha-engine = { path = "../engine", default-features = false }
 hft-infer-onnx = { path = "../../strategy-framework/infer-onnx" }

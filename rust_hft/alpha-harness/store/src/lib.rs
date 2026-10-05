@@ -7,20 +7,21 @@ pub use final_precommit::ModelFinalizationEvidenceV1;
 use final_precommit::SealedPrecommit;
 
 use alpha_domain::{
-    canonical_json_hash, AttributionKind, AttributionMode, CandidateArtifact, CandidateEvaluation,
-    CexBaselineArtifactV1, CexFactorBankRevisionV2, CexFinalPrecommitV1,
-    CexFourStageStrategyCandidateV1, CexResearchContentRefV1, CexResearchMissionArtifactV1,
-    CexSealedHoldoutClaimV1, EngineKind, EvaluationProtocolV1, FormulaEvaluatorConfig,
-    IterationVerdict, LearningDirective, LoopRun, MissionStatus, MissionTerminalReason,
-    PromotionRecord, ResearchIteration, ResearchMission, RuntimeAttributionEvent,
+    canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselineArtifactV1,
+    CexFactorBankRevisionV2, CexFinalPrecommitV1, CexFourStageStrategyCandidateV1,
+    CexResearchContentRefV1, CexResearchMissionArtifactV1, CexSealedHoldoutClaimV1, EngineKind,
+    EvaluationProtocolV1, FormulaEvaluatorConfig, IterationVerdict, LearningDirective, LoopRun,
+    MissionStatus, MissionTerminalReason, PromotionRecord, ResearchIteration, ResearchMission,
     SearchBudgetUsage, SearchPolicyRevision, StrategyBundle, StrategyBundleArtifact,
-    VerifiedRuntimeAttributionEvent, CEX_FINAL_PRECOMMIT_REGISTRY_KIND,
-    CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
-    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
-    WALK_FORWARD_EVALUATOR_VERSION,
+    CEX_FINAL_PRECOMMIT_REGISTRY_KIND, CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND,
+    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
+    SEALED_HOLDOUT_EVALUATOR_VERSION, WALK_FORWARD_EVALUATOR_VERSION,
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
+use governance::attribution::{
+    AttributionKind, AttributionMode, RuntimeAttributionEvent, VerifiedRuntimeAttributionEvent,
+};
 use governance::{
     AllowedIntentType, DeploymentEnvelope, LiveSmallEligibilityEvidence, SignedDeploymentEnvelope,
 };
@@ -2107,10 +2108,14 @@ impl AlphaStore {
         let promotion = self.get_canonical_promotion(&envelope.promotion_id)?;
         let bundle = self.get_canonical_strategy_bundle(&envelope.bundle_id)?;
         if promotion.record.bundle_id != envelope.bundle_id
-            || promotion.record.bundle_hash != envelope.bundle_hash
+            || promotion.record.bundle_hash != bundle.bundle_hash
             || promotion.record.candidate_id != envelope.asset_revision_id
             || promotion.content_hash != envelope.promotion_manifest_hash
-            || bundle.bundle_hash != envelope.bundle_hash
+            || bundle
+                .to_runtime_bundle()
+                .map_err(domain_error)?
+                .bundle_hash
+                != envelope.bundle_hash
         {
             return Err(StoreError::Domain(
                 "deployment envelope does not match persisted promotion and bundle".to_string(),
@@ -2780,6 +2785,20 @@ fn validate_strategy_scope(
         ));
     }
     let expected = match &bundle.artifact {
+        StrategyBundleArtifact::ProbabilityReversal { spec } => {
+            if let Some(symbol) = symbol {
+                if !spec
+                    .episodes
+                    .iter()
+                    .any(|episode| episode.up_token == symbol || episode.down_token == symbol)
+                {
+                    return Err(StoreError::Domain(
+                        "attribution token differs from fixed episode".into(),
+                    ));
+                }
+            }
+            bundle.bundle_id.clone()
+        }
         StrategyBundleArtifact::Formula { .. } => {
             let symbol = symbol.ok_or_else(|| {
                 StoreError::Domain(
@@ -3440,7 +3459,7 @@ fn require_text(value: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn domain_error(error: alpha_domain::DomainError) -> StoreError {
+fn domain_error(error: impl std::fmt::Display) -> StoreError {
     StoreError::Domain(error.to_string())
 }
 
@@ -3463,14 +3482,16 @@ fn serialization_error(error: serde_json::Error) -> StoreError {
 mod tests {
     use super::*;
     use alpha_domain::{
-        canonical_json_hash, sign_runtime_attribution_event, verify_runtime_attribution_event,
-        AttributionKind, AttributionMode, AttributionOutcome, EngineKind, EvaluationCostsV1,
-        EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1, IterationVerdict,
-        LoopCompletionPolicy, LoopRunStatus, LoopTargetStage, MissionCompletionPolicy,
-        MissionStatus, PromotionRecord, RuntimeAttributionEvent, SearchBudget,
-        SearchPolicyRevision, StrategyBundle, StrategyBundleArtifact, ValidatorMode,
+        canonical_json_hash, EngineKind, EvaluationCostsV1, EvaluationLabelSpecV1,
+        EvaluationProtocolV1, EvaluationWalkForwardV1, IterationVerdict, LoopCompletionPolicy,
+        LoopRunStatus, LoopTargetStage, MissionCompletionPolicy, MissionStatus, PromotionRecord,
+        SearchBudget, SearchPolicyRevision, StrategyBundle, StrategyBundleArtifact, ValidatorMode,
     };
     use ed25519_dalek::SigningKey;
+    use governance::attribution::{
+        sign_runtime_attribution_event, verify_runtime_attribution_event, AttributionKind,
+        AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
+    };
     use governance::{sign_envelope, AllowedIntentType, ApprovalClass, DeploymentEnvelope};
     use hft_factor_dsl::{FactorAst, FactorTerminal};
     use hft_research_manifest::ManifestId;
@@ -4020,6 +4041,89 @@ mod tests {
     }
 
     #[test]
+    fn fixed_probability_config_cannot_replace_recorded_scientific_evidence() {
+        use hft_research_manifest::prediction_probability::*;
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let candidate =
+            CandidateArtifact::ProbabilityReversal(Box::new(ProbabilityReversalSpecV1 {
+                schema: PROBABILITY_REVERSAL_SCHEMA.into(),
+                episodes: vec![BinaryEpisodeV1 {
+                    episode_id: "episode".into(),
+                    condition_id: "condition".into(),
+                    underlying: "BTCUSDT".into(),
+                    venue: "POLYMARKET".into(),
+                    up_token: "123".into(),
+                    down_token: "456".into(),
+                    start_us: 1_000_000,
+                    end_us: 301_000_000,
+                }],
+                prev_prob_low: 0.3,
+                curr_prob_high: 0.6,
+                prev_prob_high: 0.7,
+                curr_prob_low: 0.4,
+                take_profit_prob: 0.85,
+                stop_loss_prob: 0.5,
+                min_time_remaining_secs: 1,
+                max_time_remaining_secs: 5,
+                stake_usd: 10.into(),
+                max_positions: 1000,
+                max_daily_trades: 1000,
+                quote_max_age_us: 500_000,
+            }));
+        let record = iteration();
+        store
+            .append_iteration(&record, Some(("candidate-1", &candidate)), None)
+            .unwrap();
+        let hash = store.mission_lineage("mission-1").unwrap().candidates[0]
+            .content_hash
+            .clone();
+        let now = Utc::now();
+        let bundle = StrategyBundle::new(
+            "bundle-1".into(),
+            "candidate-1".into(),
+            hash.clone(),
+            ManifestId::new("dataset-1").unwrap(),
+            "probability-config-only".into(),
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64),
+            "4".repeat(64),
+            candidate.to_governed_strategy_bundle_artifact().unwrap(),
+            now,
+        )
+        .unwrap();
+        let promotion = PromotionRecord {
+            promotion_id: "promotion-1".into(),
+            mission_id: "mission-1".into(),
+            candidate_id: "candidate-1".into(),
+            candidate_content_hash: hash,
+            dataset_manifest_id: bundle.dataset_manifest_id.clone(),
+            evaluator_version: bundle.evaluator_version.clone(),
+            evaluation_protocol_hash: bundle.evaluation_protocol_hash.clone(),
+            evaluator_config_hash: bundle.evaluator_config_hash.clone(),
+            evaluation_metrics_hash: bundle.evaluation_metrics_hash.clone(),
+            sealed_evaluation_id: "invented-sealed-evidence".into(),
+            sealed_evaluation_hash: bundle.sealed_evaluation_hash.clone(),
+            bundle_id: bundle.bundle_id.clone(),
+            bundle_hash: bundle.bundle_hash.clone(),
+            created_at: now,
+        };
+        let error = store.promote_candidate(&bundle, &promotion).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("canonical walk-forward evidence"));
+        assert!(matches!(
+            store.get_strategy_bundle("bundle-1"),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.get_promotion("promotion-1"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
     fn canonical_promotion_eligibility_requires_the_mission_protocol_binding() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
@@ -4364,6 +4468,42 @@ mod tests {
             store.get_strategy_bundle("bundle:candidate-1"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn deployment_binding_requires_the_projected_runtime_artifact() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let now = Utc::now();
+        let (promotion, bundle) = persist_formula_promotion(&mut store, now);
+        let mut envelope = DeploymentEnvelope {
+            deployment_id: "projection-deployment".into(),
+            asset_revision_id: bundle.candidate_id.clone(),
+            promotion_id: promotion.record.promotion_id,
+            promotion_manifest_hash: promotion.content_hash,
+            bundle_id: bundle.bundle_id.clone(),
+            bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
+            runtime_config_hash: "c".repeat(64),
+            risk_policy_hash: "d".repeat(64),
+            account_id: "account-1".into(),
+            venue: "binance".into(),
+            instruments: vec!["BTCUSDT".into()],
+            allowed_intent_types: vec![AllowedIntentType::StartPaper],
+            max_notional: 100.0,
+            max_symbol_exposure: 50.0,
+            max_order_size: 10.0,
+            max_slippage_bps: 2.0,
+            valid_from: now,
+            expires_at: now + chrono::Duration::minutes(1),
+            nonce: "projection-nonce".into(),
+            approval_class: ApprovalClass::Paper,
+            approval_signatures: vec!["approval-1".into()],
+            payload_hash: String::new(),
+        };
+        let (_, original) = store.validate_deployment_binding(&envelope).unwrap();
+        assert_eq!(original, bundle);
+        envelope.bundle_hash = bundle.bundle_hash;
+        assert!(store.validate_deployment_binding(&envelope).is_err());
     }
 
     #[test]
@@ -5089,8 +5229,8 @@ mod tests {
                 asset_revision_id: "candidate-1".to_string(),
                 promotion_id: "promotion-1".to_string(),
                 promotion_manifest_hash: promotion.content_hash,
-                bundle_id: bundle.bundle_id,
-                bundle_hash: bundle.bundle_hash,
+                bundle_id: bundle.bundle_id.clone(),
+                bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
                 runtime_config_hash: "c".repeat(64),
                 risk_policy_hash: "d".repeat(64),
                 account_id: "account-1".to_string(),
@@ -5158,8 +5298,8 @@ mod tests {
                 asset_revision_id: "candidate-1".to_string(),
                 promotion_id: promotion.record.promotion_id,
                 promotion_manifest_hash: promotion.content_hash,
-                bundle_id: bundle.bundle_id,
-                bundle_hash: bundle.bundle_hash,
+                bundle_id: bundle.bundle_id.clone(),
+                bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
                 runtime_config_hash: "c".repeat(64),
                 risk_policy_hash: "d".repeat(64),
                 account_id: "account-1".to_string(),
