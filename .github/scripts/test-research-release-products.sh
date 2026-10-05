@@ -45,8 +45,9 @@ bash "$root/.github/scripts/research-release-products.sh" recipes controller >"$
 jq -s -e 'length==2 and any(.[]; .package=="alpha-harness") and any(.[]; .package=="hft-collector") and
   all(.[]; .package!="hft-backtest" and .package!="ploy-research" and .package!="hft-research-platform")' "$work/recipes" >/dev/null
 locks=$(bash "$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
-jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" \
-  '{schema:"monday.compilation-inputs.v2",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks}' >"$MONDAY_BUILD_INPUTS_FILE"
+workspace_profiles=$(ruby -rjson -rdigest -e 'root=ARGV[0]; puts JSON.generate(JSON.parse(File.read("#{root}/workspaces.json")).fetch("workspaces").to_h{|owner| manifest=owner.fetch("manifest"); [manifest,Digest::SHA256.file("#{root}/#{manifest}").hexdigest]})' "$root/rust_hft")
+jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" --argjson workspace_profiles "$workspace_profiles" --argjson recipes "$(jq -s . "$work/recipes")" \
+  '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks,builder_image:("builder@sha256:"+$h),recipes:$recipes,workspace_profiles:$workspace_profiles}' >"$MONDAY_BUILD_INPUTS_FILE"
 bash "$root/.github/scripts/research-image-release-artifact.sh" create "$work/controller" "$sha" 42 "$root/rust_hft" 2 7 controller
 ruby "$root/.github/scripts/research-release-bundle.rb" pack "$work/controller.tar" "$work/controller" controller
 ruby "$root/.github/scripts/research-release-bundle.rb" unpack "$work/controller.tar" "$work/roundtrip" controller
@@ -65,6 +66,8 @@ for selection in cex-runner prediction-runner cex-runner,controller cex-runner,p
     printf 'mock executable: %s\n' "$binary" >"$directory/research-bin/$binary"
     chmod 0755 "$directory/research-bin/$binary"
   done < <(bash "$products" binaries "$selection")
+  jq --argjson recipes "$(bash "$products" recipes "$selection" | jq -s .)" '.recipes=$recipes' "$MONDAY_BUILD_INPUTS_FILE" >"$work/updated-inputs.json"
+  cp "$work/updated-inputs.json" "$MONDAY_BUILD_INPUTS_FILE"
   bash "$root/.github/scripts/research-image-release-artifact.sh" create "$directory" "$sha" 42 "$root/rust_hft" 2 7 "$selection"
   ruby "$root/.github/scripts/research-release-bundle.rb" pack "$directory.tar" "$directory" "$selection"
   ruby "$root/.github/scripts/research-release-bundle.rb" unpack "$directory.tar" "$directory-roundtrip" "$selection"
@@ -76,4 +79,47 @@ GITHUB_REF=refs/heads/main bash "$root/.github/scripts/select-rust-ci-scope.sh" 
 grep -Fqx research_product=controller "$work/plan"
 grep -Fq ',ploy/research-image-smoke,' "$work/plan"
 bash "$root/.github/scripts/test-research-product-image.sh"
+# Exercise the real producer with a conflicting ambient target and stale host
+# binaries. Only the target recorded by compiler inputs may reach the archive.
+fixture="$work/producer"
+mkdir -p "$fixture/.github/scripts" "$fixture/rust_hft" "$fixture/bin" "$fixture/output"
+for script in build-research-release.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
+  cp "$root/.github/scripts/$script" "$fixture/.github/scripts/$script"
+done
+cp "$root/rust_hft/workspaces.json" "$fixture/rust_hft/workspaces.json"
+while IFS= read -r manifest; do
+  directory=${manifest%/Cargo.toml}; mkdir -p "$fixture/rust_hft/$directory"
+  cp "$root/rust_hft/$manifest" "$fixture/rust_hft/$manifest"
+  cp "$root/rust_hft/$directory/Cargo.lock" "$fixture/rust_hft/$directory/Cargo.lock"
+done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
+printf '#!/usr/bin/env bash\nexit 0\n' >"$fixture/.github/scripts/verify-research-runtime-abi.sh"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "1111111111111111111111111111111111111111"\n' >"$fixture/bin/git"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" 7\n' >"$fixture/bin/gh"
+cat >"$fixture/bin/cargo" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+target='' binaries=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target) target=$2; shift ;;
+    --bin) binaries+=("$2"); shift ;;
+  esac
+  shift
+done
+test "$target" = "$(jq -r .target "$MONDAY_BUILD_INPUTS_FILE")"
+mkdir -p "$CARGO_TARGET_DIR/$target/release"
+for binary in "${binaries[@]}"; do
+  printf 'fresh target executable: %s\n' "$binary" >"$CARGO_TARGET_DIR/$target/release/$binary"
+done
+MOCK
+chmod +x "$fixture/bin/"* "$fixture/.github/scripts/verify-research-runtime-abi.sh"
+mkdir -p "$fixture/rust_hft/target/release"
+while IFS= read -r binary; do
+  printf 'stale host executable\n' >"$fixture/rust_hft/target/release/$binary"
+done < <(bash "$products" binaries controller)
+jq --argjson recipes "$(bash "$products" recipes controller | jq -s .)" '.recipes=$recipes' "$MONDAY_BUILD_INPUTS_FILE" >"$fixture/inputs.json"
+PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/output" GITHUB_REPOSITORY=fixture/monday GITHUB_RUN_ID=42 CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu MONDAY_BUILD_INPUTS_FILE="$fixture/inputs.json" bash "$fixture/.github/scripts/build-research-release.sh" controller
+while IFS= read -r binary; do
+  test "$(cat "$fixture/output/research-release/research-bin/$binary")" = "fresh target executable: $binary"
+done < <(bash "$products" binaries controller)
 printf 'PASS: controller-only release builds four actual executables; product, archive and unadmitted control bytes fail closed\n'
