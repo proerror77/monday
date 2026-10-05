@@ -457,6 +457,7 @@ mod tests {
             max_attempts: 1,
             output_prefix: "research/fixture".into(),
             fit_identity_sha256: None,
+            worker_configuration: None,
         };
         let mut task = Task::new(spec)?;
         let lease = task.claim("owner", 1000, 1000)?;
