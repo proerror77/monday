@@ -5,6 +5,8 @@ pub mod admission;
 pub mod agent_api;
 #[cfg(feature = "gateway")]
 pub mod artifact_gateway;
+#[cfg(feature = "control")]
+pub mod artifact_identity;
 #[cfg(feature = "artifact-io")]
 pub mod artifact_io;
 #[cfg(feature = "control")]
