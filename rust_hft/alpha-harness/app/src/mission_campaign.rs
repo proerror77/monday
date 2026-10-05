@@ -2771,7 +2771,7 @@ fn campaign_round_claim_urls(
             request.holdout_claim_readback_url.clone(),
         ))
     } else {
-        let claim = hft_research_dispatch_io::cex_campaign_round_result_and_holdout_claim(
+        let claim = crate::mission_objects::cex_campaign_round_result_and_holdout_claim(
             &round.result_put_url,
             &request.campaign_id,
             &round.round_id,
