@@ -164,6 +164,8 @@ enum PredictionDispatchCommand {
 
 #[derive(Debug, Subcommand)]
 enum MissionDispatchCommand {
+    /// Reserve the inspected canonical request and independently publish/read back native receipts.
+    PreparePlatform(mission_dispatch::platform_admission::PlatformPrepareArgs),
     CloseFamily(CampaignCloseFamilyArgs),
     Inspect(MissionDispatchInspectArgs),
     /// Read authenticated historical dispatch identity without submitting or settling.
@@ -1286,6 +1288,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .context("sequence cohort preparation worker failed")?
             }
             MissionCommand::Dispatch { command } => match command {
+                MissionDispatchCommand::PreparePlatform(args) => {
+                    tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::prepare(args))
+                        .await
+                        .context("platform Campaign budget preparation task failed")?
+                }
                 MissionDispatchCommand::DescribeStudy(args) => {
                     mission_dispatch::sequence_admission::describe(args)
                 }
