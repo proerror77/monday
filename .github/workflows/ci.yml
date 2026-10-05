@@ -517,6 +517,12 @@ jobs:
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --test postgres --locked -- --ignored
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --test native_attempt_identity --locked -- --ignored
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy -p hft-research-platform --features control,gateway,publisher --all-targets --locked -- -D warnings
+      - name: Validate native terminal retirement against isolated PG
+        working-directory: rust_hft
+        run: |
+          docker exec "${{ job.services.postgres.id }}" psql -U fixture -d monday_foundation_test -v ON_ERROR_STOP=1 -c 'CREATE DATABASE monday_foundation_retirement_test'
+          MONDAY_TEST_DATABASE_URL="${MONDAY_TEST_DATABASE_URL%/monday_foundation_test}/monday_foundation_retirement_test" \
+            "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --lib retirement::tests::native_retirement_real_pg_archive_delete_unknown_and_recovery --locked -- --ignored
       - name: Validate packaged CH SQL against the fixture server
         run: bash .github/scripts/test-clickhouse-preparation.sh
       - name: Validate raw protocol, standard Parquet and durable CH/PG import
