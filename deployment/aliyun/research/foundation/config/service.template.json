@@ -1,0 +1,24 @@
+{
+  "owner": "foundation-controller",
+  "cluster": "__CLUSTER__",
+  "kubernetes_endpoint": "https://__KUBE_API_IP__",
+  "kubernetes_ca_file": "/run/private/credentials/kube-ca.crt",
+  "kubernetes_token_file": "/run/private/credentials/kube-token",
+  "artifact_gateway": "https://monday-foundation-control.monday-research.svc:8444/",
+  "artifact_token_file": "/run/private/credentials/artifact-reader-token",
+  "artifact_tls": {
+    "ca_file": "/run/broker/private/ca.crt",
+    "identity_file": "/run/private/credentials/artifact-reader.pem"
+  },
+  "lease_ms": 120000,
+  "agent_api": {
+    "bind": "127.0.0.1:7081",
+    "capabilities_file": "/run/broker/private/tools.json"
+  },
+  "attempt_identity": {
+    "capabilities_file": "/run/broker/private/artifacts.json",
+    "state_root": "/state/attempt-identities",
+    "namespace_prefix": "research/",
+    "tls_identity_file": "/run/private/credentials/artifact-writer.pem"
+  }
+}

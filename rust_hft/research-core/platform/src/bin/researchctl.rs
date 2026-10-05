@@ -41,6 +41,17 @@ fn read_bounded<T: serde::de::DeserializeOwned>(path: &str, max_bytes: u64) -> R
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     match args.iter().skip(1).map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["render-foundation",path,output] => {
+            let inventory:hft_research_platform::foundation::Inventory=read(path)?;
+            let output=std::path::Path::new(output);
+            std::fs::create_dir_all(output)?;
+            for (name,contents) in inventory.render()? {
+                let target=output.join(name);
+                let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(target)?;
+                use std::io::Write;
+                file.write_all(contents.as_bytes())?;
+            }
+        }
         ["tool",endpoint,token_path,path] => {
             let tool: ResearchTool = read(path)?;
             let tls = hft_research_platform::transport::TlsConfig {
@@ -96,7 +107,7 @@ async fn main() -> Result<()> {
         ["cancel", id] => { ledger().await?.cancel(id).await?; println!("cancel_requested"); }
         ["status", id] => { println!("{}", serde_json::to_string(&ledger().await?.read(id).await?)?); }
         ["terminal-snapshot",tenant,request] => { println!("{}",serde_json::to_string(&ledger().await?.native_terminal_snapshot(tenant,request).await?)?); }
-        _ => bail!("usage: researchctl plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | register-native-admission SIGNED_NATIVE_RESERVATION | register-native-request-revocation SIGNED_NATIVE_REVOCATION | register-native-campaign-inputs SIGNED_NATIVE_RESERVATION COLLECTION BLOCK_DIRECTORY | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID | terminal-snapshot TENANT REQUEST"),
+        _ => bail!("usage: researchctl render-foundation INVENTORY OUTPUT_DIRECTORY | plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | register-native-admission SIGNED_NATIVE_RESERVATION | register-native-request-revocation SIGNED_NATIVE_REVOCATION | register-native-campaign-inputs SIGNED_NATIVE_RESERVATION COLLECTION BLOCK_DIRECTORY | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID | terminal-snapshot TENANT REQUEST"),
     }
     Ok(())
 }
