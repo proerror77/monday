@@ -260,7 +260,14 @@ impl Reconciler {
                 return Ok(true);
             }
             lease = locked.task.heartbeat(&lease, now, self.lease_ms)?;
-            if self.ledger.admission(&locked.task.spec).await?.is_none() {
+            if !self
+                .ledger
+                .admits_launch(
+                    &locked.task.spec,
+                    locked.task.deadline_ms.context("launch lacks deadline")? - now,
+                )
+                .await?
+            {
                 locked.task.stop(State::Cancelled, false)?;
                 locked.commit("launch_admission_revoked").await?;
                 return Ok(true);
