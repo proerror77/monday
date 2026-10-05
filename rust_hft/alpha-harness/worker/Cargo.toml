@@ -1,0 +1,15 @@
+[package]
+workspace = "../../research-core"
+name = "hft-cex-research-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+alpha-harness = { path = "../app", features = ["scientific"] }
+anyhow = "1"
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[bin]]
+name = "monday-cex-worker"
+path = "src/main.rs"

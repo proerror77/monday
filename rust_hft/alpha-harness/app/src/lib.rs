@@ -1,0 +1,92 @@
+mod cli;
+mod data_mission;
+mod governance;
+mod loop_control;
+mod mission;
+mod mission_calendar;
+mod mission_campaign;
+mod mission_dispatch;
+mod mission_fresh_inputs;
+mod mission_metrics;
+mod mission_objects;
+mod mission_render;
+mod mission_runner;
+mod sec_orderflow;
+
+use clap::Parser;
+
+pub async fn operator_main() -> anyhow::Result<()> {
+    let result = cli::run(cli::Cli::parse()).await;
+    if result.is_err() {
+        mission_runner::research_event(
+            "alpha-harness",
+            "command_failed",
+            serde_json::json!({"reason_code": "command_failed"}),
+        );
+    }
+    result
+}
+
+#[cfg(feature = "scientific")]
+pub async fn worker_main() -> anyhow::Result<()> {
+    let result = cli::run_worker(cli::WorkerCli::parse()).await;
+    if result.is_err() {
+        mission_runner::research_event(
+            "monday-cex-worker",
+            "command_failed",
+            serde_json::json!({"reason_code":"command_failed"}),
+        );
+    }
+    result
+}
+
+#[cfg(test)]
+mod worker_boundary_tests {
+    use super::*;
+    #[test]
+    fn operator_cannot_execute_a_scientific_campaign() {
+        assert!(cli::Cli::try_parse_from([
+            "alpha-harness",
+            "mission",
+            "campaign-execute",
+            "--pre-holdout",
+            "--request",
+            "/inputs/campaign.json",
+            "--request-sha256",
+            &"a".repeat(64),
+            "--campaign-id",
+            "campaign-unit",
+            "--image-identity",
+            &format!("sha256:{}", "b".repeat(64)),
+            "--work-dir",
+            "/work"
+        ])
+        .is_err());
+    }
+    #[cfg(feature = "scientific")]
+    #[test]
+    fn worker_accepts_native_campaign_argv_and_rejects_operator_routes() {
+        cli::WorkerCli::try_parse_from([
+            "monday-cex-worker",
+            "mission",
+            "campaign-execute",
+            "--pre-holdout",
+            "--request",
+            "/inputs/campaign.json",
+            "--request-sha256",
+            &"a".repeat(64),
+            "--campaign-id",
+            "campaign-unit",
+            "--image-identity",
+            &format!("sha256:{}", "b".repeat(64)),
+            "--work-dir",
+            "/work",
+        ])
+        .unwrap();
+        for command in ["dispatch", "run", "campaign-freeze", "campaign-finalize"] {
+            assert!(
+                cli::WorkerCli::try_parse_from(["monday-cex-worker", "mission", command]).is_err()
+            );
+        }
+    }
+}

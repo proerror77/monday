@@ -15,6 +15,9 @@ use crate::mission_campaign::sequence::{
 };
 use alpha_domain::market_encoder_study::MarketDataViewV1;
 use anyhow::{bail, Context};
+use hft_cex_research_input::market_encoder::{
+    verify_prepared_feature_equivalence, verify_prepared_target_equivalence,
+};
 use hft_research_manifest::{
     market_encoder::{
         MarketFeatureDatasetV1, MarketTargetDatasetV1, FEATURE_PARQUET_SCHEMA, FEATURE_SCHEMA,
@@ -22,9 +25,6 @@ use hft_research_manifest::{
     },
     prepared_market::{validate_prepared_producer, PreparedMarketReadyReceiptV2},
     sequence::{SequenceInputSpecV1, SequenceShardV1, SequenceViewV1},
-};
-use hft_research_ml::market_encoder::data::{
-    verify_prepared_feature_equivalence, verify_prepared_target_equivalence,
 };
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Read, path::Path};
@@ -661,7 +661,7 @@ fn assemble_shards(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 mod tests {
     use super::*;
 

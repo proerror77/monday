@@ -3,7 +3,7 @@ use super::DeterministicRng;
 use crate::{
     baselines::{
         evaluate_factor_features_from_entries, validate_cex_context_bindings,
-        verify_cex_baseline_artifact,
+        verify_cex_classic_baseline_artifact,
     },
     evaluation::{EngineContext, ResearchRow},
     formula_evaluator::{evaluate_ast, FormulaEvaluator},
@@ -1758,8 +1758,8 @@ fn validate_start(
     context: &EngineContext<'_>,
 ) -> Result<(), String> {
     validate_source_bindings(mission, factor_bank, ridge, cart, gate)?;
-    verify_cex_baseline_artifact(context, factor_bank, ridge)?;
-    verify_cex_baseline_artifact(context, factor_bank, cart)?;
+    verify_cex_classic_baseline_artifact(context, factor_bank, ridge)?;
+    verify_cex_classic_baseline_artifact(context, factor_bank, cart)?;
     validate_cex_context_bindings(context, factor_bank, &mission.spec.policies.evaluation)
 }
 

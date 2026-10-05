@@ -3,7 +3,13 @@
 //! Prediction-market event and settlement inputs remain in their own contracts.
 pub mod campaign;
 pub mod data;
+#[cfg(feature = "streaming")]
+pub mod market_encoder;
 pub mod prepared;
+#[cfg(feature = "streaming")]
+pub mod sequence;
+#[cfg(feature = "streaming")]
+mod sequence_storage;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
