@@ -614,6 +614,37 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn paused_empty_projection_denies_actual_read_and_write() -> Result<()> {
+        let (_temp, gateway, token, prefix) = fixture(128)?;
+        write_caps(&gateway.config.capabilities_file, &[])?;
+        let (base, handle) = server(gateway).await?;
+        let client = reqwest::Client::new();
+        let target = format!("{base}{prefix}model.bin");
+        assert_eq!(
+            client
+                .get(&target)
+                .bearer_auth(&token)
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .put(&target)
+                .bearer_auth(&token)
+                .header("If-None-Match", "*")
+                .body("fixture bytes")
+                .send()
+                .await?
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        handle.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn revoked_capability_during_upload_cannot_publish() -> Result<()> {
         let (_temp, gateway, token, prefix) = fixture(128)?;
         let (base, handle) = server(gateway.clone()).await?;
