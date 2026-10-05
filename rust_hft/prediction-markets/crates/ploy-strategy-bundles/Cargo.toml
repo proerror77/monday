@@ -20,6 +20,10 @@ ploy-market-contracts.workspace = true
 polymarket-tape-contract = { path = "../../../shared/polymarket-tape" }
 ploy-operator-contracts.workspace = true
 portfolio-core.workspace = true
+strategy-probability-reversal = { package = "hft-strategy-probability-reversal", path = "../../../strategy-framework/strategies/probability_reversal" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+hft-core = { path = "../../../market-core/core" }
+hft-research-manifest = { path = "../../../research-core/manifest" }
 rust_decimal.workspace = true
 rust_decimal_macros.workspace = true
 serde.workspace = true
