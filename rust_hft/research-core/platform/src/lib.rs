@@ -24,6 +24,8 @@ pub mod preparation;
 #[cfg(feature = "control")]
 pub mod release;
 pub mod research;
+#[cfg(feature = "native-admission")]
+pub mod revocation;
 #[cfg(feature = "control")]
 pub mod service;
 #[cfg(feature = "control")]
