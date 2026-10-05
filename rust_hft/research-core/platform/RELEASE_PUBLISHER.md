@@ -81,3 +81,22 @@ only by `MONDAY_RESEARCH_RELEASE_IMPORT_ENABLED=true` and requires the dedicated
 `MONDAY_RESEARCH_RELEASE_IMPORT_DATABASE_URL` secret. Public plan/artifact
 metadata is retained as an Actions artifact. Private key/token files are removed
 on every wrapper exit. This change creates none of that production configuration.
+
+The publication job first runs `check-presence` before artifact download and
+issuer preparation. GitHub passes only presence booleans for the named variables
+and secrets, never their values. It reports all absent settings together using
+the actual repository setting names. If PG import is enabled, its importer URL
+must also be present before any publication begins. Non-research matrix rows do
+not run this check.
+
+Passing this inexpensive check proves only that settings exist. The later native
+`check-config` still verifies policy, signer, selected product/repository and TLS
+before registry login; presence booleans cannot authorize publication. Cargo
+still compiles the issuer before private credentials are injected. A configured
+importer must independently verify and read back its immutable PG projection.
+
+An operator must supply the real digest-pinned builder, product repositories and
+public trust policy, approve the independent signer and scoped gateway capability,
+and, when import is enabled, the dedicated existing PG importer role and URL.
+Creating persistent keys, permissions or services is a separate authorized
+operation. This preflight creates none, probes no endpoint and grants no Run.
