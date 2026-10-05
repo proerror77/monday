@@ -45,3 +45,6 @@ pub mod worker;
 
 #[cfg(feature = "control")]
 pub mod transport;
+
+#[cfg(feature = "control")]
+pub mod foundation;

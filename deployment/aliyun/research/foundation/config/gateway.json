@@ -1,0 +1,6 @@
+{
+  "bind": "127.0.0.1:7082",
+  "root": "/objects",
+  "capabilities_file": "/run/broker/private/artifacts.json",
+  "max_object_bytes": 536870912
+}

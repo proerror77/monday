@@ -1,0 +1,16 @@
+{
+  "session": {
+    "executable": "/usr/local/bin/codex",
+    "executable_sha256": "__CODEX_SHA256__",
+    "workspace": "/workspace",
+    "native_home": "/state/native",
+    "delivery_directory": "/state/deliveries"
+  },
+  "tenant": "__TENANT__",
+  "experiment_sha256": "__EXPERIMENT_SHA256__",
+  "capability_policy_receipt_sha256": "__SESSION_POLICY_SHA256__",
+  "research_endpoint": "https://monday-foundation-control.monday-research.svc:8443/research",
+  "research_token_file": "/run/broker/private/session.token",
+  "research_tls": {"ca_file": "/run/broker/private/ca.crt", "identity_file": "/run/broker/private/session.pem"},
+  "checkpoint_file": "/state/checkpoints/native.json"
+}

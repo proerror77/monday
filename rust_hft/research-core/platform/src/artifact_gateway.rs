@@ -89,9 +89,14 @@ fn now_ms() -> Result<u64> {
 fn read_capabilities(path: &std::path::Path) -> Result<Vec<Capability>> {
     // The broker owns this file and its private parent, never the Agent.
     // O_NOFOLLOW excludes a substituted symlink even during atomic reload.
+    let parent = path.parent().context("broker parent required")?;
+    ensure!(
+        parent.canonicalize()? == parent,
+        "broker parent must be canonical"
+    );
     let fd = rustix::fs::open(
         path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )?;
     let file = File::from(fd);
@@ -100,7 +105,8 @@ fn read_capabilities(path: &std::path::Path) -> Result<Vec<Capability>> {
     {
         use std::os::unix::fs::PermissionsExt;
         ensure!(
-            meta.permissions().mode() & 0o077 == 0,
+            meta.permissions().mode() & 0o077 == 0
+                && parent.metadata()?.permissions().mode() & 0o077 == 0,
             "capability file must be private"
         );
     }
@@ -115,10 +121,7 @@ fn read_capabilities(path: &std::path::Path) -> Result<Vec<Capability>> {
         "broker projection exceeds bound"
     );
     let caps: Vec<Capability> = serde_json::from_slice(&bytes)?;
-    ensure!(
-        !caps.is_empty() && caps.len() <= 1024,
-        "invalid capability count"
-    );
+    ensure!(caps.len() <= 1024, "invalid capability count");
     let mut seen = std::collections::BTreeSet::new();
     for cap in &caps {
         ensure!(
@@ -526,8 +529,10 @@ mod tests {
         Ok(())
     }
     fn fixture(max: u64) -> Result<(tempfile::TempDir, Arc<Gateway>, String, String)> {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         let token = "publisher-fixture".repeat(4);
         let prefix = format!("research/builds/{}/", "a".repeat(64));
         let cap = Capability {
@@ -549,6 +554,29 @@ mod tests {
             Ledger::gateway_fixture(),
         )?;
         Ok((temp, Arc::new(gateway), token, prefix))
+    }
+    #[tokio::test]
+    async fn broker_projection_rejects_public_parent_and_fifo_without_waiting() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, gateway, _token, _prefix) = fixture(128)?;
+        let path = &gateway.config.capabilities_file;
+        let parent = path.parent().unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))?;
+        assert!(read_capabilities(path).is_err());
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(path, b"[]")?;
+        assert!(read_capabilities(path)?.is_empty());
+        std::fs::remove_file(path)?;
+        ensure!(
+            std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()?
+                .success(),
+            "FIFO fixture creation failed"
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        assert!(read_capabilities(path).is_err());
+        Ok(())
     }
     struct Server {
         stop: tokio::sync::oneshot::Sender<()>,

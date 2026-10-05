@@ -370,6 +370,42 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn recovery_binds_exact_delivery_coverage_and_publishes_stopped_checkpoint() -> Result<()>
+    {
+        let (_temp, config) = fixture()?;
+        let mut server = AppServer::start(config.clone()).await?;
+        server.open_thread(None).await?;
+        let intent = "c".repeat(64);
+        server
+            .send_message(&intent, "bounded fixture completion")
+            .await?;
+        let path = config
+            .native_home
+            .parent()
+            .unwrap()
+            .join("checkpoint/state.json");
+        let native = server.checkpoint_to(&path).await?;
+        assert_eq!(native.schema, 2);
+        assert_eq!(native.delivery_files.len(), 1);
+        let stored: NativeState = read_json(&path)?;
+        assert_eq!(identity(&native)?, identity(&stored)?);
+        let delivery = config.delivery_directory.join(format!("{intent}.json"));
+        let original = std::fs::read(&delivery)?;
+        std::fs::write(&delivery, b"changed")?;
+        assert!(AppServer::resume(config.clone(), &native).await.is_err());
+        std::fs::remove_file(&delivery)?;
+        assert!(AppServer::resume(config.clone(), &native).await.is_err());
+        std::fs::write(&delivery, &original)?;
+        let extra = config
+            .delivery_directory
+            .join(format!("{}.json", "d".repeat(64)));
+        std::fs::write(&extra, &original)?;
+        assert!(AppServer::resume(config.clone(), &native).await.is_err());
+        std::fs::remove_file(extra)?;
+        AppServer::resume(config, &native).await?.close().await?;
+        Ok(())
+    }
+    #[tokio::test]
     async fn research_client_authenticates_and_rejects_redirects() -> Result<()> {
         let app = axum::Router::new().route(
             "/research",
@@ -432,6 +468,8 @@ pub struct NativeState {
     pub provider_binary_sha256: String,
     pub thread_id: String,
     pub files: Vec<NativeFile>,
+    /// Host-only dedup records must be restored from the same stopped checkpoint.
+    pub delivery_files: Vec<NativeFile>,
 }
 
 fn native_path(path: &str) -> bool {
@@ -447,10 +485,103 @@ fn native_path(path: &str) -> bool {
                     || path.ends_with(".sqlite-shm"))))
 }
 
+fn delivery_path_valid(path: &str) -> bool {
+    path.strip_suffix(".json").is_some_and(valid_digest)
+}
+fn collect_state(
+    root: &Path,
+    path: &Path,
+    entries: &mut Vec<NativeFile>,
+    total: &mut u64,
+) -> Result<()> {
+    ensure!(
+        entries.len() < 2048,
+        "native state file count exceeds bound"
+    );
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(!metadata.is_symlink(), "native state contains a symlink");
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            collect_state(root, &entry?.path(), entries, total)?;
+        }
+    } else {
+        let relative = path
+            .strip_prefix(root)?
+            .to_str()
+            .context("invalid native path")?;
+        if native_path(relative) {
+            let (sha256, bytes) = file_digest(path)?;
+            *total = total.checked_add(bytes).context("native size overflow")?;
+            ensure!(*total <= 512 * 1024 * 1024, "native state exceeds bound");
+            entries.push(NativeFile {
+                path: relative.into(),
+                sha256,
+                bytes,
+            });
+        }
+    }
+    Ok(())
+}
+fn state_files(home: &Path) -> Result<Vec<NativeFile>> {
+    ensure!(
+        home.canonicalize()? == home,
+        "native home must be canonical"
+    );
+    let mut files = Vec::new();
+    let mut total = 0;
+    let sessions = home.join("sessions");
+    if sessions.exists() {
+        collect_state(home, &sessions, &mut files, &mut total)?;
+    }
+    for entry in std::fs::read_dir(home)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .context("invalid native filename")?;
+        if native_path(name) {
+            collect_state(home, &path, &mut files, &mut total)?;
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+fn delivery_files(directory: &Path) -> Result<Vec<NativeFile>> {
+    ensure!(
+        directory.canonicalize()? == directory,
+        "delivery directory must be canonical"
+    );
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .context("invalid delivery filename")?;
+        // Unpublished crash leftovers and writer lock have no visible delivery.
+        if name.starts_with('.') {
+            continue;
+        }
+        ensure!(
+            files.len() < 2048 && delivery_path_valid(name),
+            "unknown delivery snapshot coverage"
+        );
+        let (sha256, bytes) = file_digest(&path)?;
+        ensure!(bytes <= FRAME_LIMIT as u64, "delivery record exceeds bound");
+        files.push(NativeFile {
+            path: name.into(),
+            sha256,
+            bytes,
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
 impl NativeState {
     fn validate(&self, expected_binary: &str, expected_thread: &str) -> Result<String> {
         ensure!(
-            self.schema == 1
+            self.schema == 2
                 && self.provider_binary_sha256 == expected_binary
                 && valid_digest(expected_binary)
                 && self.thread_id == expected_thread
@@ -477,6 +608,26 @@ impl NativeState {
             );
             rollout |= entry.path.starts_with("sessions/") && entry.path.contains(expected_thread);
         }
+        ensure!(
+            self.delivery_files.len() <= 2048
+                && self
+                    .delivery_files
+                    .windows(2)
+                    .all(|v| v[0].path < v[1].path),
+            "invalid delivery coverage"
+        );
+        for entry in &self.delivery_files {
+            ensure!(
+                delivery_path_valid(&entry.path)
+                    && valid_digest(&entry.sha256)
+                    && entry.bytes <= FRAME_LIMIT as u64,
+                "invalid delivery snapshot entry"
+            );
+            total = total
+                .checked_add(entry.bytes)
+                .context("delivery snapshot size overflow")?;
+            ensure!(total <= 512 * 1024 * 1024, "session snapshot exceeds bound");
+        }
         ensure!(rollout, "native thread rollout missing");
         identity(self)
     }
@@ -484,23 +635,16 @@ impl NativeState {
     pub fn verify(
         &self,
         home: &Path,
+        delivery_directory: &Path,
         expected_binary: &str,
         expected_thread: &str,
     ) -> Result<String> {
         let id = self.validate(expected_binary, expected_thread)?;
-        let canonical_home = home.canonicalize()?;
-        for entry in &self.files {
-            let path = home.join(&entry.path);
-            ensure!(
-                path.canonicalize()?.starts_with(&canonical_home),
-                "native state escaped its volume"
-            );
-            let (digest, bytes) = file_digest(&path)?;
-            ensure!(
-                digest == entry.sha256 && bytes == entry.bytes,
-                "native state missing or changed"
-            );
-        }
+        ensure!(
+            state_files(home)? == self.files
+                && delivery_files(delivery_directory)? == self.delivery_files,
+            "native state or host delivery coverage missing, extra or changed"
+        );
         Ok(id)
     }
 }
@@ -646,11 +790,19 @@ impl AppServer {
             _native: lock,
             _delivery: delivery_lock,
         };
+        if native.is_none() {
+            ensure!(
+                state_files(&config.native_home)?.is_empty()
+                    && delivery_files(&config.delivery_directory)?.is_empty(),
+                "existing native/delivery state requires explicit checkpoint resume"
+            );
+        }
         // Check stopped-state bytes before the new child opens SQLite/WAL.
         let verified_resume = native
             .map(|state| {
                 state.verify(
                     &config.native_home,
+                    &config.delivery_directory,
                     &config.executable_sha256,
                     &state.thread_id,
                 )?;
@@ -1116,57 +1268,33 @@ impl AppServer {
     /// A persistent-volume checkpoint. Copy/archive these listed bytes only
     /// through the admitted artifact gateway; do not archive CODEX_HOME wholesale.
     pub async fn checkpoint(mut self) -> Result<NativeState> {
+        self.capture_checkpoint().await
+    }
+    /// Publish only after the child has stopped, with both writer locks held.
+    pub async fn checkpoint_to(mut self, path: &Path) -> Result<NativeState> {
+        ensure!(
+            path.is_absolute()
+                && !path.starts_with(&self.config.workspace)
+                && !path.starts_with(&self.config.native_home)
+                && !path.starts_with(&self.config.delivery_directory),
+            "checkpoint must be host-only, outside restored trees"
+        );
+        private_directory(path.parent().context("checkpoint parent missing")?)?;
+        let native = self.capture_checkpoint().await?;
+        durable_json(path, &native)?;
+        Ok(native)
+    }
+    async fn capture_checkpoint(&mut self) -> Result<NativeState> {
         let thread = self.thread_id.clone().context("thread not opened")?;
         self.stop_child().await?;
-        fn collect(root: &Path, path: &Path, entries: &mut Vec<NativeFile>) -> Result<()> {
-            ensure!(
-                entries.len() < 2048,
-                "native state file count exceeds bound"
-            );
-            let metadata = std::fs::symlink_metadata(path)?;
-            ensure!(!metadata.is_symlink(), "native state contains a symlink");
-            if metadata.is_dir() {
-                for entry in std::fs::read_dir(path)? {
-                    collect(root, &entry?.path(), entries)?;
-                }
-            } else {
-                let relative = path
-                    .strip_prefix(root)?
-                    .to_str()
-                    .context("invalid native path")?;
-                if native_path(relative) {
-                    let (sha256, bytes) = file_digest(path)?;
-                    entries.push(NativeFile {
-                        path: relative.into(),
-                        sha256,
-                        bytes,
-                    });
-                }
-            }
-            Ok(())
-        }
-        let mut files = Vec::new();
-        let sessions = self.config.native_home.join("sessions");
-        if sessions.exists() {
-            collect(&self.config.native_home, &sessions, &mut files)?;
-        }
-        for entry in std::fs::read_dir(&self.config.native_home)? {
-            let path = entry?.path();
-            let name = path
-                .file_name()
-                .context("native file name")?
-                .to_str()
-                .context("invalid native name")?;
-            if native_path(name) {
-                collect(&self.config.native_home, &path, &mut files)?;
-            }
-        }
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let files = state_files(&self.config.native_home)?;
+        let delivery_files = delivery_files(&self.config.delivery_directory)?;
         let native = NativeState {
-            schema: 1,
+            schema: 2,
             provider_binary_sha256: self.config.executable_sha256.clone(),
             thread_id: thread,
             files,
+            delivery_files,
         };
         // File bytes were hashed during capture under this stopped-writer lock.
         // Validate the assembled manifest without rereading those same bytes.
