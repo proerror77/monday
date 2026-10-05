@@ -13,7 +13,84 @@ pub enum TaskKind {
     Prepare,
     Train,
     Backtest,
+    /// The finalized canonical CEX Campaign consumes development-only typed
+    /// input roles. It cannot be submitted as a generic Train/Backtest view.
+    CexCampaign,
     Explore,
+}
+
+/// Actual immutable scientific/public configuration read back from Kubernetes.
+/// Per-Attempt credentials and native admission signatures are late-bound;
+/// including them here would make their task identity circular.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerConfigurationRef {
+    pub schema: String,
+    pub secret_name: String,
+    pub secret_uid: String,
+    pub configuration_sha256: String,
+}
+impl WorkerConfigurationRef {
+    pub fn validate(&self, profile: &Profile) -> Result<()> {
+        ensure!(
+            self.schema == "monday.worker_configuration.v1"
+                && profile.worker_secret.as_deref() == Some(self.secret_name.as_str())
+                && !self.secret_uid.is_empty()
+                && self.secret_uid.len() <= 128
+                && self
+                    .secret_uid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && valid_digest(&self.configuration_sha256),
+            "worker configuration identity missing or changed"
+        );
+        Ok(())
+    }
+}
+
+/// One wire identity shared by the native producer, launcher, and initializer.
+/// The caller must obtain this map from an actual immutable Secret readback;
+/// computing a digest alone is not a source witness or admission.
+pub fn worker_configuration_reference(
+    namespace: &str,
+    secret_name: &str,
+    secret_uid: &str,
+    data: &std::collections::BTreeMap<String, String>,
+) -> Result<WorkerConfigurationRef> {
+    ensure!(
+        !namespace.is_empty()
+            && namespace.len() <= 63
+            && !secret_name.is_empty()
+            && secret_name.len() <= 63
+            && !secret_uid.is_empty()
+            && secret_uid.len() <= 128,
+        "configuration scope missing"
+    );
+    ensure!(
+        data.contains_key("campaign.json")
+            && data.contains_key("artifact-io.json")
+            && data.keys().all(|k| matches!(
+                k.as_str(),
+                "campaign.json" | "artifact-io.json" | "ca.pem" | "native-trust.json"
+            ))
+            && data
+                .values()
+                .all(|v| !v.is_empty() && v.len() <= 2 * 1024 * 1024)
+            && data.values().map(String::len).sum::<usize>() <= 2 * 1024 * 1024,
+        "configuration requires bounded static inputs; late credentials are forbidden"
+    );
+    Ok(WorkerConfigurationRef {
+        schema: "monday.worker_configuration.v1".into(),
+        secret_name: secret_name.to_owned(),
+        secret_uid: secret_uid.to_owned(),
+        configuration_sha256: identity(&(
+            "monday.worker_configuration_contents.v1",
+            namespace,
+            secret_name,
+            secret_uid,
+            data,
+        ))?,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,6 +108,7 @@ pub struct TaskSpec {
     pub max_attempts: u32,
     pub output_prefix: String,
     pub fit_identity_sha256: Option<String>,
+    pub worker_configuration: Option<WorkerConfigurationRef>,
 }
 
 impl TaskSpec {
@@ -85,6 +163,13 @@ impl TaskSpec {
             ensure!(valid_digest(fit), "invalid fit identity");
         }
         self.profile.validate()?;
+        if let Some(configuration) = &self.worker_configuration {
+            configuration.validate(&self.profile)?;
+        }
+        if self.kind == TaskKind::CexCampaign {
+            ensure!(self.max_attempts == 1 && self.worker_configuration.is_some(),
+                "native Campaign requires one reserved Attempt and verified immutable configuration");
+        }
         Ok(())
     }
     pub fn id(&self) -> Result<String> {
@@ -171,6 +256,44 @@ pub struct Lease {
     pub fence: i64,
     pub owner: String,
     pub expires_ms: i64,
+}
+
+/// Fixed context supplied by the reconciler's admitted Job. Workers cannot
+/// claim an Attempt; PG and the artifact gateway independently enforce it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptContext {
+    pub spec: TaskSpec,
+    pub lease: Lease,
+}
+impl AttemptContext {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.lease.task_id == self.spec.id()?
+                && self.lease.attempt > 0
+                && self.lease.attempt <= self.spec.max_attempts
+                && self.lease.fence > 0
+                && self.lease.expires_ms > 0
+                && !self.lease.owner.is_empty()
+                && self.lease.owner.len() <= 256,
+            "invalid admitted Attempt context"
+        );
+        Ok(())
+    }
+    pub fn output_prefix(&self) -> String {
+        format!(
+            "{}/{}/{}/",
+            self.spec.output_prefix, self.lease.task_id, self.lease.attempt
+        )
+    }
+    pub fn from_environment() -> Result<Self> {
+        let value = std::env::var("MONDAY_ATTEMPT_CONTEXT")
+            .context("admitted Attempt context is required")?;
+        ensure!(value.len() <= 64 * 1024, "Attempt context exceeds bound");
+        let context: Self = serde_json::from_str(&value)?;
+        context.validate()?;
+        Ok(context)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,6 +383,16 @@ impl ResultReceipt {
                 "non-preparation task cannot publish data"
             );
         }
+        if spec.kind == TaskKind::CexCampaign {
+            ensure!(
+                self.artifacts
+                    .iter()
+                    .filter(|a| a.key.ends_with("/cex-campaign.json"))
+                    .count()
+                    == 1,
+                "native Campaign lacks typed scientific evidence receipt"
+            );
+        }
         Ok(())
     }
 }
@@ -322,6 +455,8 @@ pub struct Task {
     pub lease: Option<Lease>,
     pub deadline_ms: Option<i64>,
     pub execution: Option<ExecutionHandle>,
+    #[serde(default)]
+    pub attempt_identity: Option<crate::execution::AttemptIdentityRef>,
     pub stopping_as: Option<State>,
     pub retry_after_stop: bool,
     pub receipt: Option<ResultReceipt>,
@@ -341,6 +476,7 @@ impl Task {
             lease: None,
             deadline_ms: None,
             execution: None,
+            attempt_identity: None,
             stopping_as: None,
             retry_after_stop: false,
             receipt: None,
@@ -382,6 +518,7 @@ impl Task {
             );
         }
         self.lease = Some(lease.clone());
+        self.attempt_identity = None;
         self.state = State::Launching;
         Ok(lease)
     }
@@ -409,6 +546,17 @@ impl Task {
         self.check_lease(lease, now_ms)?;
         ensure!(self.state == State::Launching, "not launching");
         handle.validate(lease, &self.spec)?;
+        if self.spec.kind == TaskKind::CexCampaign {
+            self.attempt_identity
+                .as_ref()
+                .context("Campaign launch lacks controlled identity")?
+                .validate(&self.spec, lease)?;
+        } else {
+            ensure!(
+                self.attempt_identity.is_none(),
+                "unexpected late Campaign identity"
+            );
+        }
         self.execution = Some(handle);
         self.state = State::Running;
         Ok(())
