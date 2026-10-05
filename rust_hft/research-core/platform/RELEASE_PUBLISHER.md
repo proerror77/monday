@@ -56,6 +56,10 @@ It establishes HTTPS server trust with a HEAD request without a capability token
 A mismatched signer, policy, private TLS identity or server certificate blocks
 registry publication.
 
+CI compiles the native issuer in a separate step before injecting release
+credentials. The wrapper only invokes that built binary. It does not expose
+private key/token files to Cargo or dependency build scripts.
+
 `import BUILD_SHA256 OCI_SHA256 PROOF_SHA256 PUBLIC_TRUST_FILE HTTPS_GATEWAY TOKEN_FILE` accepts no
 signing key. It reads the signed proof and artifact from the gateway, verifies
 operator trust and proof binding, and independently checks source/program bytes.

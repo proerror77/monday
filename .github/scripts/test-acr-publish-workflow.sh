@@ -107,9 +107,13 @@ publication=acr.fetch('jobs').fetch('publish')
 abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']
 steps=publication.fetch('steps')
 preflight=steps.index { |s|s.fetch('name','')=='Require independent Build signer configuration' }
+compile=steps.index { |s|s.fetch('name','')=='Compile independent release issuer before secret injection' }
 login=steps.index { |s|s.fetch('name','')=='Log in to ACR' }
 push=steps.index { |s|s.fetch('name','')=='Build and push' }
 abort 'issuer policy/TLS validation occurs after registry mutation' unless preflight && login && push && preflight<login && preflight<push
+abort 'issuer compilation can access injected release credentials' unless compile && compile<preflight && steps.fetch(compile).fetch('if')=='matrix.research_artifact' && steps.fetch(compile).fetch('env').keys==['CARGO_TARGET_DIR'] && steps.fetch(compile).fetch('run').include?('cargo build')
+wrapper=File.read(File.join(File.dirname(ARGV[0]),'../scripts/publish-research-build-release.sh'))
+abort 'issuer wrapper compiles while holding release credentials' if wrapper.match?(/\bcargo\s+(?:build|run)\b/)
 config=steps.fetch(preflight)
 abort 'issuer preflight does not bind the selected image product' unless config.fetch('if')=='matrix.research_artifact' && config.fetch('env').fetch('PRODUCT')=='${{ matrix.product }}' && config.fetch('env').fetch('PUBLISH_IMAGE_REPOSITORY')=='${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}' && config.fetch('run').include?('publish-research-build-release.sh check-config')
 readback=publication.fetch('steps').find { |s|s.fetch('name','')=='Read back research image source and executable bytes' }

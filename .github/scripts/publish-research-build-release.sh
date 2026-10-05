@@ -7,6 +7,8 @@ mode=${1:?expected check-config, publish or import}
 : "${MONDAY_RELEASE_GATEWAY:?scoped HTTPS artifact gateway required}"
 : "${MONDAY_RELEASE_GATEWAY_TOKEN:?exact Build/source capability required}"
 root=$(cd "$(dirname "$0")/../.." && pwd)
+issuer=${RUNNER_TEMP:?prebuilt native issuer directory required}/research-release-issuer-target/debug/research-release-publisher
+test -x "$issuer"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 umask 077
@@ -23,7 +25,7 @@ case "$mode" in
     unset MONDAY_RELEASE_SIGNING_KEY
     : "${GITHUB_REPOSITORY:?repository required}" "${PRODUCT:?image product required}"
     : "${PUBLISH_IMAGE_REPOSITORY:?exact selected OCI repository required}" "${RUNNER_TEMP:?authenticated software directory required}"
-    cargo run --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" --locked --features publisher --bin research-release-publisher -- check-config "$work/policy.json" "$work/key" "$RUNNER_TEMP/research-release/research-image-release.json" "$GITHUB_REPOSITORY" "$PRODUCT" "$PUBLISH_IMAGE_REPOSITORY" "$MONDAY_RELEASE_GATEWAY" "$work/token"
+    "$issuer" check-config "$work/policy.json" "$work/key" "$RUNNER_TEMP/research-release/research-image-release.json" "$GITHUB_REPOSITORY" "$PRODUCT" "$PUBLISH_IMAGE_REPOSITORY" "$MONDAY_RELEASE_GATEWAY" "$work/token"
     ;;
   publish)
     : "${MONDAY_RELEASE_SIGNING_KEY:?independent private signing key required}"
@@ -38,7 +40,7 @@ case "$mode" in
     unset MONDAY_RELEASE_SIGNING_KEY
     jq -n --arg source "$SOURCE_REVISION" --argjson software_run "$PRODUCER_RUN" --arg products "$SOFTWARE_PRODUCTS" --arg product "$PRODUCT" --arg image "$IMAGE" --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" --argjson job "$job" \
       '{source_sha:$source,software_run_id:$software_run,software_products:$products,product:$product,image:$image,publisher_run_id:$run,publisher_run_attempt:$attempt,publisher_job_id:$job}' >"$work/request.json"
-    native=(cargo run --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" --locked --features publisher --bin research-release-publisher --)
+    native=("$issuer")
     "${native[@]}" plan "$root" "$work/request.json" "$work/policy.json" >"${RUNNER_TEMP:?}/research-build-plan.json"
     "${native[@]}" publish "$root" "$work/request.json" "$work/policy.json" "$work/key" "$MONDAY_RELEASE_GATEWAY" "$work/token" >"$RUNNER_TEMP/research-build-artifacts.json"
     ;;
@@ -51,7 +53,7 @@ case "$mode" in
     # Selectors came from the native issuer; importer still verifies signature,
     # proof identity, actual source/program bytes and PG projection independently.
     while IFS=$'\t' read -r build oci proof; do
-      MONDAY_RESEARCH_DATABASE_URL="$MONDAY_RELEASE_IMPORT_DATABASE_URL" cargo run --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" --locked --features publisher --bin research-release-publisher -- import "$build" "$oci" "$proof" "$work/trust.json" "$MONDAY_RELEASE_GATEWAY" "$work/token"
+      MONDAY_RESEARCH_DATABASE_URL="$MONDAY_RELEASE_IMPORT_DATABASE_URL" "$issuer" import "$build" "$oci" "$proof" "$work/trust.json" "$MONDAY_RELEASE_GATEWAY" "$work/token"
     done < <(jq -r '.[] | [.build_sha256,.image_sha256,.publication_proof_sha256] | @tsv' "$RUNNER_TEMP/research-build-artifacts.json")
     ;;
   *) exit 2 ;;

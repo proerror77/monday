@@ -272,6 +272,12 @@ jobs:
         with:
           toolchain: 1.98.1
 
+      - name: Compile independent release issuer before secret injection
+        if: matrix.research_artifact
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/research-release-issuer-target
+        run: cargo build --manifest-path rust_hft/research-core/platform/Cargo.toml --locked --features publisher --bin research-release-publisher
+
       - name: Require independent Build signer configuration
         if: matrix.research_artifact
         env:
