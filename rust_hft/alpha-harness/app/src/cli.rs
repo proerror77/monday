@@ -1240,9 +1240,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             MissionCommand::Dispatch { command } => match command {
                 MissionDispatchCommand::PreparePlatform(args) => {
-                    tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::prepare(args))
-                        .await
-                        .context("platform Campaign budget preparation task failed")?
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_admission::prepare(args)
+                    })
+                    .await
+                    .context("platform Campaign budget preparation task failed")?
                 }
                 MissionDispatchCommand::DescribeStudy(args) => {
                     mission_dispatch::sequence_admission::describe(args)
