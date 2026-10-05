@@ -21,6 +21,8 @@ pub mod release;
 #[cfg(feature = "publisher")]
 pub mod release_publisher;
 pub mod research;
+#[cfg(feature = "native-admission")]
+pub mod revocation;
 #[cfg(feature = "control")]
 pub mod service;
 #[cfg(feature = "control")]

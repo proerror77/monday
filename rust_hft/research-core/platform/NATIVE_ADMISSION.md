@@ -19,12 +19,15 @@ locks, lease/fence/deadline and cancellation guards.
 
 Install additive migrations in this order: `postgres.sql`,
 `verified_build_release.sql`, `session_deliveries.sql`, `artifact_gateway.sql`,
-`native_admission.sql`. The last migration replaces the original permit's exact
+`native_admission.sql`, then `native_request_revocation.sql`. The latter migration
+adds scheduled source history. See [native request revocation](NATIVE_REVOCATION.md).
+The native admission migration replaces the original permit's exact
 signature and preserves its safeguards. No migration or CLI import activates PG
 or a backend. The native importer needs SELECT on registered Runs/Builds/releases
 and SELECT/INSERT on admissions and native_admission_imports; it cannot be the
 Agent or worker role. Prepare workers receive only the native import request,
-tenant and expiry columns. Keep installation and production cutover separate.
+tenant and expiry columns. Consumers also need EXECUTE on the fixed native request
+deadline function. Keep installation and production cutover separate.
 
 Native Campaign transfer retains the source ledger's existing reservation and
 full charge. The native approval/family/study and published receipt guards order
@@ -38,7 +41,9 @@ approval, debit cumulative budgets in the existing source ledger, bind the exact
 finalized Campaign request and typed prepared-input roles, durably transfer its
 execution ownership, and independently read back the source receipts before
 signing. This receiver and transfer primitive do not implement that complete
-producer, source-ledger revocation projection or data equivalence. The Campaign shared-input collection and
+producer or data equivalence. The separate revocation receiver accepts host
+witnesses after source authentication, publication and independent readback. It
+does not perform those source checks. The Campaign shared-input collection and
 canonical worker adapter remain required: search workers must not receive
 selection or holdout bytes, and a whole native dataset must not be relabeled as a
 Train view. Source metadata and signatures are not scientific terminal evidence.
