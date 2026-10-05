@@ -20,8 +20,12 @@ pub struct PrepareConfig {
     pub clickhouse_endpoint: String,
     pub clickhouse_user_file: String,
     pub clickhouse_password_file: String,
+    #[serde(default)]
+    pub clickhouse_tls: crate::transport::TlsConfig,
     pub artifact_gateway: String,
     pub artifact_token_file: String,
+    #[serde(default)]
+    pub artifact_tls: crate::transport::TlsConfig,
     pub rows_per_block: u16,
     pub max_blocks: u16,
 }
@@ -35,6 +39,19 @@ pub struct Writer {
 }
 impl Writer {
     pub fn new(endpoint: &str, token: String, task: &Task) -> Result<Self> {
+        Self::with_tls(
+            endpoint,
+            token,
+            task,
+            &crate::transport::TlsConfig::default(),
+        )
+    }
+    pub fn with_tls(
+        endpoint: &str,
+        token: String,
+        task: &Task,
+        tls: &crate::transport::TlsConfig,
+    ) -> Result<Self> {
         let base = reqwest::Url::parse(endpoint)?;
         ensure!(
             base.scheme() == "https"
@@ -46,10 +63,7 @@ impl Writer {
             "invalid worker artifact identity"
         );
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            client: tls.client(std::time::Duration::from_secs(30), true)?,
             base,
             token,
             prefix: format!("{}/{}/{}/", task.spec.output_prefix, task.id, task.attempt),

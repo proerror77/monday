@@ -320,6 +320,47 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn research_client_reloads_private_host_token_and_fails_closed() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let app = axum::Router::new().route(
+            "/research",
+            axum::routing::post(|headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some(format!("Bearer {}", "x".repeat(32)).as_str())
+                {
+                    (axum::http::StatusCode::OK, "{\"verified\":true}")
+                } else {
+                    (axum::http::StatusCode::UNAUTHORIZED, "{}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/research", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let temporary = tempfile::tempdir()?;
+        let directory = temporary.path().canonicalize()?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        let token = directory.join("host.token");
+        std::fs::write(&token, "x".repeat(32))?;
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600))?;
+        let client = ResearchClient::from_file(&endpoint, token.clone(), &Default::default())?;
+        let tool = crate::research::ResearchTool::Status {
+            run_sha256: "a".repeat(64),
+        };
+        assert_eq!(client.execute(&tool).await?, json!({"verified":true}));
+        std::fs::write(&token, "y".repeat(32))?;
+        assert!(client.execute(&tool).await.is_err());
+        std::fs::write(&token, "x".repeat(32))?;
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644))?;
+        assert!(client.execute(&tool).await.is_err());
+        std::fs::remove_file(&token)?;
+        assert!(client.execute(&tool).await.is_err());
+        server.abort();
+        Ok(())
+    }
+    #[tokio::test]
     async fn research_client_authenticates_and_rejects_redirects() -> Result<()> {
         let app = axum::Router::new().route(
             "/research",
@@ -1135,10 +1176,52 @@ impl AppServer {
 pub struct ResearchClient {
     client: reqwest::Client,
     endpoint: reqwest::Url,
-    token: String,
+    token: ClientToken,
+}
+enum ClientToken {
+    Inline(String),
+    File(PathBuf),
+}
+impl ClientToken {
+    fn read(&self) -> Result<String> {
+        let token = match self {
+            Self::Inline(token) => token.clone(),
+            Self::File(path) => String::from_utf8(crate::transport::read_private_file(path)?)?
+                .trim()
+                .to_owned(),
+        };
+        ensure!(
+            (32..=4096).contains(&token.len()),
+            "invalid capability token"
+        );
+        Ok(token)
+    }
 }
 impl ResearchClient {
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
+        Self::connect(
+            endpoint,
+            ClientToken::Inline(token),
+            &crate::transport::TlsConfig::default(),
+        )
+    }
+    /// Reload the broker's host-only token on each call, including renewal.
+    pub fn from_file(
+        endpoint: &str,
+        token_file: PathBuf,
+        tls: &crate::transport::TlsConfig,
+    ) -> Result<Self> {
+        ensure!(
+            token_file.is_absolute(),
+            "absolute host token path required"
+        );
+        Self::connect(endpoint, ClientToken::File(token_file), tls)
+    }
+    fn connect(
+        endpoint: &str,
+        token: ClientToken,
+        tls: &crate::transport::TlsConfig,
+    ) -> Result<Self> {
         let endpoint = reqwest::Url::parse(endpoint)?;
         ensure!(
             (endpoint.scheme() == "https"
@@ -1152,15 +1235,9 @@ impl ResearchClient {
                 && endpoint.password().is_none(),
             "invalid research capability endpoint"
         );
-        ensure!(
-            (32..=4096).contains(&token.len()),
-            "invalid capability token"
-        );
+        token.read()?;
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            client: tls.client(Duration::from_secs(15), endpoint.scheme() == "https")?,
             endpoint,
             token,
         })
@@ -1170,7 +1247,7 @@ impl ResearchClient {
         let mut response = self
             .client
             .post(self.endpoint.clone())
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.read()?)
             .json(tool)
             .send()
             .await
