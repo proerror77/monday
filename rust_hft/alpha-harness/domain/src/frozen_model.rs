@@ -334,14 +334,18 @@ impl FrozenModelStrategyV1 {
 
     pub fn runtime_contract(&self) -> Result<crate::CexRuntimeContractV1, crate::DomainError> {
         self.validate()?;
-        Ok(crate::CexRuntimeContractV1 {
+        Ok(self.runtime_contract_from_validated())
+    }
+
+    pub(crate) fn runtime_contract_from_validated(&self) -> crate::CexRuntimeContractV1 {
+        crate::CexRuntimeContractV1 {
             zero_epsilon: 0.0,
             observation_frequency_millis: self.frozen.program.observation_frequency_millis,
             tick_size: self.instrument_rules.tick_size.clone(),
             step_size: self.instrument_rules.step_size.clone(),
             min_notional: self.instrument_rules.min_notional.clone(),
             costs: self.evaluation_protocol.costs.clone(),
-        })
+        }
     }
 }
 

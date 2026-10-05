@@ -59,6 +59,13 @@ cargo tree --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" \
 if grep -E '^(burn|ort |hft-(collector|research-ml|data) |parquet )' "$work/control.tree"; then
   echo 'control pulls acquisition, training or Parquet' >&2; exit 1
 fi
+for features in formula-strategy,binance full; do
+  cargo tree --manifest-path "$root/rust_hft/runtime/Cargo.toml" -p hft-live \
+    --no-default-features --features "$features" --locked --edges normal --prefix none >"$work/live.tree"
+  if grep -E '^(alpha-(domain|engine|store|onnx-evaluator|harness) |burn |hft-(collector|research-platform|research-ml) )' "$work/live.tree"; then
+    echo 'live imports research control, evaluation or training' >&2; exit 1
+  fi
+done
 # Depth acquisition and book sequencing must not compile the order-loop engine.
 for selection in 'data-pipelines/Cargo.toml hft-collector' 'data-pipelines/Cargo.toml hft-binance-md' 'runtime/Cargo.toml hft-binance-depth'; do
   read -r manifest package <<<"$selection"

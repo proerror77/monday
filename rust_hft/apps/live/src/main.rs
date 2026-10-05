@@ -6,10 +6,11 @@
 
 mod helpers;
 
-use alpha_domain::{
-    AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent, StrategyBundle,
-};
 use clap::Parser;
+use governance::attribution::{
+    AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
+};
+use governance::runtime_bundle::RuntimeBundle;
 use governance::SignedDeploymentEnvelope;
 use hft_live::deployment_envelope::{
     decode_trusted_keys, ActivationRequest, DeploymentIntake, DeploymentReservation,
@@ -44,7 +45,7 @@ struct Args {
     #[arg(long)]
     deployment_envelope: Option<std::path::PathBuf>,
 
-    /// Content-addressed StrategyBundle referenced by the deployment envelope.
+    /// Content-addressed RuntimeBundle referenced by the deployment envelope.
     #[arg(long, requires = "deployment_envelope")]
     strategy_bundle: Option<std::path::PathBuf>,
 
@@ -392,13 +393,13 @@ fn apply_deployment_if_present(
     let audit_path = required_path(&args.deployment_audit_log, "--deployment-audit-log")?;
     open_feedback_log(args)?;
     let signed: SignedDeploymentEnvelope = read_json(envelope_path)?;
-    let bundle: StrategyBundle = read_json(bundle_path)?;
+    let bundle: RuntimeBundle = read_json(bundle_path)?;
     let policy_document: RuntimePolicyDocument = read_json(policy_path)?;
     let trusted_keys = decode_trusted_keys(read_json(trusted_keys_path)?)?;
     let policy = policy_document.bind(runtime_config_hash, risk_policy_hash);
     let ledger = RuntimeNonceLedger::open(nonce_path)?;
     let audit = RuntimeAuditLog::open(audit_path)?;
-    let mut adapter = SystemConfigActivationAdapter::new(config, &bundle, bundle_path);
+    let mut adapter = SystemConfigActivationAdapter::new(config, bundle.clone(), bundle_path);
     let observed_at = chrono::Utc::now();
     let (request, reservation) = DeploymentIntake::new(
         &trusted_keys,
