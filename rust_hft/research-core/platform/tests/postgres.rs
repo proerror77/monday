@@ -66,6 +66,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     sqlx_core::raw_sql::raw_sql(hft_research_platform::postgres::NATIVE_ADMISSION_MIGRATION)
         .execute(&pool)
         .await?;
+    sqlx_core::raw_sql::raw_sql(hft_research_platform::postgres::NATIVE_CAMPAIGN_INPUTS_MIGRATION)
+        .execute(&pool)
+        .await?;
     let ledger = Ledger::connect(&url).await?;
     let view = PublishedView {
         prepared_id: hash('a'),
@@ -148,7 +151,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         "INSERT INTO research.backends(acceptance_sha256,acceptance,enabled) VALUES($1,$2,true)",
     )
     .bind(&profile.acceptance_sha256)
-    .bind(serde_json::to_value(acceptance)?)
+    .bind(serde_json::to_value(&acceptance)?)
     .execute(&pool)
     .await?;
     let mut spec = TaskSpec {
@@ -357,6 +360,57 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
             Ok::<_, anyhow::Error>(())
         }
     };
+    // A valid native witness cannot route the fixed Campaign through the
+    // generic Training view or reuse a different input role.
+    let mut campaign_spec = spec.clone();
+    campaign_spec.kind = TaskKind::CexCampaign;
+    campaign_spec.max_attempts = 1;
+    campaign_spec.profile.acceptance_sha256 = hash('8');
+    campaign_spec.profile.worker_secret = Some("static-configuration".into());
+    campaign_spec.worker_configuration = Some(
+        hft_research_platform::orchestrator::WorkerConfigurationRef {
+            schema: "monday.worker_configuration.v1".into(),
+            secret_name: "static-configuration".into(),
+            secret_uid: "synthetic-source-uid".into(),
+            configuration_sha256: hash('e'),
+        },
+    );
+    campaign_spec.command = vec![
+        "/usr/local/bin/fixture".into(),
+        "mission".into(),
+        "campaign-execute".into(),
+        "--request-sha256".into(),
+        run.configuration_sha256.clone(),
+        "--pre-holdout".into(),
+    ];
+    let campaign_acceptance = Acceptance {
+        profile: campaign_spec.profile.clone(),
+        ..acceptance.clone()
+    };
+    sqlx_core::query::query(
+        "INSERT INTO research.backends(acceptance_sha256,acceptance,enabled) VALUES($1,$2,true)",
+    )
+    .bind(&campaign_spec.profile.acceptance_sha256)
+    .bind(serde_json::to_value(campaign_acceptance)?)
+    .execute(&pool)
+    .await?;
+    let mut campaign_run = run.clone();
+    campaign_run.kind = campaign_spec.kind;
+    campaign_run.command = campaign_spec.command.clone();
+    campaign_spec.run_manifest_sha256 = ledger.register_run("fixture", &campaign_run).await?;
+    admit(campaign_spec.clone()).await?;
+    let rejected = ledger
+        .submit(
+            "fixture",
+            "campaign-cannot-use-generic-train",
+            campaign_spec,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        rejected.to_string().contains("typed collection"),
+        "unexpected Campaign rejection: {rejected:#}"
+    );
     plan.spec.split = Split::Validation;
     plan.producer_image = spec.image.clone();
     let plan_id = plan.id()?;

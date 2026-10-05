@@ -10,6 +10,8 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 anyhow = "1"
 base64 = { version = "0.22", optional = true }
+zip = { version = "6", optional = true, default-features = false, features = ["deflate"] }
+tempfile = { version = "3", optional = true }
 hft-cex-research-input = { path = "../cex-input" }
 ed25519-dalek = { version = "=2.2.0", optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "process", "io-util", "io-std"] }
@@ -25,7 +27,7 @@ sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false,
 [features]
 default = []
 artifact-io = ["dep:tokio", "dep:reqwest", "dep:rustix", "dep:tokio-util", "dep:base64", "tokio/fs", "reqwest/stream"]
-control = ["artifact-io", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "native-admission"]
+control = ["artifact-io", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:zip", "dep:tempfile", "native-admission"]
 native-admission = ["dep:ed25519-dalek"]
 gateway = ["control", "dep:rustix", "dep:tokio-util", "dep:futures-util", "tokio/fs", "reqwest/stream"]
 

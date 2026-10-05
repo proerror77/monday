@@ -145,6 +145,15 @@ impl ArtifactGateway {
             let science: crate::campaign_result::CexCampaignResultReceipt =
                 serde_json::from_slice(&bytes)?;
             science.validate(&task.spec, &receipt.artifacts)?;
+            for round in &science.rounds {
+                let archive = receipt
+                    .artifacts
+                    .iter()
+                    .find(|a| **a == round.result_zip.artifact)
+                    .context("native archive missing from fixed result")?;
+                self.verify_native_archive(archive, &round.entries).await?;
+                verified.insert((&archive.key, &archive.sha256, archive.bytes));
+            }
             campaign = Some(science);
             verified.insert((&artifact.key, &artifact.sha256, artifact.bytes));
         }
@@ -243,6 +252,50 @@ impl ArtifactGateway {
             count == artifact.bytes && format!("{:x}", hash.finalize()) == artifact.sha256,
             "artifact integrity failure"
         );
+        Ok(())
+    }
+
+    async fn verify_native_archive(
+        &self,
+        artifact: &crate::orchestrator::Artifact,
+        entries: &[crate::campaign_result::ArchiveEntry],
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        ensure!(
+            artifact.bytes > 0 && artifact.bytes <= 512 * 1024 * 1024,
+            "native archive exceeds gateway budget"
+        );
+        let mut response = self
+            .client
+            .get(self.base.join(&artifact.key)?)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("native archive readback unavailable"))?
+            .error_for_status()
+            .map_err(|_| anyhow::anyhow!("native archive readback rejected"))?;
+        let mut file = tempfile::NamedTempFile::new()?;
+        let mut digest = Sha256::new();
+        let mut count = 0_u64;
+        while let Some(bytes) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow::anyhow!("native archive readback interrupted"))?
+        {
+            count = count
+                .checked_add(bytes.len() as u64)
+                .context("native archive size overflow")?;
+            ensure!(count <= artifact.bytes, "native archive size changed");
+            digest.update(&bytes);
+            file.write_all(&bytes)?;
+        }
+        ensure!(
+            count == artifact.bytes && format!("{:x}", digest.finalize()) == artifact.sha256,
+            "native archive content changed"
+        );
+        file.as_file().sync_all()?;
+        crate::campaign_result::verify_archive_entries(file.reopen()?, entries, 512 * 1024 * 1024)?;
         Ok(())
     }
 }
