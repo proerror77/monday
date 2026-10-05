@@ -311,6 +311,66 @@ pub(super) struct Admission {
 }
 
 impl Admission {
+    #[cfg(test)]
+    pub(super) fn store_usage_for_platform_test(
+        &self,
+    ) -> alpha_store::campaign_ledger::CampaignBudgetUsageV1 {
+        self.store
+            .campaign_family_usage(&self.reservation.family_id)
+            .unwrap()
+    }
+    pub(super) fn platform_budget(
+        &mut self,
+    ) -> anyhow::Result<alpha_store::campaign_ledger::VerifiedCampaignPlatformBudget> {
+        if self.purpose != Purpose::Dispatch {
+            bail!("historical authority cannot prepare a platform budget");
+        }
+        let verified = verify(&self.signed, &self.control.trusted_keys_path)?;
+        self.store
+            .with_campaign_platform_budget(&verified, &self.reservation, Utc::now, |budget| {
+                Ok::<_, anyhow::Error>(budget.clone())
+            })
+    }
+
+    #[cfg(test)]
+    pub(super) fn transfer_to_platform(
+        &mut self,
+        transfer: &alpha_store::campaign_ledger::CampaignPlatformTransferV1,
+    ) -> anyhow::Result<()> {
+        if self.purpose != Purpose::Dispatch {
+            bail!("historical authority cannot transfer execution");
+        }
+        let verified = verify(&self.signed, &self.control.trusted_keys_path)?;
+        self.store.transfer_campaign_execution_to_platform(
+            &verified,
+            &self.reservation,
+            transfer,
+            Utc::now(),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_platform_export<T>(
+        &mut self,
+        transfer: &alpha_store::campaign_ledger::CampaignPlatformTransferV1,
+        action: impl FnOnce(
+            &alpha_store::campaign_ledger::VerifiedCampaignPlatformExport,
+        ) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        if self.purpose != Purpose::Dispatch {
+            bail!("historical authority cannot export native admission");
+        }
+        let verified = verify(&self.signed, &self.control.trusted_keys_path)?;
+        self.store.with_campaign_platform_export(
+            &verified,
+            &self.reservation,
+            transfer,
+            Utc::now,
+            action,
+        )
+    }
+
     pub(super) fn open(
         path: &Path,
         validated: &ValidatedSubmission,
