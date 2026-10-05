@@ -16,7 +16,7 @@ input:../risk-control/oms-core/Cargo.toml=sha256:62ddf714dfdd4870c2dd2b194ebaa61
 input:../risk-control/portfolio-core/Cargo.toml=sha256:7aa5c2f8524cf8007bb84733a2d90280915a74f74ba22020a42745360629c2fe
 input:../shared/Cargo.toml=sha256:b35adee5a901105a6e92c2340ea64122ec93e759c3ff385273bc34019e55cc09
 input:../data-pipelines/Cargo.toml=sha256:7771b21350fe2b6fb7ad1588790fa28a4f60a5a0a00874bce897c0f6b4d0442e
-input:../research-core/Cargo.toml=sha256:1cd25936eec9eac7bab2daa13fe7f01f15cd3c68325d09e48ac1b881c751fc8a
+input:../research-core/Cargo.toml=sha256:4a6b2bf6cc04fd7bc5fe85cd6e43f0d07598af70cb6836bf80bb67feb0f3cc9d
 input:../runtime/Cargo.toml=sha256:960ac178b5a2bba414a50f0a75ef3218a7c6b2aa6d31fbdf10a35e3ac77e1e6d
 input:../research-core/search-kernel/Cargo.toml=sha256:d5a4731c11fce22c0e358097bd38fb05a674659ac2afbd7c72112285093bdec6
 package:allocator-api2@0.2.21|source=registry+https://github.com/rust-lang/crates.io-index|checksum=683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923|features=alloc
