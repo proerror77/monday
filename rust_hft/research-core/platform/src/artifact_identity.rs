@@ -50,6 +50,8 @@ fn key_valid(key: &str) -> bool {
 }
 fn prefix_valid(prefix: &str) -> bool {
     prefix.strip_suffix('/').is_some_and(key_valid)
+        || (prefix.ends_with('/')
+            && crate::retirement::source_receipt_key_valid(&format!("{prefix}receipt.json")))
 }
 
 pub(crate) fn read_capabilities(path: &std::path::Path) -> Result<Vec<Capability>> {
