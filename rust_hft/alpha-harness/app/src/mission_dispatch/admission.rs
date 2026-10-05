@@ -926,6 +926,11 @@ pub(super) fn study_prefix_identity(
                 family_id,
                 family_receipt_sha256,
                 ..
+            }
+            | CampaignStudyLedgerEventV1::PlatformSettled {
+                family_id,
+                family_receipt_sha256,
+                ..
             } => {
                 linked_heads
                     .entry(family_id.clone())

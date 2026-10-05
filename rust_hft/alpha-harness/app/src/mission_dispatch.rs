@@ -1,5 +1,6 @@
 mod admission;
 pub(crate) mod platform_admission;
+mod platform_terminal;
 pub(crate) mod controller;
 pub(crate) mod final_admission;
 pub(crate) mod final_authority;
