@@ -66,6 +66,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     sqlx_core::raw_sql::raw_sql(hft_research_platform::postgres::NATIVE_ADMISSION_MIGRATION)
         .execute(&pool)
         .await?;
+    sqlx_core::raw_sql::raw_sql(hft_research_platform::postgres::NATIVE_CAMPAIGN_INPUTS_MIGRATION)
+        .execute(&pool)
+        .await?;
     sqlx_core::raw_sql::raw_sql(
         hft_research_platform::postgres::NATIVE_REQUEST_REVOCATION_MIGRATION,
     )
@@ -153,7 +156,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         "INSERT INTO research.backends(acceptance_sha256,acceptance,enabled) VALUES($1,$2,true)",
     )
     .bind(&profile.acceptance_sha256)
-    .bind(serde_json::to_value(acceptance)?)
+    .bind(serde_json::to_value(&acceptance)?)
     .execute(&pool)
     .await?;
     let mut spec = TaskSpec {
@@ -169,6 +172,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         max_attempts: 2,
         output_prefix: "research/fixture".into(),
         fit_identity_sha256: None,
+        worker_configuration: None,
     };
     let experiment = hft_research_platform::research::Experiment {
         schema: 1,
@@ -361,6 +365,57 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
             Ok::<_, anyhow::Error>(())
         }
     };
+    // A valid native witness cannot route the fixed Campaign through the
+    // generic Training view or reuse a different input role.
+    let mut campaign_spec = spec.clone();
+    campaign_spec.kind = TaskKind::CexCampaign;
+    campaign_spec.max_attempts = 1;
+    campaign_spec.profile.acceptance_sha256 = hash('8');
+    campaign_spec.profile.worker_secret = Some("static-configuration".into());
+    campaign_spec.worker_configuration = Some(
+        hft_research_platform::orchestrator::WorkerConfigurationRef {
+            schema: "monday.worker_configuration.v1".into(),
+            secret_name: "static-configuration".into(),
+            secret_uid: "synthetic-source-uid".into(),
+            configuration_sha256: hash('e'),
+        },
+    );
+    campaign_spec.command = vec![
+        "/usr/local/bin/fixture".into(),
+        "mission".into(),
+        "campaign-execute".into(),
+        "--request-sha256".into(),
+        run.configuration_sha256.clone(),
+        "--pre-holdout".into(),
+    ];
+    let campaign_acceptance = Acceptance {
+        profile: campaign_spec.profile.clone(),
+        ..acceptance.clone()
+    };
+    sqlx_core::query::query(
+        "INSERT INTO research.backends(acceptance_sha256,acceptance,enabled) VALUES($1,$2,true)",
+    )
+    .bind(&campaign_spec.profile.acceptance_sha256)
+    .bind(serde_json::to_value(campaign_acceptance)?)
+    .execute(&pool)
+    .await?;
+    let mut campaign_run = run.clone();
+    campaign_run.kind = campaign_spec.kind;
+    campaign_run.command = campaign_spec.command.clone();
+    campaign_spec.run_manifest_sha256 = ledger.register_run("fixture", &campaign_run).await?;
+    admit(campaign_spec.clone()).await?;
+    let rejected = ledger
+        .submit(
+            "fixture",
+            "campaign-cannot-use-generic-train",
+            campaign_spec,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        rejected.to_string().contains("typed collection"),
+        "unexpected Campaign rejection: {rejected:#}"
+    );
     plan.spec.split = Split::Validation;
     plan.producer_image = spec.image.clone();
     let plan_id = plan.id()?;
@@ -607,7 +662,8 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .execute(&pool)
         .await?;
     let mut result = ledger.lock_next("result-owner", 30000).await?.unwrap();
-    let lease = result.task.lease.clone().unwrap();
+    let mut lease = result.task.lease.clone().unwrap();
+    let original_launch_lease = lease.clone();
     let handle = hft_research_platform::execution::ExecutionHandle {
         backend: result.task.spec.profile.backend,
         cluster: result.task.spec.profile.cluster.clone(),
@@ -620,6 +676,8 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         request_sha256: result.task.id.clone(),
     };
     result.task.launched(&lease, result.now_ms, handle)?;
+    result.commit("fixture_initial_launch").await?;
+    result = ledger.lock_next("result-owner", 30000).await?.unwrap();
     #[cfg(feature = "gateway")]
     {
         let task = result.task.id.clone();
@@ -687,6 +745,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         takeover.await?;
         result = ledger.lock_next("result-owner", 30000).await?.unwrap();
     }
+    lease = result.task.heartbeat(&lease, result.now_ms, 90_000)?;
+    result.commit("fixture_heartbeat").await?;
+    result = ledger.lock_next("result-owner", 30000).await?.unwrap();
     let receipt = hft_research_platform::orchestrator::ResultReceipt {
         task_id: result.task.id.clone(),
         attempt: lease.attempt,
@@ -752,6 +813,17 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     assert_eq!(snapshot.task.state, State::Cancelled);
     assert_eq!(snapshot.native_admission.evidence.tenant, "fixture");
     assert!(snapshot.result.is_none());
+    assert_eq!(
+        snapshot
+            .execution_event
+            .as_ref()
+            .unwrap()
+            .document
+            .lease
+            .as_ref(),
+        Some(&original_launch_lease)
+    );
+    assert_ne!(original_launch_lease.expires_ms, lease.expires_ms);
     assert_eq!(
         snapshot
             .execution_event

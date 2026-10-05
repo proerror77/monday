@@ -14,12 +14,24 @@ async fn ledger() -> Result<Ledger> {
 }
 
 fn read<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
+    read_bounded(path, 1024 * 1024)
+}
+fn read_bounded<T: serde::de::DeserializeOwned>(path: &str, max_bytes: u64) -> Result<T> {
+    use rustix::fs::{open, Mode, OFlags};
     use std::io::Read;
+    let file = std::fs::File::from(open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?);
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= max_bytes,
+        "input must be a bounded regular file"
+    );
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > 1024 * 1024 {
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
         bail!("input exceeds bound");
     }
     Ok(serde_json::from_slice(&bytes)?)
@@ -54,6 +66,17 @@ async fn main() -> Result<()> {
             let verified=trust.verify(&signed)?;
             println!("{}",ledger().await?.register_native_admission(&verified).await?);
         }
+        ["register-native-campaign-inputs",signed_path,manifest_path,blocks_path]=>{
+            let signed:hft_research_platform::admission::SignedNativeAdmission=read(signed_path)?;
+            let trust_path=std::env::var("MONDAY_RESEARCH_NATIVE_ADMISSION_TRUST_FILE").context("operator native reservation trust file required")?;
+            let trust:hft_research_platform::admission::NativeAdmissionTrust=read(&trust_path)?;
+            let native=trust.verify(&signed)?;
+            let manifest:hft_cex_research_input::campaign::CampaignPreparedInputsV1=read_bounded(manifest_path,64*1024*1024)?;
+            let mut source=hft_cex_research_input::prepared::SharedFiles::new(std::path::Path::new(blocks_path))?;
+            let max_bytes=u64::from(native.evidence().admission.task_spec.profile.memory_mib)*1024*1024/2;
+            let verified=hft_research_platform::campaign::verify_inputs(&native,manifest,&mut source,max_bytes)?;
+            println!("{}",ledger().await?.register_campaign_inputs(&verified,&native).await?);
+        }
         ["register-native-request-revocation",path]=>{
             let signed:hft_research_platform::revocation::SignedNativeRequestRevocation=read(path)?;
             let trust_path=std::env::var("MONDAY_RESEARCH_NATIVE_ADMISSION_TRUST_FILE").context("operator native reservation trust file required")?;
@@ -73,7 +96,7 @@ async fn main() -> Result<()> {
         ["cancel", id] => { ledger().await?.cancel(id).await?; println!("cancel_requested"); }
         ["status", id] => { println!("{}", serde_json::to_string(&ledger().await?.read(id).await?)?); }
         ["terminal-snapshot",tenant,request] => { println!("{}",serde_json::to_string(&ledger().await?.native_terminal_snapshot(tenant,request).await?)?); }
-        _ => bail!("usage: researchctl plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | register-native-admission SIGNED_NATIVE_RESERVATION | register-native-request-revocation SIGNED_NATIVE_REVOCATION | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID | terminal-snapshot TENANT REQUEST"),
+        _ => bail!("usage: researchctl plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | register-native-admission SIGNED_NATIVE_RESERVATION | register-native-request-revocation SIGNED_NATIVE_REVOCATION | register-native-campaign-inputs SIGNED_NATIVE_RESERVATION COLLECTION BLOCK_DIRECTORY | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID | terminal-snapshot TENANT REQUEST"),
     }
     Ok(())
 }
