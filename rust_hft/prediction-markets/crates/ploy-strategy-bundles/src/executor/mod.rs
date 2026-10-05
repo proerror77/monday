@@ -1,7 +1,5 @@
-//! Order executor implementations.
+//! Prediction research simulation. Canonical Monday runtime owns venue execution.
 
-mod callback;
 mod simulated;
 
-pub use callback::CallbackExecutor;
 pub use simulated::{SimulatedExecutor, SimulatedExecutorConfig};
