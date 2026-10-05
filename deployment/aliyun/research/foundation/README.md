@@ -35,6 +35,7 @@ Session host 管 native Session 与 completion delivery。Gateway 只有 SELECT 
 `artifact_write_permit` 的 EXECUTE。Prepare worker 没有 PG 写权限。
 Native admission 与 verified release import 使用独立身份，Agent 不取得这些角色。
 只有 native admission importer 可以插入 `native_admission_imports`；控制器、Submitter、Session 和 Gateway 只读。
+Prepare worker 只读取 request、tenant 和 expiry 三列，供 lease gate 校验。它不读取 trust document。
 只授予不可变 key 列或固定 true singleton 的 UPDATE 来支持 row lock；这些权限不能
 改 authority mode、proof、budget 或 admission 文档。没有 application authority-owner 凭据。
 

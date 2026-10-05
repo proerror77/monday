@@ -79,6 +79,22 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
             .await?;
         tx.rollback().await?;
     }
+    let mut tx = pool.begin().await?;
+    sqlx_core::raw_sql::raw_sql("SET LOCAL ROLE monday_research_prepare_worker")
+        .execute(&mut *tx)
+        .await?;
+    sqlx_core::query::query(
+        "SELECT request_sha256, tenant, expires_ms FROM research.native_admission_imports LIMIT 0",
+    )
+    .execute(&mut *tx)
+    .await?;
+    assert!(sqlx_core::query::query(
+        "SELECT trust_document FROM research.native_admission_imports LIMIT 0"
+    )
+    .execute(&mut *tx)
+    .await
+    .is_err());
+    tx.rollback().await?;
     for role in [
         "monday_research_artifact_gateway",
         "monday_research_prepare_worker",

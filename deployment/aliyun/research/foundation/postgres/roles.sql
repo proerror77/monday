@@ -68,3 +68,6 @@ GRANT SELECT, INSERT ON research.native_admission_imports
 GRANT SELECT ON research.native_admission_imports TO monday_research_submitter,
   monday_research_reconciler, monday_research_session_host,
   monday_research_artifact_gateway;
+-- Preparation lease checks consume only the exact tenant and expiry projection.
+GRANT SELECT(request_sha256, tenant, expires_ms) ON research.native_admission_imports
+  TO monday_research_prepare_worker;
