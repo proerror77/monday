@@ -4,6 +4,8 @@
 // validator in its focused tests; the production observer will use it once the
 // exact readonly native/Run/Task/event source is available.
 #[cfg(test)]
+mod platform_facts;
+#[cfg(test)]
 mod snapshot_transport;
 #[cfg(test)]
 mod stopped_execution;
