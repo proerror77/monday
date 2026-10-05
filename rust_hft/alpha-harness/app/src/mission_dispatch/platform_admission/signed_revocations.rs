@@ -124,6 +124,12 @@ pub(super) fn export(args: PlatformRevocationsArgs) -> anyhow::Result<()> {
             );
         }
         let retained = output.join(filename);
+        native_witness::check_public_role(
+            &projection.native_witness_key_id,
+            &trust,
+            reason.authority_public_keys(),
+            &forbidden_release_keys,
+        )?;
         let signed = if retained.exists() {
             let signed: SignedNativeRequestRevocation = signed_export::read(&retained)?;
             trust.verify_revocation(&signed)?;

@@ -340,9 +340,44 @@ fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
         run_sha256: fixed.run.id().unwrap(),
         request_sha256: fixed.spec.id().unwrap(),
     };
-    store
-        .transfer_campaign_execution_to_platform(&root, &reservation, &transfer)
-        .unwrap();
+    let result_url =
+        "https://unit.oss-ap-northeast-1-internal.aliyuncs.com/research/results/receipt.json";
+    let operation = budget.operation_sha256().unwrap();
+    let publication_url = format!("https://unit.oss-ap-northeast-1-internal.aliyuncs.com/research/native-admissions/{}/signed-native-admission.json", operation);
+    let before = store.campaign_family_usage(&reservation.family_id).unwrap();
+    for bad_url in [
+        publication_url.replace(&operation, &"0".repeat(64)),
+        publication_url.replace("https://unit.", "https://foreign."),
+    ] {
+        assert!(super::signed_export::transfer_after_export_preflight(
+            result_url,
+            &operation,
+            &bad_url,
+            &publication_url,
+            || Ok(store.transfer_campaign_execution_to_platform(&root, &reservation, &transfer)?),
+        )
+        .is_err());
+        assert!(store
+            .campaign_family_receipts(&reservation.family_id)
+            .unwrap()
+            .iter()
+            .all(|entry| !matches!(
+                entry.receipt.event,
+                alpha_store::campaign_ledger::CampaignLedgerEventV1::PlatformTransferred { .. }
+            )));
+        assert_eq!(
+            store.campaign_family_usage(&reservation.family_id).unwrap(),
+            before
+        );
+    }
+    super::signed_export::transfer_after_export_preflight(
+        result_url,
+        &operation,
+        &publication_url,
+        &publication_url,
+        || Ok(store.transfer_campaign_execution_to_platform(&root, &reservation, &transfer)?),
+    )
+    .unwrap();
     let effective = Utc::now() + TimeDelta::hours(12);
     store
         .revoke_approval(

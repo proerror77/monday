@@ -18,13 +18,7 @@ pub(super) fn load(
     authority_public_keys: &[[u8; 32]],
     release_public_keys: &[[u8; 32]],
 ) -> anyhow::Result<SigningKey> {
-    ensure!(
-        trust.schema == "monday.native_reservation_trust.v1"
-            && (1..=32).contains(&trust.native_reservation_keys.len())
-            && !key_id.is_empty()
-            && key_id.len() <= 128,
-        "invalid native witness public trust"
-    );
+    let expected = check_public_role(key_id, trust, authority_public_keys, release_public_keys)?;
     ensure!(
         path.is_absolute() && path.canonicalize()? == path,
         "native witness path must be absolute and canonical"
@@ -66,17 +60,44 @@ pub(super) fn load(
         file.read(&mut trailing)? == 0,
         "native witness changed length during read"
     );
-    let public = key.verifying_key().to_bytes();
     ensure!(
-        !key.verifying_key().is_weak()
-            && trust.native_reservation_keys.get(key_id) == Some(&hex::encode(public)),
+        key.verifying_key().to_bytes() == expected,
         "native witness differs from configured public trust"
+    );
+    Ok(key)
+}
+
+/// A restored signature must preserve the signer role without loading a key.
+pub(super) fn check_public_role(
+    key_id: &str,
+    trust: &NativeAdmissionTrust,
+    authority_public_keys: &[[u8; 32]],
+    release_public_keys: &[[u8; 32]],
+) -> anyhow::Result<[u8; 32]> {
+    ensure!(
+        trust.schema == "monday.native_reservation_trust.v1"
+            && (1..=32).contains(&trust.native_reservation_keys.len())
+            && !key_id.is_empty()
+            && key_id.len() <= 128,
+        "invalid native witness public trust"
+    );
+    let encoded = trust
+        .native_reservation_keys
+        .get(key_id)
+        .context("native witness key is absent from trust")?;
+    let public: [u8; 32] = hex::decode(encoded)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid native witness public key length"))?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&public)?;
+    ensure!(
+        !key.is_weak() && *encoded == hex::encode(public),
+        "native witness public key is weak or noncanonical"
     );
     ensure!(
         !authority_public_keys.contains(&public) && !release_public_keys.contains(&public),
         "native witness must be distinct from scientific authority and release signers"
     );
-    Ok(key)
+    Ok(public)
 }
 
 #[cfg(test)]
@@ -137,5 +158,47 @@ mod tests {
         assert!(load(&fifo, "host-witness", &trust, &[], &[]).is_err());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(load(&path, "host-witness", &trust, &[], &[]).is_err());
+    }
+
+    #[test]
+    fn retained_valid_signature_cannot_reuse_scientific_or_release_role() {
+        use hft_research_platform::revocation::{sign_revocation, NativeRequestRevocation};
+        let key = SigningKey::from_bytes(&[42; 32]);
+        let public = key.verifying_key().to_bytes();
+        let trust = NativeAdmissionTrust {
+            schema: "monday.native_reservation_trust.v1".into(),
+            native_reservation_keys: [("host-witness".into(), hex::encode(public))].into(),
+        };
+        let signed = sign_revocation(
+            NativeRequestRevocation {
+                schema: "monday.native_request_revocation.v1".into(),
+                tenant: "native-fixture".into(),
+                request_sha256: "a".repeat(64),
+                operation_sha256: "b".repeat(64),
+                family_id: "native-family".into(),
+                root_grant_sha256: "c".repeat(64),
+                reason_receipt_sha256: "d".repeat(64),
+                effective_ms: 2000,
+                issued_ms: 1000,
+            },
+            "host-witness".into(),
+            &key,
+        )
+        .unwrap();
+        // The retained signature is cryptographically valid. Role separation
+        // still rejects it without reading or requiring any private key file.
+        trust.verify_revocation(&signed).unwrap();
+        assert!(check_public_role(&signed.key_id, &trust, &[public], &[]).is_err());
+        assert!(check_public_role(&signed.key_id, &trust, &[], &[public]).is_err());
+        assert_eq!(
+            check_public_role(&signed.key_id, &trust, &[], &[]).unwrap(),
+            public
+        );
+        let mut weak = trust;
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        weak.native_reservation_keys
+            .insert(signed.key_id.clone(), hex::encode(identity));
+        assert!(check_public_role(&signed.key_id, &weak, &[], &[]).is_err());
     }
 }

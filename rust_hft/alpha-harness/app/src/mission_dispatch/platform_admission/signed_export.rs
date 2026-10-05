@@ -232,27 +232,40 @@ pub(super) fn export(args: PlatformExportArgs) -> anyhow::Result<()> {
         run_sha256: fixed.run.id()?,
         request_sha256: fixed.spec.id()?,
     };
+    native_witness::check_public_role(
+        &projection.native_witness_key_id,
+        &native_trust,
+        budget.authority_public_keys(),
+        &release_public_keys,
+    )?;
     // Nothing is signed or loaded from the private witness before all actual
     // software, development data, resources and configuration gates pass.
-    prepared.admission.transfer_to_platform(&transfer)?;
-    prepared
-        .admission
-        .publish_receipts()
-        .context("transfer charge retained; receipt readback is incomplete")?;
-    validate_export_urls(
-        &projection,
+    transfer_after_export_preflight(
         &prepared
             .validated
             .submission
             .request
             .campaign_result_readback_url,
         &budget.operation_sha256()?,
+        &projection.signed_admission_put_url,
+        &projection.signed_admission_readback_url,
+        || prepared.admission.transfer_to_platform(&transfer),
     )?;
+    prepared
+        .admission
+        .publish_receipts()
+        .context("transfer charge retained; receipt readback is incomplete")?;
     let signed_path = output.join("signed-native-admission.json");
     let signed = prepared
         .admission
         .with_platform_export(&transfer, |source| {
             let evidence = statement(source, &fixed, &artifact)?;
+            native_witness::check_public_role(
+                &projection.native_witness_key_id,
+                &native_trust,
+                source.budget().authority_public_keys(),
+                &release_public_keys,
+            )?;
             let signed = if signed_path.exists() {
                 let old: hft_research_platform::admission::SignedNativeAdmission =
                     read(&signed_path)?;
@@ -369,11 +382,13 @@ fn statement(
     evidence.admits_launch_at(chrono::Utc::now().timestamp_millis())?;
     Ok(evidence)
 }
-fn validate_export_urls(
-    projection: &Projection,
+pub(super) fn transfer_after_export_preflight<T>(
     native_result_url: &str,
     operation: &str,
-) -> anyhow::Result<()> {
+    put_url: &str,
+    readback_url: &str,
+    transfer: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     let result = hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
         "native result",
         native_result_url,
@@ -386,10 +401,7 @@ fn validate_export_urls(
             .host_str()
             .context("native receipt bucket is absent")?
     );
-    for url in [
-        &projection.signed_admission_put_url,
-        &projection.signed_admission_readback_url,
-    ] {
+    for url in [put_url, readback_url] {
         ensure!(
             hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
                 "native admission export",
@@ -398,7 +410,7 @@ fn validate_export_urls(
             "native export transport changed the exact existing operation or receipt bucket"
         );
     }
-    Ok(())
+    transfer()
 }
 fn publish_and_readback(
     client: &Client,

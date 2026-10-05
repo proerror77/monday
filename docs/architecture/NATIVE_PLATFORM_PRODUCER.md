@@ -56,10 +56,14 @@ The shared `worker_configuration_reference` identity binds namespace, Secret nam
 The Run binds the entire verified collection; its Task copies the inspected native worker command and changes only the fixed request mount to `/config/campaign.json`.
 CPU, memory, target, source, image, ABI and the original full Job duration must match the source witness.
 
-The host transfers the existing native operation exclusively and publishes/reads back its transfer receipt before signing.
+Pure publication URL and public signer-role checks precede exclusive transfer.
+An invalid operation or bucket address cannot transfer the already reserved native budget.
+The host then transfers the existing native operation and publishes/reads back its transfer receipt before signing.
 It then reacquires the source guards and loads a distinct private witness key from a regular 32-byte file.
 The key file uses mode 0600 and a canonical private mode-0700 parent; FIFO and symlink inputs fail closed.
-The signer cannot reuse the registered Root/Study authority or software-release public keys.
+The signer cannot reuse registered Root/Study authority or software-release public keys.
+Retained admissions and revocations repeat the same public role check without loading a private key.
+A valid old signature cannot bypass role separation or rewrite its original issue time.
 Current native admission signatures bind the JSON tuple `(domain, key_id, evidence_sha256)`.
 The prebuilt CLI neither starts Cargo nor exposes a raw statement-signing RPC.
 Signed exports are create-once and independently read back; ambiguous publication or import retains the full source charge.
