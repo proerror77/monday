@@ -11,10 +11,9 @@ scientific = ["alpha-engine/fitting", "hft-research-platform/artifact-io"]
 onnx-compatibility = ["dep:alpha-onnx-evaluator"]
 
 [dependencies]
-hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["native-admission", "release-verification"] }
+hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["artifact-io", "native-admission", "release-verification"] }
 hft-cex-research-input = { path = "../../research-core/cex-input", features = ["streaming"] }
 hft-research-artifacts = { path = "../../research-core/artifacts" }
-hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["native-admission", "release-verification"] }
 hft-research-dispatch-io = { path = "../../research-core/dispatch-io" }
 alpha-domain = { path = "../domain" }
 alpha-engine = { path = "../engine", default-features = false, features = ["kernel"] }
@@ -33,7 +32,6 @@ hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 hft-backtest = { path = "../../apps/backtest" }
 hft-research-manifest = { path = "../../research-core/manifest" }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
-rustix = { version = "0.38", features = ["fs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

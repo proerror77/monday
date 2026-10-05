@@ -1,7 +1,8 @@
 //! Canonical finalized Campaign budget handoff. This path creates no root grant,
 //! approval, Kubernetes Job or new budget. Data equivalence gates signed export.
 use super::{admission, load_submission, render_controlled_manifest, validate_submission};
-use crate::{cli::print_json, prediction_dispatch::validate_cluster_target};
+use crate::cli::print_json;
+use hft_research_dispatch_io::validate_cluster_target;
 use alpha_store::campaign_ledger::VerifiedCampaignPlatformBudget;
 use anyhow::Context;
 use clap::Args;
