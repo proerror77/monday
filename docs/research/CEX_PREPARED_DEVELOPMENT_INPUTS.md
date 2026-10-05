@@ -11,6 +11,13 @@ label is reconstructed from the actual future observation at its frozen clock.
 A future mark or maturity in selection or holdout rejects export. No rows or
 prices are invented, interpolated, silently cropped, or relabeled as Train.
 
+The current fixed Calendar contract starts selection at `develop_end`, without
+an authorized future-price gap. Its development tail therefore requires marks
+inside selection. Export rejects that Calendar plan until an explicit learning
+row and observation-tail contract is admitted. Ordinary non-Calendar V6 inputs
+do not inherit that limitation. A final evaluation grant alone cannot restore
+withheld read capabilities removed from a development request.
+
 `hft_cex_research_input::campaign::VerifiedCampaignPreparedInputsV1` is the opaque
 readback result. Its collection identity binds original total/partition metadata,
 protocol, label recipe, native ResearchRow hash, source Build, native preparation
