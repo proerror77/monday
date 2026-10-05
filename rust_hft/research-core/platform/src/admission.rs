@@ -144,6 +144,18 @@ pub struct SignedNativeAdmission {
     pub signature_hex: String,
 }
 
+pub(crate) fn native_signing_bytes(
+    domain: &str,
+    key_id: &str,
+    evidence_sha256: &str,
+) -> Result<Vec<u8>> {
+    ensure!(
+        !key_id.is_empty() && key_id.len() <= 128 && valid_digest(evidence_sha256),
+        "invalid native signer or evidence identity"
+    );
+    Ok(serde_json::to_vec(&(domain, key_id, evidence_sha256))?)
+}
+
 /// Only the separately controlled native reservation producer receives this key.
 /// Passing a key never replaces its source ledger's signature, approval and
 /// cumulative budget checks. The producer must construct evidence under those
@@ -159,7 +171,7 @@ pub fn sign(
     );
     let evidence_sha256 = evidence.id()?;
     let signature_hex = key
-        .sign(format!("{DOMAIN}:{evidence_sha256}").as_bytes())
+        .sign(&native_signing_bytes(DOMAIN, &key_id, &evidence_sha256)?)
         .to_bytes()
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -230,7 +242,7 @@ impl NativeAdmissionTrust {
         );
         let signature = Signature::from_slice(&decode(&signed.signature_hex)?)?;
         VerifyingKey::from_bytes(&bytes)?.verify_strict(
-            format!("{DOMAIN}:{}", signed.evidence_sha256).as_bytes(),
+            &native_signing_bytes(DOMAIN, &signed.key_id, &signed.evidence_sha256)?,
             &signature,
         )?;
         Ok(VerifiedNativeAdmission {
@@ -388,11 +400,26 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        let trust = NativeAdmissionTrust {
+        let mut trust = NativeAdmissionTrust {
             schema: "monday.native_reservation_trust.v1".into(),
             native_reservation_keys: BTreeMap::from([("native".into(), public)]),
         };
+        trust.native_reservation_keys.insert(
+            "alias".into(),
+            trust.native_reservation_keys["native"].clone(),
+        );
         let signed = sign(fixture(), "native".into(), &key).unwrap();
+        let mut relabeled = signed.clone();
+        relabeled.key_id = "alias".into();
+        assert!(trust.verify(&relabeled).is_err());
+        let mut legacy = signed.clone();
+        legacy.signature_hex = key
+            .sign(format!("{DOMAIN}:{}", legacy.evidence_sha256).as_bytes())
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(trust.verify(&legacy).is_err());
         trust.verify(&signed).unwrap();
         for field in 0..5 {
             let mut changed = signed.clone();
