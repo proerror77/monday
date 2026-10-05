@@ -1,4 +1,5 @@
 use super::DeterministicRng;
+#[cfg(feature = "fitting")]
 use crate::{
     baselines::{
         evaluate_factor_features_from_entries, validate_cex_context_bindings,
@@ -8,23 +9,33 @@ use crate::{
     formula_evaluator::{evaluate_ast, FormulaEvaluator},
     CandidateEvaluation,
 };
+#[cfg(not(feature = "fitting"))]
+use crate::{evaluation::ResearchRow, formula_evaluator::evaluate_ast, CandidateEvaluation};
 use alpha_domain::{
-    canonical_json_hash, CexBaselineArtifactV1, CexBaselineGateV1, CexBaselineModelKindV1,
-    CexEqualAbsoluteWeightPolicyV1, CexFactorBankRevisionV2, CexFactorOrientationV1,
-    CexFactorWeightRuleV1, CexResearchContentRefV1, CexResearchHoldoutStateV1, CexResearchMarketV1,
-    CexResearchMissionArtifactV1, CexResearchVenueV1, EvaluationCostsV1, EvaluationLabelSpecV1,
-    FormulaEvaluatorConfig, SearchBudget, CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
-    WALK_FORWARD_EVALUATOR_VERSION,
+    canonical_json_hash, CexFactorBankRevisionV2, CexFactorOrientationV1, CexFactorWeightRuleV1,
+    CexResearchContentRefV1, CexResearchHoldoutStateV1, CexResearchMarketV1, CexResearchVenueV1,
+    EvaluationCostsV1, EvaluationLabelSpecV1, SearchBudget,
+    CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION, WALK_FORWARD_EVALUATOR_VERSION,
+};
+#[cfg(feature = "fitting")]
+use alpha_domain::{
+    CexBaselineArtifactV1, CexBaselineGateV1, CexBaselineModelKindV1,
+    CexEqualAbsoluteWeightPolicyV1, CexResearchMissionArtifactV1, FormulaEvaluatorConfig,
 };
 use hft_factor_dsl::{validate_live_formula, FactorAst, FactorOperator, FactorTerminal};
+#[cfg(feature = "fitting")]
 use hft_search_kernel::{
     backpropagate_lineage, select_expandable_progressively, validate_tree, UctNode, UctStats,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "fitting")]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 pub const CEX_FACTOR_BANK_MCTS_IMPLEMENTATION_VERSION: &str = "cex-factor-bank-subset-mcts-v1";
+#[cfg(feature = "fitting")]
 const CHECKPOINT_SCHEMA_VERSION: &str = "cex-factor-bank-subset-mcts-checkpoint-v1";
+#[cfg(feature = "fitting")]
 const RESULT_SCHEMA_VERSION: &str = "cex-factor-bank-subset-mcts-result-v1";
 const SIGNAL_STAGE_SCHEMA_VERSION: &str = "cex-combination-signal-stage-v1";
 const SIZING_STAGE_SCHEMA_VERSION: &str = "cex-combination-sizing-stage-v1";
@@ -32,6 +43,7 @@ const RISK_STAGE_SCHEMA_VERSION: &str = "cex-combination-risk-stage-v1";
 const EXECUTION_STAGE_SCHEMA_VERSION: &str = "cex-combination-execution-stage-v1";
 const WALK_FORWARD_EVIDENCE_SCHEMA_VERSION: &str = "cex-combination-walk-forward-evidence-v1";
 const COMBINATION_ARTIFACT_SCHEMA_VERSION: &str = "cex-combination-research-artifact-v1";
+#[cfg(feature = "fitting")]
 const UCT_EXPLORATION: f64 = std::f64::consts::SQRT_2;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -71,6 +83,7 @@ pub enum CexFactorSubsetActionV1 {
     },
 }
 
+#[cfg(feature = "fitting")]
 impl CexFactorSubsetActionV1 {
     fn factor_bank_revision_id(&self) -> &str {
         match self {
@@ -118,6 +131,7 @@ struct BindingsV1 {
     max_subset_size: usize,
 }
 
+#[cfg(feature = "fitting")]
 impl BindingsV1 {
     fn validate(&self) -> Result<(), String> {
         if self.implementation_version != CEX_FACTOR_BANK_MCTS_IMPLEMENTATION_VERSION
@@ -164,6 +178,7 @@ struct NodeV1 {
     evaluation: Option<CandidateEvaluation>,
 }
 
+#[cfg(feature = "fitting")]
 impl UctNode for NodeV1 {
     fn parent(&self) -> Option<usize> {
         self.parent
@@ -409,6 +424,7 @@ pub struct CexCombinationResearchArtifactV1 {
 }
 
 impl CexSignalStageV1 {
+    #[cfg(feature = "fitting")]
     fn new(
         parent: CexResearchContentRefV1,
         subset_policy: CexResearchContentRefV1,
@@ -477,6 +493,7 @@ impl CexSignalStageV1 {
 }
 
 impl CexSizingStageV1 {
+    #[cfg(feature = "fitting")]
     fn new(parent: CexResearchContentRefV1) -> Result<Self, String> {
         let mut stage = Self {
             schema_version: SIZING_STAGE_SCHEMA_VERSION.to_string(),
@@ -523,6 +540,7 @@ impl CexSizingStageV1 {
 
 impl CexRiskStageV1 {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "fitting")]
     fn new(
         parent: CexResearchContentRefV1,
         evaluator_policy: CexResearchContentRefV1,
@@ -593,6 +611,7 @@ impl CexRiskStageV1 {
 
 impl CexExecutionStageV1 {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "fitting")]
     fn new(
         parent: CexResearchContentRefV1,
         evaluation_policy: CexResearchContentRefV1,
@@ -655,6 +674,7 @@ impl CexExecutionStageV1 {
 }
 
 impl CexCombinationEvaluationEvidenceV1 {
+    #[cfg(feature = "fitting")]
     fn new(
         kind: CexCombinationEvaluationKindV1,
         source_artifact: CexResearchContentRefV1,
@@ -689,6 +709,7 @@ impl CexCombinationEvaluationEvidenceV1 {
 
 impl CexCombinationWalkForwardEvidenceV1 {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "fitting")]
     fn new(
         research_dataset: CexResearchContentRefV1,
         walk_forward_partition: CexResearchContentRefV1,
@@ -763,6 +784,7 @@ impl CexCombinationWalkForwardEvidenceV1 {
 }
 
 impl CexCombinationResearchArtifactV1 {
+    #[cfg(feature = "fitting")]
     fn from_validated_search(
         mission: &CexResearchMissionArtifactV1,
         factor_bank: &CexFactorBankRevisionV2,
@@ -946,6 +968,7 @@ impl CexCombinationResearchArtifactV1 {
         Ok(())
     }
 
+    #[cfg(feature = "fitting")]
     #[allow(clippy::too_many_arguments)]
     pub fn validate_binding(
         &self,
@@ -1097,12 +1120,14 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+#[cfg(feature = "fitting")]
 pub struct CexFactorBankMcts {
     factor_bank: CexFactorBankRevisionV2,
     evaluator: FormulaEvaluator,
     checkpoint: CexFactorBankMctsCheckpointV1,
 }
 
+#[cfg(feature = "fitting")]
 impl CexFactorBankMcts {
     pub fn new(
         mission: &CexResearchMissionArtifactV1,
@@ -1723,6 +1748,7 @@ impl CexFactorBankMcts {
     }
 }
 
+#[cfg(feature = "fitting")]
 fn validate_start(
     mission: &CexResearchMissionArtifactV1,
     factor_bank: &CexFactorBankRevisionV2,
@@ -1737,6 +1763,7 @@ fn validate_start(
     validate_cex_context_bindings(context, factor_bank, &mission.spec.policies.evaluation)
 }
 
+#[cfg(feature = "fitting")]
 fn validate_source_bindings(
     mission: &CexResearchMissionArtifactV1,
     factor_bank: &CexFactorBankRevisionV2,
@@ -1783,6 +1810,7 @@ fn validate_source_bindings(
     Ok(())
 }
 
+#[cfg(feature = "fitting")]
 fn validate_combination_sources(
     mission: &CexResearchMissionArtifactV1,
     factor_bank: &CexFactorBankRevisionV2,
@@ -1842,6 +1870,7 @@ fn validate_combination_sources(
     Ok(())
 }
 
+#[cfg(feature = "fitting")]
 fn factor_identities(
     factor_bank: &CexFactorBankRevisionV2,
 ) -> Result<Vec<CexFactorIdentityV1>, String> {
@@ -1865,6 +1894,7 @@ fn factor_identities(
     Ok(identities)
 }
 
+#[cfg(feature = "fitting")]
 fn factor_identity_map(
     factor_bank: &CexFactorBankRevisionV2,
 ) -> Result<BTreeMap<String, String>, String> {
@@ -1876,6 +1906,7 @@ fn factor_identity_map(
     })
 }
 
+#[cfg(feature = "fitting")]
 fn validate_state(
     state: &CexFactorSubsetV1,
     identities: &BTreeMap<String, String>,
@@ -1900,6 +1931,7 @@ fn validate_state(
     Ok(())
 }
 
+#[cfg(feature = "fitting")]
 fn legal_actions(
     state: &CexFactorSubsetV1,
     factor_bank: &CexFactorBankRevisionV2,
@@ -1954,6 +1986,7 @@ fn legal_actions(
     Ok(actions)
 }
 
+#[cfg(feature = "fitting")]
 fn apply_action(
     state: &CexFactorSubsetV1,
     action: &CexFactorSubsetActionV1,
@@ -2020,6 +2053,7 @@ fn apply_action(
     Ok(next)
 }
 
+#[cfg(feature = "fitting")]
 fn evaluate_subset(
     context: &EngineContext<'_>,
     factor_bank: &CexFactorBankRevisionV2,
@@ -2058,7 +2092,7 @@ fn evaluate_subset(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fitting"))]
 mod tests {
     use super::*;
 
