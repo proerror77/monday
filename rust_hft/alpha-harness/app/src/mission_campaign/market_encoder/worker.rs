@@ -1,24 +1,25 @@
 //! One reserved development fold; stage receipts are immutable and attempt-bound.
 use super::stage_permit::{self, StageAuthorization};
 use super::*;
-use crate::mission_campaign::sequence::{readback::verify_artifact_inventory, worker as shared};
-use alpha_domain::{
-    campaign_control::{
-        verify_campaign_root_grant, CampaignAttemptReservationV1, SignedCampaignRootGrantV1,
-        VerifiedCampaignRootGrant,
-    },
-    market_encoder_study::{
-        MarketDataViewV1, MarketTrainingStageKeyV1 as Key, MarketTrainingStageKindV1 as Kind,
-        MarketTrainingStagePurposeV1 as Purpose, MarketTrainingStageV1 as Stage,
-    },
-};
-use alpha_engine::{
-    market_encoder_study::{
-        fit_market_stage, predict_market_validation, verify_market_stage_pair, FittedMarketStage,
-        MarketPredictionCoverageV1, MarketStageInput, MarketStudyEnsemble, VerifiedMarketStage,
-    },
-    sequence_study::SOL_SEQUENCE_POSITION_POLICY,
-};
+#[cfg(feature = "scientific")]
+use crate::mission_campaign::sequence::readback::verify_artifact_inventory;
+use crate::mission_campaign::sequence::worker as shared;
+use alpha_domain::market_encoder_study::MarketDataViewV1;
+use alpha_domain::market_encoder_study::MarketTrainingStageKeyV1 as Key;
+use alpha_domain::market_encoder_study::MarketTrainingStageKindV1 as Kind;
+use alpha_domain::market_encoder_study::MarketTrainingStagePurposeV1 as Purpose;
+use alpha_domain::market_encoder_study::MarketTrainingStageV1 as Stage;
+#[cfg(feature = "scientific")]
+use alpha_engine::market_encoder_study::fit_market_stage;
+use alpha_engine::market_encoder_study::predict_market_validation;
+use alpha_engine::market_encoder_study::verify_market_stage_pair;
+use alpha_engine::market_encoder_study::FittedMarketStage;
+use alpha_engine::market_encoder_study::MarketPredictionCoverageV1;
+#[cfg(feature = "scientific")]
+use alpha_engine::market_encoder_study::MarketStageInput;
+use alpha_engine::market_encoder_study::MarketStudyEnsemble;
+use alpha_engine::market_encoder_study::VerifiedMarketStage;
+use alpha_engine::sequence_study::SOL_SEQUENCE_POSITION_POLICY;
 use chrono::{DateTime, Utc};
 use hft_backtest::engine::{TargetPositionDecision, TargetPositionReplayMetrics};
 use hft_research_manifest::{
@@ -26,6 +27,13 @@ use hft_research_manifest::{
     model::{HorizonHoldingPolicyV1, HorizonPositionState},
 };
 use std::collections::BTreeMap;
+#[cfg(feature = "scientific")]
+use {
+    alpha_domain::campaign_control::verify_campaign_root_grant,
+    alpha_domain::campaign_control::CampaignAttemptReservationV1,
+    alpha_domain::campaign_control::SignedCampaignRootGrantV1,
+    alpha_domain::campaign_control::VerifiedCampaignRootGrant,
+};
 
 pub(crate) const DIRECTORY: &str = "market-encoder-results";
 pub(super) const RESULT_SCHEMA: &str = "monday.sol_market_encoder_fold_result.v1";
@@ -126,6 +134,7 @@ pub(crate) struct FoldResult {
     pub deployment_authority: bool,
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     let request: MarketRequest = read_json(&args.request)?;
     request.validate()?;
@@ -361,6 +370,7 @@ pub(crate) fn empty_result(
         deployment_authority: false,
     })
 }
+#[cfg(feature = "scientific")]
 pub(super) fn run_fold(
     request: &MarketRequest,
     request_hash: &str,
@@ -697,6 +707,7 @@ fn track(
     );
     Ok(())
 }
+#[cfg(feature = "scientific")]
 fn persist_exact(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if path.try_exists()? {
         if !path.is_file()
@@ -993,6 +1004,7 @@ pub(super) fn archive_file_limit(request: &MarketRequest) -> anyhow::Result<usiz
 }
 
 /// Load a complete stage or execute it once. The start marker survives an interrupted fit.
+#[cfg(feature = "scientific")]
 pub(super) fn execute_stage(
     request: &MarketRequest,
     results_dir: &Path,
@@ -1120,6 +1132,7 @@ pub(super) fn execute_stage(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 pub(super) fn ensure_unstarted(directory: &Path, key: Key) -> anyhow::Result<()> {
     let name = stage_name(key);
     for suffix in ["start.json", "json", "weights", "permit.json"] {

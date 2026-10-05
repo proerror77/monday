@@ -149,7 +149,7 @@ fn fixture(
     let mut grid = read_request(plan, &plan.folds[0].train);
     grid.qualified_anchors_sha256 = None;
     let mut reader = MarketFeatureReader::open(root, data.clone(), &grid).unwrap();
-    let anchors = hft_research_ml::market_encoder::data::derive_market_training_anchors(
+    let anchors = hft_cex_research_input::market_encoder::derive_market_training_anchors(
         &mut reader,
         root,
         labels.clone(),

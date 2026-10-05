@@ -1,33 +1,52 @@
 use crate::mission_objects::{cex_campaign_round_root, cex_global_holdout_claim_object};
-use hft_research_artifacts::{fetch_to_file, normalized_sha256, publish_immutable_file};
+#[cfg(feature = "scientific")]
+use crate::mission_runner::execute_report;
+#[cfg(feature = "scientific")]
+use hft_research_artifacts::publish_immutable_file;
+use hft_research_artifacts::{fetch_to_file, normalized_sha256};
 use hft_research_dispatch_io::{canonical_tokyo_oss_internal_object, validate_dns_label};
 pub(crate) mod final_evaluation;
 pub(crate) mod market_encoder;
 pub(crate) mod preparation;
 pub(crate) mod sequence;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod workflow;
-use crate::{
-    cli::{
-        print_json, CampaignExecuteArgs, CampaignFinalizeArgs, CampaignFreezeArgs, CampaignIdArgs,
-        CampaignLearnArgs, CampaignStudyProposeArgs, ExecuteMissionArgs, BUILD_SOURCE_REVISION,
-    },
-    data_mission, mission_dispatch,
-    mission_render::{
-        allowed_research_feature_fields, render_cex_bundle, render_prepared_cex_bundle,
-        validate_render_instrument_scope, CexCampaignFailureClassV1,
-        CexCampaignLearningDirectiveV1, CexCampaignPositionPolicyV1, CexCampaignResearchDeltaV1,
-        CexCampaignResearchEvidenceSignatureV2, CexCampaignResearchParentV1,
-        CexCampaignResearchPlanV1, CexCampaignSearchPolicyRevisionV1, PreparedCexInputs,
-        MAX_RESEARCH_PLAN_GENERATION,
-    },
-    mission_runner::{
-        decode_materialization, execute_report, recover_execution_report_from_cached_result,
-        recover_execution_report_from_published_result, research_event, valid_git_revision,
-        validate_cex_holdout_id, validate_supervised_candidate_binding,
-        validate_supervised_replay_binding, CexEventReplayReceiptV1, CexSupervisedModelSelectionV1,
-        ExecutionBinding, CEX_SUPERVISED_MODEL_NAMES, MAX_RESULT_BUNDLE_BYTES,
-    },
-};
+use crate::cli::print_json;
+use crate::cli::CampaignFinalizeArgs;
+use crate::cli::CampaignFreezeArgs;
+use crate::cli::CampaignIdArgs;
+use crate::cli::CampaignLearnArgs;
+use crate::cli::CampaignStudyProposeArgs;
+use crate::cli::BUILD_SOURCE_REVISION;
+use crate::mission_dispatch;
+use crate::mission_render::allowed_research_feature_fields;
+use crate::mission_render::render_cex_bundle;
+use crate::mission_render::render_prepared_cex_bundle;
+use crate::mission_render::validate_render_instrument_scope;
+use crate::mission_render::CexCampaignFailureClassV1;
+use crate::mission_render::CexCampaignLearningDirectiveV1;
+use crate::mission_render::CexCampaignPositionPolicyV1;
+use crate::mission_render::CexCampaignResearchDeltaV1;
+use crate::mission_render::CexCampaignResearchEvidenceSignatureV2;
+use crate::mission_render::CexCampaignResearchParentV1;
+use crate::mission_render::CexCampaignResearchPlanV1;
+use crate::mission_render::CexCampaignSearchPolicyRevisionV1;
+use crate::mission_render::PreparedCexInputs;
+use crate::mission_render::MAX_RESEARCH_PLAN_GENERATION;
+use crate::mission_runner::decode_materialization;
+use crate::mission_runner::recover_execution_report_from_cached_result;
+use crate::mission_runner::recover_execution_report_from_published_result;
+use crate::mission_runner::research_event;
+use crate::mission_runner::valid_git_revision;
+use crate::mission_runner::validate_cex_holdout_id;
+use crate::mission_runner::validate_supervised_candidate_binding;
+use crate::mission_runner::validate_supervised_replay_binding;
+use crate::mission_runner::CexEventReplayReceiptV1;
+use crate::mission_runner::CexSupervisedModelSelectionV1;
+use crate::mission_runner::ExecutionBinding;
+use crate::mission_runner::CEX_SUPERVISED_MODEL_NAMES;
+use crate::mission_runner::MAX_RESULT_BUNDLE_BYTES;
 use alpha_domain::{
     campaign_horizon::{
         CampaignLabelHorizonV1, CampaignNextFamilyInputWindowV1, CampaignNextFamilyParentV1,
@@ -39,7 +58,9 @@ use alpha_domain::{
 use alpha_engine::{baselines::CexSupervisedModelCandidateV2, engines::CexFactorBankMctsResultV1};
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
-use reqwest::{blocking::Client, redirect::Policy, StatusCode};
+#[cfg(feature = "scientific")]
+use reqwest::StatusCode;
+use reqwest::{blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -49,6 +70,8 @@ use std::{
     time::Duration,
 };
 use zip::ZipArchive;
+#[cfg(feature = "scientific")]
+use {crate::cli::CampaignExecuteArgs, crate::cli::ExecuteMissionArgs, crate::data_mission};
 
 const CAMPAIGN_FREEZE_SCHEMA_V1: &str = "cex-campaign-freeze-v1";
 const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
@@ -451,6 +474,7 @@ struct LoadedRequest {
     sha256: String,
 }
 
+#[cfg(feature = "scientific")]
 pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     if args.final_evaluation {
         return final_evaluation::execute(args);
@@ -1315,6 +1339,7 @@ pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow:
     validate_request(request).or_else(|_| validate_local_test_request(request))
 }
 
+#[cfg(feature = "scientific")]
 fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> anyhow::Result<()> {
     if !args.pre_holdout {
         bail!(
@@ -2632,6 +2657,7 @@ fn campaign_replay_feedback(receipt: &CexEventReplayReceiptV1) -> CampaignReplay
     }
 }
 
+#[cfg(feature = "scientific")]
 fn campaign_round_claim_urls(
     request: &CampaignRequest,
     round: &CampaignRoundRequest,
@@ -3050,6 +3076,7 @@ fn validate_existing_follow_up_plan(
 /// Reconstructs every round from independently read-back immutable artifacts.
 /// This validates evidence only: it does not train, replay, open holdout or promote.
 #[cfg(test)]
+#[cfg_attr(all(test, not(feature = "scientific")), allow(dead_code))]
 pub(crate) fn readback_pre_holdout_terminal(
     client: &Client,
     request: &CampaignRequest,
@@ -3665,7 +3692,7 @@ pub(crate) fn serialize_request(request: &CampaignRequest) -> anyhow::Result<Vec
 
 #[cfg(test)]
 pub(crate) fn valid_request_for_tests() -> CampaignRequest {
-    tests::valid_request_for_other_modules()
+    test_support::valid_request()
 }
 
 #[cfg(test)]
@@ -4350,6 +4377,7 @@ fn fetch_verified(
     Ok(())
 }
 
+#[cfg(feature = "scientific")]
 fn publish_create_once_json(
     client: &Client,
     label: &str,
@@ -4380,6 +4408,7 @@ fn publish_create_once_json(
     Ok(published_sha256)
 }
 
+#[cfg(feature = "scientific")]
 fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
     error
         .to_string()
@@ -4477,8 +4506,9 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 mod tests {
+    use super::test_support::{paired_mlp_plan_for_tests, valid_request};
     use super::*;
     use crate::mission_render;
     use parquet::{
@@ -4569,29 +4599,6 @@ mod tests {
             assert_ne!(expected_campaign_id(&drifted).unwrap(), original);
             drifted.campaign_id = expected_campaign_id(&drifted).unwrap();
             assert!(validate_request(&drifted).is_err());
-        }
-    }
-
-    pub(super) fn paired_mlp_plan_for_tests() -> alpha_domain::CexMlpTrainingPlanV1 {
-        use alpha_domain::mlp_training::CexMlpInitializationV1;
-        alpha_domain::CexMlpTrainingPlanV1 {
-            schema_version: "cex-mlp-training-plan-v1".into(),
-            updates: 64,
-            target_scale: hft_research_manifest::mlp_training::MlpTargetScaleV1::TrainStandardized,
-            optimization: None,
-            initializations: [(7, vec![71, 72, 73]), (11, vec![111, 112, 113])]
-                .into_iter()
-                .map(|(seed, fold_seeds)| {
-                    (
-                        seed,
-                        CexMlpInitializationV1 {
-                            fold_seeds,
-                            expected_factor_ids: vec!["cex-factor-1".into()],
-                            expected_factor_columns_sha256: "a".repeat(64),
-                        },
-                    )
-                })
-                .collect(),
         }
     }
 
@@ -7954,127 +7961,6 @@ mod tests {
         server.join().unwrap();
 
         assert!(immutable_publish_conflict(&error.into()));
-    }
-
-    pub(crate) fn valid_request_for_other_modules() -> CampaignRequest {
-        valid_request()
-    }
-
-    fn valid_request() -> CampaignRequest {
-        const TEST_ROOT: &str =
-            "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research";
-        let research_plan = CexCampaignResearchPlanV1::canonical();
-        let round_identity = CampaignRoundIdentityV1 {
-            schema_version: CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1.to_string(),
-            data_window_hours: CAMPAIGN_DATA_WINDOW_HOURS,
-            data_fingerprint_sha256: campaign_data_fingerprint_sha256(
-                &"f".repeat(64),
-                &"b".repeat(40),
-                &"1".repeat(64),
-                &"2".repeat(64),
-                &"3".repeat(64),
-                &"4".repeat(64),
-            )
-            .unwrap(),
-            image_identity: "1".repeat(64),
-            build_source_revision: "a".repeat(40),
-        };
-        let mut request = CampaignRequest {
-            schema_version: CAMPAIGN_REQUEST_SCHEMA_V5.to_string(),
-            campaign_id: String::new(),
-            build_source_revision: "a".repeat(40),
-            image_identity: "1".repeat(64),
-            campaign_inputs_sha256: "f".repeat(64),
-            producer_source_revision: "b".repeat(40),
-            producer_image_identity: "e".repeat(64),
-            research_plan: research_plan.clone(),
-            study_proposal: None,
-            feature_url: format!("{TEST_ROOT}/features.jsonl"),
-            feature_sha256: "1".repeat(64),
-            materialization_url: format!("{TEST_ROOT}/materialization.json"),
-            materialization_sha256: "2".repeat(64),
-            replay_artifact_url: format!("{TEST_ROOT}/replay.parquet"),
-            replay_artifact_sha256: "3".repeat(64),
-            replay_manifest_url: format!("{TEST_ROOT}/replay-manifest.json"),
-            replay_manifest_sha256: "4".repeat(64),
-            holdout_id: "cex-holdout-test".to_string(),
-            declared_total_trials: declared_total_trials_for_rounds(&research_plan, 2).unwrap(),
-            rounds: vec![
-                CampaignRoundRequest {
-                    round_id: "r1".to_string(),
-                    seed: 11,
-                    identity: round_identity.clone(),
-                    mission_put_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json"
-                    ),
-                    mission_readback_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/mission.json?readback=1"
-                    ),
-                    result_put_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip"
-                    ),
-                    result_readback_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r1/results.zip?readback=1"
-                    ),
-                },
-                CampaignRoundRequest {
-                    round_id: "r2".to_string(),
-                    seed: 17,
-                    identity: round_identity,
-                    mission_put_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/mission.json"
-                    ),
-                    mission_readback_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/mission.json?readback=1"
-                    ),
-                    result_put_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/results.zip"
-                    ),
-                    result_readback_url: format!(
-                        "{TEST_ROOT}/campaign-id=placeholder/round=r2/results.zip?readback=1"
-                    ),
-                },
-            ],
-            holdout_claim_put_url: String::new(),
-            holdout_claim_readback_url: String::new(),
-            campaign_result_put_url: format!(
-                "{TEST_ROOT}/campaign-id=placeholder/campaign-result.json"
-            ),
-            campaign_result_readback_url: format!(
-                "{TEST_ROOT}/campaign-id=placeholder/campaign-result.json?readback=1"
-            ),
-        };
-        request.campaign_id = expected_campaign_id(&request).unwrap();
-        for round in &mut request.rounds {
-            round.mission_put_url = format!(
-                "{TEST_ROOT}/campaign-id={}/round={}/mission.json",
-                request.campaign_id, round.round_id
-            );
-            round.mission_readback_url = format!(
-                "{TEST_ROOT}/campaign-id={}/round={}/mission.json?readback=1",
-                request.campaign_id, round.round_id
-            );
-            round.result_put_url = format!(
-                "{TEST_ROOT}/campaign-id={}/round={}/results.zip",
-                request.campaign_id, round.round_id
-            );
-            round.result_readback_url = format!(
-                "{TEST_ROOT}/campaign-id={}/round={}/results.zip?readback=1",
-                request.campaign_id, round.round_id
-            );
-        }
-        request.holdout_claim_put_url =
-            cex_global_holdout_claim_object(&request.holdout_id).unwrap();
-        request.holdout_claim_readback_url = request.holdout_claim_put_url.clone();
-        request.campaign_result_put_url = format!(
-            "{TEST_ROOT}/campaign-id={}/campaign-result.json",
-            request.campaign_id
-        );
-        request.campaign_result_readback_url = format!(
-            "{TEST_ROOT}/campaign-id={}/campaign-result.json?readback=1",
-            request.campaign_id
-        );
-        request
     }
 
     fn loaded_request_for_learning() -> LoadedRequest {

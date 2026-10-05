@@ -1,11 +1,4 @@
-use super::{
-    artifacts::*,
-    data::{
-        fit_market_scaling, MarketFeatureReader, MarketTaskReader, Moments,
-        UnlabeledSequenceExample,
-    },
-    network::*,
-};
+use super::{artifacts::*, network::*};
 use crate::{lock_ndarray_backend, CpuAutodiffBackend, CpuBackend};
 use burn::{
     module::AutodiffModule,
@@ -17,7 +10,13 @@ use burn::{
     tensor::{backend::Backend, Tensor, TensorData},
 };
 use burn_ndarray::NdArrayDevice;
+use hft_cex_research_input::market_encoder::{
+    fit_market_scaling, MarketFeatureReader, MarketTaskReader, Moments, UnlabeledSequenceExample,
+};
 use hft_research_manifest::market_encoder::*;
+use hft_research_manifest::portable_market::{
+    ENCODER_PORTABLE_SCHEMA as ENCODER_SCHEMA, TASK_PORTABLE_SCHEMA as TASK_SCHEMA,
+};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
@@ -184,9 +183,10 @@ pub fn pretrain_market_encoder(
     let encoder = trained.encoder;
     diag.final_encoder_values_sha256 = values_digest(&encoder)?;
     diag.validate(&request)?;
-    let weights = save(&encoder)?;
+    let weights = serde_json::to_vec(&encoder.portable()?).map_err(|e| e.to_string())?;
     let head = trained.head;
-    let head_weights = save(&head)?;
+    let head_weights =
+        serde_json::to_vec(&crate::portable::linear(&head)?).map_err(|e| e.to_string())?;
     let head_values = values_digest(&head)?;
     let mut checkpoint = MarketEncoderCheckpoint {
         model: encoder,
@@ -407,17 +407,13 @@ pub fn adapt_market_encoder(
 ) -> Result<MarketTaskModel, String> {
     request.validate()?;
     check_parent(&request, parent)?;
-    if reader.features.request() != &request.fit.read_request()
-        || !reader.features.is_at_start()
+    if reader.feature_request() != &request.fit.read_request()
+        || !reader.is_at_start()
         || reader.target_digest() != request.target_dataset_sha256
     {
         return Err("adaptation reader differs from request".into());
     }
-    let scaling = fit_market_scaling(
-        &mut reader.features,
-        request.fit.min_examples,
-        request.fit.max_examples,
-    )?;
+    let scaling = reader.fit_feature_scaling(request.fit.min_examples, request.fit.max_examples)?;
     if parent.is_some_and(|p| p.scaling() != &scaling) {
         return Err("adaptation changed its parent normalization".into());
     }
@@ -445,7 +441,9 @@ pub fn adapt_market_encoder(
     CpuAutodiffBackend::seed(&device, request.fit.seed);
     let mut encoder = Encoder::<CpuAutodiffBackend>::new(&request.fit.spec, &device);
     if let Some(p) = parent {
-        load(&mut encoder, p.weights.clone())?;
+        encoder = Encoder::from_portable(
+            &serde_json::from_slice(&p.weights).map_err(|e| e.to_string())?,
+        )?;
     }
     let initial = values_digest(&encoder.valid())?;
     if parent.is_some_and(|p| p.diagnostics().final_encoder_values_sha256 != initial) {
@@ -514,7 +512,7 @@ pub fn adapt_market_encoder(
     }
     diag.validate(&request.fit)?;
     let parameter_values_sha256 = values_digest(&model)?;
-    let weights = save(&model)?;
+    let weights = serde_json::to_vec(&model.portable()?).map_err(|e| e.to_string())?;
     Ok(MarketTaskModel {
         model,
         weights: weights.clone(),
