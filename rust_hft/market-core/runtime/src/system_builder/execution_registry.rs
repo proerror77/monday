@@ -1,18 +1,21 @@
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(any(
+    feature = "adapter-binance-data",
+    feature = "adapter-binance-execution"
+))]
 use super::{binance_execution_market, execution_config_value, BinanceMarketIdentity};
 use super::{SystemBuilder, VenueConfig, VenueType};
 use tracing::{info, warn};
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 const BINANCE_USDM_REST_LIVE: &str = "https://fapi.binance.com";
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 const BINANCE_USDM_WS_LIVE: &str = "wss://fstream.binance.com/private/ws";
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 const BINANCE_USDM_REST_TESTNET: &str = "https://demo-fapi.binance.com";
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 const BINANCE_USDM_WS_TESTNET: &str = "wss://demo-fstream.binance.com/private/ws";
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 fn is_known_binance_spot_rest_endpoint(url: &str) -> bool {
     matches!(
         url.trim_end_matches('/'),
@@ -25,7 +28,7 @@ fn is_known_binance_spot_rest_endpoint(url: &str) -> bool {
     )
 }
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 fn is_known_binance_spot_ws_endpoint(url: &str) -> bool {
     matches!(
         url.trim_end_matches('/'),
@@ -37,27 +40,27 @@ fn is_known_binance_spot_ws_endpoint(url: &str) -> bool {
     )
 }
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 fn is_binance_usdm_live_rest_endpoint(url: &str) -> bool {
     url.trim_end_matches('/') == BINANCE_USDM_REST_LIVE
 }
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 fn is_binance_usdm_testnet_rest_endpoint(url: &str) -> bool {
     url.trim_end_matches('/') == BINANCE_USDM_REST_TESTNET
 }
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 fn is_binance_usdm_live_ws_endpoint(url: &str) -> bool {
     url.trim_end_matches('/') == BINANCE_USDM_WS_LIVE
 }
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 fn is_binance_usdm_testnet_ws_endpoint(url: &str) -> bool {
     url.trim_end_matches('/') == BINANCE_USDM_WS_TESTNET
 }
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(feature = "adapter-binance-execution")]
 fn configured_binance_usdm_endpoint(
     configured: Option<&str>,
     testnet: bool,
@@ -130,7 +133,10 @@ fn configured_binance_usdm_endpoint(
     unreachable!("configured Binance USD-M endpoint branch must return")
 }
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(any(
+    feature = "adapter-binance-data",
+    feature = "adapter-binance-execution"
+))]
 fn validate_binance_usdm_execution_config(
     execution_config: Option<&serde_yaml::Value>,
 ) -> Result<(), String> {
@@ -375,7 +381,7 @@ impl SystemBuilder {
         self
     }
 
-    #[cfg(feature = "adapter-bitget-data")]
+    #[cfg(feature = "adapter-bitget-execution")]
     pub(crate) fn register_bitget_adapters(mut self, venue: &VenueConfig) -> Self {
         info!("註冊 Bitget 適配器");
         #[cfg(feature = "adapter-bitget-execution")]
@@ -424,13 +430,16 @@ impl SystemBuilder {
         self
     }
 
-    #[cfg(not(feature = "adapter-bitget-data"))]
+    #[cfg(not(feature = "adapter-bitget-execution"))]
     pub(crate) fn register_bitget_adapters(self, _venue: &VenueConfig) -> Self {
         warn!("Bitget 適配器未啟用 (缺少 feature flag)");
         self
     }
 
-    #[cfg(feature = "adapter-binance-data")]
+    #[cfg(any(
+        feature = "adapter-binance-data",
+        feature = "adapter-binance-execution"
+    ))]
     pub(crate) fn register_binance_adapters(self, venue: &VenueConfig) -> Self {
         info!("註冊 Binance 適配器");
         if let Err(error) = super::validate_binance_market_config(venue) {
@@ -558,13 +567,16 @@ impl SystemBuilder {
         }
     }
 
-    #[cfg(not(feature = "adapter-binance-data"))]
+    #[cfg(not(any(
+        feature = "adapter-binance-data",
+        feature = "adapter-binance-execution"
+    )))]
     pub(crate) fn register_binance_adapters(self, _venue: &VenueConfig) -> Self {
         warn!("Binance 適配器未啟用 (缺少 feature flag)");
         self
     }
 
-    #[cfg(feature = "adapter-grvt-data")]
+    #[cfg(feature = "adapter-grvt-execution")]
     pub(crate) fn register_grvt_adapters(mut self, venue: &VenueConfig) -> Self {
         info!("註冊 GRVT 適配器");
         #[cfg(feature = "adapter-grvt-execution")]
@@ -602,13 +614,13 @@ impl SystemBuilder {
         self
     }
 
-    #[cfg(not(feature = "adapter-grvt-data"))]
+    #[cfg(not(feature = "adapter-grvt-execution"))]
     pub(crate) fn register_grvt_adapters(self, _venue: &VenueConfig) -> Self {
         warn!("GRVT 適配器未啟用 (缺少 feature flag)");
         self
     }
 
-    #[cfg(feature = "adapter-ondo-perps-data")]
+    #[cfg(feature = "adapter-ondo-perps-execution")]
     pub(crate) fn register_ondo_perps_adapters(mut self, venue: &VenueConfig) -> Self {
         info!("註冊 Ondo Perps 適配器");
         #[cfg(feature = "adapter-ondo-perps-execution")]
@@ -643,16 +655,18 @@ impl SystemBuilder {
         self
     }
 
-    #[cfg(not(feature = "adapter-ondo-perps-data"))]
+    #[cfg(not(feature = "adapter-ondo-perps-execution"))]
     pub(crate) fn register_ondo_perps_adapters(self, _venue: &VenueConfig) -> Self {
         warn!("Ondo Perps 適配器未啟用 (缺少 feature flag)");
         self
     }
 
-    #[cfg(feature = "adapter-asterdex-data")]
-    pub(crate) fn register_asterdex_adapters(mut self, venue: &VenueConfig) -> Self {
+    #[cfg(any(
+        feature = "adapter-asterdex-data",
+        feature = "adapter-asterdex-execution"
+    ))]
+    pub(crate) fn register_asterdex_adapters(self, venue: &VenueConfig) -> Self {
         info!("註冊 Aster DEX 適配器");
-        let mut registered_execution = false;
 
         #[cfg(feature = "adapter-asterdex-execution")]
         {
@@ -687,34 +701,32 @@ impl SystemBuilder {
                     .account_id
                     .as_ref()
                     .map(|s| hft_core::AccountId(s.clone()));
-                self = self.register_execution_client_with_key(
+                return self.register_execution_client_with_key(
                     execution_client,
                     hft_core::VenueId::ASTERDEX,
                     account,
                 );
-                registered_execution = true;
             }
         }
 
-        if !registered_execution {
-            if venue.simulate_execution {
-                info!("Aster DEX: 使用模擬執行客戶端 (dry-run)");
-                self = self.register_simulated_execution_client(hft_core::VenueId::ASTERDEX);
-            } else {
-                info!("Aster DEX: 未提供有效 API 憑證，僅註冊行情");
-            }
+        if venue.simulate_execution {
+            info!("Aster DEX: 使用模擬執行客戶端 (dry-run)");
+            return self.register_simulated_execution_client(hft_core::VenueId::ASTERDEX);
         }
-
+        info!("Aster DEX: 未提供有效 API 憑證，僅註冊行情");
         self
     }
 
-    #[cfg(not(feature = "adapter-asterdex-data"))]
+    #[cfg(not(any(
+        feature = "adapter-asterdex-data",
+        feature = "adapter-asterdex-execution"
+    )))]
     pub(crate) fn register_asterdex_adapters(self, _venue: &VenueConfig) -> Self {
         warn!("Aster DEX 適配器未啟用 (缺少 feature flag)");
         self
     }
 
-    #[cfg(feature = "adapter-bybit-data")]
+    #[cfg(feature = "adapter-bybit-execution")]
     pub(crate) fn register_bybit_adapters(mut self, venue: &VenueConfig) -> Self {
         #[cfg(feature = "adapter-bybit-execution")]
         {
@@ -758,7 +770,7 @@ impl SystemBuilder {
         self
     }
 
-    #[cfg(not(feature = "adapter-bybit-data"))]
+    #[cfg(not(feature = "adapter-bybit-execution"))]
     pub(crate) fn register_bybit_adapters(self, _venue: &VenueConfig) -> Self {
         warn!("Bybit 適配器未啟用 (缺少 feature flag)");
         self
@@ -843,7 +855,7 @@ mod tests {
     use super::*;
     use shared_instrument::InstrumentId;
 
-    #[cfg(feature = "adapter-binance-data")]
+    #[cfg(feature = "adapter-binance-execution")]
     #[test]
     fn binance_usdm_endpoint_selection_is_mode_bound_and_catalog_aware() {
         assert_eq!(
@@ -879,10 +891,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(
-        feature = "adapter-binance-data",
-        feature = "adapter-binance-execution"
-    ))]
+    #[cfg(feature = "adapter-binance-execution")]
     #[test]
     fn binance_usdm_routes_to_the_dedicated_futures_execution_client() {
         let venue = VenueConfig {
@@ -919,10 +928,7 @@ mod tests {
         assert_eq!(builder.execution_client_is_binance_usdm, vec![true]);
     }
 
-    #[cfg(all(
-        feature = "adapter-binance-data",
-        feature = "adapter-binance-execution"
-    ))]
+    #[cfg(feature = "adapter-binance-execution")]
     #[test]
     fn binance_without_explicit_usdm_execution_config_keeps_spot_routing() {
         let venue = VenueConfig {
@@ -959,10 +965,7 @@ mod tests {
         assert_eq!(builder.execution_client_is_binance_usdm, vec![false]);
     }
 
-    #[cfg(all(
-        feature = "adapter-binance-data",
-        feature = "adapter-binance-execution"
-    ))]
+    #[cfg(feature = "adapter-binance-execution")]
     #[test]
     fn binance_usdm_rejects_unsupported_account_mode_before_registration() {
         let venue = VenueConfig {
@@ -997,7 +1000,10 @@ mod tests {
         assert!(builder.execution_client_venues.is_empty());
     }
 
-    #[cfg(feature = "adapter-binance-data")]
+    #[cfg(any(
+        feature = "adapter-binance-data",
+        feature = "adapter-binance-execution"
+    ))]
     #[test]
     fn simulated_usdm_uses_the_futures_venue_identity_without_a_live_client_marker() {
         let venue = VenueConfig {

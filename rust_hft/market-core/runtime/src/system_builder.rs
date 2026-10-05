@@ -814,7 +814,10 @@ enum BinanceMarketIdentity {
     Usdm,
 }
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(any(
+    feature = "adapter-binance-data",
+    feature = "adapter-binance-execution"
+))]
 fn execution_config_value<'a>(
     execution_config: Option<&'a serde_yaml::Value>,
     key: &str,
