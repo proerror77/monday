@@ -34,9 +34,10 @@ async fn main() -> Result<()> {
             config.cluster.clone(),
             &std::fs::read(&config.kubernetes_ca_file)?,
         )?,
-        artifacts: ArtifactGateway::new(
+        artifacts: ArtifactGateway::with_tls(
             &config.artifact_gateway,
             read_secret(&config.artifact_token_file)?,
+            &config.artifact_tls,
         )?,
         owner: config.owner,
         lease_ms: config.lease_ms,

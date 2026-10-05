@@ -6,6 +6,7 @@ edition = "2021"
 description = "Pure-Rust, point-in-time ML training for continuous contracts"
 
 [dependencies]
+anyhow = "1"
 hft-cex-research-input = { path = "../cex-input", features = ["streaming"] }
 hft-research-manifest = { path = "../manifest" }
 burn.workspace = true
@@ -17,6 +18,7 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 thiserror.workspace = true
+rustix = { version = "0.38", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"
