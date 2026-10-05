@@ -229,6 +229,15 @@ impl Reconciler {
             return Ok(false);
         };
         println!("{}", event(&locked.task.id, "reconcile_started"));
+        let native_deadline = locked.native_request_deadline_ms().await?;
+        let now = locked.refresh_clock().await?;
+        if let Some(deadline) = native_deadline.filter(|deadline| *deadline > now) {
+            if let Some(current) = locked.task.deadline_ms {
+                locked.task.deadline_ms = Some(current.min(deadline));
+            }
+        } else {
+            locked.task.stop(State::Cancelled, false)?;
+        }
         locked.task.expire(locked.now_ms)?;
         if self.ledger.admission(&locked.task.spec).await?.is_none() {
             locked.task.stop(State::Cancelled, false)?;

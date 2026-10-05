@@ -1,4 +1,4 @@
-use alpha_domain::OnnxModelCandidate;
+use ::governance::runtime_bundle::RuntimeOnnxModel;
 use alpha_engine::{
     evaluation::{evaluate_sealed_holdout, EngineContext, PreparedDataset, ResearchRow},
     formula_evaluator::FormulaEvaluator,
@@ -20,7 +20,7 @@ impl OnnxEvaluator {
 
     pub fn evaluate(
         &self,
-        model: &OnnxModelCandidate,
+        model: &RuntimeOnnxModel,
         model_path: &Path,
         context: &EngineContext<'_>,
     ) -> Result<CandidateEvaluation, String> {
@@ -37,7 +37,7 @@ impl OnnxEvaluator {
 
     pub fn evaluate_sealed(
         &self,
-        model: &OnnxModelCandidate,
+        model: &RuntimeOnnxModel,
         model_path: &Path,
         dataset: &PreparedDataset,
     ) -> Result<CandidateEvaluation, String> {
@@ -55,7 +55,7 @@ impl OnnxEvaluator {
     }
 }
 
-fn load_predictor(model: &OnnxModelCandidate, model_path: &Path) -> Result<OnnxPredictor, String> {
+fn load_predictor(model: &RuntimeOnnxModel, model_path: &Path) -> Result<OnnxPredictor, String> {
     let shape = input_shape(model)?;
     let checksum = model
         .artifact
@@ -65,7 +65,7 @@ fn load_predictor(model: &OnnxModelCandidate, model_path: &Path) -> Result<OnnxP
     OnnxPredictor::load_verified(model_path, checksum, shape).map_err(|error| error.to_string())
 }
 
-fn input_shape(model: &OnnxModelCandidate) -> Result<(usize, usize, usize, usize), String> {
+fn input_shape(model: &RuntimeOnnxModel) -> Result<(usize, usize, usize, usize), String> {
     model.validate().map_err(|error| error.to_string())?;
     let [input] = model.inputs.as_slice() else {
         return Err("governed ONNX evaluation supports one input tensor".to_string());
@@ -87,7 +87,7 @@ fn input_shape(model: &OnnxModelCandidate) -> Result<(usize, usize, usize, usize
 }
 
 fn infer_signals<E: std::fmt::Display>(
-    model: &OnnxModelCandidate,
+    model: &RuntimeOnnxModel,
     rows: &[ResearchRow],
     infer: impl Fn(&[f32]) -> Result<Vec<f32>, E>,
 ) -> Result<Vec<f64>, String> {
@@ -130,16 +130,18 @@ fn infer_signals<E: std::fmt::Display>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::governance::runtime_bundle::{
+        TensorElementType, TensorSpec, LOB_ONNX_PREPROCESSING_VERSION,
+    };
     use alpha_domain::{
         EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
-        TensorElementType, TensorSpec, LOB_ONNX_PREPROCESSING_VERSION,
     };
     use chrono::{Duration, Utc};
     use hft_research_manifest::ArtifactRef;
     use std::collections::BTreeMap;
 
-    fn model() -> OnnxModelCandidate {
-        OnnxModelCandidate {
+    fn model() -> RuntimeOnnxModel {
+        RuntimeOnnxModel {
             artifact: ArtifactRef {
                 uri: "model.onnx".to_string(),
                 content_type: "application/onnx".to_string(),

@@ -1,13 +1,14 @@
 # Monday V2 governance-contract inventory
 
-**Status:** Phase 1 runtime-admission extraction complete; attribution and bundle extraction pending
+**Status:** runtime admission, signed attribution and fixed runtime bundle extraction complete
 
 **Baseline:** integrated against `main` on 2026-08-21; Git history records the
 exact source revision.
 
-**Scope:** identify the smallest contract families that can leave
-`alpha-harness/domain` without changing wire format, hashes, signatures, or
-runtime behavior.
+**Scope:** separate runtime contracts from scientific policy. Attribution keeps
+its original signed wire identity. The fixed runtime bundle uses the new
+`monday.runtime_bundle.v1` schema and requires a fresh matching signed envelope
+and approval; scientific bundles and promotion history retain their audit hashes.
 
 This document is an inventory, not a new authority. The extracted governance
 crate is now the sole source of truth for runtime admission; the old
@@ -18,8 +19,8 @@ crate is now the sole source of truth for runtime admission; the old
 | Family | Current source | Runtime/research consumers | First extraction boundary |
 | --- | --- | --- | --- |
 | Runtime admission | `governance-contracts/src/lib.rs:1-511` | `apps/live/src/deployment_envelope.rs`, `apps/live/src/main.rs`, `alpha-harness/store/src/lib.rs`, `alpha-harness/app/src/governance.rs` | extracted as `hft-governance-contracts`; no `alpha-domain` re-export remains |
-| Runtime attribution | `alpha-harness/domain/src/lib.rs:3467-3755`, `alpha-harness/domain/src/runtime_latency_evidence.rs` | `apps/live/src/runtime_attribution.rs`, `apps/live/src/main.rs`, `alpha-harness/store/src/lib.rs`, `alpha-harness/engine/src/learning.rs` | attribution enums, event, signed/verified event, signing/verification, and the runtime-stage health predicate; keep learning policy outside the runtime crate |
-| Promotion and bundle identity | `alpha-harness/domain/src/lib.rs:4705-5060` | `apps/live/src/deployment_envelope.rs`, `alpha-harness/store/src/lib.rs` | `StrategyBundleArtifact`, `StrategyBundle`, and `PromotionRecord`; this family must remain separate from runtime admission because its artifact payload is research-owned |
+| Runtime attribution | `governance-contracts/src/attribution.rs` | `apps/live/src/runtime_attribution.rs`, `apps/live/src/main.rs`, `alpha-harness/store/src/lib.rs`, `alpha-harness/engine/src/learning.rs` | event, signing and verification are extracted; runtime-stage health and learning policy remain in research |
+| Promotion and bundle identity | `alpha-harness/domain/src/lib.rs`, `alpha-harness/domain/src/runtime_projection.rs`, `governance-contracts/src/runtime_bundle.rs` | `apps/live/src/deployment_envelope.rs`, `alpha-harness/store/src/lib.rs` | scientific evidence stays research-owned; live consumes only the validated fixed executable projection |
 | Canonical hashing | `alpha-harness/domain/src/lib.rs:5469-5498` | nearly every research artifact plus admission and attribution | do not move in the first extraction; first prove whether a tiny hash utility can be shared without making the governance crate depend on research types |
 
 ## 2. Ownership decisions
@@ -47,10 +48,9 @@ wire identity does not split:
 - `RuntimeEnvelopePolicy`
 - `sign_envelope`, `verify_envelope`, `deployment_scope_hash`
 
-`GovernanceError` now owns the admission errors. `DomainError` retains research
-and attribution errors; `hft-live` keeps an explicit error boundary for each so
-the runtime path cannot silently convert research failures into admission
-failures.
+`GovernanceError`, `AttributionError` and `RuntimeBundleError` own their contract
+errors. `DomainError` wraps shared contract errors at the scientific producer;
+`hft-live` has no production dependency on `alpha-domain`.
 
 ### Runtime attribution is a feedback contract, not a research command
 
@@ -58,7 +58,7 @@ failures.
 the guarded LiveSmall path. The research engine may ingest verified events to
 open a `LearningDirective`, but it must not mutate runtime configuration from
 the event. `runtime_latency_evidence.rs` validates the signed event log and
-therefore stays adjacent to this family during extraction.
+therefore remains a research consumer of the shared attribution verifier.
 
 `alpha-harness/engine/src/learning.rs` remains a consumer. Its failure-class
 mapping is research policy and must not be moved into the runtime contract
@@ -68,13 +68,14 @@ crate.
 
 `StrategyBundle` and `PromotionRecord` bind candidate, dataset manifest,
 evaluator, sealed evidence, and runtime-loadable artifact hashes. They are
-produced by the research store and read by `hft-live`; neither side may own the
-other side's validation policy.
+produced and validated by the research store. `hft-live` reads the resulting
+fixed `RuntimeBundle`; neither side owns the other side's validation policy.
 
-`StrategyBundleArtifact` currently embeds `FactorAst`, ONNX candidate data, and
-the CEX four-stage candidate. This is the main extraction blocker: moving the
-bundle family without first deciding ownership of those artifact DTOs would
-create a new wrapper/shim and preserve the existing coupling.
+`StrategyBundleArtifact` embeds scientific candidates and evaluator evidence.
+`to_runtime_bundle` validates this evidence before projecting Formula, CEX
+execution, frozen parameters or ONNX metadata. ONNX metadata has one shared
+owner. The projection's hash binds the source bundle, fixed executable payload,
+identities and creation time. The envelope and operator approval bind that hash.
 
 ## 3. Regression-vector inventory
 
