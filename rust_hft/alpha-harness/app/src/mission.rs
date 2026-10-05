@@ -88,14 +88,14 @@ fn execute_mission_inner(
 
     let manifest =
         data_mission::read_registered_research_dataset(&store, &args.dataset.dataset_manifest)?;
-    if mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
-        bail!("mission dataset id does not match the supplied manifest");
-    }
     let labels = manifest.evaluation_label_spec()?;
     let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
     let owned_dataset = prepare_dataset(manifest.load_rows(&protocol.costs)?, &protocol)?;
     let dataset = &owned_dataset;
     let manifest_id = manifest.manifest_id().to_string();
+    if mission.dataset_manifest_id.as_str() != manifest_id {
+        bail!("mission dataset id does not match the supplied manifest");
+    }
     let evaluation_protocol_hash = dataset.protocol().content_hash()?;
     let research_context = dataset.engine_context();
     let research_dataset_sha256 = canonical_json_hash(&research_context.rows())?;
