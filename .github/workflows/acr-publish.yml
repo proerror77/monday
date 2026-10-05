@@ -242,6 +242,17 @@ jobs:
         if: ${{ (matrix.repository == 'binance-lob-archiver') && !matrix.research_artifact }}
         run: deployment/aliyun/test-binance-fee-release-contract.sh
 
+      - name: Require research publication settings before preparation
+        if: matrix.research_artifact
+        env:
+          MONDAY_RELEASE_POLICY_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
+          MONDAY_RELEASE_SIGNING_KEY_PRESENT: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}
+          MONDAY_RELEASE_GATEWAY_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_GATEWAY != '' }}
+          MONDAY_RELEASE_GATEWAY_TOKEN_PRESENT: ${{ secrets.MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN != '' }}
+          MONDAY_RELEASE_IMPORT_ENABLED: ${{ vars.MONDAY_RESEARCH_RELEASE_IMPORT_ENABLED == 'true' }}
+          MONDAY_RELEASE_IMPORT_DATABASE_URL_PRESENT: ${{ secrets.MONDAY_RESEARCH_RELEASE_IMPORT_DATABASE_URL != '' }}
+        run: .github/scripts/publish-research-build-release.sh check-presence
+
       - name: Download authenticated research release
         if: matrix.research_artifact
         env:
