@@ -58,7 +58,7 @@ pub fn run_mission(args: RunMissionArgs, resume: bool) -> anyhow::Result<()> {
 }
 
 pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<MissionRunReport> {
-    execute_mission_inner(args, resume, None)
+    execute_mission_inner(args, resume, None, None)
 }
 
 #[cfg(feature = "scientific")]
@@ -68,13 +68,31 @@ pub(crate) fn execute_governed_gp_mission(
     policy: &CexGpPolicyV1,
     candidate_namespace: &str,
 ) -> anyhow::Result<MissionRunReport> {
-    execute_mission_inner(args, resume, Some((policy, candidate_namespace)))
+    execute_mission_inner(args, resume, Some((policy, candidate_namespace)), None)
+}
+
+#[cfg(feature = "scientific")]
+pub(crate) fn execute_native_governed_gp_mission(
+    args: &RunMissionArgs,
+    resume: bool,
+    policy: &CexGpPolicyV1,
+    candidate_namespace: &str,
+    dataset: &alpha_engine::evaluation::PreparedDataset,
+    original_manifest_id: &str,
+) -> anyhow::Result<MissionRunReport> {
+    execute_mission_inner(
+        args,
+        resume,
+        Some((policy, candidate_namespace)),
+        Some((dataset, original_manifest_id)),
+    )
 }
 
 fn execute_mission_inner(
     args: &RunMissionArgs,
     resume: bool,
     governed_gp: Option<(&CexGpPolicyV1, &str)>,
+    prepared: Option<(&alpha_engine::evaluation::PreparedDataset, &str)>,
 ) -> anyhow::Result<MissionRunReport> {
     validate_mission_args(args, governed_gp.is_some())?;
     let mut store = AlphaStore::open(&args.db)?;
@@ -86,16 +104,34 @@ fn execute_mission_inner(
         (true, _) => bail!("mission resume requires a paused or running mission"),
     }
 
-    let manifest =
-        data_mission::read_registered_research_dataset(&store, &args.dataset.dataset_manifest)?;
-    if mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
+    let owned_dataset;
+    let manifest_id;
+    let dataset = if let Some((dataset, original_manifest_id)) = prepared {
+        if dataset.withheld_metadata().is_none() || governed_gp.is_none() {
+            bail!("native governed search requires verified metadata-only withheld inputs");
+        }
+        let expected_protocol = args
+            .dataset
+            .validation
+            .evaluation_protocol(&dataset.protocol().labels)?;
+        if &expected_protocol != dataset.protocol() {
+            bail!("native search protocol differs from the frozen validation arguments");
+        }
+        manifest_id = original_manifest_id.to_string();
+        dataset
+    } else {
+        let manifest =
+            data_mission::read_registered_research_dataset(&store, &args.dataset.dataset_manifest)?;
+        manifest_id = manifest.manifest_id().to_string();
+        let labels = manifest.evaluation_label_spec()?;
+        let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
+        owned_dataset = prepare_dataset(manifest.load_rows(&protocol.costs)?, &protocol)?;
+        &owned_dataset
+    };
+    if mission.dataset_manifest_id.as_str() != manifest_id {
         bail!("mission dataset id does not match the supplied manifest");
     }
-    let labels = manifest.evaluation_label_spec()?;
-    let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
-    let rows = manifest.load_rows(&protocol.costs)?;
-    let evaluation_protocol_hash = protocol.content_hash()?;
-    let dataset = prepare_dataset(rows, &protocol)?;
+    let evaluation_protocol_hash = dataset.protocol().content_hash()?;
     let research_context = dataset.engine_context();
     let research_dataset_sha256 = canonical_json_hash(&research_context.rows())?;
     let research_dataset = CexResearchContentRefV1 {
@@ -127,11 +163,11 @@ fn execute_mission_inner(
         FormulaEvaluator::for_mission(&mission)
     }
     .map_err(anyhow::Error::msg)?;
-    let proposal_engine = build_engine(args, &dataset, &mission, governed_gp)?;
+    let proposal_engine = build_engine(args, dataset, &mission, governed_gp)?;
     let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
     let outcome = kernel.run(
         &args.mission_id,
-        &dataset,
+        dataset,
         RunControl {
             max_new_iterations: args.max_new_iterations,
         },
@@ -147,7 +183,7 @@ fn execute_mission_inner(
             EngineChoice::OfflineRl => ResearchEngineAuthority::LabSearchPolicyOnly,
             _ => ResearchEngineAuthority::CandidateResearchOnly,
         },
-        dataset_manifest_id: manifest.manifest_id().to_string(),
+        dataset_manifest_id: manifest_id,
         research_dataset,
         walk_forward_partition,
     })

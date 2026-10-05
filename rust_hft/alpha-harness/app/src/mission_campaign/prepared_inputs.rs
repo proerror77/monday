@@ -36,6 +36,7 @@ pub(crate) struct VerifiedNativeCampaignPreparedInputs {
     runner_image_identity: String,
     declared_trials: usize,
     prepared: VerifiedCampaignPreparedInputsV1,
+    render_inputs: PreparedCexInputs,
 }
 impl VerifiedNativeCampaignPreparedInputs {
     pub(crate) fn request_sha256(&self) -> &str {
@@ -133,6 +134,7 @@ pub(crate) fn inspect_finalized_campaign_prepared_inputs(
     {
         bail!("native prepared transport set differs from its actual views");
     }
+    let render_inputs = verify_native_render_binding(request, &prepared)?;
     Ok(VerifiedNativeCampaignPreparedInputs {
         request_sha256,
         campaign_inputs_sha256: request.campaign_inputs_sha256.clone(),
@@ -140,13 +142,59 @@ pub(crate) fn inspect_finalized_campaign_prepared_inputs(
         runner_image_identity: request.image_identity.clone(),
         declared_trials: request.declared_total_trials,
         prepared,
+        render_inputs,
     })
+}
+
+impl VerifiedNativeCampaignPreparedInputs {
+    pub(crate) fn render_inputs(&self) -> &PreparedCexInputs {
+        &self.render_inputs
+    }
+}
+fn verify_native_render_binding(
+    request: &CampaignRequest,
+    prepared: &VerifiedCampaignPreparedInputsV1,
+) -> anyhow::Result<PreparedCexInputs> {
+    let reference = request
+        .prepared_inputs
+        .as_ref()
+        .context("missing prepared reference")?;
+    let render = PreparedCexInputs::restore_metadata(
+        reference.render_metadata.clone(),
+        &request.feature_sha256,
+        &request.materialization_sha256,
+    )?;
+    let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+        render.materialization(),
+        &request.research_plan,
+    )?;
+    if !render
+        .feature_manifest()
+        .artifact_path
+        .as_os_str()
+        .is_empty()
+    {
+        bail!("native render metadata exposes the original whole-source staging path");
+    }
+    if serde_json::from_str::<EvaluationProtocolV1>(&prepared.original_metadata().protocol_json)?
+        != protocol
+        || render.materialization().rows != prepared.original_metadata().total_rows
+        || render.feature_manifest().rows != prepared.original_metadata().total_rows
+        || render.materialization().series_count != 1
+    {
+        bail!("native prepared source metadata/protocol differs from the original Mission");
+    }
+    alpha_engine::evaluation::prepare_native_campaign_dataset(prepared, &protocol)?;
+    Ok(render)
 }
 
 pub(super) fn freeze_native_prepared_reference(
     inputs: &ValidatedCampaignInputSet,
     plan: &CexCampaignResearchPlanV1,
 ) -> anyhow::Result<NativePreparedCampaignRefV1> {
+    if inputs.receipt.prepared_inputs.is_some() {
+        bail!("native exporter requires the original source receipt, before collection freeze");
+    }
     inputs.render_inputs.verify_development_precheck(plan)?;
     let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
         inputs.render_inputs.materialization(),
@@ -209,7 +257,7 @@ pub(super) fn freeze_native_prepared_reference(
         collection_url: format!("{root}/{relative}"),
         expected_native: artifacts.manifest.expected_native()?,
         block_urls,
-        render_metadata: inputs.render_inputs.metadata()?,
+        render_metadata: inputs.render_inputs.native_metadata()?,
     })
 }
 
@@ -233,7 +281,7 @@ fn persist_native_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn acquire_native_prepared(
+pub(crate) fn acquire_native_prepared(
     request: &CampaignRequest,
     expected_request_sha256: &str,
     client: &Client,
@@ -254,7 +302,25 @@ pub(super) fn acquire_native_prepared(
     )?;
     let collection: CampaignPreparedInputsV1 =
         serde_json::from_slice(&std::fs::read(&metadata_path)?)?;
-    let mut bytes = BTreeMap::new();
+    collection.validate_metadata()?;
+    if collection.id()? != reference.collection_sha256
+        || collection.expected_native()? != reference.expected_native
+    {
+        bail!("native collection differs from the finalized source binding");
+    }
+    let declared = collection
+        .features
+        .manifest
+        .blocks
+        .iter()
+        .chain(&collection.future_marks.manifest.blocks)
+        .chain(&collection.replay.manifest.blocks)
+        .map(|block| block.sha256.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if declared != reference.block_urls.keys().cloned().collect() {
+        bail!("native collection transports do not match the actual allowed views");
+    }
+    let mut files = BTreeMap::new();
     for (sha, url) in &reference.block_urls {
         let path = directory.join(format!("{sha}.mondaybin"));
         fetch_verified(
@@ -265,15 +331,41 @@ pub(super) fn acquire_native_prepared(
             sha,
             16 * 1024 * 1024,
         )?;
-        bytes.insert(sha.clone(), std::fs::read(path)?);
+        files.insert(sha.clone(), path);
     }
     inspect_finalized_campaign_prepared_inputs(
         request,
         expected_request_sha256,
         collection,
-        &mut AcquiredBlocks { bytes },
+        &mut ReadbackBlocks { files },
         MAX_NATIVE_DECODED_BYTES,
     )
+}
+
+struct ReadbackBlocks {
+    files: BTreeMap<String, PathBuf>,
+}
+impl hft_cex_research_input::data::BlockSource for ReadbackBlocks {
+    fn read(&mut self, block: &hft_cex_research_input::data::BlockRef) -> anyhow::Result<Vec<u8>> {
+        let path = self
+            .files
+            .get(&block.sha256)
+            .context("native declared block readback absent")?;
+        let mut file = std::fs::File::open(path)?;
+        if file.metadata()?.len() != block.bytes {
+            bail!("native block readback byte count changed");
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::by_ref(&mut file)
+            .take(
+                block
+                    .bytes
+                    .checked_add(1)
+                    .context("native block byte limit overflow")?,
+            )
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
 }
 
 /// The caller holds source receipt/file verification. This exporter reads only actual observations.
@@ -283,7 +375,7 @@ pub(super) fn export_trusted_source(
     protocol: &EvaluationProtocolV1,
     canonical: hft_backtest::config::VerifiedCanonicalReplay,
 ) -> anyhow::Result<PreparedCampaignArtifacts> {
-    let original = prepare_dataset(full_rows.clone(), protocol)?;
+    prepare_dataset(full_rows.clone(), protocol)?;
     let partitions = protocol.row_partitions(full_rows.len())?;
     let visible_end = protocol
         .calendar
@@ -485,13 +577,25 @@ pub(super) fn export_trusted_source(
         })
         .and_then(|millis| millis.checked_mul(1_000_000))
         .context("native label horizon overflow")?;
+    let replay_payload_depth = replay_rows
+        .iter()
+        .filter_map(|row| match &row.payload {
+            ReplayPayload::Snapshot { bids, asks } | ReplayPayload::Delta { bids, asks } => {
+                Some(bids.len().max(asks.len()))
+            }
+            ReplayPayload::Trade { .. } => None,
+        })
+        .max()
+        .context("native replay has no actual book payload")?;
+    let replay_payload_depth =
+        u16::try_from(replay_payload_depth).context("native replay payload depth overflow")?;
     let feature_sql_sha256 = identity(&(NATIVE_LABEL_RECIPE, &names))?;
     let spec = |window: Window, feature_names: Vec<String>| DataViewSpec {
         schema: 1,
         venue: "binance".into(),
         instrument: canonical.evidence.symbol.clone(),
         market: canonical.evidence.market.clone(),
-        depth: 5,
+        depth: replay_payload_depth,
         sources: sources.clone(),
         normalizer_sha256: source.materialization_sha256.clone(),
         feature_sql_sha256: feature_sql_sha256.clone(),
@@ -566,8 +670,7 @@ pub(super) fn export_trusted_source(
             .clone()
             .verify(&id, &expected, &mut acquired, MAX_NATIVE_DECODED_BYTES)?;
     if verified.rows() != &full_rows[..visible_end]
-        || verified.original_metadata().search_rows
-            != original.protocol().row_partitions(full_rows.len())?.search
+        || verified.original_metadata().search_rows != partitions.search
     {
         bail!("native export does not reproduce the verified source rows/schedule");
     }
