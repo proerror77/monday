@@ -6,6 +6,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
+hft-factor-dsl = { path = "../research-core/factor-dsl" }
+hft-research-manifest = { path = "../research-core/manifest" }
 chrono = { workspace = true, features = ["serde"] }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
@@ -13,3 +15,4 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+rust_decimal = { workspace = true }

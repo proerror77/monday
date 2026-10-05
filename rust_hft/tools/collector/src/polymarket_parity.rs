@@ -1331,8 +1331,7 @@ pub fn verify_shadow_parity(config: &ShadowParityConfig) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::mpsc;
 
     struct TestDir {
         _temp: tempfile::TempDir,
@@ -2324,37 +2323,18 @@ mod tests {
     #[test]
     fn concurrent_appends_to_the_live_legacy_tape_do_not_block_parity() {
         let (_root, config) = fixture();
-        // A large in-lookback segment widens each read pass well beyond the
-        // writer's inter-append interval. The rows are trade-completion
-        // proofs: admitted to the tape, excluded from the comparison window,
-        // so they exercise read stability without touching parity semantics.
-        let bulk = (0..50_000)
-            .map(|_| {
-                json!({
-                    "kind": "polymarket_trade_collection_complete",
-                    "condition_id": "0xbulk",
-                    "market_id": "market-bulk",
-                    "completeness_basis": "polymarket_data_api_exhausted_after_settlement_and_stable_polls_v1",
-                    "malformed_trade_rows": 0,
-                    "finalization_lag_secs": 1800,
-                    "market_window_secs": 900
-                })
-            })
-            .collect::<Vec<_>>();
-        write_tape(
-            &config
-                .legacy_spool
-                .join("market-updates.19700101T000300000000.ndjson"),
-            &bulk,
-            "1970-01-01T00:03:20Z",
-        );
-        let stop = Arc::new(AtomicBool::new(false));
-        let appended = Arc::new(AtomicU64::new(0));
-        let writer = {
-            let path = config.legacy_spool.join(ACTIVE_TAPE);
-            let stop = Arc::clone(&stop);
-            let appended = Arc::clone(&appended);
-            thread::spawn(move || {
+        let path = config.legacy_spool.join(ACTIVE_TAPE);
+        let original_rows = fs::read_to_string(&path).unwrap().lines().count();
+        let (append_request, append_requests) = mpsc::channel();
+        let (append_completed, append_completions) = mpsc::channel();
+
+        // Coordinate real appends inside the production reader's visit
+        // callback. Each visited row adds another complete row before the
+        // reader continues, so an uncapped reader would chase a growing tail.
+        // No append-rate assumption depends on CPU scheduling or fsync speed.
+        thread::scope(|scope| {
+            let writer_path = &path;
+            let writer = scope.spawn(move || {
                 let completion = json!({
                     "kind": "polymarket_trade_collection_complete",
                     "condition_id": "0xconcurrent",
@@ -2364,28 +2344,63 @@ mod tests {
                     "finalization_lag_secs": 1800,
                     "market_window_secs": 900
                 });
-                while !stop.load(Ordering::Relaxed) {
-                    append_tape(&path, &completion, "1970-01-01T00:03:21Z");
-                    appended.fetch_add(1, Ordering::Relaxed);
-                    thread::sleep(Duration::from_millis(1));
+                for () in append_requests {
+                    append_tape(writer_path, &completion, "1970-01-01T00:03:21Z");
+                    let bytes = fs::metadata(writer_path).unwrap().len();
+                    if append_completed.send(bytes).is_err() {
+                        break;
+                    }
                 }
-            })
-        };
-        // Let the writer reach a sustained high append rate before the
-        // verifier starts reading the live spool.
-        thread::sleep(Duration::from_millis(100));
-        let started = std::time::Instant::now();
-        let appended_before = appended.load(Ordering::Relaxed);
+            });
+            let read_result = (|| -> Result<()> {
+                let mut previous_snapshot = None;
+                for pass in 0..2 {
+                    let before = TapeSnapshot::from_metadata(&fs::metadata(&path)?);
+                    let expected_rows = original_rows << pass;
+                    let mut visited = 0;
+                    let mut appended_bytes = before.bytes;
+                    let snapshot = stream_stable_rows(&path, previous_snapshot, |_| {
+                        visited += 1;
+                        if visited > expected_rows {
+                            bail!("reader followed an append beyond its snapshot");
+                        }
+                        append_request
+                            .send(())
+                            .context("request concurrent append")?;
+                        // This timeout detects a stuck writer; it is not a
+                        // throughput requirement for the collector or reader.
+                        let bytes = append_completions
+                            .recv_timeout(Duration::from_secs(10))
+                            .context("writer did not complete an append during the read")?;
+                        if bytes <= appended_bytes {
+                            bail!("acknowledged append did not grow the tape");
+                        }
+                        appended_bytes = bytes;
+                        Ok(())
+                    })?
+                    .context("concurrent growth invalidated the read snapshot")?;
+                    if snapshot != before || visited != expected_rows {
+                        bail!("read did not finish at the original snapshot boundary");
+                    }
+                    if !snapshot.holds_for(&fs::metadata(&path)?) {
+                        bail!("concurrent append changed the tape identity");
+                    }
+                    previous_snapshot = Some(snapshot);
+                }
+                Ok(())
+            })();
+            drop(append_request);
+            writer.join().unwrap();
+            read_result.unwrap();
+        });
 
+        // All original market evidence remains subject to the complete semantic
+        // comparison; the appended completion proofs add no market evidence.
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().lines().count(),
+            original_rows * 4
+        );
         let evidence = compare(&config).unwrap();
-
-        let elapsed = started.elapsed();
-        stop.store(true, Ordering::Relaxed);
-        writer.join().unwrap();
-        let appended_during = appended.load(Ordering::Relaxed) - appended_before;
-        assert!(appended_during > 0);
-        let rate = appended_during as f64 / elapsed.as_secs_f64();
-        assert!(rate >= 100.0, "append rate {rate:.0} rows/s during compare");
         assert_eq!(evidence["passed"], true);
         assert_eq!(evidence["metrics"]["legacy_trade_count"], 1);
     }
