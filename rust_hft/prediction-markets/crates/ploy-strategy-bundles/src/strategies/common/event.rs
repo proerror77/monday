@@ -15,21 +15,3 @@ pub struct EventWindow {
     #[allow(dead_code)]
     pub price_to_beat: Option<Decimal>,
 }
-
-impl EventWindow {
-    #[must_use]
-    pub fn contains_token(&self, token_id: &Arc<str>) -> bool {
-        self.up_token == *token_id || self.down_token == *token_id
-    }
-
-    #[must_use]
-    pub fn token_wins(&self, token_id: &Arc<str>, up_won: bool) -> Option<bool> {
-        if *token_id == self.up_token {
-            Some(up_won)
-        } else if *token_id == self.down_token {
-            Some(!up_won)
-        } else {
-            None
-        }
-    }
-}
