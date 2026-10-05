@@ -14,6 +14,9 @@ ed25519-dalek = { version = "=2.2.0", optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "process", "io-util", "io-std"] }
 reqwest = { workspace = true, optional = true, features = ["rustls-tls", "json"] }
 axum = { workspace = true, optional = true }
+rustix = { version = "0.38", features = ["fs"], optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
+futures-util = { version = "0.3", optional = true }
 # PG only: the umbrella crate resolves unused MySQL/RSA and SQLite drivers.
 sqlx-core = { version = "=0.8.6", optional = true, default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json"] }
 sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false, features = ["json"] }
@@ -21,6 +24,7 @@ sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false,
 [features]
 default = []
 control = ["dep:tokio", "dep:reqwest", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:ed25519-dalek"]
+gateway = ["control", "dep:rustix", "dep:tokio-util", "dep:futures-util", "tokio/fs", "reqwest/stream"]
 
 [[bin]]
 name = "research-orchestrator"
@@ -41,6 +45,11 @@ required-features = ["control"]
 name = "research-session"
 path = "src/bin/research-session.rs"
 required-features = ["control"]
+
+[[bin]]
+name = "research-artifact-gateway"
+path = "src/bin/research-artifact-gateway.rs"
+required-features = ["gateway"]
 
 [dev-dependencies]
 tempfile = "3"
