@@ -163,6 +163,34 @@ impl VerifiedCampaignPlatformTerminalSource {
     }
 }
 impl AlphaStore {
+    /// Read actual registered Root/Study keys after complete source publication.
+    /// A terminal witness must be distinct from both original authority keys.
+    pub fn campaign_platform_terminal_authority_public_keys(
+        &self,
+        source: &VerifiedCampaignPlatformTerminalSource,
+    ) -> Result<Vec<[u8; 32]>, StoreError> {
+        let actual = self.campaign_platform_terminal_source(
+            &source.reservation.family_id,
+            &source.transfer.operation_id,
+        )?;
+        if actual.reservation != source.reservation || actual.transfer != source.transfer {
+            return Err(err(
+                "terminal witness changed authenticated source ownership",
+            ));
+        }
+        let mut keys = vec![*actual.root.verifying_key().as_bytes()];
+        keys.extend(
+            study::published_member_revocations(
+                &self.connection,
+                &self.integrity_key,
+                &actual.reservation.family_id,
+                actual.root.content_sha256(),
+            )?
+            .public_key,
+        );
+        Ok(keys)
+    }
+
     /// Recover the exact authenticated audit for publication retry. A caller
     /// cannot replace durable observation bytes with a newer platform snapshot.
     pub fn campaign_platform_terminal_audit(

@@ -14,6 +14,11 @@ mod fixed_campaign_tests;
 mod native_witness;
 mod released_build;
 #[cfg(feature = "scientific")]
+pub(super) use native_witness::load as load_native_witness;
+#[cfg(feature = "scientific")]
+pub(super) use released_build::public_keys as release_public_keys;
+
+#[cfg(feature = "scientific")]
 pub(super) use signed_export::{
     client as host_client, file_bytes, read as read_metadata, retain, HostTls,
 };

@@ -11,7 +11,7 @@ use std::{
     path::Path,
 };
 
-pub(super) fn load(
+pub(in crate::mission_dispatch) fn load(
     path: &Path,
     key_id: &str,
     trust: &NativeAdmissionTrust,

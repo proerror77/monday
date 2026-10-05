@@ -51,6 +51,40 @@ pub(super) fn publish(
     Ok(())
 }
 
+pub(super) fn validate_witness_access(expected: &str, access: &Publication) -> anyhow::Result<()> {
+    for url in [&access.put_url, &access.readback_url] {
+        ensure!(
+            hft_research_dispatch_io::canonical_tokyo_oss_internal_object("terminal witness", url)?
+                == expected,
+            "terminal witness publication changed original operation or signed evidence"
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn publish_witness(
+    client: &Client,
+    path: &Path,
+    bytes: &[u8],
+    expected: &str,
+    access: &Publication,
+) -> anyhow::Result<()> {
+    for url in [&access.put_url, &access.readback_url] {
+        ensure!(
+            hft_research_dispatch_io::canonical_tokyo_oss_internal_object("terminal witness", url)?
+                == expected,
+            "terminal witness publication changed original operation or signed evidence"
+        );
+    }
+    publish_file(
+        client,
+        path,
+        &hft_research_platform::sha256(bytes),
+        bytes.len() as u64,
+        access,
+    )
+}
+
 pub(super) fn publish_file(
     client: &Client,
     path: &Path,
