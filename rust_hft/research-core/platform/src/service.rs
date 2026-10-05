@@ -26,6 +26,8 @@ pub struct ServiceConfig {
     pub agent_api: Option<crate::agent_api::AgentApiConfig>,
     #[serde(default)]
     pub attempt_identity: Option<crate::artifact_identity::AttemptIdentityConfig>,
+    #[serde(default)]
+    pub terminal_retirement: crate::retirement::RetirementConfig,
 }
 
 /// Gateway credentials are controller-only, scoped to result prefix readback.
@@ -45,6 +47,19 @@ pub struct ResultReadback {
 }
 
 impl ArtifactGateway {
+    #[cfg(test)]
+    pub(crate) fn retirement_fixture(endpoint: &str) -> Result<Self> {
+        let base = reqwest::Url::parse(endpoint)?;
+        ensure!(
+            base.scheme() == "http" && base.host_str() == Some("127.0.0.1"),
+            "fixture must be loopback"
+        );
+        Ok(Self {
+            client: reqwest::Client::builder().no_proxy().build()?,
+            base,
+            token: "fixture".into(),
+        })
+    }
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
         Self::with_tls(endpoint, token, &crate::transport::TlsConfig::default())
     }
@@ -81,6 +96,18 @@ impl ArtifactGateway {
                     .all(|c| c.is_ascii_alphanumeric() || b"/-_.".contains(&c)),
             "unsafe artifact key"
         );
+        self.get_key(key, max_bytes).await
+    }
+
+    /// Only the finite, PG-bound Source family receipt grammar admits '='.
+    pub(crate) async fn family_receipt(&self, family: &str, sequence: u64) -> Result<Vec<u8>> {
+        let key = crate::retirement::source_receipt_key(family, sequence)?;
+        self.get_key(&key, 1024 * 1024)
+            .await?
+            .context("published Source receipt missing")
+    }
+
+    async fn get_key(&self, key: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
         let mut response = self
             .client
             .get(self.base.join(key)?)
@@ -226,7 +253,10 @@ impl ArtifactGateway {
         Ok(())
     }
 
-    async fn verify_artifact(&self, artifact: &crate::orchestrator::Artifact) -> Result<()> {
+    pub(crate) async fn verify_artifact(
+        &self,
+        artifact: &crate::orchestrator::Artifact,
+    ) -> Result<()> {
         use sha2::{Digest, Sha256};
         let mut response = self
             .client
