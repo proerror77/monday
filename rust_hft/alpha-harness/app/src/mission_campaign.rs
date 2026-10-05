@@ -1701,6 +1701,8 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
 }
 
 struct ValidatedCampaignInputSet {
+    native_prepared:
+        std::collections::BTreeMap<String, prepared_inputs::NativePreparedCampaignRefV1>,
     input_root: PathBuf,
     replay_artifact_path: PathBuf,
     replay_manifest_path: PathBuf,
@@ -1789,6 +1791,7 @@ fn validated_campaign_inputs(
         None,
     )?;
     Ok(ValidatedCampaignInputSet {
+        native_prepared: std::collections::BTreeMap::new(),
         input_root: args.input_root.clone(),
         replay_artifact_path,
         replay_manifest_path,
@@ -1864,17 +1867,39 @@ fn freeze_prepared_request(
         probe_seed,
         declared_total_trials,
     )?;
-    let prepared = prepared_inputs::freeze_native_prepared_reference(inputs, research_plan)?;
+    let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+        inputs.render_inputs.materialization(),
+        research_plan,
+    )?;
+    let prepared = if let Some(prepared) = inputs.native_prepared.get(&protocol.content_hash()?) {
+        let source = &prepared.expected_native.source;
+        if source.preparation_receipt_sha256 != inputs.campaign_inputs_sha256
+            || source.feature_sha256 != inputs.feature_sha256
+            || source.materialization_sha256 != inputs.materialization_sha256
+            || source.replay_artifact_sha256 != inputs.replay_artifact_sha256
+            || source.replay_manifest_sha256 != inputs.replay_manifest_sha256
+            || prepared.expected_native.native_protocol_sha256 != protocol.content_hash()?
+        {
+            bail!("trusted prepared collection differs from original native source/protocol");
+        }
+        prepared.clone()
+    } else {
+        prepared_inputs::freeze_native_prepared_reference(inputs, research_plan)?
+    };
     let mut frozen_inputs = inputs.receipt.clone();
     frozen_inputs.prepared_inputs = Some(prepared.clone());
     let frozen_inputs_sha =
         hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&frozen_inputs)?);
-    write_json_create_once(
-        &inputs
-            .input_root
-            .join(format!("native-prepared/{frozen_inputs_sha}.inputs.json")),
-        &frozen_inputs,
-    )?;
+    // Trusted cached preparation can render from an authenticated collection
+    // while the original source mount is offline. Do not create a shadow mount.
+    if inputs.input_root.try_exists()? {
+        write_json_create_once(
+            &inputs
+                .input_root
+                .join(format!("native-prepared/{frozen_inputs_sha}.inputs.json")),
+            &frozen_inputs,
+        )?;
+    }
     Ok((
         build_request_from_parts(
             &inputs.feature_url,
@@ -4675,7 +4700,7 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
 }
 
 #[cfg(all(test, feature = "scientific"))]
-mod tests {
+pub(crate) mod tests {
     use super::test_support::{paired_mlp_plan_for_tests, valid_request};
     use super::*;
     use crate::mission_render;
@@ -5772,6 +5797,193 @@ mod tests {
         validate_request(&rebased).unwrap();
     }
 
+    pub(crate) struct NativePreparedFixture {
+        pub(crate) request: CampaignRequest,
+        pub(crate) inputs: prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+        _source: CampaignE2eFixture,
+        _root: tempfile::TempDir,
+    }
+
+    pub(crate) fn native_prepared_fixture_for_tests() -> NativePreparedFixture {
+        use hft_cex_research_input::{
+            campaign::NativeSourceBindingV1, campaign::SourceBuildRefV1, prepared::AcquiredBlocks,
+        };
+        let source_fixture = campaign_e2e_fixture("native-body-equivalence", false, false, true);
+        let mut request = load_request(&source_fixture.args.request).unwrap().request;
+        let render = PreparedCexInputs::load(
+            &source_fixture._render_fixture.feature_path,
+            &source_fixture._render_fixture.materialization_path,
+            true,
+        )
+        .unwrap();
+        let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+            render.materialization(),
+            &request.research_plan,
+        )
+        .unwrap();
+        let rows = render.native_source_rows(&protocol).unwrap();
+        let partitions = protocol.row_partitions(rows.len()).unwrap();
+        let end = rows[partitions
+            .selection
+            .as_ref()
+            .map_or(partitions.sealed_holdout.start, |p| p.start)]
+        .available_time
+        .timestamp_micros()
+            - 1;
+        let canonical = hft_backtest::config::verify_canonical_replay_artifact(
+            &source_fixture.replay_artifact_path,
+            &source_fixture.replay_manifest_path,
+            Some(&request.replay_artifact_sha256),
+            &request.replay_manifest_sha256,
+            None,
+            Some(end),
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let item = |path: &Path, sha: &str| CampaignInputReceiptItem {
+            relative_path: path.file_name().unwrap().into(),
+            object_url: path.to_string_lossy().into_owned(),
+            sha256: sha.into(),
+        };
+        let mut receipt = CampaignInputsReceipt {
+            prepared_inputs: None,
+            schema_version: CAMPAIGN_INPUTS_SCHEMA_V1.into(),
+            run_id: "native-source-test".into(),
+            source_revision: request.producer_source_revision.clone(),
+            image_ref: format!("registry/source@sha256:{}", request.producer_image_identity),
+            mission_id: render.materialization().mission_id.clone(),
+            market: render.materialization().market.clone(),
+            symbol: render.materialization().symbol.clone(),
+            output_prefix: "native-source-test".into(),
+            output_object_base_url: root.path().to_string_lossy().into_owned(),
+            readback_scope: "same-mounted-ossfs-prefix".into(),
+            feature: item(
+                &source_fixture._render_fixture.feature_path,
+                &request.feature_sha256,
+            ),
+            materialization: item(
+                &source_fixture._render_fixture.materialization_path,
+                &request.materialization_sha256,
+            ),
+            replay_artifact: item(
+                &source_fixture.replay_artifact_path,
+                &request.replay_artifact_sha256,
+            ),
+            replay_manifest: item(
+                &source_fixture.replay_manifest_path,
+                &request.replay_manifest_sha256,
+            ),
+        };
+        let original_receipt_sha =
+            hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&receipt).unwrap());
+        let source = NativeSourceBindingV1 {
+            build: SourceBuildRefV1 {
+                source_revision: receipt.source_revision.clone(),
+                image_identity: receipt.image_ref.clone(),
+            },
+            preparation_run_id: receipt.run_id.clone(),
+            preparation_receipt_sha256: original_receipt_sha,
+            feature_sha256: request.feature_sha256.clone(),
+            materialization_sha256: request.materialization_sha256.clone(),
+            replay_artifact_sha256: request.replay_artifact_sha256.clone(),
+            replay_manifest_sha256: request.replay_manifest_sha256.clone(),
+        };
+        let artifacts =
+            prepared_inputs::export_trusted_source(source, rows, &protocol, canonical).unwrap();
+        let collection_path = root.path().join(format!("{}.json", artifacts.id));
+        std::fs::write(
+            &collection_path,
+            serde_json::to_vec(&artifacts.manifest).unwrap(),
+        )
+        .unwrap();
+        let mut block_urls = std::collections::BTreeMap::new();
+        for (sha, bytes) in &artifacts.blocks {
+            let path = root.path().join(format!("{sha}.mondaybin"));
+            std::fs::write(&path, bytes).unwrap();
+            block_urls.insert(sha.clone(), path.to_string_lossy().into_owned());
+        }
+        let reference = prepared_inputs::NativePreparedCampaignRefV1 {
+            collection_sha256: artifacts.id,
+            collection_url: collection_path.to_string_lossy().into_owned(),
+            expected_native: artifacts.manifest.expected_native().unwrap(),
+            block_urls,
+            render_metadata: render.native_metadata().unwrap(),
+        };
+        receipt.prepared_inputs = Some(reference.clone());
+        request.campaign_inputs_sha256 =
+            hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&receipt).unwrap());
+        request.prepared_inputs = Some(reference);
+        request.schema_version = CAMPAIGN_REQUEST_SCHEMA_V6.into();
+        request.feature_url.clear();
+        request.materialization_url.clear();
+        request.replay_artifact_url.clear();
+        request.replay_manifest_url.clear();
+        let fingerprint = campaign_data_fingerprint_sha256(
+            &request.campaign_inputs_sha256,
+            &request.producer_source_revision,
+            &request.feature_sha256,
+            &request.materialization_sha256,
+            &request.replay_artifact_sha256,
+            &request.replay_manifest_sha256,
+        )
+        .unwrap();
+        for round in &mut request.rounds {
+            round.identity.data_fingerprint_sha256 = fingerprint.clone();
+        }
+        let expected_request_sha =
+            hft_cex_research_input::sha256(&serialize_request(&request).unwrap());
+        let inputs = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+            &request,
+            &expected_request_sha,
+            artifacts.manifest,
+            &mut AcquiredBlocks {
+                bytes: artifacts.blocks,
+            },
+            1024 * 1024 * 1024,
+        )
+        .unwrap();
+        NativePreparedFixture {
+            request,
+            inputs,
+            _source: source_fixture,
+            _root: root,
+        }
+    }
+
+    #[test]
+    fn native_finalized_fixture_matches_real_body_and_rejects_changed_request() {
+        let fixture = native_prepared_fixture_for_tests();
+        assert_eq!(
+            fixture.inputs.campaign_inputs_sha256(),
+            fixture.request.campaign_inputs_sha256
+        );
+        assert_eq!(
+            fixture.inputs.collection_id(),
+            fixture
+                .request
+                .prepared_inputs
+                .as_ref()
+                .unwrap()
+                .collection_sha256
+        );
+        let mut changed = fixture.request.clone();
+        changed.declared_total_trials += 1;
+        let result = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+            &changed,
+            fixture.inputs.request_sha256(),
+            fixture.inputs.prepared().manifest().clone(),
+            &mut hft_cex_research_input::prepared::AcquiredBlocks {
+                bytes: Default::default(),
+            },
+            1024 * 1024 * 1024,
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("admission/witness"));
+    }
+
     #[test]
     fn native_collection_rebuilds_actual_rows_preserves_original_schedule_and_rejects_false_label()
     {
@@ -5993,7 +6205,7 @@ mod tests {
         let producer_revision = "b".repeat(40);
         let producer_image_ref = format!("registry/research-runner@sha256:{}", "1".repeat(64));
         let executor_image_ref = format!("registry/research-runner@sha256:{}", "2".repeat(64));
-        let fixture = campaign_e2e_fixture("campaign-freeze", false, false, false);
+        let fixture = campaign_e2e_fixture("campaign-freeze", false, false, true);
         let root = tempfile::tempdir().unwrap();
         let input_root = root.path().join("remounted-run");
         std::fs::create_dir_all(&input_root).unwrap();
@@ -6100,11 +6312,35 @@ mod tests {
         assert_eq!(receipt_again.source_revision, producer_revision);
         assert_eq!(receipt_again.image_ref, producer_image_ref);
         let frozen = load_freeze_plan(&output).unwrap();
-        assert_eq!(frozen.campaign_inputs_sha256, receipt_sha256);
+        let prepared = frozen.canonical_request.prepared_inputs.as_ref().unwrap();
         assert_eq!(
-            frozen.canonical_request.campaign_inputs_sha256,
+            prepared.expected_native.source.preparation_receipt_sha256,
             receipt_sha256
         );
+        let augmented = input_root.join(format!(
+            "native-prepared/{}.inputs.json",
+            frozen.campaign_inputs_sha256
+        ));
+        let (augmented_receipt, augmented_sha) = load_campaign_inputs_receipt(&augmented).unwrap();
+        assert_eq!(augmented_receipt.prepared_inputs.as_ref(), Some(prepared));
+        assert_eq!(frozen.campaign_inputs_sha256, augmented_sha);
+        assert_eq!(
+            frozen.canonical_request.campaign_inputs_sha256,
+            augmented_sha
+        );
+        assert_ne!(augmented_sha, receipt_sha256);
+        assert!(frozen.canonical_request.feature_url.is_empty());
+        assert!(frozen.canonical_request.materialization_url.is_empty());
+        assert!(frozen.canonical_request.replay_artifact_url.is_empty());
+        assert!(frozen.canonical_request.replay_manifest_url.is_empty());
+        assert!(frozen.signing_plan.actions.iter().all(|action| ![
+            "feature_get",
+            "materialization_get",
+            "replay_artifact_get",
+            "replay_manifest_get"
+        ]
+        .contains(&action.name.as_str())));
+
         assert_eq!(
             frozen.canonical_request.producer_source_revision,
             producer_revision
