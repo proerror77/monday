@@ -59,6 +59,10 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     sqlx_core::raw_sql::raw_sql(SESSION_DELIVERY_MIGRATION)
         .execute(&pool)
         .await?;
+    #[cfg(feature = "gateway")]
+    sqlx_core::raw_sql::raw_sql(hft_research_platform::postgres::ARTIFACT_GATEWAY_MIGRATION)
+        .execute(&pool)
+        .await?;
     let ledger = Ledger::connect(&url).await?;
     let view = PublishedView {
         prepared_id: hash('a'),
@@ -494,6 +498,73 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         request_sha256: result.task.id.clone(),
     };
     result.task.launched(&lease, result.now_ms, handle)?;
+    #[cfg(feature = "gateway")]
+    {
+        let task = result.task.id.clone();
+        let prefix = format!(
+            "{}/{}/{}/",
+            result.task.spec.output_prefix, task, lease.attempt
+        );
+        result.commit("fixture_running").await?;
+        assert_eq!(
+            ledger
+                .artifact_writer("fixture", &task, lease.attempt, lease.fence)
+                .await?,
+            prefix
+        );
+        assert!(ledger
+            .artifact_writer("foreign", &task, lease.attempt, lease.fence)
+            .await
+            .is_err());
+        assert!(ledger
+            .artifact_writer("fixture", &task, lease.attempt + 1, lease.fence)
+            .await
+            .is_err());
+        assert!(ledger
+            .artifact_writer("fixture", &task, lease.attempt, lease.fence + 1)
+            .await
+            .is_err());
+        // The gateway role can order publication with cancellation using one
+        // reviewed function, without UPDATE/INSERT rights on the ledger.
+        sqlx_core::raw_sql::raw_sql("CREATE ROLE monday_gateway_fixture; GRANT USAGE ON SCHEMA research TO monday_gateway_fixture; GRANT EXECUTE ON FUNCTION research.artifact_write_permit(text,text,integer,bigint) TO monday_gateway_fixture;")
+            .execute(&pool).await?;
+        let mut permit = pool.begin().await?;
+        sqlx_core::query::query("SET LOCAL ROLE monday_gateway_fixture")
+            .execute(&mut *permit)
+            .await?;
+        let admitted: String = sqlx_core::query_scalar::query_scalar(
+            "SELECT research.artifact_write_permit($1,$2,$3,$4)",
+        )
+        .bind("fixture")
+        .bind(&task)
+        .bind(lease.attempt as i32)
+        .bind(lease.fence)
+        .fetch_one(&mut *permit)
+        .await?;
+        assert_eq!(admitted, prefix);
+        let claim_task = task.clone();
+        let takeover = sqlx_core::query::query(
+            "SELECT task_id FROM research.tasks WHERE task_id=$1 FOR UPDATE",
+        )
+        .bind(&claim_task)
+        .fetch_one(&pool);
+        tokio::pin!(takeover);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut takeover)
+                .await
+                .is_err()
+        );
+        assert!(sqlx_core::query::query(
+            "UPDATE research.admissions SET document=document WHERE request_sha256=$1"
+        )
+        .bind(&task)
+        .execute(&mut *permit)
+        .await
+        .is_err());
+        permit.rollback().await?;
+        takeover.await?;
+        result = ledger.lock_next("result-owner", 30000).await?.unwrap();
+    }
     let receipt = hft_research_platform::orchestrator::ResultReceipt {
         task_id: result.task.id.clone(),
         attempt: lease.attempt,
@@ -523,6 +594,11 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     .bind(hash('f'))
     .execute(&pool)
     .await?;
+    #[cfg(feature = "gateway")]
+    assert!(ledger
+        .artifact_writer("fixture", &result_id, lease.attempt, lease.fence)
+        .await
+        .is_err());
     let mut stopped = ledger.lock_next("result-owner", 30000).await?.unwrap();
     stopped.task.stopped(lease.attempt, lease.fence)?;
     assert!(stopped
