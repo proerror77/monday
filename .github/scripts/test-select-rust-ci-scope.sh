@@ -402,6 +402,12 @@ for path in \
   grep -q '^jobs=.*ci/rust-hft-engine-fast-lane,' "$latency_output"
 done
 
+# Removing the engine dependency must not remove depth's actual 22-test gate.
+"$script_dir/../../rust_hft/scripts/workspace-metadata.sh" >"$tmp_dir/depth-metadata.fixture"
+printf '%s\n' rust_hft/market-core/binance-depth/src/book_sync.rs >"$tmp_dir/depth-leaf.txt"
+depth_output=$(run_case depth-leaf pull_request depth-leaf.txt "$tmp_dir/depth-metadata.fixture")
+grep -q '^jobs=.*ci/rust-hft-engine-fast-lane,' "$depth_output"
+
 printf '%s\n' \
   rust_hft/tools/collector/src/polymarket/reference.rs \
   rust_hft/tools/future-rust-tool/src/lib.rs >"$tmp_dir/known-and-future.txt"
