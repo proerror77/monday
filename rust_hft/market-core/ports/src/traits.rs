@@ -516,6 +516,12 @@ pub struct StrategyContext<'a> {
     pub book: Option<L2BookView<'a>>,
 }
 
+/// Actual engine delivery result. This state notification grants no order authority.
+pub enum IntentSubmissionResult<'a> {
+    Enqueued { client_order_id: &'a str },
+    NotSubmitted,
+}
+
 pub trait Strategy: Send + Sync {
     /// Narrow semantic expiry, such as an episode end. The engine always
     /// takes the minimum with its own latency and deployment limits.
@@ -558,6 +564,15 @@ pub trait Strategy: Send + Sync {
     /// This notification cannot submit intents. A later market/clock decision
     /// uses the normal envelope and shared-risk path.
     fn observe_execution_state(&mut self, _event: &ExecutionEvent, _account: &AccountView) {}
+
+    /// Known pre-submission rejection/failure is distinct from an enqueued
+    /// order whose outcome is still unknown. This cannot return new intents.
+    fn observe_intent_submission(
+        &mut self,
+        _intent: &OrderIntent,
+        _result: IntentSubmissionResult<'_>,
+    ) {
+    }
 
     /// 策略名稱
     fn name(&self) -> &str;

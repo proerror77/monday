@@ -123,6 +123,46 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     // allowing a strategy configuration to enlarge the verified $5 ceiling.
     assert!(intents.is_empty());
     assert!(engine.export_oms_state().is_empty());
+    engine
+        .set_intent_execution_limits(None, Some(Decimal::from(10)), Some(Decimal::from(100)))
+        .unwrap();
+    let received = now_micros();
+    ingester
+        .lock()
+        .unwrap()
+        .ingest(snapshot(25, received, 3))
+        .unwrap();
+    engine.tick().unwrap();
+    ingester
+        .lock()
+        .unwrap()
+        .ingest(snapshot(65, received + 1, 4))
+        .unwrap();
+    engine.tick().unwrap();
+    let recovered = reader.receive_envelopes();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "known pre-risk rejection must release the unsubmitted proposal"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(110)).await;
+    let received = now_micros();
+    ingester
+        .lock()
+        .unwrap()
+        .ingest(snapshot(25, received, 5))
+        .unwrap();
+    engine.tick().unwrap();
+    ingester
+        .lock()
+        .unwrap()
+        .ingest(snapshot(65, received + 1, 6))
+        .unwrap();
+    engine.tick().unwrap();
+    assert!(
+        reader.receive_envelopes().is_empty(),
+        "actual queue acceptance remains Unknown without a correlated report"
+    );
     drop(engine);
     let mut config = runtime.config.clone();
     config.engine.intent_max_order_notional = Some(Decimal::from(10));
@@ -169,7 +209,7 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     reader
         .send_event(ports::ExecutionEvent::OrderNew {
             order_id: buy.clone(),
-            client_order_id: Some("paper-buy".into()),
+            client_order_id: Some(intents[0].client_order_id.clone()),
             account_id: Some(hft_core::AccountId("paper-account".into())),
             symbol: Symbol::new("123"),
             side: hft_core::Side::Buy,
@@ -330,7 +370,7 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     reader
         .send_event(ports::ExecutionEvent::OrderNew {
             order_id: order.clone(),
-            client_order_id: Some("down-buy".into()),
+            client_order_id: Some(down[0].client_order_id.clone()),
             account_id: Some(hft_core::AccountId("paper-account".into())),
             symbol: Symbol::new("456"),
             side: hft_core::Side::Buy,
@@ -378,4 +418,60 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     assert_eq!(exit.len(), 1);
     assert_eq!(exit[0].intent.side, hft_core::Side::Sell);
     assert_eq!(exit[0].intent.quantity, Quantity(Decimal::ONE));
+    drop(engine);
+    let runtime = SystemBuilder::new(runtime.config.clone())
+        .register_strategies_from_config_strict()
+        .unwrap()
+        .register_simulated_execution_client(VenueId::POLYMARKET)
+        .build();
+    let (mut queues, mut reader) = engine::create_execution_queues(engine::ExecutionQueueConfig {
+        intent_queue_capacity: 1,
+        ..Default::default()
+    });
+    // Occupy the local queue; no worker or venue is started.
+    queues
+        .send_envelope(ports::OrderIntentEnvelope::new(
+            down[0].intent.clone(),
+            ports::OrderIntentLifecycle::default(),
+        ))
+        .unwrap();
+    let mut engine = runtime.engine.lock().await;
+    engine.set_execution_queues(queues);
+    engine.update_cash_balance(Decimal::from(1000)).unwrap();
+    let ingester = engine.create_event_ingester_pair();
+    let received = now_micros();
+    ingester
+        .lock()
+        .unwrap()
+        .ingest(snapshot(25, received, 1))
+        .unwrap();
+    engine.tick().unwrap();
+    ingester
+        .lock()
+        .unwrap()
+        .ingest(snapshot(65, received + 1, 2))
+        .unwrap();
+    engine.tick().unwrap();
+    let occupied = reader.receive_envelopes();
+    assert_eq!(occupied.len(), 1);
+    assert_eq!(occupied[0].intent.symbol, Symbol::new("456"));
+    tokio::time::sleep(std::time::Duration::from_millis(110)).await;
+    let received = now_micros();
+    ingester
+        .lock()
+        .unwrap()
+        .ingest(snapshot(25, received, 3))
+        .unwrap();
+    engine.tick().unwrap();
+    ingester
+        .lock()
+        .unwrap()
+        .ingest(snapshot(65, received + 1, 4))
+        .unwrap();
+    engine.tick().unwrap();
+    assert_eq!(
+        reader.receive_envelopes().len(),
+        1,
+        "actual QueueFull must release only the unsubmitted pending proposal"
+    );
 }

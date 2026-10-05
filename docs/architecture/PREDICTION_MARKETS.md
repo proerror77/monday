@@ -70,6 +70,15 @@ offers a state-only strategy notification. It cannot submit an order. Replayed
 accounting reports are suppressed before notification. Unknown and partially
 filled orders remain pending until the canonical terminal report. The next
 market event reads authoritative account state and uses the normal risk path.
+Known pricing, lifecycle, risk or queue admission failures release only an
+unsubmitted proposal. Successful queue delivery pins its actual client order
+ID; an unknown outcome has no timeout-based retry. A correlated worker reject
+or canonical terminal report can release it. All later attempts use the same
+envelope, risk and queue path.
+
+Only actual, same-episode UP quotes form the UP threshold history. DOWN quotes
+provide their own execution price; their complement never invents a missing UP
+observation.
 
 The fixed specification establishes inference configuration only. It does not
 establish episode readiness, scientific evaluation, sealed holdout, promotion,

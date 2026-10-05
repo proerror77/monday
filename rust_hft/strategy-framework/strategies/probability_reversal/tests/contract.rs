@@ -98,6 +98,93 @@ fn original_up_and_down_thresholds_produce_typed_share_orders() {
 }
 
 #[test]
+fn down_quote_never_invents_an_unobserved_up_probability() {
+    let mut strategy = ProbabilityReversalStrategy::new(config()).unwrap();
+    let account = AccountView::default();
+    strategy.on_market_event(&quote("456", 20, 297_000_000, 1), &account);
+    assert!(strategy
+        .on_market_event(&quote("123", 35, 297_100_000, 1), &account)
+        .is_empty());
+    strategy.on_market_event(&quote("123", 75, 297_200_000, 2), &account);
+    strategy.on_market_event(&quote("456", 20, 297_250_000, 2), &account);
+    let actual = strategy.on_market_event(&quote("123", 35, 297_300_000, 3), &account);
+    assert_eq!(actual.len(), 1);
+    assert_eq!(actual[0].symbol, Symbol::new("456"));
+}
+
+#[test]
+fn known_not_submitted_recovers_but_enqueued_unknown_requires_the_actual_client_id() {
+    let mut strategy = ProbabilityReversalStrategy::new(config()).unwrap();
+    let account = AccountView::default();
+    strategy.on_market_event(&quote("123", 25, 297_000_000, 1), &account);
+    let first = strategy
+        .on_market_event(&quote("123", 65, 297_100_000, 2), &account)
+        .remove(0);
+    strategy.observe_intent_submission(&first, ports::IntentSubmissionResult::NotSubmitted);
+    strategy.on_market_event(&quote("123", 25, 297_200_000, 3), &account);
+    let queued = strategy
+        .on_market_event(&quote("123", 65, 297_300_000, 4), &account)
+        .remove(0);
+    strategy.observe_intent_submission(
+        &queued,
+        ports::IntentSubmissionResult::Enqueued {
+            client_order_id: "actual-client",
+        },
+    );
+    strategy.observe_intent_submission(&queued, ports::IntentSubmissionResult::NotSubmitted);
+    strategy.on_execution_event(
+        &ExecutionEvent::OrderNew {
+            order_id: OrderId("foreign-order".into()),
+            client_order_id: Some("foreign-client".into()),
+            account_id: None,
+            symbol: queued.symbol.clone(),
+            side: queued.side,
+            quantity: queued.quantity,
+            requested_price: queued.price,
+            arrival_price: None,
+            timestamp: 297_350_000,
+            venue: Some(VenueId::POLYMARKET),
+            strategy_id: "probability".into(),
+        },
+        &account,
+    );
+    strategy.on_execution_event(
+        &ExecutionEvent::OrderCanceled {
+            order_id: OrderId("foreign-order".into()),
+            timestamp: 297_360_000,
+        },
+        &account,
+    );
+    strategy.on_execution_event(
+        &ExecutionEvent::OrderReject {
+            order_id: OrderId("foreign-client".into()),
+            reason: "foreign".into(),
+            timestamp: 297_400_000,
+        },
+        &account,
+    );
+    strategy.on_market_event(&quote("123", 25, 297_500_000, 5), &account);
+    assert!(strategy
+        .on_market_event(&quote("123", 65, 298_000_000, 6), &account)
+        .is_empty());
+    strategy.on_execution_event(
+        &ExecutionEvent::OrderReject {
+            order_id: OrderId("actual-client".into()),
+            reason: "actual worker rejection".into(),
+            timestamp: 298_100_000,
+        },
+        &account,
+    );
+    strategy.on_market_event(&quote("123", 25, 298_200_000, 7), &account);
+    assert_eq!(
+        strategy
+            .on_market_event(&quote("123", 65, 298_300_000, 8), &account)
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn wrong_episode_clock_invalid_price_and_stale_down_cannot_enter() {
     let account = AccountView::default();
     let mut strategy = ProbabilityReversalStrategy::new(config()).unwrap();

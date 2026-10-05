@@ -1998,6 +1998,7 @@ impl Engine {
             // 使用策略實例 ID（而不是類型名稱）進行事件過濾
             // strategy_instance_ids 與 strategies Vec 順序對應
             let strategy_account_mapping = &self.strategy_account_mapping;
+            let mut delivery_feedback = Vec::new();
 
             for (strategy_idx, strategy) in self.strategies.iter_mut().enumerate() {
                 // 跳過已禁用的策略
@@ -2116,6 +2117,15 @@ impl Engine {
                     let mut envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
                     if let Some(account_id) = account_id {
                         envelope = envelope.with_account_id(account_id);
+                    }
+                    if envelope.intent.asset_class == hft_core::AssetClass::PredictionMarket
+                        && envelope.intent.product_type == hft_core::ProductType::PredictionMarket
+                    {
+                        delivery_feedback.push((
+                            strategy_idx,
+                            envelope.intent.clone(),
+                            envelope.client_order_id.clone(),
+                        ));
                     }
                     envelope
                 }));
@@ -2266,6 +2276,7 @@ impl Engine {
                 self.apply_intent_execution_limits(&mut envelope.lifecycle);
             }
             let price_protection_modes = &self.execution_price_protection;
+            let mut enqueued_ids = HashSet::new();
             if let Some(queues) = &mut self.execution_queues {
                 let mut dropped = 0usize;
                 for mut envelope in intents_to_send.drain(..) {
@@ -2301,6 +2312,7 @@ impl Engine {
                         .target_venue
                         .and_then(|venue| price_protection_modes.get(&venue).copied())
                         .unwrap_or_default();
+                    let client_order_id = envelope.client_order_id.clone();
                     if queues
                         .send_lifecycle_intent_with_price_protection(
                             envelope,
@@ -2311,6 +2323,8 @@ impl Engine {
                         .is_err()
                     {
                         dropped += 1;
+                    } else {
+                        enqueued_ids.insert(client_order_id);
                     }
                 }
                 if dropped > 0 {
@@ -2323,6 +2337,20 @@ impl Engine {
                 }
             } else {
                 intents_to_send.clear();
+            }
+            // Every captured proposal has one actual outcome across pricing,
+            // lifecycle, shared Risk, trading mode and queue admission. Only a
+            // successful queue send is submission; all other paths are known
+            // not submitted. No retry runs inside this notification.
+            for (strategy_index, intent, client_order_id) in delivery_feedback {
+                let outcome = if enqueued_ids.contains(&client_order_id) {
+                    ports::IntentSubmissionResult::Enqueued {
+                        client_order_id: &client_order_id,
+                    }
+                } else {
+                    ports::IntentSubmissionResult::NotSubmitted
+                };
+                self.strategies[strategy_index].observe_intent_submission(&intent, outcome);
             }
 
             // 將複用緩衝歸還給引擎，保留已擴容容量

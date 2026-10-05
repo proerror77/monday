@@ -368,14 +368,22 @@ impl StrategyLogic for ProbReversalStrategy {
                         book_hash: None,
                     }),
                 });
-                adapter
-                    .strategy
+                let binding = &adapter.binding;
+                let strategy = &mut adapter.strategy;
+                strategy
                     .on_market_event(&event, &self.last_account)
                     .into_iter()
                     .filter(|i| {
-                        !active_order_exists(&Arc::from(i.symbol.as_str()), orders)
+                        let accepted = !active_order_exists(&Arc::from(i.symbol.as_str()), orders)
                             && (i.side == Side::Sell
-                                || self.daily_entries < self.config.max_daily_trades)
+                                || self.daily_entries < self.config.max_daily_trades);
+                        if !accepted {
+                            strategy.observe_intent_submission(
+                                i,
+                                ports::IntentSubmissionResult::NotSubmitted,
+                            );
+                        }
+                        accepted
                     })
                     .map(|intent| {
                         let token = intent.symbol.as_str().to_owned();
@@ -403,7 +411,7 @@ impl StrategyLogic for ProbReversalStrategy {
                             return StrategyDecision::Exit(trading);
                         }
                         let price = intent.price.unwrap().0;
-                        let up = token == adapter.binding.up_token;
+                        let up = token == binding.up_token;
                         let probability = if up {
                             ask.to_f64().unwrap_or(0.0)
                         } else {
@@ -416,7 +424,7 @@ impl StrategyLogic for ProbReversalStrategy {
                                 event_id: Some(event_id.clone()),
                                 token_id: Some(token),
                                 intent_id: None,
-                                symbol: adapter.binding.underlying.clone(),
+                                symbol: binding.underlying.clone(),
                                 direction: if up { "UP".into() } else { "DOWN".into() },
                                 p_hat: probability,
                                 edge: probability

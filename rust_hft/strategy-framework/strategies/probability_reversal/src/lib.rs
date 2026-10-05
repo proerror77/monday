@@ -36,6 +36,10 @@ struct Pending {
     side: Side,
     filled_counted: bool,
 }
+struct PendingIntent {
+    side: Side,
+    queued_client_id: Option<String>,
+}
 pub struct ProbabilityReversalStrategy {
     config: ProbabilityStrategyConfig,
     thresholds: Thresholds,
@@ -43,7 +47,7 @@ pub struct ProbabilityReversalStrategy {
     quotes: HashMap<Symbol, Quote>,
     bound_books: HashSet<Symbol>,
     previous: HashMap<usize, f64>,
-    pending: HashMap<Symbol, Side>,
+    pending: HashMap<Symbol, PendingIntent>,
     orders: HashMap<OrderId, Pending>,
     retired: HashSet<usize>,
     day: Option<u64>,
@@ -115,7 +119,13 @@ impl ProbabilityReversalStrategy {
         if quantity <= Decimal::ZERO {
             return Vec::new();
         }
-        self.pending.insert(token.clone(), side);
+        self.pending.insert(
+            token.clone(),
+            PendingIntent {
+                side,
+                queued_client_id: None,
+            },
+        );
         debug_assert!(index < self.config.spec.episodes.len());
         vec![OrderIntent::prediction_market(
             token,
@@ -183,7 +193,6 @@ impl ProbabilityReversalStrategy {
             return self.intent(index, token.clone(), Side::Sell, bid, held);
         }
         if outcome == Outcome::Down {
-            self.previous.entry(index).or_insert(1.0 - probability);
             return Vec::new();
         }
         let previous = self.previous.insert(index, probability);
@@ -357,11 +366,20 @@ impl Strategy for ProbabilityReversalStrategy {
         match event {
             ExecutionEvent::OrderNew {
                 order_id,
+                client_order_id,
                 symbol,
                 side,
                 strategy_id,
                 ..
-            } if strategy_id == &self.config.name && self.pending.get(symbol) == Some(side) => {
+            } if strategy_id == &self.config.name
+                && self.pending.get(symbol).is_some_and(|pending| {
+                    pending.side == *side
+                        && pending
+                            .queued_client_id
+                            .as_ref()
+                            .is_none_or(|id| client_order_id.as_ref() == Some(id))
+                }) =>
+            {
                 self.orders.entry(order_id.clone()).or_insert(Pending {
                     symbol: symbol.clone(),
                     side: *side,
@@ -404,6 +422,12 @@ impl Strategy for ProbabilityReversalStrategy {
                         }
                     }
                     self.pending.remove(&order.symbol);
+                } else if matches!(event, ExecutionEvent::OrderReject { .. }) {
+                    // Existing worker pre-submission rejects use the original
+                    // envelope client ID as OrderId, without an OrderNew.
+                    self.pending.retain(|_, pending| {
+                        pending.queued_client_id.as_deref() != Some(order_id.0.as_str())
+                    });
                 }
             }
             _ => {}
@@ -412,6 +436,33 @@ impl Strategy for ProbabilityReversalStrategy {
     }
     fn observe_execution_state(&mut self, event: &ExecutionEvent, account: &AccountView) {
         self.on_execution_event(event, account);
+    }
+    fn observe_intent_submission(
+        &mut self,
+        intent: &OrderIntent,
+        result: ports::IntentSubmissionResult<'_>,
+    ) {
+        if intent.strategy_id != self.config.name {
+            return;
+        }
+        let Some(pending) = self
+            .pending
+            .get_mut(&intent.symbol)
+            .filter(|p| p.side == intent.side)
+        else {
+            return;
+        };
+        match result {
+            ports::IntentSubmissionResult::Enqueued { client_order_id } => {
+                if pending.queued_client_id.is_none() {
+                    pending.queued_client_id = Some(client_order_id.into());
+                }
+            }
+            ports::IntentSubmissionResult::NotSubmitted if pending.queued_client_id.is_none() => {
+                self.pending.remove(&intent.symbol);
+            }
+            ports::IntentSubmissionResult::NotSubmitted => {}
+        }
     }
     fn name(&self) -> &str {
         &self.config.name

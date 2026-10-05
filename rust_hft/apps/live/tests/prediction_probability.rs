@@ -198,6 +198,14 @@ async fn signed_paper_and_shadow_consume_exact_fixed_probability_config() {
             hft_core::AssetClass::PredictionMarket
         );
         assert_eq!(
+            admitted[0].account_id,
+            Some(hft_core::AccountId("paper-account".into()))
+        );
+        assert_eq!(
+            admitted[0].intent.target_venue,
+            Some(hft_core::VenueId::POLYMARKET)
+        );
+        assert_eq!(
             admitted[0].intent.quantity,
             hft_core::Quantity(Decimal::from(5))
         );
