@@ -139,7 +139,11 @@ ArtifactGateway/Writer 使用 HTTPS、无 redirect、大小有界的 scoped gate
 
 其 [Codex harness](https://github.com/alphaXiv/OpenResearch/blob/f4cec9f010a64fccf51cd4653ba548df2e5fb648/src/local/harness/codex.rs) / [本地 adapter](https://github.com/alphaXiv/OpenResearch/blob/f4cec9f010a64fccf51cd4653ba548df2e5fb648/src/local/codex.rs) 提示需要长驻 app-server child、initialize/initialized、thread start/resume、turn start/steer/interrupt 和双向审批。PG thread ID 不能替代 native CODEX_HOME 状态。`research::SessionSnapshot` 因此绑定 workspace、transcript、code commit 和 native-state manifest；`coding_agent::admit_resume` 拒绝缺失或摘要错误的 native state。
 
-`session::AppServer` 和 `research-session start CONFIG | resume CONFIG NATIVE_STATE` 提供实际 Rust stdio child transport。启动使用受信、固定身份的原生二进制，隔离 native home，清除继承环境；native home 和 host delivery directory 分别有 OS 独占锁。初始化、持久 thread、固定权限的 resume、turn start/interrupt、原 RPC 审批和受控 research 工具有界处理。接收器保留部分 frame，因此等待事件时被 timer/输入打断不会丢失协议字节。默认 read-only、无 shell/browser/app 工具和受限网络不构成云 Sandbox 隔离验收。
+`session::AppServer` 和 `research-session start CONFIG | resume CONFIG CHECKPOINT_SHA256 NATIVE_STATE` 提供实际 Rust stdio child transport。恢复前，host 从 PG 读取该 tenant 当前已登记的 SessionSnapshot。PG 保留 Session 行锁直到原生 child 准入完成；追加检查点必须等待该锁。host 核对 Session、experiment、capability policy、provider binary、thread 和原生 manifest 字节。随后，它在 native-home 和 delivery 独占锁内核对实际持久文件、代码工作区和通知防重记录，再启动 child。旧检查点保留为审计记录，不能恢复 host。检查点按 parent 链选择当前节点，不依赖时间戳排序。
+
+`checkpoint` 停止 child 后输出 schema 2 manifest。其 host 段绑定实际 Git HEAD、tracked 和非 ignored 源文件摘要、原生 transcript 摘要以及 delivery journal 清单。workspace 必须是 Git 源目录的根；Git 元数据和 ignored 缓存不属于代码检查点。通知 journal 缺失、变更或多出文件时，恢复会拒绝；不能因目录为空而盲重发。schema 1 保留为只读历史，不能启动恢复。
+
+Operator 仍需通过既有 `researchctl snapshot-session` 登记 SessionSnapshot。三个代码/工作区/transcript 字段必须等于 manifest 的 host 段；native-state 摘要绑定实际 manifest 文件字节。输出本地文件不等于 PG 登记成功。启动使用受信、固定身份的原生二进制，并清除继承环境。workspace、native home 和 host delivery directory 必须互不包含。初始化、持久 thread、固定权限的 resume、turn start/interrupt、原 RPC 审批和受控 research 工具有界处理。接收器保留部分 frame，因此等待事件时被 timer/输入打断不会丢失协议字节。默认 read-only、无 shell/browser/app 工具和受限网络不构成云 Sandbox 隔离验收。
 
 停止 child 后，在同一个锁下生成仅包含 thread rollout 和原生 state SQLite/WAL 的 manifest；身份文件、配置、私钥和工具 token 不进入快照。生成时每份字节只读取一次，内部复用结果；冷恢复作为独立消费者，在启动新 child 之前再核验所列文件。workspace 和 native home 使用既有持久挂载，远端 PVC、源码归档运输和跨存储恢复仍需部署验收。
 

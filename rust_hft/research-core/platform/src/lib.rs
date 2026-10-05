@@ -34,6 +34,8 @@ pub mod revocation;
 pub mod service;
 #[cfg(feature = "control")]
 pub mod session;
+#[cfg(feature = "native-admission")]
+pub mod terminal_audit;
 #[cfg(feature = "artifact-io")]
 pub mod worker_configuration;
 

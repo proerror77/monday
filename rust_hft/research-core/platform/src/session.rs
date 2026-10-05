@@ -52,12 +52,24 @@ fn private_directory(path: &Path) -> Result<()> {
 }
 
 fn file_digest(path: &Path) -> Result<(String, u64)> {
-    let meta = std::fs::symlink_metadata(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC)
+                .bits() as i32,
+        );
+    }
+    let mut file = options.open(path)?;
+    let meta = file.metadata()?;
     ensure!(
         meta.is_file() && meta.len() <= FILE_LIMIT,
         "unbounded or aliased session file"
     );
-    let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut total = 0u64;
     let mut buffer = [0; 64 * 1024];
@@ -140,6 +152,49 @@ mod tests {
         );
         let workspace = root.join("workspace");
         std::fs::create_dir(&workspace)?;
+        ensure!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&workspace)
+                .status()?
+                .success(),
+            "fixture Git init failed"
+        );
+        std::fs::write(
+            workspace.join(".gitignore"),
+            "disconnect\noversize\nfragment*\n",
+        )?;
+        ensure!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workspace)
+                .args(["add", ".gitignore"])
+                .status()?
+                .success(),
+            "fixture Git add failed"
+        );
+        ensure!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workspace)
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture"
+                ])
+                .status()?
+                .success(),
+            "fixture Git commit failed"
+        );
         let config = SessionConfig {
             executable_sha256: file_digest(&executable)?.0,
             executable,
@@ -213,6 +268,143 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn registered_resume_checks_native_bytes_and_provider_before_starting_child() -> Result<()>
+    {
+        let (_temp, config) = fixture()?;
+        let mut server = AppServer::start(config.clone()).await?;
+        server.open_thread(None).await?;
+        let native = server.checkpoint().await?;
+        let bytes = serde_json::to_vec(&native)?;
+        for extra in ["sessions/extra.jsonl", "state_9.sqlite"] {
+            let path = config.native_home.join(extra);
+            std::fs::write(&path, "unrecorded native state")?;
+            assert!(native
+                .verify(
+                    &config.native_home,
+                    &config.executable_sha256,
+                    &native.thread_id
+                )
+                .is_err());
+            std::fs::remove_file(path)?;
+        }
+        let session = crate::research::Session {
+            schema: 1,
+            experiment_sha256: "a".repeat(64),
+            provider: crate::research::CodingAgent::CodexAppServer,
+            provider_version: crate::coding_agent::SCHEMA_VERSION.into(),
+            provider_thread_id: native.thread_id.clone(),
+            provider_binary_sha256: config.executable_sha256.clone(),
+            capability_policy_receipt_sha256: "b".repeat(64),
+        };
+        let mut snapshot = crate::research::SessionSnapshot {
+            session_sha256: session.id()?,
+            parent_snapshot_sha256: None,
+            code_commit: native.host.as_ref().unwrap().code_commit.clone(),
+            workspace_manifest_sha256: native
+                .host
+                .as_ref()
+                .unwrap()
+                .workspace_manifest_sha256
+                .clone(),
+            transcript_manifest_sha256: native
+                .host
+                .as_ref()
+                .unwrap()
+                .transcript_manifest_sha256
+                .clone(),
+            native_state_manifest_sha256: sha256(&bytes),
+        };
+        let id = snapshot.id()?;
+        assert!(
+            AppServer::resume_checkpoint(config.clone(), &session, &snapshot, &id, b"changed")
+                .await
+                .is_err()
+        );
+        let mut foreign = session.clone();
+        foreign.provider_thread_id = "another-thread".into();
+        snapshot.session_sha256 = foreign.id()?;
+        assert!(AppServer::resume_checkpoint(
+            config.clone(),
+            &foreign,
+            &snapshot,
+            &snapshot.id()?,
+            &bytes
+        )
+        .await
+        .is_err());
+        foreign = session.clone();
+        foreign.provider_binary_sha256 = "f".repeat(64);
+        snapshot.session_sha256 = foreign.id()?;
+        assert!(AppServer::resume_checkpoint(
+            config.clone(),
+            &foreign,
+            &snapshot,
+            &snapshot.id()?,
+            &bytes
+        )
+        .await
+        .is_err());
+        snapshot.session_sha256 = session.id()?;
+        let mut changed = config.clone();
+        changed.workspace = config
+            .workspace
+            .parent()
+            .unwrap()
+            .join("different-workspace");
+        std::fs::create_dir(&changed.workspace)?;
+        assert!(
+            AppServer::resume_checkpoint(changed, &session, &snapshot, &id, &bytes)
+                .await
+                .is_err()
+        );
+        let source = config.workspace.join("extra-source.rs");
+        std::fs::write(&source, "changed source")?;
+        assert!(
+            AppServer::resume_checkpoint(config.clone(), &session, &snapshot, &id, &bytes)
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(source)?;
+        let mut wrong = snapshot.clone();
+        wrong.transcript_manifest_sha256 = "f".repeat(64);
+        assert!(AppServer::resume_checkpoint(
+            config.clone(),
+            &session,
+            &wrong,
+            &wrong.id()?,
+            &bytes
+        )
+        .await
+        .is_err());
+        let resumed =
+            AppServer::resume_checkpoint(config, &session, &snapshot, &id, &bytes).await?;
+        assert_eq!(resumed.thread_id(), Some(native.thread_id.as_str()));
+        resumed.close().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn host_delivery_directory_cannot_overlap_native_provider_state() -> Result<()> {
+        let (_temp, config) = fixture()?;
+        for (native_home, delivery_directory) in [
+            (config.native_home.clone(), config.native_home.clone()),
+            (
+                config.native_home.clone(),
+                config.native_home.join("delivery"),
+            ),
+            (
+                config.delivery_directory.join("native"),
+                config.delivery_directory.clone(),
+            ),
+        ] {
+            let mut overlapping = config.clone();
+            overlapping.native_home = native_home;
+            overlapping.delivery_directory = delivery_directory;
+            assert!(AppServer::start(overlapping).await.is_err());
+        }
+        AppServer::start(config).await?.close().await?;
+        Ok(())
+    }
+    #[tokio::test]
     async fn disconnected_delivery_stays_unknown_until_native_readback() -> Result<()> {
         let (_temp, config) = fixture()?;
         std::fs::write(config.workspace.join("disconnect"), "")?;
@@ -224,6 +416,13 @@ mod tests {
             read_json(&config.delivery_directory.join(format!("{intent}.json")))?;
         assert_eq!(record.delivery, Delivery::Unknown);
         let native = server.checkpoint().await?;
+        let mut changed = config.clone();
+        changed.delivery_directory = config
+            .delivery_directory
+            .parent()
+            .unwrap()
+            .join("empty-delivery");
+        assert!(AppServer::resume(changed, &native).await.is_err());
         std::fs::remove_file(config.workspace.join("disconnect"))?;
         let mut server = AppServer::resume(config, &native).await?;
         assert!(server.send_message(&intent, "completion").await.is_err());
@@ -432,6 +631,237 @@ pub struct NativeState {
     pub provider_binary_sha256: String,
     pub thread_id: String,
     pub files: Vec<NativeFile>,
+    /// Schema 1 remains readable historical evidence. A new resume requires
+    /// schema 2 and the independently persisted host checkpoint below.
+    #[serde(default)]
+    pub host: Option<HostState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostState {
+    pub code_commit: String,
+    pub workspace_manifest_sha256: String,
+    pub transcript_manifest_sha256: String,
+    pub delivery_files: Vec<NativeFile>,
+}
+
+fn git_read(workspace: &Path, arguments: &[&str], limit: u64) -> Result<Vec<u8>> {
+    let mut child = std::process::Command::new("git")
+        .args(["--no-optional-locks", "-C"])
+        .arg(workspace)
+        .args(arguments)
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut bytes = Vec::new();
+    child
+        .stdout
+        .take()
+        .context("Git readback missing")?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("workspace Git readback exceeds bound");
+    }
+    ensure!(child.wait()?.success(), "workspace Git readback failed");
+    Ok(bytes)
+}
+
+fn workspace_state(workspace: &Path) -> Result<(String, String)> {
+    let root = String::from_utf8(git_read(
+        workspace,
+        &["rev-parse", "--show-toplevel"],
+        4096,
+    )?)?;
+    ensure!(
+        Path::new(root.trim()).canonicalize()? == workspace,
+        "Session workspace must be the Git source root"
+    );
+    let head = || -> Result<String> {
+        let value = String::from_utf8(git_read(
+            workspace,
+            &["rev-parse", "--verify", "HEAD"],
+            128,
+        )?)?
+        .trim()
+        .to_owned();
+        ensure!(
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+            "invalid workspace Git commit"
+        );
+        Ok(value)
+    };
+    let commit = head()?;
+    // Git source files include tracked and non-ignored untracked changes.
+    // Git metadata and ignored caches are not a source checkpoint.
+    let paths = git_read(
+        workspace,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        8 * 1024 * 1024,
+    )?;
+    let mut names: Vec<String> = paths
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8(p.to_vec()))
+        .collect::<std::result::Result<_, _>>()?;
+    names.sort();
+    names.dedup();
+    ensure!(
+        names.len() <= 32768,
+        "workspace source file count exceeds bound"
+    );
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for name in names {
+        ensure!(
+            !Path::new(&name).is_absolute()
+                && Path::new(&name)
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))),
+            "unsafe workspace source path"
+        );
+        let path = workspace.join(&name);
+        ensure!(
+            path.canonicalize()?.starts_with(workspace)
+                && !std::fs::symlink_metadata(&path)?.is_symlink(),
+            "aliased workspace source file"
+        );
+        let (sha256, bytes) = file_digest(&path)?;
+        total = total
+            .checked_add(bytes)
+            .context("workspace source size overflow")?;
+        ensure!(
+            total <= 512 * 1024 * 1024,
+            "workspace source size exceeds bound"
+        );
+        files.push(NativeFile {
+            path: name,
+            sha256,
+            bytes,
+        });
+    }
+    ensure!(
+        head()? == commit,
+        "workspace Git commit changed during checkpoint"
+    );
+    let digest = identity(&("monday.session_workspace.v1", &commit, files))?;
+    Ok((commit, digest))
+}
+
+fn delivery_files(directory: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .context("delivery file name")?
+            .to_str()
+            .context("invalid delivery name")?;
+        if name == ".monday-delivery.lock" || (name.starts_with('.') && name.ends_with(".pending"))
+        {
+            continue;
+        }
+        ensure!(
+            name.strip_suffix(".json").is_some_and(valid_digest)
+                && files.len() < 2048
+                && std::fs::symlink_metadata(&path)?.is_file(),
+            "invalid or excessive delivery ledger files"
+        );
+        files.push((name.into(), path));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+fn capture_files(files: Vec<(String, PathBuf)>) -> Result<Vec<NativeFile>> {
+    files
+        .into_iter()
+        .map(|(path, file)| {
+            let (sha256, bytes) = file_digest(&file)?;
+            Ok(NativeFile {
+                path,
+                sha256,
+                bytes,
+            })
+        })
+        .collect()
+}
+
+fn verify_files(root: &Path, files: Vec<(String, PathBuf)>, expected: &[NativeFile]) -> Result<()> {
+    ensure!(
+        files.len() == expected.len()
+            && files
+                .iter()
+                .zip(expected)
+                .all(|((name, _), entry)| name == &entry.path),
+        "checkpoint file inventory changed"
+    );
+    for ((_, path), entry) in files.into_iter().zip(expected) {
+        ensure!(
+            path.canonicalize()?.starts_with(root),
+            "checkpoint file escaped its volume"
+        );
+        let (digest, bytes) = file_digest(&path)?;
+        ensure!(
+            digest == entry.sha256 && bytes == entry.bytes,
+            "checkpoint file missing or changed"
+        );
+    }
+    Ok(())
+}
+
+impl HostState {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.code_commit.len() == 40
+                && self
+                    .code_commit
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                && valid_digest(&self.workspace_manifest_sha256)
+                && valid_digest(&self.transcript_manifest_sha256)
+                && self.delivery_files.len() <= 2048
+                && self
+                    .delivery_files
+                    .windows(2)
+                    .all(|p| p[0].path < p[1].path),
+            "invalid host checkpoint"
+        );
+        let mut bytes = 0u64;
+        for file in &self.delivery_files {
+            ensure!(
+                file.path.strip_suffix(".json").is_some_and(valid_digest)
+                    && valid_digest(&file.sha256)
+                    && file.bytes <= FRAME_LIMIT as u64,
+                "invalid delivery checkpoint"
+            );
+            bytes = bytes
+                .checked_add(file.bytes)
+                .context("delivery checkpoint size overflow")?;
+            ensure!(
+                bytes <= 16 * 1024 * 1024,
+                "delivery checkpoint exceeds bound"
+            );
+        }
+        Ok(())
+    }
 }
 
 fn native_path(path: &str) -> bool {
@@ -447,10 +877,62 @@ fn native_path(path: &str) -> bool {
                     || path.ends_with(".sqlite-shm"))))
 }
 
+fn native_files(home: &Path) -> Result<Vec<(String, PathBuf)>> {
+    fn collect(
+        home: &Path,
+        path: &Path,
+        visited: &mut usize,
+        files: &mut Vec<(String, PathBuf)>,
+    ) -> Result<()> {
+        *visited += 1;
+        ensure!(*visited <= 8192, "native state inventory exceeds bound");
+        let metadata = std::fs::symlink_metadata(path)?;
+        ensure!(!metadata.is_symlink(), "native state contains a symlink");
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                collect(home, &entry?.path(), visited, files)?;
+            }
+        } else {
+            let relative = path
+                .strip_prefix(home)?
+                .to_str()
+                .context("invalid native path")?;
+            if native_path(relative) {
+                ensure!(
+                    metadata.is_file() && files.len() < 2048,
+                    "invalid or excessive native state files"
+                );
+                files.push((relative.into(), path.into()));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    let mut visited = 0;
+    let sessions = home.join("sessions");
+    if sessions.try_exists()? {
+        collect(home, &sessions, &mut visited, &mut files)?;
+    }
+    for entry in std::fs::read_dir(home)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .context("native file name")?
+            .to_str()
+            .context("invalid native name")?;
+        if native_path(name) {
+            collect(home, &path, &mut visited, &mut files)?;
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
 impl NativeState {
     fn validate(&self, expected_binary: &str, expected_thread: &str) -> Result<String> {
         ensure!(
-            self.schema == 1
+            ((self.schema == 1 && self.host.is_none())
+                || (self.schema == 2 && self.host.is_some()))
                 && self.provider_binary_sha256 == expected_binary
                 && valid_digest(expected_binary)
                 && self.thread_id == expected_thread
@@ -478,7 +960,47 @@ impl NativeState {
             rollout |= entry.path.starts_with("sessions/") && entry.path.contains(expected_thread);
         }
         ensure!(rollout, "native thread rollout missing");
+        if let Some(host) = &self.host {
+            host.validate()?;
+            ensure!(
+                host.transcript_manifest_sha256 == self.transcript_manifest_sha256()?,
+                "native transcript checkpoint changed"
+            );
+        }
+        ensure!(
+            serde_json::to_vec(self)?.len() <= FRAME_LIMIT,
+            "native manifest exceeds bound"
+        );
         identity(self)
+    }
+    pub fn transcript_manifest_sha256(&self) -> Result<String> {
+        identity(&(
+            "monday.session_transcript.v1",
+            self.files
+                .iter()
+                .filter(|f| f.path.starts_with("sessions/"))
+                .collect::<Vec<_>>(),
+        ))
+    }
+    fn verify_host(&self, config: &SessionConfig) -> Result<()> {
+        let host = self
+            .host
+            .as_ref()
+            .context("resume requires a persisted host checkpoint")?;
+        ensure!(
+            self.schema == 2,
+            "historical native-only state cannot resume a host"
+        );
+        let (commit, digest) = workspace_state(&config.workspace)?;
+        ensure!(
+            commit == host.code_commit && digest == host.workspace_manifest_sha256,
+            "workspace code checkpoint changed"
+        );
+        verify_files(
+            &config.delivery_directory,
+            delivery_files(&config.delivery_directory)?,
+            &host.delivery_files,
+        )
     }
     /// An independent consumer reads each file once before starting a new child.
     pub fn verify(
@@ -489,18 +1011,7 @@ impl NativeState {
     ) -> Result<String> {
         let id = self.validate(expected_binary, expected_thread)?;
         let canonical_home = home.canonicalize()?;
-        for entry in &self.files {
-            let path = home.join(&entry.path);
-            ensure!(
-                path.canonicalize()?.starts_with(&canonical_home),
-                "native state escaped its volume"
-            );
-            let (digest, bytes) = file_digest(&path)?;
-            ensure!(
-                digest == entry.sha256 && bytes == entry.bytes,
-                "native state missing or changed"
-            );
-        }
+        verify_files(&canonical_home, native_files(home)?, &self.files)?;
         Ok(id)
     }
 }
@@ -591,6 +1102,35 @@ impl AppServer {
         client.open_thread(Some(&native.thread_id)).await?;
         Ok(client)
     }
+    /// The host supplies a checkpoint read from the tenant-scoped PG ledger.
+    /// Verify its exact native manifest before starting the provider child.
+    pub(crate) async fn resume_checkpoint(
+        config: SessionConfig,
+        session: &crate::research::Session,
+        snapshot: &crate::research::SessionSnapshot,
+        checkpoint: &str,
+        native_manifest: &[u8],
+    ) -> Result<Self> {
+        crate::coding_agent::admit_resume(snapshot, checkpoint, Some(native_manifest))?;
+        let native: NativeState = serde_json::from_slice(native_manifest)?;
+        let host = native
+            .host
+            .as_ref()
+            .context("registered resume requires complete host state")?;
+        ensure!(
+            snapshot.session_sha256 == session.id()?
+                && snapshot.code_commit == host.code_commit
+                && snapshot.workspace_manifest_sha256 == host.workspace_manifest_sha256
+                && snapshot.transcript_manifest_sha256 == host.transcript_manifest_sha256
+                && session.provider == crate::research::CodingAgent::CodexAppServer
+                && session.provider_version == crate::coding_agent::SCHEMA_VERSION
+                && session.provider_binary_sha256 == config.executable_sha256
+                && native.provider_binary_sha256 == session.provider_binary_sha256
+                && native.thread_id == session.provider_thread_id,
+            "checkpoint belongs to another provider session"
+        );
+        Self::resume(config, &native).await
+    }
     async fn launch(config: SessionConfig, native: Option<&NativeState>) -> Result<Self> {
         ensure!(
             config.executable.is_absolute()
@@ -616,8 +1156,10 @@ impl AppServer {
             !config.native_home.starts_with(&config.workspace)
                 && !config.workspace.starts_with(&config.native_home)
                 && !config.delivery_directory.starts_with(&config.workspace)
-                && !config.workspace.starts_with(&config.delivery_directory),
-            "state and host delivery records must be outside the workspace"
+                && !config.workspace.starts_with(&config.delivery_directory)
+                && !config.delivery_directory.starts_with(&config.native_home)
+                && !config.native_home.starts_with(&config.delivery_directory),
+            "workspace, native state and host delivery records must have separate directories"
         );
         private_directory(&config.native_home)?;
         private_directory(&config.delivery_directory)?;
@@ -649,6 +1191,7 @@ impl AppServer {
         // Check stopped-state bytes before the new child opens SQLite/WAL.
         let verified_resume = native
             .map(|state| {
+                state.verify_host(&config)?;
                 state.verify(
                     &config.native_home,
                     &config.executable_sha256,
@@ -1118,56 +1661,21 @@ impl AppServer {
     pub async fn checkpoint(mut self) -> Result<NativeState> {
         let thread = self.thread_id.clone().context("thread not opened")?;
         self.stop_child().await?;
-        fn collect(root: &Path, path: &Path, entries: &mut Vec<NativeFile>) -> Result<()> {
-            ensure!(
-                entries.len() < 2048,
-                "native state file count exceeds bound"
-            );
-            let metadata = std::fs::symlink_metadata(path)?;
-            ensure!(!metadata.is_symlink(), "native state contains a symlink");
-            if metadata.is_dir() {
-                for entry in std::fs::read_dir(path)? {
-                    collect(root, &entry?.path(), entries)?;
-                }
-            } else {
-                let relative = path
-                    .strip_prefix(root)?
-                    .to_str()
-                    .context("invalid native path")?;
-                if native_path(relative) {
-                    let (sha256, bytes) = file_digest(path)?;
-                    entries.push(NativeFile {
-                        path: relative.into(),
-                        sha256,
-                        bytes,
-                    });
-                }
-            }
-            Ok(())
-        }
-        let mut files = Vec::new();
-        let sessions = self.config.native_home.join("sessions");
-        if sessions.exists() {
-            collect(&self.config.native_home, &sessions, &mut files)?;
-        }
-        for entry in std::fs::read_dir(&self.config.native_home)? {
-            let path = entry?.path();
-            let name = path
-                .file_name()
-                .context("native file name")?
-                .to_str()
-                .context("invalid native name")?;
-            if native_path(name) {
-                collect(&self.config.native_home, &path, &mut files)?;
-            }
-        }
-        files.sort_by(|a, b| a.path.cmp(&b.path));
-        let native = NativeState {
-            schema: 1,
+        let files = capture_files(native_files(&self.config.native_home)?)?;
+        let (code_commit, workspace_manifest_sha256) = workspace_state(&self.config.workspace)?;
+        let mut native = NativeState {
+            schema: 2,
             provider_binary_sha256: self.config.executable_sha256.clone(),
             thread_id: thread,
             files,
+            host: None,
         };
+        native.host = Some(HostState {
+            code_commit,
+            workspace_manifest_sha256,
+            transcript_manifest_sha256: native.transcript_manifest_sha256()?,
+            delivery_files: capture_files(delivery_files(&self.config.delivery_directory)?)?,
+        });
         // File bytes were hashed during capture under this stopped-writer lock.
         // Validate the assembled manifest without rereading those same bytes.
         native.validate(&self.config.executable_sha256, &native.thread_id)?;
