@@ -757,7 +757,7 @@ if [[ $collector == true ]]; then control=true; fi
 if [[ $toolchain == true ]]; then select_job ci/rust; fi
 if [[ $collector == true ]]; then select_job ci/polymarket-evidence-compiler-image; fi
 select_job_if_affected ci/deployment-artifacts hft-live
-select_job_if_affected ci/rust-hft-engine-fast-lane hft-engine
+select_job_if_affected ci/rust-hft-engine-fast-lane hft-engine hft-binance-depth
 
 prediction_package_affected=false
 for ((index = 0; index < ${#package_names[@]}; index++)); do

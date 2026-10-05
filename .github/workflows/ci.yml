@@ -902,7 +902,7 @@ jobs:
 
       - name: Test Binance MD fast lane
         run: |
-          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-engine --locked binance_md
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-binance-depth --locked --lib
 
       - name: Enforce quote-to-worker latency budgets
         run: |
