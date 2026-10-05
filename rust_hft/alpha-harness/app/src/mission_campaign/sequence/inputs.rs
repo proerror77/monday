@@ -225,7 +225,7 @@ impl SequenceCampaignInputs {
         {
             bail!("invalid SOL sequence input identity");
         }
-        crate::prediction_dispatch::validate_dns_label("sequence input PVC", &self.pvc_name)?;
+        hft_research_dispatch_io::validate_dns_label("sequence input PVC", &self.pvc_name)?;
         if !self.producer_image.contains("@sha256:")
             || !valid_sha256(
                 self.producer_image
