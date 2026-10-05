@@ -26,6 +26,11 @@ if [[ -z $job_id && $mode != create ]]; then job_id=$(jq -er '.workflow_job_id' 
 [[ $job_id =~ ^[1-9][0-9]*$ ]] || { echo 'missing producer job' >&2; exit 1; }
 locks=$("$script_dir/research-workspace-locks.sh" "$repo_root")
 recipes=$(bash "$script_dir/research-release-products.sh" recipes "$product" | jq -s .)
+workspace_profiles='{}'
+while IFS= read -r owner; do
+  digest=$(sha256sum "$repo_root/$owner" | awk '{print $1}')
+  workspace_profiles=$(jq -c --arg owner "$owner" --arg digest "$digest" '. + {($owner):$digest}' <<<"$workspace_profiles")
+done < <(jq -r '.workspaces[].manifest' "$repo_root/workspaces.json")
 
 case "$mode" in
   create)
@@ -38,7 +43,7 @@ case "$mode" in
         '. + [{file:$file,sha256:$sha256}]' <<<"$binary_manifest")
     done
     : "${MONDAY_BUILD_INPUTS_FILE:?compiler/native build inputs required}"
-    jq -e --argjson recipes "$recipes" --argjson locks "$locks" ' .schema == "monday.compilation-inputs.v3" and .target == "x86_64-unknown-linux-gnu" and .locks == $locks and (.builder_image|test("@sha256:[0-9a-f]{64}$")) and .recipes == $recipes and (.workspace_profiles|length)>0 ' "$MONDAY_BUILD_INPUTS_FILE" >/dev/null
+    jq -e --argjson recipes "$recipes" --argjson locks "$locks" --argjson workspace_profiles "$workspace_profiles" ' .schema == "monday.compilation-inputs.v3" and .target == "x86_64-unknown-linux-gnu" and .locks == $locks and (.builder_image|test("@sha256:[0-9a-f]{64}$")) and .recipes == $recipes and .workspace_profiles == $workspace_profiles ' "$MONDAY_BUILD_INPUTS_FILE" >/dev/null
     jq -n \
       --slurpfile build_inputs "$MONDAY_BUILD_INPUTS_FILE" \
       --arg source_sha "$source_sha" \
@@ -75,6 +80,7 @@ case "$mode" in
       --argjson binary_count "${#binaries[@]}" \
       --argjson locks "$locks" \
       --argjson recipes "$recipes" \
+      --argjson workspace_profiles "$workspace_profiles" \
       '.schema == "monday.research-image-release.v6" and
        .products == ($product | split(",")) and
        .source_sha == $source_sha and
@@ -85,7 +91,7 @@ case "$mode" in
        (.build_inputs | .schema == "monday.compilation-inputs.v3" and .target == $target and .profile == "release" and ([.compiler,.native,.flags,.profiles,.recipe] + [.locks[]] | all(.[];test("^[0-9a-f]{64}$")))) and
        (.build_inputs.builder_image|test("@sha256:[0-9a-f]{64}$")) and
        (.build_inputs.recipes == $recipes) and
-       (.build_inputs.workspace_profiles|length)>0 and
+       (.build_inputs.workspace_profiles == $workspace_profiles) and
        .build_inputs.locks == $locks and .cargo_locks == $locks and
        (.binaries | length) == $binary_count' "$manifest" >/dev/null
     for binary in "${binaries[@]}"; do

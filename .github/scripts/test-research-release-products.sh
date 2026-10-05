@@ -45,8 +45,9 @@ bash "$root/.github/scripts/research-release-products.sh" recipes controller >"$
 jq -s -e 'length==2 and any(.[]; .package=="alpha-harness") and any(.[]; .package=="hft-collector") and
   all(.[]; .package!="hft-backtest" and .package!="ploy-research" and .package!="hft-research-platform")' "$work/recipes" >/dev/null
 locks=$(bash "$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
-jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" --argjson recipes "$(jq -s . "$work/recipes")" \
-  '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks,builder_image:("builder@sha256:"+$h),recipes:$recipes,workspace_profiles:{"research-core/Cargo.toml":$h}}' >"$MONDAY_BUILD_INPUTS_FILE"
+workspace_profiles=$(ruby -rjson -rdigest -e 'root=ARGV[0]; puts JSON.generate(JSON.parse(File.read("#{root}/workspaces.json")).fetch("workspaces").to_h{|owner| manifest=owner.fetch("manifest"); [manifest,Digest::SHA256.file("#{root}/#{manifest}").hexdigest]})' "$root/rust_hft")
+jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" --argjson workspace_profiles "$workspace_profiles" --argjson recipes "$(jq -s . "$work/recipes")" \
+  '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks,builder_image:("builder@sha256:"+$h),recipes:$recipes,workspace_profiles:$workspace_profiles}' >"$MONDAY_BUILD_INPUTS_FILE"
 bash "$root/.github/scripts/research-image-release-artifact.sh" create "$work/controller" "$sha" 42 "$root/rust_hft" 2 7 controller
 ruby "$root/.github/scripts/research-release-bundle.rb" pack "$work/controller.tar" "$work/controller" controller
 ruby "$root/.github/scripts/research-release-bundle.rb" unpack "$work/controller.tar" "$work/roundtrip" controller

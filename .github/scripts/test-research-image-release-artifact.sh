@@ -167,10 +167,12 @@ cp "$root/rust_hft/workspaces.json" "$repo/workspaces.json"
 while IFS= read -r manifest; do
   directory=${manifest%/Cargo.toml}; mkdir -p "$repo/$directory"
   cp "$root/rust_hft/$directory/Cargo.lock" "$repo/$directory/Cargo.lock"
+  cp "$root/rust_hft/$manifest" "$repo/$manifest"
 done < <(jq -r '.workspaces[].manifest' "$repo/workspaces.json")
 export MONDAY_BUILD_INPUTS_FILE="$tmp_dir/build-inputs.json"
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$repo")
-jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" --argjson recipes "$(bash "$script_dir/research-release-products.sh" recipes all | jq -s .)" '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks,builder_image:("builder@sha256:"+$h),recipes:$recipes,workspace_profiles:{"research-core/Cargo.toml":$h}}' >"$MONDAY_BUILD_INPUTS_FILE"
+workspace_profiles=$(ruby -rjson -rdigest -e 'root=ARGV[0]; puts JSON.generate(JSON.parse(File.read("#{root}/workspaces.json")).fetch("workspaces").to_h{|owner| manifest=owner.fetch("manifest"); [manifest,Digest::SHA256.file("#{root}/#{manifest}").hexdigest]})' "$repo")
+jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" --argjson workspace_profiles "$workspace_profiles" --argjson recipes "$(bash "$script_dir/research-release-products.sh" recipes all | jq -s .)" '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks,builder_image:("builder@sha256:"+$h),recipes:$recipes,workspace_profiles:$workspace_profiles}' >"$MONDAY_BUILD_INPUTS_FILE"
 "$artifact" create "$release" "$main_sha" 1234 "$repo"
 "$artifact" verify "$release" "$main_sha" 1234 "$repo"
 
@@ -227,6 +229,8 @@ assert_rejected() {
     digest) printf 'tampered\n' >>"$candidate/research-bin/alpha-harness" ;;
     recipe-mismatch) jq '.build_inputs.recipes[0].features="unbuilt-feature"' "$candidate/research-image-release.json" >"$candidate/changed.json"; mv "$candidate/changed.json" "$candidate/research-image-release.json" ;;
     builder-mismatch) jq '.build_inputs.builder_image="builder:latest"' "$candidate/research-image-release.json" >"$candidate/changed.json"; mv "$candidate/changed.json" "$candidate/research-image-release.json" ;;
+    profile-mismatch) jq '.build_inputs.workspace_profiles["research-core/Cargo.toml"]=("b"*64)' "$candidate/research-image-release.json" >"$candidate/changed.json"; mv "$candidate/changed.json" "$candidate/research-image-release.json" ;;
+    profile-missing) jq 'del(.build_inputs.workspace_profiles["data-pipelines/Cargo.toml"])' "$candidate/research-image-release.json" >"$candidate/changed.json"; mv "$candidate/changed.json" "$candidate/research-image-release.json" ;;
     source-mismatch|run-mismatch|lock-mismatch) ;;
   esac
   if "$artifact" verify "$candidate" "$expected_sha" "$expected_run" "$repo"; then
@@ -242,6 +246,8 @@ assert_rejected source-mismatch "$other_sha"
 assert_rejected run-mismatch "$main_sha" 9999
 assert_rejected recipe-mismatch
 assert_rejected builder-mismatch
+assert_rejected profile-mismatch
+assert_rejected profile-missing
 printf 'changed lock\n' >>"$repo/research-core/platform/Cargo.lock"
 assert_rejected lock-mismatch
 
