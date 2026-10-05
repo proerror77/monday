@@ -166,6 +166,14 @@ pub struct Gateway {
     _lock: File,
     uploads: tokio::sync::Mutex<()>,
 }
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        // Release the open-description lock before close. A concurrent unrelated
+        // fork can briefly hold a duplicate until exec applies CLOEXEC.
+        let _ = self._lock.unlock();
+    }
+}
+
 impl Gateway {
     pub fn new(config: GatewayConfig, ledger: Ledger) -> Result<Self> {
         let bind: SocketAddr = config.bind.parse()?;
