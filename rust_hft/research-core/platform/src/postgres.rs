@@ -114,6 +114,39 @@ pub struct LockedTask {
     pub now_ms: i64,
 }
 
+/// Retains the registered Session row lock until the native child is admitted.
+/// Snapshot registration takes the conflicting row lock before appending a tip.
+pub struct LockedSessionCheckpoint {
+    tx: Transaction<'static, Postgres>,
+    checkpoint: String,
+    session: crate::research::Session,
+    snapshot: crate::research::SessionSnapshot,
+}
+impl LockedSessionCheckpoint {
+    pub fn session(&self) -> &crate::research::Session {
+        &self.session
+    }
+    pub fn snapshot(&self) -> &crate::research::SessionSnapshot {
+        &self.snapshot
+    }
+    pub async fn resume(
+        self,
+        config: crate::session::SessionConfig,
+        native_manifest: &[u8],
+    ) -> Result<crate::session::AppServer> {
+        let server = crate::session::AppServer::resume_checkpoint(
+            config,
+            &self.session,
+            &self.snapshot,
+            &self.checkpoint,
+            native_manifest,
+        )
+        .await?;
+        self.tx.commit().await?;
+        Ok(server)
+    }
+}
+
 async fn clock(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
     Ok(
         query_scalar::<_, i64>(
@@ -668,7 +701,12 @@ impl Ledger {
         let mut tx = self.pool.begin().await?;
         Self::authority(&mut tx, false).await?;
         let _:Value=query_scalar("SELECT document FROM research.sessions WHERE session_sha256=$1 AND tenant=$2 FOR UPDATE").bind(&snapshot.session_sha256).bind(tenant).fetch_one(&mut *tx).await?;
-        let prior:Option<String>=query_scalar("SELECT snapshot_sha256 FROM research.session_snapshots WHERE session_sha256=$1 ORDER BY recorded_at DESC,snapshot_sha256 DESC LIMIT 1").bind(&snapshot.session_sha256).fetch_optional(&mut *tx).await?;
+        let tips:Vec<String>=query_scalar("SELECT p.snapshot_sha256 FROM research.session_snapshots p WHERE p.session_sha256=$1 AND NOT EXISTS(SELECT 1 FROM research.session_snapshots child WHERE child.parent_snapshot_sha256=p.snapshot_sha256)").bind(&snapshot.session_sha256).fetch_all(&mut *tx).await?;
+        ensure!(
+            tips.len() <= 1,
+            "session checkpoint history has multiple tips"
+        );
+        let prior = tips.into_iter().next();
         if prior.as_ref() == Some(&id) {
             return Ok(id);
         };
@@ -679,6 +717,40 @@ impl Ledger {
         query("INSERT INTO research.session_snapshots(snapshot_sha256,session_sha256,parent_snapshot_sha256,document) VALUES($1,$2,$3,$4)").bind(&id).bind(&snapshot.session_sha256).bind(&snapshot.parent_snapshot_sha256).bind(serde_json::to_value(snapshot)?).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(id)
+    }
+    /// Read the current registered checkpoint and its tenant-owned Session.
+    /// Historical checkpoints remain audit records; they cannot resume a host.
+    pub async fn session_checkpoint_for_resume(
+        &self,
+        tenant: &str,
+        checkpoint: &str,
+    ) -> Result<LockedSessionCheckpoint> {
+        ensure!(
+            crate::valid_digest(checkpoint),
+            "invalid session checkpoint identity"
+        );
+        let mut tx = self.pool.begin().await?;
+        let session_id: String = query_scalar("SELECT s.session_sha256 FROM research.session_snapshots p JOIN research.sessions s USING(session_sha256) WHERE p.snapshot_sha256=$1 AND s.tenant=$2")
+            .bind(checkpoint).bind(tenant).fetch_one(&mut *tx).await?;
+        let _: Value = query_scalar("SELECT document FROM research.sessions WHERE session_sha256=$1 AND tenant=$2 FOR SHARE")
+            .bind(&session_id).bind(tenant).fetch_one(&mut *tx).await?;
+        let (session_id, session, snapshot): (String, Value, Value) = sqlx_core::query_as::query_as(
+            "SELECT s.session_sha256,s.document,p.document FROM research.session_snapshots p JOIN research.sessions s USING(session_sha256) WHERE p.snapshot_sha256=$1 AND s.tenant=$2 AND NOT EXISTS(SELECT 1 FROM research.session_snapshots child WHERE child.parent_snapshot_sha256=p.snapshot_sha256) AND NOT EXISTS(SELECT 1 FROM research.session_snapshots sibling WHERE sibling.session_sha256=p.session_sha256 AND sibling.snapshot_sha256<>p.snapshot_sha256 AND NOT EXISTS(SELECT 1 FROM research.session_snapshots child WHERE child.parent_snapshot_sha256=sibling.snapshot_sha256))",
+        ).bind(checkpoint).bind(tenant).fetch_one(&mut *tx).await?;
+        let session: crate::research::Session = serde_json::from_value(session)?;
+        let snapshot: crate::research::SessionSnapshot = serde_json::from_value(snapshot)?;
+        ensure!(
+            session.id()? == session_id
+                && snapshot.session_sha256 == session_id
+                && snapshot.id()? == checkpoint,
+            "corrupt registered session checkpoint"
+        );
+        Ok(LockedSessionCheckpoint {
+            tx,
+            checkpoint: checkpoint.into(),
+            session,
+            snapshot,
+        })
     }
     pub async fn run_for_tenant(&self, tenant: &str, id: &str) -> Result<crate::research::Run> {
         let value: Value =
