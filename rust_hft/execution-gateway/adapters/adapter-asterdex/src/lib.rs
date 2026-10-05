@@ -8,7 +8,7 @@ use execution::{
 };
 // Re-export ExecutionMode for backwards compatibility
 pub use execution::ExecutionMode;
-use futures::{stream, StreamExt};
+use futures::StreamExt;
 use hft_core::{HftResult, OrderId, Price, Quantity};
 use integration::{
     http::{HttpClient, HttpClientConfig},
@@ -154,13 +154,29 @@ impl AsterdexExecutionClient {
             )
         })
     }
+
+    fn validate_execution_mode(&self) -> HftResult<()> {
+        match self.mode {
+            ExecutionMode::Paper => Ok(()),
+            ExecutionMode::Live if self.signer.is_some() => Ok(()),
+            ExecutionMode::Live => Err(hft_core::HftError::Authentication(
+                "AsterDEX Live execution requires API credentials; Paper must be selected explicitly"
+                    .to_string(),
+            )),
+            ExecutionMode::Testnet => Err(hft_core::HftError::Config(
+                "AsterDEX Testnet execution is not implemented; Paper must be selected explicitly"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 #[async_trait]
 impl ExecutionClient for AsterdexExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
+        self.validate_execution_mode()?;
         // Live 模式（需要 signer）
-        if self.mode == ExecutionMode::Live && self.signer.is_some() {
+        if self.mode == ExecutionMode::Live {
             if self.http_client.is_none() {
                 self.ensure_http()?;
             }
@@ -275,7 +291,8 @@ impl ExecutionClient for AsterdexExecutionClient {
     }
 
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
-        if self.mode == ExecutionMode::Live && self.signer.is_some() {
+        self.validate_execution_mode()?;
+        if self.mode == ExecutionMode::Live {
             if self.http_client.is_none() {
                 self.ensure_http()?;
             }
@@ -358,47 +375,12 @@ impl ExecutionClient for AsterdexExecutionClient {
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
     ) -> HftResult<OrderId> {
+        self.validate_execution_mode()?;
         if self.mode == ExecutionMode::Live {
-            // Aster DEX 目前沿用 Binance 風格，採用撤單重下策略
-            if new_quantity.is_none() && new_price.is_none() {
-                return Ok(order_id.clone());
-            }
-            // 取消原單（使用 resilience，處理錯誤）
-            let cancel_result = self.cancel_order(order_id).await;
-            if let Err(ref e) = cancel_result {
-                warn!(
-                    "AsterDex 修改訂單時撤單失敗 (order_id={}): {}",
-                    order_id.0, e
-                );
-                // 發送告警
-                self.send_execution_alert(
-                    ExecutionAlert::new(
-                        ExecutionAlertType::RetriesExhausted,
-                        "asterdex",
-                        "modify_order",
-                        format!("修改訂單時撤單失敗 (order_id={}): {}", order_id.0, e),
-                    )
-                    .with_error(e.to_string()),
-                );
-            }
-            // 簡化：按剩餘資料重下一張限價/市價單（需由上層提供完整 intent 更佳）
-            warn!("AsterDex 修改訂單以撤單重下實現: order_id={}", order_id.0);
-            if let Some(q) = new_quantity {
-                let _ = q;
-            }
-            if let Some(p) = new_price {
-                let _ = p;
-            }
-            // 無法重建完整意圖，僅回傳修改事件以避免阻塞（可後續改為攜帶原意圖）
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(ExecutionEvent::OrderModified {
-                    order_id: order_id.clone(),
-                    new_quantity,
-                    new_price,
-                    timestamp: hft_core::now_micros(),
-                });
-            }
-            return Ok(order_id.clone());
+            return Err(hft_core::HftError::Execution(
+                "AsterDEX Live modify is not implemented; use explicit cancel and new intents"
+                    .to_string(),
+            ));
         }
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderModified {
@@ -412,6 +394,7 @@ impl ExecutionClient for AsterdexExecutionClient {
     }
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
+        self.validate_execution_mode()?;
         if let Some(ref tx) = self.event_tx {
             let rx = tx.subscribe();
             let stream =
@@ -426,16 +409,18 @@ impl ExecutionClient for AsterdexExecutionClient {
                 });
             Ok(Box::pin(stream))
         } else {
-            Ok(Box::pin(stream::empty()))
+            Err(hft_core::HftError::Execution(
+                "AsterDEX execution stream requires a successful connection".to_string(),
+            ))
         }
     }
 
     async fn connect(&mut self) -> HftResult<()> {
+        self.validate_execution_mode()?;
+        if self.mode == ExecutionMode::Live {
+            self.ensure_http()?;
+        }
         let (tx, _rx) = broadcast::channel(1000);
-        self.event_tx = Some(tx.clone());
-        self.connected = true;
-        // 惰性初始化 HTTP 客戶端
-        let _ = self.ensure_http();
 
         // 初始化 Resilient Executor（帶告警回調）
         let retry_config = RetryConfig {
@@ -628,6 +613,8 @@ impl ExecutionClient for AsterdexExecutionClient {
             }
         }
 
+        self.event_tx = Some(tx);
+        self.connected = true;
         Ok(())
     }
 
@@ -776,6 +763,118 @@ mod tests {
             timeout_ms: 5_000,
             mode,
         }
+    }
+
+    fn test_intent() -> ports::OrderIntent {
+        ports::OrderIntent {
+            symbol: hft_core::Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Perp,
+            compliance_context: hft_core::ComplianceContext::default(),
+            side: hft_core::Side::Buy,
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            order_type: hft_core::OrderType::Limit,
+            price: Some(Price::from_f64(10.0).unwrap()),
+            time_in_force: hft_core::TimeInForce::GTC,
+            strategy_id: "mode-admission-test".to_string(),
+            target_venue: Some(hft_core::VenueId::ASTERDEX),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_live_and_testnet_modes_never_emit_simulated_order_events() {
+        for mode in [ExecutionMode::Live, ExecutionMode::Testnet] {
+            let mut client = AsterdexExecutionClient::new(make_test_config(mode));
+            let (tx, mut rx) = broadcast::channel(8);
+            client.event_tx = Some(tx);
+            let order_id = OrderId("existing-order".to_string());
+
+            assert!(client.place_order(test_intent()).await.is_err());
+            assert!(client.cancel_order(&order_id).await.is_err());
+            assert!(client
+                .modify_order(&order_id, Some(Quantity::from_f64(2.0).unwrap()), None)
+                .await
+                .is_err());
+            assert!(matches!(
+                rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_modes_cannot_report_a_successful_connection() {
+        for mode in [ExecutionMode::Live, ExecutionMode::Testnet] {
+            let mut client = AsterdexExecutionClient::new(make_test_config(mode));
+
+            assert!(client.connect().await.is_err());
+            assert!(!client.health().await.connected);
+            assert!(client.event_tx.is_none());
+            assert!(client.resilient_executor.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_live_setup_does_not_publish_a_healthy_connection_or_event_stream() {
+        let mut config = make_test_config(ExecutionMode::Live);
+        config.credentials = AsterdexCredentials::new("test-key".into(), "test-secret".into());
+        config.rest_base_url = "not a URL".to_string();
+        let mut client = AsterdexExecutionClient::new(config);
+
+        assert!(client.connect().await.is_err());
+        assert!(!client.health().await.connected);
+        assert!(client.event_tx.is_none());
+        assert!(client.listen_key.is_none());
+        assert!(client.execution_stream().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn live_modify_rejects_before_cancellation_and_does_not_emit_confirmation() {
+        let mut config = make_test_config(ExecutionMode::Live);
+        config.credentials = AsterdexCredentials::new("test-key".into(), "test-secret".into());
+        config.rest_base_url = "http://127.0.0.1:1".to_string();
+        let mut client = AsterdexExecutionClient::new(config);
+        let (tx, mut rx) = broadcast::channel(8);
+        client.event_tx = Some(tx);
+        let order_id = OrderId("existing-order".to_string());
+        client
+            .order_symbol
+            .insert(order_id.0.clone(), "BTCUSDT".into());
+
+        let error = client
+            .modify_order(&order_id, Some(Quantity::from_f64(2.0).unwrap()), None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Live modify is not implemented"));
+        assert!(client.http_client.is_none());
+        assert_eq!(client.order_symbol.get(&order_id.0).unwrap(), "BTCUSDT");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn paper_mode_still_emits_explicit_simulation_events() {
+        let mut client = AsterdexExecutionClient::new(make_test_config(ExecutionMode::Paper));
+        client.connect().await.unwrap();
+        let mut events = client.execution_stream().await.unwrap();
+        let order_id = client.place_order(test_intent()).await.unwrap();
+
+        assert!(order_id.0.starts_with("ASTERDEX_PAPER_"));
+        assert!(matches!(
+            events.next().await.unwrap().unwrap(),
+            ExecutionEvent::OrderAck { order_id: actual, .. } if actual == order_id
+        ));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            ExecutionEvent::Fill { order_id: actual, .. } if actual == order_id
+        ));
     }
 
     #[tokio::test]
