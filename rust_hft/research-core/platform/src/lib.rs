@@ -1,6 +1,8 @@
 //! Research data/control/execution boundaries. No trading or cloud provisioning authority.
 #[cfg(feature = "control")]
 pub mod agent_api;
+#[cfg(feature = "gateway")]
+pub mod artifact_gateway;
 #[cfg(feature = "control")]
 pub mod block_objects;
 pub mod build;
