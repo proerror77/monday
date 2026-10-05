@@ -118,7 +118,10 @@ pub fn read_signing_key(path: &Path) -> Result<SigningKey> {
     use std::os::unix::fs::PermissionsExt;
     let fd = rustix::fs::open(
         path,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )
     .map_err(|_| anyhow::anyhow!("signing key unavailable"))?;
@@ -1455,6 +1458,13 @@ mod tests {
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_signing_key(&key).is_err());
         assert!(read_signing_key(&link).is_err());
+        let fifo = tmp.path().join("fifo");
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(read_signing_key(&fifo).is_err());
     }
     #[test]
     fn release_publisher_requires_private_gateway_without_redirect_credentials() {
