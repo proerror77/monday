@@ -2467,6 +2467,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cex_envelope_limits_reject_prediction_venue_spoofing_before_submission() {
+        let mut client = BybitExecutionClient::new(make_test_config(ExecutionMode::Paper)).unwrap();
+        let (tx, mut rx) = broadcast::channel(8);
+        client.event_tx = Some(tx);
+        for venue in [
+            hft_core::VenueId::POLYMARKET,
+            hft_core::VenueId::BINANCE_PREDICTION,
+            hft_core::VenueId::PREDICT_FUN,
+        ] {
+            let intent = OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity::from_f64(0.001).unwrap(),
+                OrderType::Limit,
+                Some(Price::from_f64(50_000.0).unwrap()),
+                TimeInForce::GTC,
+                "prediction-venue-spoof".to_string(),
+                Some(venue),
+            );
+            for missing in [
+                "MissingMaxSlippage",
+                "MissingMaxOrderNotional",
+                "MissingMaxOrderQuantity",
+            ] {
+                let mut envelope = cex_bounded_envelope(intent.clone());
+                match missing {
+                    "MissingMaxSlippage" => envelope.lifecycle.max_slippage_bps = None,
+                    "MissingMaxOrderNotional" => envelope.lifecycle.max_order_notional = None,
+                    _ => envelope.lifecycle.max_order_quantity = None,
+                }
+                let error = client.place_order_envelope(&envelope).await.unwrap_err();
+                assert!(matches!(error, HftError::Execution(message) if message.contains(missing)));
+                let attempt = client.place_order_envelope_traced(&envelope).await;
+                assert!(
+                    matches!(attempt.outcome, Err(HftError::Execution(message)) if message.contains(missing))
+                );
+                assert!(attempt.userspace_write_started_mono_us.is_none());
+                assert!(attempt.userspace_write_returned_mono_us.is_none());
+                assert!(attempt.response_received_mono_us.is_none());
+            }
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn non_spot_intent_is_rejected_before_private_transport() {
         let mut client =
             BybitExecutionClient::new(make_test_config(ExecutionMode::Testnet)).unwrap();

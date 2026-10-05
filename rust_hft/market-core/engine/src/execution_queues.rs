@@ -211,7 +211,7 @@ impl EngineQueues {
     ) -> Result<(), LifecycleIntentSubmitError> {
         let validation = match price_protection {
             ExecutionPriceProtection::CanonicalBook => {
-                envelope.validate_cex_pre_execution(now, latest_book_seq)
+                envelope.validate_canonical_book_pre_execution(now, latest_book_seq)
             }
             ExecutionPriceProtection::VenueQuote => {
                 envelope.validate_pre_execution(now, latest_book_seq)

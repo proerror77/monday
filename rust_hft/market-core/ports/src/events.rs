@@ -664,34 +664,40 @@ impl OrderIntentEnvelope {
         self.validate_order_limits()
     }
 
+    /// Prediction venues keep optional ceilings at the shared canonical-book queue.
+    /// CEX adapters use the strict gate directly, regardless of the intent's target venue.
+    pub fn validate_canonical_book_pre_execution(
+        &self,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), OrderIntentRejectReason> {
+        if matches!(
+            self.intent.target_venue,
+            Some(VenueId::POLYMARKET | VenueId::BINANCE_PREDICTION | VenueId::PREDICT_FUN)
+        ) {
+            self.validate_pre_execution(now, latest_book_seq)?;
+            self.validate_slippage_reference(now, self.price_reference.as_ref())
+        } else {
+            self.validate_cex_pre_execution(now, latest_book_seq)
+        }
+    }
+
     pub fn validate_cex_pre_execution(
         &self,
         now: Timestamp,
         latest_book_seq: Option<u64>,
     ) -> Result<(), OrderIntentRejectReason> {
         self.validate_pre_execution(now, latest_book_seq)?;
-        if self.requires_signed_cex_execution_ceilings() {
-            if self.lifecycle.max_slippage_bps.is_none() {
-                return Err(OrderIntentRejectReason::MissingMaxSlippage);
-            }
-            if self.lifecycle.max_order_notional.is_none() {
-                return Err(OrderIntentRejectReason::MissingMaxOrderNotional);
-            }
-            if self.lifecycle.max_order_quantity.is_none() {
-                return Err(OrderIntentRejectReason::MissingMaxOrderQuantity);
-            }
+        if self.lifecycle.max_slippage_bps.is_none() {
+            return Err(OrderIntentRejectReason::MissingMaxSlippage);
+        }
+        if self.lifecycle.max_order_notional.is_none() {
+            return Err(OrderIntentRejectReason::MissingMaxOrderNotional);
+        }
+        if self.lifecycle.max_order_quantity.is_none() {
+            return Err(OrderIntentRejectReason::MissingMaxOrderQuantity);
         }
         self.validate_slippage_reference(now, self.price_reference.as_ref())
-    }
-
-    fn requires_signed_cex_execution_ceilings(&self) -> bool {
-        // CanonicalBook still calls this gate for every venue. Signed CEX
-        // ceilings stay fail-closed for CEX and unknown/bare venues; prediction
-        // markets keep optional None, matching VenueQuote adapters.
-        !matches!(
-            self.intent.target_venue,
-            Some(VenueId::POLYMARKET | VenueId::BINANCE_PREDICTION | VenueId::PREDICT_FUN)
-        )
     }
 
     /// Bound the venue-enforced limit against a fresh, instrument-bound executable quote.
@@ -1290,7 +1296,98 @@ mod tests {
             ),
             lifecycle,
         );
-        assert_eq!(envelope.validate_cex_pre_execution(1_100, None), Ok(()));
+        assert_eq!(
+            envelope.validate_canonical_book_pre_execution(1_100, None),
+            Ok(())
+        );
+        assert_eq!(
+            envelope.validate_cex_pre_execution(1_100, None),
+            Err(OrderIntentRejectReason::MissingMaxSlippage)
+        );
+    }
+
+    #[test]
+    fn canonical_book_keeps_cex_missing_ceiling_rejections() {
+        for venue in [
+            None,
+            Some(VenueId::BINANCE),
+            Some(VenueId::BINANCE_SPOT),
+            Some(VenueId::BINANCE_FUTURES),
+            Some(VenueId::BYBIT),
+            Some(VenueId::HYPERLIQUID),
+            Some(VenueId::ASTERDEX),
+            Some(VenueId::LIGHTER),
+            Some(VenueId::GRVT),
+            Some(VenueId::ONDO_PERPS),
+            Some(VenueId::MOCK),
+            Some(VenueId(u16::MAX)),
+        ] {
+            for missing in [
+                OrderIntentRejectReason::MissingMaxSlippage,
+                OrderIntentRejectReason::MissingMaxOrderNotional,
+                OrderIntentRejectReason::MissingMaxOrderQuantity,
+            ] {
+                let mut envelope = slippage_envelope(Side::Buy, rust_decimal::Decimal::from(100));
+                envelope.intent.target_venue = venue;
+                match missing {
+                    OrderIntentRejectReason::MissingMaxSlippage => {
+                        envelope.lifecycle.max_slippage_bps = None;
+                    }
+                    OrderIntentRejectReason::MissingMaxOrderNotional => {
+                        envelope.lifecycle.max_order_notional = None;
+                    }
+                    _ => envelope.lifecycle.max_order_quantity = None,
+                }
+                assert_eq!(
+                    envelope.validate_canonical_book_pre_execution(1_100, None),
+                    Err(missing),
+                    "canonical-book gate for {venue:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prediction_canonical_book_enforces_configured_ceilings() {
+        for venue in [
+            VenueId::POLYMARKET,
+            VenueId::BINANCE_PREDICTION,
+            VenueId::PREDICT_FUN,
+        ] {
+            let mut envelope = slippage_envelope(Side::Buy, rust_decimal::Decimal::from(100));
+            envelope.intent.target_venue = Some(venue);
+            envelope.lifecycle.max_order_notional = None;
+            envelope.lifecycle.max_order_quantity = None;
+            let mut reference = envelope.price_reference.take().unwrap();
+            reference.venue = venue;
+            assert_eq!(
+                envelope.validate_canonical_book_pre_execution(1_100, None),
+                Err(OrderIntentRejectReason::MissingSlippageReference)
+            );
+            envelope.price_reference = Some(reference);
+            assert_eq!(
+                envelope.validate_canonical_book_pre_execution(1_100, None),
+                Ok(())
+            );
+
+            envelope.lifecycle.max_order_notional = Some(rust_decimal::Decimal::from(99));
+            assert!(matches!(
+                envelope.validate_canonical_book_pre_execution(1_100, None),
+                Err(OrderIntentRejectReason::MaxOrderNotionalExceeded { .. })
+            ));
+            envelope.lifecycle.max_order_notional = None;
+            envelope.lifecycle.max_order_quantity = Some(rust_decimal::Decimal::new(9, 1));
+            assert!(matches!(
+                envelope.validate_canonical_book_pre_execution(1_100, None),
+                Err(OrderIntentRejectReason::MaxOrderQuantityExceeded { .. })
+            ));
+            envelope.lifecycle.max_order_quantity = None;
+            envelope.intent.price = Some(Price(rust_decimal::Decimal::new(10_026, 2)));
+            assert!(matches!(
+                envelope.validate_canonical_book_pre_execution(1_100, None),
+                Err(OrderIntentRejectReason::MaxSlippageExceeded { .. })
+            ));
+        }
     }
 
     fn slippage_envelope(side: Side, price: rust_decimal::Decimal) -> OrderIntentEnvelope {
