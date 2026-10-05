@@ -6,7 +6,8 @@ use hft_research_platform::{
     release::{BuildReleaseTrust, SignedBuildRelease, VerifiedBuildRelease},
 };
 use reqwest::blocking::Client;
-use std::{collections::BTreeMap, path::Path};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, io::Read};
 
 pub(super) struct ReadbackBuildRelease {
     release: VerifiedBuildRelease,
@@ -23,7 +24,6 @@ pub(super) fn verify_and_readback(
     signed: &SignedBuildRelease,
     urls: &BTreeMap<String, String>,
     client: &Client,
-    directory: &Path,
 ) -> anyhow::Result<ReadbackBuildRelease> {
     let release = trust.verify(artifact, signed)?;
     let expected = std::iter::once(&release.signed().receipt.source.archive)
@@ -40,7 +40,7 @@ pub(super) fn verify_and_readback(
             && expected.iter().all(|object| urls.contains_key(&object.key)),
         "independent release readback requires exact source and executable coverage"
     );
-    for (index, object) in expected.into_iter().enumerate() {
+    for object in expected {
         let url = urls
             .get(&object.key)
             .context("release readback URL is absent")?;
@@ -53,13 +53,67 @@ pub(super) fn verify_and_readback(
                 && parsed.fragment().is_none(),
             "release readback requires authenticated HTTPS object transport"
         );
-        let path = directory.join(format!("released-object-{index}"));
-        let (bytes, sha256) =
-            hft_research_artifacts::fetch_to_file(client, url, &path, object.bytes)?;
+        let response = client
+            .get(url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(reqwest::Error::without_url)?;
+        verify_bytes(object, response)?;
+    }
+    Ok(ReadbackBuildRelease { release })
+}
+
+fn verify_bytes(
+    object: &hft_research_platform::orchestrator::Artifact,
+    mut read: impl Read,
+) -> anyhow::Result<()> {
+    let mut hash = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = read.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(count as u64)
+            .context("release object size overflow")?;
         ensure!(
-            bytes == object.bytes && sha256 == object.sha256,
-            "released source or executable bytes differ from trusted publication"
+            bytes <= object.bytes,
+            "released object exceeds its signed bound"
         );
+        hash.update(&buffer[..count]);
+    }
+    ensure!(
+        bytes == object.bytes && hex::encode(hash.finalize()) == object.sha256,
+        "released source or executable bytes differ from trusted publication"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn from_test_readback_peer(
+    trust: &BuildReleaseTrust,
+    artifact: &BuildArtifact,
+    signed: &SignedBuildRelease,
+    objects: &BTreeMap<String, Vec<u8>>,
+) -> anyhow::Result<ReadbackBuildRelease> {
+    let release = trust.verify(artifact, signed)?;
+    ensure!(
+        objects.len() == release.artifact().executables.len() + 1,
+        "test peer changed release coverage"
+    );
+    for object in std::iter::once(&release.signed().receipt.source.archive)
+        .chain(release.artifact().executables.iter().map(|e| &e.blob))
+    {
+        verify_bytes(
+            object,
+            std::io::Cursor::new(
+                objects
+                    .get(&object.key)
+                    .context("test peer lacks release bytes")?,
+            ),
+        )?;
     }
     Ok(ReadbackBuildRelease { release })
 }

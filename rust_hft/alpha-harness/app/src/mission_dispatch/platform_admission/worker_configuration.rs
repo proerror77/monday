@@ -208,6 +208,17 @@ fn verify_readback(
 }
 
 #[cfg(test)]
+pub(super) fn from_test_readback_peer(
+    observed: &Value,
+    namespace: &str,
+    name: &str,
+    request: &[u8],
+    request_sha256: &str,
+) -> anyhow::Result<VerifiedWorkerConfiguration> {
+    verify_readback(observed, namespace, name, request, request_sha256)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

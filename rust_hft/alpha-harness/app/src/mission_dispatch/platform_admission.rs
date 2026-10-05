@@ -8,6 +8,8 @@ use clap::Args;
 use serde_json::json;
 use std::path::PathBuf;
 mod fixed_campaign;
+#[cfg(all(test, feature = "scientific"))]
+mod fixed_campaign_tests;
 mod native_witness;
 mod released_build;
 mod signed_export;

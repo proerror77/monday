@@ -193,7 +193,6 @@ pub(super) fn export(args: PlatformExportArgs) -> anyhow::Result<()> {
         &signed_release,
         &projection.artifact_readback,
         &release_client,
-        directory.path(),
     )?;
     let release_public_keys = released_build::public_keys(&release_trust)?;
     let mut prepared = super::prepare_budget(&args.prepare)?;
