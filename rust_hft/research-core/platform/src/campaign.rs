@@ -1,5 +1,7 @@
 //! Development-only native Campaign collections bound to an admitted fixed Run.
 use crate::{admission::VerifiedNativeAdmission, orchestrator::TaskKind};
+#[cfg(feature = "control")]
+use anyhow::Context;
 use anyhow::{ensure, Result};
 use hft_cex_research_input::{
     campaign::{CampaignPreparedInputsV1, VerifiedCampaignPreparedInputsV1},
@@ -101,6 +103,17 @@ impl crate::postgres::Ledger {
                 .fetch_one(&mut *tx)
                 .await?;
         evidence.admits_launch_at(now)?;
+        let cap: Option<i64> = query_scalar("SELECT research.native_request_deadline_ms($1)")
+            .bind(request)
+            .fetch_one(&mut *tx)
+            .await?;
+        let finish = now
+            .checked_add(evidence.admission.task_spec.timeout_ms)
+            .context("Campaign deadline overflow")?;
+        ensure!(
+            cap.is_some_and(|deadline| finish <= deadline),
+            "Campaign input publication crosses native revocation or expiry"
+        );
         let revoked: bool = query_scalar(
             "SELECT EXISTS(SELECT 1 FROM research.revocations WHERE request_sha256=$1)",
         )

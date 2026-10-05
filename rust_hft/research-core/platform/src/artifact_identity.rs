@@ -139,6 +139,64 @@ pub struct AttemptIdentityIssuer {
     config: AttemptIdentityConfig,
 }
 
+// Transport tests exercise resource binding separately from the real-PG issuer
+// test. This factory cannot exist in a production binary.
+#[cfg(test)]
+pub(crate) fn launcher_fixture(
+    spec: &crate::orchestrator::TaskSpec,
+    lease: &crate::orchestrator::Lease,
+    trust_sha256: String,
+) -> Result<(
+    tempfile::TempDir,
+    AttemptIdentityIssuer,
+    IssuedAttemptIdentity,
+)> {
+    use std::os::unix::fs::PermissionsExt;
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    let state = root.join("state");
+    std::fs::create_dir(&state)?;
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+    let projection = root.join("capabilities.json");
+    let deadline = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )? + 120_000;
+    install(
+        &projection,
+        &serde_json::to_vec(&vec![Capability {
+            token_sha256: "f".repeat(64),
+            expires_ms: u64::try_from(deadline)?,
+            access: Access::Reader {
+                prefixes: vec!["research/fixture/".into()],
+            },
+        }])?,
+    )?;
+    let issuer = AttemptIdentityIssuer::new(AttemptIdentityConfig {
+        capabilities_file: projection,
+        state_root: state,
+        namespace_prefix: format!("{}/", spec.output_prefix),
+        tls_identity_file: None,
+    })?;
+    let issued = issuer.project(
+        "fixture".into(),
+        lease.task_id.clone(),
+        lease.attempt,
+        lease.fence,
+        deadline,
+        format!(
+            "{}/{}/{}/",
+            spec.output_prefix, lease.task_id, lease.attempt
+        ),
+        "a".repeat(64),
+        trust_sha256,
+        b"{}".to_vec(),
+    )?;
+    Ok((temporary, issuer, issued))
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct OwnedIdentity {
