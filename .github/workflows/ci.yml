@@ -524,6 +524,12 @@ jobs:
       - name: Validate optional data importer boundaries
         working-directory: rust_hft
         run: cargo clippy --manifest-path data-pipelines/Cargo.toml -p hft-market-pipeline --features import --all-targets --locked -- -D warnings
+      - name: Validate paused application roles against isolated PG
+        working-directory: rust_hft
+        run: |
+          docker exec "${{ job.services.postgres.id }}" psql -U fixture -d monday_foundation_test -v ON_ERROR_STOP=1 -c 'CREATE DATABASE monday_foundation_roles_test'
+          MONDAY_TEST_DATABASE_URL="${MONDAY_TEST_DATABASE_URL%/monday_foundation_test}/monday_foundation_roles_test" \
+            "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --test persistent_platform paused_database_roles_enforce_real_read_write_and_lock_boundaries --locked -- --ignored
 
   rust_fast_gates:
     name: Rust Fast Gates

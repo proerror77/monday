@@ -3,30 +3,25 @@ use anyhow::{ensure, Result};
 
 /// An explicitly named disposable database only, not production schema work.
 #[tokio::test]
-#[ignore = "requires disposable MONDAY_TEST_DATABASE_URL ending /monday_foundation_test"]
+#[ignore = "requires disposable MONDAY_TEST_DATABASE_URL ending /monday_foundation_roles_test"]
 async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> Result<()> {
     use hft_research_platform::postgres::{
-        BUILD_RELEASE_MIGRATION, MIGRATION, NATIVE_CAMPAIGN_INPUTS_MIGRATION,
-        NATIVE_REQUEST_REVOCATION_MIGRATION, SESSION_DELIVERY_MIGRATION,
+        BUILD_RELEASE_MIGRATION, MIGRATION, NATIVE_ADMISSION_MIGRATION,
+        NATIVE_CAMPAIGN_INPUTS_MIGRATION, NATIVE_REQUEST_REVOCATION_MIGRATION,
+        SESSION_DELIVERY_MIGRATION,
     };
     let url = std::env::var("MONDAY_TEST_DATABASE_URL")?;
     ensure!(
-        url.ends_with("/monday_foundation_test"),
+        url.ends_with("/monday_foundation_roles_test"),
         "test database identity mismatch"
     );
     let pool = sqlx_postgres::PgPool::connect(&url).await?;
-    let native_path = std::env::var_os("MONDAY_TEST_NATIVE_ADMISSION_SQL")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sql/native_admission.sql")
-        });
-    let native_admission = std::fs::read_to_string(native_path)?;
     for migration in [
         MIGRATION,
         BUILD_RELEASE_MIGRATION,
         SESSION_DELIVERY_MIGRATION,
         include_str!("../sql/artifact_gateway.sql"),
-        native_admission.as_str(),
+        NATIVE_ADMISSION_MIGRATION,
         NATIVE_REQUEST_REVOCATION_MIGRATION,
         NATIVE_CAMPAIGN_INPUTS_MIGRATION,
         include_str!("../../../../deployment/aliyun/research/foundation/postgres/roles.sql"),
