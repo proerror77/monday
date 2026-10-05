@@ -5,8 +5,6 @@ use crate::cli::BUILD_SOURCE_REVISION;
 use crate::data_mission;
 #[cfg(feature = "scientific")]
 use crate::mission;
-#[cfg(feature = "scientific")]
-use crate::prediction_dispatch;
 use alpha_domain::canonical_json_hash;
 #[cfg(feature = "scientific")]
 use alpha_domain::CandidateArtifact;
@@ -4320,11 +4318,11 @@ fn validate_holdout_claim_binding(
         bail!("CEX result and holdout claim transports must match");
     }
     if put_is_remote {
-        let claim_object = prediction_dispatch::canonical_https_object(
+        let claim_object = hft_research_dispatch_io::canonical_https_object(
             "CEX holdout claim",
             &args.holdout_claim_put_url,
         )?;
-        let claim_readback_object = prediction_dispatch::canonical_https_object(
+        let claim_readback_object = hft_research_dispatch_io::canonical_https_object(
             "CEX holdout claim readback",
             &args.holdout_claim_readback_url,
         )?;
@@ -4332,7 +4330,7 @@ fn validate_holdout_claim_binding(
             bail!("CEX holdout claim readback URL must identify the same immutable object");
         }
         let expected_claim_object =
-            prediction_dispatch::cex_global_holdout_claim_object(holdout_id)?;
+            crate::mission_objects::cex_global_holdout_claim_object(holdout_id)?;
         if claim_object != expected_claim_object {
             bail!("CEX holdout claim object must use the global holdout claim path");
         }
@@ -4366,17 +4364,19 @@ fn expected_local_holdout_claim_object(
     binding: &ExecutionBinding,
 ) -> anyhow::Result<String> {
     match binding {
-        ExecutionBinding::Direct => Ok(prediction_dispatch::cex_result_attempt_and_holdout_claim(
-            result_object,
-            mission_id,
-            holdout_id,
-        )?
-        .1),
+        ExecutionBinding::Direct => Ok(
+            crate::mission_objects::cex_result_attempt_and_holdout_claim(
+                result_object,
+                mission_id,
+                holdout_id,
+            )?
+            .1,
+        ),
         ExecutionBinding::Campaign {
             campaign_id,
             round_id,
             ..
-        } => prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+        } => crate::mission_objects::cex_campaign_round_result_and_holdout_claim(
             result_object,
             campaign_id,
             round_id,
@@ -4461,8 +4461,8 @@ fn validate_result_readback_binding(
         result_readback_url.starts_with("http://") || result_readback_url.starts_with("https://");
     let same_object = match (put_is_remote, readback_is_remote) {
         (true, true) => {
-            prediction_dispatch::canonical_https_object("CEX result", result_put_url)?
-                == prediction_dispatch::canonical_https_object(
+            hft_research_dispatch_io::canonical_https_object("CEX result", result_put_url)?
+                == hft_research_dispatch_io::canonical_https_object(
                     "CEX result readback",
                     result_readback_url,
                 )?
@@ -9404,7 +9404,8 @@ pub(crate) mod tests {
         fixture.args.result_put_url = "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/anything/results.zip".to_string();
         fixture.args.result_readback_url = fixture.args.result_put_url.clone();
         fixture.args.holdout_claim_put_url =
-            prediction_dispatch::cex_global_holdout_claim_object(&fixture.args.holdout_id).unwrap();
+            crate::mission_objects::cex_global_holdout_claim_object(&fixture.args.holdout_id)
+                .unwrap();
         fixture.args.holdout_claim_readback_url = fixture.args.holdout_claim_put_url.clone();
 
         validate_holdout_claim_binding(
@@ -9913,7 +9914,7 @@ pub(crate) mod tests {
             "campaign-root/campaign-id={campaign_id}/round={round_id}/results.zip"
         ));
         std::fs::create_dir_all(result_path.parent().unwrap()).unwrap();
-        let holdout_claim = prediction_dispatch::cex_campaign_round_result_and_holdout_claim(
+        let holdout_claim = crate::mission_objects::cex_campaign_round_result_and_holdout_claim(
             &result_path.to_string_lossy(),
             campaign_id,
             round_id,
@@ -10559,7 +10560,7 @@ message binance_replay {
         let attempt_result_dir = mission_result_dir.join("attempt=test");
         std::fs::create_dir_all(&attempt_result_dir).unwrap();
         let result_path = attempt_result_dir.join("results.zip");
-        let (_, holdout_claim_path) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+        let (_, holdout_claim_path) = crate::mission_objects::cex_result_attempt_and_holdout_claim(
             &result_path.to_string_lossy(),
             &mission_id,
             &mission.spec.holdout.holdout_id,
@@ -11151,7 +11152,7 @@ message binance_replay {
         fixture.result_path = attempt_dir.join("results.zip");
         fixture.args.result_put_url = fixture.result_path.to_string_lossy().into_owned();
         fixture.args.result_readback_url = fixture.args.result_put_url.clone();
-        let (_, claim_path) = prediction_dispatch::cex_result_attempt_and_holdout_claim(
+        let (_, claim_path) = crate::mission_objects::cex_result_attempt_and_holdout_claim(
             &fixture.args.result_put_url,
             &fixture.args.mission_id,
             &fixture.args.holdout_id,

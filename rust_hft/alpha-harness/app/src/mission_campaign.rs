@@ -19,6 +19,8 @@ use crate::cli::CampaignLearnArgs;
 use crate::cli::CampaignStudyProposeArgs;
 use crate::cli::BUILD_SOURCE_REVISION;
 use crate::mission_dispatch;
+use crate::mission_objects::cex_campaign_round_root;
+use crate::mission_objects::cex_global_holdout_claim_object;
 use crate::mission_render::allowed_research_feature_fields;
 use crate::mission_render::render_cex_bundle;
 use crate::mission_render::render_prepared_cex_bundle;
@@ -46,10 +48,6 @@ use crate::mission_runner::CexSupervisedModelSelectionV1;
 use crate::mission_runner::ExecutionBinding;
 use crate::mission_runner::CEX_SUPERVISED_MODEL_NAMES;
 use crate::mission_runner::MAX_RESULT_BUNDLE_BYTES;
-use hft_research_dispatch_io::canonical_tokyo_oss_internal_object;
-use hft_research_dispatch_io::cex_campaign_round_root;
-use hft_research_dispatch_io::cex_global_holdout_claim_object;
-use hft_research_dispatch_io::validate_dns_label;
 use alpha_domain::{
     campaign_horizon::{
         CampaignLabelHorizonV1, CampaignNextFamilyInputWindowV1, CampaignNextFamilyParentV1,
@@ -61,6 +59,8 @@ use alpha_domain::{
 use alpha_engine::{baselines::CexSupervisedModelCandidateV2, engines::CexFactorBankMctsResultV1};
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
+use hft_research_dispatch_io::canonical_tokyo_oss_internal_object;
+use hft_research_dispatch_io::validate_dns_label;
 #[cfg(feature = "scientific")]
 use reqwest::StatusCode;
 use reqwest::{blocking::Client, redirect::Policy};

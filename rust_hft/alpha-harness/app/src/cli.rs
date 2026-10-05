@@ -1,6 +1,8 @@
+#[cfg(feature = "scientific")]
+use crate::mission_runner;
 use crate::{
     data_mission, governance, loop_control, mission, mission_campaign, mission_dispatch,
-    mission_fresh_inputs, mission_metrics, mission_runner,
+    mission_fresh_inputs, mission_metrics,
 };
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
@@ -1241,19 +1243,25 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             MissionCommand::Dispatch { command } => match command {
                 MissionDispatchCommand::PreparePlatform(args) => {
-                    tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::prepare(args))
-                        .await
-                        .context("platform Campaign budget preparation task failed")?
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_admission::prepare(args)
+                    })
+                    .await
+                    .context("platform Campaign budget preparation task failed")?
                 }
                 MissionDispatchCommand::ExportPlatform(args) => {
-                    tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::export(args))
-                        .await
-                        .context("native platform signed export task failed")?
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_admission::export(args)
+                    })
+                    .await
+                    .context("native platform signed export task failed")?
                 }
                 MissionDispatchCommand::ExportPlatformRevocations(args) => {
-                    tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::export_revocations(args))
-                        .await
-                        .context("native platform revocation export task failed")?
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_admission::export_revocations(args)
+                    })
+                    .await
+                    .context("native platform revocation export task failed")?
                 }
                 MissionDispatchCommand::DescribeStudy(args) => {
                     mission_dispatch::sequence_admission::describe(args)
