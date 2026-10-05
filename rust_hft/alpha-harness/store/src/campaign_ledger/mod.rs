@@ -11,7 +11,9 @@ pub use final_dispatch::{
     CampaignFinalDispatchClaimV1, CampaignFinalDispatchRecord, CampaignFinalDispatchSettlementV1,
     CampaignFinalOutcomeV1,
 };
+mod platform_transfer;
 mod state;
+pub use platform_transfer::CampaignPlatformTransferV1;
 
 pub use dispatch::{
     CampaignDispatchCancellationV1, CampaignDispatchClaimV1,
@@ -72,6 +74,9 @@ pub enum CampaignLedgerEventV1 {
         operation_id: String,
         target: CampaignDispatchTargetV1,
     },
+    PlatformTransferred {
+        transfer: CampaignPlatformTransferV1,
+    },
     DispatchJobBound {
         operation_id: String,
         job_uid: String,
@@ -120,6 +125,9 @@ impl CampaignLedgerEventV1 {
             Self::AttemptReserved { reservation } => reservation.operation_id().map_err(err)?,
             Self::DispatchClaimed { operation_id, .. } => {
                 format!("campaign-dispatch:{operation_id}")
+            }
+            Self::PlatformTransferred { transfer } => {
+                format!("campaign-platform-transfer:{}", transfer.operation_id)
             }
             Self::DispatchJobBound { operation_id, .. } => format!("campaign-job:{operation_id}"),
             Self::DispatchCancelled { evidence } => {
@@ -1182,6 +1190,64 @@ mod tests {
     }
 
     #[test]
+    fn platform_transfer_preserves_native_charge_and_excludes_legacy_claim() {
+        let (mut store, verified) = registered();
+        let reservation = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &reservation, t0())
+            .unwrap();
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: reservation.operation_id().unwrap(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        assert!(
+            store
+                .transfer_campaign_execution_to_platform(&verified, &reservation, &transfer, t0())
+                .is_err(),
+            "unpublished native receipts must not transfer authority"
+        );
+        acknowledge_all(&mut store);
+        let before = store.campaign_family_usage(FAMILY).unwrap();
+        let first = store
+            .transfer_campaign_execution_to_platform(&verified, &reservation, &transfer, t0())
+            .unwrap();
+        assert_eq!(
+            first,
+            store
+                .transfer_campaign_execution_to_platform(&verified, &reservation, &transfer, t0())
+                .unwrap()
+        );
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
+        acknowledge_all(&mut store);
+        assert!(store
+            .claim_campaign_dispatch(&verified, &reservation, &dispatch_target(), t0())
+            .is_err());
+        assert!(
+            store
+                .settle_campaign_attempt(
+                    FAMILY,
+                    &settlement(&reservation, CampaignAttemptOutcomeV1::Failed, None),
+                    t0()
+                )
+                .is_err(),
+            "legacy settlement must not free or settle platform-owned execution"
+        );
+        let mut changed = transfer;
+        changed.tenant = "another".into();
+        assert!(store
+            .transfer_campaign_execution_to_platform(&verified, &reservation, &changed, t0())
+            .is_err());
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
+        let snapshot = store.campaign_family_snapshot(FAMILY).unwrap();
+        assert!(snapshot.receipts.iter().any(|r| matches!(
+            r.receipt.event,
+            CampaignLedgerEventV1::PlatformTransferred { .. }
+        )));
+    }
+
+    #[test]
     fn root_registration_conflicts_with_inflight_approval_revocation() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         let verified = verify(grant("root-1"));
@@ -2182,6 +2248,7 @@ mod tests {
                 CampaignLedgerEventV1::StudyMemberBound { .. } => "study_member_bound",
                 CampaignLedgerEventV1::AttemptReserved { .. } => "attempt_reserved",
                 CampaignLedgerEventV1::DispatchClaimed { .. } => "dispatch_claimed",
+                CampaignLedgerEventV1::PlatformTransferred { .. } => "platform_transferred",
                 CampaignLedgerEventV1::DispatchJobBound { .. } => "dispatch_job_bound",
                 CampaignLedgerEventV1::AttemptSettled { .. } => "attempt_settled",
                 CampaignLedgerEventV1::DispatchSettled { .. } => "dispatch_settled",
