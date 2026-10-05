@@ -5,7 +5,7 @@
 
 use crate::canonical_json_hash;
 use chrono::{DateTime, TimeDelta, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -322,7 +322,7 @@ pub fn verify_campaign_root_grant(
         hex::decode(&signed.signature_hex).map_err(|_| CampaignControlError::InvalidSignature)?;
     let signature =
         Signature::from_slice(&bytes).map_err(|_| CampaignControlError::InvalidSignature)?;
-    key.verify(
+    key.verify_strict(
         signing_message(&signed.content_sha256).as_bytes(),
         &signature,
     )
@@ -590,6 +590,15 @@ mod tests {
         ));
         let trusted = BTreeMap::from([("operator".into(), key.verifying_key())]);
         assert!(verify_campaign_root_grant(&signed, &trusted, now).is_ok());
+        let mut keyless = signed.clone();
+        let identity = format!("01{}", "00".repeat(31));
+        keyless.signature_hex = format!("{identity}{}", "00".repeat(32));
+        let identity_bytes: [u8; 32] = hex::decode(identity).unwrap().try_into().unwrap();
+        let weak = BTreeMap::from([(
+            "operator".to_string(),
+            VerifyingKey::from_bytes(&identity_bytes).unwrap(),
+        )]);
+        assert!(verify_campaign_root_grant(&keyless, &weak, now).is_err());
         signed.grant.budget.max_trials += 1;
         signed.content_sha256 = signed.grant.content_hash().unwrap();
         assert!(matches!(

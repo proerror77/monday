@@ -63,6 +63,14 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     sqlx_core::raw_sql::raw_sql(hft_research_platform::postgres::ARTIFACT_GATEWAY_MIGRATION)
         .execute(&pool)
         .await?;
+    sqlx_core::raw_sql::raw_sql(hft_research_platform::postgres::NATIVE_ADMISSION_MIGRATION)
+        .execute(&pool)
+        .await?;
+    sqlx_core::raw_sql::raw_sql(
+        hft_research_platform::postgres::NATIVE_REQUEST_REVOCATION_MIGRATION,
+    )
+    .execute(&pool)
+    .await?;
     let ledger = Ledger::connect(&url).await?;
     let view = PublishedView {
         prepared_id: hash('a'),
@@ -268,25 +276,88 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     };
     spec.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
     assert!(ledger.submit("fixture", "one", spec.clone()).await.is_err());
+    // An old row containing plausible receipt hashes remains audit history,
+    // but cannot become current native authority without the signed import.
+    let unsigned_admission = hft_research_platform::orchestrator::Admission {
+        schema: 1,
+        request_sha256: spec.id()?,
+        task_spec: spec.clone(),
+        resource_reservation_receipt_sha256: hash('a'),
+        scientific_grant_receipt_sha256: hash('b'),
+        release_admission_receipt_sha256: artifact.release_receipt_sha256.clone(),
+        max_attempts: spec.max_attempts,
+    };
+    sqlx_core::query::query(
+        "INSERT INTO research.admissions(request_sha256,document) VALUES($1,$2)",
+    )
+    .bind(&unsigned_admission.request_sha256)
+    .bind(serde_json::to_value(&unsigned_admission)?)
+    .execute(&pool)
+    .await?;
+    assert!(ledger
+        .submit("fixture", "unsigned-native", spec.clone())
+        .await
+        .is_err());
     let admit = |spec: hft_research_platform::orchestrator::TaskSpec| {
-        let pool = &pool;
+        let ledger = &ledger;
         async move {
+            use hft_research_platform::admission::{NativeAdmission, NativeAdmissionTrust};
+            let run = ledger
+                .run_for_tenant("fixture", &spec.run_manifest_sha256)
+                .await?;
+            let build = ledger.build_artifact(&run.build_artifact_sha256).await?;
             let a = hft_research_platform::orchestrator::Admission {
                 schema: 1,
                 request_sha256: spec.id()?,
                 task_spec: spec.clone(),
                 resource_reservation_receipt_sha256: hash('a'),
                 scientific_grant_receipt_sha256: hash('b'),
-                release_admission_receipt_sha256: hash('c'),
+                release_admission_receipt_sha256: build.release_receipt_sha256,
                 max_attempts: spec.max_attempts,
             };
-            sqlx_core::query::query(
-                "INSERT INTO research.admissions(request_sha256,document) VALUES($1,$2)",
-            )
-            .bind(&a.request_sha256)
-            .bind(serde_json::to_value(&a)?)
-            .execute(pool)
-            .await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64;
+            let evidence = NativeAdmission {
+                schema: "monday.native_scientific_admission.v1".into(),
+                tenant: "fixture".into(),
+                native_request_sha256: run.configuration_sha256.clone(),
+                run,
+                operation_sha256: a.request_sha256.clone(),
+                family_id: "synthetic-native-budget".into(),
+                root_grant_sha256: hash('b'),
+                approval_sha256: hash('c'),
+                transfer_receipt_sha256: hash('d'),
+                declared_trials: 1,
+                reserved_job_seconds: (((spec.timeout_ms + 999) / 1000) as u64)
+                    * u64::from(spec.max_attempts),
+                reserved_llm_tokens: 0,
+                issued_ms: now,
+                expires_ms: now + 3_600_000,
+                admission: a,
+            };
+            let key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+            let signed = hft_research_platform::admission::sign(
+                evidence,
+                "fixture-native-issuer".into(),
+                &key,
+            )?;
+            let public = key
+                .verifying_key()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let trust = NativeAdmissionTrust {
+                schema: "monday.native_reservation_trust.v1".into(),
+                native_reservation_keys: std::collections::BTreeMap::from([(
+                    "fixture-native-issuer".into(),
+                    public,
+                )]),
+            };
+            ledger
+                .register_native_admission(&trust.verify(&signed)?)
+                .await?;
             Ok::<_, anyhow::Error>(())
         }
     };
@@ -326,6 +397,39 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .await?;
     assert_eq!(count, 0);
     admit(spec.clone()).await?;
+    let native_row: serde_json::Value = sqlx_core::query_scalar::query_scalar(
+        "SELECT document FROM research.native_admission_imports WHERE request_sha256=$1",
+    )
+    .bind(spec.id()?)
+    .fetch_one(&pool)
+    .await?;
+    let mut duplicate: hft_research_platform::admission::SignedNativeAdmission =
+        serde_json::from_value(native_row)?;
+    let original_operation = duplicate.evidence.operation_sha256.clone();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+    let public = key
+        .verifying_key()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let native_trust = hft_research_platform::admission::NativeAdmissionTrust {
+        schema: "monday.native_reservation_trust.v1".into(),
+        native_reservation_keys: std::collections::BTreeMap::from([(
+            "fixture-native-issuer".into(),
+            public,
+        )]),
+    };
+    duplicate.evidence.tenant = "another".into();
+    let foreign = hft_research_platform::admission::sign(
+        duplicate.evidence,
+        "fixture-native-issuer".into(),
+        &key,
+    )?;
+    assert!(ledger
+        .register_native_admission(&native_trust.verify(&foreign)?)
+        .await
+        .is_err());
     let id = ledger.submit("fixture", "one", spec.clone()).await?;
     assert_eq!(id, ledger.submit("fixture", "one", spec.clone()).await?);
     let status = hft_research_platform::agent_api::execute(
@@ -355,6 +459,24 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     run.command = second.command.clone();
     second.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
     admit(second.clone()).await?;
+    let second_row: serde_json::Value = sqlx_core::query_scalar::query_scalar(
+        "SELECT document FROM research.native_admission_imports WHERE request_sha256=$1",
+    )
+    .bind(second.id()?)
+    .fetch_one(&pool)
+    .await?;
+    let mut reused: hft_research_platform::admission::SignedNativeAdmission =
+        serde_json::from_value(second_row)?;
+    reused.evidence.operation_sha256 = original_operation;
+    let reused = hft_research_platform::admission::sign(
+        reused.evidence,
+        "fixture-native-issuer".into(),
+        &key,
+    )?;
+    assert!(ledger
+        .register_native_admission(&native_trust.verify(&reused)?)
+        .await
+        .is_err());
     ledger.submit("fixture", "two", second).await?;
     let session_temp = tempfile::tempdir()?;
     let session_root = session_temp.path().canonicalize()?;
@@ -587,6 +709,10 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     result.task.stage_result(&lease, result.now_ms, receipt)?;
     let result_id = result.task.id.clone();
     result.commit("fixture_result_staged").await?;
+    assert!(ledger
+        .native_terminal_snapshot("fixture", &result_id)
+        .await
+        .is_err());
     sqlx_core::query::query(
         "INSERT INTO research.revocations(request_sha256,reason_receipt_sha256) VALUES($1,$2)",
     )
@@ -615,9 +741,399 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     let mut cancelled = ledger.lock_next("result-owner", 30000).await?.unwrap();
     cancelled.task.stop(State::Cancelled, false)?;
     cancelled.task.stopped(lease.attempt, lease.fence)?;
-    cancelled.commit("fixture_revoked_cancelled").await?;
+    cancelled.commit("stop_reconciled").await?;
     assert_eq!(ledger.read(&result_id).await?.state, State::Cancelled);
     assert!(ledger.read(&result_id).await?.receipt.is_none());
+    // Historical readback is not new execution authority. Revocation remains
+    // readable, while foreign scopes and missing reconciled events are rejected.
+    let snapshot = ledger
+        .native_terminal_snapshot("fixture", &result_id)
+        .await?;
+    assert_eq!(snapshot.task.state, State::Cancelled);
+    assert_eq!(snapshot.native_admission.evidence.tenant, "fixture");
+    assert!(snapshot.result.is_none());
+    assert_eq!(
+        snapshot
+            .execution_event
+            .as_ref()
+            .unwrap()
+            .document
+            .execution
+            .as_ref()
+            .unwrap()
+            .uid,
+        "fixture-result"
+    );
+    assert!(ledger
+        .native_terminal_snapshot("foreign", &result_id)
+        .await
+        .is_err());
+    assert!(ledger
+        .native_terminal_snapshot("fixture", &hash('0'))
+        .await
+        .is_err());
+    // A readback cannot append an event or charge/refund a native budget.
+    let before: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.events")
+        .fetch_one(&pool)
+        .await?;
+    ledger
+        .native_terminal_snapshot("fixture", &result_id)
+        .await?;
+    let after: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.events")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(before, after);
+
+    // A separate synthetic Prepare request exercises scheduled source revocation.
+    // These signatures prove receiver semantics, never real source publication.
+    plan.spec.split = Split::Train;
+    let mut revoke_spec = ledger.read(&result_id).await?.spec;
+    revoke_spec.kind = TaskKind::Prepare;
+    revoke_spec.timeout_ms = 60_000;
+    revoke_spec.view_manifest_sha256 = ledger.register_plan(&plan).await?;
+    run.kind = revoke_spec.kind;
+    run.data_manifest_sha256 = revoke_spec.view_manifest_sha256.clone();
+    run.seed += 1;
+    revoke_spec.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
+    admit(revoke_spec.clone()).await?;
+    let revoke_task = ledger
+        .submit("fixture", "source-revoke", revoke_spec.clone())
+        .await?;
+    let native: hft_research_platform::admission::SignedNativeAdmission = serde_json::from_value(
+        sqlx_core::query_scalar::query_scalar(
+            "SELECT document FROM research.native_admission_imports WHERE request_sha256=$1",
+        )
+        .bind(&revoke_task)
+        .fetch_one(&pool)
+        .await?,
+    )?;
+    use hft_research_platform::revocation::{
+        sign_revocation, NativeRequestRevocation, NATIVE_REQUEST_REVOCATION_SCHEMA,
+    };
+    let now: i64 = sqlx_core::query_scalar::query_scalar(
+        "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let mut evidence = NativeRequestRevocation {
+        schema: NATIVE_REQUEST_REVOCATION_SCHEMA.into(),
+        tenant: native.evidence.tenant.clone(),
+        request_sha256: revoke_task.clone(),
+        operation_sha256: native.evidence.operation_sha256.clone(),
+        family_id: native.evidence.family_id.clone(),
+        root_grant_sha256: native.evidence.root_grant_sha256.clone(),
+        reason_receipt_sha256: hash('1'),
+        effective_ms: now + 40_000,
+        issued_ms: now,
+    };
+    let witness = |e| {
+        native_trust.verify_revocation(&sign_revocation(e, "fixture-native-issuer".into(), &key)?)
+    };
+    // A trusted signature still cannot redirect the original admitted identity.
+    for field in 0..5 {
+        let mut changed = evidence.clone();
+        match field {
+            0 => changed.tenant = "foreign".into(),
+            1 => changed.request_sha256 = hash('9'),
+            2 => changed.operation_sha256 = hash('9'),
+            3 => changed.family_id = "foreign".into(),
+            _ => changed.root_grant_sha256 = hash('9'),
+        }
+        assert!(ledger
+            .register_native_request_revocation(&witness(changed)?)
+            .await
+            .is_err());
+    }
+    let count: i64 = sqlx_core::query_scalar::query_scalar(
+        "SELECT count(*) FROM research.native_request_revocations",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 0);
+    // Import uses the original admission row lock, including when it waited.
+    let mut admission_lock = pool.begin().await?;
+    sqlx_core::query::query(
+        "SELECT request_sha256 FROM research.admissions WHERE request_sha256=$1 FOR UPDATE",
+    )
+    .bind(&revoke_task)
+    .fetch_one(&mut *admission_lock)
+    .await?;
+    let verified = witness(evidence.clone())?;
+    let import = ledger.register_native_request_revocation(&verified);
+    tokio::pin!(import);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut import)
+            .await
+            .is_err()
+    );
+    admission_lock.rollback().await?;
+    let revocation_id = import.await?;
+    assert_eq!(
+        ledger.register_native_request_revocation(&verified).await?,
+        revocation_id
+    );
+    let mut conflicting = evidence.clone();
+    conflicting.effective_ms += 1;
+    assert!(ledger
+        .register_native_request_revocation(&witness(conflicting)?)
+        .await
+        .is_err());
+    let mut later = evidence.clone();
+    later.reason_receipt_sha256 = hash('2');
+    later.effective_ms += 1_000;
+    ledger
+        .register_native_request_revocation(&witness(later)?)
+        .await?;
+    // A later recorded reason can take effect earlier; history is retained.
+    evidence.reason_receipt_sha256 = hash('3');
+    evidence.effective_ms -= 1_000;
+    sqlx_core::raw_sql::raw_sql("CREATE ROLE monday_revocation_importer; GRANT USAGE ON SCHEMA research TO monday_revocation_importer; GRANT SELECT ON research.admissions,research.native_admission_imports TO monday_revocation_importer; GRANT UPDATE(request_sha256) ON research.admissions TO monday_revocation_importer; GRANT SELECT,INSERT ON research.native_request_revocations TO monday_revocation_importer;").execute(&pool).await?;
+    let importer_url = format!("{url}?options=-c%20role%3Dmonday_revocation_importer");
+    let importer = Ledger::connect(&importer_url).await?;
+    importer
+        .register_native_request_revocation(&witness(evidence.clone())?)
+        .await?;
+    let importer_pool = sqlx_postgres::PgPool::connect(&importer_url).await?;
+    let error = sqlx_core::query::query(
+        "UPDATE research.admissions SET request_sha256=request_sha256 WHERE request_sha256=$1",
+    )
+    .bind(&revoke_task)
+    .execute(&importer_pool)
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("immutable research record"));
+    let error = sqlx_core::query::query(
+        "INSERT INTO research.revocations(request_sha256,reason_receipt_sha256) VALUES($1,$2)",
+    )
+    .bind(&revoke_task)
+    .bind(hash('5'))
+    .execute(&importer_pool)
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("permission denied"));
+    let error = sqlx_core::query::query(
+        "UPDATE research.native_request_revocations SET effective_ms=effective_ms",
+    )
+    .execute(&importer_pool)
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("permission denied"));
+    importer_pool.close().await;
+    assert_eq!(
+        ledger.native_request_deadline_ms(&revoke_task).await?,
+        Some(evidence.effective_ms)
+    );
+    assert!(ledger.admission(&revoke_spec).await?.is_some());
+    assert!(ledger.admits_launch(&revoke_spec, 1_000).await?);
+    assert!(
+        !ledger
+            .admits_launch(&revoke_spec, revoke_spec.timeout_ms)
+            .await?
+    );
+    let count: i64 = sqlx_core::query_scalar::query_scalar(
+        "SELECT count(*) FROM research.native_request_revocations",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 3);
+    assert!(sqlx_core::query::query(
+        "UPDATE research.native_request_revocations SET effective_ms=effective_ms"
+    )
+    .execute(&pool)
+    .await
+    .is_err());
+    assert!(
+        sqlx_core::query::query("DELETE FROM research.native_request_revocations")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    sqlx_core::raw_sql::raw_sql("CREATE ROLE monday_revocation_reader; GRANT USAGE ON SCHEMA research TO monday_revocation_reader; GRANT EXECUTE ON FUNCTION research.native_request_deadline_ms(text) TO monday_revocation_reader;").execute(&pool).await?;
+    let mut reader = pool.begin().await?;
+    sqlx_core::query::query("SET LOCAL ROLE monday_revocation_reader")
+        .execute(&mut *reader)
+        .await?;
+    let cap: Option<i64> =
+        sqlx_core::query_scalar::query_scalar("SELECT research.native_request_deadline_ms($1)")
+            .bind(&revoke_task)
+            .fetch_one(&mut *reader)
+            .await?;
+    assert_eq!(cap, Some(evidence.effective_ms));
+    assert!(sqlx_core::query::query("INSERT INTO research.native_request_revocations SELECT * FROM research.native_request_revocations").execute(&mut *reader).await.is_err());
+    reader.rollback().await?;
+    let mut running = ledger.lock_next("revoke-owner", 30_000).await?.unwrap();
+    assert_eq!(running.task.id, revoke_task);
+    let cap = running.native_request_deadline_ms().await?.unwrap();
+    running.task.deadline_ms = running.task.deadline_ms.map(|deadline| deadline.min(cap));
+    let revoke_lease = running.task.lease.clone().unwrap();
+    let handle = hft_research_platform::execution::ExecutionHandle {
+        backend: running.task.spec.profile.backend,
+        cluster: running.task.spec.profile.cluster.clone(),
+        namespace: running.task.spec.profile.namespace.clone(),
+        name: hft_research_platform::execution::resource_name(&revoke_lease),
+        uid: "fixture-revoke".into(),
+        attempt: revoke_lease.attempt,
+        fence: revoke_lease.fence,
+        task_id: revoke_task.clone(),
+        request_sha256: revoke_task.clone(),
+    };
+    running
+        .task
+        .launched(&revoke_lease, running.now_ms, handle)?;
+    running.commit("fixture_revoke_running").await?;
+    let mut preparation = ledger
+        .preparation(&revoke_task, revoke_lease.attempt, revoke_lease.fence)
+        .await?;
+    assert_eq!(preparation.task().deadline_ms, Some(evidence.effective_ms));
+    evidence.reason_receipt_sha256 = hash('4');
+    evidence.effective_ms = now - 1;
+    let due = witness(evidence.clone())?;
+    #[cfg(feature = "gateway")]
+    {
+        // Upload holds the same admission lock until publication completes.
+        let mut permit = pool.begin().await?;
+        sqlx_core::query::query("SET LOCAL ROLE monday_gateway_fixture")
+            .execute(&mut *permit)
+            .await?;
+        let _: String = sqlx_core::query_scalar::query_scalar(
+            "SELECT research.artifact_write_permit($1,$2,$3,$4)",
+        )
+        .bind("fixture")
+        .bind(&revoke_task)
+        .bind(revoke_lease.attempt as i32)
+        .bind(revoke_lease.fence)
+        .fetch_one(&mut *permit)
+        .await?;
+        let mut during_upload = evidence.clone();
+        during_upload.reason_receipt_sha256 = hash('5');
+        during_upload.effective_ms = cap + 1_000;
+        let during_upload = witness(during_upload)?;
+        let import = ledger.register_native_request_revocation(&during_upload);
+        tokio::pin!(import);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut import)
+                .await
+                .is_err()
+        );
+        permit.rollback().await?;
+        import.await?;
+        // Reverse ordering: an upload waiting on import must see its new cap.
+        // Pause the validated import transaction at its pre-commit boundary.
+        due.evidence().matches_admission(&native.evidence)?;
+        let mut import_tx = pool.begin().await?;
+        sqlx_core::query::query("SET LOCAL ROLE monday_revocation_importer")
+            .execute(&mut *import_tx)
+            .await?;
+        sqlx_core::query::query(
+            "SELECT request_sha256 FROM research.admissions WHERE request_sha256=$1 FOR UPDATE",
+        )
+        .bind(&revoke_task)
+        .fetch_one(&mut *import_tx)
+        .await?;
+        sqlx_core::query::query("INSERT INTO research.native_request_revocations(evidence_sha256,request_sha256,tenant,operation_sha256,family_id,root_grant_sha256,reason_receipt_sha256,effective_ms,issued_ms,trust_sha256,document,trust_document) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
+            .bind(due.evidence().id()?).bind(&revoke_task).bind(&due.evidence().tenant).bind(&due.evidence().operation_sha256)
+            .bind(&due.evidence().family_id).bind(&due.evidence().root_grant_sha256).bind(&due.evidence().reason_receipt_sha256)
+            .bind(due.evidence().effective_ms).bind(due.evidence().issued_ms).bind(due.trust_sha256())
+            .bind(serde_json::to_value(due.signed())?).bind(serde_json::to_value(&native_trust)?)
+            .execute(&mut *import_tx).await?;
+        let upload = sqlx_core::query_scalar::query_scalar::<_, String>(
+            "SELECT research.artifact_write_permit($1,$2,$3,$4)",
+        )
+        .bind("fixture")
+        .bind(&revoke_task)
+        .bind(revoke_lease.attempt as i32)
+        .bind(revoke_lease.fence)
+        .fetch_one(&pool);
+        tokio::pin!(upload);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut upload)
+                .await
+                .is_err()
+        );
+        import_tx.commit().await?;
+        assert!(upload
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("native artifact admission absent, revoked or expired"));
+        assert_eq!(
+            ledger.register_native_request_revocation(&due).await?,
+            due.evidence().id()?
+        );
+    }
+    #[cfg(not(feature = "gateway"))]
+    ledger.register_native_request_revocation(&due).await?;
+    assert!(ledger.admission(&revoke_spec).await?.is_none());
+    assert!(!ledger.admits_launch(&revoke_spec, 1_000).await?);
+    assert!(preparation.check().await.is_err());
+    assert!(ledger
+        .artifact_writer(
+            "fixture",
+            &revoke_task,
+            revoke_lease.attempt,
+            revoke_lease.fence
+        )
+        .await
+        .is_err());
+    drop(preparation);
+    let mut completed = ledger.lock_next("revoke-owner", 30_000).await?.unwrap();
+    let mut revoked_view = view.clone();
+    revoked_view.spec = plan.spec.clone();
+    revoked_view.prepared_id = identity(&(&revoke_task, revoke_lease.attempt, revoke_lease.fence))?;
+    revoked_view.producer_image = completed.task.spec.image.clone();
+    let receipt = hft_research_platform::orchestrator::ResultReceipt {
+        task_id: revoke_task.clone(),
+        attempt: revoke_lease.attempt,
+        fence: revoke_lease.fence,
+        view_manifest_sha256: completed.task.spec.view_manifest_sha256.clone(),
+        source_sha256: completed.task.spec.source_sha256.clone(),
+        image: completed.task.spec.image.clone(),
+        fit_identity_sha256: None,
+        artifacts: vec![hft_research_platform::orchestrator::Artifact {
+            key: format!(
+                "{}/{}/{}/{}.mondaybin",
+                completed.task.spec.output_prefix,
+                revoke_task,
+                revoke_lease.attempt,
+                hash('d')
+            ),
+            sha256: hash('d'),
+            bytes: 16,
+        }],
+        checkpoint: None,
+        prepared_view: Some(revoked_view),
+    };
+    completed
+        .task
+        .stage_result(&revoke_lease, completed.now_ms, receipt)?;
+    completed.commit("fixture_revoke_result_staged").await?;
+    let mut completed = ledger.lock_next("revoke-owner", 30_000).await?.unwrap();
+    completed
+        .task
+        .stopped(revoke_lease.attempt, revoke_lease.fence)?;
+    assert!(completed
+        .commit("fixture_revoke_terminal_rejected")
+        .await
+        .is_err());
+    let count: i64 = sqlx_core::query_scalar::query_scalar(
+        "SELECT count(*) FROM research.results WHERE task_id=$1",
+    )
+    .bind(&revoke_task)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 0);
+    // Source history does not alter existing immediate manual PG revocation.
+    let manual: String = sqlx_core::query_scalar::query_scalar(
+        "SELECT reason_receipt_sha256 FROM research.revocations WHERE request_sha256=$1",
+    )
+    .bind(&result_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(manual, hash('f'));
+    assert!(sqlx_core::query::query("DELETE FROM research.revocations")
+        .execute(&pool)
+        .await
+        .is_err());
 
     let count: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.events")
         .fetch_one(&pool)

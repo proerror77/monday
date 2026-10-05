@@ -5,9 +5,10 @@ use crate::{
     },
     governance, mission,
 };
+use ::governance::attribution::AttributionMode;
 use alpha_domain::{
-    runtime_stage_is_healthy, AttributionMode, LoopCompletionPolicy, LoopRun, LoopRunStatus,
-    LoopStage, LoopStageRecord, LoopStageStatus, LoopStopReason, LoopTargetStage, MissionStatus,
+    runtime_stage_is_healthy, LoopCompletionPolicy, LoopRun, LoopRunStatus, LoopStage,
+    LoopStageRecord, LoopStageStatus, LoopStopReason, LoopTargetStage, MissionStatus,
 };
 use alpha_store::{AlphaStore, StoreError};
 use anyhow::{bail, Context};
@@ -547,16 +548,18 @@ mod tests {
         },
         data_mission, governance,
     };
+    use ::governance::attribution::{
+        sign_runtime_attribution_event, AttributionKind, AttributionOutcome,
+        RuntimeAttributionEvent,
+    };
     use ::governance::{
         deployment_scope_hash, AllowedIntentType, ApprovalClass, DeploymentEnvelope,
         LiveSmallEligibilityEvidence,
     };
     use alpha_domain::{
-        sign_runtime_attribution_event, AttributionKind, AttributionOutcome, CandidateArtifact,
-        EngineKind, EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1,
-        EvaluationWalkForwardV1, IterationVerdict, MissionTerminalReason, ResearchIteration,
-        ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage,
-        SEALED_HOLDOUT_EVALUATOR_VERSION,
+        CandidateArtifact, EngineKind, EvaluationCostsV1, EvaluationLabelSpecV1,
+        EvaluationProtocolV1, EvaluationWalkForwardV1, IterationVerdict, MissionTerminalReason,
+        ResearchIteration, ResearchMission, SearchBudgetUsage, SEALED_HOLDOUT_EVALUATOR_VERSION,
     };
     use alpha_engine::{
         evaluation::prepare_dataset,
@@ -700,7 +703,7 @@ mod tests {
             promotion_id: promotion.record.promotion_id.clone(),
             promotion_manifest_hash: promotion.content_hash,
             bundle_id: bundle.bundle_id.clone(),
-            bundle_hash: bundle.bundle_hash,
+            bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
             runtime_config_hash: "d".repeat(64),
             risk_policy_hash: "e".repeat(64),
             account_id: "account-e2e".to_string(),

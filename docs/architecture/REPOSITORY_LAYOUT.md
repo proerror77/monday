@@ -102,6 +102,21 @@ identity. It imports no venue, scientific model, scheduler, database, risk or
 execution crate. CEX Campaign and holdout object bindings remain CEX-owned.
 The CEX harness contains no Prediction command or Prediction-owned dependency.
 
+## Runtime strategy handoff
+
+`rust_hft/governance-contracts` owns the fixed `monday.runtime_bundle.v1`
+artifact and signed runtime attribution schema. `alpha-domain` validates complete
+scientific evidence and projects only executable Formula, CEX execution, frozen
+parameters or ONNX metadata. `hft-live` consumes that projection; its normal and
+full graphs reject research domain, evaluation, store and training. Scientific
+fixtures are explicit dev-only consumers. ONNX metadata has one shared owner.
+
+The scientific promotion remains immutable audit evidence. Its hash is
+`source_bundle_hash`; the runtime projection has its own `bundle_hash`. The signed
+envelope and exact operator approval must bind the runtime hash. Old scientific
+handoff files cannot activate the new intake. Historical DB records remain
+readable; there is no compatibility fallback.
+
 ## Enforced invariants
 
 - `products/ploy` must not exist.
