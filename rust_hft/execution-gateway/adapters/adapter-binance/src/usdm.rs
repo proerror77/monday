@@ -86,8 +86,6 @@ pub struct BinanceUsdMExecutionClient {
     private_stream_connected: Arc<AtomicBool>,
     resilient_executor: Option<Arc<ResilientExecutor>>,
     alert_callback: Option<AlertCallback>,
-    next_client_order_id: Option<String>,
-    next_reduce_only: Option<bool>,
     shutdown_tx: Option<watch::Sender<bool>>,
     private_event_receiver: std::sync::Mutex<Option<broadcast::Receiver<ExecutionEvent>>>,
 }
@@ -1122,8 +1120,6 @@ impl BinanceUsdMExecutionClient {
             private_stream_connected: Arc::new(AtomicBool::new(false)),
             resilient_executor: None,
             alert_callback: None,
-            next_client_order_id: None,
-            next_reduce_only: None,
             shutdown_tx: None,
             private_event_receiver: std::sync::Mutex::new(None),
         }
@@ -1261,15 +1257,6 @@ impl BinanceUsdMExecutionClient {
         Ok(())
     }
 
-    fn next_client_order_id(&mut self) -> HftResult<String> {
-        let id = self
-            .next_client_order_id
-            .take()
-            .unwrap_or_else(|| format!("BINANCE_USDM_{:x}", hft_core::now_micros()));
-        validate_client_order_id(&id)?;
-        Ok(id)
-    }
-
     fn remember_order(&self, order_id: &OrderId, mut record: UsdMOrderRecord) -> HftResult<()> {
         let mut records = self
             .order_records
@@ -1325,10 +1312,22 @@ impl BinanceUsdMExecutionClient {
 #[async_trait]
 impl ExecutionClient for BinanceUsdMExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
-        self.validate_intent(&intent)?;
+        self.place_order_envelope(&OrderIntentEnvelope::new(intent, Default::default()))
+            .await
+    }
+
+    async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
+        let intent = &envelope.intent;
+        self.validate_intent(intent)?;
+        envelope
+            .validate_cex_pre_execution(hft_core::now_micros(), None)
+            .map_err(|reason| {
+                HftError::Execution(format!("execution envelope rejected: {reason:?}"))
+            })?;
         self.require_private_access("place_order")?;
-        let client_order_id = self.next_client_order_id()?;
-        let reduce_only = self.next_reduce_only.take().unwrap_or(false);
+        let client_order_id = envelope.client_order_id.clone();
+        validate_client_order_id(&client_order_id)?;
+        let reduce_only = envelope.lifecycle.reduce_only;
         self.ensure_http()?;
         let mut params = HashMap::from([
             ("symbol".to_string(), intent.symbol.as_str().to_string()),
@@ -1414,30 +1413,12 @@ impl ExecutionClient for BinanceUsdMExecutionClient {
         Ok(order_id)
     }
 
-    async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
-        envelope
-            .validate_cex_pre_execution(hft_core::now_micros(), None)
-            .map_err(|reason| {
-                HftError::Execution(format!("execution envelope rejected: {reason:?}"))
-            })?;
-        self.next_client_order_id = Some(envelope.client_order_id.clone());
-        self.next_reduce_only = Some(envelope.lifecycle.reduce_only);
-        self.place_order(envelope.intent.clone()).await
-    }
-
     async fn place_order_envelope_traced(
         &mut self,
         envelope: &OrderIntentEnvelope,
     ) -> ExecutionSubmissionAttempt {
-        if let Err(reason) = envelope.validate_cex_pre_execution(hft_core::now_micros(), None) {
-            return ExecutionSubmissionAttempt::without_transport_timing(Err(HftError::Execution(
-                format!("execution envelope rejected: {reason:?}"),
-            )));
-        }
-        self.next_client_order_id = Some(envelope.client_order_id.clone());
-        self.next_reduce_only = Some(envelope.lifecycle.reduce_only);
         ExecutionSubmissionAttempt::without_transport_timing(
-            self.place_order(envelope.intent.clone()).await,
+            self.place_order_envelope(envelope).await,
         )
     }
 
@@ -1790,6 +1771,74 @@ mod tests {
         }
     }
 
+    fn cex_bounded_envelope(intent: ports::OrderIntent) -> OrderIntentEnvelope {
+        let now = hft_core::now_micros();
+        let mut envelope = OrderIntentEnvelope::new(
+            intent.clone(),
+            OrderIntentLifecycle {
+                created_ts: now,
+                max_slippage_bps: Some(25),
+                max_order_notional: Some(Decimal::from(1_000_000)),
+                max_order_quantity: Some(Decimal::from(10)),
+                max_latency_us: Some(60_000_000),
+                ..Default::default()
+            },
+        );
+        envelope.price_reference = Some(ports::ExecutionPriceReference {
+            venue: intent.target_venue.expect("usd-m test intent has a venue"),
+            symbol: intent.symbol.clone(),
+            side: intent.side,
+            price: intent.price.expect("usd-m test intent has a price"),
+            book_sequence: 1,
+            received_at: hft_core::LocalReceiveTimestamp::new(now),
+        });
+        envelope
+    }
+
+    #[tokio::test]
+    async fn usd_m_cex_envelope_limits_reject_bare_and_unbounded_orders_before_submission() {
+        for mode in [
+            ExecutionMode::Paper,
+            ExecutionMode::Live,
+            ExecutionMode::Testnet,
+        ] {
+            let mut client = BinanceUsdMExecutionClient::new(config(mode));
+            let (tx, mut rx) = broadcast::channel(8);
+            client.event_tx = Some(tx);
+            let error = client.place_order(perp_intent()).await.unwrap_err();
+            assert!(
+                matches!(error, HftError::Execution(message) if message.contains("MissingMaxSlippage"))
+            );
+            for missing in [
+                "MissingMaxSlippage",
+                "MissingMaxOrderNotional",
+                "MissingMaxOrderQuantity",
+            ] {
+                let mut envelope = cex_bounded_envelope(perp_intent());
+                match missing {
+                    "MissingMaxSlippage" => envelope.lifecycle.max_slippage_bps = None,
+                    "MissingMaxOrderNotional" => envelope.lifecycle.max_order_notional = None,
+                    _ => envelope.lifecycle.max_order_quantity = None,
+                }
+                let error = client.place_order_envelope(&envelope).await.unwrap_err();
+                assert!(matches!(error, HftError::Execution(message) if message.contains(missing)));
+                let attempt = client.place_order_envelope_traced(&envelope).await;
+                assert!(
+                    matches!(attempt.outcome, Err(HftError::Execution(message)) if message.contains(missing))
+                );
+                assert!(attempt.userspace_write_started_mono_us.is_none());
+                assert!(attempt.userspace_write_returned_mono_us.is_none());
+                assert!(attempt.response_received_mono_us.is_none());
+            }
+            assert!(client.http_client.is_none());
+            assert!(client.order_records.lock().unwrap().is_empty());
+            assert!(matches!(
+                rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
     fn valid_order() -> BinanceUsdMOrder {
         BinanceUsdMOrder {
             symbol: "BTCUSDT".to_string(),
@@ -1900,12 +1949,8 @@ mod tests {
             BinanceCredentials::new("test-key".to_string(), "test-secret".to_string());
         cfg.rest_base_url = base_url;
         let mut client = BinanceUsdMExecutionClient::new(cfg);
-        let lifecycle = OrderIntentLifecycle {
-            reduce_only: true,
-            ..Default::default()
-        };
-        let envelope =
-            OrderIntentEnvelope::new(perp_intent(), lifecycle).with_client_order_id("client-usdm");
+        let mut envelope = cex_bounded_envelope(perp_intent()).with_client_order_id("client-usdm");
+        envelope.lifecycle.reduce_only = true;
 
         let order_id = client.place_order_envelope(&envelope).await.unwrap();
         assert_eq!(
@@ -2102,8 +2147,7 @@ mod tests {
             BinanceCredentials::new("test-key".to_string(), "test-secret".to_string());
         cfg.rest_base_url = base_url;
         let mut client = BinanceUsdMExecutionClient::new(cfg);
-        let envelope = OrderIntentEnvelope::new(perp_intent(), OrderIntentLifecycle::default())
-            .with_client_order_id("client-usdm");
+        let envelope = cex_bounded_envelope(perp_intent()).with_client_order_id("client-usdm");
 
         let error = client.place_order_envelope(&envelope).await.unwrap_err();
         assert!(
@@ -2124,8 +2168,7 @@ mod tests {
             BinanceCredentials::new("test-key".to_string(), "test-secret".to_string());
         cfg.rest_base_url = base_url;
         let mut client = BinanceUsdMExecutionClient::new(cfg);
-        let envelope = OrderIntentEnvelope::new(perp_intent(), OrderIntentLifecycle::default())
-            .with_client_order_id("client-usdm");
+        let envelope = cex_bounded_envelope(perp_intent()).with_client_order_id("client-usdm");
 
         let error = client.place_order_envelope(&envelope).await.unwrap_err();
         assert!(matches!(error, HftError::Network(message) if message.contains("outcome unknown")));
@@ -2279,7 +2322,10 @@ mod tests {
             client.place_order(spot).await,
             Err(HftError::InvalidOrder(_))
         ));
-        let place_error = client.place_order(perp_intent()).await.unwrap_err();
+        let place_error = client
+            .place_order_envelope(&cex_bounded_envelope(perp_intent()))
+            .await
+            .unwrap_err();
         assert!(place_error
             .to_string()
             .contains("canonical simulated execution client"));
@@ -2320,6 +2366,8 @@ mod tests {
     async fn usd_m_both_envelope_entrypoints_apply_cex_gate_before_submission() {
         let lifecycle = OrderIntentLifecycle {
             max_slippage_bps: Some(25),
+            max_order_notional: Some(Decimal::from(10_000)),
+            max_order_quantity: Some(Decimal::from(10)),
             ..Default::default()
         };
         let envelope = OrderIntentEnvelope::new(perp_intent(), lifecycle)
