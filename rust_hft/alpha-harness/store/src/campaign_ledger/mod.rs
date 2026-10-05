@@ -12,12 +12,14 @@ pub use final_dispatch::{
     CampaignFinalOutcomeV1,
 };
 mod platform_budget;
+mod platform_terminal;
 mod platform_transfer;
 mod state;
 pub use platform_budget::{
     VerifiedCampaignPlatformBudget, VerifiedCampaignPlatformExport,
     VerifiedCampaignPlatformRevocation,
 };
+pub use platform_terminal::VerifiedCampaignPlatformTerminalSource;
 pub use platform_transfer::CampaignPlatformTransferV1;
 
 pub use dispatch::{
@@ -1220,6 +1222,60 @@ mod tests {
         let mut changed = reservation.clone();
         changed.declared_trials += 1;
         assert!(read(&mut store, &changed).is_err());
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
+    }
+
+    #[test]
+    fn platform_terminal_source_is_historical_and_requires_published_exclusive_transfer() {
+        let (mut store, verified) = registered();
+        let reservation = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &reservation, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let operation = reservation.operation_id().unwrap();
+        assert!(store
+            .campaign_platform_terminal_source(FAMILY, &operation)
+            .is_err());
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: operation.clone(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        let receipt = store
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+            )
+            .unwrap();
+        assert!(store
+            .campaign_platform_terminal_source(FAMILY, &operation)
+            .is_err());
+        acknowledge_all(&mut store);
+        store
+            .revoke_approval(APPROVAL, "operator", "source revoked", minutes(1))
+            .unwrap();
+        let before = store.campaign_family_usage(FAMILY).unwrap();
+        let witness = store
+            .campaign_platform_terminal_source(FAMILY, &operation)
+            .unwrap();
+        assert_eq!(witness.root().signed_grant(), verified.signed_grant());
+        assert_eq!(witness.reservation(), &reservation);
+        assert_eq!(witness.transfer(), &transfer);
+        assert_eq!(witness.transfer_receipt(), &receipt);
+        assert_eq!(
+            witness.operation_sha256().unwrap(),
+            alpha_domain::canonical_json_hash(&operation).unwrap()
+        );
+        assert!(store
+            .campaign_platform_terminal_source("foreign", &operation)
+            .is_err());
+        assert!(store
+            .campaign_platform_terminal_source(FAMILY, "caller-renamed-op")
+            .is_err());
         assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
     }
 
