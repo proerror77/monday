@@ -6254,6 +6254,17 @@ pub(crate) mod tests {
                 "native evidence mutation {mutation} was accepted"
             );
         }
+        platform_output::assert_publication(
+            &LoadedRequest {
+                request: fixture.request.clone(),
+                sha256: fixture.inputs.request_sha256().into(),
+            },
+            &fixture.inputs,
+            &result,
+            &hash,
+            &work_dir,
+        )
+        .unwrap();
     }
 
     #[test]

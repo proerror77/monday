@@ -49,6 +49,20 @@ remain exact lineage metadata. Development bytes never use the original
 full-source feature SHA filename. Recovery rejects altered or missing blocks,
 foreign lineage metadata, and withheld evaluation artifacts.
 
+The platform worker verifies the admitted Attempt, exact static configuration,
+native signature, source revision, protocol and expiry before fitting. Static
+files use `/config`; per-Attempt credentials use `/identity`. Credentials never
+enter the static configuration hash. The private reader hashes and parses one
+snapshot of the static files. No signing key or database credential reaches the
+worker.
+
+After independent native ZIP recovery, the worker uploads the actual campaign
+result and round archives through the scoped TLS writer. Immutable PUT recovery
+requires actual GET bytes. `cex-campaign.json` binds the original request,
+collection, source, trials and decoded archive entries. `receipt.json` binds the
+same artifacts to the admitted Task, Attempt and fence. Successful transport
+keeps the scientific status `insufficient_evidence`.
+
 Platform CexCampaign admission, its transferred native budget, the platform
 lease/attempt fence and terminal settlement are separate enforced boundaries.
 The data inspector is not a substitute for any of them. Sequence and market
