@@ -14,12 +14,24 @@ async fn ledger() -> Result<Ledger> {
 }
 
 fn read<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
+    read_bounded(path, 1024 * 1024)
+}
+fn read_bounded<T: serde::de::DeserializeOwned>(path: &str, max_bytes: u64) -> Result<T> {
+    use rustix::fs::{open, Mode, OFlags};
     use std::io::Read;
+    let file = std::fs::File::from(open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?);
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= max_bytes,
+        "input must be a bounded regular file"
+    );
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > 1024 * 1024 {
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
         bail!("input exceeds bound");
     }
     Ok(serde_json::from_slice(&bytes)?)
@@ -47,6 +59,24 @@ async fn main() -> Result<()> {
             let verified=trust.verify(&value,&signed)?;
             println!("{}",ledger().await?.register_build(&verified).await?);
         }
+        ["register-native-admission",path]=>{
+            let signed:hft_research_platform::admission::SignedNativeAdmission=read(path)?;
+            let trust_path=std::env::var("MONDAY_RESEARCH_NATIVE_ADMISSION_TRUST_FILE").context("operator native reservation trust file required")?;
+            let trust:hft_research_platform::admission::NativeAdmissionTrust=read(&trust_path)?;
+            let verified=trust.verify(&signed)?;
+            println!("{}",ledger().await?.register_native_admission(&verified).await?);
+        }
+        ["register-native-campaign-inputs",signed_path,manifest_path,blocks_path]=>{
+            let signed:hft_research_platform::admission::SignedNativeAdmission=read(signed_path)?;
+            let trust_path=std::env::var("MONDAY_RESEARCH_NATIVE_ADMISSION_TRUST_FILE").context("operator native reservation trust file required")?;
+            let trust:hft_research_platform::admission::NativeAdmissionTrust=read(&trust_path)?;
+            let native=trust.verify(&signed)?;
+            let manifest:hft_cex_research_input::campaign::CampaignPreparedInputsV1=read_bounded(manifest_path,64*1024*1024)?;
+            let mut source=hft_cex_research_input::prepared::SharedFiles::new(std::path::Path::new(blocks_path))?;
+            let max_bytes=u64::from(native.evidence().admission.task_spec.profile.memory_mib)*1024*1024/2;
+            let verified=hft_research_platform::campaign::verify_inputs(&native,manifest,&mut source,max_bytes)?;
+            println!("{}",ledger().await?.register_campaign_inputs(&verified,&native).await?);
+        }
         ["subscribe",tenant,session,run]=>{ledger().await?.subscribe(tenant,session,run).await?;println!("subscribed");}
         ["register-experiment",tenant,path]=>{let value:Experiment=read(path)?;println!("{}",ledger().await?.register_experiment(tenant,&value).await?);}
         ["register-run",tenant,path]=>{let value:Run=read(path)?;println!("{}",ledger().await?.register_run(tenant,&value).await?);}
@@ -58,7 +88,7 @@ async fn main() -> Result<()> {
         ["view",path] => { let spec: hft_cex_research_input::data::DataViewSpec=read(path)?; println!("{}",serde_json::to_string(&ledger().await?.find_view(&spec).await?.context("view has not been published")?)?); }
         ["cancel", id] => { ledger().await?.cancel(id).await?; println!("cancel_requested"); }
         ["status", id] => { println!("{}", serde_json::to_string(&ledger().await?.read(id).await?)?); }
-        _ => bail!("usage: researchctl plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID"),
+        _ => bail!("usage: researchctl plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | register-native-admission SIGNED_NATIVE_RESERVATION | register-native-campaign-inputs SIGNED_NATIVE_RESERVATION COLLECTION BLOCK_DIRECTORY | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID"),
     }
     Ok(())
 }

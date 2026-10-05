@@ -495,7 +495,7 @@ fn stamp(clock: &mut Option<&mut dyn FnMut() -> i64>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binance_md::{BookSyncState, SignalSide};
+    use crate::{BookSyncState, SignalSide};
 
     const BTCUSDT_ID: u32 = 1;
 

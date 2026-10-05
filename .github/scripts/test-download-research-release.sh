@@ -14,7 +14,8 @@ for binary in hft-backtest alpha-harness monday-cex-worker lob-pit-materializer 
 done
 export MONDAY_BUILD_INPUTS_FILE="$work/build-inputs.json"
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
-jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" '{schema:"monday.compilation-inputs.v2",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks}' >"$MONDAY_BUILD_INPUTS_FILE"
+workspace_profiles=$(ruby -rjson -rdigest -e 'root=ARGV[0]; puts JSON.generate(JSON.parse(File.read("#{root}/workspaces.json")).fetch("workspaces").to_h{|owner| manifest=owner.fetch("manifest"); [manifest,Digest::SHA256.file("#{root}/#{manifest}").hexdigest]})' "$root/rust_hft")
+jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" --argjson workspace_profiles "$workspace_profiles" --argjson recipes "$(bash "$root/.github/scripts/research-release-products.sh" recipes all | jq -s .)" '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks,builder_image:("builder@sha256:"+$h),recipes:$recipes,workspace_profiles:$workspace_profiles}' >"$MONDAY_BUILD_INPUTS_FILE"
 "$root/.github/scripts/research-image-release-artifact.sh" create "$work/release" "$source_sha" 1234 "$root/rust_hft"
 ruby "$root/.github/scripts/research-release-bundle.rb" pack "$work/research-image-release.tar" "$work/release"
 (cd "$work" && zip -q "$work/release.zip" research-image-release.tar)

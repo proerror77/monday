@@ -34,6 +34,14 @@ pub struct ArtifactGateway {
     token: String,
 }
 
+/// Request-local verified bytes and parsed evidence are reused through the
+/// terminal transaction. A later poll starts its own independent readback.
+#[derive(Debug)]
+pub struct ResultReadback {
+    receipt: ResultReceipt,
+    campaign: Option<crate::campaign_result::CexCampaignResultReceipt>,
+}
+
 impl ArtifactGateway {
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
         Self::with_tls(endpoint, token, &crate::transport::TlsConfig::default())
@@ -62,7 +70,7 @@ impl ArtifactGateway {
         })
     }
 
-    async fn get(&self, key: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn get(&self, key: &str, max_bytes: u64) -> Result<Option<Vec<u8>>> {
         ensure!(
             key.starts_with("research/")
                 && !key.contains("..")
@@ -99,7 +107,7 @@ impl ArtifactGateway {
         Ok(Some(bytes))
     }
 
-    pub async fn receipt(&self, task: &Task) -> Result<Option<ResultReceipt>> {
+    pub async fn receipt(&self, task: &Task) -> Result<Option<ResultReadback>> {
         let key = format!(
             "{}/{}/{}/receipt.json",
             task.spec.output_prefix, task.id, task.attempt
@@ -115,6 +123,31 @@ impl ArtifactGateway {
         // Prepared blocks are checked on the exact bytes being decoded. Reuse
         // that readback within this receipt, including its object key and size.
         let mut verified = std::collections::BTreeSet::new();
+        let mut campaign = None;
+        if task.spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+            let artifact = receipt
+                .artifacts
+                .iter()
+                .find(|a| a.key.ends_with("/cex-campaign.json"))
+                .context("Campaign result lacks native evidence receipt")?;
+            ensure!(
+                artifact.bytes <= 16 * 1024 * 1024,
+                "Campaign evidence receipt exceeds bound"
+            );
+            let bytes = self
+                .get(&artifact.key, artifact.bytes)
+                .await?
+                .context("Campaign evidence receipt missing")?;
+            ensure!(
+                bytes.len() as u64 == artifact.bytes && sha256(&bytes) == artifact.sha256,
+                "Campaign evidence receipt changed"
+            );
+            let science: crate::campaign_result::CexCampaignResultReceipt =
+                serde_json::from_slice(&bytes)?;
+            science.validate(&task.spec, &receipt.artifacts)?;
+            campaign = Some(science);
+            verified.insert((&artifact.key, &artifact.sha256, artifact.bytes));
+        }
         if let Some(view) = &receipt.prepared_view {
             let mut orders = std::collections::BTreeMap::<
                 hft_cex_research_input::data::Exit,
@@ -154,7 +187,7 @@ impl ArtifactGateway {
                 self.verify_artifact(artifact).await?;
             }
         }
-        Ok(Some(receipt))
+        Ok(Some(ResultReadback { receipt, campaign }))
     }
 
     pub async fn checkpoint(&self, task: &Task) -> Result<Option<crate::orchestrator::Checkpoint>> {
@@ -268,7 +301,14 @@ impl Reconciler {
                 return Ok(true);
             }
             lease = locked.task.heartbeat(&lease, now, self.lease_ms)?;
-            if self.ledger.admission(&locked.task.spec).await?.is_none() {
+            if !self
+                .ledger
+                .admits_launch(
+                    &locked.task.spec,
+                    locked.task.deadline_ms.context("launch lacks deadline")? - now,
+                )
+                .await?
+            {
                 locked.task.stop(State::Cancelled, false)?;
                 locked.commit("launch_admission_revoked").await?;
                 return Ok(true);
@@ -309,10 +349,15 @@ impl Reconciler {
                 let complete = observed == Observation::Succeeded
                     || locked.task.spec.profile.backend == Backend::AgentSandbox;
                 if complete {
-                    if let Some(receipt) = self.artifacts.receipt(&locked.task).await? {
+                    if let Some(readback) = self.artifacts.receipt(&locked.task).await? {
+                        if let Some(science) = &readback.campaign {
+                            self.ledger
+                                .validate_campaign_result(&locked.task, science)
+                                .await?;
+                        }
                         let now = locked.refresh_clock().await?;
                         if !locked.task.expire(now)? {
-                            locked.task.stage_result(&lease, now, receipt)?;
+                            locked.task.stage_result(&lease, now, readback.receipt)?;
                         }
                     }
                 }
