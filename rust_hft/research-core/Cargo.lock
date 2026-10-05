@@ -3120,6 +3120,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
+ "chrono",
  "hft-research-manifest",
  "serde",
  "serde_json",

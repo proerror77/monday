@@ -10,6 +10,7 @@ default = []
 streaming = ["dep:hft-research-manifest"]
 
 [dependencies]
+chrono = { workspace = true, features = ["serde"] }
 hft-research-manifest = { path = "../manifest", optional = true }
 anyhow = "1"
 serde = { workspace = true, features = ["derive"] }

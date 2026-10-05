@@ -1,6 +1,7 @@
 //! Immutable CEX time-series inputs shared by control and CPU workers.
 //! No database, provider, agent, acquisition or execution dependency.
 //! Prediction-market event and settlement inputs remain in their own contracts.
+pub mod campaign;
 pub mod data;
 #[cfg(feature = "streaming")]
 pub mod market_encoder;

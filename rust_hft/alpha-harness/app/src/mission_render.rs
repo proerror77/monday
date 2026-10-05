@@ -928,7 +928,7 @@ pub(crate) struct PreparedCexInputs {
     _feature_artifacts: Option<tempfile::TempDir>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreparedCexInputMetadata {
     materialization_json: String,
@@ -1048,6 +1048,22 @@ impl PreparedCexInputs {
             bail!("trusted preparation snapshot lacks this development precheck");
         }
         Ok(())
+    }
+    pub(crate) fn native_source_rows(
+        &self,
+        protocol: &alpha_domain::EvaluationProtocolV1,
+    ) -> anyhow::Result<Vec<alpha_engine::evaluation::ResearchRow>> {
+        let mut rows = self
+            .feature_rows
+            .as_ref()
+            .context("native prepared export requires the original admitted rows")?
+            .clone();
+        for row in &mut rows {
+            row.fee_bps = protocol.costs.fee_bps;
+            row.funding_bps = protocol.costs.funding_bps;
+            row.latency_bps = protocol.costs.latency_bps;
+        }
+        Ok(rows)
     }
     pub(crate) fn feature_sha256(&self) -> &str {
         &self.feature_sha256
