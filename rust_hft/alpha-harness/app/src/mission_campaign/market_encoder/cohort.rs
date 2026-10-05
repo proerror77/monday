@@ -667,12 +667,13 @@ mod tests {
 
     #[test]
     fn prepared_campaign_cohort_preserves_native_proofs_anchors_and_converter_identity() {
+        use hft_prepared_market_io::{write_feature_parquet_shard, write_target_parquet_shard};
         use hft_research_manifest::{
             market_encoder::{MarketFeatureFrameV1, MarketTargetFrameV1},
             prepared_market::{
-                write_feature_parquet_shard, write_target_parquet_shard, PreparedMarketArtifactV1,
-                PreparedMarketDataRequestV1, PreparedMarketRequestSourceV1, PreparedMarketSeriesV1,
-                PreparedMarketSourceV1, PreparedMarketViewV1, PREPARED_MARKET_VIEW_SCHEMA,
+                PreparedMarketArtifactV1, PreparedMarketDataRequestV1,
+                PreparedMarketRequestSourceV1, PreparedMarketSeriesV1, PreparedMarketSourceV1,
+                PreparedMarketViewV1, PREPARED_MARKET_VIEW_SCHEMA,
             },
         };
         let (root, mut campaign, native_train, _) = inputs::tests::fixture();

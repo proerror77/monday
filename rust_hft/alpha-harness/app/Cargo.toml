@@ -41,4 +41,5 @@ name = "alpha-harness"
 path = "src/main.rs"
 
 [dev-dependencies]
+hft-prepared-market-io = { path = "../../research-core/prepared-market-io" }
 parquet = { version = "59.1", default-features = false, features = ["zstd"] }

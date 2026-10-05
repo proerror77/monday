@@ -175,7 +175,7 @@ pub(crate) fn validate_sequence_shards(shards: &[SequenceShardV1]) -> Result<(),
     validate_sequence_shards_with_extension(shards, ".jsonl")
 }
 
-pub(crate) fn validate_sequence_shards_with_extension(
+pub fn validate_sequence_shards_with_extension(
     shards: &[SequenceShardV1],
     extension: &str,
 ) -> Result<(), String> {

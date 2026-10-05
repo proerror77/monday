@@ -7,10 +7,11 @@ publish = false
 
 [features]
 default = []
-streaming = ["dep:hft-research-manifest"]
+streaming = ["dep:hft-research-manifest", "dep:hft-prepared-market-io"]
 
 [dependencies]
 hft-research-manifest = { path = "../manifest", optional = true }
+hft-prepared-market-io = { path = "../prepared-market-io", optional = true }
 chrono = { workspace = true, features = ["serde"] }
 anyhow = "1"
 serde = { workspace = true, features = ["derive"] }

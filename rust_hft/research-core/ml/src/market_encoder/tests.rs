@@ -12,9 +12,7 @@ use std::path::Path;
 
 #[test]
 fn prepared_market_reader_matches_jsonl_samples_scaling_and_mature_targets() {
-    use hft_research_manifest::prepared_market::{
-        write_feature_parquet_shard, write_target_parquet_shard,
-    };
+    use hft_prepared_market_io::{write_feature_parquet_shard, write_target_parquet_shard};
     let root = tempfile::tempdir().unwrap();
     let (json_features, json_targets, json_fit) = fixture(root.path());
     let feature_rows = std::fs::read_to_string(root.path().join("features.jsonl"))
@@ -115,9 +113,7 @@ fn prepared_market_reader_matches_jsonl_samples_scaling_and_mature_targets() {
 
 #[test]
 fn prepared_conversion_proof_preserves_native_union_and_rejects_float_bit_changes() {
-    use hft_research_manifest::prepared_market::{
-        write_feature_parquet_shard, write_target_parquet_shard,
-    };
+    use hft_prepared_market_io::{write_feature_parquet_shard, write_target_parquet_shard};
     let root = tempfile::tempdir().unwrap();
     let (original_features, original_targets, _) = fixture(root.path());
     let rows = std::fs::read_to_string(root.path().join("features.jsonl"))
