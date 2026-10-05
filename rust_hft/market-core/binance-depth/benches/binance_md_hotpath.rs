@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use engine::binance_md::{
+use hft_binance_depth::{
     parse_depth_update, LatencyTrace, MarketDataLane, ParsedDepthUpdate, SignalRules,
 };
 
