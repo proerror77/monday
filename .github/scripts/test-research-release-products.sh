@@ -79,4 +79,47 @@ GITHUB_REF=refs/heads/main bash "$root/.github/scripts/select-rust-ci-scope.sh" 
 grep -Fqx research_product=controller "$work/plan"
 grep -Fq ',ploy/research-image-smoke,' "$work/plan"
 bash "$root/.github/scripts/test-research-product-image.sh"
+# Exercise the real producer with a conflicting ambient target and stale host
+# binaries. Only the target recorded by compiler inputs may reach the archive.
+fixture="$work/producer"
+mkdir -p "$fixture/.github/scripts" "$fixture/rust_hft" "$fixture/bin" "$fixture/output"
+for script in build-research-release.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
+  cp "$root/.github/scripts/$script" "$fixture/.github/scripts/$script"
+done
+cp "$root/rust_hft/workspaces.json" "$fixture/rust_hft/workspaces.json"
+while IFS= read -r manifest; do
+  directory=${manifest%/Cargo.toml}; mkdir -p "$fixture/rust_hft/$directory"
+  cp "$root/rust_hft/$manifest" "$fixture/rust_hft/$manifest"
+  cp "$root/rust_hft/$directory/Cargo.lock" "$fixture/rust_hft/$directory/Cargo.lock"
+done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
+printf '#!/usr/bin/env bash\nexit 0\n' >"$fixture/.github/scripts/verify-research-runtime-abi.sh"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "1111111111111111111111111111111111111111"\n' >"$fixture/bin/git"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" 7\n' >"$fixture/bin/gh"
+cat >"$fixture/bin/cargo" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+target='' binaries=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target) target=$2; shift ;;
+    --bin) binaries+=("$2"); shift ;;
+  esac
+  shift
+done
+test "$target" = "$(jq -r .target "$MONDAY_BUILD_INPUTS_FILE")"
+mkdir -p "$CARGO_TARGET_DIR/$target/release"
+for binary in "${binaries[@]}"; do
+  printf 'fresh target executable: %s\n' "$binary" >"$CARGO_TARGET_DIR/$target/release/$binary"
+done
+MOCK
+chmod +x "$fixture/bin/"* "$fixture/.github/scripts/verify-research-runtime-abi.sh"
+mkdir -p "$fixture/rust_hft/target/release"
+while IFS= read -r binary; do
+  printf 'stale host executable\n' >"$fixture/rust_hft/target/release/$binary"
+done < <(bash "$products" binaries controller)
+jq --argjson recipes "$(bash "$products" recipes controller | jq -s .)" '.recipes=$recipes' "$MONDAY_BUILD_INPUTS_FILE" >"$fixture/inputs.json"
+PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/output" GITHUB_REPOSITORY=fixture/monday GITHUB_RUN_ID=42 CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu MONDAY_BUILD_INPUTS_FILE="$fixture/inputs.json" bash "$fixture/.github/scripts/build-research-release.sh" controller
+while IFS= read -r binary; do
+  test "$(cat "$fixture/output/research-release/research-bin/$binary")" = "fresh target executable: $binary"
+done < <(bash "$products" binaries controller)
 printf 'PASS: controller-only release builds four actual executables; product, archive and unadmitted control bytes fail closed\n'
