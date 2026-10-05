@@ -101,4 +101,9 @@ for package in hft-research-artifacts hft-research-dispatch-io hft-prediction-re
     echo 'artifact transport or scientific worker imports cluster operations' >&2; exit 1
   fi
 done
+cargo tree --manifest-path "$root/rust_hft/runtime/Cargo.toml" \
+  -p hft-strategy-probability-reversal --locked --edges normal --prefix none >"$work/probability.tree"
+if grep -E '^(alpha-(domain|engine|harness|store|onnx-evaluator) |burn |ort |sqlx-|axum |reqwest |hft-(collector|research-platform|research-ml|execution-adapter-[a-z-]+) )' "$work/probability.tree"; then
+  echo 'fixed probability strategy imports science, control, transport or execution' >&2; exit 1
+fi
 printf 'workspace ownership, scoped commands, feature rejection and thin closures passed\n'
