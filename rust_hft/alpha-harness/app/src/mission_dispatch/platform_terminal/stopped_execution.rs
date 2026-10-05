@@ -103,6 +103,15 @@ fn verify(
             && spec.max_attempts == 1,
         "terminal observer requires exact native Campaign attempt"
     );
+    ensure!(
+        handle.uid.len() <= 128
+            && !handle.uid.is_empty()
+            && handle
+                .uid
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+        "original Job UID is invalid"
+    );
     let attempt_label = lease.attempt.to_string();
     let fence_label = lease.fence.to_string();
     let annotation = &job["metadata"]["annotations"];
@@ -181,13 +190,30 @@ fn verify(
         ("MONDAY_ATTEMPT", lease.attempt.to_string()),
         ("MONDAY_FENCE", lease.fence.to_string()),
         ("MONDAY_VIEW_MANIFEST", spec.view_manifest_sha256.clone()),
-        ("MONDAY_OUTPUT_PREFIX", format!("{}/{}/{}/", spec.output_prefix, lease.task_id, lease.attempt)),
+        (
+            "MONDAY_OUTPUT_PREFIX",
+            format!(
+                "{}/{}/{}/",
+                spec.output_prefix, lease.task_id, lease.attempt
+            ),
+        ),
     ]);
-    let env = worker["env"].as_array().context("worker environment missing")?;
-    ensure!(env.len() == expected_env.len() && worker["envFrom"].is_null(), "terminal worker has an unrecorded environment");
+    let env = worker["env"]
+        .as_array()
+        .context("worker environment missing")?;
+    ensure!(
+        env.len() == expected_env.len() && worker["envFrom"].is_null(),
+        "terminal worker has an unrecorded environment"
+    );
     for (name, value) in expected_env {
-        let entries = env.iter().filter(|entry| entry["name"] == name).collect::<Vec<_>>();
-        ensure!(entries.len() == 1 && entries[0]["value"] == value && entries[0]["valueFrom"].is_null(), "terminal worker changed fixed environment {name}");
+        let entries = env
+            .iter()
+            .filter(|entry| entry["name"] == name)
+            .collect::<Vec<_>>();
+        ensure!(
+            entries.len() == 1 && entries[0]["value"] == value && entries[0]["valueFrom"].is_null(),
+            "terminal worker changed fixed environment {name}"
+        );
     }
 
     ensure!(
@@ -211,7 +237,12 @@ fn verify(
     );
     let pod_uid = pod["metadata"]["uid"]
         .as_str()
-        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        })
         .context("terminal Pod UID is absent")?;
     let conditions = job["status"]["conditions"]
         .as_array()
@@ -355,10 +386,18 @@ pub(super) fn verify_controlled_identity(
     stopped: &VerifiedStoppedExecution,
     identity: &hft_research_platform::execution::AttemptIdentityRef,
 ) -> anyhow::Result<()> {
-
-    let volumes = stopped.job["spec"]["template"]["spec"]["volumes"].as_array().context("controlled identity volumes absent")?;
-    let identity_volumes = volumes.iter().filter(|volume| volume["name"] == "identity-inputs").collect::<Vec<_>>();
-    ensure!(identity_volumes.len() == 1 && identity_volumes[0]["secret"]["secretName"] == identity.secret_name, "controlled identity mount changed original Secret name");
+    let volumes = stopped.job["spec"]["template"]["spec"]["volumes"]
+        .as_array()
+        .context("controlled identity volumes absent")?;
+    let identity_volumes = volumes
+        .iter()
+        .filter(|volume| volume["name"] == "identity-inputs")
+        .collect::<Vec<_>>();
+    ensure!(
+        identity_volumes.len() == 1
+            && identity_volumes[0]["secret"]["secretName"] == identity.secret_name,
+        "controlled identity mount changed original Secret name"
+    );
     for metadata in [
         &stopped.job["metadata"],
         &stopped.job["spec"]["template"]["metadata"],

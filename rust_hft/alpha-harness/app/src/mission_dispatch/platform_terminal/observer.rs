@@ -35,6 +35,7 @@ struct Observation {
     /// URLs must name each exact PG receipt artifact. Bytes remain independently
     /// bound to its task/attempt/fence, digest and size, including ZIP contents.
     artifact_readback: BTreeMap<String, String>,
+    publications: BTreeMap<String, super::publication::Publication>,
     #[serde(default)]
     artifact_tls: platform_admission::HostTls,
 }
@@ -84,7 +85,8 @@ pub(super) fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
         serde_json::from_slice(&platform_admission::file_bytes(&path, 1024 * 1024, true)?)?;
     ensure!(
         observation.schema == "monday.native_campaign_terminal_observer.v1"
-            && observation.artifact_readback.len() <= 258,
+            && observation.artifact_readback.len() <= 258
+            && observation.publications.len() <= 522,
         "invalid bounded terminal observer configuration"
     );
     let base = path
@@ -145,6 +147,34 @@ pub(super) fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
         )?
     };
     let receipt = store.record_campaign_platform_terminal_audit(&source, &evidence.audit)?;
+    if args.retain_only {
+        let prefix = format!(
+            "research/native-terminal-audits/{}/{}",
+            source.operation_sha256()?,
+            alpha_domain::canonical_json_hash(&evidence.audit)?
+        );
+        let publication_keys = super::retained_files::objects(&evidence.retained)?
+            .into_iter()
+            .map(|(name, _, _)| format!("{prefix}/{name}"))
+            .collect::<Vec<_>>();
+        let family_receipt_keys = store
+            .campaign_family_receipts(&source.reservation().family_id)?
+            .into_iter()
+            .map(|r| r.object_key())
+            .collect::<Vec<_>>();
+        let study_receipt_keys =
+            match store.campaign_study_id_for_family(&source.reservation().family_id)? {
+                Some(study) => store
+                    .campaign_study_receipts(&study)?
+                    .into_iter()
+                    .map(|r| r.object_key())
+                    .collect::<Vec<_>>(),
+                None => Vec::new(),
+            };
+        return crate::cli::print_json(
+            &serde_json::json!({"schema":"monday.native_campaign_terminal_retained.v1", "audit_receipt_sha256":receipt.object_sha256()?, "retained_observation":evidence.retained, "publication_keys":publication_keys, "family_receipt_keys":family_receipt_keys, "study_receipt_keys":study_receipt_keys, "publication_stage":"pending", "cleanup_authority":"not_issued", "budget_released":false}),
+        );
+    }
     // A durable append precedes publication. Retries recover this exact audit
     // and its complete retained content instead of replacing observation time.
     let origin = reqwest::Url::parse(
@@ -172,6 +202,14 @@ pub(super) fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
             |access, bytes| admission::publish_and_readback(&client, access, bytes),
         )?;
     }
+    super::publication::publish(
+        &client,
+        &evidence.retained,
+        &source.operation_sha256()?,
+        &evidence.audit,
+        &origin,
+        &observation.publications,
+    )?;
     crate::cli::print_json(
         &serde_json::json!({"schema":"monday.native_campaign_terminal_audit_result.v1", "operation_sha256":source.operation_sha256()?, "task_id":evidence.audit.task_id, "attempt":evidence.audit.attempt, "fence":evidence.audit.fence, "terminal_revision":evidence.audit.terminal_revision, "job_uid":evidence.audit.job_uid, "pod_uid":evidence.audit.pod_uid, "audit_receipt_sha256":receipt.object_sha256()?, "retained_observation":evidence.retained, "charging_trials":evidence.audit.charging_trials, "known_scientific_consumption":evidence.audit.known_scientific_consumption, "cleanup_authority":"not_issued", "budget_released":false}),
     )
@@ -187,6 +225,10 @@ fn construct(
 ) -> anyhow::Result<VerifiedPlatformTerminalEvidence> {
     let temporary = tempfile::tempdir_in(output)?;
     let root = temporary.path().canonicalize()?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    }
     let client = platform_admission::host_client(&observation.artifact_tls)?;
     let input = tempfile::tempdir_in(output)?;
     let source_client = platform_admission::host_client(&platform_admission::HostTls::default())?;

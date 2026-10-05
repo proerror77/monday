@@ -47,6 +47,17 @@ pub(super) fn verify(root: &Path, expected: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) fn objects(root: &Path) -> anyhow::Result<Vec<(String, String, u64)>> {
+    let mut files = inventory(root)?;
+    for name in ["terminal-audit.json", "retained-manifest.json"] {
+        add(root, name, &mut files)?;
+    }
+    Ok(files
+        .into_iter()
+        .map(|(name, file)| (name, file.sha256, file.bytes))
+        .collect())
+}
+
 fn inventory(root: &Path) -> anyhow::Result<BTreeMap<String, Identity>> {
     let mut files = BTreeMap::new();
     for entry in std::fs::read_dir(root)? {
@@ -150,6 +161,10 @@ mod tests {
     fn all_retained_observation_bytes_and_coverage_are_content_bound() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().canonicalize()?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        }
         std::fs::write(root.join("platform-snapshot.json"), b"actual fixture bytes")?;
         let digest = super::retain(&root)?;
         super::verify(&root, &digest)?;

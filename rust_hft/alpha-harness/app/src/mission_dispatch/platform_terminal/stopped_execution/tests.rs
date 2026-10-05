@@ -231,3 +231,52 @@ fn provider_readback_rejects_missing_or_ambiguous_owner_pods() {
     .unwrap();
     assert!(read_with(&tool, &spec.profile.cluster, &spec, &lease, &handle).is_ok());
 }
+
+#[cfg(feature = "scientific")]
+#[test]
+fn controlled_identity_uid_scope_and_mount_match_original_ref() {
+    let (spec, lease, handle, mut job, mut pod, observed) = fixture();
+    let identity = hft_research_platform::execution::AttemptIdentityRef {
+        secret_name: format!("{}-identity", resource_name(&lease)),
+        secret_uid: "original-secret-uid".into(),
+        scope_sha256: "a".repeat(64),
+        native_evidence_sha256: "b".repeat(64),
+        data_sha256: "c".repeat(64),
+        attempt: lease.attempt,
+        fence: lease.fence,
+        deadline_ms: observed.timestamp_millis(),
+        launch_lease: lease.clone(),
+    };
+    for metadata in [&mut job["metadata"], &mut pod["metadata"]] {
+        metadata["annotations"]["monday.io/identity-secret-uid"] = json!(identity.secret_uid);
+        metadata["annotations"]["monday.io/identity-scope-sha256"] = json!(identity.scope_sha256);
+    }
+    job["spec"]["template"]["metadata"] = pod["metadata"].clone();
+    job["spec"]["template"]["spec"]["volumes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"identity-inputs","secret":{"secretName":identity.secret_name}}));
+    pod["spec"]["volumes"] = job["spec"]["template"]["spec"]["volumes"].clone();
+    let proof = verify(&spec, &lease, &handle, &job, &pod, observed).unwrap();
+    verify_controlled_identity(&proof, &identity).unwrap();
+    for mutate in [
+        |p: &mut VerifiedStoppedExecution| {
+            p.pod["metadata"]["annotations"]["monday.io/identity-secret-uid"] =
+                json!("recreated-uid")
+        },
+        |p: &mut VerifiedStoppedExecution| {
+            p.job["spec"]["template"]["metadata"]["annotations"]
+                ["monday.io/identity-scope-sha256"] = json!("d".repeat(64))
+        },
+        |p: &mut VerifiedStoppedExecution| {
+            p.job["spec"]["template"]["spec"]["volumes"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|v| v["name"] != "identity-inputs")
+        },
+    ] {
+        let mut changed = verify(&spec, &lease, &handle, &job, &pod, observed).unwrap();
+        mutate(&mut changed);
+        assert!(verify_controlled_identity(&changed, &identity).is_err());
+    }
+}

@@ -19,12 +19,18 @@ pub struct PlatformTerminalArgs {
     /// Existing private directory retaining exact observation and native bytes.
     #[arg(long)]
     pub output: PathBuf,
+    /// Retain a durable observation and list finite publication keys. This step
+    /// issues no cleanup witness; rerun publication against the same audit.
+    #[arg(long)]
+    pub retain_only: bool,
 }
 
 #[cfg(feature = "scientific")]
 mod observer;
 #[cfg(feature = "scientific")]
 mod platform_facts;
+#[cfg(feature = "scientific")]
+mod publication;
 #[cfg(feature = "scientific")]
 mod retained_files;
 #[cfg(feature = "scientific")]
