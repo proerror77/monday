@@ -13,10 +13,15 @@ mod fixed_campaign_tests;
 mod native_witness;
 mod released_build;
 mod signed_export;
+mod signed_revocations;
 mod worker_configuration;
 pub use signed_export::PlatformExportArgs;
+pub use signed_revocations::PlatformRevocationsArgs;
 pub fn export(args: PlatformExportArgs) -> anyhow::Result<()> {
     signed_export::export(args)
+}
+pub fn export_revocations(args: PlatformRevocationsArgs) -> anyhow::Result<()> {
+    signed_revocations::export(args)
 }
 
 #[derive(Debug, Clone, Args)]

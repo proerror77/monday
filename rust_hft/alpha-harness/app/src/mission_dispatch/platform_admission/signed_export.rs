@@ -53,16 +53,16 @@ struct Projection {
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HostTls {
+pub(super) struct HostTls {
     ca_file: Option<PathBuf>,
     identity_file: Option<PathBuf>,
 }
 
-fn read<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
+pub(super) fn read<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     let bytes = file_bytes(path, 1024 * 1024, false)?;
     serde_json::from_slice(&bytes).context("invalid typed native export metadata")
 }
-fn file_bytes(path: &Path, limit: u64, private: bool) -> anyhow::Result<Vec<u8>> {
+pub(super) fn file_bytes(path: &Path, limit: u64, private: bool) -> anyhow::Result<Vec<u8>> {
     use rustix::fs::{open, Mode, OFlags};
     use std::os::unix::fs::PermissionsExt;
     ensure!(
@@ -99,7 +99,7 @@ fn file_bytes(path: &Path, limit: u64, private: bool) -> anyhow::Result<Vec<u8>>
     );
     Ok(bytes)
 }
-fn client(tls: &HostTls) -> anyhow::Result<Client> {
+pub(super) fn client(tls: &HostTls) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -122,7 +122,7 @@ fn client(tls: &HostTls) -> anyhow::Result<Client> {
     }
     Ok(builder.build()?)
 }
-fn resolve(base: &Path, path: &mut PathBuf) {
+pub(super) fn resolve(base: &Path, path: &mut PathBuf) {
     if !path.is_absolute() {
         *path = base.join(&*path);
     }
@@ -213,6 +213,7 @@ pub(super) fn export(args: PlatformExportArgs) -> anyhow::Result<()> {
             .context("fixed Campaign worker configuration is absent")?,
         prepared.validated.request_json.as_bytes(),
         &budget.reservation().request_sha256,
+        &native_trust,
     )?;
     let fixed = fixed_campaign::construct(fixed_campaign::Inputs {
         budget: &budget,
@@ -291,6 +292,29 @@ pub(super) fn export(args: PlatformExportArgs) -> anyhow::Result<()> {
         ),
     ] {
         retain(&output.join(name), &bytes)?;
+    }
+    // Preserve the verified immutable transport bytes for the independent PG
+    // input importer. Dropping this temporary cache without them would leave a
+    // signed collection that its controlled consumer could not actually read.
+    let manifest = data.prepared().manifest();
+    let mut copied = std::collections::BTreeSet::new();
+    for block in manifest
+        .features
+        .manifest
+        .blocks
+        .iter()
+        .chain(&manifest.future_marks.manifest.blocks)
+        .chain(&manifest.replay.manifest.blocks)
+    {
+        if copied.insert(&block.sha256) {
+            let name = format!("{}.mondaybin", block.sha256);
+            let bytes = file_bytes(&directory.path().join(&name), 16 * 1024 * 1024, false)?;
+            ensure!(
+                bytes.len() as u64 == block.bytes,
+                "verified immutable block changed size before export retention"
+            );
+            retain(&output.join(name), &bytes)?;
+        }
     }
     crate::cli::print_json(&serde_json::json!({
         "schema":"monday.native_campaign_platform_export_result.v1", "tenant":signed.evidence.tenant,
@@ -411,7 +435,7 @@ fn publish_and_readback(
     );
     Ok(())
 }
-fn retain(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(super) fn retain(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let parent = path.parent().context("export output parent is absent")?;
     ensure!(

@@ -91,7 +91,7 @@ fn verify_bytes(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 pub(super) fn from_test_readback_peer(
     trust: &BuildReleaseTrust,
     artifact: &BuildArtifact,

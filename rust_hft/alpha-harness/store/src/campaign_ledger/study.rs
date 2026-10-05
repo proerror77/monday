@@ -812,14 +812,21 @@ fn require_published_study_receipts(
 
 /// Historical revocation constraints for one authenticated Study member.
 /// This exports no new approval and never substitutes a caller's receipt hash.
+pub(super) struct PublishedMemberRevocations {
+    pub public_key: Option<[u8; 32]>,
+    pub reasons: Vec<(ApprovalRevocationV1, String)>,
+}
 pub(super) fn published_member_revocations(
     conn: &Connection,
     key: &[u8; 32],
     family: &str,
     root_sha256: &str,
-) -> Result<Vec<(ApprovalRevocationV1, String)>, StoreError> {
+) -> Result<PublishedMemberRevocations, StoreError> {
     let Some((study_id, registered_root, _)) = read_member_projection(conn, key, family)? else {
-        return Ok(Vec::new());
+        return Ok(PublishedMemberRevocations {
+            public_key: None,
+            reasons: Vec::new(),
+        });
     };
     if registered_root != root_sha256 {
         return Err(err("revocation Study member root changed"));
@@ -846,7 +853,10 @@ pub(super) fn published_member_revocations(
             output.push((revocation.clone(), entry.object_sha256()?));
         }
     }
-    Ok(output)
+    Ok(PublishedMemberRevocations {
+        public_key: Some(*state.grant()?.verifying_key().as_bytes()),
+        reasons: output,
+    })
 }
 
 fn ensure_study_head(conn: &Connection, key: &[u8; 32], study_id: &str) -> Result<(), StoreError> {

@@ -175,6 +175,8 @@ enum MissionDispatchCommand {
     PreparePlatform(mission_dispatch::platform_admission::PlatformPrepareArgs),
     /// Export one source-reserved Campaign after actual software/data/configuration readback.
     ExportPlatform(mission_dispatch::platform_admission::PlatformExportArgs),
+    /// Export authenticated Root/Study constraints for already transferred native operations.
+    ExportPlatformRevocations(mission_dispatch::platform_admission::PlatformRevocationsArgs),
     CloseFamily(CampaignCloseFamilyArgs),
     Inspect(MissionDispatchInspectArgs),
     /// Read authenticated historical dispatch identity without submitting or settling.
@@ -1303,6 +1305,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::export(args))
                         .await
                         .context("native platform signed export task failed")?
+                }
+                MissionDispatchCommand::ExportPlatformRevocations(args) => {
+                    tokio::task::spawn_blocking(move || mission_dispatch::platform_admission::export_revocations(args))
+                        .await
+                        .context("native platform revocation export task failed")?
                 }
                 MissionDispatchCommand::DescribeStudy(args) => {
                     mission_dispatch::sequence_admission::describe(args)

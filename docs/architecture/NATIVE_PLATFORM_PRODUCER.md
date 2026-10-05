@@ -41,7 +41,32 @@ This interface does not issue or revoke arbitrary row-wide approvals.
 Platform terminal settlement still requires independent task, Job, Pod, receipt and stopped-process evidence.
 A worker hash or claimed success cannot refund or settle the native reservation.
 The legacy dispatch and settlement paths remain excluded after platform transfer.
-That complete terminal bridge and signed data-bound export are not claimed by the preparation interface.
+That complete terminal bridge is not implemented by the source exporter.
+
+`mission dispatch export-platform` adds a controlled code path after preparation.
+It verifies the release signature and independently streams the exact source/archive and executable bytes.
+It obtains the CEX opaque proof from actual collection and block readback, using the durable reservation's request hash.
+It independently reads an existing immutable Kubernetes configuration Secret.
+The static contents must be exactly `campaign.json`, `artifact-io.json`, `ca.pem`, and `native-trust.json`.
+The request bytes match finalization; public native trust matches the controlled host trust.
+The shared `worker_configuration_reference` identity binds namespace, Secret name, UID and sorted encoded static contents.
+The Run binds the entire verified collection; its Task copies the inspected native worker command and changes only the fixed request mount to `/config/campaign.json`.
+CPU, memory, target, source, image, ABI and the original full Job duration must match the source witness.
+
+The host transfers the existing native operation exclusively and publishes/reads back its transfer receipt before signing.
+It then reacquires the source guards and loads a distinct private witness key from a regular 32-byte file.
+The key file uses mode 0600 and a canonical private mode-0700 parent; FIFO and symlink inputs fail closed.
+The signer cannot reuse the registered Root/Study authority or software-release public keys.
+Current native admission signatures bind the JSON tuple `(domain, key_id, evidence_sha256)`.
+The prebuilt CLI neither starts Cargo nor exposes a raw statement-signing RPC.
+Signed exports are create-once and independently read back; ambiguous publication or import retains the full source charge.
+The source CLI leaves controlled PG registration and terminal settlement to their explicit consumers.
+
+Attempt credentials remain outside the signed static configuration to avoid a task/token identity cycle.
+The worker uses `/identity/artifact.token` and `/identity/tls.pem`, mounted through controlled private staging.
+The existing gateway projection supports exact tenant/task/attempt/fence writers and independently checks PG upload permits.
+The controller's late credential issuer/mount integration remains pending; the current Kubernetes adapter explicitly rejects a CEX launch without it.
+This code path and local tests do not prove a live Secret, broker projection, cloud import, launch or scientific outcome.
 
 Tests use synthetic native grants, published receipt peers and local source ledgers.
 They verify debit retention, ownership, expiration, revocation and callback ordering.
@@ -51,8 +76,10 @@ They do not prove cloud execution, real native budget issuance or scientific com
 
 This review separates source authority, executable publication and actual scientific consumption.
 The source anchor for the preparation interfaces is `267f5c02e`.
-CEX's `d36e05286` checkpoint provides the verified-data inspector; its complete worker wiring is pending.
-Root owns the new CexCampaign/PG input-kind contract and independent revocation receiver.
+CEX's `73b77dfc6` source supplies actual data verification and scientific consumption; `75858c42b` adds the genuine V6 test fixture.
+Root's `65b39fe0d` supplies the fixed Task configuration and private stager; the late controlled identity issuer remains pending.
+The independent receiver source `9d18b10a0` supplies scheduled revocation import and domain/key-bound native signatures.
+Root owns the CexCampaign/PG input-kind and provider context contract; its launch refusal preserves the unfinished integration boundary.
 
 | Subfunction | Caller and authority owner | Actual consumer | Verified boundary | Remaining gap |
 | --- | --- | --- | --- | --- |

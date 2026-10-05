@@ -15,19 +15,18 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn encode(bytes: &[u8]) -> String {
-    let output = std::process::Command::new("openssl")
-        .args(["base64", "-A"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut child = output;
     use std::io::Write;
-    child.stdin.take().unwrap().write_all(bytes).unwrap();
-    let output = child.wait_with_output().unwrap();
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input.write_all(bytes).unwrap();
+    let output = std::process::Command::new("openssl")
+        .args(["base64", "-A", "-in"])
+        .arg(input.path())
+        .output()
+        .unwrap();
     assert!(output.status.success());
     String::from_utf8(output.stdout).unwrap()
 }
+
 fn software(source: &str, image: &str) -> super::released_build::ReadbackBuildRelease {
     let h = |c: char| c.to_string().repeat(64);
     let key = SigningKey::from_bytes(&[20; 32]);
@@ -134,11 +133,18 @@ fn software(source: &str, image: &str) -> super::released_build::ReadbackBuildRe
 fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
     let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
     let image = format!("registry/worker@sha256:{}", fixture.request.image_identity);
-    let validated = super::super::validate_submission(super::super::MissionDispatchSubmission {
+    let submission = super::super::MissionDispatchSubmission {
         attempt_id: "native-export-fixture".into(),
         image: image.clone(),
         request: fixture.request.clone(),
-    })
+    };
+    // This genuine local-data fixture is not a cloud transport acceptance.
+    // Production continues to reject its file-backed collection URLs.
+    assert!(super::super::validate_submission(submission.clone()).is_err());
+    let validated = super::super::validate_submission_with_request_check(
+        submission,
+        crate::mission_campaign::validate_request_for_execute,
+    )
     .unwrap();
     let manifest = super::super::render_manifest(&validated, "monday-research").unwrap();
     let inspection = super::super::admission::reconstruct_binding(
@@ -239,13 +245,22 @@ fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
         .unwrap();
     assert!(result.status.success());
     let config = serde_json::to_vec(&json!({"schema_version":"monday.cex_campaign_artifact_io.v1","artifact_gateway":"https://gateway.invalid/","artifact_token_file":"/identity/artifact.token","artifact_tls":{"ca_file":"/config/ca.pem","identity_file":"/identity/tls.pem"}})).unwrap();
-    let observed = json!({"apiVersion":"v1","kind":"Secret","type":"Opaque","immutable":true,"metadata":{"name":"native-config","namespace":"monday-research","uid":"fixture-uid"},"data":{"campaign.json":encode(validated.request_json.as_bytes()),"artifact-io.json":encode(&config),"ca.pem":encode(&std::fs::read(certificate).unwrap())}});
+    let native_trust = hft_research_platform::admission::NativeAdmissionTrust {
+        schema: "monday.native_reservation_trust.v1".into(),
+        native_reservation_keys: [(
+            "host-witness".into(),
+            hex::encode(SigningKey::from_bytes(&[42; 32]).verifying_key().as_bytes()),
+        )]
+        .into(),
+    };
+    let observed = json!({"apiVersion":"v1","kind":"Secret","type":"Opaque","immutable":true,"metadata":{"name":"native-config","namespace":"monday-research","uid":"fixture-uid"},"data":{"campaign.json":encode(validated.request_json.as_bytes()),"artifact-io.json":encode(&config),"ca.pem":encode(&std::fs::read(certificate).unwrap()),"native-trust.json":encode(&serde_json::to_vec(&native_trust).unwrap())}});
     let configuration = super::worker_configuration::from_test_readback_peer(
         &observed,
         "monday-research",
         "native-config",
         validated.request_json.as_bytes(),
         &reservation.request_sha256,
+        &native_trust,
     )
     .unwrap();
     let profile = Profile {
@@ -304,7 +319,8 @@ fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
         "monday-research",
         "native-config",
         validated.request_json.as_bytes(),
-        &reservation.request_sha256
+        &reservation.request_sha256,
+        &native_trust,
     )
     .is_err());
     let mut tampered = observed;
@@ -314,7 +330,64 @@ fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
         "monday-research",
         "native-config",
         validated.request_json.as_bytes(),
-        &reservation.request_sha256
+        &reservation.request_sha256,
+        &native_trust,
     )
     .is_err());
+    let transfer = alpha_store::campaign_ledger::CampaignPlatformTransferV1 {
+        operation_id: reservation.operation_id().unwrap(),
+        tenant: "native-fixture".into(),
+        run_sha256: fixed.run.id().unwrap(),
+        request_sha256: fixed.spec.id().unwrap(),
+    };
+    store
+        .transfer_campaign_execution_to_platform(&root, &reservation, &transfer)
+        .unwrap();
+    let effective = Utc::now() + TimeDelta::hours(12);
+    store
+        .revoke_approval(
+            "native-export-approval",
+            "authority",
+            "scheduled stop",
+            effective,
+        )
+        .unwrap();
+    for entry in store
+        .campaign_family_receipts(&reservation.family_id)
+        .unwrap()
+    {
+        store
+            .acknowledge_campaign_receipt_readback(
+                &reservation.family_id,
+                entry.receipt.sequence,
+                &entry.object_key(),
+                &entry.object_sha256().unwrap(),
+            )
+            .unwrap();
+    }
+    let reasons = store
+        .campaign_platform_revocations(&reservation.family_id)
+        .unwrap();
+    assert_eq!(reasons.len(), 1);
+    let evidence =
+        super::signed_revocations::statement(&reasons[0], Utc::now().timestamp_millis()).unwrap();
+    assert_eq!(evidence.request_sha256, fixed.spec.id().unwrap());
+    assert_eq!(
+        evidence.operation_sha256,
+        budget.operation_sha256().unwrap()
+    );
+    assert_eq!(evidence.effective_ms, effective.timestamp_millis());
+    assert!(evidence.effective_ms > evidence.issued_ms);
+    assert_eq!(
+        reasons[0].authority_public_keys(),
+        &[key.verifying_key().to_bytes()]
+    );
+    let witness = SigningKey::from_bytes(&[42; 32]);
+    let signed = hft_research_platform::revocation::sign_revocation(
+        evidence,
+        "host-witness".into(),
+        &witness,
+    )
+    .unwrap();
+    native_trust.verify_revocation(&signed).unwrap();
 }

@@ -73,6 +73,7 @@ pub struct VerifiedCampaignPlatformRevocation {
     family_id: String,
     reason_receipt_sha256: String,
     effective_at: DateTime<Utc>,
+    authority_public_keys: Vec<[u8; 32]>,
 }
 impl VerifiedCampaignPlatformRevocation {
     pub fn transfer(&self) -> &CampaignPlatformTransferV1 {
@@ -89,6 +90,9 @@ impl VerifiedCampaignPlatformRevocation {
     }
     pub fn effective_at(&self) -> DateTime<Utc> {
         self.effective_at
+    }
+    pub fn authority_public_keys(&self) -> &[[u8; 32]] {
+        &self.authority_public_keys
     }
     pub fn operation_sha256(&self) -> Result<String, StoreError> {
         alpha_domain::canonical_json_hash(&self.transfer.operation_id).map_err(err)
@@ -136,12 +140,15 @@ impl AlphaStore {
                     }
                 }
             }
-            reasons.extend(study::published_member_revocations(
+            let study = study::published_member_revocations(
                 &self.connection,
                 &self.integrity_key,
                 family_id,
                 &attempt.reservation.root_grant_sha256,
-            )?);
+            )?;
+            reasons.extend(study.reasons);
+            let mut authority_public_keys = vec![*root.grant.verifying_key().as_bytes()];
+            authority_public_keys.extend(study.public_key);
             for (reason, reason_receipt_sha256) in reasons {
                 output.push(VerifiedCampaignPlatformRevocation {
                     transfer: transfer.clone(),
@@ -149,6 +156,7 @@ impl AlphaStore {
                     family_id: family_id.into(),
                     reason_receipt_sha256,
                     effective_at: reason.revoked_at,
+                    authority_public_keys: authority_public_keys.clone(),
                 });
             }
         }

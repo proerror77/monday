@@ -44,6 +44,7 @@ pub(super) fn readback(
     name: &str,
     expected_request: &[u8],
     expected_request_sha256: &str,
+    native_trust: &hft_research_platform::admission::NativeAdmissionTrust,
 ) -> anyhow::Result<VerifiedWorkerConfiguration> {
     let observed = kubectl_json(
         &kubectl_binary(),
@@ -58,6 +59,7 @@ pub(super) fn readback(
         name,
         expected_request,
         expected_request_sha256,
+        native_trust,
     )
 }
 
@@ -84,6 +86,7 @@ fn verify_readback(
     name: &str,
     expected_request: &[u8],
     expected_request_sha256: &str,
+    native_trust: &hft_research_platform::admission::NativeAdmissionTrust,
 ) -> anyhow::Result<VerifiedWorkerConfiguration> {
     ensure!(
         observed["apiVersion"] == "v1"
@@ -101,7 +104,7 @@ fn verify_readback(
     let data = observed["data"]
         .as_object()
         .context("worker configuration readback lacks bytes")?;
-    ensure!(data.len() == 3, "unbounded worker configuration payload");
+    ensure!(data.len() == 4, "unbounded worker configuration payload");
     let mut decoded = BTreeMap::new();
     let mut total = 0_usize;
     for (key, encoded) in data {
@@ -170,9 +173,10 @@ fn verify_readback(
         "campaign.json".to_owned(),
         "artifact-io.json".to_owned(),
         ca_name.clone(),
+        "native-trust.json".to_owned(),
     ]);
     ensure!(
-        keys.len() == 3,
+        keys.len() == 4,
         "private CA aliases scientific configuration"
     );
     let ca = decoded
@@ -181,6 +185,19 @@ fn verify_readback(
     ensure!(
         ca.len() <= 64 * 1024 && !reqwest::Certificate::from_pem_bundle(ca)?.is_empty(),
         "invalid private artifact CA"
+    );
+    let trust_bytes = decoded
+        .get("native-trust.json")
+        .context("worker configuration lacks public native witness trust")?;
+    ensure!(
+        trust_bytes.len() <= 64 * 1024,
+        "public native witness trust exceeds bound"
+    );
+    let observed_trust: hft_research_platform::admission::NativeAdmissionTrust =
+        serde_json::from_slice(trust_bytes)?;
+    ensure!(
+        serde_json::to_value(&observed_trust)? == serde_json::to_value(native_trust)?,
+        "worker native witness trust differs from the controlled source host"
     );
     // Tokens and TLS private identity arrive only after the exact task/lease is
     // imported and leased. They are excluded from this signed static identity.
@@ -207,15 +224,23 @@ fn verify_readback(
     Ok(VerifiedWorkerConfiguration { reference })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "scientific"))]
 pub(super) fn from_test_readback_peer(
     observed: &Value,
     namespace: &str,
     name: &str,
     request: &[u8],
     request_sha256: &str,
+    native_trust: &hft_research_platform::admission::NativeAdmissionTrust,
 ) -> anyhow::Result<VerifiedWorkerConfiguration> {
-    verify_readback(observed, namespace, name, request, request_sha256)
+    verify_readback(
+        observed,
+        namespace,
+        name,
+        request,
+        request_sha256,
+        native_trust,
+    )
 }
 
 #[cfg(test)]
@@ -223,13 +248,18 @@ mod tests {
     use super::*;
     #[test]
     fn declared_immutable_or_hash_without_actual_configuration_never_proves_a_worker() {
+        let trust = hft_research_platform::admission::NativeAdmissionTrust {
+            schema: "monday.native_reservation_trust.v1".into(),
+            native_reservation_keys: [("host".into(), "1".repeat(64))].into(),
+        };
         let forged = serde_json::json!({"apiVersion":"v1","kind":"Secret","type":"Opaque","immutable":true,"metadata":{"name":"worker","namespace":"monday-research"},"data":{"campaign.json":"e30=","artifact-io.json":"e30=","token":"dG9rZW4="}});
         assert!(verify_readback(
             &forged,
             "monday-research",
             "worker",
             b"{}",
-            &hft_research_platform::sha256(b"{}")
+            &hft_research_platform::sha256(b"{}"),
+            &trust,
         )
         .is_err());
         let mut unknown = forged;
@@ -239,7 +269,8 @@ mod tests {
             "monday-research",
             "worker",
             b"{}",
-            &hft_research_platform::sha256(b"{}")
+            &hft_research_platform::sha256(b"{}"),
+            &trust,
         )
         .is_err());
         for path in [
