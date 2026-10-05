@@ -105,6 +105,7 @@ dependencies = [
  "hex",
  "hft-backtest",
  "hft-cex-research-input",
+ "hft-cex-search-driver",
  "hft-collector",
  "hft-factor-dsl",
  "hft-governance-contracts",
@@ -3126,6 +3127,17 @@ dependencies = [
  "alpha-harness",
  "anyhow",
  "tokio",
+]
+
+[[package]]
+name = "hft-cex-search-driver"
+version = "0.1.0"
+dependencies = [
+ "alpha-domain",
+ "alpha-engine",
+ "alpha-store",
+ "anyhow",
+ "serde_json",
 ]
 
 [[package]]

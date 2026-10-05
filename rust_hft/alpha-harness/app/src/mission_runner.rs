@@ -1695,14 +1695,38 @@ fn execute_report_inner(
     );
     let run_search = |resume| {
         if native.is_some() {
-            mission::execute_native_governed_gp_mission(
-                &run_args,
-                resume,
-                &gp_policy,
-                &control_mission.spec.search_lineage_id,
-                &baseline_dataset,
-                &dataset_manifest.manifest_id,
-            )
+            let expected_protocol = run_args
+                .dataset
+                .validation
+                .evaluation_protocol(&baseline_dataset.protocol().labels)?;
+            let mut store = AlphaStore::open(&db)?;
+            let run = hft_cex_search_driver::run(
+                &mut store,
+                hft_cex_search_driver::NativeGpRequest {
+                    mission_id: &run_args.mission_id,
+                    resume,
+                    dataset: &baseline_dataset,
+                    original_manifest_id: &dataset_manifest.manifest_id,
+                    expected_protocol: &expected_protocol,
+                    feature_fields: &run_args.feature_fields,
+                    seed: run_args.seed,
+                    policy: &gp_policy,
+                    candidate_namespace: &control_mission.spec.search_lineage_id,
+                    max_new_iterations: run_args.max_new_iterations,
+                },
+            )?;
+            Ok(mission::MissionRunReport {
+                mission_id: run_args.mission_id.clone(),
+                status: run.outcome.status,
+                terminal_reason: run.outcome.terminal_reason,
+                total_iterations: run.outcome.total_iterations,
+                new_iterations: run.outcome.new_iterations,
+                engine: EngineChoice::Gp,
+                engine_authority: mission::ResearchEngineAuthority::CandidateResearchOnly,
+                dataset_manifest_id: run.dataset_manifest_id,
+                research_dataset: run.research_dataset,
+                walk_forward_partition: run.walk_forward_partition,
+            })
         } else {
             mission::execute_governed_gp_mission(
                 &run_args,

@@ -1,0 +1,13 @@
+[package]
+workspace = "../../research-core"
+name = "hft-cex-search-driver"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+alpha-domain = { path = "../domain" }
+alpha-engine = { path = "../engine", default-features = false, features = ["kernel"] }
+alpha-store = { path = "../store" }
+anyhow = "1"
+serde_json = { workspace = true }
