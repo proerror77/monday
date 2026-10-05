@@ -810,6 +810,45 @@ fn require_published_study_receipts(
     Ok(())
 }
 
+/// Historical revocation constraints for one authenticated Study member.
+/// This exports no new approval and never substitutes a caller's receipt hash.
+pub(super) fn published_member_revocations(
+    conn: &Connection,
+    key: &[u8; 32],
+    family: &str,
+    root_sha256: &str,
+) -> Result<Vec<(ApprovalRevocationV1, String)>, StoreError> {
+    let Some((study_id, registered_root, _)) = read_member_projection(conn, key, family)? else {
+        return Ok(Vec::new());
+    };
+    if registered_root != root_sha256 {
+        return Err(err("revocation Study member root changed"));
+    }
+    let (state, history) = study_load(conn, key, &study_id)?;
+    let state = state.ok_or_else(|| err("revocation Study is missing"))?;
+    let approval = state
+        .approval
+        .as_ref()
+        .ok_or_else(|| err("revocation Study approval is missing"))?;
+    let mut output = Vec::new();
+    for entry in &history {
+        if let CampaignStudyLedgerEventV1::ApprovalRevoked { revocation } = &entry.receipt.event {
+            if revocation.approval_id != approval.approval_id {
+                return Err(err("revocation Study approval differs"));
+            }
+            require_published_study_receipts(
+                conn,
+                key,
+                &study_id,
+                &history,
+                entry.receipt.sequence,
+            )?;
+            output.push((revocation.clone(), entry.object_sha256()?));
+        }
+    }
+    Ok(output)
+}
+
 fn ensure_study_head(conn: &Connection, key: &[u8; 32], study_id: &str) -> Result<(), StoreError> {
     conn.execute(
         "INSERT INTO campaign_study_heads SELECT ?, 0, '', ? WHERE NOT EXISTS (SELECT 1 FROM campaign_study_heads WHERE study_id = ?)",
@@ -2386,6 +2425,57 @@ mod tests {
         store
             .register_campaign_root(root, approval_id, t0())
             .unwrap();
+    }
+
+    #[test]
+    fn platform_revocation_projects_published_root_and_earlier_study_constraints() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let root = verify_root(root("root-1", "family-1", 'a'));
+        register_root(&mut store, &root, "root-approval");
+        let study = register_study(&mut store, &[&root], 100);
+        let reserved = reservation(&root, 0, 20);
+        store
+            .reserve_campaign_attempt(&root, &reserved, t0())
+            .unwrap();
+        acknowledge_family_receipts(&mut store, "family-1");
+        acknowledge_study_receipts(&mut store, &study.grant().study_id);
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: reserved.operation_id().unwrap(),
+            tenant: "tenant-a".into(),
+            run_sha256: repeat_hex('4'),
+            request_sha256: repeat_hex('5'),
+        };
+        store
+            .transfer_campaign_execution_to_platform_with_clock(&root, &reserved, &transfer, t0)
+            .unwrap();
+        acknowledge_family_receipts(&mut store, "family-1");
+        let before = store.campaign_family_usage("family-1").unwrap();
+        store
+            .revoke_approval("root-approval", "operator", "root stop", at(20))
+            .unwrap();
+        acknowledge_family_receipts(&mut store, "family-1");
+        assert_eq!(
+            store
+                .campaign_platform_revocations("family-1")
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .revoke_approval("study-approval", "operator", "earlier Study stop", at(10))
+            .unwrap();
+        assert!(store.campaign_platform_revocations("family-1").is_err());
+        acknowledge_study_receipts(&mut store, &study.grant().study_id);
+        let output = store.campaign_platform_revocations("family-1").unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].effective_at(), at(10));
+        assert_eq!(output[1].effective_at(), at(20));
+        assert!(output.iter().all(|entry| entry.transfer() == &transfer));
+        assert_ne!(
+            output[0].reason_receipt_sha256(),
+            output[1].reason_receipt_sha256()
+        );
+        assert_eq!(store.campaign_family_usage("family-1").unwrap(), before);
     }
 
     fn register_study(

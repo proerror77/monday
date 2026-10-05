@@ -15,6 +15,7 @@ pub(super) struct Attempt {
     pub sequence: u64,
     pub settlement: Option<CampaignAttemptSettlementV1>,
     pub dispatch: Option<CampaignDispatchClaimV1>,
+    pub platform_transfer: Option<CampaignPlatformTransferV1>,
     pub terminal_pod_uid: Option<String>,
     pub cancellation: Option<CampaignDispatchCancellationV1>,
     pub completion_provenance: Option<CampaignDispatchCompletionProvenanceV1>,
@@ -76,6 +77,7 @@ impl State {
                 CampaignLedgerEventV1::RootRegistered { .. }
                     | CampaignLedgerEventV1::StudyMemberBound { .. }
                     | CampaignLedgerEventV1::AttemptReserved { .. }
+                    | CampaignLedgerEventV1::PlatformTransferred { .. }
                     | CampaignLedgerEventV1::DispatchClaimed { .. }
                     | CampaignLedgerEventV1::DispatchJobBound { .. }
             )
@@ -285,11 +287,39 @@ impl State {
                         sequence: receipt.sequence,
                         settlement: None,
                         dispatch: None,
+                        platform_transfer: None,
                         terminal_pod_uid: None,
                         cancellation: None,
                         completion_provenance: None,
                     },
                 );
+            }
+            CampaignLedgerEventV1::PlatformTransferred { transfer } => {
+                transfer.validate()?;
+                let attempt = self
+                    .attempts
+                    .get_mut(&transfer.operation_id)
+                    .ok_or_else(|| err("platform transfer has no reservation"))?;
+                if attempt.dispatch.is_some()
+                    || attempt.platform_transfer.is_some()
+                    || attempt.settlement.is_some()
+                {
+                    return Err(err("attempt already has an execution owner"));
+                }
+                let root = self
+                    .roots
+                    .get(&attempt.reservation.root_grant_sha256)
+                    .ok_or_else(|| err("platform transfer has no root"))?;
+                root.grant
+                    .validate_attempt_scope(&attempt.reservation, receipt.recorded_at)
+                    .map_err(err)?;
+                if root
+                    .revoked_at
+                    .is_some_and(|when| receipt.recorded_at >= when)
+                {
+                    return Err(err("platform transfer root is revoked"));
+                }
+                attempt.platform_transfer = Some(transfer.clone());
             }
             CampaignLedgerEventV1::DispatchClaimed {
                 operation_id,
@@ -300,7 +330,10 @@ impl State {
                     .attempts
                     .get_mut(operation_id)
                     .ok_or_else(|| err("dispatch has no reservation"))?;
-                if attempt.dispatch.is_some() || attempt.settlement.is_some() {
+                if attempt.dispatch.is_some()
+                    || attempt.platform_transfer.is_some()
+                    || attempt.settlement.is_some()
+                {
                     return Err(err("attempt already dispatched or settled"));
                 }
                 let root = self
@@ -432,6 +465,9 @@ impl State {
                     .attempts
                     .get_mut(&settlement.operation_id)
                     .ok_or_else(|| err("settlement has no reservation"))?;
+                if attempt.platform_transfer.is_some() {
+                    return Err(err("platform-owned attempt requires independently verified platform settlement"));
+                }
                 if attempt.cancellation.is_some()
                     || attempt
                         .dispatch
