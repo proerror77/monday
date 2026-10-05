@@ -23,7 +23,7 @@ sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false,
 
 [features]
 default = []
-control = ["dep:tokio", "dep:reqwest", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:ed25519-dalek"]
+control = ["dep:tokio", "dep:reqwest", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:ed25519-dalek", "dep:rustix"]
 gateway = ["control", "dep:rustix", "dep:tokio-util", "dep:futures-util", "tokio/fs", "reqwest/stream"]
 
 [[bin]]
