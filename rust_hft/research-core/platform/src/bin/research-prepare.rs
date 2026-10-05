@@ -42,15 +42,17 @@ async fn main() -> Result<()> {
     }
     anyhow::ensure!(admitted, "controller startup admission timed out");
     let mut permit = ledger.preparation(&id, attempt, fence).await?;
-    let ch = ClickHouse::new(
+    let ch = ClickHouse::with_tls(
         &config.clickhouse_endpoint,
         read_secret(&config.clickhouse_user_file)?,
         read_secret(&config.clickhouse_password_file)?,
+        &config.clickhouse_tls,
     )?;
-    let writer = Writer::new(
+    let writer = Writer::with_tls(
         &config.artifact_gateway,
         read_secret(&config.artifact_token_file)?,
         permit.task(),
+        &config.artifact_tls,
     )?;
     hft_research_platform::worker::prepare(
         &mut permit,

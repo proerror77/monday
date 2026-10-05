@@ -6,7 +6,6 @@
 
 pub mod adapter_bridge;
 pub mod aggregation;
-pub mod binance_md;
 pub mod dataflow;
 pub mod execution_control;
 pub mod execution_queues;

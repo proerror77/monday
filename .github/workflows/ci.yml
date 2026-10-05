@@ -510,9 +510,9 @@ jobs:
         working-directory: rust_hft
         run: |
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" fmt -p hft-research-platform -- --check
-          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control --locked
-          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control --test postgres --locked -- --ignored
-          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy -p hft-research-platform --features control --all-targets --locked -- -D warnings
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --locked
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --test postgres --locked -- --ignored
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy -p hft-research-platform --features control,gateway,publisher --all-targets --locked -- -D warnings
       - name: Validate packaged CH SQL against the fixture server
         run: bash .github/scripts/test-clickhouse-preparation.sh
       - name: Validate raw protocol, standard Parquet and durable CH/PG import
@@ -902,7 +902,7 @@ jobs:
 
       - name: Test Binance MD fast lane
         run: |
-          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-engine --locked binance_md
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-binance-depth --locked --lib
 
       - name: Enforce quote-to-worker latency budgets
         run: |

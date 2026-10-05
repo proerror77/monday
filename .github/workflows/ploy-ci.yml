@@ -245,7 +245,7 @@ jobs:
       - name: Capture compiler, native environment and scoped recipe
         id: build-inputs
         working-directory: .
-        run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json"
+        run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json" "${{ needs.image-smoke-scope.outputs.research_product }}"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
