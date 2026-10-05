@@ -54,7 +54,12 @@ fn main() {
         if method == "turn/start" && workspace.join("fragment").exists() {
             print!("{{\"me");
             io::stdout().flush().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::fs::write(workspace.join("fragment.sent"), "").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !workspace.join("fragment.release").exists() {
+                assert!(std::time::Instant::now() < deadline, "fragment fixture was not released");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             println!("thod\":\"thread/status/changed\",\"params\":{{\"threadId\":\"thread-fixture\"}}}}");
             io::stdout().flush().unwrap();
         }

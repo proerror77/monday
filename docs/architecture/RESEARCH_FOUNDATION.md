@@ -109,7 +109,7 @@ CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生�
 
 该链目前是 bounded pilot：100,000 行、128 MiB Parquet、64 staging tables/target partitions。它仅接受录制边界严格相接的来源；一般连续文件的时间与序列边界、跨 session/gap 标记仍需生产合同。不能据此宣称已导入滚动一月、全部资产或完整交易所深度。原始 OSS 继续现有 30 天生命周期，不补缺口或延长保留；实验与模型审计记录独立保留。
 
-新 trainer 的 shared-input 接入、科学 CLI 的 Run/config 下载和最终 manifest 写入、normalized ingestion 到 research preparation tables 的版本化投影、原生 evaluation/Campaign settlement 投影仍未完成。prepare、tiny fixture 或转换回执均不是训练或终态科学成果。
+原有 CPU MLP trainer 已能直接消费 `SharedInput` 的 Train exit；`train-contract-model --prepared-view VIEW --prepared-root ROOT` 通过固定 training request 绑定整个 published view、SQL/列顺序、标的、horizon 与 cutoff。缓存准入后不生成 JSON rows spool，也不重复哈希输入；availability/maturity 向上取整至 native 毫秒时钟，窗口边界不可无声取整。仍使用既有 Burn 算法、优化限制、purge/embargo 与 fit-only diagnostics。科学 CLI 的 Run/config 下载和最终 manifest 写入、normalized ingestion 到 research preparation tables 的版本化投影、原生 evaluation/Campaign settlement 投影仍未完成。prepare、tiny fixture 或转换回执均不是训练或终态科学成果。
 
 ## PG 单权威、任务和终态
 
@@ -131,7 +131,7 @@ Stopping 仍检查 admission 撤销。撤销清除待提交 receipt，并将停�
 
 Backend profile 绑定 exact cluster/namespace/service account、架构、CPU/内存/scratch、接受证明及可选 readonly prepared PVC / worker config secret。GPU 显式拒绝。worker service account token 不自动挂载；控制平面 token 与 worker 凭据分开。新接口使用 `agents.kruise.io/v1alpha1` CRD 模板，但没有假定官方 Rust SDK、E2B 完整日志事件 API、memory snapshot 或 provider command reconnect 已被验证。
 
-ArtifactGateway/Writer 是 HTTPS、无 redirect、大小有界的 scoped gateway 合同，不是向 OSS 原生 endpoint 直接发送 bearer token。gateway、identity broker、每个 attempt 的输出前缀/短期凭据、只读源码/数据范围与 ACR pulls 仍需要独立部署和权限验收。当前代码不会创建这些资源或 RAM 权限。
+ArtifactGateway/Writer 使用 HTTPS、无 redirect、大小有界的 scoped gateway。`research-artifact-gateway` 已实现持久文件存储：Reader 只读受控前缀，Publisher 只写固定 source/Build 前缀，AttemptWriter 只写当前 tenant/task/attempt/fence 的输出。它逐请求读取私有 broker 准入投影，在上传前后检查有效期与撤销，并在最终原子发布期间用受限 PG 函数锁定 authority/task/admission；网关不获得这些表的写权限。文件经流式限额、同步及不可覆盖的原子 link 发布；路径逐段以 directory FD 和 NOFOLLOW 打开。网关监听 loopback，远端 TLS ingress、broker 发放/续期、持久卷与 ACR pulls 仍需独立部署和权限验收。当前代码不会创建这些资源或 RAM 权限。
 
 ## Session：借鉴 OpenResearch，保留 Monday 科学权威
 
