@@ -1,6 +1,18 @@
 # Alpha Harness
 Rust CLI and libraries for the governed CEX Campaign and prediction research plane. It has no order or trade command and does not depend on execution adapters.
 
+## Scientific fitting and control evidence
+
+`alpha-engine` keeps immutable fitted-model evidence, protocol validation and
+deterministic ledger/replay verification available without default features.
+The `fitting` feature owns baseline fitting, independent refits, sequence
+training and market-encoder training. Only that feature depends on
+`hft-research-ml` and Burn. The existing scientific default enables `kernel`
+and `fitting`; control consumers must explicitly disable default features.
+
+This separates compilation ownership. It does not change Campaign admission,
+trial/resource budgets, final evaluation, holdout isolation or settlement.
+
 ## Packages
 
 - `alpha-domain`: typed missions, candidates, feedback, learning, approvals, and signed envelopes.
@@ -252,11 +264,13 @@ pauses closed; invoking a diagnostic command never supplies that evidence.
 
 ## Prediction-Market Research
 
-`alpha-harness` is also the single Monday transport and evidence entrypoint for
-prediction-market research. It does not merge the evaluators: continuous
-contracts keep the IC/RankIC/ICIR evaluator above, while binary event contracts
-use the event-disjoint Brier/log-loss/calibration/full-depth settlement evaluator
-compiled as `monday-prediction-evaluator`.
+Prediction research belongs to the Prediction workspace. Its
+`monday-prediction-operator` owns governed submission and status readback;
+`monday-prediction-worker` owns snapshot transport and execution. Neither imports
+the CEX harness. `alpha-harness` accepts only CEX control commands. Continuous
+contracts keep the IC/RankIC/ICIR evaluator above. Binary event contracts use
+the separate event-disjoint Brier/log-loss/calibration/full-depth settlement
+evaluator compiled as `monday-prediction-evaluator`.
 
 Build an immutable snapshot from the governed read-only research database and
 publish it once:

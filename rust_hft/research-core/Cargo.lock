@@ -105,6 +105,7 @@ dependencies = [
  "hft-factor-dsl",
  "hft-governance-contracts",
  "hft-research-artifacts",
+ "hft-research-dispatch-io",
  "hft-research-manifest",
  "hft-research-ml",
  "parquet",
@@ -3306,6 +3307,16 @@ dependencies = [
  "sha2",
  "tempfile",
  "zip 6.0.0",
+]
+
+[[package]]
+name = "hft-research-dispatch-io"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
