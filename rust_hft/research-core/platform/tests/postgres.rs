@@ -63,6 +63,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     sqlx_core::raw_sql::raw_sql(hft_research_platform::postgres::ARTIFACT_GATEWAY_MIGRATION)
         .execute(&pool)
         .await?;
+    sqlx_core::raw_sql::raw_sql(hft_research_platform::postgres::NATIVE_ADMISSION_MIGRATION)
+        .execute(&pool)
+        .await?;
     let ledger = Ledger::connect(&url).await?;
     let view = PublishedView {
         prepared_id: hash('a'),
@@ -268,25 +271,88 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     };
     spec.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
     assert!(ledger.submit("fixture", "one", spec.clone()).await.is_err());
+    // An old row containing plausible receipt hashes remains audit history,
+    // but cannot become current native authority without the signed import.
+    let unsigned_admission = hft_research_platform::orchestrator::Admission {
+        schema: 1,
+        request_sha256: spec.id()?,
+        task_spec: spec.clone(),
+        resource_reservation_receipt_sha256: hash('a'),
+        scientific_grant_receipt_sha256: hash('b'),
+        release_admission_receipt_sha256: artifact.release_receipt_sha256.clone(),
+        max_attempts: spec.max_attempts,
+    };
+    sqlx_core::query::query(
+        "INSERT INTO research.admissions(request_sha256,document) VALUES($1,$2)",
+    )
+    .bind(&unsigned_admission.request_sha256)
+    .bind(serde_json::to_value(&unsigned_admission)?)
+    .execute(&pool)
+    .await?;
+    assert!(ledger
+        .submit("fixture", "unsigned-native", spec.clone())
+        .await
+        .is_err());
     let admit = |spec: hft_research_platform::orchestrator::TaskSpec| {
-        let pool = &pool;
+        let ledger = &ledger;
         async move {
+            use hft_research_platform::admission::{NativeAdmission, NativeAdmissionTrust};
+            let run = ledger
+                .run_for_tenant("fixture", &spec.run_manifest_sha256)
+                .await?;
+            let build = ledger.build_artifact(&run.build_artifact_sha256).await?;
             let a = hft_research_platform::orchestrator::Admission {
                 schema: 1,
                 request_sha256: spec.id()?,
                 task_spec: spec.clone(),
                 resource_reservation_receipt_sha256: hash('a'),
                 scientific_grant_receipt_sha256: hash('b'),
-                release_admission_receipt_sha256: hash('c'),
+                release_admission_receipt_sha256: build.release_receipt_sha256,
                 max_attempts: spec.max_attempts,
             };
-            sqlx_core::query::query(
-                "INSERT INTO research.admissions(request_sha256,document) VALUES($1,$2)",
-            )
-            .bind(&a.request_sha256)
-            .bind(serde_json::to_value(&a)?)
-            .execute(pool)
-            .await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64;
+            let evidence = NativeAdmission {
+                schema: "monday.native_scientific_admission.v1".into(),
+                tenant: "fixture".into(),
+                native_request_sha256: run.configuration_sha256.clone(),
+                run,
+                operation_sha256: a.request_sha256.clone(),
+                family_id: "synthetic-native-budget".into(),
+                root_grant_sha256: hash('b'),
+                approval_sha256: hash('c'),
+                transfer_receipt_sha256: hash('d'),
+                declared_trials: 1,
+                reserved_job_seconds: (((spec.timeout_ms + 999) / 1000) as u64)
+                    * u64::from(spec.max_attempts),
+                reserved_llm_tokens: 0,
+                issued_ms: now,
+                expires_ms: now + 3_600_000,
+                admission: a,
+            };
+            let key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+            let signed = hft_research_platform::admission::sign(
+                evidence,
+                "fixture-native-issuer".into(),
+                &key,
+            )?;
+            let public = key
+                .verifying_key()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let trust = NativeAdmissionTrust {
+                schema: "monday.native_reservation_trust.v1".into(),
+                native_reservation_keys: std::collections::BTreeMap::from([(
+                    "fixture-native-issuer".into(),
+                    public,
+                )]),
+            };
+            ledger
+                .register_native_admission(&trust.verify(&signed)?)
+                .await?;
             Ok::<_, anyhow::Error>(())
         }
     };
@@ -326,6 +392,39 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .await?;
     assert_eq!(count, 0);
     admit(spec.clone()).await?;
+    let native_row: serde_json::Value = sqlx_core::query_scalar::query_scalar(
+        "SELECT document FROM research.native_admission_imports WHERE request_sha256=$1",
+    )
+    .bind(spec.id()?)
+    .fetch_one(&pool)
+    .await?;
+    let mut duplicate: hft_research_platform::admission::SignedNativeAdmission =
+        serde_json::from_value(native_row)?;
+    let original_operation = duplicate.evidence.operation_sha256.clone();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+    let public = key
+        .verifying_key()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let native_trust = hft_research_platform::admission::NativeAdmissionTrust {
+        schema: "monday.native_reservation_trust.v1".into(),
+        native_reservation_keys: std::collections::BTreeMap::from([(
+            "fixture-native-issuer".into(),
+            public,
+        )]),
+    };
+    duplicate.evidence.tenant = "another".into();
+    let foreign = hft_research_platform::admission::sign(
+        duplicate.evidence,
+        "fixture-native-issuer".into(),
+        &key,
+    )?;
+    assert!(ledger
+        .register_native_admission(&native_trust.verify(&foreign)?)
+        .await
+        .is_err());
     let id = ledger.submit("fixture", "one", spec.clone()).await?;
     assert_eq!(id, ledger.submit("fixture", "one", spec.clone()).await?);
     let status = hft_research_platform::agent_api::execute(
@@ -355,6 +454,24 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     run.command = second.command.clone();
     second.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
     admit(second.clone()).await?;
+    let second_row: serde_json::Value = sqlx_core::query_scalar::query_scalar(
+        "SELECT document FROM research.native_admission_imports WHERE request_sha256=$1",
+    )
+    .bind(second.id()?)
+    .fetch_one(&pool)
+    .await?;
+    let mut reused: hft_research_platform::admission::SignedNativeAdmission =
+        serde_json::from_value(second_row)?;
+    reused.evidence.operation_sha256 = original_operation;
+    let reused = hft_research_platform::admission::sign(
+        reused.evidence,
+        "fixture-native-issuer".into(),
+        &key,
+    )?;
+    assert!(ledger
+        .register_native_admission(&native_trust.verify(&reused)?)
+        .await
+        .is_err());
     ledger.submit("fixture", "two", second).await?;
     let session_temp = tempfile::tempdir()?;
     let session_root = session_temp.path().canonicalize()?;
