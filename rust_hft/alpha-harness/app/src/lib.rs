@@ -29,6 +29,17 @@ pub async fn operator_main() -> anyhow::Result<()> {
 
 #[cfg(feature = "scientific")]
 pub async fn worker_main() -> anyhow::Result<()> {
+    let argv = std::env::args_os().collect::<Vec<_>>();
+    if argv
+        .get(1)
+        .is_some_and(|arg| arg == "--stage-configuration")
+    {
+        if argv.len() != 2 {
+            anyhow::bail!("configuration staging accepts no path, execution, or network arguments");
+        }
+        let context = hft_research_platform::orchestrator::AttemptContext::from_environment()?;
+        return hft_research_platform::worker_configuration::stage_configuration(&context);
+    }
     let result = cli::run_worker(cli::WorkerCli::parse()).await;
     if result.is_err() {
         mission_runner::research_event(

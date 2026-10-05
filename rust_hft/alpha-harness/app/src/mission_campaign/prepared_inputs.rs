@@ -30,6 +30,7 @@ pub(crate) struct PreparedCampaignArtifacts {
 }
 
 pub(crate) struct VerifiedNativeCampaignPreparedInputs {
+    finalized_request: CampaignRequest,
     request_sha256: String,
     campaign_inputs_sha256: String,
     source_revision: String,
@@ -39,6 +40,9 @@ pub(crate) struct VerifiedNativeCampaignPreparedInputs {
     render_inputs: PreparedCexInputs,
 }
 impl VerifiedNativeCampaignPreparedInputs {
+    pub(crate) fn finalized_request(&self) -> &CampaignRequest {
+        &self.finalized_request
+    }
     pub(crate) fn request_sha256(&self) -> &str {
         &self.request_sha256
     }
@@ -136,6 +140,7 @@ pub(crate) fn inspect_finalized_campaign_prepared_inputs(
     }
     let render_inputs = verify_native_render_binding(request, &prepared)?;
     Ok(VerifiedNativeCampaignPreparedInputs {
+        finalized_request: request.clone(),
         request_sha256,
         campaign_inputs_sha256: request.campaign_inputs_sha256.clone(),
         source_revision: request.build_source_revision.clone(),
