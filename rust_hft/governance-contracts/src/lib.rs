@@ -45,6 +45,7 @@ pub enum GovernanceError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AllowedIntentType {
+    LoadProbabilityReversal,
     LoadFactor,
     LoadModel,
     LoadAllocatorPolicy,
@@ -441,6 +442,7 @@ fn intent_sort_key(intent: &AllowedIntentType) -> u8 {
         AllowedIntentType::StartPaper => 3,
         AllowedIntentType::StartShadow => 4,
         AllowedIntentType::StartLiveSmall => 5,
+        AllowedIntentType::LoadProbabilityReversal => 6,
     }
 }
 
