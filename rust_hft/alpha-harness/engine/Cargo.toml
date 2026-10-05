@@ -6,7 +6,8 @@ edition = "2021"
 publish = false
 
 [features]
-default = ["kernel"]
+default = ["kernel", "fitting"]
+fitting = ["dep:hft-research-ml"]
 kernel = ["dep:alpha-store"]
 
 [dependencies]
@@ -17,7 +18,7 @@ chrono = { workspace = true, features = ["serde"] }
 hex = { workspace = true }
 hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 hft-research-manifest = { path = "../../research-core/manifest" }
-hft-research-ml = { path = "../../research-core/ml" }
+hft-research-ml = { path = "../../research-core/ml", optional = true }
 hft-search-kernel = { path = "../../research-core/search-kernel" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
