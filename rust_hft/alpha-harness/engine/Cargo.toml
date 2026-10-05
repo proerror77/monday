@@ -10,6 +10,7 @@ default = ["kernel"]
 kernel = ["dep:alpha-store"]
 
 [dependencies]
+governance = { package = "hft-governance-contracts", path = "../../governance-contracts" }
 alpha-domain = { path = "../domain" }
 alpha-store = { path = "../store", optional = true }
 chrono = { workspace = true, features = ["serde"] }

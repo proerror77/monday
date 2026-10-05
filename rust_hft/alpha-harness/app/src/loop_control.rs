@@ -5,9 +5,10 @@ use crate::{
     },
     governance, mission,
 };
+use ::governance::attribution::AttributionMode;
 use alpha_domain::{
-    runtime_stage_is_healthy, AttributionMode, LoopCompletionPolicy, LoopRun, LoopRunStatus,
-    LoopStage, LoopStageRecord, LoopStageStatus, LoopStopReason, LoopTargetStage, MissionStatus,
+    runtime_stage_is_healthy, LoopCompletionPolicy, LoopRun, LoopRunStatus, LoopStage,
+    LoopStageRecord, LoopStageStatus, LoopStopReason, LoopTargetStage, MissionStatus,
 };
 use alpha_store::{AlphaStore, StoreError};
 use anyhow::{bail, Context};
@@ -547,16 +548,18 @@ mod tests {
         },
         data_mission, governance,
     };
+    use ::governance::attribution::{
+        sign_runtime_attribution_event, AttributionKind, AttributionOutcome,
+        RuntimeAttributionEvent,
+    };
     use ::governance::{
         deployment_scope_hash, AllowedIntentType, ApprovalClass, DeploymentEnvelope,
         LiveSmallEligibilityEvidence,
     };
     use alpha_domain::{
-        sign_runtime_attribution_event, AttributionKind, AttributionOutcome, CandidateArtifact,
-        EngineKind, EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1,
-        EvaluationWalkForwardV1, IterationVerdict, MissionTerminalReason, ResearchIteration,
-        ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage,
-        SEALED_HOLDOUT_EVALUATOR_VERSION,
+        CandidateArtifact, EngineKind, EvaluationCostsV1, EvaluationLabelSpecV1,
+        EvaluationProtocolV1, EvaluationWalkForwardV1, IterationVerdict, MissionTerminalReason,
+        ResearchIteration, ResearchMission, SearchBudgetUsage, SEALED_HOLDOUT_EVALUATOR_VERSION,
     };
     use alpha_engine::{
         evaluation::prepare_dataset,

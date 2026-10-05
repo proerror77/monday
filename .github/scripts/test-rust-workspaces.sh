@@ -39,6 +39,13 @@ cargo tree --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" \
 if grep -E '^(burn|ort |hft-(collector|research-ml|data) |parquet )' "$work/control.tree"; then
   echo 'control pulls acquisition, training or Parquet' >&2; exit 1
 fi
+for features in formula-strategy,binance full; do
+  cargo tree --manifest-path "$root/rust_hft/runtime/Cargo.toml" -p hft-live \
+    --no-default-features --features "$features" --locked --edges normal --prefix none >"$work/live.tree"
+  if grep -E '^(alpha-(domain|engine|store|onnx-evaluator|harness) |burn |hft-(collector|research-platform|research-ml) )' "$work/live.tree"; then
+    echo 'live imports research control, evaluation or training' >&2; exit 1
+  fi
+done
 cargo tree --manifest-path "$root/rust_hft/data-pipelines/Cargo.toml" \
   -p hft-data --locked --edges normal --prefix none >"$work/data.tree"
 if grep -E '^(burn|ort |hft-(collector|research-ml|execution-adapter-[a-z-]+) )' "$work/data.tree"; then

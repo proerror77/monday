@@ -7,20 +7,21 @@ pub use final_precommit::ModelFinalizationEvidenceV1;
 use final_precommit::SealedPrecommit;
 
 use alpha_domain::{
-    canonical_json_hash, AttributionKind, AttributionMode, CandidateArtifact, CandidateEvaluation,
-    CexBaselineArtifactV1, CexFactorBankRevisionV2, CexFinalPrecommitV1,
-    CexFourStageStrategyCandidateV1, CexResearchContentRefV1, CexResearchMissionArtifactV1,
-    CexSealedHoldoutClaimV1, EngineKind, EvaluationProtocolV1, FormulaEvaluatorConfig,
-    IterationVerdict, LearningDirective, LoopRun, MissionStatus, MissionTerminalReason,
-    PromotionRecord, ResearchIteration, ResearchMission, RuntimeAttributionEvent,
+    canonical_json_hash, CandidateArtifact, CandidateEvaluation, CexBaselineArtifactV1,
+    CexFactorBankRevisionV2, CexFinalPrecommitV1, CexFourStageStrategyCandidateV1,
+    CexResearchContentRefV1, CexResearchMissionArtifactV1, CexSealedHoldoutClaimV1, EngineKind,
+    EvaluationProtocolV1, FormulaEvaluatorConfig, IterationVerdict, LearningDirective, LoopRun,
+    MissionStatus, MissionTerminalReason, PromotionRecord, ResearchIteration, ResearchMission,
     SearchBudgetUsage, SearchPolicyRevision, StrategyBundle, StrategyBundleArtifact,
-    VerifiedRuntimeAttributionEvent, CEX_FINAL_PRECOMMIT_REGISTRY_KIND,
-    CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
-    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
-    WALK_FORWARD_EVALUATOR_VERSION,
+    CEX_FINAL_PRECOMMIT_REGISTRY_KIND, CEX_SEALED_HOLDOUT_CLAIM_REGISTRY_KIND,
+    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
+    SEALED_HOLDOUT_EVALUATOR_VERSION, WALK_FORWARD_EVALUATOR_VERSION,
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
+use governance::attribution::{
+    AttributionKind, AttributionMode, RuntimeAttributionEvent, VerifiedRuntimeAttributionEvent,
+};
 use governance::{
     AllowedIntentType, DeploymentEnvelope, LiveSmallEligibilityEvidence, SignedDeploymentEnvelope,
 };
@@ -2107,10 +2108,14 @@ impl AlphaStore {
         let promotion = self.get_canonical_promotion(&envelope.promotion_id)?;
         let bundle = self.get_canonical_strategy_bundle(&envelope.bundle_id)?;
         if promotion.record.bundle_id != envelope.bundle_id
-            || promotion.record.bundle_hash != envelope.bundle_hash
+            || promotion.record.bundle_hash != bundle.bundle_hash
             || promotion.record.candidate_id != envelope.asset_revision_id
             || promotion.content_hash != envelope.promotion_manifest_hash
-            || bundle.bundle_hash != envelope.bundle_hash
+            || bundle
+                .to_runtime_bundle()
+                .map_err(domain_error)?
+                .bundle_hash
+                != envelope.bundle_hash
         {
             return Err(StoreError::Domain(
                 "deployment envelope does not match persisted promotion and bundle".to_string(),
@@ -3440,7 +3445,7 @@ fn require_text(value: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn domain_error(error: alpha_domain::DomainError) -> StoreError {
+fn domain_error(error: impl std::fmt::Display) -> StoreError {
     StoreError::Domain(error.to_string())
 }
 
@@ -3463,14 +3468,16 @@ fn serialization_error(error: serde_json::Error) -> StoreError {
 mod tests {
     use super::*;
     use alpha_domain::{
-        canonical_json_hash, sign_runtime_attribution_event, verify_runtime_attribution_event,
-        AttributionKind, AttributionMode, AttributionOutcome, EngineKind, EvaluationCostsV1,
-        EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1, IterationVerdict,
-        LoopCompletionPolicy, LoopRunStatus, LoopTargetStage, MissionCompletionPolicy,
-        MissionStatus, PromotionRecord, RuntimeAttributionEvent, SearchBudget,
-        SearchPolicyRevision, StrategyBundle, StrategyBundleArtifact, ValidatorMode,
+        canonical_json_hash, EngineKind, EvaluationCostsV1, EvaluationLabelSpecV1,
+        EvaluationProtocolV1, EvaluationWalkForwardV1, IterationVerdict, LoopCompletionPolicy,
+        LoopRunStatus, LoopTargetStage, MissionCompletionPolicy, MissionStatus, PromotionRecord,
+        SearchBudget, SearchPolicyRevision, StrategyBundle, StrategyBundleArtifact, ValidatorMode,
     };
     use ed25519_dalek::SigningKey;
+    use governance::attribution::{
+        sign_runtime_attribution_event, verify_runtime_attribution_event, AttributionKind,
+        AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
+    };
     use governance::{sign_envelope, AllowedIntentType, ApprovalClass, DeploymentEnvelope};
     use hft_factor_dsl::{FactorAst, FactorTerminal};
     use hft_research_manifest::ManifestId;
@@ -4367,6 +4374,29 @@ mod tests {
     }
 
     #[test]
+    fn deployment_binding_requires_the_projected_runtime_artifact() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let now = Utc::now();
+        let (promotion, bundle) = persist_formula_promotion(&mut store, now);
+        let mut envelope = DeploymentEnvelope {
+            deployment_id: "projection-deployment".into(), asset_revision_id: bundle.candidate_id.clone(),
+            promotion_id: promotion.record.promotion_id, promotion_manifest_hash: promotion.content_hash,
+            bundle_id: bundle.bundle_id.clone(), bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
+            runtime_config_hash: "c".repeat(64), risk_policy_hash: "d".repeat(64),
+            account_id: "account-1".into(), venue: "binance".into(), instruments: vec!["BTCUSDT".into()],
+            allowed_intent_types: vec![AllowedIntentType::StartPaper], max_notional: 100.0,
+            max_symbol_exposure: 50.0, max_order_size: 10.0, max_slippage_bps: 2.0,
+            valid_from: now, expires_at: now + chrono::Duration::minutes(1), nonce: "projection-nonce".into(),
+            approval_class: ApprovalClass::Paper, approval_signatures: vec!["approval-1".into()], payload_hash: String::new(),
+        };
+        let (_, original) = store.validate_deployment_binding(&envelope).unwrap();
+        assert_eq!(original, bundle);
+        envelope.bundle_hash = bundle.bundle_hash;
+        assert!(store.validate_deployment_binding(&envelope).is_err());
+    }
+
+    #[test]
     fn deployment_store_rejects_arbitrary_bundle_binding() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
@@ -5089,8 +5119,8 @@ mod tests {
                 asset_revision_id: "candidate-1".to_string(),
                 promotion_id: "promotion-1".to_string(),
                 promotion_manifest_hash: promotion.content_hash,
-                bundle_id: bundle.bundle_id,
-                bundle_hash: bundle.bundle_hash,
+                bundle_id: bundle.bundle_id.clone(),
+                bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
                 runtime_config_hash: "c".repeat(64),
                 risk_policy_hash: "d".repeat(64),
                 account_id: "account-1".to_string(),
@@ -5158,8 +5188,8 @@ mod tests {
                 asset_revision_id: "candidate-1".to_string(),
                 promotion_id: promotion.record.promotion_id,
                 promotion_manifest_hash: promotion.content_hash,
-                bundle_id: bundle.bundle_id,
-                bundle_hash: bundle.bundle_hash,
+                bundle_id: bundle.bundle_id.clone(),
+                bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
                 runtime_config_hash: "c".repeat(64),
                 risk_policy_hash: "d".repeat(64),
                 account_id: "account-1".to_string(),

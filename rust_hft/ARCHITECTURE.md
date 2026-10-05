@@ -52,7 +52,8 @@ and Session transport still require integration before cutover. See
 
 ## Durable Packages
 
-- `alpha-harness/domain`: Campaign/family, mission, LoopRun, candidate, evaluation, learning, approval, bundle, and signed deployment contracts.
+- `alpha-harness/domain`: Campaign/family, mission, LoopRun, candidate, evaluation, learning and scientific bundle contracts.
+- `governance-contracts`: signed deployment, fixed executable runtime bundle and signed runtime attribution contracts.
 - `alpha-harness/store`: DuckDB migrations and append-only control-plane repositories.
 - `research-core/search-kernel`: domain-neutral deterministic UCT selection,
   topology and reward statistics. It owns no candidate grammar, evaluator,
@@ -177,6 +178,15 @@ Streaming connector availability is a runtime capability, not proof that the sam
 No passing result, candidate count, or profitability claim is fabricated. DuckDB replay proves plumbing and lineage, not alpha.
 
 ## Deployment Safety
+
+The producer validates full scientific evidence and emits
+`monday.runtime_bundle.v1`. Runtime consumes fixed inference and execution state,
+with the original scientific bundle identity, rather than evaluator structures.
+The signed envelope and exact approval scope bind the projected runtime hash.
+Scientific promotion history retains its original hash. This schema transition
+requires a fresh matching handoff and approval; it does not resume a runtime or
+grant live-small authority.
+
 
 The runtime verifies current config/risk hashes, account, venue, instruments, intent types, limits, validity window, envelope signature, runtime-owned approval evidence, and durable nonce before preparing activation. The order is pre-activation audit fsync, nonce reservation/fsync, runtime construction, then signed activation attribution.
 

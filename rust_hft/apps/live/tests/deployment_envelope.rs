@@ -76,7 +76,7 @@ fn envelope(
     mode: AllowedIntentType,
     approval: ApprovalClass,
 ) -> DeploymentEnvelope {
-    let bundle = formula_bundle(now);
+    let bundle = formula_bundle(now).to_runtime_bundle().unwrap();
     DeploymentEnvelope {
         deployment_id: id.to_string(),
         asset_revision_id: bundle.candidate_id.clone(),
@@ -142,7 +142,7 @@ fn cex_four_stage_bundle() -> StrategyBundle {
 fn bind_bundle(mut envelope: DeploymentEnvelope, bundle: &StrategyBundle) -> DeploymentEnvelope {
     envelope.asset_revision_id = bundle.candidate_id.clone();
     envelope.bundle_id = bundle.bundle_id.clone();
-    envelope.bundle_hash = bundle.bundle_hash.clone();
+    envelope.bundle_hash = bundle.to_runtime_bundle().unwrap().bundle_hash.clone();
     envelope
 }
 
@@ -250,7 +250,11 @@ fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
     let mut config = configured_runtime();
     let bundle = formula_bundle(now);
     let bundle_path = directory.join("bundle.json");
-    let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+    let mut adapter = SystemConfigActivationAdapter::new(
+        &mut config,
+        bundle.to_runtime_bundle().unwrap(),
+        &bundle_path,
+    );
 
     let paper = sign_envelope(
         envelope(
@@ -418,7 +422,11 @@ fn signed_frozen_model_bundle_loads_native_parameters_and_preserves_limits() {
     let signed = sign_envelope(grant, "key-1", &key).unwrap();
     let request = {
         let bundle_path = directory.join("bundle.json");
-        let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+        let mut adapter = SystemConfigActivationAdapter::new(
+            &mut config,
+            bundle.to_runtime_bundle().unwrap(),
+            &bundle_path,
+        );
         intake(
             &signed,
             &trusted(&key),
@@ -507,8 +515,11 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
         )
         .unwrap();
         let request = {
-            let mut adapter =
-                SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+            let mut adapter = SystemConfigActivationAdapter::new(
+                &mut config,
+                bundle.to_runtime_bundle().unwrap(),
+                &bundle_path,
+            );
             intake(
                 &signed,
                 &trusted,
@@ -595,7 +606,11 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
     .unwrap();
     let mut wrong_market = configured_runtime();
     wrong_market.venues[0].inst_type = Some("spot".to_string());
-    let mut adapter = SystemConfigActivationAdapter::new(&mut wrong_market, &bundle, &bundle_path);
+    let mut adapter = SystemConfigActivationAdapter::new(
+        &mut wrong_market,
+        bundle.to_runtime_bundle().unwrap(),
+        &bundle_path,
+    );
     assert!(intake(
         &signed,
         &trusted,
@@ -626,8 +641,11 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
     .unwrap();
     let mut spot_endpoints = configured_runtime();
     spot_endpoints.venues[0].inst_type = Some("usdm".to_string());
-    let mut adapter =
-        SystemConfigActivationAdapter::new(&mut spot_endpoints, &bundle, &bundle_path);
+    let mut adapter = SystemConfigActivationAdapter::new(
+        &mut spot_endpoints,
+        bundle.to_runtime_bundle().unwrap(),
+        &bundle_path,
+    );
     assert!(intake(
         &signed,
         &trusted,
@@ -656,7 +674,11 @@ fn four_stage_cex_bundle_uses_formula_runtime_only_for_its_signed_scope() {
         &key,
     )
     .unwrap();
-    let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+    let mut adapter = SystemConfigActivationAdapter::new(
+        &mut config,
+        bundle.to_runtime_bundle().unwrap(),
+        &bundle_path,
+    );
     assert!(intake(
         &signed,
         &trusted,
@@ -717,12 +739,12 @@ fn paper_and_shadow_require_their_exact_approval_class() {
 #[tokio::test]
 #[cfg(feature = "formula-strategy")]
 async fn shadow_activation_waits_for_market_then_produces_loop_consumable_evidence() {
-    use alpha_domain::{
-        runtime_stage_is_healthy, verify_runtime_attribution_event, AttributionKind,
-        AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
-        SignedRuntimeAttributionEvent,
-    };
+    use alpha_domain::runtime_stage_is_healthy;
     use engine::dataflow::{EventIngester, IngestionConfig};
+    use governance::attribution::{
+        verify_runtime_attribution_event, AttributionKind, AttributionMode, AttributionOutcome,
+        RuntimeAttributionEvent, SignedRuntimeAttributionEvent,
+    };
     use hft_core::{Symbol, VenueId};
     use ports::{BookLevel, MarketEvent, MarketSnapshot};
     use std::collections::BTreeMap;
@@ -747,7 +769,11 @@ async fn shadow_activation_waits_for_market_then_produces_loop_consumable_eviden
     let bundle_path = directory.join("bundle.json");
     let mut config = configured_runtime();
     let request = {
-        let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+        let mut adapter = SystemConfigActivationAdapter::new(
+            &mut config,
+            bundle.to_runtime_bundle().unwrap(),
+            &bundle_path,
+        );
         intake(
             &signed,
             &trusted(&envelope_key),
@@ -919,7 +945,7 @@ fn featureless_runtime_rejects_formula_strategy_startup() {
         asset_revision_id: bundle.candidate_id.clone(),
         promotion_id: "promotion-1".to_string(),
         bundle_id: bundle.bundle_id.clone(),
-        bundle_hash: bundle.bundle_hash.clone(),
+        bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash.clone(),
         account_id: "account-1".to_string(),
         venue: "binance".to_string(),
         market: None,
@@ -932,9 +958,13 @@ fn featureless_runtime_rejects_formula_strategy_startup() {
         max_order_size: 100.0,
         max_slippage_bps: 5.0,
     };
-    SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
-        .activate(&mut request)
-        .unwrap();
+    SystemConfigActivationAdapter::new(
+        &mut config,
+        bundle.to_runtime_bundle().unwrap(),
+        &bundle_path,
+    )
+    .activate(&mut request)
+    .unwrap();
 
     assert!(runtime::SystemBuilder::new(config)
         .auto_register_adapters_strict()
@@ -1224,7 +1254,11 @@ fn live_small_polymarket_formula_activation_remains_fail_closed() {
     config.venues[0].symbol_catalog[0].0 = "123456789@POLYMARKET".to_string();
     let bundle = formula_bundle(now);
     let bundle_path = directory.join("bundle.json");
-    let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+    let mut adapter = SystemConfigActivationAdapter::new(
+        &mut config,
+        bundle.to_runtime_bundle().unwrap(),
+        &bundle_path,
+    );
     let error = intake(
         &signed,
         &trusted,
@@ -1260,7 +1294,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             asset_revision_id: bundle.candidate_id.clone(),
             promotion_id: "promotion-1".to_string(),
             bundle_id: bundle.bundle_id.clone(),
-            bundle_hash: bundle.bundle_hash.clone(),
+            bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash.clone(),
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
             market: None,
@@ -1273,9 +1307,13 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             max_order_size: 100.0,
             max_slippage_bps: value,
         };
-        let error = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
-            .activate(&mut request)
-            .unwrap_err();
+        let error = SystemConfigActivationAdapter::new(
+            &mut config,
+            bundle.to_runtime_bundle().unwrap(),
+            &bundle_path,
+        )
+        .activate(&mut request)
+        .unwrap_err();
         assert!(error.contains("finite integer in 1..=10000"));
         assert_eq!(config.engine.intent_max_slippage_bps, None);
         assert_eq!(config.engine.intent_max_order_notional, None);
@@ -1289,7 +1327,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             asset_revision_id: bundle.candidate_id.clone(),
             promotion_id: "promotion-1".to_string(),
             bundle_id: bundle.bundle_id.clone(),
-            bundle_hash: bundle.bundle_hash.clone(),
+            bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash.clone(),
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
             market: None,
@@ -1302,9 +1340,13 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
             max_order_size: 100.0,
             max_slippage_bps: value,
         };
-        SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
-            .activate(&mut request)
-            .expect("inclusive slippage boundary");
+        SystemConfigActivationAdapter::new(
+            &mut config,
+            bundle.to_runtime_bundle().unwrap(),
+            &bundle_path,
+        )
+        .activate(&mut request)
+        .expect("inclusive slippage boundary");
         assert_eq!(config.engine.intent_max_slippage_bps, Some(value as i32));
         assert_eq!(
             config.engine.intent_max_order_notional,
@@ -1345,13 +1387,17 @@ fn onnx_handoff_rejects_bad_schema_and_checksum_before_runtime_build() {
         );
         unsigned.asset_revision_id = bundle.candidate_id.clone();
         unsigned.bundle_id = bundle.bundle_id.clone();
-        unsigned.bundle_hash = bundle.bundle_hash.clone();
+        unsigned.bundle_hash = bundle.to_runtime_bundle().unwrap().bundle_hash.clone();
         unsigned.allowed_intent_types =
             vec![AllowedIntentType::LoadModel, AllowedIntentType::StartPaper];
         let signed = sign_envelope(unsigned, "key-1", &key).unwrap();
         let mut config = configured_runtime();
         let bundle_path = directory.join(format!("bundle-{suffix}.json"));
-        let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+        let mut adapter = SystemConfigActivationAdapter::new(
+            &mut config,
+            bundle.to_runtime_bundle().unwrap(),
+            &bundle_path,
+        );
 
         assert!(intake(
             &signed,
@@ -1377,13 +1423,17 @@ fn onnx_handoff_rejects_bad_schema_and_checksum_before_runtime_build() {
     );
     unsigned.asset_revision_id = bundle.candidate_id.clone();
     unsigned.bundle_id = bundle.bundle_id.clone();
-    unsigned.bundle_hash = bundle.bundle_hash.clone();
+    unsigned.bundle_hash = bundle.to_runtime_bundle().unwrap().bundle_hash.clone();
     unsigned.allowed_intent_types =
         vec![AllowedIntentType::LoadModel, AllowedIntentType::StartPaper];
     let signed = sign_envelope(unsigned, "key-1", &key).unwrap();
     let mut config = configured_runtime();
     let bundle_path = directory.join("bundle-valid-metadata.json");
-    let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+    let mut adapter = SystemConfigActivationAdapter::new(
+        &mut config,
+        bundle.to_runtime_bundle().unwrap(),
+        &bundle_path,
+    );
     let (_, reservation) = prepare_intake(
         &signed,
         &trusted,
@@ -1455,13 +1505,17 @@ fn onnx_handoff_rejects_absolute_file_and_parent_paths() {
         );
         unsigned.asset_revision_id = bundle.candidate_id.clone();
         unsigned.bundle_id = bundle.bundle_id.clone();
-        unsigned.bundle_hash = bundle.bundle_hash.clone();
+        unsigned.bundle_hash = bundle.to_runtime_bundle().unwrap().bundle_hash.clone();
         unsigned.allowed_intent_types =
             vec![AllowedIntentType::LoadModel, AllowedIntentType::StartPaper];
         let signed = sign_envelope(unsigned, "key-1", &key).unwrap();
         let mut config = configured_runtime();
         let bundle_path = bundle_directory.join(format!("bundle-{suffix}.json"));
-        let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+        let mut adapter = SystemConfigActivationAdapter::new(
+            &mut config,
+            bundle.to_runtime_bundle().unwrap(),
+            &bundle_path,
+        );
 
         let error = intake(
             &signed,
