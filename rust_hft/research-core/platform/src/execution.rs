@@ -567,8 +567,8 @@ impl Kubernetes {
         })
     }
 
-    /// Foreground deletion and a zero owned-Pod readback constitute the
-    /// process-tree stop proof accepted by this adapter. API failure stays unknown.
+    /// Retain naturally finished Jobs and Pods for independent terminal audit.
+    /// Other attempts use UID-bound deletion and an empty Pod readback.
     pub async fn stop(
         &self,
         spec: &TaskSpec,
@@ -589,9 +589,23 @@ impl Kubernetes {
             if let Some(known) = known {
                 ensure!(known == &handle, "deletion UID drift");
             }
+            if spec.profile.backend != Backend::AgentSandbox && job_has_terminal_condition(&object)
+            {
+                return retained_job_stopped(
+                    &object,
+                    &self.owned_pods(spec, lease).await?,
+                    &handle,
+                );
+            }
             self.client.delete(self.endpoint.join(&path)?).bearer_auth(&self.token).json(&json!({"apiVersion":"v1","kind":"DeleteOptions","propagationPolicy":"Foreground","preconditions":{"uid":handle.uid}})).send().await?.error_for_status()?;
             return Ok(false);
         }
+        let list = self.owned_pods(spec, lease).await?;
+        let items = list["items"].as_array().context("Pod list missing items")?;
+        Ok(items.is_empty())
+    }
+
+    async fn owned_pods(&self, spec: &TaskSpec, lease: &Lease) -> Result<Value> {
         let selector = format!(
             "monday.io/task={},monday.io/attempt={},monday.io/fence={}",
             task_label(&lease.task_id),
@@ -608,7 +622,205 @@ impl Kubernetes {
             .read(url.as_str())
             .await?
             .context("Pod list unavailable")?;
-        let items = list["items"].as_array().context("Pod list missing items")?;
-        Ok(items.is_empty())
+        ensure!(
+            list["metadata"]["continue"]
+                .as_str()
+                .is_none_or(str::is_empty),
+            "incomplete Pod list"
+        );
+        list["items"].as_array().context("Pod list missing items")?;
+        Ok(list)
+    }
+}
+
+#[cfg(feature = "control")]
+fn job_has_terminal_condition(job: &Value) -> bool {
+    job["status"]["conditions"]
+        .as_array()
+        .is_some_and(|conditions| {
+            conditions.iter().any(|c| {
+                matches!(c["type"].as_str(), Some("Complete" | "Failed")) && c["status"] == "True"
+            })
+        })
+}
+
+#[cfg(feature = "control")]
+fn retained_job_stopped(job: &Value, pods: &Value, handle: &ExecutionHandle) -> Result<bool> {
+    if !job_has_terminal_condition(job)
+        || !job["metadata"]["deletionTimestamp"].is_null()
+        || job["status"]["active"].as_u64().unwrap_or(0) != 0
+    {
+        return Ok(false);
+    }
+    let conditions = job["status"]["conditions"]
+        .as_array()
+        .context("terminal conditions missing")?;
+    let complete = conditions
+        .iter()
+        .filter(|c| c["type"] == "Complete" && c["status"] == "True")
+        .count();
+    let failed = conditions
+        .iter()
+        .filter(|c| c["type"] == "Failed" && c["status"] == "True")
+        .count();
+    let expected_phase = match (complete, failed) {
+        (1, 0)
+            if job["status"]["succeeded"].as_u64() == Some(1)
+                && job["status"]["failed"].as_u64().unwrap_or(0) == 0 =>
+        {
+            "Succeeded"
+        }
+        (0, 1)
+            if job["status"]["failed"].as_u64() == Some(1)
+                && job["status"]["succeeded"].as_u64().unwrap_or(0) == 0 =>
+        {
+            "Failed"
+        }
+        _ => return Ok(false),
+    };
+    ensure!(
+        pods["metadata"]["continue"]
+            .as_str()
+            .is_none_or(str::is_empty),
+        "incomplete Pod list"
+    );
+    let items = pods["items"].as_array().context("Pod list missing items")?;
+    if items.len() != 1 {
+        return Ok(false);
+    }
+    let pod = &items[0];
+    let owners = pod["metadata"]["ownerReferences"]
+        .as_array()
+        .context("Pod owner missing")?;
+    if !owners.iter().any(|owner| {
+        owner["controller"] == true
+            && owner["kind"] == "Job"
+            && owner["uid"] == handle.uid
+            && owner["name"] == handle.name
+    }) || pod["metadata"]["namespace"] != handle.namespace
+        || pod["metadata"]["uid"].as_str().is_none_or(str::is_empty)
+        || !pod["metadata"]["deletionTimestamp"].is_null()
+        || !["labels", "annotations"].iter().all(|field| {
+            job["spec"]["template"]["metadata"][field]
+                .as_object()
+                .is_some_and(|expected| {
+                    expected
+                        .iter()
+                        .all(|(key, value)| pod["metadata"][field][key] == *value)
+                })
+        })
+        || pod["status"]["phase"] != expected_phase
+        || pod["spec"]["ephemeralContainers"]
+            .as_array()
+            .is_some_and(|cs| !cs.is_empty())
+    {
+        return Ok(false);
+    }
+    for (declared, status) in [
+        ("containers", "containerStatuses"),
+        ("initContainers", "initContainerStatuses"),
+    ] {
+        let expected = job["spec"]["template"]["spec"][declared].as_array();
+        let actual_spec = pod["spec"][declared].as_array();
+        if expected != actual_spec {
+            return Ok(false);
+        }
+        let statuses = pod["status"][status].as_array();
+        let expected = expected.map(Vec::as_slice).unwrap_or_default();
+        let statuses = statuses.map(Vec::as_slice).unwrap_or_default();
+        if statuses.len() != expected.len() || (declared == "containers" && expected.is_empty()) {
+            return Ok(false);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for container in statuses {
+            let name = container["name"]
+                .as_str()
+                .context("container status lacks name")?;
+            if !seen.insert(name)
+                || !expected.iter().any(|c| c["name"] == name)
+                || !container["state"]["terminated"].is_object()
+                || !container["state"]["running"].is_null()
+                || !container["state"]["waiting"].is_null()
+                || container["restartCount"].as_u64() != Some(0)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(all(test, feature = "control"))]
+mod stop_tests {
+    use super::*;
+    fn fixture() -> (Value, Value, ExecutionHandle) {
+        let metadata = json!({"labels":{"monday.io/task":"task","monday.io/attempt":"1","monday.io/fence":"2"},"annotations":{"monday.io/request-sha256":"request"}});
+        let spec = json!({"containers":[{"name":"worker","image":"fixture@sha256:abc"}],"initContainers":[{"name":"configuration","image":"fixture@sha256:abc"}]});
+        let job = json!({"metadata":{"uid":"original","name":"research-task-1"},"spec":{"template":{"metadata":metadata,"spec":spec}},"status":{"active":0,"succeeded":1,"conditions":[{"type":"Complete","status":"True"}]}});
+        let mut pod_metadata = metadata;
+        pod_metadata["namespace"] = json!("research");
+        pod_metadata["uid"] = json!("pod-original");
+        pod_metadata["ownerReferences"] =
+            json!([{"controller":true,"kind":"Job","uid":"original","name":"research-task-1"}]);
+        let pods = json!({"items":[{"metadata":pod_metadata,"spec":spec,"status":{"phase":"Succeeded","containerStatuses":[{"name":"worker","restartCount":0,"state":{"terminated":{"exitCode":0}}}],"initContainerStatuses":[{"name":"configuration","restartCount":0,"state":{"terminated":{"exitCode":0}}}]}}]});
+        let handle = ExecutionHandle {
+            backend: Backend::KubernetesJob,
+            cluster: "fixture".into(),
+            namespace: "research".into(),
+            name: "research-task-1".into(),
+            uid: "original".into(),
+            attempt: 1,
+            fence: 2,
+            task_id: "task".into(),
+            request_sha256: "request".into(),
+        };
+        (job, pods, handle)
+    }
+
+    #[test]
+    fn retained_terminal_requires_every_original_process_stopped() {
+        let (job, pods, handle) = fixture();
+        assert!(retained_job_stopped(&job, &pods, &handle).unwrap());
+        for bad in [
+            {
+                let mut p = pods.clone();
+                p["items"][0]["status"]["initContainerStatuses"][0]["state"] =
+                    json!({"running":{}});
+                p
+            },
+            {
+                let mut p = pods.clone();
+                p["items"][0]["status"]["containerStatuses"] = json!([]);
+                p
+            },
+            {
+                let mut p = pods.clone();
+                p["items"][0]["metadata"]["ownerReferences"][0]["uid"] = json!("foreign");
+                p
+            },
+            {
+                let mut p = pods.clone();
+                p["items"][0]["status"]["containerStatuses"][0]["restartCount"] = json!(1);
+                p
+            },
+            {
+                let mut p = pods.clone();
+                let duplicate = p["items"][0].clone();
+                p["items"].as_array_mut().unwrap().push(duplicate);
+                p
+            },
+            json!({"items":[]}),
+        ] {
+            assert!(!retained_job_stopped(&job, &bad, &handle).unwrap());
+        }
+        let mut partial = pods.clone();
+        partial["metadata"]["continue"] = json!("more");
+        assert!(retained_job_stopped(&job, &partial, &handle).is_err());
+        let mut deleting = job.clone();
+        deleting["metadata"]["deletionTimestamp"] = json!("2026-10-05T00:00:00Z");
+        assert!(!retained_job_stopped(&deleting, &pods, &handle).unwrap());
+        let mut active = job;
+        active["status"]["active"] = json!(1);
+        assert!(!retained_job_stopped(&active, &pods, &handle).unwrap());
     }
 }

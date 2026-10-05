@@ -764,6 +764,10 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     result.task.stage_result(&lease, result.now_ms, receipt)?;
     let result_id = result.task.id.clone();
     result.commit("fixture_result_staged").await?;
+    assert!(ledger
+        .native_terminal_snapshot("fixture", &result_id)
+        .await
+        .is_err());
     sqlx_core::query::query(
         "INSERT INTO research.revocations(request_sha256,reason_receipt_sha256) VALUES($1,$2)",
     )
@@ -792,9 +796,48 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     let mut cancelled = ledger.lock_next("result-owner", 30000).await?.unwrap();
     cancelled.task.stop(State::Cancelled, false)?;
     cancelled.task.stopped(lease.attempt, lease.fence)?;
-    cancelled.commit("fixture_revoked_cancelled").await?;
+    cancelled.commit("stop_reconciled").await?;
     assert_eq!(ledger.read(&result_id).await?.state, State::Cancelled);
     assert!(ledger.read(&result_id).await?.receipt.is_none());
+    // Historical readback is not new execution authority. Revocation remains
+    // readable, while foreign scopes and missing reconciled events are rejected.
+    let snapshot = ledger
+        .native_terminal_snapshot("fixture", &result_id)
+        .await?;
+    assert_eq!(snapshot.task.state, State::Cancelled);
+    assert_eq!(snapshot.native_admission.evidence.tenant, "fixture");
+    assert!(snapshot.result.is_none());
+    assert_eq!(
+        snapshot
+            .execution_event
+            .as_ref()
+            .unwrap()
+            .document
+            .execution
+            .as_ref()
+            .unwrap()
+            .uid,
+        "fixture-result"
+    );
+    assert!(ledger
+        .native_terminal_snapshot("foreign", &result_id)
+        .await
+        .is_err());
+    assert!(ledger
+        .native_terminal_snapshot("fixture", &hash('0'))
+        .await
+        .is_err());
+    // A readback cannot append an event or charge/refund a native budget.
+    let before: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.events")
+        .fetch_one(&pool)
+        .await?;
+    ledger
+        .native_terminal_snapshot("fixture", &result_id)
+        .await?;
+    let after: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.events")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(before, after);
 
     // A separate synthetic Prepare request exercises scheduled source revocation.
     // These signatures prove receiver semantics, never real source publication.
