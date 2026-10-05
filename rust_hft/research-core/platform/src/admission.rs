@@ -210,7 +210,15 @@ impl VerifiedNativeAdmission {
     }
 }
 impl NativeAdmissionTrust {
-    pub fn verify(&self, signed: &SignedNativeAdmission) -> Result<VerifiedNativeAdmission> {
+    /// Shared strict native witness verification. A valid signature proves
+    /// only this purpose and body, never a new grant or source publication.
+    pub(crate) fn verify_native_signature(
+        &self,
+        domain: &str,
+        key_id: &str,
+        evidence_sha256: &str,
+        signature_hex: &str,
+    ) -> Result<String> {
         ensure!(
             self.schema == "monday.native_reservation_trust.v1"
                 && !self.native_reservation_keys.is_empty()
@@ -219,11 +227,11 @@ impl NativeAdmissionTrust {
         );
         let public = self
             .native_reservation_keys
-            .get(&signed.key_id)
+            .get(key_id)
             .context("untrusted native reservation issuer")?;
-        let decode = |s: &str| -> Result<Vec<u8>> {
+        let decode = |s: &str, bytes: usize| -> Result<Vec<u8>> {
             ensure!(
-                s.len().is_multiple_of(2)
+                s.len() == bytes * 2
                     && s.bytes()
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
                 "invalid native signature encoding"
@@ -233,21 +241,31 @@ impl NativeAdmissionTrust {
                 .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(Into::into))
                 .collect()
         };
-        let bytes: [u8; 32] = decode(public)?
+        let bytes: [u8; 32] = decode(public, 32)?
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid native public key"))?;
+        let signature = Signature::from_slice(&decode(signature_hex, 64)?)?;
+        VerifyingKey::from_bytes(&bytes)?.verify_strict(
+            &native_signing_bytes(domain, key_id, evidence_sha256)?,
+            &signature,
+        )?;
+        identity(self)
+    }
+
+    pub fn verify(&self, signed: &SignedNativeAdmission) -> Result<VerifiedNativeAdmission> {
         ensure!(
             signed.evidence.id()? == signed.evidence_sha256,
             "native evidence changed"
         );
-        let signature = Signature::from_slice(&decode(&signed.signature_hex)?)?;
-        VerifyingKey::from_bytes(&bytes)?.verify_strict(
-            &native_signing_bytes(DOMAIN, &signed.key_id, &signed.evidence_sha256)?,
-            &signature,
+        let trust_sha256 = self.verify_native_signature(
+            DOMAIN,
+            &signed.key_id,
+            &signed.evidence_sha256,
+            &signed.signature_hex,
         )?;
         Ok(VerifiedNativeAdmission {
             signed: signed.clone(),
-            trust_sha256: identity(self)?,
+            trust_sha256,
             #[cfg(feature = "control")]
             trust_document: serde_json::to_value(self)?,
         })
