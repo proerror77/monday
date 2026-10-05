@@ -1,12 +1,12 @@
 //! Read-only verifier for immutable V2 runtime-latency evidence.
 
-use crate::{
-    verify_runtime_attribution_event, AttributionKind, AttributionMode, AttributionOutcome,
-    SignedRuntimeAttributionEvent,
-};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
+use governance::attribution::{
+    verify_runtime_attribution_event, AttributionKind, AttributionMode, AttributionOutcome,
+    SignedRuntimeAttributionEvent,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,

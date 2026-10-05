@@ -14,10 +14,13 @@ use crate::{
 
 pub const MIGRATION: &str = include_str!("../sql/postgres.sql");
 pub const BUILD_RELEASE_MIGRATION: &str = include_str!("../sql/verified_build_release.sql");
+pub const NATIVE_ADMISSION_MIGRATION: &str = include_str!("../sql/native_admission.sql");
+pub const NATIVE_REQUEST_REVOCATION_MIGRATION: &str =
+    include_str!("../sql/native_request_revocation.sql");
 
 #[derive(Clone)]
 pub struct Ledger {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 #[cfg(feature = "gateway")]
@@ -81,9 +84,12 @@ impl PreparationPermit {
         &self.generation
     }
     pub async fn check(&mut self) -> Result<()> {
-        let row = query("SELECT t.document,floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms,a.mode FROM research.tasks t CROSS JOIN research.authority a WHERE t.task_id=$1 AND a.singleton AND EXISTS(SELECT 1 FROM research.admissions d WHERE d.request_sha256=t.request_sha256 AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=d.request_sha256))")
+        let row = query("SELECT t.document,research.native_request_deadline_ms(t.request_sha256) AS native_deadline_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms,a.mode FROM research.tasks t CROSS JOIN research.authority a WHERE t.task_id=$1 AND a.singleton AND EXISTS(SELECT 1 FROM research.admissions d JOIN research.native_admission_imports n USING(request_sha256) WHERE d.request_sha256=t.request_sha256 AND n.tenant=t.tenant AND research.native_request_deadline_ms(n.request_sha256)>floor(extract(epoch FROM clock_timestamp())*1000)::bigint AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=d.request_sha256))")
             .bind(&self.task.id).fetch_one(&mut self.connection).await?;
-        let current: Task = serde_json::from_value(row.get("document"))?;
+        let mut current: Task = serde_json::from_value(row.get("document"))?;
+        current.deadline_ms = current
+            .deadline_ms
+            .map(|deadline| deadline.min(row.get("native_deadline_ms")));
         let now: i64 = row.get("now_ms");
         ensure!(
             row.get::<String, _>("mode") == "postgres"
@@ -117,6 +123,123 @@ async fn clock(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
 }
 
 impl Ledger {
+    /// No mutation, secret, grant, provider call, or settlement. Snapshot rows
+    /// share one read-only transaction; historical expiry/revocation is retained.
+    pub async fn native_terminal_snapshot(
+        &self,
+        tenant: &str,
+        request: &str,
+    ) -> Result<crate::research::NativeTerminalSnapshot> {
+        ensure!(
+            !tenant.is_empty() && tenant.len() <= 128 && crate::valid_digest(request),
+            "invalid terminal snapshot scope"
+        );
+        let mut tx = self.pool.begin().await?;
+        sqlx_core::raw_sql::raw_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let row = query("SELECT t.document,t.revision,r.document AS run,n.document AS native,n.trust_document,n.trust_sha256,n.evidence_sha256 FROM research.tasks t JOIN research.runs r ON r.run_sha256=t.run_manifest_sha256 AND r.tenant=t.tenant JOIN research.native_admission_imports n ON n.request_sha256=t.request_sha256 AND n.tenant=t.tenant WHERE t.task_id=$1 AND t.tenant=$2")
+            .bind(request).bind(tenant).fetch_one(&mut *tx).await?;
+        let task: Task = serde_json::from_value(row.get("document"))?;
+        let run: crate::research::Run = serde_json::from_value(row.get("run"))?;
+        let native: crate::admission::SignedNativeAdmission =
+            serde_json::from_value(row.get("native"))?;
+        let trust: crate::admission::NativeAdmissionTrust =
+            serde_json::from_value(row.get("trust_document"))?;
+        let verified = trust.verify(&native)?;
+        run.admit(&task.spec)?;
+        ensure!(
+            task.id == request
+                && task.spec.id()? == task.id
+                && task.state.terminal()
+                && native.evidence.tenant == tenant
+                && native.evidence.admission.request_sha256 == task.id
+                && native.evidence.run == run
+                && native.evidence.admission.task_spec == task.spec
+                && native.evidence_sha256 == row.get::<String, _>("evidence_sha256")
+                && verified.trust_sha256() == row.get::<String, _>("trust_sha256"),
+            "terminal snapshot changed native request or principal"
+        );
+        let revision: i64 = row.get("revision");
+        let terminal = query(
+            "SELECT revision,event,document FROM research.events WHERE task_id=$1 AND revision=$2",
+        )
+        .bind(request)
+        .bind(revision)
+        .fetch_one(&mut *tx)
+        .await?;
+        let terminal_event = crate::research::TerminalLedgerEvent {
+            revision: terminal.get("revision"),
+            event: terminal.get("event"),
+            document: serde_json::from_value(terminal.get("document"))?,
+        };
+        ensure!(
+            terminal_event.document == task && terminal_event.event == "stop_reconciled",
+            "terminal lacks reconciled process-tree stop event"
+        );
+        let execution = query("SELECT revision,event,document FROM research.events WHERE task_id=$1 AND revision<$2 AND document->'execution' IS NOT NULL AND document->'execution'<>'null'::jsonb AND (document->>'attempt')::integer=$3 ORDER BY revision DESC LIMIT 1")
+            .bind(request).bind(revision).bind(i32::try_from(task.attempt)?).fetch_optional(&mut *tx).await?;
+        let execution_event = execution
+            .map(|row| -> Result<_> {
+                Ok(crate::research::TerminalLedgerEvent {
+                    revision: row.get("revision"),
+                    event: row.get("event"),
+                    document: serde_json::from_value(row.get("document"))?,
+                })
+            })
+            .transpose()?;
+        if let Some(event) = &execution_event {
+            let executed = &event.document;
+            let lease = executed
+                .lease
+                .as_ref()
+                .context("execution event lacks lease")?;
+            ensure!(
+                executed.id == task.id
+                    && executed.spec == task.spec
+                    && executed.attempt == task.attempt
+                    && executed.fence == task.fence
+                    && event.revision < revision,
+                "terminal execution event changed request or Attempt"
+            );
+            executed
+                .execution
+                .as_ref()
+                .context("execution event lacks handle")?
+                .validate(lease, &task.spec)?;
+        }
+        let value: Option<Value> =
+            query_scalar("SELECT receipt FROM research.results WHERE task_id=$1 AND attempt=$2")
+                .bind(request)
+                .bind(i32::try_from(task.attempt)?)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let result: Option<ResultReceipt> = value.map(serde_json::from_value).transpose()?;
+        ensure!(
+            result == task.receipt,
+            "terminal receipt differs from immutable result"
+        );
+        if let Some(result) = &result {
+            let lease = execution_event
+                .as_ref()
+                .and_then(|event| event.document.lease.as_ref())
+                .context("terminal receipt lacks execution lease")?;
+            result.validate(&task.spec, lease)?;
+        }
+        tx.commit().await?;
+        Ok(crate::research::NativeTerminalSnapshot {
+            schema: "monday.native_platform_terminal_snapshot.v1".into(),
+            tenant: tenant.to_owned(),
+            task,
+            run,
+            native_admission: native,
+            native_trust: trust,
+            terminal_revision: revision,
+            terminal_event,
+            execution_event,
+            result,
+        })
+    }
     #[cfg(feature = "gateway")]
     pub(crate) async fn artifact_write_permit(
         &self,
@@ -153,7 +276,7 @@ impl Ledger {
         attempt: u32,
         fence: i64,
     ) -> Result<String> {
-        let row = query("SELECT t.document, floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms FROM research.tasks t CROSS JOIN research.authority a WHERE t.task_id=$1 AND t.tenant=$2 AND a.singleton AND a.mode='postgres' AND EXISTS(SELECT 1 FROM research.admissions d WHERE d.request_sha256=t.request_sha256 AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=d.request_sha256))")
+        let row = query("SELECT t.document, floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms FROM research.tasks t CROSS JOIN research.authority a WHERE t.task_id=$1 AND t.tenant=$2 AND a.singleton AND a.mode='postgres' AND EXISTS(SELECT 1 FROM research.admissions d JOIN research.native_admission_imports n USING(request_sha256) WHERE d.request_sha256=t.request_sha256 AND n.tenant=t.tenant AND research.native_request_deadline_ms(n.request_sha256)>floor(extract(epoch FROM clock_timestamp())*1000)::bigint AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=d.request_sha256))")
             .bind(task).bind(tenant).fetch_one(&self.pool).await?;
         let current: Task = serde_json::from_value(row.get("document"))?;
         let now_ms: i64 = row.get("now_ms");
@@ -309,11 +432,45 @@ impl Ledger {
         &self,
         spec: &TaskSpec,
     ) -> Result<Option<crate::orchestrator::Admission>> {
-        let value:Option<Value>=query_scalar("SELECT document FROM research.admissions a WHERE request_sha256=$1 AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=a.request_sha256)").bind(spec.id()?).fetch_optional(&self.pool).await?;
-        let Some(value) = value else { return Ok(None) };
+        let row=query("SELECT a.document,n.document AS native_document,n.trust_document,n.trust_sha256,n.evidence_sha256,n.tenant,research.native_request_deadline_ms(n.request_sha256) AS native_deadline_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms FROM research.admissions a JOIN research.native_admission_imports n USING(request_sha256) WHERE a.request_sha256=$1 AND research.native_request_deadline_ms(n.request_sha256)>floor(extract(epoch FROM clock_timestamp())*1000)::bigint AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=a.request_sha256)").bind(spec.id()?).fetch_optional(&self.pool).await?;
+        let Some(row) = row else { return Ok(None) };
+        let signed: crate::admission::SignedNativeAdmission =
+            serde_json::from_value(row.get("native_document"))?;
+        let trust: crate::admission::NativeAdmissionTrust =
+            serde_json::from_value(row.get("trust_document"))?;
+        let verified = trust.verify(&signed)?;
+        ensure!(
+            verified.trust_sha256() == row.get::<String, _>("trust_sha256")
+                && signed.evidence_sha256 == row.get::<String, _>("evidence_sha256")
+                && signed.evidence.tenant == row.get::<String, _>("tenant"),
+            "native admission import identity changed"
+        );
+        verified.evidence().active_at(row.get("now_ms"))?;
+        ensure!(
+            row.get::<i64, _>("native_deadline_ms") > row.get::<i64, _>("now_ms"),
+            "native request revoked or expired"
+        );
+        let value: Value = row.get("document");
         let admission: crate::orchestrator::Admission = serde_json::from_value(value)?;
         admission.validate(spec)?;
+        ensure!(
+            admission == signed.evidence.admission,
+            "admission differs from native signed projection"
+        );
         Ok(Some(admission))
+    }
+
+    pub async fn admits_launch(&self, spec: &TaskSpec, remaining_ms: i64) -> Result<bool> {
+        ensure!(
+            remaining_ms > 0 && remaining_ms <= spec.timeout_ms,
+            "invalid remaining Job duration"
+        );
+        if self.admission(spec).await?.is_none() {
+            return Ok(false);
+        };
+        let covers:bool=query_scalar("SELECT COALESCE(research.native_request_deadline_ms($1)>=floor(extract(epoch FROM clock_timestamp())*1000)::bigint+$2,false)")
+            .bind(spec.id()?).bind(remaining_ms).fetch_one(&self.pool).await?;
+        Ok(covers)
     }
 
     pub async fn register_experiment(
@@ -550,9 +707,12 @@ impl Ledger {
             .map_err(Into::into)
     }
     pub async fn approved_request(&self, tenant: &str, id: &str) -> Result<TaskSpec> {
-        let value:Value=query_scalar("SELECT a.document FROM research.admissions a WHERE request_sha256=$1 AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=a.request_sha256)").bind(id).fetch_one(&self.pool).await?;
+        let value:Value=query_scalar("SELECT a.document FROM research.admissions a JOIN research.native_admission_imports n USING(request_sha256) WHERE a.request_sha256=$1 AND n.tenant=$2 AND research.native_request_deadline_ms(n.request_sha256)>floor(extract(epoch FROM clock_timestamp())*1000)::bigint AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=a.request_sha256)").bind(id).bind(tenant).fetch_one(&self.pool).await?;
         let admission: crate::orchestrator::Admission = serde_json::from_value(value)?;
         admission.validate(&admission.task_spec)?;
+        self.admission(&admission.task_spec)
+            .await?
+            .context("native governance admission unavailable")?;
         ensure!(admission.task_spec.id()? == id, "request identity changed");
         self.run_for_tenant(tenant, &admission.task_spec.run_manifest_sha256)
             .await?
@@ -791,6 +951,36 @@ impl Ledger {
 }
 
 impl LockedTask {
+    /// Order provider reconciliation against native/manual revocation imports.
+    /// A scheduled future witness caps execution without cancelling it early.
+    pub async fn native_request_deadline_ms(&mut self) -> Result<Option<i64>> {
+        if query(
+            "SELECT request_sha256 FROM research.admissions WHERE request_sha256=$1 FOR UPDATE",
+        )
+        .bind(&self.task.id)
+        .fetch_optional(&mut *self.tx)
+        .await?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        let revoked: bool = query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM research.revocations WHERE request_sha256=$1)",
+        )
+        .bind(&self.task.id)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if revoked {
+            return Ok(None);
+        }
+        Ok(
+            query_scalar("SELECT research.native_request_deadline_ms($1)")
+                .bind(&self.task.id)
+                .fetch_one(&mut *self.tx)
+                .await?,
+        )
+    }
+
     pub async fn refresh_clock(&mut self) -> Result<i64> {
         self.now_ms = clock(&mut self.tx).await?;
         Ok(self.now_ms)
@@ -808,6 +998,20 @@ impl LockedTask {
             .await?;
             let admission: crate::orchestrator::Admission = serde_json::from_value(value)?;
             admission.validate(&self.task.spec)?;
+            let row=query("SELECT document,trust_document,trust_sha256,evidence_sha256 FROM research.native_admission_imports WHERE request_sha256=$1 AND research.native_request_deadline_ms(request_sha256)>floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+                .bind(&self.task.id).fetch_one(&mut *self.tx).await?;
+            let native: crate::admission::SignedNativeAdmission =
+                serde_json::from_value(row.get("document"))?;
+            let trust: crate::admission::NativeAdmissionTrust =
+                serde_json::from_value(row.get("trust_document"))?;
+            let verified = trust.verify(&native)?;
+            verified.evidence().active_at(clock(&mut self.tx).await?)?;
+            ensure!(
+                native.evidence.admission == admission
+                    && verified.trust_sha256() == row.get::<String, _>("trust_sha256")
+                    && native.evidence_sha256 == row.get::<String, _>("evidence_sha256"),
+                "terminal result changed native admission"
+            );
             let revoked: bool = query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM research.revocations WHERE request_sha256=$1)",
             )

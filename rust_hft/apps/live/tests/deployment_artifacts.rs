@@ -149,7 +149,7 @@ fn production_config_accepts_the_governed_paper_target() {
         asset_revision_id: bundle.candidate_id.clone(),
         promotion_id: "promotion-1".to_string(),
         bundle_id: bundle.bundle_id.clone(),
-        bundle_hash: bundle.bundle_hash.clone(),
+        bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash.clone(),
         account_id: "bitget_main".to_string(),
         venue: "bitget".to_string(),
         market: None,
@@ -163,9 +163,13 @@ fn production_config_accepts_the_governed_paper_target() {
         max_slippage_bps: 10.0,
     };
 
-    SystemConfigActivationAdapter::new(&mut config, &bundle, Path::new("bundle.json"))
-        .activate(&mut request)
-        .expect("canonical deployment target must resolve");
+    SystemConfigActivationAdapter::new(
+        &mut config,
+        bundle.to_runtime_bundle().unwrap(),
+        Path::new("bundle.json"),
+    )
+    .activate(&mut request)
+    .expect("canonical deployment target must resolve");
     assert!(!config.quotes_only);
     assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Paper"));
     assert_eq!(
