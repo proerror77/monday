@@ -211,7 +211,7 @@ impl EngineQueues {
     ) -> Result<(), LifecycleIntentSubmitError> {
         let validation = match price_protection {
             ExecutionPriceProtection::CanonicalBook => {
-                envelope.validate_cex_pre_execution(now, latest_book_seq)
+                envelope.validate_canonical_book_pre_execution(now, latest_book_seq)
             }
             ExecutionPriceProtection::VenueQuote => {
                 envelope.validate_pre_execution(now, latest_book_seq)
@@ -237,15 +237,18 @@ impl EngineQueues {
                         self.stats.intent_max_latency_count += 1;
                     }
                     OrderIntentRejectReason::InvalidMaxOrderNotional { .. }
+                    | OrderIntentRejectReason::MissingMaxOrderNotional
                     | OrderIntentRejectReason::OrderNotionalUnpriceable { .. }
                     | OrderIntentRejectReason::MaxOrderNotionalExceeded { .. } => {
                         self.stats.intent_order_notional_count += 1;
                     }
                     OrderIntentRejectReason::InvalidMaxOrderQuantity { .. }
+                    | OrderIntentRejectReason::MissingMaxOrderQuantity
                     | OrderIntentRejectReason::MaxOrderQuantityExceeded { .. } => {
                         self.stats.intent_order_quantity_count += 1;
                     }
                     OrderIntentRejectReason::InvalidMaxSlippage { .. }
+                    | OrderIntentRejectReason::MissingMaxSlippage
                     | OrderIntentRejectReason::MissingSlippageReference
                     | OrderIntentRejectReason::SlippageReferenceMismatch
                     | OrderIntentRejectReason::MissingSlippageReferenceLifetime
