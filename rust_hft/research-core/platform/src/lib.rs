@@ -16,6 +16,8 @@ pub mod postgres;
 pub mod preparation;
 #[cfg(feature = "control")]
 pub mod release;
+#[cfg(feature = "publisher")]
+pub mod release_publisher;
 pub mod research;
 #[cfg(feature = "control")]
 pub mod service;

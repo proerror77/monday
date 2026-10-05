@@ -194,6 +194,30 @@ pub fn check_configuration(policy: &PublisherPolicy, key: &SigningKey) -> Result
     Ok(())
 }
 
+/// Check the selected publication against authenticated producer metadata before
+/// a registry login or push. A well-formed policy can still name another target.
+pub fn check_publication_configuration(
+    policy: &PublisherPolicy,
+    key: &SigningKey,
+    software_manifest: &Path,
+    repository: &str,
+    product: &str,
+    image_repository: &str,
+) -> Result<()> {
+    check_configuration(policy, key)?;
+    let manifest: SoftwareRelease = read_json(software_manifest)?;
+    ensure!(
+        policy.trust.repository == repository
+            && policy.image_repositories.get(product).map(String::as_str) == Some(image_repository)
+            && manifest.schema == "monday.research-image-release.v6"
+            && manifest.build_inputs.schema == "monday.compilation-inputs.v3"
+            && manifest.build_inputs.builder_image == policy.builder_image
+            && manifest.products.contains(&product.to_owned()),
+        "operator policy does not admit selected publication"
+    );
+    Ok(())
+}
+
 fn command(root: &Path, program: &str, args: &[&str], repository: &str) -> Result<Vec<u8>> {
     // Never return stderr (gh and transport tools may include credential URLs).
     let mut child = Command::new(program)
@@ -502,6 +526,21 @@ impl ReleaseGateway {
         let mut gateway = Self::new(endpoint, token)?;
         gateway.client = tls.client(std::time::Duration::from_secs(120), true)?;
         Ok(gateway)
+    }
+    /// Establish server trust before registry writes. A HEAD response can reject
+    /// this route; a TLS handshake failure cannot admit publication.
+    pub async fn check_transport(&self) -> Result<()> {
+        let response = self
+            .client
+            .head(self.base.clone())
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("release gateway TLS unavailable"))?;
+        ensure!(
+            !response.status().is_redirection(),
+            "release gateway redirects are not admitted"
+        );
+        Ok(())
     }
     fn url(&self, key: &str) -> Result<reqwest::Url> {
         ensure!(
@@ -1237,6 +1276,52 @@ mod tests {
             tls: Default::default(),
         };
         check_configuration(&policy, &key).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let manifest = temporary.path().join("software.json");
+        let mut software = json!({
+            "schema":"monday.research-image-release.v6",
+            "products":["cex-runner"],
+            "source_sha":"a".repeat(40),
+            "workflow_run_id":"20",
+            "workflow_run_attempt":1,
+            "workflow_job_id":30,
+            "target":"x86_64-unknown-linux-gnu",
+            "build_inputs":inputs(),
+            "cargo_locks":inputs().locks,
+            "binaries":[]
+        });
+        std::fs::write(&manifest, serde_json::to_vec(&software).unwrap()).unwrap();
+        check_publication_configuration(
+            &policy,
+            &key,
+            &manifest,
+            "owner/repo",
+            "cex-runner",
+            "registry/research-runner",
+        )
+        .unwrap();
+        for (repository, product, image) in [
+            ("foreign/repo", "cex-runner", "registry/research-runner"),
+            ("owner/repo", "controller", "registry/research-runner"),
+            ("owner/repo", "cex-runner", "registry/foreign"),
+        ] {
+            assert!(check_publication_configuration(
+                &policy, &key, &manifest, repository, product, image
+            )
+            .is_err());
+        }
+        software["build_inputs"]["builder_image"] =
+            json!(format!("builder@sha256:{}", "b".repeat(64)));
+        std::fs::write(&manifest, serde_json::to_vec(&software).unwrap()).unwrap();
+        assert!(check_publication_configuration(
+            &policy,
+            &key,
+            &manifest,
+            "owner/repo",
+            "cex-runner",
+            "registry/research-runner"
+        )
+        .is_err());
         policy.trust.keys.insert("issuer".into(), "0".repeat(64));
         assert!(check_configuration(&policy, &key).is_err());
         policy.trust.keys.insert("issuer".into(), public);

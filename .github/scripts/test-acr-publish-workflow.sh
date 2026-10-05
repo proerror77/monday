@@ -105,6 +105,13 @@ acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
 end
 publication=acr.fetch('jobs').fetch('publish')
 abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']
+steps=publication.fetch('steps')
+preflight=steps.index { |s|s.fetch('name','')=='Require independent Build signer configuration' }
+login=steps.index { |s|s.fetch('name','')=='Log in to ACR' }
+push=steps.index { |s|s.fetch('name','')=='Build and push' }
+abort 'issuer policy/TLS validation occurs after registry mutation' unless preflight && login && push && preflight<login && preflight<push
+config=steps.fetch(preflight)
+abort 'issuer preflight does not bind the selected image product' unless config.fetch('if')=='matrix.research_artifact' && config.fetch('env').fetch('PRODUCT')=='${{ matrix.product }}' && config.fetch('env').fetch('PUBLISH_IMAGE_REPOSITORY')=='${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}' && config.fetch('run').include?('publish-research-build-release.sh check-config')
 readback=publication.fetch('steps').find { |s|s.fetch('name','')=='Read back research image source and executable bytes' }
 abort 'independent executable readback missing' unless readback && readback.fetch('if')=='matrix.research_artifact' && readback.fetch('run').include?('docker pull') && readback.fetch('run').include?('verify-research-product-image.sh')
 logout=publication.fetch('steps').index { |s|s.fetch('name','')=='Remove ACR credentials' }

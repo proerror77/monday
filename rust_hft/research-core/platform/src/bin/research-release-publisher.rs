@@ -8,11 +8,11 @@ use std::path::Path;
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     match args.iter().skip(1).map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["check-config",policy,key,endpoint,token]=>{
+        ["check-config",policy,key,manifest,repository,product,image_repository,endpoint,token]=>{
             let policy:PublisherPolicy=release_publisher::read_json(Path::new(policy))?;
             let key=release_publisher::read_signing_key(Path::new(key))?;
-            release_publisher::check_configuration(&policy,&key)?;
-            ReleaseGateway::with_tls(endpoint,hft_research_platform::service::read_secret(token)?,&policy.tls)?;
+            release_publisher::check_publication_configuration(&policy,&key,Path::new(manifest),repository,product,image_repository)?;
+            ReleaseGateway::with_tls(endpoint,hft_research_platform::service::read_secret(token)?,&policy.tls)?.check_transport().await?;
             println!("release issuer configuration verified");
         }
         ["plan",root,request,policy]=>{
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
             let ledger=hft_research_platform::postgres::Ledger::connect(&std::env::var("MONDAY_RESEARCH_DATABASE_URL").context("release importer PG URL required")?).await.map_err(|_|anyhow::anyhow!("release importer PG unavailable"))?;
             println!("{}",release_publisher::import_build(build,oci,proof,&trust,&gateway,&ledger).await?);
         }
-        _=>bail!("usage: research-release-publisher plan SOURCE_ROOT REQUEST POLICY | publish SOURCE_ROOT REQUEST POLICY PRIVATE_KEY_FILE HTTPS_GATEWAY TOKEN_FILE | import BUILD_SHA256 OCI_SHA256 PROOF_SHA256 PUBLIC_TRUST_FILE HTTPS_GATEWAY TOKEN_FILE"),
+        _=>bail!("usage: research-release-publisher check-config POLICY PRIVATE_KEY_FILE SOFTWARE_MANIFEST REPOSITORY PRODUCT IMAGE_REPOSITORY HTTPS_GATEWAY TOKEN_FILE | plan SOURCE_ROOT REQUEST POLICY | publish SOURCE_ROOT REQUEST POLICY PRIVATE_KEY_FILE HTTPS_GATEWAY TOKEN_FILE | import BUILD_SHA256 OCI_SHA256 PROOF_SHA256 PUBLIC_TRUST_FILE HTTPS_GATEWAY TOKEN_FILE"),
     }
     Ok(())
 }

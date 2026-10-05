@@ -21,7 +21,9 @@ case "$mode" in
     [[ $MONDAY_RELEASE_GATEWAY == https://*/ ]]
     printf '%s' "$MONDAY_RELEASE_SIGNING_KEY" >"$work/key"
     unset MONDAY_RELEASE_SIGNING_KEY
-    cargo run --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" --locked --features publisher --bin research-release-publisher -- check-config "$work/policy.json" "$work/key" "$MONDAY_RELEASE_GATEWAY" "$work/token"
+    : "${GITHUB_REPOSITORY:?repository required}" "${PRODUCT:?image product required}"
+    : "${PUBLISH_IMAGE_REPOSITORY:?exact selected OCI repository required}" "${RUNNER_TEMP:?authenticated software directory required}"
+    cargo run --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" --locked --features publisher --bin research-release-publisher -- check-config "$work/policy.json" "$work/key" "$RUNNER_TEMP/research-release/research-image-release.json" "$GITHUB_REPOSITORY" "$PRODUCT" "$PUBLISH_IMAGE_REPOSITORY" "$MONDAY_RELEASE_GATEWAY" "$work/token"
     ;;
   publish)
     : "${MONDAY_RELEASE_SIGNING_KEY:?independent private signing key required}"

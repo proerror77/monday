@@ -50,6 +50,12 @@ supplied by the operator; do not use placeholder hashes or keys):
 - `tls`: optional private `ca_file` and combined PEM `identity_file` paths.
   TLS retains hostname verification and disables ambient proxies and redirects.
 
+Before registry login, native preflight checks that policy admits the selected
+GitHub repository, product, OCI repository and authenticated producer container.
+It establishes HTTPS server trust with a HEAD request without a capability token.
+A mismatched signer, policy, private TLS identity or server certificate blocks
+registry publication.
+
 `import BUILD_SHA256 OCI_SHA256 PROOF_SHA256 PUBLIC_TRUST_FILE HTTPS_GATEWAY TOKEN_FILE` accepts no
 signing key. It reads the signed proof and artifact from the gateway, verifies
 operator trust and proof binding, and independently checks source/program bytes.
