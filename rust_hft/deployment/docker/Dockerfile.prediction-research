@@ -16,8 +16,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && case "$SOURCE_REVISION" in *[!0-9a-f]*) exit 1 ;; esac \
     && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo --config 'build.rustc-wrapper=""' build \
     --manifest-path prediction-markets/Cargo.toml --release --locked \
-    -p ploy-research -p hft-prediction-research-worker --features ploy-research/db \
-    --bin monday-prediction-research --bin monday-prediction-evaluator --bin monday-prediction-snapshot --bin monday-prediction-worker \
+    -p ploy-research -p hft-prediction-research-worker -p hft-prediction-research-operator --features ploy-research/db \
+    --bin monday-prediction-research --bin monday-prediction-evaluator --bin monday-prediction-snapshot --bin monday-prediction-worker --bin monday-prediction-operator \
+    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-operator /out/bin/monday-prediction-operator \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-worker /out/bin/monday-prediction-worker \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-research /out/bin/monday-prediction-research \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-evaluator /out/bin/monday-prediction-evaluator \
@@ -38,6 +39,7 @@ ENV MONDAY_PREDICTION_RESEARCH_BIN=/usr/local/bin/monday-prediction-research \
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/monday-prediction-worker"]
 
 FROM runtime-base AS prebuilt
+COPY --chmod=0755 research-bin/monday-prediction-operator /usr/local/bin/monday-prediction-operator
 COPY --chmod=0755 research-bin/monday-prediction-worker /usr/local/bin/monday-prediction-worker
 COPY --chmod=0755 research-bin/monday-prediction-research /usr/local/bin/monday-prediction-research
 COPY --chmod=0755 research-bin/monday-prediction-evaluator /usr/local/bin/monday-prediction-evaluator

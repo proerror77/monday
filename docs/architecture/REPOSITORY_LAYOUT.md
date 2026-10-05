@@ -91,8 +91,16 @@ Prediction's worker.
 The product catalog publishes CEX `research-runner`, Prediction
 `prediction-research-runner`, and CEX `campaign-cycle-controller` independently.
 Each image contains only its catalog programs. The operator's Prediction dispatch
-command still lives in `alpha-harness`; that control entry remains split debt.
-It renders Jobs that launch `monday-prediction-worker` in the Prediction image.
+command belongs to `hft-prediction-research-operator`. Its independently built
+`monday-prediction-operator` renders, submits and reads back Jobs that launch
+`monday-prediction-worker` in the Prediction image. Operator hosts supply the
+existing cluster client and explicit context; scientific Jobs do not receive
+cluster credentials.
+
+`hft-research-dispatch-io` owns shared cluster operations and immutable object URL
+identity. It imports no venue, scientific model, scheduler, database, risk or
+execution crate. CEX Campaign and holdout object bindings remain CEX-owned.
+The CEX harness contains no Prediction command or Prediction-owned dependency.
 
 ## Runtime strategy handoff
 

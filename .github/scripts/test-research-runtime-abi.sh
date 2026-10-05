@@ -4,10 +4,10 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin" "$work/release"
-for binary in hft-backtest alpha-harness lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot monday-prediction-worker; do
+while IFS= read -r binary; do
   printf 'ELF fixture\n' > "$work/release/$binary"
   chmod 0755 "$work/release/$binary"
-done
+done < <(bash "$script_dir/research-release-products.sh" binaries all)
 cat > "$work/bin/readelf" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
