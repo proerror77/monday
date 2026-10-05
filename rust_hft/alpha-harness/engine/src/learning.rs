@@ -1,9 +1,7 @@
-use alpha_domain::{
-    AttributionKind, AttributionOutcome, IterationVerdict, LearningDirective, MissionStatus,
-    ResearchMission,
-};
+use alpha_domain::{IterationVerdict, LearningDirective, MissionStatus, ResearchMission};
 use alpha_store::{AlphaStore, MemoryRecord, StoreError};
 use chrono::Utc;
+use governance::attribution::{AttributionKind, AttributionOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -245,7 +243,9 @@ pub fn close_learning_loop(
     Ok(outcome)
 }
 
-fn runtime_failure_class(event: &alpha_domain::RuntimeAttributionEvent) -> Option<String> {
+fn runtime_failure_class(
+    event: &governance::attribution::RuntimeAttributionEvent,
+) -> Option<String> {
     match event.kind {
         AttributionKind::Reject => Some("runtime_reject".to_string()),
         AttributionKind::StreamGap => Some("runtime_stream_gap".to_string()),
@@ -262,11 +262,13 @@ fn runtime_failure_class(event: &alpha_domain::RuntimeAttributionEvent) -> Optio
 mod tests {
     use super::*;
     use alpha_domain::{
-        AttributionKind, AttributionMode, AttributionOutcome, EngineKind, MissionCompletionPolicy,
-        MissionTerminalReason, ResearchIteration, RuntimeAttributionEvent, SearchBudget,
-        SearchBudgetLimit, SearchBudgetUsage, SearchPolicyRevision, ValidatorMode,
+        EngineKind, MissionCompletionPolicy, MissionTerminalReason, ResearchIteration,
+        SearchBudget, SearchBudgetLimit, SearchBudgetUsage, SearchPolicyRevision, ValidatorMode,
     };
     use chrono::Utc;
+    use governance::attribution::{
+        AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
+    };
     use hft_research_manifest::ManifestId;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

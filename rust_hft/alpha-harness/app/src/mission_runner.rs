@@ -6024,19 +6024,21 @@ pub(crate) mod tests {
         cli::{FeedbackLogArgs, FeedbackRecordArgs, SignDeploymentArgs, ValidationArgs},
         governance,
     };
+    use ::governance::attribution::{
+        sign_runtime_attribution_event, AttributionKind, AttributionMode, AttributionOutcome,
+        RuntimeAttributionEvent, SignedRuntimeAttributionEvent,
+    };
     use ::governance::{
         deployment_scope_hash, AllowedIntentType, ApprovalClass, DeploymentEnvelope,
     };
     use alpha_domain::{
-        runtime_stage_is_healthy, sign_runtime_attribution_event, AttributionKind, AttributionMode,
-        AttributionOutcome, CexBaselineArtifactV1, CexBaselineGateV1, CexEventReplayPolicyV1,
+        runtime_stage_is_healthy, CexBaselineArtifactV1, CexBaselineGateV1, CexEventReplayPolicyV1,
         CexResearchContentRefV1, CexResearchEvidenceKindV1, CexResearchEvidenceRefV1,
         CexResearchEvidenceSignatureV1, CexResearchFalsificationTestV1, CexResearchHoldoutStateV1,
         CexResearchHoldoutV1, CexResearchHypothesisTargetV1, CexResearchHypothesisV1,
         CexResearchInputBindingsV1, CexResearchInstrumentV1, CexResearchMarketV1,
         CexResearchMissionSpecV1, CexResearchOperationalMetadataV1, CexResearchPolicyBindingsV1,
-        CexResearchSearchPlanV1, CexResearchVenueV1, EvaluationLabelSpecV1,
-        RuntimeAttributionEvent, SearchBudget, SignedRuntimeAttributionEvent,
+        CexResearchSearchPlanV1, CexResearchVenueV1, EvaluationLabelSpecV1, SearchBudget,
         CEX_RESEARCH_MISSION_SCHEMA_V1,
     };
     use alpha_engine::engines::{CexCombinationResearchArtifactV1, CexFactorBankMctsResultV1};
@@ -6460,7 +6462,7 @@ pub(crate) mod tests {
                 promotion_id: promotion.promotion_id.clone(),
                 promotion_manifest_hash: canonical_json_hash(promotion).unwrap(),
                 bundle_id: bundle.bundle_id.clone(),
-                bundle_hash: bundle.bundle_hash.clone(),
+                bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
                 runtime_config_hash: "d".repeat(64),
                 risk_policy_hash: "e".repeat(64),
                 account_id: "binance-paper-shadow".to_string(),

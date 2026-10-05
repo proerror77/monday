@@ -1,7 +1,7 @@
 //! Deterministic Ridge/CART refits used by independent control verification.
 use super::*;
 use crate::{
-    engines::solve,
+    engines::bayesian::solve,
     evaluation::WalkForwardFold,
     formula_evaluator::{evaluate_ast, FormulaEvaluator},
 };

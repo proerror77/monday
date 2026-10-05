@@ -4,6 +4,7 @@ use crate::{
     data_mission, governance, loop_control, mission, mission_campaign, mission_dispatch,
     mission_fresh_inputs, mission_metrics,
 };
+
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
 };
@@ -1523,6 +1524,7 @@ mod tests {
             "resume",
             "learn",
             "recover-legacy-checkpoint",
+            "campaign-execute",
         ] {
             assert!(!listed(command), "{command} must stay diagnostic-only");
         }
@@ -1530,11 +1532,22 @@ mod tests {
             "campaign-freeze",
             "campaign-finalize",
             "campaign-id",
-            "campaign-execute",
             "prepare-fresh-inputs",
             "dispatch",
         ] {
             assert!(listed(command), "{command} must stay on the Campaign path");
+        }
+        #[cfg(feature = "scientific")]
+        {
+            let mut worker = WorkerCli::command();
+            let worker_help = worker
+                .find_subcommand_mut("mission")
+                .unwrap()
+                .render_help()
+                .to_string();
+            assert!(worker_help
+                .lines()
+                .any(|line| { line.split_whitespace().next() == Some("campaign-execute") }));
         }
     }
 
@@ -1620,18 +1633,30 @@ mod tests {
     fn parses_mission_campaign_execute() {
         let args = "alpha-harness mission campaign-execute --work-dir work --campaign-id cex-campaign-1234567890abcdef1234567890abcdef --image-identity aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --request campaign.json --request-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_err());
-        assert!(Cli::try_parse_from(format!("{args} --pre-holdout").split_whitespace()).is_ok());
-        for suffix in [
-            " --final-evaluation",
-            " --final-trusted-keys keys.json",
-            " --final-evaluation --final-trusted-keys keys.json --pre-holdout",
-        ] {
-            assert!(Cli::try_parse_from(format!("{args}{suffix}").split_whitespace()).is_err());
+        assert!(Cli::try_parse_from(format!("{args} --pre-holdout").split_whitespace()).is_err());
+        #[cfg(feature = "scientific")]
+        {
+            assert!(WorkerCli::try_parse_from(args.split_whitespace()).is_err());
+            assert!(
+                WorkerCli::try_parse_from(format!("{args} --pre-holdout").split_whitespace())
+                    .is_ok()
+            );
+            for suffix in [
+                " --final-evaluation",
+                " --final-trusted-keys keys.json",
+                " --final-evaluation --final-trusted-keys keys.json --pre-holdout",
+            ] {
+                assert!(
+                    WorkerCli::try_parse_from(format!("{args}{suffix}").split_whitespace())
+                        .is_err()
+                );
+            }
+            assert!(WorkerCli::try_parse_from(
+                format!("{args} --final-evaluation --final-trusted-keys keys.json")
+                    .split_whitespace()
+            )
+            .is_ok());
         }
-        assert!(Cli::try_parse_from(
-            format!("{args} --final-evaluation --final-trusted-keys keys.json").split_whitespace()
-        )
-        .is_ok());
     }
 
     #[test]
