@@ -24,6 +24,7 @@ sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false,
 [features]
 default = []
 control = ["dep:tokio", "dep:reqwest", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:ed25519-dalek", "dep:rustix"]
+publisher = ["control", "dep:rustix", "dep:tokio-util", "tokio/fs", "reqwest/stream"]
 gateway = ["control", "dep:rustix", "dep:tokio-util", "dep:futures-util", "tokio/fs", "reqwest/stream"]
 
 [[bin]]
@@ -50,6 +51,11 @@ required-features = ["control"]
 name = "research-artifact-gateway"
 path = "src/bin/research-artifact-gateway.rs"
 required-features = ["gateway"]
+
+[[bin]]
+name = "research-release-publisher"
+path = "src/bin/research-release-publisher.rs"
+required-features = ["publisher"]
 
 [dev-dependencies]
 tempfile = "3"

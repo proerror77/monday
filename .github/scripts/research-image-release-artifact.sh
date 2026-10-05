@@ -25,6 +25,7 @@ while IFS= read -r binary; do binaries+=("$binary"); done < <(bash "$script_dir/
 if [[ -z $job_id && $mode != create ]]; then job_id=$(jq -er '.workflow_job_id' "$manifest"); fi
 [[ $job_id =~ ^[1-9][0-9]*$ ]] || { echo 'missing producer job' >&2; exit 1; }
 locks=$("$script_dir/research-workspace-locks.sh" "$repo_root")
+recipes=$(bash "$script_dir/research-release-products.sh" recipes "$product" | jq -s .)
 
 case "$mode" in
   create)
@@ -37,7 +38,7 @@ case "$mode" in
         '. + [{file:$file,sha256:$sha256}]' <<<"$binary_manifest")
     done
     : "${MONDAY_BUILD_INPUTS_FILE:?compiler/native build inputs required}"
-    jq -e --argjson locks "$locks" ' .schema == "monday.compilation-inputs.v2" and .target == "x86_64-unknown-linux-gnu" and .locks == $locks ' "$MONDAY_BUILD_INPUTS_FILE" >/dev/null
+    jq -e --argjson recipes "$recipes" --argjson locks "$locks" ' .schema == "monday.compilation-inputs.v3" and .target == "x86_64-unknown-linux-gnu" and .locks == $locks and (.builder_image|test("@sha256:[0-9a-f]{64}$")) and .recipes == $recipes and (.workspace_profiles|length)>0 ' "$MONDAY_BUILD_INPUTS_FILE" >/dev/null
     jq -n \
       --slurpfile build_inputs "$MONDAY_BUILD_INPUTS_FILE" \
       --arg source_sha "$source_sha" \
@@ -48,7 +49,7 @@ case "$mode" in
       --arg product "$product" \
       --argjson locks "$locks" \
       --argjson binaries "$binary_manifest" \
-      '{schema:"monday.research-image-release.v5",
+      '{schema:"monday.research-image-release.v6",
         products:($product | split(",")),
         source_sha:$source_sha,
         workflow_run_id:$workflow_run_id,
@@ -73,14 +74,18 @@ case "$mode" in
       --arg product "$product" \
       --argjson binary_count "${#binaries[@]}" \
       --argjson locks "$locks" \
-      '.schema == "monday.research-image-release.v5" and
+      --argjson recipes "$recipes" \
+      '.schema == "monday.research-image-release.v6" and
        .products == ($product | split(",")) and
        .source_sha == $source_sha and
        .workflow_run_id == $workflow_run_id and
        .workflow_run_attempt == $workflow_run_attempt and
        .workflow_job_id == $workflow_job_id and
        .target == $target and
-       (.build_inputs | .schema == "monday.compilation-inputs.v2" and .target == $target and .profile == "release" and ([.compiler,.native,.flags,.profiles,.recipe] + [.locks[]] | all(.[];test("^[0-9a-f]{64}$")))) and
+       (.build_inputs | .schema == "monday.compilation-inputs.v3" and .target == $target and .profile == "release" and ([.compiler,.native,.flags,.profiles,.recipe] + [.locks[]] | all(.[];test("^[0-9a-f]{64}$")))) and
+       (.build_inputs.builder_image|test("@sha256:[0-9a-f]{64}$")) and
+       (.build_inputs.recipes == $recipes) and
+       (.build_inputs.workspace_profiles|length)>0 and
        .build_inputs.locks == $locks and .cargo_locks == $locks and
        (.binaries | length) == $binary_count' "$manifest" >/dev/null
     for binary in "${binaries[@]}"; do

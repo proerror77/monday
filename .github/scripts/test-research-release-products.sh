@@ -45,8 +45,8 @@ bash "$root/.github/scripts/research-release-products.sh" recipes controller >"$
 jq -s -e 'length==2 and any(.[]; .package=="alpha-harness") and any(.[]; .package=="hft-collector") and
   all(.[]; .package!="hft-backtest" and .package!="ploy-research" and .package!="hft-research-platform")' "$work/recipes" >/dev/null
 locks=$(bash "$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
-jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" \
-  '{schema:"monday.compilation-inputs.v2",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks}' >"$MONDAY_BUILD_INPUTS_FILE"
+jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" --argjson recipes "$(jq -s . "$work/recipes")" \
+  '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks,builder_image:("builder@sha256:"+$h),recipes:$recipes,workspace_profiles:{"research-core/Cargo.toml":$h}}' >"$MONDAY_BUILD_INPUTS_FILE"
 bash "$root/.github/scripts/research-image-release-artifact.sh" create "$work/controller" "$sha" 42 "$root/rust_hft" 2 7 controller
 ruby "$root/.github/scripts/research-release-bundle.rb" pack "$work/controller.tar" "$work/controller" controller
 ruby "$root/.github/scripts/research-release-bundle.rb" unpack "$work/controller.tar" "$work/roundtrip" controller
@@ -65,6 +65,8 @@ for selection in cex-runner prediction-runner cex-runner,controller cex-runner,p
     printf 'mock executable: %s\n' "$binary" >"$directory/research-bin/$binary"
     chmod 0755 "$directory/research-bin/$binary"
   done < <(bash "$products" binaries "$selection")
+  jq --argjson recipes "$(bash "$products" recipes "$selection" | jq -s .)" '.recipes=$recipes' "$MONDAY_BUILD_INPUTS_FILE" >"$work/updated-inputs.json"
+  cp "$work/updated-inputs.json" "$MONDAY_BUILD_INPUTS_FILE"
   bash "$root/.github/scripts/research-image-release-artifact.sh" create "$directory" "$sha" 42 "$root/rust_hft" 2 7 "$selection"
   ruby "$root/.github/scripts/research-release-bundle.rb" pack "$directory.tar" "$directory" "$selection"
   ruby "$root/.github/scripts/research-release-bundle.rb" unpack "$directory.tar" "$directory-roundtrip" "$selection"

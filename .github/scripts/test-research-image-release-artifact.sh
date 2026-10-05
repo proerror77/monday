@@ -170,7 +170,7 @@ while IFS= read -r manifest; do
 done < <(jq -r '.workspaces[].manifest' "$repo/workspaces.json")
 export MONDAY_BUILD_INPUTS_FILE="$tmp_dir/build-inputs.json"
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$repo")
-jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" '{schema:"monday.compilation-inputs.v2",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks}' >"$MONDAY_BUILD_INPUTS_FILE"
+jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" --argjson recipes "$(bash "$script_dir/research-release-products.sh" recipes all | jq -s .)" '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$h,native:$h,flags:$h,profiles:$h,recipe:$h,locks:$locks,builder_image:("builder@sha256:"+$h),recipes:$recipes,workspace_profiles:{"research-core/Cargo.toml":$h}}' >"$MONDAY_BUILD_INPUTS_FILE"
 "$artifact" create "$release" "$main_sha" 1234 "$repo"
 "$artifact" verify "$release" "$main_sha" 1234 "$repo"
 
@@ -225,6 +225,8 @@ assert_rejected() {
     missing) rm "$candidate/research-bin/hft-backtest" ;;
     extra) touch "$candidate/research-bin/unexpected" ;;
     digest) printf 'tampered\n' >>"$candidate/research-bin/alpha-harness" ;;
+    recipe-mismatch) jq '.build_inputs.recipes[0].features="unbuilt-feature"' "$candidate/research-image-release.json" >"$candidate/changed.json"; mv "$candidate/changed.json" "$candidate/research-image-release.json" ;;
+    builder-mismatch) jq '.build_inputs.builder_image="builder:latest"' "$candidate/research-image-release.json" >"$candidate/changed.json"; mv "$candidate/changed.json" "$candidate/research-image-release.json" ;;
     source-mismatch|run-mismatch|lock-mismatch) ;;
   esac
   if "$artifact" verify "$candidate" "$expected_sha" "$expected_run" "$repo"; then
@@ -238,6 +240,8 @@ assert_rejected extra
 assert_rejected digest
 assert_rejected source-mismatch "$other_sha"
 assert_rejected run-mismatch "$main_sha" 9999
+assert_rejected recipe-mismatch
+assert_rejected builder-mismatch
 printf 'changed lock\n' >>"$repo/research-core/platform/Cargo.lock"
 assert_rejected lock-mismatch
 
