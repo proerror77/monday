@@ -162,6 +162,28 @@ OpenResearch [chat delivery](https://github.com/alphaXiv/OpenResearch/blob/f4cec
 - ACR source-test 仍只有审核过的两个离线测试 profile、可信当前 main 和确定 source-test tag。native runner 构建/测试该镜像，不把测试生命周期塞回 ACK private executor。
 - GHCR 已有 artifact/image reuse 继续保留，未重复重写。Monorepo/Prediction/Security/ACR 不再调用旧 private ACK receipt wait。历史 signed receipt/helper 测试作为审计记录保留；Mac signer、private executor 与资源策略脚本不再是这些 required checks 的完成路径。真实 Ops 和有偿资源控制未在本 PR 中启用或迁移。
 
+## 保留终态资源的受控清理
+
+`researchctl retire-native-terminal CONFIG REQUEST` 是 operator-only 机械清理入口。
+配置 `terminal_retirement.enabled` 默认 `false`，普通 reconciler tick 和 Agent API 不调用它。
+REQUEST 只选择已存在的 tenant、Task、signed witness SHA 和 family receipt sequence，不创建 grant。
+
+消费者先核验 PG 当前 `stop_reconciled` 的不可变终态、stored native trust/signature、fixed Run/source 和原 controlled launch lease/handle。
+随后实际 GET 固定 signed witness、Source family receipt、retained manifest 和每个 raw object。
+receipt 使用实际 whole-wrapper bytes SHA；manifest 使用实际 pretty bytes SHA；raw grouping 使用 `identity(Value audit)`。
+原 `prepared-inputs`、source transfer、PG snapshot、Job/Pod 与成功结果的 exact coverage 必须一致。
+每文件最多 512 MiB，最多 520 文件，累计 readback 最多 8 GiB；这些限制只保护机械消费者，不表示科学数据已验证。
+
+离线 additive `sql/native_terminal_retirement.sql` 创建 append-only audit 和 retirement event，不修改原迁移或 Task terminal revision。
+真实归档核验后先 durable 保存固定 `delete_requested`，再持 PG task lock 生成不可从 JSON 创建的 permit。
+Kubernetes fresh readback 必须匹配 namespace、Job/Pod UID、owner、原 context/resources/image 和全进程 terminated 状态。
+Foreground DELETE 带原 Job UID precondition。Unknown 响应或 host crash 只恢复同 witness/UID，不另建操作。
+Job、原 Pod 均 absence 且 scope Pod inventory 为空后，独立写入 `retired`；仅 DELETE 成功响应不能证明已清理。
+Source family receipt 的 `=`/`:` 只在有限 family/20-digit sequence 模板内可读，Reader 不能写，Publisher 原 Build/source scope 不扩大。
+
+签名 witness 只供机械 retirement；不 refund、不重启、不恢复执行，也不把失败或缺少 provider 记录转成科学成功。
+Source observer 的真实发表/readback、云 provider 验收和生产启用仍是独立阶段。本地 loopback/一次性 PG fixture 不证明这些阶段完成。
+
 ## 验证、灰度与阻塞项
 
 新服务直接依赖 SQLx core/PostgreSQL driver；不解析未用 MySQL/RSA/SQLite 驱动，也未新增 audit ignore。

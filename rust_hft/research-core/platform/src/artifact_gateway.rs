@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{ensure, Context, Result};
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{OriginalUri, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -45,15 +45,16 @@ pub struct GatewayConfig {
 }
 
 fn key_valid(key: &str) -> bool {
-    key.starts_with("research/")
-        && key.len() <= 2048
-        && key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b))
-        && key.split('/').count() <= 32
-        && key
-            .split('/')
-            .all(|p| !p.is_empty() && p.len() <= 255 && !p.starts_with('.'))
+    crate::retirement::source_receipt_key_valid(key)
+        || (key.starts_with("research/")
+            && key.len() <= 2048
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b))
+            && key.split('/').count() <= 32
+            && key
+                .split('/')
+                .all(|p| !p.is_empty() && p.len() <= 255 && !p.starts_with('.')))
 }
 
 fn now_ms() -> Result<u64> {
@@ -277,9 +278,15 @@ impl Drop for Upload {
 async fn read(
     State(gateway): State<Arc<Gateway>>,
     Path(key): Path<String>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     let key = format!("research/{key}");
+    if key.starts_with("research/campaign-ledger/")
+        && (uri.query().is_some() || uri.path() != format!("/{key}"))
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let cap = gateway
         .capability(&headers)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
@@ -677,6 +684,63 @@ mod tests {
             assert!(gateway.begin_upload(key).is_err());
         }
         assert_eq!(std::fs::read(external.join("secret"))?, b"secret");
+        Ok(())
+    }
+    #[tokio::test]
+    async fn source_receipt_reader_is_exact_and_cannot_write_or_cross_family() -> Result<()> {
+        let (_temp, gateway, token, _) = fixture(128)?;
+        let key = crate::retirement::source_receipt_key("family.one:original", 2)?;
+        let prefix = key.strip_suffix("receipt.json").unwrap().to_owned();
+        let cap = Capability {
+            token_sha256: sha256(token.as_bytes()),
+            expires_ms: now_ms()? + 60_000,
+            access: Access::Reader {
+                prefixes: vec![prefix.clone()],
+            },
+        };
+        write_caps(
+            &gateway.config.capabilities_file,
+            std::slice::from_ref(&cap),
+        )?;
+        assert!(read_capabilities(&gateway.config.capabilities_file).is_ok());
+        let path = gateway.config.root.join(&key);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, b"exact Source bytes")?;
+        let (base, handle) = server(gateway.clone()).await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let response = client
+            .get(format!("{base}{key}"))
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await?.as_ref(), b"exact Source bytes");
+        for bad in [
+            format!("{key}?other=1"),
+            key.replace("family.one:original", "other"),
+            key.replace("family.one:original", "family%2Eone:original"),
+            key.replace("receipt.json", "other.json"),
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("{base}{bad}"))
+                    .bearer_auth(&token)
+                    .send()
+                    .await?
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert!(gateway.admits(&cap, &key, true).await.is_err());
+        let publisher = Capability {
+            access: Access::Publisher {
+                prefixes: vec![prefix],
+            },
+            ..cap
+        };
+        write_caps(&gateway.config.capabilities_file, &[publisher])?;
+        assert!(read_capabilities(&gateway.config.capabilities_file).is_err());
+        handle.close().await;
         Ok(())
     }
 }
