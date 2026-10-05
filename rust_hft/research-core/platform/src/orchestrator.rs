@@ -455,6 +455,8 @@ pub struct Task {
     pub lease: Option<Lease>,
     pub deadline_ms: Option<i64>,
     pub execution: Option<ExecutionHandle>,
+    #[serde(default)]
+    pub attempt_identity: Option<crate::execution::AttemptIdentityRef>,
     pub stopping_as: Option<State>,
     pub retry_after_stop: bool,
     pub receipt: Option<ResultReceipt>,
@@ -474,6 +476,7 @@ impl Task {
             lease: None,
             deadline_ms: None,
             execution: None,
+            attempt_identity: None,
             stopping_as: None,
             retry_after_stop: false,
             receipt: None,
@@ -515,6 +518,7 @@ impl Task {
             );
         }
         self.lease = Some(lease.clone());
+        self.attempt_identity = None;
         self.state = State::Launching;
         Ok(lease)
     }
@@ -542,6 +546,17 @@ impl Task {
         self.check_lease(lease, now_ms)?;
         ensure!(self.state == State::Launching, "not launching");
         handle.validate(lease, &self.spec)?;
+        if self.spec.kind == TaskKind::CexCampaign {
+            self.attempt_identity
+                .as_ref()
+                .context("Campaign launch lacks controlled identity")?
+                .validate(&self.spec, lease)?;
+        } else {
+            ensure!(
+                self.attempt_identity.is_none(),
+                "unexpected late Campaign identity"
+            );
+        }
         self.execution = Some(handle);
         self.state = State::Running;
         Ok(())

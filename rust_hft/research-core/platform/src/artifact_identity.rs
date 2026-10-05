@@ -171,6 +171,9 @@ impl IssuedAttemptIdentity {
     pub fn native_evidence_sha256(&self) -> &str {
         &self.record.native_evidence_sha256
     }
+    pub fn native_trust_sha256(&self) -> &str {
+        &self.record.native_trust_sha256
+    }
     pub fn tenant(&self) -> &str {
         &self.record.tenant
     }
@@ -348,7 +351,11 @@ impl AttemptIdentityIssuer {
             .state_root
             .join(format!("{task}.{attempt}.{fence}"))
     }
-    fn remove_files(&self, directory: &Path, record: &OwnedIdentity) -> Result<()> {
+    fn verify_owned_files(
+        &self,
+        directory: &Path,
+        record: &OwnedIdentity,
+    ) -> Result<std::collections::BTreeSet<String>> {
         private_directory(directory)?;
         let expected: std::collections::BTreeSet<_> = record
             .files_sha256
@@ -372,7 +379,10 @@ impl AttemptIdentityIssuer {
                 "owned identity bytes changed"
             );
         }
-        for name in expected {
+        Ok(expected)
+    }
+    fn remove_files(&self, directory: &Path, record: &OwnedIdentity) -> Result<()> {
+        for name in self.verify_owned_files(directory, record)? {
             std::fs::remove_file(directory.join(name))?;
         }
         std::fs::remove_dir(directory)?;
@@ -404,6 +414,120 @@ impl AttemptIdentityIssuer {
             fence: issued.record.fence,
             owned_identity_sha256: identity(&issued.record)?,
         })
+    }
+
+    /// Recover existing bytes for mechanical cleanup. Never mint, restore a
+    /// capability, or require a still-active grant after process-tree stop.
+    pub async fn recover_for_cleanup(
+        &self,
+        tx: &mut sqlx_core::transaction::Transaction<'_, sqlx_postgres::Postgres>,
+        selected: &crate::orchestrator::Task,
+    ) -> Result<Option<IssuedAttemptIdentity>> {
+        use sqlx_core::{query::query, row::Row};
+        ensure!(
+            selected.state == crate::orchestrator::State::Stopping,
+            "cleanup requires stopping Attempt"
+        );
+        let row = query("SELECT t.tenant,t.document,n.document AS native,n.trust_document,n.trust_sha256,n.evidence_sha256 FROM research.tasks t JOIN research.native_admission_imports n ON n.request_sha256=t.request_sha256 AND n.tenant=t.tenant WHERE t.task_id=$1 FOR SHARE OF t")
+            .bind(&selected.id).fetch_one(&mut **tx).await?;
+        let current: crate::orchestrator::Task = serde_json::from_value(row.get("document"))?;
+        ensure!(
+            current.id == selected.id
+                && current.spec == selected.spec
+                && current.attempt == selected.attempt
+                && current.fence == selected.fence,
+            "cleanup changed ledger Attempt"
+        );
+        let signed: crate::admission::SignedNativeAdmission =
+            serde_json::from_value(row.get("native"))?;
+        let trust: crate::admission::NativeAdmissionTrust =
+            serde_json::from_value(row.get("trust_document"))?;
+        let verified = trust.verify(&signed)?;
+        ensure!(
+            signed.evidence.admission.task_spec == current.spec
+                && signed.evidence.admission.request_sha256 == current.id
+                && signed.evidence.tenant == row.get::<String, _>("tenant")
+                && signed.evidence_sha256 == row.get::<String, _>("evidence_sha256")
+                && verified.trust_sha256() == row.get::<String, _>("trust_sha256"),
+            "cleanup changed native history"
+        );
+        let _lock = self.lock()?;
+        let directory = self.directory(&current.id, current.attempt, current.fence);
+        if !directory.try_exists()? {
+            return Ok(None);
+        }
+        let record: OwnedIdentity =
+            serde_json::from_slice(&private_bytes(&directory.join("identity.json"), 64 * 1024)?)?;
+        ensure!(
+            record.schema == 1
+                && record.issuer_sha256 == identity(&self.config)?
+                && record.tenant == signed.evidence.tenant
+                && record.task_id == current.id
+                && record.attempt == current.attempt
+                && record.fence == current.fence
+                && record.native_evidence_sha256 == signed.evidence_sha256
+                && record.native_trust_sha256 == verified.trust_sha256(),
+            "foreign cleanup journal"
+        );
+        let expected_scope = identity(&(
+            &record.issuer_sha256,
+            &record.tenant,
+            &record.task_id,
+            record.attempt,
+            record.fence,
+            &record.native_evidence_sha256,
+            &record.native_trust_sha256,
+        ))?;
+        ensure!(
+            record.scope_id == expected_scope
+                && record.artifact_prefix
+                    == format!(
+                        "{}/{}/{}/",
+                        current.spec.output_prefix, current.id, current.attempt
+                    )
+                && record
+                    .artifact_prefix
+                    .starts_with(&self.config.namespace_prefix),
+            "cleanup journal changed scope"
+        );
+        ensure!(
+            record.capability.access
+                == Access::AttemptWriter {
+                    tenant: record.tenant.clone(),
+                    task_id: record.task_id.clone(),
+                    attempt: record.attempt,
+                    fence: record.fence
+                }
+                && record.capability.expires_ms == u64::try_from(record.deadline_ms)?,
+            "cleanup capability changed scope"
+        );
+        let mut files = BTreeMap::new();
+        for name in record.files_sha256.keys() {
+            ensure!(
+                matches!(
+                    name.as_str(),
+                    "artifact.token" | "native-admission.json" | "tls.pem"
+                ),
+                "foreign cleanup file"
+            );
+            files.insert(
+                name.clone(),
+                private_bytes(&directory.join(name), 64 * 1024)?,
+            );
+        }
+        self.verify_owned_files(&directory, &record)?;
+        ensure!(
+            files.get("native-admission.json") == Some(&serde_json::to_vec(&signed)?)
+                && files
+                    .get("artifact.token")
+                    .is_some_and(|token| sha256(token) == record.capability.token_sha256),
+            "cleanup credential changed"
+        );
+        Ok(Some(IssuedAttemptIdentity {
+            record,
+            directory,
+            files,
+        }))
     }
 
     /// Root's LockedTask wrapper supplies its existing transaction. The request

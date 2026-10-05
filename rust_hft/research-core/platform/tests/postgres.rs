@@ -662,7 +662,8 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .execute(&pool)
         .await?;
     let mut result = ledger.lock_next("result-owner", 30000).await?.unwrap();
-    let lease = result.task.lease.clone().unwrap();
+    let mut lease = result.task.lease.clone().unwrap();
+    let original_launch_lease = lease.clone();
     let handle = hft_research_platform::execution::ExecutionHandle {
         backend: result.task.spec.profile.backend,
         cluster: result.task.spec.profile.cluster.clone(),
@@ -675,6 +676,8 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         request_sha256: result.task.id.clone(),
     };
     result.task.launched(&lease, result.now_ms, handle)?;
+    result.commit("fixture_initial_launch").await?;
+    result = ledger.lock_next("result-owner", 30000).await?.unwrap();
     #[cfg(feature = "gateway")]
     {
         let task = result.task.id.clone();
@@ -742,6 +745,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         takeover.await?;
         result = ledger.lock_next("result-owner", 30000).await?.unwrap();
     }
+    lease = result.task.heartbeat(&lease, result.now_ms, 90_000)?;
+    result.commit("fixture_heartbeat").await?;
+    result = ledger.lock_next("result-owner", 30000).await?.unwrap();
     let receipt = hft_research_platform::orchestrator::ResultReceipt {
         task_id: result.task.id.clone(),
         attempt: lease.attempt,
@@ -807,6 +813,17 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     assert_eq!(snapshot.task.state, State::Cancelled);
     assert_eq!(snapshot.native_admission.evidence.tenant, "fixture");
     assert!(snapshot.result.is_none());
+    assert_eq!(
+        snapshot
+            .execution_event
+            .as_ref()
+            .unwrap()
+            .document
+            .lease
+            .as_ref(),
+        Some(&original_launch_lease)
+    );
+    assert_ne!(original_launch_lease.expires_ms, lease.expires_ms);
     assert_eq!(
         snapshot
             .execution_event

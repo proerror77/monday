@@ -330,9 +330,38 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
     assert!(
         serde_json::from_slice::<serde_json::Value>(&std::fs::read(&projection)?)? == projected
     );
-    restored_issuer.cleanup(recovered)?;
+    task.state = State::Stopping;
+    query("UPDATE research.tasks SET state='stopping',document=$1 WHERE task_id=$2")
+        .bind(serde_json::to_value(&task)?)
+        .bind(&task_id)
+        .execute(&pool)
+        .await?;
+    let mut cleanup_tx = pool.begin().await?;
+    let owned = restored_issuer
+        .recover_for_cleanup(&mut cleanup_tx, &task)
+        .await?
+        .unwrap();
+    assert_eq!(owned.scope_id(), recovered.scope_id());
+    assert!(owned.late_files()["artifact.token"] == token);
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&projection)?)? == projected
+    );
+    let mut foreign = task.clone();
+    foreign.fence += 1;
+    assert!(restored_issuer
+        .recover_for_cleanup(&mut cleanup_tx, &foreign)
+        .await
+        .is_err());
+    cleanup_tx.rollback().await?;
+    restored_issuer.cleanup(owned)?;
     assert!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(&projection)?)? == original);
     assert_eq!(std::fs::read_dir(state)?.count(), 0);
+    let mut cleanup_tx = pool.begin().await?;
+    assert!(restored_issuer
+        .recover_for_cleanup(&mut cleanup_tx, &task)
+        .await?
+        .is_none());
+    cleanup_tx.rollback().await?;
     pool.close().await;
     Ok(())
 }

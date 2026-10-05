@@ -24,6 +24,8 @@ pub struct ServiceConfig {
     pub artifact_tls: crate::transport::TlsConfig,
     pub lease_ms: i64,
     pub agent_api: Option<crate::agent_api::AgentApiConfig>,
+    #[serde(default)]
+    pub attempt_identity: Option<crate::artifact_identity::AttemptIdentityConfig>,
 }
 
 /// Gateway credentials are controller-only, scoped to result prefix readback.
@@ -306,6 +308,7 @@ pub struct Reconciler {
     pub artifacts: ArtifactGateway,
     pub owner: String,
     pub lease_ms: i64,
+    pub issuer: Option<crate::artifact_identity::AttemptIdentityIssuer>,
 }
 
 impl Reconciler {
@@ -340,6 +343,29 @@ impl Reconciler {
                 .stop(&locked.task.spec, &lease, locked.task.execution.as_ref())
                 .await?
             {
+                if locked.task.spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+                    let issuer = self
+                        .issuer
+                        .as_ref()
+                        .context("Campaign cleanup lacks controlled issuer")?;
+                    let issued = locked.recover_attempt_identity_for_cleanup(issuer).await?;
+                    if !self
+                        .kubernetes
+                        .cleanup_attempt_identity(
+                            &locked.task.spec,
+                            &lease,
+                            locked.task.attempt_identity.as_ref(),
+                            issued.as_ref(),
+                        )
+                        .await?
+                    {
+                        locked.commit("identity_cleanup_pending").await?;
+                        return Ok(true);
+                    }
+                    if let Some(issued) = issued {
+                        issuer.cleanup(issued)?;
+                    }
+                }
                 if self.ledger.admission(&locked.task.spec).await?.is_none() {
                     locked.task.stop(State::Cancelled, false)?;
                 }
@@ -376,7 +402,19 @@ impl Reconciler {
                 return Ok(true);
             }
             let acceptance = self.ledger.acceptance(&locked.task.spec).await?;
-            let handle = self
+            let issued =
+                if locked.task.spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+                    Some(
+                        locked
+                            .issue_attempt_identity(self.issuer.as_ref().context(
+                                "native Campaign requires controlled per-Attempt issuer",
+                            )?)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+            let (handle, attempt_identity) = self
                 .kubernetes
                 .launch(
                     &locked.task.spec,
@@ -384,8 +422,10 @@ impl Reconciler {
                     &acceptance,
                     locked.task.checkpoint.as_ref(),
                     locked.task.deadline_ms.context("launch lacks deadline")? - locked.now_ms,
+                    issued.as_ref(),
                 )
                 .await?;
+            locked.task.attempt_identity = attempt_identity;
             let now = locked.refresh_clock().await?;
             if locked.task.expire(now)? {
                 // Resource identity is still recovered by name during stopping.
