@@ -12,7 +12,7 @@ readonly POLICY=$SCRIPT_DIR/trading-ecs-paper-shadow-policy.jq
 readonly UNIT=$SCRIPT_DIR/hft-trading-ecs.service
 readonly WORKFLOW=$SCRIPT_DIR/../../.github/workflows/acr-publish.yml
 
-for command in awk chmod cp find grep jq ln mkfifo mktemp rm sed sha256sum shellcheck sort; do
+for command in awk chmod cp find grep jq ln mkfifo mktemp rm ruby sed sha256sum shellcheck sort; do
   command -v "$command" >/dev/null 2>&1 \
     || { printf 'missing trading host contract test dependency: %s\n' "$command" >&2; exit 2; }
 done
@@ -1342,9 +1342,14 @@ grep -Fq \
 grep -Fq \
   'uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8' \
   "$WORKFLOW"
-[[ $(grep -Fc \
-  'uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' \
-  "$WORKFLOW") -eq 4 ]]
+ruby -ryaml - "$WORKFLOW" <<'RUBY'
+steps=YAML.safe_load(File.read(ARGV[0])).fetch('jobs').fetch('publish').fetch('steps')
+uploads=steps.select { |step| step.dig('with','name')=='hft-trading-ecs-linux-amd64-${{ github.sha }}' }
+abort 'missing or duplicate trading host artifact upload' unless uploads.length==1
+upload=uploads.fetch(0)
+abort 'trading host artifact action must retain its pinned source' unless upload.fetch('uses')=='actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02'
+abort 'trading host artifact upload changed its owning image' unless upload.fetch('if')=="${{ (matrix.repository == 'hft-trading') && !matrix.research_artifact }}"
+RUBY
 if grep -Eq \
   'uses: (actions/(checkout|upload-artifact)|docker/(setup-buildx-action|login-action|build-push-action))@v[0-9]' \
   "$WORKFLOW"; then
