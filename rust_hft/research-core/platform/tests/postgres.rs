@@ -38,6 +38,29 @@ fn researchctl_rejects_unsigned_build_registration_before_connecting_to_pg() {
         .contains("SIGNED_RELEASE"));
 }
 
+#[test]
+fn session_host_rejects_resume_without_registered_checkpoint_before_starting_child() {
+    for arguments in [
+        vec!["resume", "missing-config.json", "native.json"],
+        vec![
+            "resume",
+            "missing-config.json",
+            "invalid-checkpoint",
+            "native.json",
+        ],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_research-session"))
+            .args(arguments)
+            .env_remove("MONDAY_RESEARCH_DATABASE_URL")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("CHECKPOINT_SHA256"));
+    }
+}
+
 /// Only the explicitly named disposable test database is permitted. This test
 /// never targets production, imports business data, or connects to Kubernetes.
 #[tokio::test]
@@ -550,6 +573,37 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     );
     let workspace = session_root.join("workspace");
     std::fs::create_dir(&workspace)?;
+    anyhow::ensure!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&workspace)
+            .status()?
+            .success(),
+        "fixture Git init failed"
+    );
+    anyhow::ensure!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "fixture"
+            ])
+            .status()?
+            .success(),
+        "fixture Git commit failed"
+    );
     let session_config = hft_research_platform::session::SessionConfig {
         executable_sha256: hft_research_platform::sha256(&std::fs::read(&fixture_binary)?),
         executable: fixture_binary,
@@ -564,9 +618,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         schema: 1,
         experiment_sha256: run.experiment_sha256.clone(),
         provider: hft_research_platform::research::CodingAgent::CodexAppServer,
-        provider_version: "0.159.2".into(),
+        provider_version: hft_research_platform::coding_agent::SCHEMA_VERSION.into(),
         provider_thread_id: native_session.thread_id().unwrap().into(),
-        provider_binary_sha256: session_config.executable_sha256,
+        provider_binary_sha256: session_config.executable_sha256.clone(),
         capability_policy_receipt_sha256: hash('b'),
     };
     let session_id = ledger.register_session("fixture", &session).await?;
@@ -656,11 +710,165 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     .execute(&pool)
     .await
     .is_err());
-    native_session.close().await?;
+    let native = native_session.checkpoint().await?;
+    let native_bytes = serde_json::to_vec(&native)?;
 
     sqlx_core::query::query("UPDATE research.authority SET mode='postgres'")
         .execute(&pool)
         .await?;
+    let mut checkpoint = hft_research_platform::research::SessionSnapshot {
+        session_sha256: session_id.clone(),
+        parent_snapshot_sha256: None,
+        code_commit: native.host.as_ref().unwrap().code_commit.clone(),
+        workspace_manifest_sha256: native
+            .host
+            .as_ref()
+            .unwrap()
+            .workspace_manifest_sha256
+            .clone(),
+        transcript_manifest_sha256: native
+            .host
+            .as_ref()
+            .unwrap()
+            .transcript_manifest_sha256
+            .clone(),
+        native_state_manifest_sha256: hft_research_platform::sha256(&native_bytes),
+    };
+    assert!(ledger
+        .session_checkpoint_for_resume("fixture", &checkpoint.id()?)
+        .await
+        .is_err());
+    let checkpoint_id = ledger.snapshot_session("fixture", &checkpoint).await?;
+    assert!(ledger
+        .session_checkpoint_for_resume("another", &checkpoint_id)
+        .await
+        .is_err());
+    assert!(ledger
+        .session_checkpoint_for_resume("fixture", &hash('0'))
+        .await
+        .is_err());
+    assert_eq!(
+        ledger.snapshot_session("fixture", &checkpoint).await?,
+        checkpoint_id
+    );
+    let registered = ledger
+        .session_checkpoint_for_resume("fixture", &checkpoint_id)
+        .await?;
+    let resumed = registered
+        .resume(session_config.clone(), &native_bytes)
+        .await?;
+    resumed.close().await?;
+    let native_path = session_root.join("native-manifest.json");
+    std::fs::write(&native_path, &native_bytes)?;
+    let token_path = session_root.join("research.token");
+    std::fs::write(&token_path, "x".repeat(32))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&session_root, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let config_path = session_root.join("host.json");
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec(&serde_json::json!({
+            "session":session_config,
+            "tenant":"fixture",
+            "experiment_sha256":session.experiment_sha256,
+            "capability_policy_receipt_sha256":session.capability_policy_receipt_sha256,
+            "research_endpoint":"http://127.0.0.1:9/research",
+            "research_token_file":token_path,
+        }))?,
+    )?;
+    // Exercise the production host command against PG and the offline native
+    // protocol peer. No broker request, model turn or external send occurs.
+    let mut host = std::process::Command::new(env!("CARGO_BIN_EXE_research-session"))
+        .arg("resume")
+        .arg(&config_path)
+        .arg(&checkpoint_id)
+        .arg(&native_path)
+        .env("MONDAY_RESEARCH_DATABASE_URL", &url)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write;
+        host.stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"operation\":\"close\"}\n")?;
+    }
+    let output = host.wait_with_output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "registered host resume failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout)?;
+    let opened: serde_json::Value = serde_json::from_str(output.lines().next().unwrap())?;
+    assert_eq!(opened["session_sha256"], session_id);
+    assert!(output.contains("\"child_stopped\":true"));
+    checkpoint.parent_snapshot_sha256 = Some(checkpoint_id.clone());
+    let registered = ledger
+        .session_checkpoint_for_resume("fixture", &checkpoint_id)
+        .await?;
+    let writer = Ledger::connect(&url).await?;
+    let next = checkpoint.clone();
+    let mut append = tokio::spawn(async move { writer.snapshot_session("fixture", &next).await });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let blocked: bool = sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname='monday_foundation_test' AND wait_event_type='Lock' AND query LIKE '%research.sessions%FOR UPDATE%')").fetch_one(&pool).await?;
+        if blocked {
+            break;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline && !append.is_finished(),
+            "checkpoint append did not wait for native admission"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut append)
+            .await
+            .is_err()
+    );
+    let resumed = registered
+        .resume(session_config.clone(), &native_bytes)
+        .await?;
+    resumed.close().await?;
+    let next_checkpoint = append.await??;
+    assert!(ledger
+        .session_checkpoint_for_resume("fixture", &checkpoint_id)
+        .await
+        .is_err());
+    assert_eq!(
+        ledger
+            .session_checkpoint_for_resume("fixture", &next_checkpoint)
+            .await?
+            .snapshot()
+            .id()?,
+        next_checkpoint
+    );
+    // A privileged fixture injects a fork that normal locked registration
+    // rejects. Neither branch is a canonical checkpoint for resume.
+    let mut fork = checkpoint.clone();
+    fork.code_commit = "e".repeat(40);
+    let fork_id = fork.id()?;
+    sqlx_core::query::query("INSERT INTO research.session_snapshots(snapshot_sha256,session_sha256,parent_snapshot_sha256,document) VALUES($1,$2,$3,$4)")
+        .bind(&fork_id).bind(&session_id).bind(&checkpoint_id).bind(serde_json::to_value(&fork)?).execute(&pool).await?;
+    assert!(ledger
+        .session_checkpoint_for_resume("fixture", &next_checkpoint)
+        .await
+        .is_err());
+    assert!(ledger
+        .session_checkpoint_for_resume("fixture", &fork_id)
+        .await
+        .is_err());
+    assert!(ledger
+        .snapshot_session("fixture", &checkpoint)
+        .await
+        .is_err());
     let mut result = ledger.lock_next("result-owner", 30000).await?.unwrap();
     let mut lease = result.task.lease.clone().unwrap();
     let original_launch_lease = lease.clone();

@@ -4,7 +4,7 @@ use hft_research_platform::{
     coding_agent::{ApprovalKind, RpcId},
     postgres::{completion_message, Ledger},
     research::{CodingAgent, Session},
-    session::{AppServer, NativeState, ResearchClient, SessionConfig},
+    session::{AppServer, ResearchClient, SessionConfig},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -49,7 +49,7 @@ enum Command {
     Close,
 }
 
-fn read<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
+fn read_bytes(path: &str) -> Result<Vec<u8>> {
     ensure!(
         std::fs::symlink_metadata(path)?.is_file(),
         "configuration must be a regular file"
@@ -59,7 +59,10 @@ fn read<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
         .take(1024 * 1024 + 1)
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 1024 * 1024, "configuration exceeds bound");
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(bytes)
+}
+fn read<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
+    Ok(serde_json::from_slice(&read_bytes(path)?)?)
 }
 
 fn print(value: &Value) -> Result<()> {
@@ -74,10 +77,10 @@ fn print(value: &Value) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (config_path, native_path) = match args.as_slice() {
+    let (config_path, resume) = match args.as_slice() {
         [operation, config] if operation == "start" => (config.as_str(), None),
-        [operation, config, native] if operation == "resume" => (config.as_str(), Some(native.as_str())),
-        _ => bail!("usage: research-session start CONFIG | resume CONFIG NATIVE_STATE; typed operator commands on stdin"),
+        [operation, config, checkpoint, native] if operation == "resume" && hft_research_platform::valid_digest(checkpoint) => (config.as_str(), Some((checkpoint.as_str(), native.as_str()))),
+        _ => bail!("usage: research-session start CONFIG | resume CONFIG CHECKPOINT_SHA256 NATIVE_STATE; typed operator commands on stdin"),
     };
     let config: Config = read(config_path)?;
     ensure!(
@@ -96,23 +99,44 @@ async fn main() -> Result<()> {
     )
     .await?;
     let executable_sha256 = config.session.executable_sha256.clone();
-    let mut server = if let Some(path) = native_path {
-        AppServer::resume(config.session, &read::<NativeState>(path)?).await?
+    let (mut server, registered_session) = if let Some((checkpoint, path)) = resume {
+        let registered = ledger
+            .session_checkpoint_for_resume(&config.tenant, checkpoint)
+            .await?;
+        ensure!(
+            registered.session().experiment_sha256 == config.experiment_sha256
+                && registered.session().capability_policy_receipt_sha256
+                    == config.capability_policy_receipt_sha256,
+            "registered Session does not match host experiment or capability policy"
+        );
+        let session = registered.session().clone();
+        let server = registered
+            .resume(config.session, &read_bytes(path)?)
+            .await?;
+        (server, Some(session))
     } else {
         let mut server = AppServer::start(config.session).await?;
         server.open_thread(None).await?;
-        server
+        (server, None)
     };
-    let session = Session {
-        schema: 1,
-        experiment_sha256: config.experiment_sha256,
-        provider: CodingAgent::CodexAppServer,
-        provider_version: hft_research_platform::coding_agent::SCHEMA_VERSION.into(),
-        provider_thread_id: server.thread_id().context("native thread missing")?.into(),
-        provider_binary_sha256: executable_sha256,
-        capability_policy_receipt_sha256: config.capability_policy_receipt_sha256,
+    let session_id = if let Some(session) = registered_session {
+        session.id()?
+    } else {
+        ledger
+            .register_session(
+                &config.tenant,
+                &Session {
+                    schema: 1,
+                    experiment_sha256: config.experiment_sha256,
+                    provider: CodingAgent::CodexAppServer,
+                    provider_version: hft_research_platform::coding_agent::SCHEMA_VERSION.into(),
+                    provider_thread_id: server.thread_id().context("native thread missing")?.into(),
+                    provider_binary_sha256: executable_sha256,
+                    capability_policy_receipt_sha256: config.capability_policy_receipt_sha256,
+                },
+            )
+            .await?
     };
-    let session_id = ledger.register_session(&config.tenant, &session).await?;
     print(
         &json!({"session_sha256":session_id,"thread_id":server.thread_id(),"generation":server.generation()}),
     )?;
