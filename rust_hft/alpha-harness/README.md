@@ -1,6 +1,18 @@
 # Alpha Harness
 Rust CLI and libraries for the governed CEX Campaign and prediction research plane. It has no order or trade command and does not depend on execution adapters.
 
+## Scientific fitting and control evidence
+
+`alpha-engine` keeps immutable fitted-model evidence, protocol validation and
+deterministic ledger/replay verification available without default features.
+The `fitting` feature owns baseline fitting, independent refits, sequence
+training and market-encoder training. Only that feature depends on
+`hft-research-ml` and Burn. The existing scientific default enables `kernel`
+and `fitting`; control consumers must explicitly disable default features.
+
+This separates compilation ownership. It does not change Campaign admission,
+trial/resource budgets, final evaluation, holdout isolation or settlement.
+
 ## Packages
 
 - `alpha-domain`: typed missions, candidates, feedback, learning, approvals, and signed envelopes.
