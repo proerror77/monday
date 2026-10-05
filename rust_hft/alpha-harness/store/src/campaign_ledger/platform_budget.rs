@@ -167,6 +167,27 @@ impl AlphaStore {
         &mut self,
         verified: &VerifiedCampaignRootGrant,
         reservation: &CampaignAttemptReservationV1,
+        action: impl FnOnce(&VerifiedCampaignPlatformBudget) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.with_campaign_platform_budget_impl(verified, reservation, Utc::now, action)
+    }
+
+    // The public API fixes real time; only source-ledger tests inject a clock.
+    #[cfg(test)]
+    pub(super) fn with_campaign_platform_budget_with_clock<T, E: From<StoreError>>(
+        &mut self,
+        verified: &VerifiedCampaignRootGrant,
+        reservation: &CampaignAttemptReservationV1,
+        now: impl FnOnce() -> DateTime<Utc>,
+        action: impl FnOnce(&VerifiedCampaignPlatformBudget) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.with_campaign_platform_budget_impl(verified, reservation, now, action)
+    }
+
+    fn with_campaign_platform_budget_impl<T, E: From<StoreError>>(
+        &mut self,
+        verified: &VerifiedCampaignRootGrant,
+        reservation: &CampaignAttemptReservationV1,
         now: impl FnOnce() -> DateTime<Utc>,
         action: impl FnOnce(&VerifiedCampaignPlatformBudget) -> Result<T, E>,
     ) -> Result<T, E> {
@@ -190,6 +211,28 @@ impl AlphaStore {
     /// Recheck source authority and exact exclusive ownership immediately before
     /// signing/publishing. Unknown export or PG import retains the full charge.
     pub fn with_campaign_platform_export<T, E: From<StoreError>>(
+        &mut self,
+        verified: &VerifiedCampaignRootGrant,
+        reservation: &CampaignAttemptReservationV1,
+        transfer: &CampaignPlatformTransferV1,
+        action: impl FnOnce(&VerifiedCampaignPlatformExport) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.with_campaign_platform_export_impl(verified, reservation, transfer, Utc::now, action)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_campaign_platform_export_with_clock<T, E: From<StoreError>>(
+        &mut self,
+        verified: &VerifiedCampaignRootGrant,
+        reservation: &CampaignAttemptReservationV1,
+        transfer: &CampaignPlatformTransferV1,
+        now: impl FnOnce() -> DateTime<Utc>,
+        action: impl FnOnce(&VerifiedCampaignPlatformExport) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.with_campaign_platform_export_impl(verified, reservation, transfer, now, action)
+    }
+
+    fn with_campaign_platform_export_impl<T, E: From<StoreError>>(
         &mut self,
         verified: &VerifiedCampaignRootGrant,
         reservation: &CampaignAttemptReservationV1,
@@ -247,9 +290,17 @@ fn lock_budget(
         .get(verified.content_sha256())
         .ok_or_else(|| err("missing native budget root"))?;
     serialize_approval_mutation(tx, &root.approval.approval_id)?;
-    // Sample after acquiring the approval guard, matching native dispatch.
+    study::lock_campaign_guards(
+        tx,
+        key,
+        verified,
+        &reservation.family_id,
+        verified.grant().valid_from,
+        false,
+    )?;
+    // Sample after approval, Study and family guards. Waiting for another
+    // writer cannot turn a caller's stale timestamp into current authority.
     let at = now();
-    study::lock_campaign_guards(tx, key, verified, &reservation.family_id, at, true)?;
     let observed = dispatch::checked_reservation(
         tx,
         key,

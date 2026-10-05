@@ -2446,7 +2446,7 @@ mod tests {
             request_sha256: repeat_hex('5'),
         };
         store
-            .transfer_campaign_execution_to_platform(&root, &reserved, &transfer, t0())
+            .transfer_campaign_execution_to_platform_with_clock(&root, &reserved, &transfer, t0)
             .unwrap();
         acknowledge_family_receipts(&mut store, "family-1");
         let before = store.campaign_family_usage("family-1").unwrap();

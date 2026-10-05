@@ -18,6 +18,8 @@ It preserves the original deadline and full charge after unknown export or PG im
 The operation hash is `canonical_json_hash` of the original structured operation ID.
 It is not a newly named retry.
 
+Public budget inspection, exclusive transfer and guarded export always sample the real clock after acquiring approval, Study and family guards. Callers cannot supply historical time. Internal source-ledger tests inject clocks to verify expiry and serialization; those helpers are not public APIs.
+
 A complete signing path also requires the independently verified Build release and executable bytes.
 It must bind the exact Run, Task, source, image, resources, configuration and verified development collection.
 The CEX app inspector supplies the opaque finalized-request/data-equivalence object.

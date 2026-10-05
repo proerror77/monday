@@ -1199,7 +1199,7 @@ mod tests {
         let (mut store, verified) = registered();
         let reservation = reservation(&verified, 0, 40);
         let read = |store: &mut AlphaStore, reservation: &CampaignAttemptReservationV1| {
-            store.with_campaign_platform_budget(&verified, reservation, t0, |value| {
+            store.with_campaign_platform_budget_with_clock(&verified, reservation, t0, |value| {
                 Ok::<_, StoreError>(value.clone())
             })
         };
@@ -1238,13 +1238,22 @@ mod tests {
             request_sha256: "b".repeat(64),
         };
         let read = |store: &mut AlphaStore, transfer: &CampaignPlatformTransferV1| {
-            store.with_campaign_platform_export(&verified, &reservation, transfer, t0, |value| {
-                Ok::<_, StoreError>(value.clone())
-            })
+            store.with_campaign_platform_export_with_clock(
+                &verified,
+                &reservation,
+                transfer,
+                t0,
+                |value| Ok::<_, StoreError>(value.clone()),
+            )
         };
         assert!(read(&mut store, &transfer).is_err());
         let receipt = store
-            .transfer_campaign_execution_to_platform(&verified, &reservation, &transfer, t0())
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+            )
             .unwrap();
         assert!(read(&mut store, &transfer).is_err());
         acknowledge_all(&mut store);
@@ -1254,10 +1263,13 @@ mod tests {
         let mut different = transfer.clone();
         different.request_sha256 = "c".repeat(64);
         assert!(read(&mut store, &different).is_err());
-        let unknown =
-            store.with_campaign_platform_export(&verified, &reservation, &transfer, t0, |_| {
-                Err::<(), _>(err("unknown PG import outcome"))
-            });
+        let unknown = store.with_campaign_platform_export_with_clock(
+            &verified,
+            &reservation,
+            &transfer,
+            t0,
+            |_| Err::<(), _>(err("unknown PG import outcome")),
+        );
         assert!(unknown.is_err());
         assert_eq!(
             read(&mut store, &transfer).unwrap().transfer_receipt(),
@@ -1281,7 +1293,12 @@ mod tests {
             request_sha256: "b".repeat(64),
         };
         store
-            .transfer_campaign_execution_to_platform(&verified, &reservation, &transfer, t0())
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+            )
             .unwrap();
         acknowledge_all(&mut store);
         let before = store.campaign_family_usage(FAMILY).unwrap();
@@ -1298,11 +1315,16 @@ mod tests {
                 .unwrap();
             }
             let mut called = false;
-            let result =
-                store.with_campaign_platform_export(&verified, &reservation, &transfer, t0, |_| {
+            let result = store.with_campaign_platform_export_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+                |_| {
                     called = true;
                     Ok::<_, StoreError>(())
-                });
+                },
+            );
             assert!(result.is_err());
             assert!(!called);
             tx.rollback().unwrap();
@@ -1312,13 +1334,116 @@ mod tests {
             .unwrap();
         let mut called = false;
         assert!(store
-            .with_campaign_platform_export(&verified, &reservation, &transfer, t0, |_| {
-                called = true;
-                Ok::<_, StoreError>(())
-            })
+            .with_campaign_platform_export_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+                |_| {
+                    called = true;
+                    Ok::<_, StoreError>(())
+                }
+            )
             .is_err());
         assert!(!called);
         assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
+    }
+
+    #[test]
+    fn platform_clocks_follow_all_source_guards_and_public_api_rejects_stale_time() {
+        let (mut store, verified) = registered();
+        let reservation = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &reservation, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: reservation.operation_id().unwrap(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        for guard in ["approval", "family"] {
+            let mut other = store.connection.try_clone().unwrap();
+            let tx = other.transaction().unwrap();
+            if guard == "approval" {
+                serialize_approval_mutation(&tx, APPROVAL).unwrap();
+            } else {
+                tx.execute(
+                    "UPDATE campaign_family_heads SET sequence=sequence WHERE family_id=?",
+                    params![FAMILY],
+                )
+                .unwrap();
+            }
+            let mut sampled = false;
+            let mut acted = false;
+            assert!(store
+                .with_campaign_platform_budget_with_clock(
+                    &verified,
+                    &reservation,
+                    || {
+                        sampled = true;
+                        t0()
+                    },
+                    |_| {
+                        acted = true;
+                        Ok::<_, StoreError>(())
+                    }
+                )
+                .is_err());
+            assert!(
+                !sampled && !acted,
+                "budget clock must follow the {guard} guard"
+            );
+            assert!(store
+                .transfer_campaign_execution_to_platform_with_clock(
+                    &verified,
+                    &reservation,
+                    &transfer,
+                    || {
+                        sampled = true;
+                        t0()
+                    }
+                )
+                .is_err());
+            assert!(!sampled, "transfer clock must follow the {guard} guard");
+            tx.rollback().unwrap();
+        }
+        let before = store.campaign_family_usage(FAMILY).unwrap();
+        let mut acted = false;
+        assert!(store
+            .with_campaign_platform_budget_with_clock(
+                &verified,
+                &reservation,
+                || minutes(800),
+                |_| {
+                    acted = true;
+                    Ok::<_, StoreError>(())
+                }
+            )
+            .is_err());
+        assert!(!acted);
+        assert!(store
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                || minutes(800)
+            )
+            .is_err());
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
+        // These public methods expose no caller time or clock argument.
+        assert!(Utc::now() > verified.grant().expires_at);
+        assert!(store
+            .with_campaign_platform_budget(&verified, &reservation, |_| {
+                acted = true;
+                Ok::<_, StoreError>(())
+            })
+            .is_err());
+        assert!(!acted);
+        assert!(store
+            .transfer_campaign_execution_to_platform(&verified, &reservation, &transfer)
+            .is_err());
     }
 
     #[test]
@@ -1336,7 +1461,12 @@ mod tests {
             request_sha256: "b".repeat(64),
         };
         store
-            .transfer_campaign_execution_to_platform(&verified, &reservation, &transfer, t0())
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+            )
             .unwrap();
         acknowledge_all(&mut store);
         assert!(store
@@ -1392,19 +1522,34 @@ mod tests {
         };
         assert!(
             store
-                .transfer_campaign_execution_to_platform(&verified, &reservation, &transfer, t0())
+                .transfer_campaign_execution_to_platform_with_clock(
+                    &verified,
+                    &reservation,
+                    &transfer,
+                    t0
+                )
                 .is_err(),
             "unpublished native receipts must not transfer authority"
         );
         acknowledge_all(&mut store);
         let before = store.campaign_family_usage(FAMILY).unwrap();
         let first = store
-            .transfer_campaign_execution_to_platform(&verified, &reservation, &transfer, t0())
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+            )
             .unwrap();
         assert_eq!(
             first,
             store
-                .transfer_campaign_execution_to_platform(&verified, &reservation, &transfer, t0())
+                .transfer_campaign_execution_to_platform_with_clock(
+                    &verified,
+                    &reservation,
+                    &transfer,
+                    t0
+                )
                 .unwrap()
         );
         assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
@@ -1425,7 +1570,12 @@ mod tests {
         let mut changed = transfer;
         changed.tenant = "another".into();
         assert!(store
-            .transfer_campaign_execution_to_platform(&verified, &reservation, &changed, t0())
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &changed,
+                t0
+            )
             .is_err());
         assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
         let snapshot = store.campaign_family_snapshot(FAMILY).unwrap();
