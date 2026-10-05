@@ -38,6 +38,55 @@ pub fn create_strategy_instances_from_config(
         }
         StrategyType::Formula | StrategyType::FrozenModel => create_formula_strategies(config),
         StrategyType::Onnx => create_onnx_strategy(config),
+        StrategyType::ProbabilityReversal => create_probability_reversal(config),
+    }
+}
+
+fn create_probability_reversal(config: &StrategyConfig) -> HftResult<Vec<Box<dyn StrategyTrait>>> {
+    #[cfg(feature = "strategy-probability-reversal")]
+    {
+        let StrategyParams::ProbabilityReversal {
+            spec,
+            max_order_notional,
+            max_order_quantity,
+        } = &config.params
+        else {
+            return Err(StrategyFactoryError::InvalidParams(
+                "ProbabilityReversal parameters required".into(),
+            )
+            .into());
+        };
+        let expected = spec
+            .episodes
+            .iter()
+            .flat_map(|e| [e.up_token.clone(), e.down_token.clone()])
+            .collect::<std::collections::BTreeSet<_>>();
+        let actual = config
+            .symbols
+            .iter()
+            .map(|s| s.as_str().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        if expected != actual || actual.len() != config.symbols.len() {
+            return Err(StrategyFactoryError::InvalidParams(
+                "episode outcome tokens differ from configured instruments".into(),
+            )
+            .into());
+        }
+        let strategy = strategy_probability_reversal::ProbabilityReversalStrategy::new(
+            strategy_probability_reversal::ProbabilityStrategyConfig {
+                name: config.name.clone(),
+                spec: (**spec).clone(),
+                max_order_notional: *max_order_notional,
+                max_order_quantity: *max_order_quantity,
+            },
+        )
+        .map_err(|error| StrategyFactoryError::BuildFailure(error.to_string()))?;
+        Ok(vec![Box::new(strategy)])
+    }
+    #[cfg(not(feature = "strategy-probability-reversal"))]
+    {
+        let _ = config;
+        Err(StrategyFactoryError::FeatureDisabled("strategy-probability-reversal").into())
     }
 }
 

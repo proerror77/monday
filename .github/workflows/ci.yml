@@ -341,6 +341,9 @@ jobs:
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-live --no-default-features --test deployment_artifacts --locked
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-live --no-default-features --features formula-strategy,binance --test deployment_envelope --locked
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-live --no-default-features --features formula-strategy,bitget --test deployment_artifacts --locked
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-live --no-default-features --features probability-reversal-strategy --test prediction_probability --locked
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-runtime --features strategy-probability-reversal --test prediction_probability --locked
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy -p hft-live --no-default-features --features probability-reversal-strategy --all-targets --locked --no-deps -- -D warnings
 
       - name: Check JSON feature matrix
         id: json
