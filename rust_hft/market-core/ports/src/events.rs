@@ -670,16 +670,28 @@ impl OrderIntentEnvelope {
         latest_book_seq: Option<u64>,
     ) -> Result<(), OrderIntentRejectReason> {
         self.validate_pre_execution(now, latest_book_seq)?;
-        if self.lifecycle.max_slippage_bps.is_none() {
-            return Err(OrderIntentRejectReason::MissingMaxSlippage);
-        }
-        if self.lifecycle.max_order_notional.is_none() {
-            return Err(OrderIntentRejectReason::MissingMaxOrderNotional);
-        }
-        if self.lifecycle.max_order_quantity.is_none() {
-            return Err(OrderIntentRejectReason::MissingMaxOrderQuantity);
+        if self.requires_signed_cex_execution_ceilings() {
+            if self.lifecycle.max_slippage_bps.is_none() {
+                return Err(OrderIntentRejectReason::MissingMaxSlippage);
+            }
+            if self.lifecycle.max_order_notional.is_none() {
+                return Err(OrderIntentRejectReason::MissingMaxOrderNotional);
+            }
+            if self.lifecycle.max_order_quantity.is_none() {
+                return Err(OrderIntentRejectReason::MissingMaxOrderQuantity);
+            }
         }
         self.validate_slippage_reference(now, self.price_reference.as_ref())
+    }
+
+    fn requires_signed_cex_execution_ceilings(&self) -> bool {
+        // CanonicalBook still calls this gate for every venue. Signed CEX
+        // ceilings stay fail-closed for CEX and unknown/bare venues; prediction
+        // markets keep optional None, matching VenueQuote adapters.
+        !matches!(
+            self.intent.target_venue,
+            Some(VenueId::POLYMARKET | VenueId::BINANCE_PREDICTION | VenueId::PREDICT_FUN)
+        )
     }
 
     /// Bound the venue-enforced limit against a fresh, instrument-bound executable quote.
@@ -1260,6 +1272,25 @@ mod tests {
             notional_only.validate_cex_pre_execution(1_100, None),
             Err(OrderIntentRejectReason::MissingMaxOrderQuantity)
         );
+    }
+
+    #[test]
+    fn prediction_envelope_does_not_inherit_cex_ceiling_fail_closed() {
+        let lifecycle = lifecycle(1_000, 2_000);
+        let envelope = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("123"),
+                Side::Buy,
+                Quantity(rust_decimal::Decimal::ONE),
+                OrderType::Limit,
+                Some(Price(rust_decimal::Decimal::from(65))),
+                TimeInForce::IOC,
+                "prediction".to_string(),
+                Some(VenueId::POLYMARKET),
+            ),
+            lifecycle,
+        );
+        assert_eq!(envelope.validate_cex_pre_execution(1_100, None), Ok(()));
     }
 
     fn slippage_envelope(side: Side, price: rust_decimal::Decimal) -> OrderIntentEnvelope {
