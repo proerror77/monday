@@ -7,11 +7,11 @@ use super::{
 use crate::{
     cli::{print_json, MissionDispatchSubmitArgs},
     mission_campaign::{readback_pre_holdout_terminal_cached, report_settled_campaign_cache},
-    prediction_dispatch::{kubectl_binary, kubectl_json, validate_cluster_target},
 };
 use alpha_domain::campaign_control::CampaignAttemptSettlementV1;
 use alpha_store::campaign_ledger::CampaignDispatchSettlementV1;
 use anyhow::{bail, Context};
+use hft_research_dispatch_io::{kubectl_binary, kubectl_json, validate_cluster_target};
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
