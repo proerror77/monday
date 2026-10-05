@@ -1,9 +1,9 @@
-use alpha_domain::{
-    sign_runtime_attribution_event, DomainError, EvaluationCostsV1, RuntimeAttributionEvent,
-    StrategyBundle, StrategyBundleArtifact, MAX_ONNX_ARTIFACT_BYTES, MAX_ONNX_TENSOR_ELEMENTS,
-};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use governance::attribution::{sign_runtime_attribution_event, RuntimeAttributionEvent};
+use governance::runtime_bundle::{
+    RuntimeArtifact, RuntimeBundle, RuntimeCosts, MAX_ONNX_ARTIFACT_BYTES, MAX_ONNX_TENSOR_ELEMENTS,
+};
 use governance::{
     verify_envelope, AllowedIntentType, ApprovalClass, GovernanceError, RuntimeApprovalEvidence,
     RuntimeEnvelopePolicy, SignedDeploymentEnvelope, VerifiedDeploymentEnvelope,
@@ -24,7 +24,7 @@ pub enum IntakeError {
     #[error("deployment envelope rejected: {0}")]
     Domain(#[from] GovernanceError),
     #[error("runtime attribution rejected: {0}")]
-    Attribution(#[from] DomainError),
+    Attribution(#[from] governance::attribution::AttributionError),
     #[error("runtime is paused and cannot be resumed by a deployment envelope")]
     RuntimePaused,
     #[error("deployment must request exactly one paper, shadow, or live-small activation")]
@@ -69,7 +69,7 @@ pub struct ActivationRequest {
     #[serde(default)]
     pub market: Option<String>,
     #[serde(default)]
-    pub cex_execution_costs: Option<EvaluationCostsV1>,
+    pub cex_execution_costs: Option<RuntimeCosts>,
     pub instruments: Vec<String>,
     pub artifact: ActivationArtifact,
     pub mode: ActivationMode,
@@ -145,7 +145,7 @@ pub fn decode_trusted_keys(
 
 pub struct SystemConfigActivationAdapter<'a> {
     config: &'a mut runtime::SystemConfig,
-    bundle: &'a StrategyBundle,
+    bundle: RuntimeBundle,
     bundle_path: &'a Path,
     applied_modes: Vec<ActivationMode>,
 }
@@ -153,7 +153,7 @@ pub struct SystemConfigActivationAdapter<'a> {
 impl<'a> SystemConfigActivationAdapter<'a> {
     pub fn new(
         config: &'a mut runtime::SystemConfig,
-        bundle: &'a StrategyBundle,
+        bundle: RuntimeBundle,
         bundle_path: &'a Path,
     ) -> Self {
         Self {
@@ -204,14 +204,12 @@ impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
                 );
             }
         }
-        apply_strategy_bundle(&mut proposed, request, self.bundle, self.bundle_path)?;
+        apply_strategy_bundle(&mut proposed, request, &self.bundle, self.bundle_path)?;
         request.market = match &self.bundle.artifact {
-            StrategyBundleArtifact::CexFourStage { strategy } => {
+            RuntimeArtifact::CexFourStage { strategy } => {
                 Some(strategy.market.as_str().to_string())
             }
-            StrategyBundleArtifact::FrozenModel { strategy } => {
-                Some(strategy.frozen.program.market.clone())
-            }
+            RuntimeArtifact::FrozenModel { strategy } => Some(strategy.program.market.clone()),
             _ => None,
         };
         *self.config = proposed;
@@ -242,7 +240,7 @@ fn validate_instrument_catalog(
     Ok(())
 }
 
-fn require_supported_cex_execution(costs: &EvaluationCostsV1) -> Result<(), String> {
+fn require_supported_cex_execution(costs: &RuntimeCosts) -> Result<(), String> {
     // Paper uses canonical opposite-side depth for crossing orders.
     // ponytail: non-zero funding needs a point-in-time runtime funding feed; admit it only after
     // that feed can debit every research bucket deterministically.
@@ -254,7 +252,7 @@ fn require_supported_cex_execution(costs: &EvaluationCostsV1) -> Result<(), Stri
 
 fn bound_notional_by_sealed_capacity(
     notional: rust_decimal::Decimal,
-    costs: &EvaluationCostsV1,
+    costs: &RuntimeCosts,
 ) -> Result<rust_decimal::Decimal, String> {
     if !costs.capacity_enabled() {
         return Ok(notional);
@@ -268,7 +266,7 @@ fn bound_notional_by_sealed_capacity(
 fn apply_strategy_bundle(
     config: &mut runtime::SystemConfig,
     request: &mut ActivationRequest,
-    bundle: &StrategyBundle,
+    bundle: &RuntimeBundle,
     bundle_path: &Path,
 ) -> Result<(), String> {
     bundle.validate().map_err(|error| error.to_string())?;
@@ -289,14 +287,14 @@ fn apply_strategy_bundle(
     }
     let mut total_notional = hard_notional.min(requested_notional).min(requested_symbol);
     let cex_contract = match (&request.artifact, &bundle.artifact) {
-        (ActivationArtifact::Formula, StrategyBundleArtifact::CexFourStage { strategy }) => Some(
+        (ActivationArtifact::Formula, RuntimeArtifact::CexFourStage { strategy }) => Some(
             strategy
                 .runtime_contract()
                 .map_err(|error| error.to_string())?,
         ),
         (
             ActivationArtifact::Onnx | ActivationArtifact::FrozenModel,
-            StrategyBundleArtifact::FrozenModel { strategy },
+            RuntimeArtifact::FrozenModel { strategy },
         ) => Some(
             strategy
                 .runtime_contract()
@@ -331,8 +329,8 @@ fn apply_strategy_bundle(
         (ActivationArtifact::Formula, artifact) => {
             let (ast, target_position, signal_threshold, interval_ms, execution_contract) =
                 match artifact {
-                    StrategyBundleArtifact::Formula { ast } => (ast, false, 0.0, None, None),
-                    StrategyBundleArtifact::CexFourStage { strategy } => {
+                    RuntimeArtifact::Formula { ast } => (ast, false, 0.0, None, None),
+                    RuntimeArtifact::CexFourStage { strategy } => {
                         let contract = cex_contract
                             .as_ref()
                             .expect("validated CEX runtime contract");
@@ -383,12 +381,12 @@ fn apply_strategy_bundle(
         }
         (
             ActivationArtifact::Onnx | ActivationArtifact::FrozenModel,
-            StrategyBundleArtifact::FrozenModel { strategy },
+            RuntimeArtifact::FrozenModel { strategy },
         ) => {
             let contract = cex_contract
                 .as_ref()
                 .expect("validated frozen runtime contract");
-            let program = &strategy.frozen.program;
+            let program = &strategy.program;
             let execution_contract = cex_execution_contract(
                 config,
                 request,
@@ -418,7 +416,7 @@ fn apply_strategy_bundle(
                 ids,
             )
         }
-        (ActivationArtifact::Onnx, StrategyBundleArtifact::Onnx { model }) => {
+        (ActivationArtifact::Onnx, RuntimeArtifact::Onnx { model }) => {
             let (model_path, top_n, window_size, checksum) =
                 verify_onnx_artifact(model, bundle_path)?;
             (
@@ -483,7 +481,7 @@ fn cex_execution_contract(
     expected_venue: &str,
     expected_market: &str,
     expected_symbol: &str,
-    contract: &alpha_domain::CexRuntimeContractV1,
+    contract: &governance::runtime_bundle::RuntimeExecutionContract,
 ) -> Result<runtime::FormulaExecutionContract, String> {
     let [instrument] = request.instruments.as_slice() else {
         return Err("four-stage CEX deployment requires exactly one instrument".to_string());
@@ -579,7 +577,7 @@ fn integer_slippage_bps(value: f64) -> Result<i32, String> {
 }
 
 fn verify_onnx_artifact(
-    model: &alpha_domain::OnnxModelCandidate,
+    model: &governance::runtime_bundle::RuntimeOnnxModel,
     bundle_path: &Path,
 ) -> Result<(PathBuf, usize, usize, String), String> {
     let input = match model.inputs.as_slice() {
@@ -1105,7 +1103,7 @@ mod tests {
 
     #[test]
     fn cross_spread_cex_execution_is_not_admitted() {
-        let mut costs = EvaluationCostsV1 {
+        let mut costs = RuntimeCosts {
             fee_bps: 2.0,
             rebate_bps: 0.0,
             funding_bps: 0.0,
@@ -1130,7 +1128,7 @@ mod tests {
 
     #[test]
     fn sealed_capacity_caps_runtime_notional() {
-        let mut costs = EvaluationCostsV1 {
+        let mut costs = RuntimeCosts {
             fee_bps: 0.0,
             rebate_bps: 0.0,
             funding_bps: 0.0,
