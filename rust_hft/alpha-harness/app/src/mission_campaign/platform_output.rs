@@ -329,6 +329,7 @@ pub(super) async fn publish(
                 round_id: round.round_id.clone(),
                 request_sha256: loaded.sha256.clone(),
             },
+            Some((native.finalized_request(), native.request_sha256())),
         )?;
         let reconstructed = collect_round_ledger(&execute, planned, &report)?;
         if serde_json::to_value(&reconstructed)? != serde_json::to_value(round)? {
