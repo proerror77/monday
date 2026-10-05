@@ -256,14 +256,23 @@ mod tests {
     async fn cancelled_event_wait_keeps_its_partial_frame() -> Result<()> {
         let (_temp, config) = fixture()?;
         std::fs::write(config.workspace.join("fragment"), "")?;
-        let mut server = AppServer::start(config).await?;
+        let mut server = AppServer::start(config.clone()).await?;
         server.open_thread(None).await?;
         server.send_message(&"e".repeat(64), "completion").await?;
         server.next_event().await?; // queued approval before the response
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !config.workspace.join("fragment.sent").exists() {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "fragment fixture did not send prefix"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert!(timeout(Duration::from_millis(10), server.next_event())
             .await
             .is_err());
         assert!(!server.frame.is_empty());
+        std::fs::write(config.workspace.join("fragment.release"), "")?;
         let event = server.next_event().await?;
         assert_eq!(event["method"], "thread/status/changed");
         server.close().await?;
@@ -317,6 +326,47 @@ mod tests {
             assert!(ResearchClient::new(endpoint, "a".repeat(32)).is_err());
         }
         ResearchClient::new("https://example.com/research", "a".repeat(32))?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn research_client_reloads_private_host_token_and_fails_closed() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let app = axum::Router::new().route(
+            "/research",
+            axum::routing::post(|headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some(format!("Bearer {}", "x".repeat(32)).as_str())
+                {
+                    (axum::http::StatusCode::OK, "{\"verified\":true}")
+                } else {
+                    (axum::http::StatusCode::UNAUTHORIZED, "{}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/research", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let temporary = tempfile::tempdir()?;
+        let directory = temporary.path().canonicalize()?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        let token = directory.join("host.token");
+        std::fs::write(&token, "x".repeat(32))?;
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600))?;
+        let client = ResearchClient::from_file(&endpoint, token.clone(), &Default::default())?;
+        let tool = crate::research::ResearchTool::Status {
+            run_sha256: "a".repeat(64),
+        };
+        assert_eq!(client.execute(&tool).await?, json!({"verified":true}));
+        std::fs::write(&token, "y".repeat(32))?;
+        assert!(client.execute(&tool).await.is_err());
+        std::fs::write(&token, "x".repeat(32))?;
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644))?;
+        assert!(client.execute(&tool).await.is_err());
+        std::fs::remove_file(&token)?;
+        assert!(client.execute(&tool).await.is_err());
+        server.abort();
         Ok(())
     }
     #[tokio::test]
@@ -1135,10 +1185,52 @@ impl AppServer {
 pub struct ResearchClient {
     client: reqwest::Client,
     endpoint: reqwest::Url,
-    token: String,
+    token: ClientToken,
+}
+enum ClientToken {
+    Inline(String),
+    File(PathBuf),
+}
+impl ClientToken {
+    fn read(&self) -> Result<String> {
+        let token = match self {
+            Self::Inline(token) => token.clone(),
+            Self::File(path) => String::from_utf8(crate::transport::read_private_file(path)?)?
+                .trim()
+                .to_owned(),
+        };
+        ensure!(
+            (32..=4096).contains(&token.len()),
+            "invalid capability token"
+        );
+        Ok(token)
+    }
 }
 impl ResearchClient {
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
+        Self::connect(
+            endpoint,
+            ClientToken::Inline(token),
+            &crate::transport::TlsConfig::default(),
+        )
+    }
+    /// Reload the broker's host-only token on each call, including renewal.
+    pub fn from_file(
+        endpoint: &str,
+        token_file: PathBuf,
+        tls: &crate::transport::TlsConfig,
+    ) -> Result<Self> {
+        ensure!(
+            token_file.is_absolute(),
+            "absolute host token path required"
+        );
+        Self::connect(endpoint, ClientToken::File(token_file), tls)
+    }
+    fn connect(
+        endpoint: &str,
+        token: ClientToken,
+        tls: &crate::transport::TlsConfig,
+    ) -> Result<Self> {
         let endpoint = reqwest::Url::parse(endpoint)?;
         ensure!(
             (endpoint.scheme() == "https"
@@ -1152,15 +1244,9 @@ impl ResearchClient {
                 && endpoint.password().is_none(),
             "invalid research capability endpoint"
         );
-        ensure!(
-            (32..=4096).contains(&token.len()),
-            "invalid capability token"
-        );
+        token.read()?;
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            client: tls.client(Duration::from_secs(15), endpoint.scheme() == "https")?,
             endpoint,
             token,
         })
@@ -1170,7 +1256,7 @@ impl ResearchClient {
         let mut response = self
             .client
             .post(self.endpoint.clone())
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.read()?)
             .json(tool)
             .send()
             .await
