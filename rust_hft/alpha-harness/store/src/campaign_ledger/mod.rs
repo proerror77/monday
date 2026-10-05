@@ -1361,9 +1361,13 @@ mod tests {
             request_sha256: "b".repeat(64),
         };
         let read = |store: &mut AlphaStore, transfer: &CampaignPlatformTransferV1| {
-            store.with_campaign_platform_export_with_clock(&verified, &reservation, transfer, t0, |value| {
-                Ok::<_, StoreError>(value.clone())
-            })
+            store.with_campaign_platform_export_with_clock(
+                &verified,
+                &reservation,
+                transfer,
+                t0,
+                |value| Ok::<_, StoreError>(value.clone()),
+            )
         };
         assert!(read(&mut store, &transfer).is_err());
         let receipt = store
@@ -1382,10 +1386,13 @@ mod tests {
         let mut different = transfer.clone();
         different.request_sha256 = "c".repeat(64);
         assert!(read(&mut store, &different).is_err());
-        let unknown =
-            store.with_campaign_platform_export_with_clock(&verified, &reservation, &transfer, t0, |_| {
-                Err::<(), _>(err("unknown PG import outcome"))
-            });
+        let unknown = store.with_campaign_platform_export_with_clock(
+            &verified,
+            &reservation,
+            &transfer,
+            t0,
+            |_| Err::<(), _>(err("unknown PG import outcome")),
+        );
         assert!(unknown.is_err());
         assert_eq!(
             read(&mut store, &transfer).unwrap().transfer_receipt(),
@@ -1431,11 +1438,16 @@ mod tests {
                 .unwrap();
             }
             let mut called = false;
-            let result =
-                store.with_campaign_platform_export_with_clock(&verified, &reservation, &transfer, t0, |_| {
+            let result = store.with_campaign_platform_export_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+                |_| {
                     called = true;
                     Ok::<_, StoreError>(())
-                });
+                },
+            );
             assert!(result.is_err());
             assert!(!called);
             tx.rollback().unwrap();
@@ -1445,10 +1457,16 @@ mod tests {
             .unwrap();
         let mut called = false;
         assert!(store
-            .with_campaign_platform_export_with_clock(&verified, &reservation, &transfer, t0, |_| {
-                called = true;
-                Ok::<_, StoreError>(())
-            })
+            .with_campaign_platform_export_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+                |_| {
+                    called = true;
+                    Ok::<_, StoreError>(())
+                }
+            )
             .is_err());
         assert!(!called);
         assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
@@ -1626,6 +1644,10 @@ mod tests {
         let audit = terminal_audit(&source, minutes(800));
         for mutate in [
             |v: &mut CampaignPlatformTerminalAuditV1| v.charging_trials -= 1,
+            |v: &mut CampaignPlatformTerminalAuditV1| v.task_id = "foreign-task".into(),
+            |v: &mut CampaignPlatformTerminalAuditV1| v.attempt = 2,
+            |v: &mut CampaignPlatformTerminalAuditV1| v.fence = 0,
+            |v: &mut CampaignPlatformTerminalAuditV1| v.retained_manifest_sha256.clear(),
             |v: &mut CampaignPlatformTerminalAuditV1| v.transfer.tenant = "foreign".into(),
             |v: &mut CampaignPlatformTerminalAuditV1| v.known_scientific_consumption = Some(1),
             |v: &mut CampaignPlatformTerminalAuditV1| {
@@ -1650,6 +1672,10 @@ mod tests {
                     802
                 ))
                 .unwrap()
+        );
+        assert_eq!(
+            store.campaign_platform_terminal_audit(&source).unwrap(),
+            Some(audit.clone())
         );
         let after = store.campaign_family_usage(FAMILY).unwrap();
         assert_eq!(
@@ -1699,11 +1725,15 @@ mod tests {
             scientific_status: CampaignPlatformScientificStatusV1::Unknown,
             charging_trials: source.reservation().declared_trials,
             known_scientific_consumption: None,
+            retained_manifest_sha256: "9".repeat(64),
             platform_snapshot_sha256: "1".repeat(64),
             observer_release_sha256: "0".repeat(64),
             native_admission_sha256: "2".repeat(64),
             native_trust_sha256: "3".repeat(64),
             collection_sha256: "4".repeat(64),
+            task_id: source.transfer().request_sha256.clone(),
+            attempt: 1,
+            fence: 7,
             terminal_revision: 7,
             terminal_event_sha256: "5".repeat(64),
             execution_event_sha256: "6".repeat(64),

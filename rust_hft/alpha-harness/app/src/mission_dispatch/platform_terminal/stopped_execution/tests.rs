@@ -114,6 +114,8 @@ fn original_job_owner_and_all_processes_must_be_stopped() {
         alpha_domain::canonical_json_hash(&pod).unwrap()
     );
     assert_eq!(proof.worker_exit_code, 0);
+    assert_eq!(proof.job, job);
+    assert_eq!(proof.pod, pod);
     // Historical lease expiry does not renew execution or erase stop evidence.
     assert!(lease.expires_ms < observed.timestamp_millis());
     assert!(read("foreign-cluster", &spec, &lease, &handle).is_err());

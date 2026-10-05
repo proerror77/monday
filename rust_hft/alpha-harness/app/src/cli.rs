@@ -154,6 +154,8 @@ enum MissionDispatchCommand {
     ExportPlatform(mission_dispatch::platform_admission::PlatformExportArgs),
     /// Export authenticated Root/Study constraints for already transferred native operations.
     ExportPlatformRevocations(mission_dispatch::platform_admission::PlatformRevocationsArgs),
+    /// Audit one transferred terminal Attempt using independent stopped/native readback.
+    AuditPlatformTerminal(mission_dispatch::platform_terminal::PlatformTerminalArgs),
     CloseFamily(CampaignCloseFamilyArgs),
     Inspect(MissionDispatchInspectArgs),
     /// Read authenticated historical dispatch identity without submitting or settling.
@@ -1263,6 +1265,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     })
                     .await
                     .context("native platform revocation export task failed")?
+                }
+                MissionDispatchCommand::AuditPlatformTerminal(args) => {
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_terminal::audit(args)
+                    })
+                    .await
+                    .context("native platform terminal observation failed")?
                 }
                 MissionDispatchCommand::DescribeStudy(args) => {
                     mission_dispatch::sequence_admission::describe(args)

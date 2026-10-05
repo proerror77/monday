@@ -359,12 +359,8 @@ impl Admission {
             bail!("historical authority cannot export native admission");
         }
         let verified = verify(&self.signed, &self.control.trusted_keys_path)?;
-        self.store.with_campaign_platform_export(
-            &verified,
-            &self.reservation,
-            transfer,
-            action,
-        )
+        self.store
+            .with_campaign_platform_export(&verified, &self.reservation, transfer, action)
     }
 
     pub(super) fn open(

@@ -3111,7 +3111,6 @@ name = "hft-cex-research-input"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "bincode 1.3.3",
  "chrono",
  "hft-research-manifest",
@@ -3389,6 +3388,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-util",
+ "zip 6.0.0",
 ]
 
 [[package]]

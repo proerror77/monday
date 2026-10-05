@@ -17,6 +17,8 @@ pub(super) struct VerifiedStoppedExecution {
     pub(super) job_sha256: String,
     pub(super) pod_sha256: String,
     pub(super) worker_exit_code: i64,
+    pub(super) job: Value,
+    pub(super) pod: Value,
 }
 
 pub(super) fn read(
@@ -172,6 +174,22 @@ fn verify(
             .context("terminal context is not text")?,
     )?;
     context.validate()?;
+    let expected_env = std::collections::BTreeMap::from([
+        ("MONDAY_ATTEMPT_CONTEXT", serde_json::to_string(&context)?),
+        ("MONDAY_TASK_ID", lease.task_id.clone()),
+        ("MONDAY_RUN_MANIFEST", spec.run_manifest_sha256.clone()),
+        ("MONDAY_ATTEMPT", lease.attempt.to_string()),
+        ("MONDAY_FENCE", lease.fence.to_string()),
+        ("MONDAY_VIEW_MANIFEST", spec.view_manifest_sha256.clone()),
+        ("MONDAY_OUTPUT_PREFIX", format!("{}/{}/{}/", spec.output_prefix, lease.task_id, lease.attempt)),
+    ]);
+    let env = worker["env"].as_array().context("worker environment missing")?;
+    ensure!(env.len() == expected_env.len() && worker["envFrom"].is_null(), "terminal worker has an unrecorded environment");
+    for (name, value) in expected_env {
+        let entries = env.iter().filter(|entry| entry["name"] == name).collect::<Vec<_>>();
+        ensure!(entries.len() == 1 && entries[0]["value"] == value && entries[0]["valueFrom"].is_null(), "terminal worker changed fixed environment {name}");
+    }
+
     ensure!(
         context.spec == *spec && context.lease == *lease,
         "terminal Job context changed the signed attempt"
@@ -327,7 +345,33 @@ fn verify(
         job_sha256: alpha_domain::canonical_json_hash(job)?,
         pod_sha256: alpha_domain::canonical_json_hash(pod)?,
         worker_exit_code: exit,
+        job: job.clone(),
+        pod: pod.clone(),
     })
+}
+
+#[cfg(feature = "scientific")]
+pub(super) fn verify_controlled_identity(
+    stopped: &VerifiedStoppedExecution,
+    identity: &hft_research_platform::execution::AttemptIdentityRef,
+) -> anyhow::Result<()> {
+
+    let volumes = stopped.job["spec"]["template"]["spec"]["volumes"].as_array().context("controlled identity volumes absent")?;
+    let identity_volumes = volumes.iter().filter(|volume| volume["name"] == "identity-inputs").collect::<Vec<_>>();
+    ensure!(identity_volumes.len() == 1 && identity_volumes[0]["secret"]["secretName"] == identity.secret_name, "controlled identity mount changed original Secret name");
+    for metadata in [
+        &stopped.job["metadata"],
+        &stopped.job["spec"]["template"]["metadata"],
+        &stopped.pod["metadata"],
+    ] {
+        ensure!(
+            metadata["annotations"]["monday.io/identity-secret-uid"] == identity.secret_uid
+                && metadata["annotations"]["monday.io/identity-scope-sha256"]
+                    == identity.scope_sha256,
+            "original provider changed its controlled identity UID or scope"
+        );
+    }
+    Ok(())
 }
 
 fn absent_or_count(value: &Value, expected: u64) -> bool {

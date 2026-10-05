@@ -16,11 +16,15 @@ pub struct CampaignPlatformTerminalAuditV1 {
     pub charging_trials: u64,
     /// Actual original native validator output, never a platform metric.
     pub known_scientific_consumption: Option<u64>,
+    pub retained_manifest_sha256: String,
     pub platform_snapshot_sha256: String,
     pub observer_release_sha256: String,
     pub native_admission_sha256: String,
     pub native_trust_sha256: String,
     pub collection_sha256: String,
+    pub task_id: String,
+    pub attempt: u32,
+    pub fence: i64,
     pub terminal_revision: i64,
     pub terminal_event_sha256: String,
     pub execution_event_sha256: String,
@@ -60,6 +64,9 @@ impl CampaignPlatformTerminalAuditV1 {
         if self.schema_version != "monday.campaign_platform_terminal_audit.v1"
             || self.transfer.operation_id != reservation.operation_id().map_err(err)?
             || self.charging_trials != reservation.declared_trials
+            || self.task_id != self.transfer.request_sha256
+            || self.attempt != 1
+            || self.fence < 1
             || self.terminal_revision < 1
             || self.observed_at > at
             || self
@@ -71,6 +78,7 @@ impl CampaignPlatformTerminalAuditV1 {
             ));
         }
         for digest in [
+            &self.retained_manifest_sha256,
             &self.platform_snapshot_sha256,
             &self.observer_release_sha256,
             &self.native_admission_sha256,
@@ -104,7 +112,9 @@ impl CampaignPlatformTerminalAuditV1 {
             self.scientific_status,
             CampaignPlatformScientificStatusV1::ValidatedNoCandidate
                 | CampaignPlatformScientificStatusV1::ValidatedSelectedPreHoldout
-        );
+        ) || (self.scientific_status
+            == CampaignPlatformScientificStatusV1::InsufficientEvidence
+            && self.known_scientific_consumption.is_some());
         if known != self.known_scientific_consumption.is_some()
             || (known
                 && (self.native_result_sha256.is_none()
@@ -153,6 +163,31 @@ impl VerifiedCampaignPlatformTerminalSource {
     }
 }
 impl AlphaStore {
+    /// Recover the exact authenticated audit for publication retry. A caller
+    /// cannot replace durable observation bytes with a newer platform snapshot.
+    pub fn campaign_platform_terminal_audit(
+        &self,
+        source: &VerifiedCampaignPlatformTerminalSource,
+    ) -> Result<Option<CampaignPlatformTerminalAuditV1>, StoreError> {
+        let (state, _) = load(
+            &self.connection,
+            &self.integrity_key,
+            &source.reservation.family_id,
+        )?;
+        let attempt = state
+            .attempts
+            .get(&source.transfer.operation_id)
+            .ok_or_else(|| err("terminal audit lost its original operation"))?;
+        if attempt.reservation != source.reservation
+            || attempt.platform_transfer.as_ref() != Some(&source.transfer)
+            || attempt.dispatch.is_some()
+            || attempt.settlement.is_some()
+        {
+            return Err(err("terminal audit changed exclusive native ownership"));
+        }
+        Ok(attempt.platform_audit.clone())
+    }
+
     /// Append an exact full-charge mechanical audit. This cannot release budget,
     /// settle legacy science, admit retries or transfer ownership back. Actual
     /// stop/scientific authority belongs to the controlled app observer.

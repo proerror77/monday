@@ -2,10 +2,10 @@
 //! approval, Kubernetes Job or new budget. Data equivalence gates signed export.
 use super::{admission, load_submission, render_controlled_manifest, validate_submission};
 use crate::cli::print_json;
-use hft_research_dispatch_io::validate_cluster_target;
 use alpha_store::campaign_ledger::VerifiedCampaignPlatformBudget;
 use anyhow::Context;
 use clap::Args;
+use hft_research_dispatch_io::validate_cluster_target;
 use serde_json::json;
 use std::path::PathBuf;
 mod fixed_campaign;
@@ -13,6 +13,10 @@ mod fixed_campaign;
 mod fixed_campaign_tests;
 mod native_witness;
 mod released_build;
+#[cfg(feature = "scientific")]
+pub(super) use signed_export::{
+    client as host_client, file_bytes, read as read_metadata, retain, HostTls,
+};
 mod signed_export;
 mod signed_revocations;
 mod worker_configuration;

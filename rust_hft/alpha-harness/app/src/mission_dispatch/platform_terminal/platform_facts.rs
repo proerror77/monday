@@ -16,6 +16,7 @@ pub(super) struct VerifiedPlatformFacts {
     pub(super) snapshot: NativeTerminalSnapshot,
     pub(super) snapshot_sha256: String,
     pub(super) observer_release_sha256: String,
+    pub(super) snapshot_bytes: Vec<u8>,
     pub(super) lease: Lease,
     pub(super) handle: ExecutionHandle,
 }
@@ -47,12 +48,13 @@ fn bind(
         snapshot,
         snapshot_sha256: hft_research_platform::sha256(bytes.bytes()),
         observer_release_sha256: bytes.observer_release_sha256().into(),
+        snapshot_bytes: bytes.bytes().to_vec(),
         lease: observed.0,
         handle: observed.1,
     })
 }
 
-fn verify_snapshot(
+pub(super) fn verify_snapshot(
     source: &VerifiedCampaignPlatformTerminalSource,
     snapshot: &NativeTerminalSnapshot,
     native_trust: &NativeAdmissionTrust,
