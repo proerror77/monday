@@ -4380,15 +4380,28 @@ mod tests {
         let now = Utc::now();
         let (promotion, bundle) = persist_formula_promotion(&mut store, now);
         let mut envelope = DeploymentEnvelope {
-            deployment_id: "projection-deployment".into(), asset_revision_id: bundle.candidate_id.clone(),
-            promotion_id: promotion.record.promotion_id, promotion_manifest_hash: promotion.content_hash,
-            bundle_id: bundle.bundle_id.clone(), bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
-            runtime_config_hash: "c".repeat(64), risk_policy_hash: "d".repeat(64),
-            account_id: "account-1".into(), venue: "binance".into(), instruments: vec!["BTCUSDT".into()],
-            allowed_intent_types: vec![AllowedIntentType::StartPaper], max_notional: 100.0,
-            max_symbol_exposure: 50.0, max_order_size: 10.0, max_slippage_bps: 2.0,
-            valid_from: now, expires_at: now + chrono::Duration::minutes(1), nonce: "projection-nonce".into(),
-            approval_class: ApprovalClass::Paper, approval_signatures: vec!["approval-1".into()], payload_hash: String::new(),
+            deployment_id: "projection-deployment".into(),
+            asset_revision_id: bundle.candidate_id.clone(),
+            promotion_id: promotion.record.promotion_id,
+            promotion_manifest_hash: promotion.content_hash,
+            bundle_id: bundle.bundle_id.clone(),
+            bundle_hash: bundle.to_runtime_bundle().unwrap().bundle_hash,
+            runtime_config_hash: "c".repeat(64),
+            risk_policy_hash: "d".repeat(64),
+            account_id: "account-1".into(),
+            venue: "binance".into(),
+            instruments: vec!["BTCUSDT".into()],
+            allowed_intent_types: vec![AllowedIntentType::StartPaper],
+            max_notional: 100.0,
+            max_symbol_exposure: 50.0,
+            max_order_size: 10.0,
+            max_slippage_bps: 2.0,
+            valid_from: now,
+            expires_at: now + chrono::Duration::minutes(1),
+            nonce: "projection-nonce".into(),
+            approval_class: ApprovalClass::Paper,
+            approval_signatures: vec!["approval-1".into()],
+            payload_hash: String::new(),
         };
         let (_, original) = store.validate_deployment_binding(&envelope).unwrap();
         assert_eq!(original, bundle);

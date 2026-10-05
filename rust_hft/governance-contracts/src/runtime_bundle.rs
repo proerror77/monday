@@ -327,6 +327,8 @@ impl RuntimeBundle {
         canonical_hash(&(
             &self.schema_version,
             &self.source_bundle_hash,
+            &self.bundle_id,
+            &self.candidate_id,
             &self.candidate_content_hash,
             &self.dataset_manifest_id,
             &self.evaluator_version,
@@ -335,6 +337,7 @@ impl RuntimeBundle {
             &self.evaluation_metrics_hash,
             &self.sealed_evaluation_hash,
             &self.artifact,
+            &self.created_at,
         ))
     }
 }
@@ -357,17 +360,21 @@ mod tests {
     #[test]
     fn changed_executable_or_source_is_not_the_approved_runtime_artifact() {
         let sealed = fixture().finalize().unwrap();
-        for source in [false, true] {
+        for field in 0..5 {
             let mut changed = sealed.clone();
-            if source {
-                changed.source_bundle_hash = "1".repeat(64);
-            } else {
-                changed.artifact = RuntimeArtifact::Formula {
-                    ast: serde_json::from_value(
-                        serde_json::json!({"Terminal":{"Field":"mid_price"}}),
-                    )
-                    .unwrap(),
-                };
+            match field {
+                0 => changed.source_bundle_hash = "1".repeat(64),
+                1 => changed.bundle_id.push_str("-changed"),
+                2 => changed.candidate_id.push_str("-changed"),
+                3 => changed.created_at += chrono::Duration::seconds(1),
+                _ => {
+                    changed.artifact = RuntimeArtifact::Formula {
+                        ast: serde_json::from_value(
+                            serde_json::json!({"Terminal":{"Field":"mid_price"}}),
+                        )
+                        .unwrap(),
+                    }
+                }
             }
             assert_eq!(changed.validate(), Err(RuntimeBundleError::HashMismatch));
         }

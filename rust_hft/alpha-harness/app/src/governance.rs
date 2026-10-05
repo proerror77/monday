@@ -810,7 +810,7 @@ impl StagedBundle {
                             bundle.artifact,
                             RuntimeArtifact::Onnx {
                                 model: published_model
-                            } if serde_json::to_value(&published_model).ok() == serde_json::to_value(&model).ok()
+                            } if published_model == model
                         )
                     });
                 if !published_bundle_uses_model {

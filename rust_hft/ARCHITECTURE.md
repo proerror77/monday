@@ -187,7 +187,6 @@ Scientific promotion history retains its original hash. This schema transition
 requires a fresh matching handoff and approval; it does not resume a runtime or
 grant live-small authority.
 
-
 The runtime verifies current config/risk hashes, account, venue, instruments, intent types, limits, validity window, envelope signature, runtime-owned approval evidence, and durable nonce before preparing activation. The order is pre-activation audit fsync, nonce reservation/fsync, runtime construction, then signed activation attribution.
 
 Paper forces paper execution. Shadow also uses simulated Paper execution, but emits Shadow-scoped attribution so fills and portfolio health are measurable without sending a real venue order. `LiveSmall` remains disabled even when eligibility evidence exists; a human approval cannot bypass missing real-venue acceptance tests.

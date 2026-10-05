@@ -24,7 +24,10 @@ use governance::attribution::{
 };
 use governance::runtime_bundle::RuntimeOnnxModel;
 #[cfg(test)]
-use governance::runtime_bundle::{TensorElementType, TensorSpec, LOB_ONNX_PREPROCESSING_VERSION, MAX_ONNX_ARTIFACT_BYTES, MAX_ONNX_TENSOR_ELEMENTS};
+use governance::runtime_bundle::{
+    TensorElementType, TensorSpec, LOB_ONNX_PREPROCESSING_VERSION, MAX_ONNX_ARTIFACT_BYTES,
+    MAX_ONNX_TENSOR_ELEMENTS,
+};
 
 use chrono::{DateTime, Utc};
 #[cfg(test)]
@@ -5400,7 +5403,9 @@ impl StrategyBundleArtifact {
                         .then_some(())
                         .ok_or(DomainError::InvalidStrategyBundle)
                 }),
-            Self::Onnx { model } => model.validate().map_err(|_|DomainError::InvalidStrategyBundle),
+            Self::Onnx { model } => model
+                .validate()
+                .map_err(|_| DomainError::InvalidStrategyBundle),
             Self::CexFourStage { strategy } => strategy.validate(),
             Self::FrozenModel { strategy } => strategy.validate(),
         }
@@ -5411,7 +5416,9 @@ impl StrategyBundleArtifact {
             Self::Formula { ast } => ast
                 .validate()
                 .map_err(|_| DomainError::InvalidStrategyBundle),
-            Self::Onnx { model } => model.validate().map_err(|_|DomainError::InvalidStrategyBundle),
+            Self::Onnx { model } => model
+                .validate()
+                .map_err(|_| DomainError::InvalidStrategyBundle),
             Self::CexFourStage { strategy } => strategy.validate(),
             Self::FrozenModel { strategy } => strategy.validate(),
         }
