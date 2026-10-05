@@ -56,6 +56,20 @@ Prediction 的概率/事件策略消费 `MarketUpdate`、输出 `portfolio_core:
 
 独立 binary/image 仍复用 alpha-harness scientific library。搜索、fit、replay、evaluation 是真实功能，控制器/签名/运维模块不是这些算法的必要职责。下一步从实际消费者裁定提取范围，避免仅改 Cargo 分组或同时复制两套算法。
 
+### P1 — 配置、身份与实际 Job 不可只按名称视为等价
+
+进一步核验发现：native argv 的 `/inputs/campaign.json` 与新平台 `/config` 挂载不一致；native 临时文件需要 `/tmp`，而新平台只提供 `/work`。配置 Secret 名称不能证明实际 UID 和字节身份。Kubernetes 投影文件的符号链接/目录权限与既有严格私有文件读取也不匹配。
+
+修正应绑定实际不可变静态配置的 UID/内容，并在启动前独立读回。静态科学配置与晚绑定的 task/attempt/fence 身份分开；把 per-attempt token 放进 Task 身份所 hash 的 Secret 会形成循环依赖。使用同签名 worker 的受控 Rust 初始化，把白名单配置复制到私有目录；不放宽凭证读取。`/work` 与 `/tmp` 复用同一受限 scratch，不能悄悄增加磁盘预算。相关接入尚在独立 Code 修正中，没有部署验收。
+
+### P1 — 预算判断的时钟应在权限锁之后采样
+
+源 transfer 调用者先传 `Utc::now()`、随后等待 approval/Study 锁，会使等待期间过期的批准仍按旧时间判断。新的生产者路径在实际 approval/family/Study 锁后采样时钟；旧 event/receipt 保留只读，不保留新的 caller-at 绕过入口。最近的反例验证覆盖锁持有和等锁后过期拒绝；这不是实际云预算结账证据。
+
+### P2 — 签名必须覆盖 issuer 身份
+
+原生 admission 的签名消息只覆盖 domain 和 evidence SHA，未覆盖外层 key_id。同一 public key 被登记为两个受信别名时，改变 issuer 标签仍可验签；这不扩大资源范围，但破坏精确 issuer 审计。独立撤销/准入修正在使用无歧义的 domain/key_id/evidence 绑定及严格验签，并补别名替换反例。历史 proof 保留，不作为新修正已发布的证明。
+
 ## 对每项功能的复核循环
 
 1. 指明输入、输出、所有者和有权产生该输入的角色。
