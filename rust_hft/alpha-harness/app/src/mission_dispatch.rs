@@ -1202,7 +1202,7 @@ fn render_campaign_manifest(
                                 "name": "alpha-campaign",
                                 "image": input.image,
                                 "imagePullPolicy": "IfNotPresent",
-                                "command": ["/usr/local/bin/alpha-harness"],
+                                "command": ["/usr/local/bin/monday-cex-worker"],
                                 "args": input.args,
                                 "resources": cpu_research_container_resources(),
                                 "securityContext": {

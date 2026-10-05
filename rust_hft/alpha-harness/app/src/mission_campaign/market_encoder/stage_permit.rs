@@ -1,13 +1,18 @@
 //! Worker-side consumer for current, one-stage permission. No ledger or private key is mounted.
+#[cfg(feature = "scientific")]
 use super::{read_json, worker, MarketRequest};
+use alpha_domain::campaign_stage::SignedCampaignStagePermitV1;
+#[cfg(feature = "scientific")]
 use alpha_domain::campaign_stage::{
-    verify_stage_permit, CampaignStageRequestV1, SignedCampaignStagePermitV1, REQUEST_SCHEMA,
-    REQUEST_SECONDS,
+    verify_stage_permit, CampaignStageRequestV1, REQUEST_SCHEMA, REQUEST_SECONDS,
 };
+#[cfg(feature = "scientific")]
 use alpha_domain::market_encoder_study::MarketTrainingStageV1;
+#[cfg(feature = "scientific")]
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "scientific")]
 use std::{
     fs::File,
     io::{Read, Write},
@@ -26,6 +31,7 @@ pub(crate) struct StageAuthorization {
     pub accepted_at: DateTime<Utc>,
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) struct FileStageAuthority {
     request: MarketRequest,
     request_sha256: String,
@@ -36,7 +42,9 @@ pub(crate) struct FileStageAuthority {
     original_grant_deadline: DateTime<Utc>,
     directory: PathBuf,
 }
+#[cfg(feature = "scientific")]
 impl FileStageAuthority {
+    #[cfg(feature = "scientific")]
     pub(crate) fn from_environment(
         request: &MarketRequest,
         request_sha256: &str,
@@ -113,6 +121,7 @@ impl FileStageAuthority {
     }
 }
 
+#[cfg(feature = "scientific")]
 pub(crate) fn await_permit(
     request: &MarketRequest,
     challenge: &CampaignStageRequestV1,
@@ -149,6 +158,7 @@ pub(crate) fn await_permit(
 
 /// Immutable evidence publication with an atomic directory entry and directory
 /// fsync. The admitted persistent volume, not this function, supplies node-loss durability.
+#[cfg(feature = "scientific")]
 pub(crate) fn write_atomic_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let directory = path
         .parent()
