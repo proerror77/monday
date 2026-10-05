@@ -107,7 +107,18 @@ async fn main() -> Result<()> {
         ["cancel", id] => { ledger().await?.cancel(id).await?; println!("cancel_requested"); }
         ["status", id] => { println!("{}", serde_json::to_string(&ledger().await?.read(id).await?)?); }
         ["terminal-snapshot",tenant,request] => { println!("{}",serde_json::to_string(&ledger().await?.native_terminal_snapshot(tenant,request).await?)?); }
-        _ => bail!("usage: researchctl render-foundation INVENTORY OUTPUT_DIRECTORY | plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | register-native-admission SIGNED_NATIVE_RESERVATION | register-native-request-revocation SIGNED_NATIVE_REVOCATION | register-native-campaign-inputs SIGNED_NATIVE_RESERVATION COLLECTION BLOCK_DIRECTORY | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID | terminal-snapshot TENANT REQUEST"),
+        ["retire-native-terminal",config_path,request_path] => {
+            let config:hft_research_platform::service::ServiceConfig=read(config_path)?;
+            anyhow::ensure!(config.terminal_retirement.enabled,"native terminal retirement is disabled");
+            let request:hft_research_platform::retirement::RetirementRequest=read(request_path)?;
+            let kube=hft_research_platform::execution::Kubernetes::new(&config.kubernetes_endpoint,
+                hft_research_platform::service::read_secret(&config.kubernetes_token_file)?,config.cluster,
+                &std::fs::read(&config.kubernetes_ca_file)?)?;
+            let artifacts=hft_research_platform::service::ArtifactGateway::with_tls(&config.artifact_gateway,
+                hft_research_platform::service::read_secret(&config.artifact_token_file)?,&config.artifact_tls)?;
+            println!("{}",serde_json::to_string(&hft_research_platform::retirement::retire(&config.terminal_retirement,&ledger().await?,&kube,&artifacts,&request).await?)?);
+        }
+        _ => bail!("usage: researchctl render-foundation INVENTORY OUTPUT_DIRECTORY | plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | register-native-admission SIGNED_NATIVE_RESERVATION | register-native-request-revocation SIGNED_NATIVE_REVOCATION | register-native-campaign-inputs SIGNED_NATIVE_RESERVATION COLLECTION BLOCK_DIRECTORY | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID | terminal-snapshot TENANT REQUEST | retire-native-terminal CONFIG REQUEST"),
     }
     Ok(())
 }
