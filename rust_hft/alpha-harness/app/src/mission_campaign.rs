@@ -5804,6 +5804,18 @@ pub(crate) mod tests {
         _root: tempfile::TempDir,
     }
 
+    impl NativePreparedFixture {
+        pub(crate) fn materialization_path(&self) -> &Path {
+            &self._source._render_fixture.materialization_path
+        }
+        pub(crate) fn original_receipt_path(&self) -> PathBuf {
+            self._root.path().join("native-source-inputs.json")
+        }
+        pub(crate) fn augmented_receipt_path(&self) -> PathBuf {
+            self._root.path().join("native-campaign-inputs.json")
+        }
+    }
+
     pub(crate) fn native_prepared_fixture_for_tests() -> NativePreparedFixture {
         use hft_cex_research_input::{
             campaign::NativeSourceBindingV1, campaign::SourceBuildRefV1, prepared::AcquiredBlocks,
@@ -5874,8 +5886,13 @@ pub(crate) mod tests {
                 &request.replay_manifest_sha256,
             ),
         };
-        let original_receipt_sha =
-            hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&receipt).unwrap());
+        let original_receipt_bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        let original_receipt_sha = hft_cex_research_input::sha256(&original_receipt_bytes);
+        std::fs::write(
+            root.path().join("native-source-inputs.json"),
+            &original_receipt_bytes,
+        )
+        .unwrap();
         let source = NativeSourceBindingV1 {
             build: SourceBuildRefV1 {
                 source_revision: receipt.source_revision.clone(),
@@ -5910,8 +5927,13 @@ pub(crate) mod tests {
             render_metadata: render.native_metadata().unwrap(),
         };
         receipt.prepared_inputs = Some(reference.clone());
-        request.campaign_inputs_sha256 =
-            hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&receipt).unwrap());
+        let augmented_receipt_bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        request.campaign_inputs_sha256 = hft_cex_research_input::sha256(&augmented_receipt_bytes);
+        std::fs::write(
+            root.path().join("native-campaign-inputs.json"),
+            &augmented_receipt_bytes,
+        )
+        .unwrap();
         request.prepared_inputs = Some(reference);
         request.schema_version = CAMPAIGN_REQUEST_SCHEMA_V6.into();
         request.feature_url.clear();
@@ -5965,6 +5987,20 @@ pub(crate) mod tests {
                 .as_ref()
                 .unwrap()
                 .collection_sha256
+        );
+        assert!(fixture.materialization_path().is_file());
+        assert_eq!(
+            hft_research_artifacts::sha256_file(&fixture.original_receipt_path()).unwrap(),
+            fixture
+                .inputs
+                .prepared()
+                .manifest()
+                .source
+                .preparation_receipt_sha256
+        );
+        assert_eq!(
+            hft_research_artifacts::sha256_file(&fixture.augmented_receipt_path()).unwrap(),
+            fixture.request.campaign_inputs_sha256
         );
         let mut changed = fixture.request.clone();
         changed.declared_total_trials += 1;
