@@ -43,7 +43,28 @@ impl AlphaStore {
         verified: &VerifiedCampaignRootGrant,
         reservation: &CampaignAttemptReservationV1,
         transfer: &CampaignPlatformTransferV1,
-        at: DateTime<Utc>,
+    ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
+        self.transfer_campaign_execution_to_platform_impl(verified, reservation, transfer, Utc::now)
+    }
+
+    // Tests may inject a clock, but callers cannot backdate execution ownership.
+    #[cfg(test)]
+    pub(super) fn transfer_campaign_execution_to_platform_with_clock(
+        &mut self,
+        verified: &VerifiedCampaignRootGrant,
+        reservation: &CampaignAttemptReservationV1,
+        transfer: &CampaignPlatformTransferV1,
+        now: impl FnOnce() -> DateTime<Utc>,
+    ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
+        self.transfer_campaign_execution_to_platform_impl(verified, reservation, transfer, now)
+    }
+
+    fn transfer_campaign_execution_to_platform_impl(
+        &mut self,
+        verified: &VerifiedCampaignRootGrant,
+        reservation: &CampaignAttemptReservationV1,
+        transfer: &CampaignPlatformTransferV1,
+        now: impl FnOnce() -> DateTime<Utc>,
     ) -> Result<AuthenticatedCampaignReceiptV1, StoreError> {
         transfer.validate()?;
         if transfer.operation_id != reservation.operation_id().map_err(err)? {
@@ -61,9 +82,12 @@ impl AlphaStore {
             &self.integrity_key,
             verified,
             &reservation.family_id,
-            at,
-            true,
+            verified.grant().valid_from,
+            false,
         )?;
+        // Approval, Study and family guards now belong to this transaction.
+        // Current expiry/revocation checks use time sampled after all guards.
+        let at = now();
         let observed = dispatch::checked_reservation(
             &tx,
             &self.integrity_key,

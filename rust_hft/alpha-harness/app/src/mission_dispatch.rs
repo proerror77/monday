@@ -6,6 +6,7 @@ mod admission;
 pub(crate) mod controller;
 pub(crate) mod final_admission;
 pub(crate) mod final_authority;
+pub(crate) mod platform_admission;
 pub(crate) mod sequence_admission;
 pub(crate) mod stage_controller;
 pub(crate) mod study_authority;
@@ -2269,6 +2270,56 @@ mod tests {
                 .campaign_family_usage("dispatch-study")
                 .unwrap()
         }
+    }
+
+    #[test]
+    fn platform_budget_preparation_reuses_actual_inspection_and_keeps_unknown_charge() {
+        let fixture = AdmissionFixture::new();
+        let mut source = fixture.open();
+        assert!(source.platform_budget().is_err());
+        source.prepare().unwrap();
+        assert!(source.platform_budget().is_err());
+        source
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        let before = source.store_usage_for_platform_test();
+        let budget = source.platform_budget().unwrap();
+        assert_eq!(budget.reservation(), &source.reservation);
+        assert_eq!(
+            budget.reservation().request_sha256,
+            fixture.validated.request_sha256
+        );
+        let transfer = alpha_store::campaign_ledger::CampaignPlatformTransferV1 {
+            operation_id: budget.reservation().operation_id().unwrap(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        source.transfer_to_platform(&transfer).unwrap();
+        assert!(source.with_platform_export(&transfer, |_| Ok(())).is_err());
+        source
+            .publish_receipts_with(|_, bytes| Ok(bytes.to_vec()))
+            .unwrap();
+        let actual = source
+            .with_platform_export(&transfer, |export| {
+                Ok(export.transfer_receipt().content_sha256.clone())
+            })
+            .unwrap();
+        assert!(source
+            .with_platform_export(&transfer, |_| Err::<(), _>(anyhow::anyhow!(
+                "unknown import"
+            )))
+            .is_err());
+        assert_eq!(
+            source
+                .with_platform_export(&transfer, |export| Ok(export
+                    .transfer_receipt()
+                    .content_sha256
+                    .clone()))
+                .unwrap(),
+            actual
+        );
+        assert_eq!(source.store_usage_for_platform_test(), before);
     }
 
     #[test]
