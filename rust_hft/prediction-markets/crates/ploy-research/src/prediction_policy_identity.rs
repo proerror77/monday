@@ -99,6 +99,7 @@ mod tests {
             "hft-engine",
             "hft-execution",
             "hft-execution-adapter-polymarket",
+            "hft-research-dispatch-io",
         ] {
             assert!(!fingerprint.contains(&format!("package:{forbidden}@")));
         }
@@ -171,6 +172,10 @@ mod tests {
 
         for (package, expected) in [
             ("hft-runtime", "includes runtime authority hft-runtime"),
+            (
+                "hft-research-dispatch-io",
+                "includes runtime authority hft-research-dispatch-io",
+            ),
             ("sqlx-sqlite", "includes sqlx-sqlite"),
             (
                 "core-foundation-sys",
