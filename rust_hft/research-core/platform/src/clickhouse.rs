@@ -16,6 +16,19 @@ pub struct ClickHouse {
 pub type Cursor = (i64, String, u64);
 impl ClickHouse {
     pub fn new(endpoint: &str, user: String, password: String) -> Result<Self> {
+        Self::with_tls(
+            endpoint,
+            user,
+            password,
+            &crate::transport::TlsConfig::default(),
+        )
+    }
+    pub fn with_tls(
+        endpoint: &str,
+        user: String,
+        password: String,
+        tls: &crate::transport::TlsConfig,
+    ) -> Result<Self> {
         let endpoint = reqwest::Url::parse(endpoint)?;
         ensure!(
             endpoint.scheme() == "https"
@@ -26,10 +39,7 @@ impl ClickHouse {
         );
         ensure!(!user.is_empty(), "ClickHouse identity required");
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            client: tls.client(std::time::Duration::from_secs(60), true)?,
             endpoint,
             user,
             password,

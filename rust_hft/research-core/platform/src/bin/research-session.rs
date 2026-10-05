@@ -20,6 +20,8 @@ struct Config {
     capability_policy_receipt_sha256: String,
     research_endpoint: String,
     research_token_file: String,
+    #[serde(default)]
+    research_tls: hft_research_platform::transport::TlsConfig,
 }
 
 #[derive(Deserialize)]
@@ -84,9 +86,10 @@ async fn main() -> Result<()> {
             && Path::new(&config.research_token_file).is_absolute(),
         "invalid host principal or capability path"
     );
-    let client = ResearchClient::new(
+    let client = ResearchClient::from_file(
         &config.research_endpoint,
-        hft_research_platform::service::read_secret(&config.research_token_file)?,
+        config.research_token_file.into(),
+        &config.research_tls,
     )?;
     let ledger = Ledger::connect(
         &std::env::var("MONDAY_RESEARCH_DATABASE_URL").context("host PG identity required")?,
