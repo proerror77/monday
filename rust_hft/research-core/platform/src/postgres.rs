@@ -15,6 +15,8 @@ use crate::{
 pub const MIGRATION: &str = include_str!("../sql/postgres.sql");
 pub const BUILD_RELEASE_MIGRATION: &str = include_str!("../sql/verified_build_release.sql");
 pub const NATIVE_ADMISSION_MIGRATION: &str = include_str!("../sql/native_admission.sql");
+pub const NATIVE_CAMPAIGN_INPUTS_MIGRATION: &str =
+    include_str!("../sql/native_campaign_inputs.sql");
 pub const NATIVE_REQUEST_REVOCATION_MIGRATION: &str =
     include_str!("../sql/native_request_revocation.sql");
 
@@ -177,7 +179,7 @@ impl Ledger {
             terminal_event.document == task && terminal_event.event == "stop_reconciled",
             "terminal lacks reconciled process-tree stop event"
         );
-        let execution = query("SELECT revision,event,document FROM research.events WHERE task_id=$1 AND revision<$2 AND document->'execution' IS NOT NULL AND document->'execution'<>'null'::jsonb AND (document->>'attempt')::integer=$3 ORDER BY revision DESC LIMIT 1")
+        let execution = query("SELECT revision,event,document FROM research.events WHERE task_id=$1 AND revision<$2 AND document->'execution' IS NOT NULL AND document->'execution'<>'null'::jsonb AND (document->>'attempt')::integer=$3 ORDER BY revision ASC LIMIT 1")
             .bind(request).bind(revision).bind(i32::try_from(task.attempt)?).fetch_optional(&mut *tx).await?;
         let execution_event = execution
             .map(|row| -> Result<_> {
@@ -792,6 +794,24 @@ impl Ledger {
                 "preparation worker supports only the training split"
             );
             plan.spec.split
+        } else if task.spec.kind == TaskKind::CexCampaign {
+            ensure!(
+                input.get::<String, _>("kind") == "cex_campaign",
+                "native Campaign requires its typed collection"
+            );
+            let exists: bool = query_scalar("SELECT EXISTS(SELECT 1 FROM research.native_campaign_inputs WHERE request_sha256=$1 AND manifest_sha256=$2 AND tenant=$3)")
+                .bind(&task.id).bind(&task.spec.view_manifest_sha256).bind(tenant).fetch_one(&mut *tx).await?;
+            ensure!(
+                exists,
+                "native Campaign collection lacks exact tenant/request readback"
+            );
+            let collection: hft_cex_research_input::campaign::CampaignPreparedInputsV1 =
+                serde_json::from_value(input.get("document"))?;
+            ensure!(
+                collection.id()? == task.spec.view_manifest_sha256,
+                "native Campaign collection identity changed"
+            );
+            hft_cex_research_input::data::Split::Validation
         } else {
             ensure!(
                 input.get::<String, _>("kind") == "prepared",
@@ -951,6 +971,18 @@ impl Ledger {
 }
 
 impl LockedTask {
+    pub async fn issue_attempt_identity(
+        &mut self,
+        issuer: &crate::artifact_identity::AttemptIdentityIssuer,
+    ) -> Result<crate::artifact_identity::IssuedAttemptIdentity> {
+        issuer.issue_for_task(&mut self.tx, &self.task).await
+    }
+    pub async fn recover_attempt_identity_for_cleanup(
+        &mut self,
+        issuer: &crate::artifact_identity::AttemptIdentityIssuer,
+    ) -> Result<Option<crate::artifact_identity::IssuedAttemptIdentity>> {
+        issuer.recover_for_cleanup(&mut self.tx, &self.task).await
+    }
     /// Order provider reconciliation against native/manual revocation imports.
     /// A scheduled future witness caps execution without cancelling it early.
     pub async fn native_request_deadline_ms(&mut self) -> Result<Option<i64>> {
