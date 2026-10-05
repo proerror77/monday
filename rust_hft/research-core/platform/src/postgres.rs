@@ -20,6 +20,16 @@ pub struct Ledger {
     pool: PgPool,
 }
 
+#[cfg(feature = "gateway")]
+pub(crate) struct ArtifactWritePermit {
+    // Keep the task, authority and admission shared locks through atomic link.
+    // Cancellation, revocation, takeover and pause are ordered against publication.
+    _tx: Transaction<'static, Postgres>,
+    pub(crate) prefix: String,
+}
+
+pub const ARTIFACT_GATEWAY_MIGRATION: &str = include_str!("../sql/artifact_gateway.sql");
+
 pub const SESSION_DELIVERY_MIGRATION: &str = include_str!("../sql/session_deliveries.sql");
 
 pub fn completion_message(intent_id: &str, intent: &Value) -> Result<String> {
@@ -107,6 +117,63 @@ async fn clock(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
 }
 
 impl Ledger {
+    #[cfg(feature = "gateway")]
+    pub(crate) async fn artifact_write_permit(
+        &self,
+        tenant: &str,
+        task: &str,
+        attempt: u32,
+        fence: i64,
+    ) -> Result<ArtifactWritePermit> {
+        let mut tx = self.pool.begin().await?;
+        let prefix: String = query_scalar("SELECT research.artifact_write_permit($1,$2,$3,$4)")
+            .bind(tenant)
+            .bind(task)
+            .bind(i32::try_from(attempt)?)
+            .bind(fence)
+            .fetch_one(&mut *tx)
+            .await?;
+        Ok(ArtifactWritePermit { prefix, _tx: tx })
+    }
+
+    #[cfg(all(test, feature = "gateway"))]
+    pub(crate) fn gateway_fixture() -> Self {
+        Self {
+            pool: PgPoolOptions::new()
+                .connect_lazy("postgres://fixture:fixture@127.0.0.1:1/monday_foundation_test")
+                .expect("fixture URL"),
+        }
+    }
+    /// Read-only broker check. Tokens cannot keep a cancelled, revoked, expired
+    /// or superseded Attempt alive. This never claims a task or enables PG.
+    pub async fn artifact_writer(
+        &self,
+        tenant: &str,
+        task: &str,
+        attempt: u32,
+        fence: i64,
+    ) -> Result<String> {
+        let row = query("SELECT t.document, floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms FROM research.tasks t CROSS JOIN research.authority a WHERE t.task_id=$1 AND t.tenant=$2 AND a.singleton AND a.mode='postgres' AND EXISTS(SELECT 1 FROM research.admissions d WHERE d.request_sha256=t.request_sha256 AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=d.request_sha256))")
+            .bind(task).bind(tenant).fetch_one(&self.pool).await?;
+        let current: Task = serde_json::from_value(row.get("document"))?;
+        let now_ms: i64 = row.get("now_ms");
+        ensure!(
+            current.state == State::Running
+                && current.attempt == attempt
+                && current.fence == fence
+                && current
+                    .lease
+                    .as_ref()
+                    .is_some_and(|l| l.expires_ms > now_ms)
+                && current.deadline_ms.is_some_and(|d| d > now_ms),
+            "artifact writer is no longer admitted"
+        );
+        Ok(format!(
+            "{}/{}/{}/",
+            current.spec.output_prefix, current.id, attempt
+        ))
+    }
+
     pub async fn connect(url: &str) -> Result<Self> {
         // No migrations, authority changes or automatic backend enabling here.
         let pool = PgPoolOptions::new()

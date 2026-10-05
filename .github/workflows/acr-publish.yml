@@ -194,7 +194,7 @@ jobs:
           apt-get install -y --no-install-recommends clang cmake mold pkg-config protobuf-compiler gh jq ruby binutils
       - name: Capture compiler, native environment and scoped recipe
         id: build-inputs
-        run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json"
+        run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json" "${{ needs.selector.outputs.research_product }}"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
@@ -215,6 +215,7 @@ jobs:
           retention-days: 7
 
   publish:
+    name: Publish ${{ matrix.repository }}
     needs: [selector, research-runner-binaries]
     if: always() && needs.selector.result == 'success' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'
     runs-on: ubuntu-latest
@@ -264,6 +265,29 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Install independent release issuer toolchain
+        if: matrix.research_artifact
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: 1.98.1
+
+      - name: Compile independent release issuer before secret injection
+        if: matrix.research_artifact
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/research-release-issuer-target
+        run: cargo build --manifest-path rust_hft/research-core/platform/Cargo.toml --locked --features publisher --bin research-release-publisher
+
+      - name: Require independent Build signer configuration
+        if: matrix.research_artifact
+        env:
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          MONDAY_RELEASE_SIGNING_KEY: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY }}
+          MONDAY_RELEASE_GATEWAY: ${{ vars.MONDAY_RESEARCH_RELEASE_GATEWAY }}
+          MONDAY_RELEASE_GATEWAY_TOKEN: ${{ secrets.MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN }}
+          PRODUCT: ${{ matrix.product }}
+          PUBLISH_IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}
+        run: .github/scripts/publish-research-build-release.sh check-config
 
       - name: Log in to ACR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -760,6 +784,42 @@ jobs:
           docker pull "$IMAGE"
           bash .github/scripts/verify-research-product-image.sh "$IMAGE" "$SOURCE_REVISION" \
             "${RUNNER_TEMP}/research-release/research-bin" "${{ matrix.product }}"
+
+      - name: Issue verified native Build release proofs
+        if: matrix.research_artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          MONDAY_RELEASE_SIGNING_KEY: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY }}
+          MONDAY_RELEASE_GATEWAY: ${{ vars.MONDAY_RESEARCH_RELEASE_GATEWAY }}
+          MONDAY_RELEASE_GATEWAY_TOKEN: ${{ secrets.MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
+          SOFTWARE_PRODUCTS: ${{ needs.selector.outputs.research_product }}
+          PRODUCT: ${{ matrix.product }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          IMAGE_REPOSITORY: ${{ matrix.repository }}
+        run: .github/scripts/publish-research-build-release.sh publish
+
+      - name: Project independently verified Build releases to PG
+        if: matrix.research_artifact && vars.MONDAY_RESEARCH_RELEASE_IMPORT_ENABLED == 'true'
+        env:
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          MONDAY_RELEASE_GATEWAY: ${{ vars.MONDAY_RESEARCH_RELEASE_GATEWAY }}
+          MONDAY_RELEASE_GATEWAY_TOKEN: ${{ secrets.MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN }}
+          MONDAY_RELEASE_IMPORT_DATABASE_URL: ${{ secrets.MONDAY_RESEARCH_RELEASE_IMPORT_DATABASE_URL }}
+        run: .github/scripts/publish-research-build-release.sh import
+
+      - name: Retain native Build release projection
+        if: matrix.research_artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: research-build-release-${{ needs.selector.outputs.source_sha }}-${{ matrix.product }}
+          path: |
+            ${{ runner.temp }}/research-build-plan.json
+            ${{ runner.temp }}/research-build-artifacts.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Remove ACR credentials
         if: always()
