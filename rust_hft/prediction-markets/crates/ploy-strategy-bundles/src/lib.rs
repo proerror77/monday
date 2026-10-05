@@ -12,7 +12,7 @@ pub mod traits;
 pub use bundle::StrategyBundle;
 pub use config::FullConfig;
 pub use engine::{RuntimeConfig, RuntimeMode, RuntimeResult, StrategyRuntime};
-pub use executor::{CallbackExecutor, SimulatedExecutor, SimulatedExecutorConfig};
+pub use executor::{SimulatedExecutor, SimulatedExecutorConfig};
 #[cfg(feature = "parquet-feed")]
 pub use feed::StreamingParquetFeed;
 pub use feed::{
