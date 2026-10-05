@@ -274,6 +274,7 @@ for path in "${paths[@]}"; do
     .github/workflows/acr-publish.yml|.github/scripts/test-acr-publish-workflow.sh|\
     .github/scripts/read-release-required-checks.sh|.github/scripts/wait-release-required-checks.sh|\
     .github/scripts/research-image-release-artifact.sh|.github/scripts/test-research-image-release-artifact.sh|\
+    .github/scripts/publish-research-build-release.sh|\
     .github/scripts/verify-research-runner-binaries.sh|\
     .github/scripts/read-acr-publish-source.sh|.github/scripts/select-acr-publish-source.sh|\
     .github/scripts/test-acr-publish-source-readback.sh)
@@ -756,7 +757,7 @@ if [[ $collector == true ]]; then control=true; fi
 if [[ $toolchain == true ]]; then select_job ci/rust; fi
 if [[ $collector == true ]]; then select_job ci/polymarket-evidence-compiler-image; fi
 select_job_if_affected ci/deployment-artifacts hft-live
-select_job_if_affected ci/rust-hft-engine-fast-lane hft-engine
+select_job_if_affected ci/rust-hft-engine-fast-lane hft-engine hft-binance-depth
 
 prediction_package_affected=false
 for ((index = 0; index < ${#package_names[@]}; index++)); do
