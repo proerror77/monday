@@ -1,8 +1,6 @@
 //! Kubernetes/ACS Jobs and AgentSandbox use the same persisted task identity.
 //! No ECS/ACK provisioning, GitHub run, or CI receipt appears in this contract.
-#[cfg(feature = "control")]
-use anyhow::Context;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -893,8 +891,9 @@ fn read_launch_context(worker: &Value) -> Result<crate::orchestrator::AttemptCon
     Ok(context)
 }
 
-#[cfg(feature = "control")]
-fn verify_cpu_resources(container: &Value, profile: &Profile) -> Result<()> {
+/// Compare exact CPU resource quantities. This pure check grants no admission
+/// and performs no provider or ledger operation.
+pub fn verify_cpu_resources(container: &Value, profile: &Profile) -> Result<()> {
     for section in ["requests", "limits"] {
         let map = container["resources"][section]
             .as_object()
@@ -904,6 +903,7 @@ fn verify_cpu_resources(container: &Value, profile: &Profile) -> Result<()> {
             "unadmitted worker resource"
         );
         let cpu = map["cpu"].as_str().context("CPU quantity missing")?;
+        ensure!(cpu.len() <= 32, "CPU quantity exceeds bound");
         let millis = if let Some(value) = cpu.strip_suffix('m') {
             value.parse::<u64>()?
         } else {
@@ -927,6 +927,7 @@ fn verify_cpu_resources(container: &Value, profile: &Profile) -> Result<()> {
             whole.checked_add(sub).context("CPU quantity overflow")?
         };
         let memory = map["memory"].as_str().context("memory quantity missing")?;
+        ensure!(memory.len() <= 32, "memory quantity exceeds bound");
         let bytes = if let Some(value) = memory.strip_suffix("Mi") {
             value
                 .parse::<u64>()?
