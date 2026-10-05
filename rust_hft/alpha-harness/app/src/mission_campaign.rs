@@ -5,6 +5,8 @@ use hft_research_artifacts::{fetch_to_file, normalized_sha256};
 use hft_research_dispatch_io::{canonical_tokyo_oss_internal_object, validate_dns_label};
 pub(crate) mod final_evaluation;
 pub(crate) mod market_encoder;
+#[cfg(feature = "scientific")]
+mod platform_output;
 pub(crate) mod preparation;
 pub(crate) mod prepared_inputs;
 pub(crate) mod sequence;
@@ -480,6 +482,19 @@ struct LoadedRequest {
 
 #[cfg(feature = "scientific")]
 pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
+    if std::env::var_os("MONDAY_ATTEMPT_CONTEXT").is_some() {
+        let plain = load_request(&args.request)
+            .context("platform CexCampaign requires the plain finalized native V6 request")?;
+        if args.final_evaluation
+            || !args.pre_holdout
+            || plain.request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V6
+            || plain.request.prepared_inputs.is_none()
+        {
+            bail!(
+                "platform CexCampaign cannot execute another native schema or withheld evaluation"
+            );
+        }
+    }
     if args.final_evaluation {
         return final_evaluation::execute(args);
     }
@@ -1423,6 +1438,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
         &client,
         &shared_input_dir,
     )?;
+    let platform_output = platform_output::BoundOutput::from_environment(&loaded, &native_inputs)?;
     let render_inputs = native_inputs.render_inputs();
     research_event(
         "alpha-harness",
@@ -1685,6 +1701,17 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             "consumed_trials": result.consumed_trials,
         }),
     );
+    if let Some(output) = platform_output {
+        tokio::runtime::Handle::try_current()
+            .context("platform worker requires the admitted async runtime")?
+            .block_on(output.publish(
+                &loaded,
+                &native_inputs,
+                &result,
+                &result_sha256,
+                &args.work_dir,
+            ))?;
+    }
     print_json(&serde_json::json!({
         "campaign_id": result.campaign_id,
         "request_sha256": result.request_sha256,
