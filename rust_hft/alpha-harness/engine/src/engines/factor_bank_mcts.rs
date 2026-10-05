@@ -2,26 +2,29 @@ use super::DeterministicRng;
 use crate::{
     baselines::{
         evaluate_factor_features_from_entries, validate_cex_context_bindings,
-        verify_cex_baseline_artifact,
+        verify_cex_classic_baseline_artifact,
     },
     evaluation::{EngineContext, ResearchRow},
     formula_evaluator::{evaluate_ast, FormulaEvaluator},
     CandidateEvaluation,
 };
 use alpha_domain::{
-    canonical_json_hash, CexBaselineArtifactV1, CexBaselineGateV1, CexBaselineModelKindV1,
-    CexEqualAbsoluteWeightPolicyV1, CexFactorBankRevisionV2, CexFactorOrientationV1,
-    CexFactorWeightRuleV1, CexResearchContentRefV1, CexResearchHoldoutStateV1, CexResearchMarketV1,
-    CexResearchMissionArtifactV1, CexResearchVenueV1, EvaluationCostsV1, EvaluationLabelSpecV1,
-    FormulaEvaluatorConfig, SearchBudget, CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION,
-    WALK_FORWARD_EVALUATOR_VERSION,
+    canonical_json_hash, CexFactorBankRevisionV2, CexFactorOrientationV1, CexFactorWeightRuleV1,
+    CexResearchContentRefV1, CexResearchHoldoutStateV1, CexResearchMarketV1, CexResearchVenueV1,
+    EvaluationCostsV1, EvaluationLabelSpecV1, SearchBudget,
+    CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION, WALK_FORWARD_EVALUATOR_VERSION,
+};
+use alpha_domain::{
+    CexBaselineArtifactV1, CexBaselineGateV1, CexBaselineModelKindV1,
+    CexEqualAbsoluteWeightPolicyV1, CexResearchMissionArtifactV1, FormulaEvaluatorConfig,
 };
 use hft_factor_dsl::{validate_live_formula, FactorAst, FactorOperator, FactorTerminal};
 use hft_search_kernel::{
     backpropagate_lineage, select_expandable_progressively, validate_tree, UctNode, UctStats,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 pub const CEX_FACTOR_BANK_MCTS_IMPLEMENTATION_VERSION: &str = "cex-factor-bank-subset-mcts-v1";
 const CHECKPOINT_SCHEMA_VERSION: &str = "cex-factor-bank-subset-mcts-checkpoint-v1";
@@ -1732,8 +1735,8 @@ fn validate_start(
     context: &EngineContext<'_>,
 ) -> Result<(), String> {
     validate_source_bindings(mission, factor_bank, ridge, cart, gate)?;
-    verify_cex_baseline_artifact(context, factor_bank, ridge)?;
-    verify_cex_baseline_artifact(context, factor_bank, cart)?;
+    verify_cex_classic_baseline_artifact(context, factor_bank, ridge)?;
+    verify_cex_classic_baseline_artifact(context, factor_bank, cart)?;
     validate_cex_context_bindings(context, factor_bank, &mission.spec.policies.evaluation)
 }
 
@@ -2058,7 +2061,7 @@ fn evaluate_subset(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fitting"))]
 mod tests {
     use super::*;
 

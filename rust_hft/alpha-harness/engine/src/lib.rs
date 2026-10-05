@@ -43,6 +43,7 @@ fn kernel_research_event(event: &str, details: serde_json::Value) {
     research_event("alpha-engine-kernel", event, details);
 }
 
+#[cfg(any(feature = "fitting", feature = "kernel"))]
 pub(crate) fn research_event(component: &str, event: &str, details: serde_json::Value) {
     eprintln!(
         "{}",
