@@ -1,33 +1,48 @@
-use crate::{
-    cli::{
-        print_json, CandidateShowArgs, EnvelopeArgs, EvaluateArgs, FeedbackLogArgs,
-        FeedbackRecordArgs, JsonRecordArgs, MissionStatusArgs, PromoteArgs, RegisterOnnxArgs,
-        RevokeApprovalArgs, SignDeploymentArgs,
-    },
-    data_mission,
-};
+use crate::cli::print_json;
+use crate::cli::CandidateShowArgs;
+use crate::cli::EnvelopeArgs;
+use crate::cli::EvaluateArgs;
+use crate::cli::FeedbackLogArgs;
+use crate::cli::FeedbackRecordArgs;
+use crate::cli::JsonRecordArgs;
+use crate::cli::MissionStatusArgs;
+use crate::cli::PromoteArgs;
+#[cfg(feature = "onnx-compatibility")]
+use crate::cli::RegisterOnnxArgs;
+use crate::cli::RevokeApprovalArgs;
+use crate::cli::SignDeploymentArgs;
+use crate::data_mission;
 use ::governance::attribution::{
     verify_runtime_attribution_event, SignedRuntimeAttributionEvent,
     VerifiedRuntimeAttributionEvent,
 };
 use ::governance::runtime_bundle::RuntimeOnnxModel as OnnxModelCandidate;
 use ::governance::runtime_bundle::{RuntimeArtifact, RuntimeBundle};
-use alpha_domain::{
-    canonical_json_hash, CandidateArtifact, EngineKind, IterationVerdict, MissionStatus,
-    MissionTerminalReason, PromotionRecord, ResearchIteration, SearchBudgetLimit,
-    SearchBudgetUsage, SearchPolicyRevision, StrategyBundle, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
-    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
-};
-use alpha_engine::{
-    evaluation::prepare_dataset,
-    formula_evaluator::{FormulaEvaluator, WALK_FORWARD_EVALUATOR_VERSION},
-    CandidateEvaluation,
-};
+use alpha_domain::canonical_json_hash;
+use alpha_domain::CandidateArtifact;
+use alpha_domain::IterationVerdict;
+use alpha_domain::PromotionRecord;
+use alpha_domain::SearchPolicyRevision;
+use alpha_domain::StrategyBundle;
+use alpha_domain::ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION;
+use alpha_domain::ONNX_WALK_FORWARD_EVALUATOR_VERSION;
+use alpha_domain::SEALED_HOLDOUT_EVALUATOR_VERSION;
+#[cfg(feature = "onnx-compatibility")]
+use alpha_engine::evaluation::prepare_dataset;
+use alpha_engine::formula_evaluator::FormulaEvaluator;
+use alpha_engine::formula_evaluator::WALK_FORWARD_EVALUATOR_VERSION;
+use alpha_engine::CandidateEvaluation;
+#[cfg(feature = "onnx-compatibility")]
 use alpha_onnx_evaluator::OnnxEvaluator;
-use alpha_store::{
-    AlphaStore, ApprovalRecord, EvaluationRecord, MissionLineage, RegistryRevision, StoreError,
-    StoredCandidate, StoredEvaluation,
-};
+use alpha_store::AlphaStore;
+use alpha_store::ApprovalRecord;
+#[cfg(any(feature = "onnx-compatibility", test))]
+use alpha_store::EvaluationRecord;
+use alpha_store::MissionLineage;
+use alpha_store::RegistryRevision;
+use alpha_store::StoreError;
+use alpha_store::StoredCandidate;
+use alpha_store::StoredEvaluation;
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -38,6 +53,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+};
+#[cfg(any(feature = "onnx-compatibility", test))]
+use {
+    alpha_domain::EngineKind, alpha_domain::MissionStatus, alpha_domain::ResearchIteration,
+    alpha_domain::SearchBudgetUsage,
 };
 
 static NEXT_BUNDLE_STAGE_ID: AtomicU64 = AtomicU64::new(0);
@@ -311,6 +331,7 @@ fn validated_walk_forward_evidence_in_lineage(
     Ok(candidates)
 }
 
+#[cfg(feature = "onnx-compatibility")]
 pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
     let mut store = AlphaStore::open(&args.db)?;
     let mission = store.get_mission(&args.mission_id)?;
@@ -2193,3 +2214,6 @@ mod tests {
             .contains("does not match candidate identity"));
     }
 }
+
+#[cfg(feature = "onnx-compatibility")]
+use alpha_domain::{MissionTerminalReason, SearchBudgetLimit};

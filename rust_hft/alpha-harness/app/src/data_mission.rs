@@ -68,6 +68,7 @@ pub fn import_and_register_features(
     Ok(manifest)
 }
 
+#[cfg(any(feature = "scientific", test))]
 pub fn admit_cex_replay_dataset(
     store: &mut AlphaStore,
     features: &FeatureDatasetManifest,
@@ -941,6 +942,7 @@ pub(crate) fn feature_available_times(
         .collect())
 }
 
+#[cfg(any(feature = "scientific", test))]
 pub(crate) fn feature_decision_clocks(
     manifest: &FeatureDatasetManifest,
 ) -> anyhow::Result<Vec<FeatureDecisionClock>> {

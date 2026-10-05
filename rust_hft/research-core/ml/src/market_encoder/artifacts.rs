@@ -1,10 +1,10 @@
-use super::data::UnlabeledSequenceExample;
 use super::network::*;
 use super::training::input_tensor;
 use crate::{lock_ndarray_backend, CpuBackend};
-use burn::nn::LinearConfig;
-use burn_ndarray::NdArrayDevice;
+use hft_cex_research_input::market_encoder::UnlabeledSequenceExample;
 use hft_research_manifest::market_encoder::*;
+use hft_research_manifest::portable_market::{FrozenMarketEncoderV1, FrozenMarketTaskModelV1};
+use hft_research_manifest::portable_network::FrozenLinearV1;
 use serde::{Deserialize, Serialize};
 
 pub(super) const MASK_POLICY: &str = "causal-whole-frame-3s-30pct-prefix6s-v1";
@@ -247,14 +247,14 @@ impl MarketEncoderCheckpoint {
         if let Some(report) = &audit.diagnostics {
             report.validate(&self.manifest.request, &self.manifest.scaling)?;
         }
-        let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
-        let mut head = LinearConfig::new(
+        let head: FrozenLinearV1 = serde_json::from_slice(&weights).map_err(|e| e.to_string())?;
+        head.validate(
             self.manifest.request.spec.hidden_channels,
             self.manifest.request.spec.input.ordered_channels.len(),
-        )
-        .init::<CpuBackend>(&NdArrayDevice::Cpu);
-        load(&mut head, weights.clone())?;
-        if values_digest(&head)? != audit.parameter_values_sha256 {
+        )?;
+        if head.parameter_digest(b"monday.market-parameter-values.v1")
+            != audit.parameter_values_sha256
+        {
             return Err("reconstruction head values differ".into());
         }
         self.reconstruction = Some(ReconstructionAudit {
@@ -286,27 +286,29 @@ impl MarketEncoderCheckpoint {
             weights,
         ))
     }
+    pub fn portable(&self) -> Result<FrozenMarketEncoderV1, String> {
+        let manifest = serde_json::to_vec(&self.manifest).map_err(|e| e.to_string())?;
+        let mut frozen = FrozenMarketEncoderV1::restore(
+            &manifest,
+            &bytes_digest(&manifest),
+            self.weights.clone(),
+        )?;
+        if let Some(audit) = &self.reconstruction {
+            let metadata = serde_json::to_vec(&audit.metadata).map_err(|e| e.to_string())?;
+            frozen.attach_reconstruction_audit(
+                &metadata,
+                &bytes_digest(&metadata),
+                audit.weights.clone(),
+            )?;
+        }
+        Ok(frozen)
+    }
     pub fn restore(manifest: &[u8], expected: &str, weights: Vec<u8>) -> Result<Self, String> {
-        verify_bytes(manifest, expected, &weights)?;
-        let meta: EncoderManifest = serde_json::from_slice(manifest).map_err(|e| e.to_string())?;
-        meta.request.validate()?;
-        meta.scaling.validate(&meta.request)?;
-        meta.diagnostics.validate(&meta.request)?;
-        if meta.schema_version != ENCODER_SCHEMA
-            || meta.mask_policy != MASK_POLICY
-            || bytes_digest(&weights) != meta.weights_sha256
-        {
-            return Err("encoder manifest or weight binding differs".into());
-        }
+        let frozen = FrozenMarketEncoderV1::restore(manifest, expected, weights.clone())?;
         let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
-        let mut model = Encoder::<CpuBackend>::new(&meta.request.spec, &NdArrayDevice::Cpu);
-        load(&mut model, weights.clone())?;
-        if values_digest(&model)? != meta.diagnostics.final_encoder_values_sha256 {
-            return Err("encoder values differ from receipt".into());
-        }
         Ok(Self {
-            model,
-            manifest: meta,
+            model: Encoder::from_portable(frozen.network())?,
+            manifest: serde_json::from_slice(manifest).map_err(|e| e.to_string())?,
             weights,
             reconstruction: None,
         })
@@ -382,70 +384,39 @@ impl MarketTaskModel {
         ))
     }
     /// Inherited models require the verified parent, not only its claimed hash.
+    pub fn portable(
+        &self,
+        parent: Option<&MarketEncoderCheckpoint>,
+    ) -> Result<FrozenMarketTaskModelV1, String> {
+        let manifest = serde_json::to_vec(&self.manifest).map_err(|e| e.to_string())?;
+        let parent = parent.map(MarketEncoderCheckpoint::portable).transpose()?;
+        FrozenMarketTaskModelV1::restore(
+            &manifest,
+            &bytes_digest(&manifest),
+            self.weights.clone(),
+            parent.as_ref(),
+        )
+    }
     pub fn restore(
         manifest: &[u8],
         expected: &str,
         weights: Vec<u8>,
         parent: Option<&MarketEncoderCheckpoint>,
     ) -> Result<Self, String> {
-        verify_bytes(manifest, expected, &weights)?;
-        let meta: TaskManifest = serde_json::from_slice(manifest).map_err(|e| e.to_string())?;
-        meta.request.validate()?;
-        meta.scaling.validate(&meta.request.fit)?;
-        meta.diagnostics.validate(&meta.request.fit)?;
-        check_parent(&meta.request, parent)?;
-        if let Some(p) = parent {
-            if meta.scaling != p.manifest.scaling
-                || meta.diagnostics.initial_encoder_values_sha256
-                    != p.manifest.diagnostics.final_encoder_values_sha256
-            {
-                return Err("task did not inherit its declared parent scaling and values".into());
-            }
-        }
-        if meta.schema_version != TASK_SCHEMA
-            || bytes_digest(&weights) != meta.weights_sha256
-            || !meta.target_mean.is_finite()
-            || !meta.target_scale.is_finite()
-            || meta.target_scale <= 0.0
-            || (meta.request.mode == AdaptationModeV1::LinearProbe
-                && meta.diagnostics.initial_encoder_values_sha256
-                    != meta.diagnostics.final_encoder_values_sha256)
-        {
-            return Err("invalid market task artifact or frozen encoder".into());
-        }
-        if meta.request.mode == AdaptationModeV1::FullFineTune
-            && meta.diagnostics.initial_encoder_values_sha256
-                == meta.diagnostics.final_encoder_values_sha256
-        {
-            return Err("fine-tuning artifact did not update encoder values".into());
-        }
+        let frozen_parent = parent.map(MarketEncoderCheckpoint::portable).transpose()?;
+        let frozen = FrozenMarketTaskModelV1::restore(
+            manifest,
+            expected,
+            weights.clone(),
+            frozen_parent.as_ref(),
+        )?;
         let _guard = lock_ndarray_backend().map_err(|e| e.to_string())?;
-        let device = NdArrayDevice::Cpu;
-        let mut model = TaskNetwork {
-            encoder: Encoder::<CpuBackend>::new(&meta.request.fit.spec, &device),
-            head: LinearConfig::new(meta.request.fit.spec.hidden_channels, 1).init(&device),
-        };
-        load(&mut model, weights.clone())?;
-        if values_digest(&model)? != meta.parameter_values_sha256
-            || values_digest(&model.encoder)? != meta.diagnostics.final_encoder_values_sha256
-        {
-            return Err("task values differ from receipt".into());
-        }
         Ok(Self {
-            model,
-            manifest: meta,
+            model: TaskNetwork::from_portable(frozen.network())?,
+            manifest: serde_json::from_slice(manifest).map_err(|e| e.to_string())?,
             weights,
         })
     }
-}
-fn verify_bytes(manifest: &[u8], expected: &str, weights: &[u8]) -> Result<(), String> {
-    if manifest.len() > 2 * 1024 * 1024
-        || weights.len() > 16 * 1024 * 1024
-        || bytes_digest(manifest) != expected
-    {
-        return Err("market bundle size or external manifest hash mismatch".into());
-    }
-    Ok(())
 }
 pub(super) fn check_parent(
     request: &MarketAdaptationRequestV1,

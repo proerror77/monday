@@ -3,6 +3,7 @@
     "cex-runner": [
       "hft-backtest",
       "alpha-harness",
+      "monday-cex-worker",
       "lob-pit-materializer",
       "binance-market-tape-slicer",
       "binance-replay-parquet-materializer",
@@ -37,6 +38,14 @@
       "features": "",
       "binaries": [
         "alpha-harness"
+      ]
+    },
+    {
+      "manifest": "research-core/Cargo.toml",
+      "package": "hft-cex-research-worker",
+      "features": "",
+      "binaries": [
+        "monday-cex-worker"
       ]
     },
     {
