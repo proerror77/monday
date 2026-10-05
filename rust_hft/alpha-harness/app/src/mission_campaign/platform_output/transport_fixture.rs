@@ -190,11 +190,11 @@ impl Gateway {
                         let mut bytes = vec![0; length];
                         reader.read_exact(&mut bytes)?;
                         let mut objects = server_objects.lock().unwrap();
-                        if objects.contains_key(&key) {
-                            (412, Vec::new())
-                        } else {
-                            objects.insert(key, bytes);
+                        if let std::collections::btree_map::Entry::Vacant(entry) = objects.entry(key) {
+                            entry.insert(bytes);
                             (201, Vec::new())
+                        } else {
+                            (412, Vec::new())
                         }
                     }
                     "GET" => (
@@ -499,6 +499,9 @@ fn native_attempt_transport_requires_exact_private_admitted_binding() -> anyhow:
         gateway.objects.lock().unwrap().get(&artifact.key).unwrap(),
         b"actual private transport bytes"
     );
+    assert_eq!(runtime.block_on(output.writer.put(
+        "transport-probe.json", b"actual private transport bytes".to_vec(),
+    ))?, artifact);
     gateway.corrupt_get.store(true, Ordering::SeqCst);
     assert!(runtime.block_on(output.writer.readback(&artifact)).is_err());
     Ok(())
@@ -517,7 +520,7 @@ pub(crate) fn assert_publication(
         .enable_all()
         .build()?;
     let receipt = runtime.block_on(publish(
-        &context,
+        context,
         &output.writer,
         loaded,
         native,
