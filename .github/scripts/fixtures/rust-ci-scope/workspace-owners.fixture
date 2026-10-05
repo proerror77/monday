@@ -1,6 +1,19 @@
 {
   "packages": [
     {
+      "name": "hft-cex-research-worker",
+      "manifest_path": "rust_hft/alpha-harness/worker/Cargo.toml",
+      "dependencies": [
+        {
+          "name": "alpha-harness",
+          "path": "rust_hft/alpha-harness/app",
+          "kind": null,
+          "target": null,
+          "optional": false
+        }
+      ]
+    },
+    {
       "name": "alpha-domain",
       "manifest_path": "rust_hft/alpha-harness/domain/Cargo.toml",
       "dependencies": [
@@ -93,6 +106,16 @@
           "kind": "dev",
           "target": null,
           "optional": false
+        },
+        {
+          "name": "hft-cex-research-input",
+          "path": "rust_hft/research-core/cex-input",
+          "kind": null,
+          "target": null,
+          "optional": false,
+          "features": [
+            "streaming"
+          ]
         }
       ]
     },
@@ -119,7 +142,7 @@
           "path": "rust_hft/alpha-harness/onnx-evaluator",
           "kind": null,
           "target": null,
-          "optional": false
+          "optional": true
         },
         {
           "name": "alpha-store",
@@ -164,11 +187,14 @@
           "optional": false
         },
         {
-          "name": "hft-research-ml",
-          "path": "rust_hft/research-core/ml",
+          "name": "hft-cex-research-input",
+          "path": "rust_hft/research-core/cex-input",
           "kind": null,
           "target": null,
-          "optional": false
+          "optional": false,
+          "features": [
+            "streaming"
+          ]
         }
       ]
     },
@@ -1376,6 +1402,16 @@
           "kind": null,
           "target": null,
           "optional": false
+        },
+        {
+          "name": "hft-cex-research-input",
+          "path": "rust_hft/research-core/cex-input",
+          "kind": null,
+          "target": null,
+          "optional": false,
+          "features": [
+            "streaming"
+          ]
         }
       ]
     },

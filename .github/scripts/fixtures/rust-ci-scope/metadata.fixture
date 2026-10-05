@@ -9,6 +9,11 @@
       "manifest_path": "rust_hft/alpha-harness/app/Cargo.toml",
       "dependencies": [{ "name": "hft-collector", "path": "rust_hft/tools/collector" }]
     },
+    {
+      "name": "hft-cex-research-worker",
+      "manifest_path": "rust_hft/alpha-harness/worker/Cargo.toml",
+      "dependencies": [{ "name": "alpha-harness", "path": "rust_hft/alpha-harness/app" }]
+    },
     { "name": "hft-strategy-probability-reversal", "manifest_path": "rust_hft/strategy-framework/strategies/probability_reversal/Cargo.toml", "dependencies": [{ "name": "hft-ports", "path": "../../../market-core/ports" }] },
     { "name": "hft-runtime", "manifest_path": "rust_hft/market-core/runtime/Cargo.toml", "dependencies": [{ "name": "hft-strategy-probability-reversal", "path": "../../../strategy-framework/strategies/probability_reversal" }] },
     { "name": "hft-live", "manifest_path": "rust_hft/apps/live/Cargo.toml", "dependencies": [{ "name": "hft-runtime", "path": "../../market-core/runtime" }] },
