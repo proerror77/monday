@@ -357,6 +357,20 @@ pub struct Kubernetes {
 
 #[cfg(feature = "control")]
 impl Kubernetes {
+    #[cfg(test)]
+    pub(crate) fn retirement_fixture(endpoint: &str, cluster: &str) -> Result<Self> {
+        let endpoint = reqwest::Url::parse(endpoint)?;
+        ensure!(
+            endpoint.scheme() == "http" && endpoint.host_str() == Some("127.0.0.1"),
+            "fixture must be loopback"
+        );
+        Ok(Self {
+            client: reqwest::Client::builder().no_proxy().build()?,
+            endpoint,
+            token: "fixture".into(),
+            cluster: cluster.into(),
+        })
+    }
     /// Read-only configuration check on the exact accepted Kubernetes target.
     /// A name, digest supplied by a caller, or immutable flag alone is insufficient.
     pub async fn verify_worker_configuration(&self, spec: &TaskSpec) -> Result<Option<String>> {
@@ -844,6 +858,103 @@ impl Kubernetes {
         Ok(items.is_empty())
     }
 
+    /// Mechanical retirement requires an opaque PG/archive permit. Unknown
+    /// deletion replies retain the same Job/Pod UIDs for a later readback.
+    pub async fn retire_native_terminal(
+        &self,
+        permit: &crate::retirement::RetirementPermit,
+    ) -> Result<bool> {
+        let spec = permit.spec();
+        let lease = permit.lease();
+        let handle = permit.handle();
+        ensure!(self.cluster == handle.cluster, "retirement cluster changed");
+        handle.validate(lease, spec)?;
+        let path = format!(
+            "{}/{}",
+            Self::path(handle.backend, &handle.namespace),
+            handle.name
+        );
+        if let Some(job) = self.read(&path).await? {
+            ensure!(
+                self.handle(&job, spec, lease)? == *handle
+                    && job["metadata"]["name"] == handle.name
+                    && job["metadata"]["namespace"] == handle.namespace
+                    && job["spec"] == permit.job()["spec"],
+                "retirement Job UID or original specification drift"
+            );
+            let pods = self.owned_pods(spec, lease).await?;
+            if !job["metadata"]["deletionTimestamp"].is_null() {
+                // A foreground operation is already pending. Never substitute
+                // another resource or infer success from the delete response.
+                for pod in pods["items"].as_array().context("Pod list absent")? {
+                    ensure!(
+                        pod["metadata"]["uid"] == permit.pod()["metadata"]["uid"]
+                            && pod["spec"] == permit.pod()["spec"],
+                        "pending retirement Pod drift"
+                    );
+                }
+                return Ok(false);
+            }
+            let items = pods["items"].as_array().context("Pod list absent")?;
+            ensure!(
+                items.len() == 1
+                    && items[0]["metadata"]["uid"] == permit.pod()["metadata"]["uid"]
+                    && items[0]["spec"] == permit.pod()["spec"],
+                "retirement Pod UID or specification drift"
+            );
+            verify_retirement_observation(
+                spec,
+                lease,
+                handle,
+                permit.acceptance(),
+                permit.identity(),
+                &job,
+                &items[0],
+            )?;
+            let response = self.client.delete(self.endpoint.join(&path)?).bearer_auth(&self.token)
+                .json(&json!({"apiVersion":"v1","kind":"DeleteOptions","propagationPolicy":"Foreground","preconditions":{"uid":handle.uid}})).send().await;
+            match response {
+                Ok(r)
+                    if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND => {}
+                Ok(r) if r.status().is_client_error() => {
+                    r.error_for_status()?;
+                }
+                // Transport/5xx is Unknown. The fixed-name GET below resolves
+                // absence; otherwise this same durable operation stays pending.
+                _ => {}
+            }
+        }
+        if let Some(job) = self.read(&path).await? {
+            ensure!(
+                job["metadata"]["uid"] == handle.uid,
+                "retirement readback Job UID drift"
+            );
+            return Ok(false);
+        }
+        let pod_name = permit.pod()["metadata"]["name"]
+            .as_str()
+            .context("original Pod name missing")?;
+        ensure!(dns_label(pod_name), "invalid original Pod name");
+        if let Some(pod) = self
+            .read(&format!(
+                "/api/v1/namespaces/{}/pods/{pod_name}",
+                handle.namespace
+            ))
+            .await?
+        {
+            ensure!(
+                pod["metadata"]["uid"] == permit.pod()["metadata"]["uid"],
+                "retirement readback Pod UID drift"
+            );
+            return Ok(false);
+        }
+        let pods = self.owned_pods(spec, lease).await?;
+        Ok(pods["items"]
+            .as_array()
+            .context("Pod list absent")?
+            .is_empty())
+    }
+
     async fn owned_pods(&self, spec: &TaskSpec, lease: &Lease) -> Result<Value> {
         let selector = format!(
             "monday.io/task={},monday.io/attempt={},monday.io/fence={}",
@@ -926,21 +1037,7 @@ pub fn verify_cpu_resources(container: &Value, profile: &Profile) -> Result<()> 
             };
             whole.checked_add(sub).context("CPU quantity overflow")?
         };
-        let memory = map["memory"].as_str().context("memory quantity missing")?;
-        ensure!(memory.len() <= 32, "memory quantity exceeds bound");
-        let bytes = if let Some(value) = memory.strip_suffix("Mi") {
-            value
-                .parse::<u64>()?
-                .checked_mul(1024 * 1024)
-                .context("memory overflow")?
-        } else if let Some(value) = memory.strip_suffix("Gi") {
-            value
-                .parse::<u64>()?
-                .checked_mul(1024 * 1024 * 1024)
-                .context("memory overflow")?
-        } else {
-            memory.parse::<u64>()?
-        };
+        let bytes = quantity_bytes(map["memory"].as_str().context("memory quantity missing")?)?;
         ensure!(
             millis == u64::from(profile.cpu_millis)
                 && bytes == u64::from(profile.memory_mib) * 1024 * 1024,
@@ -948,6 +1045,19 @@ pub fn verify_cpu_resources(container: &Value, profile: &Profile) -> Result<()> 
         );
     }
     Ok(())
+}
+
+fn quantity_bytes(value: &str) -> Result<u64> {
+    ensure!(value.len() <= 32, "memory quantity exceeds bound");
+    for (suffix, multiplier) in [("Mi", 1024_u64 * 1024), ("Gi", 1024_u64 * 1024 * 1024)] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            return number
+                .parse::<u64>()?
+                .checked_mul(multiplier)
+                .context("memory overflow");
+        }
+    }
+    Ok(value.parse::<u64>()?)
 }
 
 #[cfg(feature = "control")]
@@ -1206,6 +1316,233 @@ fn retained_job_stopped(job: &Value, pods: &Value, handle: &ExecutionHandle) -> 
         }
     }
     Ok(true)
+}
+
+#[cfg(feature = "control")]
+pub(crate) fn verify_retirement_observation(
+    spec: &TaskSpec,
+    lease: &Lease,
+    handle: &ExecutionHandle,
+    acceptance: &Acceptance,
+    reference: &AttemptIdentityRef,
+    job: &Value,
+    pod: &Value,
+) -> Result<()> {
+    handle.validate(lease, spec)?;
+    reference.validate(spec, lease)?;
+    let mut expected = render(spec, lease, acceptance)?;
+    install_attempt_identity(&mut expected, reference)?;
+    ensure!(
+        job["kind"] == "Job"
+            && job["apiVersion"] == "batch/v1"
+            && job["metadata"]["name"] == handle.name
+            && job["metadata"]["namespace"] == handle.namespace
+            && job["metadata"]["uid"] == handle.uid
+            && job["spec"]["backoffLimit"] == 0,
+        "terminal Job changed original target or retry policy"
+    );
+    ensure!(
+        pod["kind"] == "Pod"
+            && pod["apiVersion"] == "v1"
+            && pod["metadata"]["name"].as_str().is_some_and(dns_label),
+        "invalid original Pod identity"
+    );
+    for pointer in [
+        "/metadata/labels",
+        "/metadata/annotations",
+        "/spec/template/metadata/labels",
+        "/spec/template/metadata/annotations",
+    ] {
+        let map = expected
+            .pointer(pointer)
+            .and_then(Value::as_object)
+            .context("expected Job scope absent")?;
+        ensure!(
+            map.iter()
+                .all(|(k, v)| job.pointer(pointer).is_some_and(|m| m[k] == *v)),
+            "terminal Job scope changed"
+        );
+    }
+    let actual = &job["spec"]["template"]["spec"];
+    let wanted = &expected["spec"]["template"]["spec"];
+    for field in [
+        "restartPolicy",
+        "serviceAccountName",
+        "automountServiceAccountToken",
+        "nodeSelector",
+        "terminationGracePeriodSeconds",
+    ] {
+        ensure!(
+            actual[field] == wanted[field],
+            "terminal Job execution profile changed"
+        );
+    }
+    ensure!(
+        normalized_security(&actual["securityContext"], true)
+            == normalized_security(&wanted["securityContext"], true),
+        "terminal Pod security drift"
+    );
+    ensure!(
+        normalized_volumes(&actual["volumes"])? == normalized_volumes(&wanted["volumes"])?,
+        "terminal volumes changed original identities or sizes"
+    );
+    for section in ["containers", "initContainers"] {
+        let actual = actual[section]
+            .as_array()
+            .context("original containers missing")?;
+        let wanted = wanted[section]
+            .as_array()
+            .context("expected containers missing")?;
+        ensure!(
+            actual.len() == wanted.len(),
+            "unadmitted terminal container"
+        );
+        for (actual, wanted) in actual.iter().zip(wanted) {
+            verify_cpu_resources(actual, &spec.profile)?;
+            ensure!(
+                normalized_container(actual, &spec.profile)?
+                    == normalized_container(wanted, &spec.profile)?,
+                "terminal container execution drift"
+            );
+        }
+    }
+    let worker = &actual["containers"][0];
+    ensure!(
+        read_launch_context(worker)?
+            == (crate::orchestrator::AttemptContext {
+                spec: spec.clone(),
+                lease: lease.clone()
+            }),
+        "terminal changed original launch lease"
+    );
+    for value in [
+        &job["spec"]["activeDeadlineSeconds"],
+        &actual["activeDeadlineSeconds"],
+    ] {
+        ensure!(
+            value
+                .as_i64()
+                .is_some_and(|n| n > 0 && n <= (spec.timeout_ms + 999) / 1000),
+            "terminal Job deadline exceeds original budget"
+        );
+    }
+    ensure!(
+        retained_job_stopped(job, &json!({"items":[pod]}), handle)?,
+        "retirement requires the exact naturally terminated process tree"
+    );
+    Ok(())
+}
+
+// Normalize only established API defaults. Unknown/extra executable fields,
+// mounts and volumes survive normalization and must still match the renderer.
+#[cfg(feature = "control")]
+fn remove_default(value: &mut Value, key: &str, default: &Value) {
+    if value.get(key) == Some(default) {
+        if let Some(map) = value.as_object_mut() {
+            map.remove(key);
+        }
+    }
+}
+#[cfg(feature = "control")]
+fn remove_nulls(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            for v in map.values_mut() {
+                remove_nulls(v);
+            }
+        }
+        Value::Array(values) => {
+            for v in values {
+                remove_nulls(v);
+            }
+        }
+        _ => {}
+    }
+}
+#[cfg(feature = "control")]
+fn normalized_security(value: &Value, pod: bool) -> Value {
+    let mut value = value.clone();
+    remove_nulls(&mut value);
+    if pod {
+        for (key, default) in [
+            ("fsGroupChangePolicy", json!("Always")),
+            ("supplementalGroupsPolicy", json!("Merge")),
+            ("supplementalGroups", json!([])),
+            ("sysctls", json!([])),
+        ] {
+            remove_default(&mut value, key, &default);
+        }
+    } else {
+        remove_default(&mut value, "privileged", &json!(false));
+        remove_default(&mut value, "procMount", &json!("Default"));
+        if let Some(caps) = value.get_mut("capabilities") {
+            remove_default(caps, "add", &json!([]));
+        }
+    }
+    value
+}
+#[cfg(feature = "control")]
+fn normalized_volumes(value: &Value) -> Result<Value> {
+    let mut value = value.clone();
+    remove_nulls(&mut value);
+    for volume in value.as_array_mut().context("volume inventory missing")? {
+        if let Some(empty) = volume.get_mut("emptyDir") {
+            remove_default(empty, "medium", &json!(""));
+            let bytes = quantity_bytes(
+                empty["sizeLimit"]
+                    .as_str()
+                    .context("bounded scratch size absent")?,
+            )?;
+            empty["sizeLimit"] = json!(bytes);
+        }
+        if let Some(secret) = volume.get_mut("secret") {
+            remove_default(secret, "optional", &json!(false));
+            remove_default(secret, "items", &json!([]));
+            if secret.get("defaultMode").is_none() {
+                secret["defaultMode"] = json!(420);
+            }
+        }
+    }
+    Ok(value)
+}
+#[cfg(feature = "control")]
+fn normalized_container(value: &Value, profile: &Profile) -> Result<Value> {
+    verify_cpu_resources(value, profile)?;
+    let mut value = value.clone();
+    remove_nulls(&mut value);
+    value["resources"] = json!({"cpu_millis":profile.cpu_millis,"memory_mib":profile.memory_mib});
+    value["securityContext"] = normalized_security(&value["securityContext"], false);
+    for (key, default) in [
+        ("imagePullPolicy", json!("IfNotPresent")),
+        ("terminationMessagePath", json!("/dev/termination-log")),
+        ("terminationMessagePolicy", json!("File")),
+        ("args", json!([])),
+        ("ports", json!([])),
+        ("envFrom", json!([])),
+        ("volumeDevices", json!([])),
+        ("workingDir", json!("")),
+        ("stdin", json!(false)),
+        ("stdinOnce", json!(false)),
+        ("tty", json!(false)),
+    ] {
+        remove_default(&mut value, key, &default);
+    }
+    for mount in value["volumeMounts"]
+        .as_array_mut()
+        .context("mount inventory missing")?
+    {
+        for (key, default) in [
+            ("readOnly", json!(false)),
+            ("mountPropagation", json!("None")),
+            ("recursiveReadOnly", json!("Disabled")),
+            ("subPath", json!("")),
+            ("subPathExpr", json!("")),
+        ] {
+            remove_default(mount, key, &default);
+        }
+    }
+    Ok(value)
 }
 
 #[cfg(all(test, feature = "control"))]
