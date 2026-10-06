@@ -17,7 +17,7 @@ hft-cex-research-input = { path = "../../research-core/cex-input", features = ["
 hft-research-artifacts = { path = "../../research-core/artifacts" }
 hft-research-dispatch-io = { path = "../../research-core/dispatch-io" }
 alpha-domain = { path = "../domain" }
-alpha-engine = { path = "../engine", default-features = false, features = ["kernel"] }
+alpha-engine = { path = "../engine", default-features = false, features = ["kernel", "llm"] }
 alpha-onnx-evaluator = { path = "../onnx-evaluator", optional = true }
 alpha-store = { path = "../store" }
 anyhow = "1"
