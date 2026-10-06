@@ -124,10 +124,25 @@ fn session_host_rejects_resume_without_registered_checkpoint_before_starting_chi
 /// Only the explicitly named disposable test database is permitted. This test
 /// never targets production, imports business data, or connects to Kubernetes.
 #[cfg(feature = "publisher")]
-#[tokio::test]
+#[test]
 #[ignore = "requires disposable MONDAY_TEST_DATABASE_URL ending /monday_foundation_test"]
-async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
-) -> anyhow::Result<()> {
+fn postgres_single_authority_claims_idempotency_and_append_only_evidence() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("postgres-platform-integration".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(postgres_platform_integration_inner())
+        })
+        .context("spawn isolated PG integration thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("PG integration thread panicked"))?
+}
+
+#[cfg(feature = "publisher")]
+async fn postgres_platform_integration_inner() -> anyhow::Result<()> {
     let url = std::env::var("MONDAY_TEST_DATABASE_URL")?;
     anyhow::ensure!(
         url.ends_with("/monday_foundation_test"),
