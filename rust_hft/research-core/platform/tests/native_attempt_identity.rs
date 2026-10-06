@@ -1,4 +1,4 @@
-#![cfg(feature = "control")]
+#![cfg(all(feature = "control", feature = "publisher"))]
 use anyhow::Result;
 use hft_research_platform::{
     admission::{sign, NativeAdmission, NativeAdmissionTrust},
@@ -21,6 +21,7 @@ fn hash(c: char) -> String {
     c.to_string().repeat(64)
 }
 
+#[cfg(feature = "publisher")]
 #[tokio::test]
 #[ignore = "requires disposable loopback MONDAY_TEST_DATABASE_URL ending /monday_foundation_test"]
 async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Result<()> {
@@ -92,10 +93,9 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
             },
         }],
     };
-    let (artifact, signed, release_trust) = common::attest(artifact);
-    let artifact_id = ledger
-        .register_build(&release_trust.verify(&artifact, &signed)?)
-        .await?;
+    let package = common::published::Package::new(artifact).await?;
+    let artifact = package.artifact.clone();
+    let artifact_id = package.import(&ledger).await?;
     let run = Run {
         schema: 1,
         experiment_sha256: experiment_id,
