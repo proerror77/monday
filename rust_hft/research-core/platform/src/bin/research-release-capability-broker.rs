@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use hft_research_platform::{
-    artifact_identity::{Access, Capability},
+    artifact_identity::{read_capabilities, Access, Capability},
     build::pinned_image,
     identity,
     release_publisher::{read_json, PublisherPolicy},
@@ -466,6 +466,14 @@ fn private_lock(path: &Path) -> Result<std::fs::File> {
     }
     Ok(file)
 }
+fn projection(config: &Config) -> Result<Vec<Capability>> {
+    let caps: Vec<Capability> = read_private(&config.capabilities_file)?;
+    ensure!(
+        caps == read_capabilities(&config.capabilities_file)?,
+        "gateway projection readback differs"
+    );
+    Ok(caps)
+}
 fn journal(config: &Config) -> Result<Journal> {
     let journal: Journal = read_private(&config.replay_file)?;
     ensure!(
@@ -484,7 +492,7 @@ fn journal(config: &Config) -> Result<Journal> {
 fn revoke_after_restart(config: &Config) -> Result<()> {
     let _lock = projection_lock(config)?;
     let mut journal = journal(config)?;
-    let mut caps: Vec<Capability> = read_private(&config.capabilities_file)?;
+    let mut caps: Vec<Capability> = projection(config)?;
     caps.retain(|cap| !journal.issued.contains_key(&cap.token_sha256));
     replace(&config.capabilities_file, &caps)?;
     journal.issued.clear();
@@ -493,7 +501,7 @@ fn revoke_after_restart(config: &Config) -> Result<()> {
 fn refresh(config: &Config, token_hash: &str, active: bool, now: u64) -> Result<bool> {
     let _lock = projection_lock(config)?;
     let mut journal = journal(config)?;
-    let mut caps: Vec<Capability> = read_private(&config.capabilities_file)?;
+    let mut caps: Vec<Capability> = projection(config)?;
     let deadline = journal.issued.get(token_hash).copied().unwrap_or_default();
     let cap = caps.iter_mut().find(|cap| cap.token_sha256 == token_hash);
     let keep = active && deadline > now && cap.as_ref().is_some_and(|cap| cap.expires_ms > now);
@@ -526,7 +534,7 @@ fn install(
         "issuance identity expired"
     );
     let _lock = projection_lock(config)?;
-    let mut caps: Vec<Capability> = read_private(&config.capabilities_file)?;
+    let mut caps: Vec<Capability> = projection(config)?;
     let mut journal = journal(config)?;
     journal.replays.retain(|_, expiry| *expiry > now);
     let replay = sha256(format!("{}:{}", job_identity.0.iss, job_identity.0.jti).as_bytes());
@@ -571,7 +579,7 @@ fn install(
     replace(&config.replay_file, &journal)?;
     caps.push(cap);
     replace(&config.capabilities_file, &caps)?;
-    let observed: Vec<Capability> = read_private(&config.capabilities_file)?;
+    let observed: Vec<Capability> = projection(config)?;
     ensure!(observed == caps, "capability projection readback differs");
     Ok(Response {
         schema: 1,
@@ -636,6 +644,21 @@ struct Broker {
 struct Watcher {
     hashes: BTreeSet<String>,
     read_token: String,
+    wakeup: Arc<tokio::sync::Notify>,
+}
+impl Watcher {
+    fn coalesce(&mut self, token_hash: String, token: &str) {
+        self.hashes.insert(token_hash);
+        self.read_token = token.to_owned();
+        // Notify stores a permit if an authority read is already in progress.
+        self.wakeup.notify_one();
+    }
+}
+async fn wait_for_renewal(wakeup: &tokio::sync::Notify) {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+        _ = wakeup.notified() => {},
+    }
 }
 impl Broker {
     fn new(config: Config, policy: PublisherPolicy) -> Result<Self> {
@@ -1025,19 +1048,22 @@ impl Broker {
         ))?;
         let mut watchers = self.watchers.lock().await;
         if let Some(watcher) = watchers.get_mut(&key) {
-            watcher.hashes.insert(token_hash);
-            watcher.read_token = token.to_owned();
+            watcher.coalesce(token_hash, token);
         } else {
+            let wakeup = Arc::new(tokio::sync::Notify::new());
             watchers.insert(
                 key.clone(),
                 Watcher {
                     hashes: BTreeSet::from([token_hash]),
                     read_token: token.to_owned(),
+                    wakeup: wakeup.clone(),
                 },
             );
             let broker = self.clone();
             tokio::spawn(async move {
-                broker.renew_while_running(context, check_run_id, key).await;
+                broker
+                    .renew_while_running(context, check_run_id, key, wakeup)
+                    .await;
             });
         }
         Ok(())
@@ -1047,9 +1073,10 @@ impl Broker {
         context: contract::ContextBinding,
         check_run_id: u64,
         key: String,
+        wakeup: Arc<tokio::sync::Notify>,
     ) {
         loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            wait_for_renewal(&wakeup).await;
             let Some((read_token, hashes)) = self
                 .watchers
                 .lock()
@@ -1208,9 +1235,16 @@ fn validate_paths(config: &Config, policy: &PublisherPolicy) -> Result<()> {
         ensure!(
             path.is_absolute()
                 && !path.starts_with(&config.scratch_root)
-                && !["/usr", "/bin", "/lib", "/lib64", "/etc/ssl/certs"]
-                    .iter()
-                    .any(|root| path.starts_with(root)),
+                && ![
+                    "/usr",
+                    "/bin",
+                    "/lib",
+                    "/lib64",
+                    "/etc/alternatives",
+                    "/etc/ssl/certs",
+                ]
+                .iter()
+                .any(|root| path.starts_with(root)),
             "verifier cannot read broker state or private TLS identity"
         );
     }
@@ -1661,7 +1695,7 @@ mod tests {
             expires_ms: now + HOUR_MS,
             access: Access::AttemptWriter {
                 tenant: "unrelated".into(),
-                task_id: "existing".into(),
+                task_id: "7".repeat(64),
                 attempt: 1,
                 fence: 1,
             },
@@ -1736,6 +1770,110 @@ mod tests {
         assert_eq!(caps.len(), 2);
         assert_ne!(caps[0].token_sha256, caps[1].token_sha256);
         assert_eq!(journal(&c).unwrap().issued.len(), 2);
+    }
+    #[test]
+    fn invalid_existing_projection_denies_issuance_without_mutation() {
+        for invalid in ["duplicate", "reader", "publisher", "attempt"] {
+            let (_temp, c, p, r, claims, keys) = fixture();
+            let now = now_ms().unwrap();
+            let mut cap = Capability {
+                token_sha256: "8".repeat(64),
+                expires_ms: now + HOUR_MS,
+                access: Access::Reader {
+                    prefixes: vec![format!("research/sources/{}/", r.context.source_sha)],
+                },
+            };
+            match invalid {
+                "reader" => {
+                    cap.access = Access::Reader {
+                        prefixes: vec!["research/../private/".into()],
+                    }
+                }
+                "publisher" => {
+                    cap.access = Access::Publisher {
+                        prefixes: vec!["research/results/".into()],
+                    }
+                }
+                "attempt" => {
+                    cap.access = Access::AttemptWriter {
+                        tenant: "unrelated".into(),
+                        task_id: "7".repeat(64),
+                        attempt: 1,
+                        fence: 0,
+                    }
+                }
+                _ => {}
+            }
+            let caps = if invalid == "duplicate" {
+                vec![cap.clone(), cap]
+            } else {
+                vec![cap]
+            };
+            replace(&c.capabilities_file, &caps).unwrap();
+            let before = std::fs::read(&c.capabilities_file).unwrap();
+            let before_journal = std::fs::read(&c.replay_file).unwrap();
+            let verified = verify_identity(&signed(&claims), &keys, &c, &p, &r, now).unwrap();
+            assert!(
+                install(&c, &r, &verified, scope(&r, &p, None, now).unwrap(), now).is_err(),
+                "{invalid}"
+            );
+            assert_eq!(std::fs::read(&c.capabilities_file).unwrap(), before);
+            assert_eq!(std::fs::read(&c.replay_file).unwrap(), before_journal);
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn late_phases_wake_slow_reads_before_initial_lease_expires() {
+        for phase in [Phase::Publish, Phase::Read] {
+            let (_temp, c, p, mut r, claims, keys) = fixture();
+            let plan = native_plan(&r, &p);
+            bind_plan(&mut r, &plan, phase);
+            let wakeup = Arc::new(tokio::sync::Notify::new());
+            let watcher = Arc::new(tokio::sync::Mutex::new(Watcher {
+                hashes: BTreeSet::from(["8".repeat(64)]),
+                read_token: "public-fixture-old-read-token".into(),
+                wakeup: wakeup.clone(),
+            }));
+            let (snapshot_tx, snapshot_rx) = tokio::sync::oneshot::channel();
+            let renewing = watcher.clone();
+            let monitor = tokio::spawn(async move {
+                wait_for_renewal(&wakeup).await;
+                let old_hashes = renewing.lock().await.hashes.clone();
+                snapshot_tx.send(old_hashes).unwrap();
+                // Both authority reads consume their entire bounded interval.
+                tokio::time::sleep(Duration::from_secs(35)).await;
+                wait_for_renewal(&wakeup).await;
+                let new_hashes = renewing.lock().await.hashes.clone();
+                tokio::time::sleep(Duration::from_secs(35)).await;
+                new_hashes
+            });
+            let old_hashes = snapshot_rx.await.unwrap();
+            let issued_at = tokio::time::Instant::now();
+            let now = now_ms().unwrap();
+            let verified = verify_identity(&signed(&claims), &keys, &c, &p, &r, now).unwrap();
+            let response = install(
+                &c,
+                &r,
+                &verified,
+                scope(&r, &p, Some(&plan), now).unwrap(),
+                now,
+            )
+            .unwrap();
+            let hash = sha256(response.token.as_bytes());
+            assert!(!old_hashes.contains(&hash));
+            watcher
+                .lock()
+                .await
+                .coalesce(hash.clone(), "public-fixture-new-read-token");
+            let new_hashes = monitor.await.unwrap();
+            let elapsed_ms = issued_at.elapsed().as_millis() as u64;
+            assert_eq!(elapsed_ms, 70_000);
+            assert!(elapsed_ms < LEASE_MS);
+            assert!(new_hashes.contains(&hash));
+            assert!(refresh(&c, &hash, true, now + elapsed_ms).unwrap());
+            let observed = projection(&c).unwrap();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].expires_ms, now + elapsed_ms + LEASE_MS);
+        }
     }
     #[test]
     fn shared_projection_lock_and_private_files_fail_closed() {

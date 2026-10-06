@@ -147,6 +147,8 @@ Two native plans may run concurrently; requests have a 150-second bound.
 
 Each response grants an initial lease of at most two minutes.
 One monitor serves all capabilities issued to the same signed publisher job.
+A newly coalesced phase wakes that monitor, including during an authority read.
+It cannot wait through a second normal sleep before its first refresh.
 Every minute it reads that job and the latest authenticated required checks independently.
 Queued, failed or missing exact-source checks stop renewal and remove issued access.
 Required-check reads never use the renewal snapshot cache.
@@ -184,3 +186,6 @@ implementation; this client neither adds PG nor enables platform authority.
 An operator may integrate an existing compliant broker/gateway implementation.
 Choosing hosting, adding a publisher-only storage adapter or changing raw OCI
 staging policy are separate decisions. No new instance is required by this PR.
+
+Broker projection reads and issuance readback apply the gateway's existing validation rules.
+Malformed unrelated entries deny issuance before journal or projection mutation.
