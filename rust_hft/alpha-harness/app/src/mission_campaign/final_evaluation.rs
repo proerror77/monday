@@ -3,8 +3,97 @@ use super::*;
 use alpha_domain::campaign_finalization::SignedCampaignFinalEvaluationGrantV1;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) const REQUEST_SCHEMA: &str = "monday.campaign_final_request.v1";
+pub(crate) const REQUEST_SCHEMA: &str = "monday.campaign_final_request.v2";
 const FREEZE_SCHEMA: &str = "monday.campaign_final_freeze.v1";
+const NATIVE_FINAL_INPUTS_SCHEMA: &str = "monday.cex_native_final_inputs.v1";
+const MAX_NATIVE_FINAL_PARTITION_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Content-addressed withheld partitions are carried only by the separately
+/// admitted final request. The development CampaignRequest continues to expose
+/// only its existing development blocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeFinalPartitionRefV1 {
+    pub object_url: String,
+    pub content_sha256: String,
+    pub rows: u64,
+    pub source_content_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeFinalInputsV1 {
+    pub schema_version: String,
+    pub final_grant_sha256: String,
+    pub source_result_sha256: String,
+    pub prepared_collection_sha256: String,
+    pub evaluation_protocol_sha256: String,
+    pub holdout_id: String,
+    pub selection: NativeFinalPartitionRefV1,
+    pub sealed_holdout: NativeFinalPartitionRefV1,
+}
+
+impl NativeFinalInputsV1 {
+    fn validate_for(
+        &self,
+        grant: &SignedCampaignFinalEvaluationGrantV1,
+        source: &CampaignRequest,
+        source_result_sha256: &str,
+    ) -> anyhow::Result<()> {
+        let prepared = source
+            .prepared_inputs
+            .as_ref()
+            .context("native final-input bridge requires a prepared development collection")?;
+        let valid_digest =
+            |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if self.schema_version != NATIVE_FINAL_INPUTS_SCHEMA
+            || self.final_grant_sha256 != grant.content_sha256
+            || self.source_result_sha256 != source_result_sha256
+            || self.prepared_collection_sha256 != prepared.collection_sha256
+            || self.evaluation_protocol_sha256 != grant.grant.execution.evaluation_protocol_sha256
+            || self.holdout_id != source.holdout_id
+            || self.selection.rows == 0
+            || self.sealed_holdout.rows == 0
+            || !valid_digest(&self.selection.content_sha256)
+            || !valid_digest(&self.selection.source_content_sha256)
+            || !valid_digest(&self.sealed_holdout.content_sha256)
+            || !valid_digest(&self.sealed_holdout.source_content_sha256)
+        {
+            bail!("native final-input bridge identity or partition binding changed");
+        }
+        for (label, partition) in [
+            ("selection", &self.selection),
+            ("sealed holdout", &self.sealed_holdout),
+        ] {
+            canonical_final_object(label, &partition.object_url)?;
+        }
+        Ok(())
+    }
+}
+
+/// Decode a partition only after its final-request capability has been
+/// verified. The producer wire format is newline-delimited native research
+/// rows, so row count and bytes are both checked before evaluation.
+fn decode_native_final_partition(
+    reference: &NativeFinalPartitionRefV1,
+    bytes: &[u8],
+) -> anyhow::Result<Vec<alpha_engine::evaluation::ResearchRow>> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_NATIVE_FINAL_PARTITION_BYTES
+        || hex::encode(Sha256::digest(bytes)) != reference.content_sha256
+    {
+        bail!("native final partition byte identity or size is invalid");
+    }
+    let rows = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice)
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() as u64 != reference.rows {
+        bail!("native final partition row count differs from its manifest");
+    }
+    Ok(rows)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +104,9 @@ pub(crate) struct FinalRequest {
     pub build_source_revision: String,
     pub image_identity: String,
     pub grant: SignedCampaignFinalEvaluationGrantV1,
+    /// Present only for native prepared campaigns; never copied to a search worker.
+    #[serde(default)]
+    pub native_final_inputs: BTreeMap<String, NativeFinalInputsV1>,
     /// Original request bytes remain identity evidence; fresh read capabilities
     /// are a separate map and cannot rewrite the settled request identities.
     pub sources: BTreeMap<String, CampaignRequest>,
@@ -41,6 +133,15 @@ impl FinalRequest {
         sources: BTreeMap<String, CampaignRequest>,
         output_root: String,
     ) -> anyhow::Result<Self> {
+        Self::new_with_native_final_inputs(grant, sources, BTreeMap::new(), output_root)
+    }
+
+    pub(crate) fn new_with_native_final_inputs(
+        grant: SignedCampaignFinalEvaluationGrantV1,
+        sources: BTreeMap<String, CampaignRequest>,
+        native_final_inputs: BTreeMap<String, NativeFinalInputsV1>,
+        output_root: String,
+    ) -> anyhow::Result<Self> {
         let first = sources
             .values()
             .next()
@@ -55,6 +156,7 @@ impl FinalRequest {
             image_identity,
             grant,
             sources,
+            native_final_inputs,
             read_urls: BTreeMap::new(),
             result_put_url: String::new(),
             result_readback_url: String::new(),
@@ -99,6 +201,7 @@ impl FinalRequest {
             &self.schema_version,
             &self.grant.content_sha256,
             sources,
+            &self.native_final_inputs,
             &self.output_root,
         ))?;
         Ok(format!("cex-final-{}", &hash[..32]))
@@ -121,6 +224,16 @@ impl FinalRequest {
                     objects.insert(canonical_final_object("final source round", url)?);
                 }
             }
+        }
+        for bridge in self.native_final_inputs.values() {
+            objects.insert(canonical_final_object(
+                "native selection input",
+                &bridge.selection.object_url,
+            )?);
+            objects.insert(canonical_final_object(
+                "native sealed input",
+                &bridge.sealed_holdout.object_url,
+            )?);
         }
         Ok(objects)
     }
@@ -167,6 +280,32 @@ impl FinalRequest {
             {
                 bail!("final source data, holdout cohort or code differs from the closed family");
             }
+        }
+        let native_sources = self
+            .sources
+            .iter()
+            .filter(|(_, source)| source.prepared_inputs.is_some())
+            .map(|(operation, _)| operation.clone())
+            .collect::<BTreeSet<_>>();
+        if native_sources
+            != self
+                .native_final_inputs
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        {
+            bail!("native final-input bridge is missing or names a non-native source");
+        }
+        for (operation, bridge) in &self.native_final_inputs {
+            let source = self
+                .sources
+                .get(operation)
+                .context("native final source missing")?;
+            let result_sha256 = grant
+                .selected_results
+                .get(operation)
+                .context("native final source is not selected by the final grant")?;
+            bridge.validate_for(&self.grant, source, result_sha256)?;
         }
         let root = format!("{}/{}", self.output_root, self.campaign_id);
         for (url, expected) in [
@@ -1722,6 +1861,69 @@ mod tests {
         changed = signed;
         changed.read_urls.pop_first();
         assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn native_final_bridge_is_admission_only_and_rejects_unbound_inputs() {
+        let mut request = request();
+        let operation = request.sources.keys().next().unwrap().clone();
+        let digest = "1".repeat(64);
+        let partition = NativeFinalPartitionRefV1 {
+            object_url: "/tmp/selection.rows".into(),
+            content_sha256: digest.clone(),
+            rows: 2,
+            source_content_sha256: "2".repeat(64),
+        };
+        let bridge = NativeFinalInputsV1 {
+            schema_version: NATIVE_FINAL_INPUTS_SCHEMA.into(),
+            final_grant_sha256: request.grant.content_sha256.clone(),
+            source_result_sha256: request.grant.grant.selected_results[&operation].clone(),
+            prepared_collection_sha256: digest.clone(),
+            evaluation_protocol_sha256: request
+                .grant
+                .grant
+                .execution
+                .evaluation_protocol_sha256
+                .clone(),
+            holdout_id: request.sources[&operation].holdout_id.clone(),
+            selection: partition,
+            sealed_holdout: NativeFinalPartitionRefV1 {
+                object_url: "/tmp/sealed.rows".into(),
+                content_sha256: digest,
+                rows: 1,
+                source_content_sha256: "2".repeat(64),
+            },
+        };
+        assert!(
+            bridge
+                .validate_for(
+                    &request.grant,
+                    &request.sources[&operation],
+                    &request.grant.grant.selected_results[&operation],
+                )
+                .is_err(),
+            "legacy/whole-source requests must not masquerade as native prepared inputs"
+        );
+
+        request.native_final_inputs.insert(operation, bridge);
+        assert!(
+            request.validate().is_err(),
+            "a bridge cannot elevate an unprepared source"
+        );
+    }
+
+    #[test]
+    fn native_final_partition_rejects_bytes_that_do_not_match_the_manifest() {
+        let reference = NativeFinalPartitionRefV1 {
+            object_url: "/tmp/sealed.rows".into(),
+            content_sha256: "0".repeat(64),
+            rows: 1,
+            source_content_sha256: "1".repeat(64),
+        };
+        assert!(decode_native_final_partition(&reference, b"{}\n")
+            .unwrap_err()
+            .to_string()
+            .contains("byte identity"));
     }
 
     #[test]
