@@ -1,0 +1,50 @@
+# First start requires empty native/delivery state. Recovery explicitly changes
+# args to [resume, /config/session.json, CHECKPOINT_SHA256, NATIVE_STATE].
+# CHECKPOINT_SHA256 must be the current tenant/session registered schema2 snapshot.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: monday-foundation-session, namespace: monday-research}
+spec:
+  replicas: 0
+  serviceName: monday-foundation-session
+  persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}
+  selector: {matchLabels: {app: monday-foundation-session}}
+  template:
+    metadata: {labels: {app: monday-foundation-session, research.monday/foundation-access: admitted}}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      nodeSelector: {workload: research-data, kubernetes.io/arch: amd64}
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, fsGroupChangePolicy: OnRootMismatch, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: session-host
+          image: __SESSION_IMAGE__
+          command: [/usr/local/bin/research-session]
+          args: [start, /config/session.json]
+          stdin: true
+          stdinOnce: false
+          env:
+            - name: MONDAY_RESEARCH_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: monday-foundation-session-pg, key: url}}
+          resources: {requests: {cpu: '0.25', memory: 256Mi}, limits: {cpu: '1', memory: 1Gi}}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: state, mountPath: /state}
+            - {name: workspace, mountPath: /workspace, readOnly: true}
+            - {name: broker, mountPath: /run/broker, readOnly: true}
+            - {name: runtime, mountPath: /tmp}
+      volumes:
+        # Existing independently prepared readable Git source; never empty state.
+        - {name: workspace, persistentVolumeClaim: {claimName: __WORKSPACE_CLAIM__, readOnly: true}}
+        - {name: runtime, emptyDir: {sizeLimit: 64Mi}}
+        - {name: config, configMap: {name: monday-foundation-session}}
+        # Private CA and client identity/token are broker files, read by host.
+        - {name: broker, persistentVolumeClaim: {claimName: __BROKER_CLAIM__, readOnly: true}}
+  volumeClaimTemplates:
+    - metadata: {name: state}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: __STORAGE_CLASS__
+        resources: {requests: {storage: __SESSION_STORAGE__}}
