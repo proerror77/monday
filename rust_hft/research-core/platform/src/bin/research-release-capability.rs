@@ -1,13 +1,11 @@
 //! Exchange job identity for a bounded source/Build capability. Never mint one.
 use anyhow::{bail, ensure, Context, Result};
 use hft_research_platform::{
-    build::{pinned_image, BuildSpec},
+    build::pinned_image,
     identity,
-    release::SourceArchive,
     release_publisher::{read_json, PublisherPolicy},
     transport::TlsConfig,
 };
-use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     io::Write,
@@ -19,58 +17,9 @@ use std::{
 const LIFETIME_MS: u64 = 60 * 60 * 1000;
 const MAX_RESPONSE: usize = 64 * 1024;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ContextBinding {
-    repository: String,
-    source_sha: String,
-    product: String,
-    image_repository: String,
-    software_run_id: u64,
-    publisher_run_id: u64,
-    publisher_run_attempt: u32,
-    publisher_job_id: u64,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Phase {
-    Source,
-    Publish,
-    Read,
-}
-
-#[derive(Debug, Serialize)]
-struct Request {
-    schema: u32,
-    context: ContextBinding,
-    phase: Phase,
-    publisher_prefixes: Vec<String>,
-    image: Option<String>,
-    plan_sha256: Option<String>,
-    expires_ms: u64,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Plan {
-    schema: u32,
-    image: String,
-    source: SourceArchive,
-    builds: Vec<BuildSpec>,
-    publisher_prefixes: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Response {
-    schema: u32,
-    request_sha256: String,
-    expires_ms: u64,
-    role: String,
-    prefixes: Vec<String>,
-    token: String,
-}
+#[path = "../release_capability_contract.rs"]
+mod contract;
+use contract::{ContextBinding, Phase, Plan, Request, Response};
 
 fn now_ms() -> Result<u64> {
     Ok(u64::try_from(
@@ -264,7 +213,7 @@ async fn exchange(request: &Request, broker: &reqwest::Url, tls: &TlsConfig) -> 
         .as_str()
         .filter(|v| !v.is_empty())
         .context("GitHub OIDC identity missing")?;
-    let client = tls.client(Duration::from_secs(30), true)?;
+    let client = tls.client(Duration::from_secs(180), true)?;
     let github_read_token =
         std::env::var("GH_TOKEN").context("job read-only GitHub token required")?;
     let response = client
@@ -300,7 +249,13 @@ fn write_token(path: &Path, token: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| anyhow::anyhow!("arguments require UTF-8"))
+        })
+        .collect::<Result<_>>()?;
     let (phase, policy, context, plan, broker, gateway, output) = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["source", policy, context, broker, gateway, output] => (Phase::Source, *policy, *context, None, *broker, *gateway, *output),
         ["publish", policy, context, plan, broker, gateway, output] => (Phase::Publish, *policy, *context, Some(*plan), *broker, *gateway, *output),
@@ -329,6 +284,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hft_research_platform::{build::BuildSpec, release::SourceArchive};
     use serde_json::json;
 
     fn source() -> Request {
