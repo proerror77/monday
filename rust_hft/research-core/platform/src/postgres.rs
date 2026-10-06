@@ -537,12 +537,14 @@ impl Ledger {
         tx.commit().await?;
         Ok(id)
     }
-    /// Import the release verifier's signed proof. This can stage a Build while
+    /// Import a signed package whose actual objects were read back. This can stage a Build while
     /// authority is paused; it neither admits a Run nor enables a backend.
+    #[cfg(feature = "publisher")]
     pub async fn register_build(
         &self,
-        verified: &crate::release::VerifiedBuildRelease,
+        published: &crate::release_publisher::VerifiedPublishedBuildRelease,
     ) -> Result<String> {
+        let verified = published.verified();
         let artifact = verified.artifact();
         let id = artifact.id()?;
         let mut tx = self.pool.begin().await?;
