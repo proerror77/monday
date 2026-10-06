@@ -218,6 +218,40 @@ fn bind_native_sealed_access(
     })
 }
 
+fn validate_native_bridge_metadata(
+    bridge: &NativeFinalInputsV1,
+    metadata: &hft_cex_research_input::campaign::NativeDatasetMetadataV1,
+) -> anyhow::Result<()> {
+    let selection = metadata
+        .selection
+        .as_ref()
+        .context("native final bridge requires a reserved selection partition")?;
+    let sealed_tail_rows = metadata
+        .total_rows
+        .checked_sub(selection.original_rows.end)
+        .context("native selection range exceeds original source rows")?;
+    if bridge.selection.rows != selection.original_rows.len() as u64
+        || bridge.selection.source_content_sha256 != selection.source_content_sha256
+        || bridge.sealed_holdout.rows != sealed_tail_rows as u64
+        || bridge.sealed_holdout.source_content_sha256 != metadata.holdout.source_content_sha256
+        || bridge.decision_clock_index.rows != metadata.total_rows as u64
+    {
+        bail!("native final bridge partition extents or source identities differ from the verified original metadata");
+    }
+    Ok(())
+}
+
+fn verify_native_partition_source_rows(
+    reference: &NativeFinalPartitionRefV1,
+    rows: &[alpha_engine::evaluation::ResearchRow],
+    label: &str,
+) -> anyhow::Result<()> {
+    if hft_cex_research_input::identity(&rows)? != reference.source_content_sha256 {
+        bail!("{label} source rows differ from the verified original partition identity");
+    }
+    Ok(())
+}
+
 fn read_native_final_clock_index(
     path: &Path,
     reference: &NativeFinalClockIndexRefV1,
@@ -998,6 +1032,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         replay_artifact_sha256,
         replay_manifest_sha256,
         native_bridge,
+        native_metadata,
     ) = if first.prepared_inputs.is_some() {
         let bridge = request
             .native_final_inputs
@@ -1012,6 +1047,8 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             &client,
             &native_dir,
         )?;
+        let native_metadata = native.prepared().original_metadata().clone();
+        validate_native_bridge_metadata(bridge, &native_metadata)?;
         let original_materialization = native.render_inputs().materialization_bytes();
         if hex::encode(Sha256::digest(original_materialization)) != first.materialization_sha256 {
             bail!("native final materialization differs from its source identity");
@@ -1039,6 +1076,11 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             &request,
             &bridge.selection,
             &selection_path,
+            "native final selection",
+        )?;
+        verify_native_partition_source_rows(
+            &bridge.selection,
+            &selection_rows,
             "native final selection",
         )?;
         let dataset =
@@ -1094,6 +1136,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             replay.artifact_sha256.clone(),
             replay.manifest_sha256.clone(),
             Some(bridge),
+            Some(native_metadata),
         )
     } else {
         for (label, url, path, hash, limit) in [
@@ -1178,6 +1221,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             first.replay_artifact_sha256.clone(),
             first.replay_manifest_sha256.clone(),
             None,
+            None,
         )
     };
     let (selection, evaluated, outcome, precommit_ref, sealed_ref, bundle_ref, promotion_ref) =
@@ -1195,6 +1239,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
                 &replay_artifact_sha256,
                 &replay_manifest_sha256,
                 &inputs,
+                native_metadata.as_ref(),
                 &client,
                 &request,
             )?,
@@ -1205,6 +1250,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
                 &results,
                 &inputs,
                 native_bridge,
+                native_metadata.as_ref(),
                 &client,
                 &request,
             )?,
@@ -1327,6 +1373,7 @@ fn finalize_supervised_family(
     replay_artifact_sha256: &str,
     replay_manifest_sha256: &str,
     native_inputs_dir: &Path,
+    native_metadata: Option<&hft_cex_research_input::campaign::NativeDatasetMetadataV1>,
     client: &Client,
     request: &FinalRequest,
 ) -> anyhow::Result<FamilyOutcome> {
@@ -1572,6 +1619,28 @@ fn finalize_supervised_family(
                             &path,
                             "native sealed holdout",
                         )?;
+                        let metadata = native_metadata
+                            .context("native sealed partition has no verified original metadata")?;
+                        let selection_end = metadata
+                            .selection
+                            .as_ref()
+                            .context("native sealed partition has no selection boundary")?
+                            .original_rows
+                            .end;
+                        let holdout_offset = metadata
+                            .holdout
+                            .original_rows
+                            .start
+                            .checked_sub(selection_end)
+                            .context("native holdout begins before the sealed tail")?;
+                        let source_holdout_rows = rows
+                            .get(holdout_offset..)
+                            .context("native sealed tail is shorter than its holdout range")?;
+                        verify_native_partition_source_rows(
+                            &bridge.sealed_holdout,
+                            source_holdout_rows,
+                            "native sealed holdout",
+                        )?;
                         let attached = alpha_engine::evaluation::attach_native_sealed_holdout_rows(
                             dataset.clone(),
                             rows,
@@ -1632,6 +1701,7 @@ fn finalize_formula_family(
     results: &Path,
     native_inputs_dir: &Path,
     native_bridge: Option<&NativeFinalInputsV1>,
+    native_metadata: Option<&hft_cex_research_input::campaign::NativeDatasetMetadataV1>,
     client: &Client,
     request: &FinalRequest,
 ) -> anyhow::Result<FamilyOutcome> {
@@ -1755,6 +1825,28 @@ fn finalize_formula_family(
                         request,
                         &bridge.sealed_holdout,
                         &path,
+                        "native sealed holdout",
+                    )?;
+                    let metadata = native_metadata
+                        .context("native sealed partition has no verified original metadata")?;
+                    let selection_end = metadata
+                        .selection
+                        .as_ref()
+                        .context("native sealed partition has no selection boundary")?
+                        .original_rows
+                        .end;
+                    let holdout_offset = metadata
+                        .holdout
+                        .original_rows
+                        .start
+                        .checked_sub(selection_end)
+                        .context("native holdout begins before the sealed tail")?;
+                    let source_holdout_rows = rows
+                        .get(holdout_offset..)
+                        .context("native sealed tail is shorter than its holdout range")?;
+                    verify_native_partition_source_rows(
+                        &bridge.sealed_holdout,
+                        source_holdout_rows,
                         "native sealed holdout",
                     )?;
                     let attached = alpha_engine::evaluation::attach_native_sealed_holdout_rows(
@@ -2323,6 +2415,120 @@ mod tests {
             request.validate().is_err(),
             "a bridge cannot elevate an unprepared source"
         );
+    }
+
+    #[test]
+    fn native_final_bridge_binds_partition_source_identities_and_tail_extent() {
+        let rows = vec![alpha_engine::evaluation::ResearchRow {
+            series_id: 7,
+            available_time: chrono::DateTime::from_timestamp_nanos(10),
+            label_available_time: chrono::DateTime::from_timestamp_nanos(11),
+            signal: 0.0,
+            features: BTreeMap::from([("mid_price".to_string(), 100.0)]),
+            label: 0.01,
+            fee_bps: 2.0,
+            funding_bps: 0.0,
+            pit_funding: false,
+            latency_bps: 0.0,
+        }];
+        let row_identity = hft_cex_research_input::identity(&rows).unwrap();
+        let row_ref = NativeFinalPartitionRefV1 {
+            object_url: "/tmp/rows.jsonl".into(),
+            content_sha256: "1".repeat(64),
+            rows: 1,
+            source_content_sha256: row_identity,
+        };
+        verify_native_partition_source_rows(&row_ref, &rows, "fixture selection").unwrap();
+        let mut mismatched_row_ref = row_ref.clone();
+        mismatched_row_ref.source_content_sha256 = "2".repeat(64);
+        assert!(verify_native_partition_source_rows(
+            &mismatched_row_ref,
+            &rows,
+            "fixture selection"
+        )
+        .is_err());
+
+        let metadata = hft_cex_research_input::campaign::NativeDatasetMetadataV1 {
+            total_rows: 10,
+            original_window: hft_cex_research_input::data::Window {
+                start_ns: 0,
+                end_ns: 100,
+            },
+            original_rows_sha256: "a".repeat(64),
+            protocol_json: "{}".into(),
+            protocol_sha256: "b".repeat(64),
+            search_rows: 0..4,
+            visible_rows: 0..4,
+            development_window: hft_cex_research_input::data::Window {
+                start_ns: 0,
+                end_ns: 10,
+            },
+            authorized_context_end_ns: 9,
+            selection: Some(
+                hft_cex_research_input::campaign::OpaqueWithheldPartitionV1 {
+                    original_rows: 4..6,
+                    window: hft_cex_research_input::data::Window {
+                        start_ns: 10,
+                        end_ns: 20,
+                    },
+                    source_content_sha256: "c".repeat(64),
+                },
+            ),
+            holdout: hft_cex_research_input::campaign::OpaqueWithheldPartitionV1 {
+                original_rows: 7..10,
+                window: hft_cex_research_input::data::Window {
+                    start_ns: 30,
+                    end_ns: 40,
+                },
+                source_content_sha256: "d".repeat(64),
+            },
+        };
+        let operation_request = request();
+        let operation = operation_request.sources.keys().next().unwrap().clone();
+        let bridge = NativeFinalInputsV1 {
+            schema_version: NATIVE_FINAL_INPUTS_SCHEMA.into(),
+            final_grant_sha256: operation_request.grant.content_sha256.clone(),
+            source_result_sha256: operation_request.grant.grant.selected_results[&operation]
+                .clone(),
+            prepared_collection_sha256: "e".repeat(64),
+            evaluation_protocol_sha256: operation_request
+                .grant
+                .grant
+                .execution
+                .evaluation_protocol_sha256
+                .clone(),
+            holdout_id: operation_request.sources[&operation].holdout_id.clone(),
+            selection: NativeFinalPartitionRefV1 {
+                object_url: "/tmp/selection.rows".into(),
+                content_sha256: "1".repeat(64),
+                rows: 2,
+                source_content_sha256: "c".repeat(64),
+            },
+            sealed_holdout: NativeFinalPartitionRefV1 {
+                object_url: "/tmp/sealed-tail.rows".into(),
+                content_sha256: "2".repeat(64),
+                rows: 4,
+                source_content_sha256: "d".repeat(64),
+            },
+            decision_clock_index: NativeFinalClockIndexRefV1 {
+                object_url: "/tmp/clocks.rows".into(),
+                content_sha256: "3".repeat(64),
+                rows: 10,
+            },
+            selection_replay: NativeFinalReplayRefV1 {
+                artifact_url: "/tmp/replay.parquet".into(),
+                artifact_sha256: "4".repeat(64),
+                manifest_url: "/tmp/replay.json".into(),
+                manifest_sha256: "5".repeat(64),
+            },
+        };
+        validate_native_bridge_metadata(&bridge, &metadata).unwrap();
+        let mut changed = bridge.clone();
+        changed.sealed_holdout.rows -= 1;
+        assert!(validate_native_bridge_metadata(&changed, &metadata).is_err());
+        changed = bridge.clone();
+        changed.sealed_holdout.source_content_sha256 = "f".repeat(64);
+        assert!(validate_native_bridge_metadata(&changed, &metadata).is_err());
     }
 
     #[test]
