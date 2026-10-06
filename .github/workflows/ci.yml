@@ -344,6 +344,8 @@ jobs:
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-live --no-default-features --features probability-reversal-strategy --test prediction_probability --locked
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-runtime --features strategy-probability-reversal --test prediction_probability --locked
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy -p hft-live --no-default-features --features probability-reversal-strategy --all-targets --locked --no-deps -- -D warnings
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-runtime --no-default-features --features adapter-binance-execution,adapter-binance-prediction-execution --lib system_builder::execution_registry::tests --locked
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy -p hft-live --no-default-features --features binance-data,binance-prediction-data,polymarket-data --all-targets --locked --no-deps -- -D warnings
 
       - name: Check JSON feature matrix
         id: json
