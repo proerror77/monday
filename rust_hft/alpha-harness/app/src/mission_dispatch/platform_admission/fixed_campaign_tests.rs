@@ -214,6 +214,28 @@ fn exercise_exact_native_task(represented: bool) {
             changed.build_source_revision = changed_source.into();
             assert!(crate::mission_campaign::validate_request_for_execute(&changed).is_err());
         }
+        for change in ["producer", "receipt", "feature", "rows"] {
+            let mut changed = fixture.request.clone();
+            let binding = changed
+                .research_plan
+                .representation_binding
+                .as_mut()
+                .unwrap();
+            match change {
+                "producer" => {
+                    binding.producer_source_revision =
+                        "abcdef0123456789abcdef0123456789abcdef01".into()
+                }
+                "receipt" => binding.preparation_receipt_sha256 = "0".repeat(64),
+                "feature" => binding.feature_sha256 = "0".repeat(64),
+                "rows" => binding.development_rows_sha256 = "0".repeat(64),
+                _ => unreachable!(),
+            }
+            assert!(
+                crate::mission_campaign::validate_request_for_execute(&changed).is_err(),
+                "{change}"
+            );
+        }
         submission.request = fixture.request.clone();
         let validated = super::super::validate_submission_with_request_check(
             submission,

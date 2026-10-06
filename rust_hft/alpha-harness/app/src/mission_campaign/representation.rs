@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     mission_dispatch::admission::planning_view::{
-        with_authorized_prepared_view, VerifiedPlanningView,
+        with_authorized_prepared_view, NormalizedPlanningColumns, VerifiedPlanningView,
     },
     mission_render::{CexCampaignResearchPlanV1, PreparedCexInputs, RenderedCexMission},
     mission_runner::Materialization,
@@ -109,37 +109,85 @@ fn checked_columns(
     Ok(spec.feature_names.clone())
 }
 
+fn scope_inputs(scope: &VerifiedPlanningView<'_>) -> Result<PreparedCexInputs> {
+    let columns = scope.columns();
+    let source = columns.source();
+    PreparedCexInputs::restore_metadata(
+        scope.render_metadata()?.clone(),
+        &source.feature_sha256,
+        &source.materialization_sha256,
+    )
+}
+
+fn checked_normalized_columns(
+    data: &NormalizedPlanningColumns<'_>,
+    plan: &CexCampaignResearchPlanV1,
+) -> Result<Vec<String>> {
+    let metadata = data.original_metadata();
+    ensure!(
+        data.rows().len() == metadata.visible_rows.len()
+            && data.rows().iter().all(|row| {
+                row.available_time
+                    .timestamp_nanos_opt()
+                    .is_some_and(|time| {
+                        time >= metadata.development_window.start_ns
+                            && time < metadata.development_window.end_ns
+                    })
+            }),
+        "normalized column clocks exceed the approved development window"
+    );
+    for field in &plan.feature_fields {
+        ensure!(data.feature_names().contains(field) && data.rows().iter().all(|row| row.features.get(field).is_some_and(|value| value.is_finite())),
+            "registered column {field} is not already materialized; original producer preparation is required");
+    }
+    Ok(data.feature_names().to_vec())
+}
+
+fn validate_normalized_binding(
+    plan: &CexCampaignResearchPlanV1,
+    data: &NormalizedPlanningColumns<'_>,
+) -> Result<()> {
+    let binding = plan
+        .representation_binding
+        .as_ref()
+        .context("missing prepared-column binding")?;
+    ensure!(
+        binding.collection_sha256 == data.collection_id()
+            && binding.development_rows_sha256 == data.development_rows_sha256()
+            && binding.protocol_sha256 == data.protocol_sha256()
+            && binding.materialized_columns == checked_normalized_columns(data, plan)?,
+        "bound columns differ from the approved normalized projection"
+    );
+    Ok(())
+}
+
 fn preview_for_scope(
     scope: &VerifiedPlanningView<'_>,
     selected_arm: &str,
 ) -> Result<RepresentationCampaignContractRefsV1> {
     scope.recheck()?;
-    let prepared = scope.prepared();
-    let request = prepared.finalized_request();
-    let plan = registered_template(request.research_plan.clone(), selected_arm)?;
-    checked_columns(prepared.prepared(), &plan)?;
-    let seeds = request
-        .rounds
-        .iter()
-        .map(|round| round.seed)
-        .collect::<Vec<_>>();
-    let rendered = render_template(prepared.render_inputs(), &plan, &seeds)?;
+    let columns = scope.columns();
+    let plan = registered_template(scope.research_plan().clone(), selected_arm)?;
+    checked_normalized_columns(&columns, &plan)?;
+    let inputs = scope_inputs(scope)?;
+    let seeds = scope.seeds();
+    let rendered = render_template(&inputs, &plan, &seeds)?;
     let refs = contract_refs(
         &plan,
         &rendered.mission,
-        prepared.render_inputs().materialization(),
+        inputs.materialization(),
         &seeds,
-        &request.build_source_revision,
+        scope.runner_source_revision(),
     )?;
     ensure!(
         refs.planning_view == scope.view().view,
-        "selected template differs from the original signed search view"
+        "selected template differs from original signed search view"
     );
-    let window = &prepared.prepared().original_metadata().development_window;
+    let window = &columns.original_metadata().development_window;
     ensure!(
         i64::try_from(refs.window_start_ns)? == window.start_ns
             && i64::try_from(refs.window_end_ns)? == window.end_ns,
-        "goal window differs from the actual verified exclusive-end development projection"
+        "goal window differs from actual exclusive-end normalized projection"
     );
     scope.recheck()?;
     Ok(refs)
@@ -152,29 +200,25 @@ fn bind_for_scope(
 ) -> Result<CexCampaignResearchPlanV1> {
     scope.recheck()?;
     goal.validate().map_err(anyhow::Error::msg)?;
-    let prepared = scope.prepared();
-    let request = prepared.finalized_request();
-    let mut plan = registered_template(request.research_plan.clone(), selected_arm)?;
-    let columns = checked_columns(prepared.prepared(), &plan)?;
-    let seeds = request
-        .rounds
-        .iter()
-        .map(|round| round.seed)
-        .collect::<Vec<_>>();
+    let columns = scope.columns();
+    let mut plan = registered_template(scope.research_plan().clone(), selected_arm)?;
+    let names = checked_normalized_columns(&columns, &plan)?;
+    let inputs = scope_inputs(scope)?;
+    let seeds = scope.seeds();
     let declared = declared_total_trials_for_rounds(&plan, seeds.len())?;
-    let source = &prepared.prepared().manifest().source;
+    let source = columns.source();
     ensure!(
         goal.family_id == scope.view().family_id,
-        "goal belongs to a different signed planning family"
+        "goal belongs to a different signed family"
     );
     plan.representation_binding = Some(RepresentationCampaignBindingV1 {
         schema: "monday.representation_campaign_binding.v1".into(),
         goal: goal.clone(),
         planning_view: scope.view().clone(),
         selected_arm: selected_arm.into(),
-        runner_source_revision: request.build_source_revision.clone(),
-        collection_sha256: prepared.collection_id().into(),
-        development_rows_sha256: prepared.prepared().development_rows_sha256().into(),
+        runner_source_revision: scope.runner_source_revision().into(),
+        collection_sha256: columns.collection_id().into(),
+        development_rows_sha256: columns.development_rows_sha256().into(),
         producer_source_revision: source.build.source_revision.clone(),
         producer_image_identity: source.build.image_identity.clone(),
         preparation_run_id: source.preparation_run_id.clone(),
@@ -183,28 +227,28 @@ fn bind_for_scope(
         materialization_sha256: source.materialization_sha256.clone(),
         replay_artifact_sha256: source.replay_artifact_sha256.clone(),
         replay_manifest_sha256: source.replay_manifest_sha256.clone(),
-        protocol_sha256: prepared.evaluation_protocol_sha256().into(),
-        materialized_columns: columns,
+        protocol_sha256: columns.protocol_sha256().into(),
+        materialized_columns: names,
         seeds: seeds.clone(),
         declared_total_trials: declared,
     });
     plan.validate()?;
-    let rendered = render_template(prepared.render_inputs(), &plan, &seeds)?;
+    let rendered = render_template(&inputs, &plan, &seeds)?;
     let refs = contract_refs(
         &plan,
         &rendered.mission,
-        prepared.render_inputs().materialization(),
+        inputs.materialization(),
         &seeds,
-        &request.build_source_revision,
+        scope.runner_source_revision(),
     )?;
-    let window = &prepared.prepared().original_metadata().development_window;
+    let window = &columns.original_metadata().development_window;
     ensure!(
         i64::try_from(refs.window_start_ns)? == window.start_ns
             && i64::try_from(refs.window_end_ns)? == window.end_ns,
-        "goal window differs from the actual verified exclusive-end development projection"
+        "goal window differs from actual exclusive-end normalized projection"
     );
     validate_goal_contracts(plan.representation_binding.as_ref().unwrap(), &refs)?;
-    validate_verified_prepared_binding(&plan, prepared.prepared())?;
+    validate_normalized_binding(&plan, &columns)?;
     scope.recheck()?;
     Ok(plan)
 }
@@ -589,10 +633,10 @@ pub(crate) fn prepared_plan_for_fixture(
     root: &VerifiedCampaignRootGrant,
 ) -> Result<CexCampaignResearchPlanV1> {
     let refs = preview_for_scope(scope, "registered_h1_snapshot_family")?;
-    let request = scope.prepared().finalized_request();
-    let materialization = scope.prepared().render_inputs().materialization();
+    let inputs = scope_inputs(scope)?;
+    let materialization = inputs.materialization();
     let goal = RepresentationGoalV1 {
-        goal: reference("prepared-fixture-goal", &scope.prepared().collection_id())?,
+        goal: reference("prepared-fixture-goal", &scope.columns().collection_id())?,
         family_id: scope.view().family_id.clone(),
         venue: "binance".into(),
         market: materialization.market.clone(),
@@ -616,7 +660,7 @@ pub(crate) fn prepared_plan_for_fixture(
         },
     };
     ensure!(
-        request.build_source_revision == root.grant().execution.source_revision,
+        scope.runner_source_revision() == root.grant().execution.source_revision,
         "fixture runner source differs from signed authority"
     );
     let bound = bind_for_scope(scope, "registered_h1_snapshot_family", &goal)?;
@@ -632,7 +676,7 @@ fn assert_scope_regressions_for_fixture(
 ) -> Result<()> {
     // The baseline is actual decoded materialized data under current signed authority.
     bound.validate()?;
-    validate_verified_prepared_binding(bound, scope.prepared().prepared())?;
+    validate_normalized_binding(bound, &scope.columns())?;
     let declared = declared_total_trials_for_rounds(
         bound,
         bound.representation_binding.as_ref().unwrap().seeds.len(),
@@ -647,10 +691,9 @@ fn assert_scope_regressions_for_fixture(
             && declared > 2,
         "scope fixture did not retain original scientific accounting"
     );
-    let inputs = scope.prepared().render_inputs();
-    let original = scope.prepared().finalized_request();
+    let inputs = scope_inputs(scope)?;
     let seeds = bound.representation_binding.as_ref().unwrap().seeds.clone();
-    render_template(inputs, bound, &seeds)?;
+    render_template(&inputs, bound, &seeds)?;
     for change in [
         "model",
         "scaling",
@@ -685,13 +728,8 @@ fn assert_scope_regressions_for_fixture(
         "prepared fixture accepted an unregistered column family"
     );
     if !scope
-        .prepared()
-        .prepared()
-        .manifest()
-        .features
-        .manifest
-        .spec
-        .feature_names
+        .columns()
+        .feature_names()
         .contains(&"cont_ofi_lag60s".into())
     {
         ensure!(
@@ -706,7 +744,7 @@ fn assert_scope_regressions_for_fixture(
         .unwrap()
         .collection_sha256 = "0".repeat(64);
     ensure!(
-        validate_verified_prepared_binding(&changed, scope.prepared().prepared()).is_err(),
+        validate_normalized_binding(&changed, &scope.columns()).is_err(),
         "actual decoded collection identity was ignored"
     );
     let mut changed = bound.clone();
@@ -716,7 +754,7 @@ fn assert_scope_regressions_for_fixture(
         .unwrap()
         .runner_source_revision = "abcdef0123456789abcdef0123456789abcdef01".into();
     ensure!(
-        render_template(inputs, &changed, &seeds).is_err(),
+        render_template(&inputs, &changed, &seeds).is_err(),
         "bound runner drift was ignored"
     );
     let mut changed = bound.clone();
@@ -730,31 +768,6 @@ fn assert_scope_regressions_for_fixture(
         changed.validate().is_err(),
         "selected registered column was removed"
     );
-    let mut request = original.clone();
-    request.research_plan = bound.clone();
-    // The pure data/request check precedes transport identity and checks original producer facts.
-    validate_campaign_request(&request)?;
-    for change in ["producer", "receipt", "feature", "rows"] {
-        let mut request = request.clone();
-        let binding = request
-            .research_plan
-            .representation_binding
-            .as_mut()
-            .unwrap();
-        match change {
-            "producer" => {
-                binding.producer_source_revision = "abcdef0123456789abcdef0123456789abcdef01".into()
-            }
-            "receipt" => binding.preparation_receipt_sha256 = "0".repeat(64),
-            "feature" => binding.feature_sha256 = "0".repeat(64),
-            "rows" => binding.development_rows_sha256 = "0".repeat(64),
-            _ => unreachable!(),
-        }
-        ensure!(
-            validate_campaign_request(&request).is_err(),
-            "prepared fixture accepted {change} identity drift"
-        );
-    }
     scope.recheck()?;
     Ok(())
 }

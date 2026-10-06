@@ -80,6 +80,8 @@ Unit cases verify software behavior. They do not prove real data coverage, train
 
 The second slice exposes `preview_representation_campaign_contracts` and `bind_signed_prepared_representation_campaign`.
 Both accept the original control and request paths. They use the shared current Root/Study planning guard before inspecting prepared inputs.
+Planner callbacks borrow only normalized rows, column names, source identities, protocol and window facts. Replay, full manifests and transports remain private to IO.
+The current source-only fixed-calendar projection cannot execute a scientific Campaign. Its readiness gate rejects execution before budget reservation.
 The binder selects exact registered H1 or H2 columns from the original decoded development projection. It does not regenerate columns.
 A missing `cont_ofi_lag60s` column requires the original producer to prepare it. Its name alone cannot establish raw OFI qualification.
 
