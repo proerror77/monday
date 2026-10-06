@@ -64,6 +64,48 @@ pub struct FieldClockV1 {
     pub decision_ns: u64,
 }
 
+/// A source/window declaration. Only original artifact verifiers establish its facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRuleCoverageV1 {
+    pub market: String,
+    pub symbol: String,
+    pub sources: Vec<CexResearchContentRefV1>,
+    pub rules_identity_sha256: String,
+    pub first_available_ns: u64,
+    pub last_available_ns: u64,
+    pub max_gap_ns: u64,
+}
+
+impl InstrumentRuleCoverageV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        CexResearchContentRefV1 {
+            id: "instrument-rules".into(),
+            content_sha256: self.rules_identity_sha256.clone(),
+        }
+        .validate()
+        .map_err(|error| error.to_string())?;
+        if !matches!(self.market.as_str(), "usdm" | "spot")
+            || self.symbol.is_empty()
+            || self.sources.is_empty()
+            || self.sources.len() > MAX_CAPABILITY_SOURCES
+            || self.first_available_ns == 0
+            || self.last_available_ns < self.first_available_ns
+            || self.max_gap_ns > hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS
+        {
+            return Err("invalid instrument-rule coverage declaration".into());
+        }
+        let mut identities = BTreeSet::new();
+        for source in &self.sources {
+            source.validate().map_err(|error| error.to_string())?;
+            if !identities.insert(&source.content_sha256) {
+                return Err("repeated instrument-rule source identity".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 impl FieldClockV1 {
     pub fn validate(&self) -> Result<(), String> {
         if self.field.is_empty()
@@ -93,6 +135,7 @@ pub struct DataCapabilityV1 {
     pub series: Vec<BookSeriesCapabilityV1>,
     pub fields: Vec<FieldClockV1>,
     pub aggregate_trade_direction: bool,
+    pub instrument_rules: Option<InstrumentRuleCoverageV1>,
     pub view: PlanningViewV1,
 }
 
@@ -126,6 +169,20 @@ impl DataCapabilityV1 {
             source.validate().map_err(|e| e.to_string())?;
             if !sources.insert(&source.content_sha256) {
                 return Err("repeated source identity".into());
+            }
+        }
+        if let Some(rules) = &self.instrument_rules {
+            rules.validate()?;
+            if rules.market != self.market
+                || rules.symbol != self.symbol
+                || rules
+                    .sources
+                    .iter()
+                    .any(|reference| !self.sources.iter().any(|source| source == reference))
+            {
+                return Err(
+                    "instrument-rule scope or sources differ from the data capability".into(),
+                );
             }
         }
         let mut sessions = BTreeSet::new();
@@ -271,7 +328,7 @@ pub struct RepresentationArmV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepresentationPlanStatusV1 {
-    RequiresDataVerificationAndNativeAdmission,
+    NoExecutableComparison,
     NoFeasibleComparison,
 }
 
@@ -285,9 +342,13 @@ pub struct RepresentationPlanV1 {
     pub status: RepresentationPlanStatusV1,
     pub goal: RepresentationGoalV1,
     pub matches: Vec<ToolMatchV1>,
+    /// Unfunded representation materials; these are not scientific trials.
+    pub materializations: Vec<RepresentationArmV1>,
+    /// Reserved for a future native execution contract. This planner emits none.
     pub arms: Vec<RepresentationArmV1>,
     pub hypothesis: Option<CexResearchHypothesisV1>,
-    pub requested_resources: PlanningResourcesV1,
+    /// Unknown until an actual execution template and accounting contract are bound.
+    pub requested_resources: Option<PlanningResourcesV1>,
     pub limitations: Vec<String>,
 }
 impl RepresentationPlanV1 {

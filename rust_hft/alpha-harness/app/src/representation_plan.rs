@@ -5,8 +5,18 @@ use data::{
     binance_lob_replay::ReplaySequenceEvent,
     binance_market_tape_artifact::{ReplayedBinanceBookEvent, VerifiedBinanceMarketTapeSeries},
 };
+use hft_collector::{
+    binance_spot_reference_artifact::VerifiedSpotReferenceArtifact,
+    binance_usdm_reference_artifact::VerifiedReferenceArtifact,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+
+/// Borrow only source-bound handles returned by the original rule artifact verifiers.
+pub enum VerifiedInstrumentRuleReferences<'a> {
+    Spot(&'a [VerifiedSpotReferenceArtifact]),
+    Usdm(&'a [VerifiedReferenceArtifact]),
+}
 
 /// This handle cannot be restored from JSON. Reverify raw objects after a process restart.
 /// It confirms raw integrity and replay continuity, not permission, scientific success or execution admission.
@@ -38,6 +48,26 @@ impl VerifiedTapeRepresentationProposal {
 /// This function does not acquire data, fit models, call an LLM, debit budget or submit a Campaign.
 pub fn plan_from_verified_tape(
     series: &[VerifiedBinanceMarketTapeSeries],
+    view: PlanningViewV1,
+    goal: &RepresentationGoalV1,
+) -> Result<VerifiedTapeRepresentationProposal> {
+    plan_from_verified_tape_inner(series, None, view, goal)
+}
+
+/// Propose materials only after source-bound rules cover the same instrument and window.
+/// This still does not resolve a scientific trial budget or native execution authority.
+pub fn plan_from_verified_tape_with_rules(
+    series: &[VerifiedBinanceMarketTapeSeries],
+    references: VerifiedInstrumentRuleReferences<'_>,
+    view: PlanningViewV1,
+    goal: &RepresentationGoalV1,
+) -> Result<VerifiedTapeRepresentationProposal> {
+    plan_from_verified_tape_inner(series, Some(references), view, goal)
+}
+
+fn plan_from_verified_tape_inner(
+    series: &[VerifiedBinanceMarketTapeSeries],
+    references: Option<VerifiedInstrumentRuleReferences<'_>>,
     view: PlanningViewV1,
     goal: &RepresentationGoalV1,
 ) -> Result<VerifiedTapeRepresentationProposal> {
@@ -209,6 +239,20 @@ pub fn plan_from_verified_tape(
     if latest_available == 0 || summaries.is_empty() {
         bail!("no observed book before the planned decision window");
     }
+    let instrument_rules = references
+        .map(|references| rule_coverage(references, goal))
+        .transpose()?;
+    if let Some(rules) = &instrument_rules {
+        for reference in &rules.sources {
+            if seen_sources.insert(reference.content_sha256.clone()) {
+                ensure!(
+                    sources.len() < MAX_CAPABILITY_SOURCES,
+                    "too many immutable source identities"
+                );
+                sources.push(reference.clone());
+            }
+        }
+    }
     let capability = DataCapabilityV1 {
         schema: CAPABILITY_SCHEMA.into(),
         venue: "binance".into(),
@@ -226,6 +270,12 @@ pub fn plan_from_verified_tape(
                         include_str!(
                             "../../../data-pipelines/core/src/binance_market_tape_artifact.rs"
                         ),
+                        include_str!(
+                            "../../../tools/collector/src/binance_spot_reference_artifact.rs"
+                        ),
+                        include_str!(
+                            "../../../tools/collector/src/binance_usdm_reference_artifact.rs"
+                        ),
                     )
                     .as_bytes()
                 )
@@ -241,6 +291,7 @@ pub fn plan_from_verified_tape(
             decision_ns: goal.window_end_ns,
         }],
         aggregate_trade_direction: directional_trades,
+        instrument_rules,
         view,
     };
     let proposal =
@@ -249,6 +300,150 @@ pub fn plan_from_verified_tape(
     Ok(VerifiedTapeRepresentationProposal {
         capability,
         proposal,
+    })
+}
+
+fn rule_coverage(
+    references: VerifiedInstrumentRuleReferences<'_>,
+    goal: &RepresentationGoalV1,
+) -> Result<InstrumentRuleCoverageV1> {
+    let mut observations = Vec::new();
+    let mut sources = Vec::new();
+    let mut seen_sources = BTreeSet::new();
+    let mut rule_identity = None;
+    let mut observe = |received, identity: String, data: &str, manifest: &str| -> Result<()> {
+        ensure!(
+            rule_identity.get_or_insert_with(|| identity.clone()) == &identity,
+            "instrument rules changed inside the supplied PIT window"
+        );
+        observations.push(received);
+        for (kind, digest) in [
+            ("instrument-rule-data", data),
+            ("instrument-rule-manifest", manifest),
+        ] {
+            if seen_sources.insert(digest.to_owned()) {
+                ensure!(
+                    sources.len() < MAX_CAPABILITY_SOURCES,
+                    "too many instrument-rule sources"
+                );
+                sources.push(CexResearchContentRefV1 {
+                    id: format!("{kind}-{digest}"),
+                    content_sha256: digest.into(),
+                });
+            }
+        }
+        Ok(())
+    };
+    match references {
+        VerifiedInstrumentRuleReferences::Usdm(references) => {
+            ensure!(
+                goal.market == "usdm"
+                    && !references.is_empty()
+                    && references.len() <= MAX_CAPABILITY_SOURCES / 2,
+                "nonempty USD-M rule artifacts must match the goal market"
+            );
+            for reference in references {
+                let rule = reference
+                    .contracts()
+                    .iter()
+                    .find(|rule| rule.symbol == goal.symbol)
+                    .context("verified USD-M rule artifact lacks the requested instrument")?;
+                let identity = alpha_domain::canonical_json_hash(&(
+                    rule.tick_size,
+                    rule.step_size,
+                    rule.min_notional,
+                ))?;
+                observe(
+                    rule.received_at_ns,
+                    identity,
+                    reference.data_sha256(),
+                    reference.manifest_sha256(),
+                )?;
+            }
+        }
+        VerifiedInstrumentRuleReferences::Spot(references) => {
+            ensure!(
+                goal.market == "spot"
+                    && !references.is_empty()
+                    && references.len() <= MAX_CAPABILITY_SOURCES / 2,
+                "nonempty Spot rule artifacts must match the goal market"
+            );
+            for reference in references {
+                let rule = reference
+                    .rules()
+                    .iter()
+                    .find(|rule| rule.symbol == goal.symbol)
+                    .context("verified Spot rule artifact lacks the requested instrument")?;
+                ensure!((rule.price_filter.tick_size.is_sign_positive() && !rule.price_filter.tick_size.is_zero())
+                    && (rule.lot_size_filter.step_size.is_sign_positive() && !rule.lot_size_filter.step_size.is_zero())
+                    && (rule.lot_size_filter.min_quantity.is_sign_positive() && !rule.lot_size_filter.min_quantity.is_zero())
+                    && (rule.lot_size_filter.max_quantity.is_sign_positive() && !rule.lot_size_filter.max_quantity.is_zero())
+                    && rule.market_lot_size_filter.as_ref().is_none_or(|filter| (filter.max_quantity.is_sign_negative() || filter.max_quantity.is_zero()) || filter.min_quantity <= filter.max_quantity)
+                    && rule.notional_filter.max_notional.is_none_or(|max| (max.is_sign_positive() && !max.is_zero()) && max >= rule.notional_filter.min_notional),
+                    "verified Spot rule artifact has disabled or invalid materialization fill bounds");
+                let mut identity = serde_json::to_value(rule)?;
+                let identity = identity
+                    .as_object_mut()
+                    .context("Spot rule identity is not an object")?;
+                for clock in [
+                    "source_time_ms",
+                    "source_clock_received_at_ns",
+                    "received_at_ns",
+                ] {
+                    identity.remove(clock);
+                }
+                let identity = alpha_domain::canonical_json_hash(identity)?;
+                observe(
+                    rule.received_at_ns,
+                    identity,
+                    reference.data_sha256(),
+                    reference.manifest_sha256(),
+                )?;
+            }
+        }
+    }
+    observations.sort_unstable();
+    observations.dedup();
+    let lookback_start = goal
+        .window_start_ns
+        .checked_sub(60_000_000_000)
+        .context("representation lookback underflow")?;
+    let horizon_ns = goal
+        .labels
+        .observation_frequency_millis
+        .checked_mul(goal.labels.horizon_buckets as u64)
+        .and_then(|millis| millis.checked_mul(1_000_000))
+        .context("label availability window overflow")?;
+    let label_end = goal
+        .window_end_ns
+        .checked_add(horizon_ns)
+        .context("label availability window overflow")?;
+    let before = observations
+        .iter()
+        .rposition(|&time| time <= lookback_start)
+        .context("instrument-rule coverage starts after the required lookback")?;
+    let after = observations
+        .iter()
+        .position(|&time| time >= label_end)
+        .context("instrument-rule coverage ends before label availability")?;
+    let selected = &observations[before..=after];
+    let max_gap_ns = selected
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .max()
+        .unwrap_or(0);
+    ensure!(
+        max_gap_ns <= hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS,
+        "instrument-rule coverage has a gap above 90s"
+    );
+    Ok(InstrumentRuleCoverageV1 {
+        market: goal.market.clone(),
+        symbol: goal.symbol.clone(),
+        sources,
+        rules_identity_sha256: rule_identity.context("instrument rules are missing")?,
+        first_available_ns: selected[0],
+        last_available_ns: *selected.last().unwrap(),
+        max_gap_ns,
     })
 }
 
@@ -359,7 +554,7 @@ mod tests {
         let name = format!("part-{start}.jsonl.zst");
         let sha = format!("{:x}", Sha256::digest(compressed));
         let mut manifest = serde_json::json!({
-            "schema":rows.first().unwrap()["schema"],"venue":"binance","market":"usdm","dataset":dataset,"shard_id":shard_id,"mode":"diff",
+            "schema":rows.first().unwrap()["schema"],"venue":"binance","market":rows.first().unwrap()["market"],"dataset":dataset,"shard_id":shard_id,"mode":"diff",
             "symbols":["BTCUSDT"],"security_token_symbols":[],"excluded_symbols":[],"snapshot_limit":1000,
             "replay_scope":"captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs","venue_depth_complete":false,
             "events":rows.len(),"event_types":counts,"has_replay_safe_checkpoint":true,
@@ -447,7 +642,8 @@ mod tests {
         );
         assert_eq!(output.capability().series[0].captured_seed_depth, 5);
         assert_eq!(output.capability().sources.len(), 2);
-        assert_eq!(output.proposal().arms.len(), 2);
+        assert!(output.proposal().arms.is_empty());
+        assert!(output.proposal().materializations.is_empty());
         assert_eq!(
             output.to_readonly_json().unwrap()["permission_and_execution"],
             "requires_current_native_admission"
@@ -509,12 +705,7 @@ mod tests {
             + "\n";
         // A small standard Zstd frame with one uncompressed block. The original
         // sealer and verifier decode and check it; no test verification handle is minted.
-        let size = u32::try_from(raw.len()).unwrap();
-        assert!(size < 128 * 1024);
-        let mut compressed = vec![0x28, 0xb5, 0x2f, 0xfd, 0xa0];
-        compressed.extend_from_slice(&size.to_le_bytes());
-        compressed.extend_from_slice(&(size * 8 + 1).to_le_bytes()[..3]);
-        compressed.extend_from_slice(raw.as_bytes());
+        let compressed = raw_block_fixture(&raw);
         fixture_with(
             &raw,
             &compressed,
@@ -522,6 +713,16 @@ mod tests {
             shard,
             lob_only.then_some(&["depth@100ms"][..]),
         )
+    }
+
+    fn raw_block_fixture(raw: &str) -> Vec<u8> {
+        let size = u32::try_from(raw.len()).unwrap();
+        assert!(size < 128 * 1024);
+        let mut compressed = vec![0x28, 0xb5, 0x2f, 0xfd, 0xa0];
+        compressed.extend_from_slice(&size.to_le_bytes());
+        compressed.extend_from_slice(&(size * 8 + 1).to_le_bytes()[..3]);
+        compressed.extend_from_slice(raw.as_bytes());
+        compressed
     }
 
     #[test]
@@ -599,6 +800,339 @@ mod tests {
             );
             let (view, goal) = planning_bindings();
             assert!(plan_from_verified_tape(&series, view, &goal).is_err());
+        }
+    }
+
+    #[test]
+    fn review_tape_only_inventory_reports_missing_instrument_rules() {
+        use data::binance_market_tape_artifact::{
+            seal_binance_market_tape_triplet,
+            verify_binance_market_tape_series_with_required_lob_continuity,
+        };
+        let (_root, triplet, anchor) = fixture();
+        let series = verify_binance_market_tape_series_with_required_lob_continuity(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap();
+        let (view, mut goal) = planning_bindings();
+        goal.resource_limit.trials = 1_000;
+        let output = plan_from_verified_tape(&series, view, &goal).unwrap();
+        assert!(output.proposal().arms.is_empty());
+        assert!(output
+            .proposal()
+            .limitations
+            .iter()
+            .any(|reason| reason.contains("instrument-rule")));
+    }
+
+    fn rule_fixture(
+        received: u64,
+        symbol: &str,
+        tick_size: &str,
+    ) -> (tempfile::TempDir, VerifiedReferenceArtifact) {
+        use data::binance_usdm_reference::{
+            ActivePerpetualContract, CompleteReferenceBatch, MarkIndexFundingObservation,
+            OpenInterestObservation, EXCHANGE_INFO_ENDPOINT, OPEN_INTEREST_ENDPOINT,
+            PREMIUM_INDEX_ENDPOINT, REFERENCE_SCHEMA, SERVER_TIME_ENDPOINT,
+        };
+        use hft_collector::binance_usdm_reference_artifact::{
+            publish_reference_batch, verify_bound_reference_artifact_read_only_current_batch,
+            ReferenceArtifactConfig,
+        };
+        use hft_collector::binance_usdm_reference_collector::OFFICIAL_USDM_SOURCE_ORIGIN;
+        let source_ms = (received - 10_000_000) / 1_000_000;
+        let batch = CompleteReferenceBatch::new(
+            vec![ActivePerpetualContract {
+                schema: REFERENCE_SCHEMA.into(),
+                symbol: symbol.into(),
+                pair: symbol.into(),
+                base_asset: symbol.strip_suffix("USDT").unwrap().into(),
+                quote_asset: "USDT".into(),
+                margin_asset: "USDT".into(),
+                tick_size: tick_size.parse().unwrap(),
+                step_size: "0.001".parse().unwrap(),
+                min_notional: "5".parse().unwrap(),
+                contract_type: "PERPETUAL".into(),
+                status: "TRADING".into(),
+                onboard_date_ms: 1,
+                delivery_date_ms: 4_133_404_800_000,
+                source_time_ms: source_ms,
+                source_clock_received_at_ns: received - 1,
+                received_at_ns: received,
+                source_endpoint: EXCHANGE_INFO_ENDPOINT.into(),
+                source_clock_endpoint: SERVER_TIME_ENDPOINT.into(),
+            }],
+            vec![MarkIndexFundingObservation {
+                schema: REFERENCE_SCHEMA.into(),
+                symbol: symbol.into(),
+                mark_price: "101".parse().unwrap(),
+                index_price: "100".parse().unwrap(),
+                basis: "1".parse().unwrap(),
+                basis_rate: "0.01".parse().unwrap(),
+                last_funding_rate: "0.0001".parse().unwrap(),
+                interest_rate: "0.0001".parse().unwrap(),
+                next_funding_time_ms: source_ms + 28_800_000,
+                source_time_ms: source_ms,
+                received_at_ns: received + 1,
+                source_endpoint: PREMIUM_INDEX_ENDPOINT.into(),
+            }],
+            vec![OpenInterestObservation {
+                schema: REFERENCE_SCHEMA.into(),
+                symbol: symbol.into(),
+                open_interest: "12".parse().unwrap(),
+                source_time_ms: source_ms,
+                received_at_ns: received + 2,
+                source_endpoint: OPEN_INTEREST_ENDPOINT.into(),
+            }],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let published = publish_reference_batch(
+            &ReferenceArtifactConfig {
+                output_root: std::fs::canonicalize(root.path()).unwrap(),
+                observed_at_ns: received + 3,
+                max_staleness_ms: 1_000,
+            },
+            OFFICIAL_USDM_SOURCE_ORIGIN,
+            &batch,
+        )
+        .unwrap();
+        let verified = verify_bound_reference_artifact_read_only_current_batch(
+            &published,
+            &published.data_sha256,
+            &published.manifest_sha256,
+        )
+        .unwrap();
+        (root, verified)
+    }
+
+    #[test]
+    fn source_bound_rules_propose_materials_without_claiming_scientific_trial_resources() {
+        use data::binance_market_tape_artifact::{
+            seal_binance_market_tape_triplet,
+            verify_binance_market_tape_series_with_required_lob_continuity,
+        };
+        let (_root, triplet, anchor) = fixture();
+        let series = verify_binance_market_tape_series_with_required_lob_continuity(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap();
+        let fixtures = [
+            1700000000100000000,
+            1700000090100000000,
+            1700000150000000000,
+        ]
+        .map(|time| rule_fixture(time, "BTCUSDT", "0.1"));
+        let (_roots, references): (Vec<_>, Vec<_>) = fixtures.into_iter().unzip();
+        let (view, goal) = planning_bindings();
+        let output = plan_from_verified_tape_with_rules(
+            &series,
+            VerifiedInstrumentRuleReferences::Usdm(&references),
+            view,
+            &goal,
+        )
+        .unwrap();
+        assert_eq!(output.proposal().materializations.len(), 2);
+        assert!(output.proposal().arms.is_empty());
+        assert!(output.proposal().requested_resources.is_none());
+        assert_eq!(
+            output.proposal().status,
+            RepresentationPlanStatusV1::NoExecutableComparison
+        );
+        let coverage = output.capability().instrument_rules.as_ref().unwrap();
+        assert_eq!(
+            coverage.max_gap_ns,
+            hft_research_manifest::CEX_DERIVATIVES_MAX_GAP_NS
+        );
+        assert_eq!(coverage.sources.len(), 6);
+        assert_eq!(output.capability().sources.len(), 8);
+        for reference in &references {
+            assert!(coverage
+                .sources
+                .iter()
+                .any(|source| source.content_sha256 == reference.data_sha256()));
+            assert!(coverage
+                .sources
+                .iter()
+                .any(|source| source.content_sha256 == reference.manifest_sha256()));
+        }
+    }
+
+    #[test]
+    fn rule_references_reject_wrong_instrument_change_gap_and_short_window() {
+        use data::binance_market_tape_artifact::{
+            seal_binance_market_tape_triplet,
+            verify_binance_market_tape_series_with_required_lob_continuity,
+        };
+        let (_root, triplet, anchor) = fixture();
+        let series = verify_binance_market_tape_series_with_required_lob_continuity(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap();
+        let (view, goal) = planning_bindings();
+        let seed = 1700000000100000000;
+        let middle = 1700000090100000000;
+        let end = 1700000150000000000;
+        for (symbol, times, changed) in [
+            ("ETHUSDT", vec![seed, middle, end], false),
+            ("BTCUSDT", vec![seed, middle, end], true),
+            ("BTCUSDT", vec![seed, end], false),
+            ("BTCUSDT", vec![seed + 1, middle, end], false),
+            ("BTCUSDT", vec![seed, middle, end - 1], false),
+        ] {
+            let fixtures = times
+                .into_iter()
+                .enumerate()
+                .map(|(index, time)| {
+                    rule_fixture(
+                        time,
+                        symbol,
+                        if changed && index == 1 { "0.2" } else { "0.1" },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let (_roots, references): (Vec<_>, Vec<_>) = fixtures.into_iter().unzip();
+            assert!(plan_from_verified_tape_with_rules(
+                &series,
+                VerifiedInstrumentRuleReferences::Usdm(&references),
+                view.clone(),
+                &goal
+            )
+            .is_err());
+        }
+        assert!(plan_from_verified_tape_with_rules(
+            &series,
+            VerifiedInstrumentRuleReferences::Usdm(&[]),
+            view.clone(),
+            &goal
+        )
+        .is_err());
+        assert!(plan_from_verified_tape_with_rules(
+            &series,
+            VerifiedInstrumentRuleReferences::Spot(&[]),
+            view,
+            &goal
+        )
+        .is_err());
+    }
+
+    fn spot_rule_fixture(
+        received: u64,
+        tick_size: &str,
+    ) -> (tempfile::TempDir, VerifiedSpotReferenceArtifact) {
+        use data::binance_spot_reference::{
+            SpotInstrumentRules, SpotNotionalFilter, SpotPriceFilter, SpotQuantityFilter,
+            SpotReferenceBatch, EXCHANGE_INFO_ENDPOINT, OFFICIAL_SOURCE_ORIGIN, REFERENCE_SCHEMA,
+            SERVER_TIME_ENDPOINT,
+        };
+        use hft_collector::binance_spot_reference_artifact::{
+            publish_spot_reference, verify_bound_spot_reference_artifact,
+            SpotReferenceArtifactConfig,
+        };
+        let batch = SpotReferenceBatch::new(vec![SpotInstrumentRules {
+            schema: REFERENCE_SCHEMA.into(),
+            venue: "binance".into(),
+            market: "spot".into(),
+            symbol: "BTCUSDT".into(),
+            base_asset: "BTC".into(),
+            quote_asset: "USDT".into(),
+            status: "TRADING".into(),
+            is_spot_trading_allowed: true,
+            base_asset_precision: 8,
+            quote_asset_precision: 8,
+            price_filter: SpotPriceFilter {
+                min_price: "0".parse().unwrap(),
+                max_price: "0".parse().unwrap(),
+                tick_size: tick_size.parse().unwrap(),
+            },
+            lot_size_filter: SpotQuantityFilter {
+                min_quantity: "0.001".parse().unwrap(),
+                max_quantity: "9000".parse().unwrap(),
+                step_size: "0.001".parse().unwrap(),
+            },
+            market_lot_size_filter: None,
+            notional_filter: SpotNotionalFilter {
+                filter_type: "MIN_NOTIONAL".into(),
+                min_notional: "5".parse().unwrap(),
+                max_notional: None,
+                apply_min_to_market: true,
+                apply_max_to_market: None,
+                avg_price_mins: 5,
+            },
+            source_time_ms: (received - 10_000_000) / 1_000_000,
+            source_clock_received_at_ns: received - 1,
+            received_at_ns: received,
+            source_endpoint: EXCHANGE_INFO_ENDPOINT.into(),
+            source_clock_endpoint: SERVER_TIME_ENDPOINT.into(),
+        }])
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let published = publish_spot_reference(
+            &SpotReferenceArtifactConfig {
+                output_root: std::fs::canonicalize(root.path()).unwrap(),
+                observed_at_ns: received + 1,
+                max_staleness_ms: 1_000,
+            },
+            OFFICIAL_SOURCE_ORIGIN,
+            received - 1,
+            received,
+            &batch,
+        )
+        .unwrap();
+        let verified = verify_bound_spot_reference_artifact(
+            &published,
+            &published.data_sha256,
+            &published.manifest_sha256,
+        )
+        .unwrap();
+        (root, verified)
+    }
+
+    #[test]
+    fn spot_rule_materialization_preserves_fill_bounds_and_source_window() {
+        use data::binance_market_tape_artifact::{
+            seal_binance_market_tape_triplet,
+            verify_binance_market_tape_series_with_required_lob_continuity,
+        };
+        let raw = RAW.replace("\"market\":\"usdm\"", "\"market\":\"spot\"");
+        let (_root, triplet, anchor) =
+            fixture_with(&raw, &raw_block_fixture(&raw), "spot_all", "all", None);
+        let series = verify_binance_market_tape_series_with_required_lob_continuity(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap();
+        let (view, mut goal) = planning_bindings();
+        goal.market = "spot".into();
+        for tick in ["0.1", "0"] {
+            let fixtures = [
+                1700000000100000000,
+                1700000090100000000,
+                1700000150000000000,
+            ]
+            .map(|time| spot_rule_fixture(time, tick));
+            let (_roots, references): (Vec<_>, Vec<_>) = fixtures.into_iter().unzip();
+            let result = plan_from_verified_tape_with_rules(
+                &series,
+                VerifiedInstrumentRuleReferences::Spot(&references),
+                view.clone(),
+                &goal,
+            );
+            if tick == "0.1" {
+                let output = result.unwrap();
+                assert_eq!(output.proposal().materializations.len(), 2);
+                assert_eq!(
+                    output
+                        .capability()
+                        .instrument_rules
+                        .as_ref()
+                        .unwrap()
+                        .market,
+                    "spot"
+                );
+                assert!(output.proposal().arms.is_empty());
+            } else {
+                assert!(result.is_err());
+            }
         }
     }
     #[test]

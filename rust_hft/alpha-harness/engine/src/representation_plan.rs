@@ -29,6 +29,7 @@ const HISTORY_FIELDS: [&str; 9] = [
     "weighted_book_imbalance_top5",
 ];
 
+#[cfg(test)]
 fn reference(id: &str, bytes: &[u8]) -> CexResearchContentRefV1 {
     CexResearchContentRefV1 {
         id: id.into(),
@@ -36,30 +37,94 @@ fn reference(id: &str, bytes: &[u8]) -> CexResearchContentRefV1 {
     }
 }
 
-fn implementation(tool: RepresentationToolV1) -> CexResearchContentRefV1 {
+fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'static [u8])> {
+    macro_rules! source {
+        ($path:literal) => {
+            ($path, include_bytes!($path).as_slice())
+        };
+    }
+    // Every registered renderer uses this replay, feature and reference path.
+    // Bind its modules once so a dependency change invalidates every affected tool.
+    let mut sources = vec![
+        source!("../../../tools/collector/src/bin/lob-pit-materializer.rs"),
+        source!("../../../tools/collector/src/bin/lob-pit-materializer/market_encoder.rs"),
+        source!("../../../market-core/core/src/book_features.rs"),
+        source!("../../../data-pipelines/core/src/binance_lob_replay.rs"),
+        source!("../../../data-pipelines/core/src/binance_market_tape.rs"),
+        source!("../../../data-pipelines/core/src/binance_market_tape_artifact.rs"),
+        source!("../../../data-pipelines/core/src/binance_reference_common.rs"),
+        source!("../../../data-pipelines/core/src/binance_spot_reference.rs"),
+        source!("../../../data-pipelines/core/src/binance_usdm_reference.rs"),
+        source!("../../../tools/collector/src/binance_spot_reference_artifact.rs"),
+        source!("../../../tools/collector/src/binance_usdm_reference_artifact.rs"),
+        source!("../../../research-core/manifest/src/lib.rs"),
+        source!("../../../research-core/manifest/src/sequence.rs"),
+        source!("../../../research-core/manifest/src/market_encoder.rs"),
+        source!("../../../data-pipelines/Cargo.lock"),
+        source!("../../../research-core/Cargo.lock"),
+    ];
+    if matches!(
+        tool,
+        RepresentationToolV1::SolSequence | RepresentationToolV1::SolMarketEncoder
+    ) {
+        sources.extend([
+            source!("baselines.rs"),
+            source!("baselines/classic.rs"),
+            source!("baselines/fitting.rs"),
+            source!("../../../research-core/ml/src/portable.rs"),
+            source!("../../../research-core/ml/src/shared_input.rs"),
+            source!("../../../research-core/manifest/src/model.rs"),
+            source!("../../../research-core/manifest/src/portable_network.rs"),
+        ]);
+    }
     match tool {
+        RepresentationToolV1::SolSequence => sources.extend([
+            source!("sequence_study.rs"),
+            source!("../../domain/src/sequence_study.rs"),
+            source!("../../../research-core/cex-input/src/sequence.rs"),
+            source!("../../../research-core/cex-input/src/sequence_storage.rs"),
+            source!("../../../research-core/ml/src/sequence/training.rs"),
+            source!("../../../research-core/manifest/src/portable_sequence.rs"),
+        ]),
+        RepresentationToolV1::SolMarketEncoder => sources.extend([
+            source!("market_encoder_study.rs"),
+            source!("../../domain/src/market_encoder_study.rs"),
+            source!("../../../research-core/cex-input/src/market_encoder.rs"),
+            source!("../../../research-core/ml/src/market_encoder/artifacts.rs"),
+            source!("../../../research-core/ml/src/market_encoder/network.rs"),
+            source!("../../../research-core/ml/src/market_encoder/training.rs"),
+            source!("../../../research-core/manifest/src/portable_market.rs"),
+        ]),
+        _ => {}
+    }
+    sources
+}
+
+fn source_reference(id: &str, sources: &[(&str, &[u8])]) -> CexResearchContentRefV1 {
+    let mut digest = Sha256::new();
+    digest.update(b"monday.representation-tool-sources.v2\0");
+    for (path, body) in sources {
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update((body.len() as u64).to_le_bytes());
+        digest.update(body);
+    }
+    CexResearchContentRefV1 {
+        id: id.into(),
+        content_sha256: format!("{:x}", digest.finalize()),
+    }
+}
+
+fn implementation(tool: RepresentationToolV1) -> CexResearchContentRefV1 {
+    let id = match tool {
         RepresentationToolV1::CapturedBookReplay
         | RepresentationToolV1::StaticTop5
         | RepresentationToolV1::LaggedContinuousOfi
-        | RepresentationToolV1::AggregateTradeFlow => reference(
-            "lob-pit-materializer:captured-book-v1",
-            include_bytes!("../../../tools/collector/src/bin/lob-pit-materializer.rs"),
-        ),
-        RepresentationToolV1::SolSequence => {
-            reference("sol-sequence-study:v1", include_bytes!("sequence_study.rs"))
-        }
-        RepresentationToolV1::SolMarketEncoder => reference(
-            "sol-market-encoder-study:v1",
-            concat!(
-                include_str!("market_encoder_study.rs"),
-                include_str!("../../../tools/collector/src/bin/lob-pit-materializer.rs"),
-                include_str!(
-                    "../../../tools/collector/src/bin/lob-pit-materializer/market_encoder.rs"
-                ),
-            )
-            .as_bytes(),
-        ),
-    }
+        | RepresentationToolV1::AggregateTradeFlow => "lob-pit-materializer:captured-book-v1",
+        RepresentationToolV1::SolSequence => "sol-sequence-study:v1",
+        RepresentationToolV1::SolMarketEncoder => "sol-market-encoder-study:v1",
+    };
+    source_reference(id, &implementation_sources(tool))
 }
 
 /// All inputs remain declarations. Only the IO owner may derive them from verified raw handles.
@@ -95,6 +160,24 @@ pub fn propose_representation_comparison(
     }) {
         return Err("field clock falls outside the frozen goal decision window".into());
     }
+    let label_end = goal
+        .window_end_ns
+        .checked_add(
+            goal.labels
+                .observation_frequency_millis
+                .checked_mul(goal.labels.horizon_buckets as u64)
+                .and_then(|millis| millis.checked_mul(1_000_000))
+                .ok_or("label availability window overflow")?,
+        )
+        .ok_or("label availability window overflow")?;
+    let rules_for_history = |history_ms: u64| {
+        data.instrument_rules.as_ref().is_some_and(|rules| {
+            goal.window_start_ns
+                .checked_sub(history_ms * 1_000_000)
+                .is_some_and(|start| rules.first_available_ns <= start)
+                && rules.last_available_ns >= label_end
+        })
+    };
     let mut matches = Vec::new();
     for tool in [
         RepresentationToolV1::CapturedBookReplay,
@@ -132,6 +215,9 @@ pub fn propose_representation_comparison(
         });
         if !covered {
             reasons.push("requires captured Top5 seed and coverage inside one suitable series; gaps and unseeded diffs are unusable".into());
+        }
+        if tool != RepresentationToolV1::CapturedBookReplay && !rules_for_history(history_ms) {
+            reasons.push("registered materialization requires matching instrument-rule artifacts covering its history and label availability window".into());
         }
         if matches!(
             tool,
@@ -174,13 +260,9 @@ pub fn propose_representation_comparison(
     ))
     .map_err(|e| e.to_string())?;
     let has = |tool| matches.iter().any(|m| m.tool == tool && m.supported);
-    // Two bounded materializations are proposed. No trial or compute has been reserved.
-    let requested_resources = PlanningResourcesV1 {
-        cpu_millis: 2000,
-        memory_mib: 4096,
-        wall_seconds: 900,
-        trials: 2,
-    };
+    // Materializations are not trials. Only the future native execution template
+    // and accounting contract can resolve a scientific comparison's resources.
+    let requested_resources = None;
     let renderer_supported = goal.target_name == "forward_mid_return"
         && goal.labels.observation_frequency_millis == 1000
         && [5, 10, 30].contains(&goal.labels.horizon_buckets)
@@ -188,11 +270,12 @@ pub fn propose_representation_comparison(
             (goal.market.as_str(), goal.symbol.as_str()),
             ("usdm", "BTCUSDT" | "SOLUSDT" | "BNBUSDT") | ("spot", "BTCUSDT")
         );
+    let rules_cover_window = rules_for_history(60_000);
     let feasible = has(RepresentationToolV1::StaticTop5)
         && has(RepresentationToolV1::LaggedContinuousOfi)
         && has(RepresentationToolV1::AggregateTradeFlow)
         && renderer_supported
-        && requested_resources.fits(&goal.resource_limit);
+        && rules_cover_window;
     let mut limitations = vec![
         "Raw declarations and hashes are not verification receipts or read permissions.".into(),
         "Captured L2 depth does not establish full venue depth, L3 queue position, or exact cancellations.".into(),
@@ -200,16 +283,17 @@ pub fn propose_representation_comparison(
         "Current H2 substitutes lagged OFI for aggregate trade imbalance; it does not add arbitrary fields.".into(),
         "Materialization must still verify per-row depth, availability, warmup and label maturity.".into(),
         "Plan output never authorizes dispatch, changes a finite grant allowlist, or debits a budget.".into(),
+        "Scientific comparison resources are unresolved: two materializations are not two charged trials, and a statistical comparison family is not a budget reservation.".into(),
     ];
     if !renderer_supported {
         limitations.push(
             "Current H1/H2 renderer has no registered instrument, target, cadence or horizon for this goal.".into(),
         );
     }
-    if !requested_resources.fits(&goal.resource_limit) {
-        limitations.push("The two-arm requirement exceeds the declared resource limit; no executable plan is emitted.".into());
+    if !rules_cover_window {
+        limitations.push("Verified instrument-rule artifacts must cover the same instrument, lookback and label availability window before materialization candidates are emitted.".into());
     }
-    let arms = if feasible {
+    let materializations = if feasible {
         vec![
             RepresentationArmV1 {
                 name: "registered_h1_snapshot_family".into(),
@@ -252,13 +336,14 @@ pub fn propose_representation_comparison(
         goal_sha256: goal.digest()?,
         registry_sha256,
         status: if feasible {
-            RepresentationPlanStatusV1::RequiresDataVerificationAndNativeAdmission
+            RepresentationPlanStatusV1::NoExecutableComparison
         } else {
             RepresentationPlanStatusV1::NoFeasibleComparison
         },
         goal: goal.clone(),
         matches,
-        arms,
+        materializations,
+        arms: Vec::new(),
         hypothesis,
         requested_resources,
         limitations,
@@ -291,7 +376,12 @@ mod tests {
             venue: "binance".into(),
             market: "usdm".into(),
             symbol: "BTCUSDT".into(),
-            sources: vec![content("raw"), content("raw-manifest")],
+            sources: vec![
+                content("raw"),
+                content("raw-manifest"),
+                content("rule-data"),
+                content("rule-manifest"),
+            ],
             normalizer: content("normalizer"),
             series: vec![BookSeriesCapabilityV1 {
                 session_id: "one".into(),
@@ -311,6 +401,15 @@ mod tests {
                 decision_ns: 61_000_000_000,
             }],
             aggregate_trade_direction: true,
+            instrument_rules: Some(InstrumentRuleCoverageV1 {
+                market: "usdm".into(),
+                symbol: "BTCUSDT".into(),
+                sources: vec![content("rule-data"), content("rule-manifest")],
+                rules_identity_sha256: content("rules").content_sha256,
+                first_available_ns: 1_000_000_000,
+                last_available_ns: 300_000_000_000,
+                max_gap_ns: 60_000_000_000,
+            }),
             view: PlanningViewV1 {
                 view: content("development"),
                 family_id: "family".into(),
@@ -353,13 +452,13 @@ mod tests {
         let plan = propose_representation_comparison(&data, &goal).unwrap();
         assert!(supported(&plan, RepresentationToolV1::CapturedBookReplay));
         assert!(supported(&plan, RepresentationToolV1::LaggedContinuousOfi));
-        assert_eq!(plan.arms.len(), 2);
-        assert_eq!(plan.arms[0].fields, STATIC_FIELDS);
-        assert_eq!(plan.arms[1].fields, HISTORY_FIELDS);
+        assert_eq!(plan.materializations.len(), 2);
+        assert_eq!(plan.materializations[0].fields, STATIC_FIELDS);
+        assert_eq!(plan.materializations[1].fields, HISTORY_FIELDS);
         assert_eq!(plan.goal, goal);
         assert_eq!(
             plan.status,
-            RepresentationPlanStatusV1::RequiresDataVerificationAndNativeAdmission
+            RepresentationPlanStatusV1::NoExecutableComparison
         );
         validate_representation_plan(&plan, &data, &goal).unwrap();
     }
@@ -379,7 +478,7 @@ mod tests {
             let plan = propose_representation_comparison(&changed, &goal).unwrap();
             assert!(!supported(&plan, RepresentationToolV1::CapturedBookReplay));
             assert!(!supported(&plan, RepresentationToolV1::LaggedContinuousOfi));
-            assert!(plan.arms.is_empty());
+            assert!(plan.materializations.is_empty());
             if continuity == BookContinuityV1::SnapshotOnly {
                 assert!(supported(&plan, RepresentationToolV1::StaticTop5));
             }
@@ -393,7 +492,7 @@ mod tests {
         assert!(!supported(&plan, RepresentationToolV1::AggregateTradeFlow));
         assert!(!supported(&plan, RepresentationToolV1::SolSequence));
         assert!(supported(&plan, RepresentationToolV1::LaggedContinuousOfi));
-        assert!(plan.arms.is_empty());
+        assert!(plan.materializations.is_empty());
     }
     #[test]
     fn future_availability_and_protected_views_are_rejected() {
@@ -423,7 +522,7 @@ mod tests {
         data.series.push(second);
         let plan = propose_representation_comparison(&data, &goal).unwrap();
         assert!(!supported(&plan, RepresentationToolV1::LaggedContinuousOfi));
-        assert!(plan.arms.is_empty());
+        assert!(plan.materializations.is_empty());
     }
     #[test]
     fn hashes_and_recomputation_reject_changed_data_goal_tool_and_columns() {
@@ -446,7 +545,7 @@ mod tests {
         changed_plan.matches[0].implementation = content("different-tool");
         assert!(validate_representation_plan(&changed_plan, &data, &goal).is_err());
         let mut changed_plan = plan.clone();
-        changed_plan.arms[1]
+        changed_plan.materializations[1]
             .fields
             .push("unauthorized_column".into());
         assert!(validate_representation_plan(&changed_plan, &data, &goal).is_err());
@@ -455,21 +554,22 @@ mod tests {
     fn resource_horizon_and_sol_scope_are_bounded() {
         let (mut data, mut goal) = input();
         goal.resource_limit.trials = 1;
-        assert!(propose_representation_comparison(&data, &goal)
-            .unwrap()
-            .arms
-            .is_empty());
+        let unfunded = propose_representation_comparison(&data, &goal).unwrap();
+        assert!(unfunded.arms.is_empty());
+        assert!(unfunded.requested_resources.is_none());
+        assert_eq!(unfunded.materializations.len(), 2);
         goal.resource_limit.trials = 2;
         goal.labels.horizon_buckets = 60;
         assert!(propose_representation_comparison(&data, &goal)
             .unwrap()
-            .arms
+            .materializations
             .is_empty());
         assert!(!supported(
             &propose_representation_comparison(&data, &goal).unwrap(),
             RepresentationToolV1::SolSequence
         ));
         data.symbol = "SOLUSDT".into();
+        data.instrument_rules.as_mut().unwrap().symbol = "SOLUSDT".into();
         goal.symbol = "SOLUSDT".into();
         goal.labels.horizon_buckets = 30;
         assert!(supported(
@@ -509,12 +609,14 @@ mod tests {
         ] {
             let (mut data, mut goal) = input();
             data.market = market.into();
+            data.instrument_rules.as_mut().unwrap().market = market.into();
             goal.market = market.into();
             data.symbol = symbol.into();
+            data.instrument_rules.as_mut().unwrap().symbol = symbol.into();
             goal.symbol = symbol.into();
             let plan = propose_representation_comparison(&data, &goal).unwrap();
             assert_eq!(
-                !plan.arms.is_empty(),
+                !plan.materializations.is_empty(),
                 supported_instrument,
                 "{market}/{symbol}"
             );
@@ -525,6 +627,7 @@ mod tests {
     fn sol_diagnostic_horizons_are_not_registered_study_primary_targets() {
         let (mut data, mut goal) = input();
         data.symbol = "SOLUSDT".into();
+        data.instrument_rules.as_mut().unwrap().symbol = "SOLUSDT".into();
         goal.symbol = "SOLUSDT".into();
         for horizon in [5, 10, 30] {
             goal.labels.horizon_buckets = horizon;
@@ -547,14 +650,32 @@ mod tests {
             .iter()
             .find(|tool| tool.tool == RepresentationToolV1::SolMarketEncoder)
             .unwrap();
-        let complete = concat!(
-            include_str!("market_encoder_study.rs"),
-            include_str!("../../../tools/collector/src/bin/lob-pit-materializer.rs"),
-            include_str!("../../../tools/collector/src/bin/lob-pit-materializer/market_encoder.rs"),
-        );
-        assert_eq!(
-            encoder.implementation.content_sha256,
-            format!("{:x}", Sha256::digest(complete.as_bytes()))
+        let sources = implementation_sources(RepresentationToolV1::SolMarketEncoder);
+        let feature_path =
+            "../../../tools/collector/src/bin/lob-pit-materializer/market_encoder.rs";
+        let original = sources
+            .iter()
+            .find(|(path, _)| *path == feature_path)
+            .unwrap()
+            .1;
+        let mut changed = original.to_vec();
+        changed.extend_from_slice(b"\n// different encoder feature/target implementation\n");
+        let mutated = sources
+            .iter()
+            .map(|&(path, body)| {
+                (
+                    path,
+                    if path == feature_path {
+                        changed.as_slice()
+                    } else {
+                        body
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(
+            encoder.implementation,
+            source_reference(&encoder.implementation.id, &mutated)
         );
         let mut obsolete = plan;
         obsolete
@@ -574,11 +695,12 @@ mod tests {
         for symbol in ["BTCUSDT", "SOLUSDT"] {
             let (mut data, mut goal) = input();
             data.symbol = symbol.into();
+            data.instrument_rules.as_mut().unwrap().symbol = symbol.into();
             goal.symbol = symbol.into();
             for target in ["mid_return", "unregistered_target"] {
                 goal.target_name = target.into();
                 let plan = propose_representation_comparison(&data, &goal).unwrap();
-                assert!(plan.arms.is_empty(), "{symbol}/{target}");
+                assert!(plan.materializations.is_empty(), "{symbol}/{target}");
                 assert!(plan.hypothesis.is_none());
                 if symbol == "SOLUSDT" {
                     for tool in [
@@ -601,7 +723,103 @@ mod tests {
             propose_representation_comparison(&data, &goal)
                 .unwrap()
                 .status,
-            RepresentationPlanStatusV1::RequiresDataVerificationAndNativeAdmission
+            RepresentationPlanStatusV1::NoExecutableComparison
         );
+    }
+
+    #[test]
+    fn review_sequence_identity_covers_channel_and_target_materialization() {
+        let (data, goal) = input();
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        let sequence = plan
+            .matches
+            .iter()
+            .find(|tool| tool.tool == RepresentationToolV1::SolSequence)
+            .unwrap();
+        let study_only = reference("sol-sequence-study:v1", include_bytes!("sequence_study.rs"));
+        assert_ne!(sequence.implementation, study_only);
+        let mut obsolete = plan;
+        obsolete
+            .matches
+            .iter_mut()
+            .find(|tool| tool.tool == RepresentationToolV1::SolSequence)
+            .unwrap()
+            .implementation = study_only;
+        assert!(validate_representation_plan(&obsolete, &data, &goal).is_err());
+    }
+
+    #[test]
+    fn materializer_change_invalidates_every_registered_tool_identity() {
+        for tool in [
+            RepresentationToolV1::CapturedBookReplay,
+            RepresentationToolV1::StaticTop5,
+            RepresentationToolV1::LaggedContinuousOfi,
+            RepresentationToolV1::AggregateTradeFlow,
+            RepresentationToolV1::SolSequence,
+            RepresentationToolV1::SolMarketEncoder,
+        ] {
+            let sources = implementation_sources(tool);
+            let materializer = "../../../tools/collector/src/bin/lob-pit-materializer.rs";
+            let body = sources
+                .iter()
+                .find(|(path, _)| *path == materializer)
+                .unwrap()
+                .1;
+            let mut changed = body.to_vec();
+            changed.extend_from_slice(b"\n// different materializer semantics\n");
+            let changed_sources = sources
+                .iter()
+                .map(|&(path, body)| {
+                    (
+                        path,
+                        if path == materializer {
+                            changed.as_slice()
+                        } else {
+                            body
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let actual = implementation(tool);
+            assert_ne!(
+                actual,
+                source_reference(&actual.id, &changed_sources),
+                "{tool:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_short_rule_coverage_cannot_propose_materializations() {
+        let (data, goal) = input();
+        let mut missing = data.clone();
+        missing.instrument_rules = None;
+        assert!(propose_representation_comparison(&missing, &goal)
+            .unwrap()
+            .materializations
+            .is_empty());
+        let mut short = data.clone();
+        short.instrument_rules.as_mut().unwrap().last_available_ns = goal.window_end_ns;
+        assert!(propose_representation_comparison(&short, &goal)
+            .unwrap()
+            .materializations
+            .is_empty());
+        let mut late = data;
+        late.instrument_rules.as_mut().unwrap().first_available_ns = goal.window_start_ns;
+        assert!(propose_representation_comparison(&late, &goal)
+            .unwrap()
+            .materializations
+            .is_empty());
+    }
+
+    #[test]
+    fn review_two_materializations_are_not_a_funded_scientific_trial_comparison() {
+        let (data, goal) = input();
+        assert_eq!(goal.resource_limit.trials, 2);
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        assert!(plan.arms.is_empty());
+        let report = serde_json::to_value(&plan).unwrap();
+        assert_eq!(report["status"], "no_executable_comparison");
+        assert!(report["requested_resources"].is_null());
     }
 }

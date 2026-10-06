@@ -46,6 +46,28 @@ pub struct PublishedReferenceArtifact {
     pub data_sha256: String,
     pub manifest_sha256: String,
 }
+
+/// Source-bound, read-only rules produced only by the original artifact verifier.
+#[derive(Debug)]
+pub struct VerifiedReferenceArtifact {
+    batch: CompleteReferenceBatch,
+    data_sha256: String,
+    manifest_sha256: String,
+}
+
+impl VerifiedReferenceArtifact {
+    pub fn contracts(&self) -> &[ActivePerpetualContract] {
+        self.batch.contracts()
+    }
+
+    pub fn data_sha256(&self) -> &str {
+        &self.data_sha256
+    }
+
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedReferenceCounts {
     pub metadata: usize,
@@ -477,6 +499,23 @@ pub fn verify_reference_artifact_read_only_current_batch(
         }
         _ => bail!("reference manifest schema is unsupported"),
     }
+}
+
+pub fn verify_bound_reference_artifact_read_only_current_batch(
+    published: &PublishedReferenceArtifact,
+    expected_data_sha256: &str,
+    expected_manifest_sha256: &str,
+) -> Result<VerifiedReferenceArtifact> {
+    let batch = verify_reference_artifact_read_only_current_batch(
+        published,
+        expected_data_sha256,
+        expected_manifest_sha256,
+    )?;
+    Ok(VerifiedReferenceArtifact {
+        batch,
+        data_sha256: expected_data_sha256.to_owned(),
+        manifest_sha256: expected_manifest_sha256.to_owned(),
+    })
 }
 
 fn read_artifact_trust_anchor(
@@ -1243,6 +1282,33 @@ mod tests {
             manifest.open_interest.last_available_at_ns,
             RECEIVED_NS + 50
         );
+    }
+
+    #[test]
+    fn bound_read_only_rules_keep_verified_sources_and_reject_wrong_anchors() {
+        let (_root, _config, published) = publish_fixture();
+        let verified = verify_bound_reference_artifact_read_only_current_batch(
+            &published,
+            &published.data_sha256,
+            &published.manifest_sha256,
+        )
+        .unwrap();
+        assert_eq!(verified.contracts()[0].symbol, "BTCUSDT");
+        assert_eq!(verified.data_sha256(), published.data_sha256);
+        assert_eq!(verified.manifest_sha256(), published.manifest_sha256);
+        assert!(verify_bound_reference_artifact_read_only_current_batch(
+            &published,
+            &"0".repeat(64),
+            &published.manifest_sha256,
+        )
+        .is_err());
+        fs::write(&published.data_path, b"changed reference rows\n").unwrap();
+        assert!(verify_bound_reference_artifact_read_only_current_batch(
+            &published,
+            &published.data_sha256,
+            &published.manifest_sha256,
+        )
+        .is_err());
     }
 
     #[test]
