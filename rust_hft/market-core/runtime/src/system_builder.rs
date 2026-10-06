@@ -603,6 +603,7 @@ impl SystemBuilder {
             ));
         }
         self = self.register_market_streams_from_config();
+        validate_market_data_plans(&self.market_stream_plans)?;
         let quotes_only = quotes_only_enabled(&self.config);
         if quotes_only {
             info!("quotes-only enabled; execution clients remain disabled");
@@ -1062,6 +1063,51 @@ fn requires_authoritative_balance_reconciliation(config: &SystemConfig) -> bool 
         })
 }
 
+fn validate_market_data_plans(plans: &[(VenueType, String, Vec<InstrumentSpec>)]) -> HftResult<()> {
+    for (venue_type, venue_name, instruments) in plans {
+        if instruments.is_empty() {
+            continue;
+        }
+        let (feature, enabled) = match venue_type {
+            VenueType::Bitget => ("adapter-bitget-data", cfg!(feature = "adapter-bitget-data")),
+            VenueType::Binance => (
+                "adapter-binance-data",
+                cfg!(feature = "adapter-binance-data"),
+            ),
+            VenueType::BinancePrediction => (
+                "adapter-binance-prediction-data",
+                cfg!(feature = "adapter-binance-prediction-data"),
+            ),
+            VenueType::Bybit => ("adapter-bybit-data", cfg!(feature = "adapter-bybit-data")),
+            VenueType::Grvt => ("adapter-grvt-data", cfg!(feature = "adapter-grvt-data")),
+            VenueType::Asterdex => (
+                "adapter-asterdex-data",
+                cfg!(feature = "adapter-asterdex-data"),
+            ),
+            VenueType::OndoPerps => (
+                "adapter-ondo-perps-data",
+                cfg!(feature = "adapter-ondo-perps-data"),
+            ),
+            VenueType::Polymarket => (
+                "adapter-polymarket-data",
+                cfg!(feature = "adapter-polymarket-data"),
+            ),
+            VenueType::Mock => ("adapter-mock-data", cfg!(feature = "adapter-mock-data")),
+            VenueType::Okx | VenueType::Hyperliquid | VenueType::Lighter | VenueType::Backpack => {
+                return Err(HftError::Config(format!(
+                    "market data for venue '{venue_name}' ({venue_type:?}) is not implemented"
+                )));
+            }
+        };
+        if !enabled {
+            return Err(HftError::Config(format!(
+                "market data for venue '{venue_name}' ({venue_type:?}) requires feature '{feature}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl SystemRuntime {
     /// 啟動系統
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1075,6 +1121,7 @@ impl SystemRuntime {
         info!("啟動系統運行時...");
         validate_shared_portfolio_market_scope(&self.config)
             .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+        validate_market_data_plans(&self.market_plans)?;
         #[cfg(feature = "infra-ipc")]
         let prepared_ipc =
             crate::ipc_handler::prepare_ipc_server(ipc_socket_path).map_err(|error| {
@@ -3547,5 +3594,87 @@ mod tests {
         assert!(runtime.ipc_task.is_some());
         runtime.stop().await.expect("quotes-only runtime stops");
         assert!(runtime.ipc_task.is_none());
+    }
+
+    #[cfg(not(feature = "adapter-binance-data"))]
+    #[test]
+    fn missing_market_data_feature_rejects_strict_quotes_registration() {
+        let config = SystemConfig {
+            quotes_only: true,
+            venues: vec![live_venue_config()],
+            ..Default::default()
+        };
+        let Err(error) = SystemBuilder::new(config).auto_register_adapters_strict() else {
+            panic!("strict startup accepted a Binance quote plan without its data feature");
+        };
+        assert!(error.to_string().contains("adapter-binance-data"));
+    }
+
+    #[cfg(not(feature = "adapter-binance-data"))]
+    #[tokio::test]
+    #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
+    async fn missing_market_data_feature_rejects_manual_plan_before_start() {
+        let config = SystemConfig {
+            quotes_only: true,
+            ..Default::default()
+        };
+        let mut runtime = SystemBuilder::new(config)
+            .register_market_instrument_plan(
+                VenueType::Binance,
+                "binance-quotes".into(),
+                vec![InstrumentSpec::crypto_spot(
+                    Symbol::new("BTCUSDT"),
+                    VenueId::BINANCE,
+                )],
+            )
+            .build();
+        let result = runtime.start().await;
+        if result.is_ok() {
+            runtime
+                .stop()
+                .await
+                .expect("stop incorrectly started runtime");
+        }
+        let error = result.expect_err("manual quote plan needs a compiled data adapter");
+        assert!(error.to_string().contains("binance-quotes"));
+        assert!(error.to_string().contains("adapter-binance-data"));
+        assert!(runtime.tasks.is_empty());
+        assert!(runtime.adapter_bridge.is_none());
+        assert!(runtime.execution_worker_tasks.is_empty());
+        assert!(runtime.exec_control_tx.is_none());
+        assert!(runtime.ipc_task.is_none());
+    }
+
+    #[test]
+    fn unsupported_market_data_rejects_strict_quotes_registration() {
+        let mut venue = live_venue_config();
+        venue.name = "okx-quotes".into();
+        venue.venue_type = VenueType::Okx;
+        venue.symbol_catalog = vec![InstrumentId::new("BTCUSDT@OKX")];
+        let config = SystemConfig {
+            quotes_only: true,
+            venues: vec![venue],
+            ..Default::default()
+        };
+        let Err(error) = SystemBuilder::new(config).auto_register_adapters_strict() else {
+            panic!("strict startup accepted an unimplemented OKX market stream");
+        };
+        assert!(error.to_string().contains("okx-quotes"));
+        assert!(error.to_string().contains("not implemented"));
+    }
+
+    #[cfg(feature = "adapter-binance-data")]
+    #[test]
+    fn compiled_market_data_quotes_do_not_require_execution() {
+        let config = SystemConfig {
+            quotes_only: true,
+            venues: vec![live_venue_config()],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .auto_register_adapters_strict()
+            .expect("compiled Binance quote plans are available without execution");
+        assert_eq!(builder.market_stream_plans.len(), 1);
+        assert!(builder.execution_clients.is_empty());
     }
 }
