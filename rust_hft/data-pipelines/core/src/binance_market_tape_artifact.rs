@@ -331,6 +331,8 @@ pub struct VerifiedBinanceLobObservation {
 
 #[derive(Debug)]
 pub struct VerifiedBinanceMarketTape {
+    dataset: String,
+    shard_id: String,
     segments: Vec<BinanceMarketTapeSegmentIdentity>,
     aggregate_trades: Vec<AggregateTrade>,
     aggregate_trade_sources: Vec<SourceRowIdentity>,
@@ -339,6 +341,16 @@ pub struct VerifiedBinanceMarketTape {
 }
 
 impl VerifiedBinanceMarketTape {
+    /// Dataset scope retained from the manifests checked by the original verifier.
+    pub fn dataset(&self) -> &str {
+        &self.dataset
+    }
+
+    /// Shard scope retained from the manifests checked by the original verifier.
+    pub fn shard_id(&self) -> &str {
+        &self.shard_id
+    }
+
     pub fn segments(&self) -> &[BinanceMarketTapeSegmentIdentity] {
         &self.segments
     }
@@ -1263,6 +1275,8 @@ fn verify_ordered_market_tape(
         }
     }
     Ok(VerifiedBinanceMarketTape {
+        dataset,
+        shard_id,
         segments: identities,
         aggregate_trades,
         aggregate_trade_sources,

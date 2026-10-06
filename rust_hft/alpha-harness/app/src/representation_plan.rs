@@ -50,19 +50,36 @@ pub fn plan_from_verified_tape(
     let mut seen_sources = BTreeSet::new();
     let mut summaries = Vec::new();
     let mut market = None;
+    let mut collection_scope = None;
+    let mut seen_sessions = BTreeSet::new();
+    let mut previous_segment_end = None;
     let mut latest_receive = 0;
     let mut latest_available = 0;
     let mut latest_event = None;
-    let mut directional_trades = false;
+    let mut directional_trades = true;
     for series in series {
         let verified = series.verified();
         ensure!(!verified.segments().is_empty(), "empty verified source");
+        let scope = (verified.dataset(), verified.shard_id());
+        ensure!(
+            collection_scope.get_or_insert(scope) == &scope,
+            "verified series do not share one dataset/shard scope"
+        );
+        ensure!(
+            seen_sessions.insert(series.session_id()),
+            "verified capture session reappeared in the planned collection"
+        );
         for segment in verified.segments() {
             let current = segment.market.as_str();
             ensure!(
                 market.get_or_insert(current) == &current,
                 "mixed market sources"
             );
+            ensure!(
+                previous_segment_end.is_none_or(|end| segment.start_received_at_ns >= end),
+                "verified collection receive time moved backwards across segments"
+            );
+            previous_segment_end = Some(segment.end_received_at_ns);
             for (kind, digest) in [
                 ("market-tape", &segment.content_sha256),
                 ("market-manifest", &segment.manifest_sha256),
@@ -155,11 +172,9 @@ pub fn plan_from_verified_tape(
                         &mut latest_event,
                     )?;
                 }
-                ReplayedBinanceBookEvent::Checkpoint { .. } => {
-                    if let Some(summary) = &mut current {
-                        summary.end_available_ns = received;
-                    }
-                }
+                // Legacy H1/H2 and sequence renderers ignore checkpoints.
+                // The shared coverage summary must not promise their quiet tail.
+                ReplayedBinanceBookEvent::Checkpoint { .. } => {}
             }
             ensure!(
                 summaries.len() < MAX_CAPABILITY_SERIES,
@@ -169,6 +184,11 @@ pub fn plan_from_verified_tape(
         if let Some(current) = current {
             summaries.push(current);
         }
+        let has_trade_modality = verified
+            .segments()
+            .iter()
+            .any(|segment| segment.trade_summaries.contains_key(&goal.symbol));
+        let mut has_causal_trade = false;
         for trade in verified.aggregate_trades().iter().filter(|trade| {
             trade.symbol == goal.symbol && trade.received_at_ns <= goal.window_end_ns
         }) {
@@ -180,8 +200,11 @@ pub fn plan_from_verified_tape(
                 event_ns <= trade.received_at_ns,
                 "future exchange trade clock is not a causal input"
             );
-            directional_trades = true;
+            has_causal_trade = true;
         }
+        // The registered renderer consumes every supplied series and rejects
+        // mixed trade modalities. One session cannot establish another's input.
+        directional_trades &= has_trade_modality && has_causal_trade;
     }
     if latest_available == 0 || summaries.is_empty() {
         bail!("no observed book before the planned decision window");
@@ -300,13 +323,26 @@ mod tests {
         data::binance_market_tape_artifact::BinanceMarketTapeTriplet,
         data::binance_market_tape_artifact::BinanceMarketTapeTrustAnchor,
     ) {
+        fixture_with(RAW, COMPRESSED, "usdm_all", "all", None)
+    }
+    fn fixture_with(
+        raw: &str,
+        compressed: &[u8],
+        dataset: &str,
+        shard_id: &str,
+        stream_types: Option<&[&str]>,
+    ) -> (
+        tempfile::TempDir,
+        data::binance_market_tape_artifact::BinanceMarketTapeTriplet,
+        data::binance_market_tape_artifact::BinanceMarketTapeTrustAnchor,
+    ) {
         use data::binance_market_tape::{LobContinuitySummaryBuilder, MARKET_TAPE_SCHEMA};
         use data::binance_market_tape_artifact::{
             BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor,
         };
         let root = tempfile::tempdir().unwrap();
         let dir = std::fs::canonicalize(root.path()).unwrap();
-        let rows: Vec<serde_json::Value> = RAW
+        let rows: Vec<serde_json::Value> = raw
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
@@ -318,28 +354,35 @@ mod tests {
                 .entry(row["type"].as_str().unwrap().into())
                 .or_default() += 1;
         }
-        let name = "part-1700000000000000000.jsonl.zst";
-        let sha = format!("{:x}", Sha256::digest(COMPRESSED));
-        let manifest = serde_json::json!({
-            "schema":MARKET_TAPE_SCHEMA,"venue":"binance","market":"usdm","dataset":"usdm_all","shard_id":"all","mode":"diff",
+        let start = rows.first().unwrap()["received_at_ns"].as_u64().unwrap();
+        let end = rows.last().unwrap()["received_at_ns"].as_u64().unwrap();
+        let name = format!("part-{start}.jsonl.zst");
+        let sha = format!("{:x}", Sha256::digest(compressed));
+        let mut manifest = serde_json::json!({
+            "schema":rows.first().unwrap()["schema"],"venue":"binance","market":"usdm","dataset":dataset,"shard_id":shard_id,"mode":"diff",
             "symbols":["BTCUSDT"],"security_token_symbols":[],"excluded_symbols":[],"snapshot_limit":1000,
             "replay_scope":"captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs","venue_depth_complete":false,
             "events":rows.len(),"event_types":counts,"has_replay_safe_checkpoint":true,
             "snapshot_ready_count":1,"bridged_count":1,"stream_coverage_verified_count":1,
             "snapshot_only_symbols":[],"all_symbols_bridged":true,"all_stream_coverage_verified":true,
-            "start_received_at_ns":1700000000000000000u64,"end_received_at_ns":1700000120100000000u64,
-            "date":"2023-11-14","hour":"22","file":name,"bytes":COMPRESSED.len(),"sha256":sha,
+            "start_received_at_ns":start,"end_received_at_ns":end,
+            "date":"2023-11-14","hour":"22","file":name,"bytes":compressed.len(),"sha256":sha,
             "trade_representation":"aggregate_trade_only","price_surface_derivation":"latest aggregate trade price",
             "lob_continuity":summary.finish().unwrap(),
         });
+        if let Some(stream_types) = stream_types {
+            manifest["stream_types"] = serde_json::json!(stream_types);
+        } else {
+            assert_eq!(manifest["schema"], MARKET_TAPE_SCHEMA);
+        }
         let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         manifest_bytes.push(b'\n');
         let triplet = BinanceMarketTapeTriplet {
-            data: dir.join(name),
+            data: dir.join(&name),
             manifest: dir.join(format!("{name}.manifest.json")),
             success: dir.join(format!("{name}._SUCCESS")),
         };
-        std::fs::write(&triplet.data, COMPRESSED).unwrap();
+        std::fs::write(&triplet.data, compressed).unwrap();
         std::fs::write(&triplet.manifest, &manifest_bytes).unwrap();
         std::fs::write(&triplet.success, format!("{sha}\n")).unwrap();
         let anchor = BinanceMarketTapeTrustAnchor::from_lower_hex(
@@ -349,16 +392,7 @@ mod tests {
         .unwrap();
         (root, triplet, anchor)
     }
-    #[test]
-    fn original_raw_verifier_produces_the_only_accepted_adapter_input() {
-        use data::binance_market_tape_artifact::{
-            seal_binance_market_tape_triplet,
-            verify_binance_market_tape_series_with_required_lob_continuity,
-        };
-        let (_root, triplet, anchor) = fixture();
-        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
-        let series =
-            verify_binance_market_tape_series_with_required_lob_continuity(vec![sealed]).unwrap();
+    fn planning_bindings() -> (PlanningViewV1, RepresentationGoalV1) {
         let content = |id: &str| CexResearchContentRefV1 {
             id: id.into(),
             content_sha256: format!("{:x}", Sha256::digest(id.as_bytes())),
@@ -375,13 +409,13 @@ mod tests {
             venue: "binance".into(),
             market: "usdm".into(),
             symbol: "BTCUSDT".into(),
-            target_name: "mid_return".into(),
+            target_name: "forward_mid_return".into(),
             labels: alpha_domain::EvaluationLabelSpecV1 {
                 horizon_buckets: 30,
                 observation_frequency_millis: 1000,
             },
             window_start_ns: 1700000060100000000,
-            window_end_ns: 1700000120100000000,
+            window_end_ns: 1700000120000000000,
             model: content("ridge"),
             scaling: content("train-scaler"),
             costs: content("costs"),
@@ -393,6 +427,19 @@ mod tests {
                 trials: 2,
             },
         };
+        (view, goal)
+    }
+    #[test]
+    fn original_raw_verifier_produces_the_only_accepted_adapter_input() {
+        use data::binance_market_tape_artifact::{
+            seal_binance_market_tape_triplet,
+            verify_binance_market_tape_series_with_required_lob_continuity,
+        };
+        let (_root, triplet, anchor) = fixture();
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+        let series =
+            verify_binance_market_tape_series_with_required_lob_continuity(vec![sealed]).unwrap();
+        let (view, goal) = planning_bindings();
         let output = plan_from_verified_tape(&series, view.clone(), &goal).unwrap();
         assert_eq!(
             output.capability().series[0].continuity,
@@ -412,6 +459,147 @@ mod tests {
         tampered[0] ^= 1;
         std::fs::write(&triplet.data, tampered).unwrap();
         assert!(seal_binance_market_tape_triplet(&triplet, &anchor).is_err());
+    }
+
+    fn shifted_fixture(
+        dataset: &str,
+        shard: &str,
+        lob_only: bool,
+    ) -> (
+        tempfile::TempDir,
+        data::binance_market_tape_artifact::BinanceMarketTapeTriplet,
+        data::binance_market_tape_artifact::BinanceMarketTapeTrustAnchor,
+    ) {
+        use data::binance_market_tape::MARKET_TAPE_SCHEMA_V2;
+        let mut rows: Vec<serde_json::Value> = RAW
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|row: &serde_json::Value| !lob_only || row["type"] != "agg_trade")
+            .collect();
+        for row in &mut rows {
+            row["session_id"] = serde_json::json!("session-2");
+            row["received_at_ns"] =
+                serde_json::json!(row["received_at_ns"].as_u64().unwrap() + 130_000_000_000);
+            if let Some(start) = row.get("request_started_at_ns").and_then(|v| v.as_u64()) {
+                row["request_started_at_ns"] = serde_json::json!(start + 130_000_000_000);
+            }
+            if let Some(frame) = row.get_mut("frame") {
+                for clock in ["E", "T"] {
+                    frame["data"][clock] =
+                        serde_json::json!(frame["data"][clock].as_u64().unwrap() + 130_000);
+                }
+            }
+            if lob_only {
+                row["schema"] = serde_json::json!(MARKET_TAPE_SCHEMA_V2);
+                if row["type"] == "session_start" {
+                    row["websocket_shards"] = serde_json::json!(1);
+                    row["websocket_streams"] = serde_json::json!(1);
+                    row["stream_types"] = serde_json::json!(["depth@100ms"]);
+                }
+                if row["type"] == "stream_coverage" {
+                    row["shards"] = serde_json::json!([["btcusdt@depth@100ms"]]);
+                }
+            }
+        }
+        let raw = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        // A small standard Zstd frame with one uncompressed block. The original
+        // sealer and verifier decode and check it; no test verification handle is minted.
+        let size = u32::try_from(raw.len()).unwrap();
+        assert!(size < 128 * 1024);
+        let mut compressed = vec![0x28, 0xb5, 0x2f, 0xfd, 0xa0];
+        compressed.extend_from_slice(&size.to_le_bytes());
+        compressed.extend_from_slice(&(size * 8 + 1).to_le_bytes()[..3]);
+        compressed.extend_from_slice(raw.as_bytes());
+        fixture_with(
+            &raw,
+            &compressed,
+            dataset,
+            shard,
+            lob_only.then_some(&["depth@100ms"][..]),
+        )
+    }
+
+    #[test]
+    fn review_trade_direction_must_cover_every_verified_series() {
+        use data::binance_market_tape_artifact::{
+            seal_binance_market_tape_triplet,
+            verify_binance_market_tape_series_with_required_lob_continuity,
+        };
+        let (_first_root, first, first_anchor) = fixture();
+        let (_second_root, second, second_anchor) = shifted_fixture("usdm_all", "all", true);
+        let series = verify_binance_market_tape_series_with_required_lob_continuity(vec![
+            seal_binance_market_tape_triplet(&first, &first_anchor).unwrap(),
+            seal_binance_market_tape_triplet(&second, &second_anchor).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(series.len(), 2);
+        assert!(!series[0].verified().aggregate_trades().is_empty());
+        assert!(series[1].verified().aggregate_trades().is_empty());
+        let (view, mut goal) = planning_bindings();
+        goal.window_start_ns = 1700000191000000000;
+        goal.window_end_ns = 1700000250000000000;
+        if let Ok(output) = plan_from_verified_tape(&series, view, &goal) {
+            assert!(!output.capability().aggregate_trade_direction);
+            assert!(output.proposal().arms.is_empty());
+        }
+    }
+
+    #[test]
+    fn review_checkpoint_does_not_extend_legacy_renderer_coverage() {
+        use data::binance_market_tape_artifact::{
+            seal_binance_market_tape_triplet,
+            verify_binance_market_tape_series_with_required_lob_continuity,
+        };
+        let (_root, triplet, anchor) = fixture();
+        let series = verify_binance_market_tape_series_with_required_lob_continuity(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap();
+        let (view, mut goal) = planning_bindings();
+        goal.window_end_ns = 1700000120100000000;
+        let output = plan_from_verified_tape(&series, view, &goal).unwrap();
+        assert_eq!(
+            output.capability().series[0].end_available_ns,
+            1700000120000000000
+        );
+        assert!(output.proposal().arms.is_empty());
+    }
+
+    #[test]
+    fn review_separate_verifier_calls_cannot_mix_dataset_or_shard_scope() {
+        use data::binance_market_tape_artifact::{
+            seal_binance_market_tape_triplet,
+            verify_binance_market_tape_series_with_required_lob_continuity,
+        };
+        for (dataset, shard) in [("other_dataset", "all"), ("usdm_all", "other_shard")] {
+            let (_first_root, first, first_anchor) = fixture();
+            let (_second_root, second, second_anchor) = shifted_fixture(dataset, shard, false);
+            // The original verifier rejects exactly this collection scope.
+            assert!(
+                verify_binance_market_tape_series_with_required_lob_continuity(vec![
+                    seal_binance_market_tape_triplet(&first, &first_anchor).unwrap(),
+                    seal_binance_market_tape_triplet(&second, &second_anchor).unwrap(),
+                ])
+                .is_err()
+            );
+            let mut series = verify_binance_market_tape_series_with_required_lob_continuity(vec![
+                seal_binance_market_tape_triplet(&first, &first_anchor).unwrap(),
+            ])
+            .unwrap();
+            series.extend(
+                verify_binance_market_tape_series_with_required_lob_continuity(vec![
+                    seal_binance_market_tape_triplet(&second, &second_anchor).unwrap(),
+                ])
+                .unwrap(),
+            );
+            let (view, goal) = planning_bindings();
+            assert!(plan_from_verified_tape(&series, view, &goal).is_err());
+        }
     }
     #[test]
     fn exchange_future_and_receive_after_availability_are_rejected() {

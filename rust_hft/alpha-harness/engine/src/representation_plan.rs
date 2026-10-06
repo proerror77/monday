@@ -50,7 +50,14 @@ fn implementation(tool: RepresentationToolV1) -> CexResearchContentRefV1 {
         }
         RepresentationToolV1::SolMarketEncoder => reference(
             "sol-market-encoder-study:v1",
-            include_bytes!("market_encoder_study.rs"),
+            concat!(
+                include_str!("market_encoder_study.rs"),
+                include_str!("../../../tools/collector/src/bin/lob-pit-materializer.rs"),
+                include_str!(
+                    "../../../tools/collector/src/bin/lob-pit-materializer/market_encoder.rs"
+                ),
+            )
+            .as_bytes(),
         ),
     }
 }
@@ -140,6 +147,7 @@ pub fn propose_representation_comparison(
             RepresentationToolV1::SolSequence | RepresentationToolV1::SolMarketEncoder
         ) && (goal.symbol != "SOLUSDT"
             || goal.market != "usdm"
+            || goal.target_name != "forward_mid_return"
             || goal.labels.observation_frequency_millis != 1000
             || goal.labels.horizon_buckets != 30)
         {
@@ -173,7 +181,8 @@ pub fn propose_representation_comparison(
         wall_seconds: 900,
         trials: 2,
     };
-    let renderer_supported = goal.labels.observation_frequency_millis == 1000
+    let renderer_supported = goal.target_name == "forward_mid_return"
+        && goal.labels.observation_frequency_millis == 1000
         && [5, 10, 30].contains(&goal.labels.horizon_buckets)
         && matches!(
             (goal.market.as_str(), goal.symbol.as_str()),
@@ -194,7 +203,7 @@ pub fn propose_representation_comparison(
     ];
     if !renderer_supported {
         limitations.push(
-            "Current H1/H2 renderer has no registered instrument, cadence or horizon for this goal.".into(),
+            "Current H1/H2 renderer has no registered instrument, target, cadence or horizon for this goal.".into(),
         );
     }
     if !requested_resources.fits(&goal.resource_limit) {
@@ -315,7 +324,7 @@ mod tests {
             venue: "binance".into(),
             market: "usdm".into(),
             symbol: "BTCUSDT".into(),
-            target_name: "mid_return".into(),
+            target_name: "forward_mid_return".into(),
             labels: EvaluationLabelSpecV1 {
                 horizon_buckets: 30,
                 observation_frequency_millis: 1000,
@@ -525,6 +534,60 @@ mod tests {
                 RepresentationToolV1::SolMarketEncoder,
             ] {
                 assert_eq!(supported(&plan, tool), horizon == 30, "{tool:?}/{horizon}");
+            }
+        }
+    }
+
+    #[test]
+    fn review_encoder_identity_covers_feature_and_target_materialization() {
+        let (data, goal) = input();
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        let encoder = plan
+            .matches
+            .iter()
+            .find(|tool| tool.tool == RepresentationToolV1::SolMarketEncoder)
+            .unwrap();
+        let complete = concat!(
+            include_str!("market_encoder_study.rs"),
+            include_str!("../../../tools/collector/src/bin/lob-pit-materializer.rs"),
+            include_str!("../../../tools/collector/src/bin/lob-pit-materializer/market_encoder.rs"),
+        );
+        assert_eq!(
+            encoder.implementation.content_sha256,
+            format!("{:x}", Sha256::digest(complete.as_bytes()))
+        );
+        let mut obsolete = plan;
+        obsolete
+            .matches
+            .iter_mut()
+            .find(|tool| tool.tool == RepresentationToolV1::SolMarketEncoder)
+            .unwrap()
+            .implementation = reference(
+            "sol-market-encoder-study:v1",
+            include_bytes!("market_encoder_study.rs"),
+        );
+        assert!(validate_representation_plan(&obsolete, &data, &goal).is_err());
+    }
+
+    #[test]
+    fn review_only_canonical_forward_mid_return_can_emit_comparison_arms() {
+        for symbol in ["BTCUSDT", "SOLUSDT"] {
+            let (mut data, mut goal) = input();
+            data.symbol = symbol.into();
+            goal.symbol = symbol.into();
+            for target in ["mid_return", "unregistered_target"] {
+                goal.target_name = target.into();
+                let plan = propose_representation_comparison(&data, &goal).unwrap();
+                assert!(plan.arms.is_empty(), "{symbol}/{target}");
+                assert!(plan.hypothesis.is_none());
+                if symbol == "SOLUSDT" {
+                    for tool in [
+                        RepresentationToolV1::SolSequence,
+                        RepresentationToolV1::SolMarketEncoder,
+                    ] {
+                        assert!(!supported(&plan, tool), "{tool:?}/{target}");
+                    }
+                }
             }
         }
     }
