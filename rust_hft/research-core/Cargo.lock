@@ -3388,6 +3388,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-util",
+ "zip 6.0.0",
 ]
 
 [[package]]
