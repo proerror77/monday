@@ -1,13 +1,12 @@
 //! Verified streaming feature/target readers. Pretraining cannot deserialize labels.
 use crate::sequence_storage::{Frame, Frames};
+#[cfg(feature = "market-parquet")]
 use hft_prepared_market_io::{FeatureParquetReader, TargetParquetReader};
 use hft_research_manifest::{market_encoder::*, sequence::SequenceInputSpecV1};
-use std::{
-    collections::VecDeque,
-    fs::File,
-    io::Read,
-    path::{Path, PathBuf},
-};
+use std::{collections::VecDeque, fs::File, io::Read, path::Path};
+
+#[cfg(feature = "market-parquet")]
+use std::path::PathBuf;
 
 impl Frame for MarketFeatureFrameV1 {
     fn clock(&self) -> i64 {
@@ -37,30 +36,35 @@ pub struct UnlabeledSequenceExample {
 // target decoder, including when both artifacts live in the same prepared view.
 enum FeatureFrames {
     Jsonl(Box<Frames<MarketFeatureFrameV1>>),
+    #[cfg(feature = "market-parquet")]
     Parquet(Box<FeatureParquetReader>),
 }
 impl FeatureFrames {
     fn next(&mut self) -> Result<Option<MarketFeatureFrameV1>, String> {
         match self {
             Self::Jsonl(r) => r.next(),
+            #[cfg(feature = "market-parquet")]
             Self::Parquet(r) => r.next_frame(),
         }
     }
     fn rewind(&mut self) -> Result<(), String> {
         match self {
             Self::Jsonl(r) => r.rewind(),
+            #[cfg(feature = "market-parquet")]
             Self::Parquet(r) => r.rewind(),
         }
     }
     fn is_at_start(&self) -> bool {
         match self {
             Self::Jsonl(r) => r.is_at_start(),
+            #[cfg(feature = "market-parquet")]
             Self::Parquet(r) => r.is_at_start(),
         }
     }
 }
 enum TargetFrames {
     Jsonl(Box<Frames<MarketTargetFrameV1>>),
+    #[cfg(feature = "market-parquet")]
     Parquet(Box<TargetParquetReader>),
 }
 impl TargetFrames {
@@ -75,28 +79,36 @@ impl TargetFrames {
                 targets.shards,
                 input,
             )?))),
+            #[cfg(feature = "market-parquet")]
             TARGET_PARQUET_SCHEMA => Ok(Self::Parquet(Box::new(TargetParquetReader::open(
                 root,
                 targets.shards,
             )?))),
+            #[cfg(not(feature = "market-parquet"))]
+            TARGET_PARQUET_SCHEMA => {
+                Err("Parquet market targets require the market-parquet feature".into())
+            }
             _ => Err("unsupported market target storage schema".into()),
         }
     }
     fn next(&mut self) -> Result<Option<MarketTargetFrameV1>, String> {
         match self {
             Self::Jsonl(r) => r.next(),
+            #[cfg(feature = "market-parquet")]
             Self::Parquet(r) => r.next_frame(),
         }
     }
     fn rewind(&mut self) -> Result<(), String> {
         match self {
             Self::Jsonl(r) => r.rewind(),
+            #[cfg(feature = "market-parquet")]
             Self::Parquet(r) => r.rewind(),
         }
     }
     fn is_at_start(&self) -> bool {
         match self {
             Self::Jsonl(r) => r.is_at_start(),
+            #[cfg(feature = "market-parquet")]
             Self::Parquet(r) => r.is_at_start(),
         }
     }
@@ -158,11 +170,16 @@ impl MarketFeatureReader {
             FEATURE_SCHEMA => {
                 FeatureFrames::Jsonl(Box::new(Frames::open(root, dataset.shards, dataset.input)?))
             }
+            #[cfg(feature = "market-parquet")]
             FEATURE_PARQUET_SCHEMA => FeatureFrames::Parquet(Box::new(FeatureParquetReader::open(
                 root,
                 dataset.shards,
                 dataset.input,
             )?)),
+            #[cfg(not(feature = "market-parquet"))]
+            FEATURE_PARQUET_SCHEMA => {
+                return Err("Parquet market features require the market-parquet feature".into())
+            }
             _ => return Err("unsupported market feature storage schema".into()),
         };
         Ok(Self {
@@ -548,6 +565,7 @@ pub struct PreparedMarketEquivalenceV1 {
 
 /// Proves that prepared label-free frames preserve every admitted original row,
 /// including exact recovery identities and Float32 bits. It never reads targets.
+#[cfg(feature = "market-parquet")]
 pub fn verify_prepared_feature_equivalence(
     sources: &[(PathBuf, MarketFeatureDatasetV1)],
     prepared_root: &Path,
@@ -633,6 +651,7 @@ pub fn verify_prepared_feature_equivalence(
 
 /// Proves exact target values and maturity clocks separately from the feature
 /// proof. The caller retains the original native source and holdout checks.
+#[cfg(feature = "market-parquet")]
 pub fn verify_prepared_target_equivalence(
     sources: &[(PathBuf, MarketTargetDatasetV1)],
     prepared_root: &Path,
@@ -699,4 +718,161 @@ pub fn verify_prepared_target_equivalence(
         decoded_sha256: format!("{:x}", decoded.finalize()),
         rows,
     })
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use hft_research_manifest::sequence::{SequenceShardV1, SequenceViewV1};
+
+    fn jsonl<T: serde::Serialize>(
+        root: &Path,
+        file: &str,
+        rows: &[T],
+        first: i64,
+        last: i64,
+    ) -> SequenceShardV1 {
+        let mut bytes = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut bytes, row).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(root.join(file), &bytes).unwrap();
+        SequenceShardV1 {
+            file: file.into(),
+            sha256: bytes_digest(&bytes),
+            bytes: bytes.len() as u64,
+            rows: rows.len() as u64,
+            first_observed_at_ms: first,
+            last_observed_at_ms: last,
+        }
+    }
+
+    fn fixture(
+        root: &Path,
+    ) -> (
+        MarketFeatureDatasetV1,
+        MarketTargetDatasetV1,
+        MarketDataReadRequestV1,
+    ) {
+        let rows = (0..3)
+            .map(|i| MarketFeatureFrameV1 {
+                series_id: 1,
+                observed_at_ms: i * 1000,
+                feature_max_available_at_ms: i * 1000,
+                channels: vec![i as f32, -0.0],
+            })
+            .collect::<Vec<_>>();
+        let labels = rows[1..]
+            .iter()
+            .map(|row| MarketTargetFrameV1 {
+                series_id: row.series_id,
+                observed_at_ms: row.observed_at_ms,
+                available_at_ms: row.observed_at_ms + TASK_HORIZON_MS,
+                simple_return: 0.125,
+                spread_bps: 1.25,
+            })
+            .collect::<Vec<_>>();
+        let features = MarketFeatureDatasetV1 {
+            schema_version: FEATURE_SCHEMA.into(),
+            venue: "binance-usdm".into(),
+            symbol: "SOLUSDT".into(),
+            source_manifest_sha256: "a".repeat(64),
+            input: SequenceInputSpecV1 {
+                ordered_channels: vec!["a".into(), "b".into()],
+                context_rows: 2,
+                bucket_ms: 1000,
+            },
+            shards: vec![jsonl(root, "features.jsonl", &rows, 0, 2000)],
+        };
+        let targets = MarketTargetDatasetV1 {
+            schema_version: TARGET_SCHEMA.into(),
+            feature_dataset_sha256: features.digest().unwrap(),
+            horizon_ms: TASK_HORIZON_MS,
+            shards: vec![jsonl(root, "targets.jsonl", &labels, 1000, 2000)],
+        };
+        let request = MarketDataReadRequestV1 {
+            feature_dataset_sha256: features.digest().unwrap(),
+            qualified_anchors_sha256: None,
+            input: features.input.clone(),
+            view: SequenceViewV1 {
+                history_start_ms: 0,
+                decision_start_ms: 1000,
+                end_ms: 34000,
+                decision_stride_ms: 1000,
+            },
+            anchor_end_ms: 3000,
+        };
+        (features, targets, request)
+    }
+
+    #[test]
+    fn jsonl_market_reader_keeps_causal_context_and_mature_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let (features, targets, request) = fixture(root.path());
+        let reader = MarketFeatureReader::open(root.path(), features, &request).unwrap();
+        let mut tasks = MarketTaskReader::open(
+            reader,
+            root.path(),
+            targets.clone(),
+            &targets.digest().unwrap(),
+        )
+        .unwrap();
+        let examples = tasks.next_batch(2).unwrap();
+        assert_eq!(examples.len(), 2);
+        assert_eq!(examples[0].features.observed_at_ms, 1000);
+        assert_eq!(examples[0].features.inputs, vec![0.0, -0.0, 1.0, -0.0]);
+        assert_eq!(
+            examples[0].features.inputs[1].to_bits(),
+            (-0.0_f32).to_bits()
+        );
+        assert_eq!(examples[1].target.available_at_ms, 32000);
+        assert_eq!(examples[1].target.spread_bps.to_bits(), 1.25_f64.to_bits());
+        assert!(tasks.next_batch(2).unwrap().is_empty());
+        tasks.finish_pass().unwrap();
+        tasks.rewind().unwrap();
+        assert_eq!(
+            tasks.next_batch(1).unwrap()[0].features,
+            examples[0].features
+        );
+    }
+
+    #[cfg(not(feature = "market-parquet"))]
+    #[test]
+    fn parquet_schema_cannot_fall_back_to_jsonl_without_format_capability() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut features, mut targets, mut request) = fixture(root.path());
+        // JSONL bytes would decode successfully only if storage dispatch fell back.
+        std::fs::rename(
+            root.path().join("features.jsonl"),
+            root.path().join("features.parquet"),
+        )
+        .unwrap();
+        features.schema_version = FEATURE_PARQUET_SCHEMA.into();
+        features.shards[0].file = "features.parquet".into();
+        request.feature_dataset_sha256 = features.digest().unwrap();
+        let error = MarketFeatureReader::open(root.path(), features, &request)
+            .err()
+            .expect("Parquet features must reject before any JSONL fallback");
+        assert_eq!(
+            error,
+            "Parquet market features require the market-parquet feature"
+        );
+
+        std::fs::rename(
+            root.path().join("targets.jsonl"),
+            root.path().join("targets.parquet"),
+        )
+        .unwrap();
+        targets.schema_version = TARGET_PARQUET_SCHEMA.into();
+        targets.shards[0].file = "targets.parquet".into();
+        targets.validate().unwrap();
+        let error = TargetFrames::open(root.path(), targets, request.input)
+            .err()
+            .expect("Parquet targets must reject before any JSONL fallback");
+        assert_eq!(
+            error,
+            "Parquet market targets require the market-parquet feature"
+        );
+    }
 }

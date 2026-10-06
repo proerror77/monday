@@ -7,7 +7,8 @@ publish = false
 
 [features]
 default = []
-streaming = ["dep:hft-research-manifest", "dep:hft-prepared-market-io"]
+streaming = ["dep:hft-research-manifest"]
+market-parquet = ["streaming", "dep:hft-prepared-market-io"]
 
 [dependencies]
 hft-research-manifest = { path = "../manifest", optional = true }

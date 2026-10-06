@@ -7,7 +7,7 @@ description = "Pure-Rust, point-in-time ML training for continuous contracts"
 
 [dependencies]
 anyhow = "1"
-hft-cex-research-input = { path = "../cex-input", features = ["streaming"] }
+hft-cex-research-input = { path = "../cex-input", features = ["streaming", "market-parquet"] }
 hft-research-manifest = { path = "../manifest" }
 burn.workspace = true
 burn-ndarray.workspace = true
