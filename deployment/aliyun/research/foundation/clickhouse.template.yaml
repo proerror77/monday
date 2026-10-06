@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Service
+metadata: {name: monday-foundation-clickhouse, namespace: monday-research}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector: {app: monday-foundation-clickhouse}
+  ports: [{name: https, port: 8443, targetPort: 8443}, {name: native-tls, port: 9440, targetPort: 9440}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: monday-foundation-clickhouse, namespace: monday-research}
+spec:
+  replicas: 0
+  serviceName: monday-foundation-clickhouse
+  persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}
+  selector: {matchLabels: {app: monday-foundation-clickhouse}}
+  template:
+    metadata: {labels: {app: monday-foundation-clickhouse, research.monday/foundation-access: admitted}}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 120
+      nodeSelector: {workload: research-data, kubernetes.io/arch: amd64}
+      securityContext: {runAsNonRoot: true, runAsUser: 101, runAsGroup: 101, fsGroup: 101, seccompProfile: {type: RuntimeDefault}}
+      initContainers:
+        - name: install-tls
+          image: __INIT_IMAGE__
+          command: [sh, /config/install-tls.sh]
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+          volumeMounts:
+            - {name: tls-secret, mountPath: /projection, readOnly: true}
+            - {name: private, mountPath: /private}
+            - {name: config, mountPath: /config, readOnly: true}
+            - {name: runtime, mountPath: /runtime}
+      containers:
+        - name: clickhouse
+          image: __CLICKHOUSE_IMAGE__
+          command: [clickhouse-server]
+          args: ['--config-file=/etc/clickhouse-server/config.xml']
+          env:
+            - name: MONDAY_FOUNDATION_PREPARE_PASSWORD
+              valueFrom: {secretKeyRef: {name: monday-foundation-clickhouse-prepare, key: password}}
+            - name: MONDAY_FOUNDATION_READER_PASSWORD
+              valueFrom: {secretKeyRef: {name: monday-foundation-clickhouse-reader, key: password}}
+          ports: [{name: https, containerPort: 8443}, {name: native-tls, containerPort: 9440}]
+          resources: {requests: {cpu: '1', memory: 3Gi}, limits: {cpu: '2', memory: 5Gi}}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+          readinessProbe: {tcpSocket: {port: https}, initialDelaySeconds: 10, periodSeconds: 10}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/clickhouse}
+            - {name: runtime, mountPath: /var/log/clickhouse-server, subPath: logs}
+            - {name: runtime, mountPath: /tmp, subPath: tmp}
+            - {name: runtime, mountPath: /var/run/clickhouse-server, subPath: run}
+            - {name: private, mountPath: /run/private, readOnly: true}
+            - {name: config, mountPath: /etc/clickhouse-server/config.d/monday.xml, subPath: config.xml, readOnly: true}
+            - {name: config, mountPath: /etc/clickhouse-server/users.d/monday.xml, subPath: users.xml, readOnly: true}
+      volumes:
+        - {name: runtime, emptyDir: {sizeLimit: 1Gi}}
+        - {name: private, emptyDir: {medium: Memory, sizeLimit: 1Mi}}
+        - {name: config, configMap: {name: monday-foundation-clickhouse}}
+        - {name: tls-secret, secret: {secretName: monday-foundation-clickhouse-tls, defaultMode: 288}}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: __STORAGE_CLASS__
+        resources: {requests: {storage: __CLICKHOUSE_STORAGE__}}
