@@ -13,7 +13,7 @@ onnx-compatibility = ["dep:alpha-onnx-evaluator"]
 [dependencies]
 hft-cex-search-driver = { path = "../search-driver", optional = true }
 hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["native-admission", "release-verification"] }
-hft-cex-research-input = { path = "../../research-core/cex-input", features = ["streaming"] }
+hft-cex-research-input = { path = "../../research-core/cex-input", features = ["streaming", "market-parquet"] }
 hft-research-artifacts = { path = "../../research-core/artifacts" }
 hft-research-dispatch-io = { path = "../../research-core/dispatch-io" }
 alpha-domain = { path = "../domain" }
