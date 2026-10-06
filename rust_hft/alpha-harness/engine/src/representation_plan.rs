@@ -160,16 +160,7 @@ pub fn propose_representation_comparison(
     }) {
         return Err("field clock falls outside the frozen goal decision window".into());
     }
-    let label_end = goal
-        .window_end_ns
-        .checked_add(
-            goal.labels
-                .observation_frequency_millis
-                .checked_mul(goal.labels.horizon_buckets as u64)
-                .and_then(|millis| millis.checked_mul(1_000_000))
-                .ok_or("label availability window overflow")?,
-        )
-        .ok_or("label availability window overflow")?;
+    let label_end = goal.label_end_ns()?;
     let rules_for_history = |history_ms: u64| {
         data.instrument_rules.as_ref().is_some_and(|rules| {
             goal.window_start_ns
@@ -194,15 +185,19 @@ pub fn propose_representation_comparison(
             _ => 0,
         };
         let mut reasons = Vec::new();
+        let raw_replay = tool == RepresentationToolV1::CapturedBookReplay;
+        let required_depth = if raw_replay { 1 } else { 5 };
         // Recovery series stay separate. A lookback must fit wholly within one verified series.
         let covered = data.series.iter().any(|s| {
             goal.window_start_ns
                 .checked_sub(history_ms * 1_000_000)
                 .is_some_and(|start| {
-                    s.start_available_ns <= start && s.end_available_ns >= goal.window_end_ns
+                    s.start_available_ns <= start
+                        && s.end_available_ns >= goal.window_end_ns
+                        && (raw_replay || s.label_available_through_ns >= label_end)
                 })
                 && s.snapshots > 0
-                && s.captured_seed_depth >= 5
+                && s.captured_seed_depth >= required_depth
                 && match tool {
                     RepresentationToolV1::StaticTop5 | RepresentationToolV1::AggregateTradeFlow => {
                         matches!(
@@ -214,7 +209,11 @@ pub fn propose_representation_comparison(
                 }
         });
         if !covered {
-            reasons.push("requires captured Top5 seed and coverage inside one suitable series; gaps and unseeded diffs are unusable".into());
+            reasons.push(if raw_replay {
+                "requires a positive-depth captured seed and its own replay window inside one sequence-checked series"
+            } else {
+                "requires captured Top5 seed, history, decision window and mature label coverage inside one suitable series; gaps and recovery seeds cannot be stitched"
+            }.into());
         }
         if tool != RepresentationToolV1::CapturedBookReplay && !rules_for_history(history_ms) {
             reasons.push("registered materialization requires matching instrument-rule artifacts covering its history and label availability window".into());
@@ -387,6 +386,7 @@ mod tests {
                 session_id: "one".into(),
                 start_available_ns: 1_000_000_000,
                 end_available_ns: 200_000_000_000,
+                label_available_through_ns: 300_000_000_000,
                 snapshots: 1,
                 diffs: 10,
                 captured_seed_depth: 100,
@@ -821,5 +821,63 @@ mod tests {
         let report = serde_json::to_value(&plan).unwrap();
         assert_eq!(report["status"], "no_executable_comparison");
         assert!(report["requested_resources"].is_null());
+    }
+
+    #[test]
+    fn review_shallow_books_keep_raw_replay_without_claiming_top5_materials() {
+        for depth in 1..=4 {
+            let (mut data, goal) = input();
+            data.series[0].captured_seed_depth = depth;
+            let plan = propose_representation_comparison(&data, &goal).unwrap();
+            assert!(supported(&plan, RepresentationToolV1::CapturedBookReplay));
+            for tool in [
+                RepresentationToolV1::StaticTop5,
+                RepresentationToolV1::LaggedContinuousOfi,
+                RepresentationToolV1::AggregateTradeFlow,
+                RepresentationToolV1::SolSequence,
+                RepresentationToolV1::SolMarketEncoder,
+            ] {
+                assert!(!supported(&plan, tool), "{tool:?}/{depth}");
+            }
+            assert!(plan.materializations.is_empty());
+            data.instrument_rules = None;
+            assert!(supported(
+                &propose_representation_comparison(&data, &goal).unwrap(),
+                RepresentationToolV1::CapturedBookReplay
+            ));
+        }
+    }
+
+    #[test]
+    fn decision_only_or_recovery_label_coverage_does_not_claim_mature_materials() {
+        let (mut data, goal) = input();
+        data.series[0].label_available_through_ns = data.series[0].end_available_ns;
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        assert!(plan.materializations.is_empty());
+        assert!(supported(&plan, RepresentationToolV1::CapturedBookReplay));
+        let mut recovery = data.series[0].clone();
+        recovery.session_id = "later-recovery".into();
+        recovery.start_available_ns = data.series[0].end_available_ns + 1;
+        recovery.end_available_ns = goal.label_end_ns().unwrap();
+        recovery.label_available_through_ns = recovery.end_available_ns;
+        data.series.push(recovery);
+        assert!(propose_representation_comparison(&data, &goal)
+            .unwrap()
+            .materializations
+            .is_empty());
+    }
+
+    #[test]
+    fn label_endpoint_overflow_is_rejected_before_matching_or_tape_scanning() {
+        let (data, goal) = input();
+        let mut too_late = goal.clone();
+        too_late.window_end_ns = u64::MAX - 1;
+        assert!(too_late.validate().is_err());
+        assert!(propose_representation_comparison(&data, &too_late).is_err());
+        let mut too_wide = goal;
+        too_wide.labels.observation_frequency_millis = u64::MAX;
+        too_wide.labels.horizon_buckets = 1;
+        assert!(too_wide.label_end_ns().is_err());
+        assert!(propose_representation_comparison(&data, &too_wide).is_err());
     }
 }

@@ -72,6 +72,7 @@ fn plan_from_verified_tape_inner(
     goal: &RepresentationGoalV1,
 ) -> Result<VerifiedTapeRepresentationProposal> {
     goal.validate().map_err(anyhow::Error::msg)?;
+    let label_end_ns = goal.label_end_ns().map_err(anyhow::Error::msg)?;
     ensure!(
         !series.is_empty() && series.len() <= MAX_CAPABILITY_SERIES,
         "bounded verified series required"
@@ -133,10 +134,45 @@ fn plan_from_verified_tape_inner(
             .context("requested instrument has no verified book")?;
         let mut current: Option<BookSeriesCapabilityV1> = None;
         let mut seed_number = 0;
+        let mut label_continuous = true;
         for event in book.events() {
             let received = event.received_at_ns();
-            if received > goal.window_end_ns {
+            if received > label_end_ns {
                 break;
+            }
+            if received > goal.window_end_ns {
+                match event {
+                    ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot { .. }) => {
+                        // A new recovery seed cannot mature the prior series' targets.
+                        label_continuous = false;
+                    }
+                    ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                        clock, ..
+                    }) if label_continuous => {
+                        let original = clock
+                            .as_ref()
+                            .context("verified label diff lost its original clock")?;
+                        ensure!(
+                            original.source.is_some(),
+                            "verified label diff lacks a sealed source row"
+                        );
+                        let (mut available, mut receive, mut exchange) = (0, 0, None);
+                        observe_clock(
+                            received,
+                            original.raw_received_at_ns,
+                            original.exchange_event_time_ms,
+                            &mut available,
+                            &mut receive,
+                            &mut exchange,
+                        )?;
+                        if let Some(summary) = current.as_mut() {
+                            summary.label_available_through_ns = received;
+                        }
+                    }
+                    _ => {}
+                }
+                // Future labels do not update feature clocks, depth, counts or continuity.
+                continue;
             }
             match event {
                 ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
@@ -162,6 +198,7 @@ fn plan_from_verified_tape_inner(
                         session_id: format!("{}:seed-{seed_number}", series.session_id()),
                         start_available_ns: received,
                         end_available_ns: received,
+                        label_available_through_ns: received,
                         snapshots: 1,
                         diffs: 0,
                         captured_seed_depth: depth,
@@ -192,6 +229,7 @@ fn plan_from_verified_tape_inner(
                         .checked_add(1)
                         .context("diff count overflow")?;
                     summary.end_available_ns = received;
+                    summary.label_available_through_ns = received;
                     summary.continuity = BookContinuityV1::SequenceChecked;
                     observe_clock(
                         received,
@@ -408,16 +446,7 @@ fn rule_coverage(
         .window_start_ns
         .checked_sub(60_000_000_000)
         .context("representation lookback underflow")?;
-    let horizon_ns = goal
-        .labels
-        .observation_frequency_millis
-        .checked_mul(goal.labels.horizon_buckets as u64)
-        .and_then(|millis| millis.checked_mul(1_000_000))
-        .context("label availability window overflow")?;
-    let label_end = goal
-        .window_end_ns
-        .checked_add(horizon_ns)
-        .context("label availability window overflow")?;
+    let label_end = goal.label_end_ns().map_err(anyhow::Error::msg)?;
     let before = observations
         .iter()
         .rposition(|&time| time <= lookback_start)
@@ -725,6 +754,173 @@ mod tests {
         compressed
     }
 
+    fn label_fixture(
+        matured: bool,
+    ) -> (
+        tempfile::TempDir,
+        data::binance_market_tape_artifact::BinanceMarketTapeTriplet,
+        data::binance_market_tape_artifact::BinanceMarketTapeTrustAnchor,
+    ) {
+        if !matured {
+            return fixture();
+        }
+        let raw = mature_label_raw();
+        fixture_with(&raw, &raw_block_fixture(&raw), "usdm_all", "all", None)
+    }
+
+    fn mature_label_raw() -> String {
+        let mut rows: Vec<serde_json::Value> = RAW
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut checkpoint = rows.pop().unwrap();
+        let mut future = rows
+            .iter()
+            .rev()
+            .find(|row| row["type"] == "diff")
+            .unwrap()
+            .clone();
+        future["received_at_ns"] = serde_json::json!(1700000150000000000u64);
+        future["frame"]["data"]["E"] = serde_json::json!(1700000150000u64);
+        future["frame"]["data"]["T"] = serde_json::json!(1700000150000u64);
+        future["frame"]["data"]["U"] = serde_json::json!(103);
+        future["frame"]["data"]["u"] = serde_json::json!(103);
+        future["frame"]["data"]["pu"] = serde_json::json!(102);
+        future["frame"]["data"]["b"] = serde_json::json!([["100", "999"]]);
+        checkpoint["received_at_ns"] = serde_json::json!(1700000150100000000u64);
+        checkpoint["last_update_id"] = serde_json::json!(103);
+        checkpoint["bids"][0][1] = serde_json::json!("999");
+        rows.push(future);
+        rows.push(checkpoint);
+        rows.iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    #[test]
+    fn review_label_window_requires_maturity_without_leaking_future_feature_clocks() {
+        use data::binance_market_tape_artifact::{
+            seal_binance_market_tape_triplet,
+            verify_binance_market_tape_series_with_required_lob_continuity,
+        };
+        for matured in [true, false] {
+            let (_root, triplet, anchor) = label_fixture(matured);
+            let series = verify_binance_market_tape_series_with_required_lob_continuity(vec![
+                seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+            ])
+            .unwrap();
+            let fixtures = [
+                1700000000100000000,
+                1700000090100000000,
+                1700000150000000000,
+            ]
+            .map(|time| rule_fixture(time, "BTCUSDT", "0.1"));
+            let (_roots, references): (Vec<_>, Vec<_>) = fixtures.into_iter().unzip();
+            let (view, goal) = planning_bindings();
+            let output = plan_from_verified_tape_with_rules(
+                &series,
+                VerifiedInstrumentRuleReferences::Usdm(&references),
+                view,
+                &goal,
+            )
+            .unwrap();
+            assert_eq!(
+                output.capability().fields[0].available_ns,
+                goal.window_end_ns
+            );
+            assert_eq!(
+                output.capability().fields[0].received_ns,
+                goal.window_end_ns
+            );
+            assert_eq!(
+                output.capability().series[0].end_available_ns,
+                goal.window_end_ns
+            );
+            assert_eq!(output.capability().series[0].diffs, 2);
+            if matured {
+                assert_eq!(output.proposal().materializations.len(), 2);
+                let report = output.to_readonly_json().unwrap();
+                assert_eq!(
+                    report["capability"]["series"][0]["label_available_through_ns"],
+                    1700000150000000000u64
+                );
+            } else {
+                assert!(output.proposal().materializations.is_empty());
+                assert!(output
+                    .proposal()
+                    .matches
+                    .iter()
+                    .any(|tool| tool.tool == RepresentationToolV1::CapturedBookReplay
+                        && tool.supported));
+            }
+        }
+    }
+
+    #[test]
+    fn future_recovery_cannot_mature_the_prior_decision_series() {
+        use data::binance_market_tape_artifact::{
+            seal_binance_market_tape_triplet,
+            verify_binance_market_tape_series_with_required_lob_continuity,
+        };
+        let mut rows: Vec<serde_json::Value> = mature_label_raw()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut recovery = rows
+            .iter()
+            .find(|row| row["type"] == "snapshot")
+            .unwrap()
+            .clone();
+        recovery["received_at_ns"] = serde_json::json!(1700000130000000000u64);
+        recovery["request_started_at_ns"] = serde_json::json!(1700000129950000000u64);
+        recovery["snapshot"]["lastUpdateId"] = serde_json::json!(102);
+        recovery["snapshot"]["bids"][0][1] = serde_json::json!("2");
+        let future = rows
+            .iter()
+            .position(|row| row["received_at_ns"] == 1700000150000000000u64)
+            .unwrap();
+        rows.insert(future, recovery);
+        let raw = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let (_root, triplet, anchor) =
+            fixture_with(&raw, &raw_block_fixture(&raw), "usdm_all", "all", None);
+        let series = verify_binance_market_tape_series_with_required_lob_continuity(vec![
+            seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
+        ])
+        .unwrap();
+        let fixtures = [
+            1700000000100000000,
+            1700000090100000000,
+            1700000150000000000,
+        ]
+        .map(|time| rule_fixture(time, "BTCUSDT", "0.1"));
+        let (_roots, references): (Vec<_>, Vec<_>) = fixtures.into_iter().unzip();
+        let (view, goal) = planning_bindings();
+        let output = plan_from_verified_tape_with_rules(
+            &series,
+            VerifiedInstrumentRuleReferences::Usdm(&references),
+            view,
+            &goal,
+        )
+        .unwrap();
+        assert!(output.proposal().materializations.is_empty());
+        assert_eq!(output.capability().series.len(), 1);
+        assert_eq!(
+            output.capability().series[0].label_available_through_ns,
+            goal.window_end_ns
+        );
+        assert_eq!(
+            output.capability().fields[0].available_ns,
+            goal.window_end_ns
+        );
+    }
+
     #[test]
     fn review_trade_direction_must_cover_every_verified_series() {
         use data::binance_market_tape_artifact::{
@@ -912,7 +1108,7 @@ mod tests {
             seal_binance_market_tape_triplet,
             verify_binance_market_tape_series_with_required_lob_continuity,
         };
-        let (_root, triplet, anchor) = fixture();
+        let (_root, triplet, anchor) = label_fixture(true);
         let series = verify_binance_market_tape_series_with_required_lob_continuity(vec![
             seal_binance_market_tape_triplet(&triplet, &anchor).unwrap(),
         ])
@@ -1094,7 +1290,7 @@ mod tests {
             seal_binance_market_tape_triplet,
             verify_binance_market_tape_series_with_required_lob_continuity,
         };
-        let raw = RAW.replace("\"market\":\"usdm\"", "\"market\":\"spot\"");
+        let raw = mature_label_raw().replace("\"market\":\"usdm\"", "\"market\":\"spot\"");
         let (_root, triplet, anchor) =
             fixture_with(&raw, &raw_block_fixture(&raw), "spot_all", "all", None);
         let series = verify_binance_market_tape_series_with_required_lob_continuity(vec![

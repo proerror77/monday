@@ -46,6 +46,8 @@ pub struct BookSeriesCapabilityV1 {
     pub session_id: String,
     pub start_available_ns: u64,
     pub end_available_ns: u64,
+    /// Label-only coverage in this same recovery series; never a feature clock.
+    pub label_available_through_ns: u64,
     pub snapshots: u64,
     pub diffs: u64,
     /// Observed snapshot depth; this does not certify every future replay state.
@@ -191,6 +193,7 @@ impl DataCapabilityV1 {
                 || !sessions.insert(&series.session_id)
                 || series.start_available_ns == 0
                 || series.end_available_ns < series.start_available_ns
+                || series.label_available_through_ns < series.end_available_ns
                 || series.captured_seed_depth > 4096
                 || (series.continuity == BookContinuityV1::SequenceChecked
                     && (series.snapshots == 0 || series.diffs == 0))
@@ -262,6 +265,18 @@ pub struct RepresentationGoalV1 {
     pub resource_limit: PlanningResourcesV1,
 }
 impl RepresentationGoalV1 {
+    pub fn label_end_ns(&self) -> Result<u64, String> {
+        let horizon_ns = self
+            .labels
+            .observation_frequency_millis
+            .checked_mul(self.labels.horizon_buckets as u64)
+            .and_then(|millis| millis.checked_mul(1_000_000))
+            .ok_or("label availability window overflow")?;
+        self.window_end_ns
+            .checked_add(horizon_ns)
+            .ok_or_else(|| "label availability window overflow".into())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for reference in [
             &self.goal,
@@ -273,6 +288,7 @@ impl RepresentationGoalV1 {
             reference.validate().map_err(|e| e.to_string())?;
         }
         self.resource_limit.validate()?;
+        self.label_end_ns()?;
         if self.family_id.is_empty()
             || self.target_name.is_empty()
             || self.window_start_ns == 0

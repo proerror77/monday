@@ -19,7 +19,7 @@ Current view permissions, signed allowlists, source/image identity and remaining
 
 | Tool | Required input | Boundary |
 | --- | --- | --- |
-| Captured book replay | Snapshot seed and sequence-checked diffs | Captured L2 depth only; quantities replace levels |
+| Captured book replay | Any positive-depth snapshot seed and sequence-checked diffs covering its replay window | Captured L2 depth only; quantities replace levels; no Top5, rule or scientific-label prerequisite |
 | Static Top5 | Observed Top5 seed and suitable time coverage | Snapshot-only supports observed state, not complete event history |
 | Lagged continuous OFI | Continuous book history and 60-second warmup | No interpolation across gaps or recovery seeds |
 | Aggregate trade flow | Verified aggregate-trade aggressor direction | No inferred direction from undirected trades |
@@ -33,8 +33,12 @@ The digest frames both paths and source bodies. Changing a materializer changes 
 The raw adapter preserves each recovery seed as a separate series. It never joins history across that boundary.
 The original verifier retains dataset and shard scope in the opaque handle. The planner requires one market/dataset/shard scope, unique capture sessions and ordered, nonoverlapping receive intervals across supplied series.
 Trade direction requires the requested symbol's verified trade modality and causal trade evidence in every supplied series. A trade in one session cannot qualify a LOB-only session.
-Shared coverage ends at the last replayed snapshot or diff. Legacy H1/H2 and sequence materializers ignore checkpoints, so checkpoints cannot extend their quiet tail.
-Market encoder checkpoint flushing is not advertised through this conservative shared coverage summary.
+Feature coverage and clocks stop at the frozen decision-window end. `label_available_through_ns` separately records the same recovery series' label-only book coverage after that decision.
+Post-decision diffs can extend this label endpoint. They never update feature clocks, depth, snapshot/diff counts or feature continuity.
+A post-decision recovery snapshot cuts the old series' label interval; a later series cannot mature its targets.
+Legacy H1/H2 and sequence materializers ignore checkpoints, so checkpoints extend neither feature nor label coverage.
+Market encoder checkpoint flushing is not advertised through these conservative summaries.
+Top5, flow and Study materials require at least five observed seed levels. Shallow books remain usable raw replay inventory.
 Observed seed depth does not prove every replay row has enough levels. Materialization must verify that condition independently.
 
 ## Automatic comparison
@@ -63,12 +67,15 @@ The engine validates an imported plan by recomputing the full deterministic resu
 Snapshot-only, gaps and unseeded diffs cannot support continuous history.
 Missing direction in any supplied series blocks directed trade and SOL tools. Future availability blocks planning.
 Materialization tools also require instrument-rule coverage for their own history and label availability window.
+H1/H2 material candidates require a single continuous book series covering the complete decision window and `window_end + observation_frequency × horizon`. Immature tape emits no candidates, even when rule artifacts cover the label end.
+The goal computes this endpoint with checked arithmetic before tape scanning. Post-decision label data is not a feature input or a permission grant.
 The raw replay tool can still describe book replay when rule inputs are missing; inventory never upgrades that fact into materialization readiness.
 Reference artifacts must match the same market and symbol, preserve stable rules, bracket the sixty-second lookback and forward-label end, and satisfy the original 90-second maximum observation gap. Spot references also preserve the materializer's enabled fill-bound checks.
 Verified rule data and manifest hashes participate in the capability and proposal identities.
 Opaque results from separate verifier calls cannot be concatenated to bypass dataset, shard, session or receive-order boundaries.
 Each field decision clock must lie within the frozen goal window. Its availability cannot exceed that window end.
-A lookback must fit within one continuous series. The frozen resource limit remains a future admission constraint; this planner neither estimates nor reserves scientific compute or trials.
+A lookback, decision coverage and mature label coverage must fit within one continuous series. The frozen resource limit remains a future admission constraint; this planner neither estimates nor reserves scientific compute or trials.
+The label coverage field is a serialized declaration. Restoring it from JSON never restores raw verification or current DataView permission.
 Independent validation, strategy sealed, meta certification and exposed terminal views cannot feed this family search.
 A caller's view label is a declaration. Raw verification does not establish exposure-ledger or permission truth.
 The next execution slice must verify those bindings through the current governed Campaign contract.
