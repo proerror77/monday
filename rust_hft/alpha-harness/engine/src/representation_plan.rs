@@ -1088,6 +1088,7 @@ mod tests {
         let (data, goal) = input();
         let plan = propose_representation_comparison(&data, &goal).unwrap();
         for dependency in [
+            "evaluation.rs",
             "../../domain/src/research_accelerator.rs",
             "../../app/src/representation_plan.rs",
             "../../app/src/mission_dispatch.rs",

@@ -7335,7 +7335,54 @@ pub(crate) mod tests {
         assert_calendar_h1_readback(false);
     }
 
+    pub(crate) fn native_prepared_calendar_fixture_for_tests(
+        negative: bool,
+    ) -> NativePreparedFixture {
+        let source_fixture = calendar_source_fixture(negative);
+        let (request, inputs, root) = prepare_native_source_fixture(&source_fixture).unwrap();
+        NativePreparedFixture {
+            request,
+            inputs,
+            _source: source_fixture,
+            _root: root,
+        }
+    }
+
     fn assert_calendar_h1_readback(negative: bool) {
+        let fixture = native_prepared_calendar_fixture_for_tests(negative);
+        let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+            fixture.inputs.render_inputs().materialization(),
+            &fixture.request.research_plan,
+        )
+        .unwrap();
+        let parts = protocol
+            .row_partitions(fixture.inputs.prepared().original_metadata().total_rows)
+            .unwrap();
+        assert!(protocol.calendar.as_ref().unwrap().develop_end_row > parts.search.end);
+        assert_eq!(
+            fixture.inputs.prepared().original_metadata().visible_rows,
+            parts.search
+        );
+        assert_eq!(fixture.inputs.prepared().rows().len(), parts.search.len());
+        let dataset = alpha_engine::evaluation::prepare_native_campaign_dataset(
+            fixture.inputs.prepared(),
+            &protocol,
+        )
+        .unwrap();
+        assert_eq!(dataset.proposal_context().row_count(), parts.search.len());
+        assert_eq!(dataset.plan().folds.len(), 3);
+        assert!(dataset.calendar_validation_rows().is_none());
+        prepared_inputs::validate_signed_planning_metadata(&fixture.request).unwrap();
+        prepared_inputs::validate_planning_projection_metadata(
+            fixture.inputs.prepared().manifest(),
+            &fixture.request,
+        )
+        .unwrap();
+        assert!(!fixture._source.work_dir.exists());
+        assert!(!fixture._source.global_claim_path.exists());
+    }
+
+    fn calendar_source_fixture(negative: bool) -> CampaignE2eFixture {
         let render_fixture = mission_render::tests::Fixture::new(28_795);
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
         for (index, row) in rows.iter_mut().enumerate() {
@@ -7398,20 +7445,7 @@ pub(crate) mod tests {
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
             hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
-        let error = prepare_fixture_for_execute(&mut fixture).unwrap_err();
-        assert!(
-            error.to_string().contains("withheld selection or holdout"),
-            "{error:#}"
-        );
-        assert!(!fixture.work_dir.exists());
-        assert!(!fixture.global_claim_path.exists());
-        assert_eq!(
-            load_request(&fixture.args.request)
-                .unwrap()
-                .request
-                .prepared_inputs,
-            None
-        );
+        fixture
     }
 
     fn assert_ridge_holding_campaign(mut fixture: CampaignE2eFixture, negative: bool) {

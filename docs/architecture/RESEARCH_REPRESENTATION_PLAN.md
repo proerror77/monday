@@ -12,6 +12,8 @@ Independent selection, sealed holdout and meta certification data cannot be rela
 
 The signed DataReady reference must contain safe `planning_metadata`. The planner reconstructs the protocol, partitions and permitted window from that header before opening the collection JSON or its blocks. Missing metadata rejects planning. Older execution and audit records may still parse without it; parsing does not grant planning access.
 
+Fresh native preparation exports exactly the protocol's search rows, including fixed-calendar sources. The native consumer verifies that same range. Full schedule metadata and withheld identities stay bound; label and replay context still end before withheld data. Preparing this projection does not supply the unavailable diagnostic calendar validation view or complete a calendar research run.
+
 The existing normalized projection is not a `VerifiedBinanceMarketTapeSeries`. It does not mint raw replay, aggressor-direction or OFI regeneration qualification. It retains the original producer Build/source, receipt, four output identities and actual clocked values. Signed prepared-column reuse must preserve those facts and the exact authorized view.
 
 Public raw family-search adapters and their task-created proof wrappers were removed. Original market-tape and reference verifiers remain unchanged. Development-only raw representation planning remains unavailable until its original producer supplies a trustworthy view projection. Old public commits retain the repair history; obsolete adapters are not kept as test-only pseudo-features.

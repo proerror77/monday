@@ -620,6 +620,47 @@ mod planning_projection_tests {
     use std::cell::Cell;
 
     #[test]
+    fn calendar_search_projection_preserves_actual_producer_and_blocks_overbroad_header_before_read(
+    ) {
+        let fixture =
+            crate::mission_campaign::tests::native_prepared_calendar_fixture_for_tests(false);
+        let reads = Cell::new(0);
+        with_signed_planning_metadata(&fixture.request, || {
+            reads.set(reads.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        let original = fixture.inputs.prepared().original_metadata();
+        let protocol: EvaluationProtocolV1 = serde_json::from_str(&original.protocol_json).unwrap();
+        assert!(protocol.calendar.as_ref().unwrap().develop_end_row > original.visible_rows.end);
+        assert_eq!(original.visible_rows, original.search_rows);
+        assert!(
+            original.visible_rows.end < original.selection.as_ref().unwrap().original_rows.start
+        );
+        for boundary in ["calendar-tail", "selection", "sealed"] {
+            let mut request = fixture.request.clone();
+            let reference = request.prepared_inputs.as_mut().unwrap();
+            let header = reference.planning_metadata.as_mut().unwrap();
+            header.visible_rows.end = match boundary {
+                "calendar-tail" => protocol.calendar.as_ref().unwrap().develop_end_row,
+                "selection" => original.selection.as_ref().unwrap().original_rows.end,
+                "sealed" => original.holdout.original_rows.end,
+                _ => unreachable!(),
+            };
+            reference.expected_native.original_metadata_sha256 = identity(header).unwrap();
+            assert!(
+                with_signed_planning_metadata(&request, || {
+                    reads.set(reads.get() + 1);
+                    Ok(())
+                })
+                .is_err(),
+                "{boundary}"
+            );
+            assert_eq!(reads.get(), 1, "{boundary} read collection anchors");
+        }
+    }
+
+    #[test]
     fn safe_scope_is_verified_before_any_collection_or_block_read() {
         let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
         let reads = Cell::new(0);
@@ -710,10 +751,9 @@ pub(super) fn export_trusted_source(
 ) -> anyhow::Result<PreparedCampaignArtifacts> {
     prepare_dataset(full_rows.clone(), protocol)?;
     let partitions = protocol.row_partitions(full_rows.len())?;
-    let visible_end = protocol
-        .calendar
-        .as_ref()
-        .map_or(partitions.search.end, |c| c.develop_end_row);
+    // Publish only the actual search prefix. Calendar's wider development tail
+    // is purge/context metadata, not permission to import labels from selection.
+    let visible_end = partitions.search.end;
     if visible_end == 0
         || visible_end > partitions.sealed_holdout.start
         || full_rows.iter().any(|row| row.series_id != 1)
