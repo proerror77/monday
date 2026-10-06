@@ -3,10 +3,17 @@ use std::collections::BTreeSet;
 use hft_core::{BaseSymbol, InstrumentSpec, Symbol, VenueId};
 use tracing::info;
 
-use super::{SystemBuilder, VenueConfig, VenueType};
+use super::{StrategyParams, StrategyType, SystemBuilder, VenueConfig, VenueType};
 
 impl SystemBuilder {
     pub(crate) fn register_market_streams_from_config(mut self) -> Self {
+        let requested = match self.requested_market_venues() {
+            Ok(requested) => requested,
+            Err(error) => {
+                self.market_data_planning_error = Some(error);
+                return self;
+            }
+        };
         let instruments = self.collect_market_stream_instruments();
         info!(
             "收集到 {} 個商品需要訂閱: {:?}",
@@ -15,11 +22,240 @@ impl SystemBuilder {
         );
 
         let venues = self.config.venues.clone();
-        for venue in venues {
-            self = self.register_market_streams_for_venue(&venue, &instruments);
+        for (index, venue) in venues.into_iter().enumerate() {
+            if requested.contains(&index) && !self.has_market_plan_for(&venue) {
+                self = self.register_market_streams_for_venue(&venue, &instruments);
+            }
         }
 
         self
+    }
+
+    fn requested_market_venues(&self) -> Result<BTreeSet<usize>, String> {
+        // Endpoints and catalogs describe connections and instruments. The v2
+        // loader can fill both without requesting a market-data capability.
+        if !self.config.strategies.is_empty() || !self.strategies.is_empty() {
+            match &self.config.router {
+                Some(ports::RouterConfig::SameVenue { default_venue }) => {
+                    parse_router_venue(default_venue)?;
+                }
+                Some(ports::RouterConfig::StrategyMap {
+                    strategy_venues,
+                    default_venue,
+                }) => {
+                    parse_router_venue(default_venue)?;
+                    for target in strategy_venues.values() {
+                        parse_router_venue(target)?;
+                    }
+                }
+                Some(ports::RouterConfig::RoundRobin { venues }) => {
+                    if venues.is_empty() {
+                        return Err("market-data planning rejects an empty RoundRobin route".into());
+                    }
+                    for target in venues {
+                        parse_router_venue(target)?;
+                    }
+                }
+                None => {}
+            }
+        }
+        let quotes_only = super::quotes_only_enabled(&self.config);
+        let mut requested = self
+            .config
+            .venues
+            .iter()
+            .enumerate()
+            .filter(|(_, venue)| quotes_only || venue.data_config.is_some())
+            .map(|(index, _)| index)
+            .collect::<BTreeSet<_>>();
+        let mut configured_ids = BTreeSet::new();
+        for strategy in &self.config.strategies {
+            let typed_venue = match &strategy.params {
+                StrategyParams::Formula {
+                    execution_contract: Some(contract),
+                    ..
+                }
+                | StrategyParams::FrozenModel {
+                    execution_contract: contract,
+                    ..
+                } => Some(contract.venue),
+                StrategyParams::ProbabilityReversal { .. } => Some(VenueId::POLYMARKET),
+                StrategyParams::LobFlowGrid { config } => config
+                    .venue
+                    .as_deref()
+                    .map(parse_router_venue)
+                    .transpose()?,
+                _ => None,
+            };
+            let ids = match strategy.strategy_type {
+                StrategyType::Trend
+                | StrategyType::Imbalance
+                | StrategyType::LobFlowGrid
+                | StrategyType::Formula
+                | StrategyType::FrozenModel => strategy
+                    .symbols
+                    .iter()
+                    .map(|symbol| format!("{}:{}", strategy.name, symbol.as_str()))
+                    .collect::<Vec<_>>(),
+                _ => vec![strategy.name.clone()],
+            };
+            for id in ids {
+                configured_ids.insert(id.clone());
+                if let Some(index) =
+                    self.strategy_market_venue(&id, Some(&strategy.name), typed_venue)?
+                {
+                    requested.insert(index);
+                }
+            }
+        }
+        for strategy in &self.strategies {
+            if configured_ids.contains(strategy.id()) {
+                continue;
+            }
+            if strategy.venue_scope() == ports::VenueScope::Cross {
+                // The trait declares cross-venue scope, not its exact sources.
+                // Only caller-supplied concrete plans can provide those sources.
+                self.router_market_venues(strategy.id(), None)?;
+                if !self.has_nonempty_market_plan() {
+                    return Err(format!(
+                        "manual cross-venue strategy '{}' requires explicit market plans",
+                        strategy.id()
+                    ));
+                }
+                continue;
+            }
+            if let Some(index) = self.strategy_market_venue(strategy.id(), None, None)? {
+                requested.insert(index);
+            }
+        }
+        Ok(requested)
+    }
+
+    fn strategy_market_venue(
+        &self,
+        id: &str,
+        configured_name: Option<&str>,
+        typed_venue: Option<VenueId>,
+    ) -> Result<Option<usize>, String> {
+        // Runtime account and router maps use the instance ID. Configured
+        // strategies also retain their group-level binding as a fallback.
+        let account =
+            self.config.strategy_accounts.get(id).or_else(|| {
+                configured_name.and_then(|name| self.config.strategy_accounts.get(name))
+            });
+        if let Some(account) = account {
+            let matching = self
+                .config
+                .venues
+                .iter()
+                .enumerate()
+                .filter(|(_, venue)| venue.account_id.as_deref().unwrap_or(&venue.name) == account)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let [index] = matching.as_slice() else {
+                return Err(format!(
+                    "strategy '{id}' account '{account}' must identify exactly one market venue"
+                ));
+            };
+            if let Some(typed) = typed_venue {
+                let actual = super::venue_config_to_market_venue_id(&self.config.venues[*index])?;
+                if normalize_market_venue(actual) != normalize_market_venue(typed) {
+                    return Err(format!(
+                        "strategy '{id}' account and execution contract name different market venues"
+                    ));
+                }
+            }
+            return Ok(Some(*index));
+        }
+        let targets = if let Some(venue) = typed_venue {
+            vec![venue]
+        } else {
+            self.router_market_venues(id, configured_name)?
+        };
+        if !targets.is_empty() {
+            let mut matching = BTreeSet::new();
+            for target in targets {
+                let mut found = false;
+                for (index, venue) in self.config.venues.iter().enumerate() {
+                    if normalize_market_venue(super::venue_config_to_market_venue_id(venue)?)
+                        == normalize_market_venue(target)
+                    {
+                        matching.insert(index);
+                        found = true;
+                    }
+                }
+                if !found {
+                    return Err(format!(
+                        "strategy '{id}' market venue '{target}' is absent from the runtime configuration"
+                    ));
+                }
+            }
+            if matching.len() == 1 {
+                return Ok(matching.first().copied());
+            }
+        } else if self.config.venues.len() == 1 {
+            return Ok(Some(0));
+        }
+        if self.has_nonempty_market_plan() {
+            return Ok(None);
+        }
+        Err(format!(
+            "strategy '{id}' has no unique market venue; bind its account or route, or register explicit market plans"
+        ))
+    }
+
+    fn router_market_venues(
+        &self,
+        id: &str,
+        configured_name: Option<&str>,
+    ) -> Result<Vec<VenueId>, String> {
+        match &self.config.router {
+            Some(ports::RouterConfig::SameVenue { default_venue }) => {
+                Ok(vec![parse_router_venue(default_venue)?])
+            }
+            Some(ports::RouterConfig::StrategyMap {
+                strategy_venues,
+                default_venue,
+            }) => {
+                let target = strategy_venues
+                    .get(id)
+                    .or_else(|| configured_name.and_then(|name| strategy_venues.get(name)))
+                    .unwrap_or(default_venue);
+                Ok(vec![parse_router_venue(target)?])
+            }
+            Some(ports::RouterConfig::RoundRobin { venues }) => {
+                if venues.is_empty() {
+                    return Err("market-data planning rejects an empty RoundRobin route".into());
+                }
+                venues
+                    .iter()
+                    .map(|venue| parse_router_venue(venue))
+                    .collect()
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn has_nonempty_market_plan(&self) -> bool {
+        self.market_stream_plans
+            .iter()
+            .any(|(_, _, instruments)| !instruments.is_empty())
+    }
+
+    fn has_market_plan_for(&self, venue: &VenueConfig) -> bool {
+        self.market_stream_plans
+            .iter()
+            .any(|(kind, name, instruments)| {
+                if instruments.is_empty() || kind != &venue.venue_type {
+                    return false;
+                }
+                name == &venue.name
+                    || super::venue_config_to_market_venue_id(venue).is_ok_and(|id| {
+                        instruments.iter().any(|instrument| {
+                            normalize_market_venue(instrument.venue) == normalize_market_venue(id)
+                        })
+                    })
+            })
     }
 
     fn collect_market_stream_instruments(&self) -> Vec<InstrumentSpec> {
@@ -57,17 +293,6 @@ impl SystemBuilder {
         venue: &VenueConfig,
         instruments: &[InstrumentSpec],
     ) -> Self {
-        if self.config.strategies.is_empty()
-            && !super::quotes_only_enabled(&self.config)
-            && venue.ws_public.is_none()
-            && venue.data_config.is_none()
-        {
-            info!(
-                venue = %venue.name,
-                "account control has no market data request; skipping implicit market plan"
-            );
-            return self;
-        }
         if venue.venue_type == VenueType::BinancePrediction
             && (venue.symbol_catalog.is_empty() || venue.data_config.is_none())
         {
@@ -155,6 +380,19 @@ impl SystemBuilder {
             venue.name.clone(),
             filtered_instruments,
         )
+    }
+}
+
+fn parse_router_venue(value: &str) -> Result<VenueId, String> {
+    VenueId::from_str(value)
+        .ok_or_else(|| format!("market-data planning rejects unknown router venue '{value}'"))
+}
+
+fn normalize_market_venue(venue: VenueId) -> VenueId {
+    if venue == VenueId::BINANCE_SPOT {
+        VenueId::BINANCE
+    } else {
+        venue
     }
 }
 
@@ -573,5 +811,197 @@ mod tests {
         assert_eq!(instruments.len(), 1);
         assert_eq!(instruments[0].symbol.as_str(), "BTCUSDT");
         assert_eq!(instruments[0].venue, VenueId::MOCK);
+    }
+
+    fn demand_venue(name: &str, kind: VenueType, account: &str) -> VenueConfig {
+        VenueConfig {
+            name: name.into(),
+            account_id: Some(account.into()),
+            venue_type: kind,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: Some("Paper".into()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: None,
+            simulate_execution: true,
+            symbol_catalog: Vec::new(),
+            data_config: None,
+            execution_config: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        }
+    }
+
+    fn demand_config() -> SystemConfig {
+        SystemConfig {
+            venues: vec![
+                demand_venue("binance", VenueType::Binance, "binance-account"),
+                demand_venue("okx-control", VenueType::Okx, "okx-account"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    struct ManualDemandStrategy(ports::VenueScope);
+
+    impl ports::Strategy for ManualDemandStrategy {
+        fn on_market_event(
+            &mut self,
+            _: &ports::MarketEvent,
+            _: &ports::AccountView,
+        ) -> Vec<ports::OrderIntent> {
+            Vec::new()
+        }
+
+        fn on_execution_event(
+            &mut self,
+            _: &ports::ExecutionEvent,
+            _: &ports::AccountView,
+        ) -> Vec<ports::OrderIntent> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &str {
+            "display-only-name"
+        }
+
+        fn id(&self) -> &str {
+            "manual-instance"
+        }
+
+        fn venue_scope(&self) -> ports::VenueScope {
+            self.0
+        }
+    }
+
+    #[test]
+    fn explicit_data_intent_does_not_come_from_endpoints() {
+        let mut config = demand_config();
+        config.venues[0].ws_public = Some("wss://catalog.example".into());
+        config.venues[1].data_config = Some(serde_yaml::Value::Mapping(Default::default()));
+        let requested = SystemBuilder::new(config)
+            .requested_market_venues()
+            .unwrap();
+        assert_eq!(requested, BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn formula_instance_account_and_typed_contract_agree_on_one_venue() {
+        let mut config = demand_config();
+        config.strategies.push(StrategyConfig {
+            name: "factor".into(),
+            strategy_type: StrategyType::Formula,
+            symbols: vec![Symbol::new("BTCUSDT")],
+            params: StrategyParams::Formula {
+                ast: serde_json::from_value(serde_json::json!({
+                    "Terminal":{"Field":"book_imbalance"}
+                }))
+                .unwrap(),
+                max_order_notional: Decimal::ONE,
+                signal_threshold: 0.0,
+                target_position: false,
+                evaluation_interval_millis: None,
+                execution_contract: Some(super::super::FormulaExecutionContract {
+                    venue: VenueId::BINANCE,
+                    venue_spec: ports::VenueSpec::default(),
+                    cross_spread: false,
+                }),
+            },
+            risk_limits: empty_risk_limits(),
+        });
+        config
+            .strategy_accounts
+            .insert("factor:BTCUSDT".into(), "binance-account".into());
+        assert_eq!(
+            SystemBuilder::new(config.clone())
+                .requested_market_venues()
+                .unwrap(),
+            BTreeSet::from([0])
+        );
+        config
+            .strategy_accounts
+            .insert("factor:BTCUSDT".into(), "okx-account".into());
+        assert!(SystemBuilder::new(config)
+            .requested_market_venues()
+            .unwrap_err()
+            .contains("execution contract"));
+    }
+
+    #[test]
+    fn manual_router_mapping_uses_id_and_rejects_malformed_targets() {
+        let mut config = demand_config();
+        config.router = Some(ports::RouterConfig::StrategyMap {
+            strategy_venues: std::collections::HashMap::from([(
+                "manual-instance".into(),
+                "BINANCE".into(),
+            )]),
+            default_venue: "OKX".into(),
+        });
+        let builder = SystemBuilder::new(config.clone())
+            .register_strategy(ManualDemandStrategy(ports::VenueScope::Single))
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 1);
+        assert_eq!(builder.market_stream_plans[0].0, VenueType::Binance);
+
+        config.router = Some(ports::RouterConfig::SameVenue {
+            default_venue: "not-a-venue".into(),
+        });
+        let builder = SystemBuilder::new(config)
+            .register_strategy(ManualDemandStrategy(ports::VenueScope::Single))
+            .register_market_stream_plan(
+                VenueType::Binance,
+                "binance".into(),
+                vec![Symbol::new("BTCUSDT")],
+            )
+            .register_market_streams_from_config();
+        assert!(builder
+            .market_data_planning_error
+            .as_deref()
+            .unwrap()
+            .contains("unknown router venue"));
+    }
+
+    #[test]
+    fn ambiguous_and_cross_manual_strategies_require_concrete_plans() {
+        for scope in [ports::VenueScope::Single, ports::VenueScope::Cross] {
+            let builder = SystemBuilder::new(demand_config())
+                .register_strategy(ManualDemandStrategy(scope))
+                .register_market_streams_from_config();
+            assert!(builder.market_data_planning_error.is_some());
+
+            let builder = SystemBuilder::new(demand_config())
+                .register_strategy(ManualDemandStrategy(scope))
+                .register_market_stream_plan(
+                    VenueType::Binance,
+                    "binance".into(),
+                    vec![Symbol::new("BTCUSDT")],
+                )
+                .register_market_streams_from_config();
+            assert!(builder.market_data_planning_error.is_none());
+            assert_eq!(builder.market_stream_plans.len(), 1);
+            assert_eq!(builder.market_stream_plans[0].0, VenueType::Binance);
+        }
+    }
+
+    #[test]
+    fn explicit_manual_plan_does_not_duplicate_automatic_quote_subscription() {
+        let mut config = demand_config();
+        config.venues.truncate(1);
+        config.quotes_only = true;
+        let builder = SystemBuilder::new(config)
+            .register_market_stream_plan(
+                VenueType::Binance,
+                "binance".into(),
+                vec![Symbol::new("BTCUSDT")],
+            )
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 1);
     }
 }

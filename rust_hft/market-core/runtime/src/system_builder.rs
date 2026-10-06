@@ -227,6 +227,7 @@ pub struct SystemBuilder {
     risk_managers: Vec<Box<dyn RiskManager>>,
     // 僅登記市場流規劃，實際橋接在 Runtime::start() 內進行
     market_stream_plans: Vec<(VenueType, String, Vec<InstrumentSpec>)>,
+    market_data_planning_error: Option<String>,
     // 分片配置
     shard_config: Option<ShardConfig>,
     // 🔥 Phase 1: 跟蹤執行客戶端對應的交易所
@@ -252,6 +253,7 @@ impl SystemBuilder {
             strategies: Vec::new(),
             risk_managers: Vec::new(),
             market_stream_plans: Vec::new(),
+            market_data_planning_error: None,
             shard_config: None,
             execution_client_venues: Vec::new(),
             execution_client_accounts: Vec::new(),
@@ -566,6 +568,13 @@ impl SystemBuilder {
         info!("自動註冊適配器...");
 
         self = self.register_market_streams_from_config();
+        if self.market_data_planning_error.is_some() {
+            return self;
+        }
+        if let Err(error) = validate_market_data_plans(&self.market_stream_plans) {
+            self.market_data_planning_error = Some(error.to_string());
+            return self;
+        }
         // Quotes-only 模式：YAML `quotes_only: true` 或環境變量 HFT_QUOTES_ONLY=1
         let quotes_only = quotes_only_enabled(&self.config);
         if quotes_only {
@@ -603,6 +612,9 @@ impl SystemBuilder {
             ));
         }
         self = self.register_market_streams_from_config();
+        if let Some(error) = &self.market_data_planning_error {
+            return Err(HftError::Config(error.clone()));
+        }
         validate_market_data_plans(&self.market_stream_plans)?;
         let quotes_only = quotes_only_enabled(&self.config);
         if quotes_only {
@@ -781,6 +793,7 @@ impl SystemBuilder {
             ipc_task: None,
             exec_control_tx: None,
             market_plans: self.market_stream_plans,
+            market_data_planning_error: self.market_data_planning_error,
             execution_client_venues: self.execution_client_venues,
             execution_client_accounts: self.execution_client_accounts,
             execution_client_is_binance_usdm: self.execution_client_is_binance_usdm,
@@ -1032,6 +1045,7 @@ pub struct SystemRuntime {
         Option<tokio::sync::mpsc::UnboundedSender<engine::execution_worker::ControlCommand>>,
     // 登記的市場流規劃
     market_plans: Vec<(VenueType, String, Vec<InstrumentSpec>)>,
+    market_data_planning_error: Option<String>,
     // 🔥 Phase 1: 執行客戶端到交易所的映射
     execution_client_venues: Vec<VenueId>,
     // 🔥 Phase 1.x: 執行客戶端到帳戶的映射（可選）
@@ -1121,6 +1135,9 @@ impl SystemRuntime {
         info!("啟動系統運行時...");
         validate_shared_portfolio_market_scope(&self.config)
             .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+        if let Some(error) = &self.market_data_planning_error {
+            return Err(HftError::Config(error.clone()).into());
+        }
         validate_market_data_plans(&self.market_plans)?;
         #[cfg(feature = "infra-ipc")]
         let prepared_ipc =
@@ -3705,6 +3722,131 @@ mod tests {
             runtime.start().await.expect("account control starts");
             assert!(runtime.exec_control_tx.is_some());
             runtime.stop().await.expect("account control stops");
+        }
+    }
+
+    struct MarketPlanTestStrategy;
+
+    impl Strategy for MarketPlanTestStrategy {
+        fn on_market_event(&mut self, _: &MarketEvent, _: &AccountView) -> Vec<OrderIntent> {
+            Vec::new()
+        }
+
+        fn on_execution_event(&mut self, _: &ExecutionEvent, _: &AccountView) -> Vec<OrderIntent> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &str {
+            "manual-market-plan"
+        }
+
+        fn id(&self) -> &str {
+            "manual-market-plan:BTCUSDT"
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn market_data_intent_ignores_v2_catalog_endpoints_for_account_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = dir.path().join("venues.yaml");
+        std::fs::write(
+            &catalog,
+            "venues:\n  - venue_id: BINANCE\n    name: Binance\n    ws_public_endpoint: wss://stream.binance.com:9443/ws\n",
+        )
+        .unwrap();
+        let previous = std::env::var_os("HFT_VENUE_CATALOG");
+        std::env::set_var("HFT_VENUE_CATALOG", &catalog);
+        let loaded = super::config_loader::load_config_from_str(
+            "schema_version: v2\nengine:\n  queue_capacity: 1024\n  stale_us: 5000\n  top_n: 10\nvenues:\n  - name: binance\n    venue_type: BINANCE\n    execution_mode: Paper\n    simulate_execution: true\n    symbol_catalog: [BTCUSDT@BINANCE]\nstrategies: []\nrisk:\n  risk_type: Default\n  global_position_limit: 0\n  global_notional_limit: 0\n  max_daily_trades: 0\n  max_orders_per_second: 0\n  staleness_threshold_us: 5000\n",
+        );
+        match previous {
+            Some(value) => std::env::set_var("HFT_VENUE_CATALOG", value),
+            None => std::env::remove_var("HFT_VENUE_CATALOG"),
+        }
+        let config = loaded.expect("actual v2 account config loads");
+        assert!(config.venues[0].ws_public.is_some());
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert!(builder.market_stream_plans.is_empty());
+    }
+
+    #[test]
+    fn market_data_intent_includes_manually_registered_strategy_ids() {
+        let mut venue = live_venue_config();
+        venue.account_id = Some("binance-account".into());
+        let config = SystemConfig {
+            venues: vec![venue],
+            strategy_accounts: HashMap::from([(
+                "manual-market-plan:BTCUSDT".into(),
+                "binance-account".into(),
+            )]),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 1);
+        assert_eq!(builder.market_stream_plans[0].0, VenueType::Binance);
+    }
+
+    #[test]
+    fn market_data_intent_keeps_unrelated_venue_control_only() {
+        let mut binance = live_venue_config();
+        binance.account_id = Some("binance-account".into());
+        let mut okx = live_venue_config();
+        okx.name = "okx-control".into();
+        okx.account_id = Some("okx-account".into());
+        okx.venue_type = VenueType::Okx;
+        okx.symbol_catalog.clear();
+        let strategy = configured_strategy();
+        let config = SystemConfig {
+            venues: vec![binance, okx],
+            strategy_accounts: HashMap::from([(
+                format!("{}:BTCUSDT", strategy.name),
+                "binance-account".into(),
+            )]),
+            strategies: vec![strategy],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 1);
+        assert_eq!(builder.market_stream_plans[0].0, VenueType::Binance);
+    }
+
+    #[tokio::test]
+    async fn market_data_planning_rejection_survives_runtime_and_ipc_clone() {
+        let mut binance = live_venue_config();
+        binance.simulate_execution = true;
+        let mut okx = binance.clone();
+        okx.name = "okx-control".into();
+        okx.venue_type = VenueType::Okx;
+        let config = SystemConfig {
+            venues: vec![binance, okx],
+            router: Some(ports::RouterConfig::SameVenue {
+                default_venue: "unknown-market-data-venue".into(),
+            }),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .auto_register_adapters();
+        assert!(builder.market_data_planning_error.is_some());
+        let mut runtime = builder.build();
+        let mut ipc = runtime.clone_for_ipc();
+        for target in [&mut runtime, &mut ipc] {
+            let error = target
+                .start()
+                .await
+                .expect_err("invalid data route fails closed");
+            assert!(error.to_string().contains("unknown-market-data-venue"));
+            assert!(target.tasks.is_empty());
+            assert!(target.execution_worker_tasks.is_empty());
+            assert!(target.exec_control_tx.is_none());
+            assert!(target.ipc_task.is_none());
+            assert!(target.adapter_bridge.is_none());
         }
     }
 }
