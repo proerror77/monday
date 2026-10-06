@@ -501,21 +501,45 @@ pub fn attach_native_selection_rows(
         .selection
         .as_ref()
         .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
-    if dataset.rows.len() != selection.original_rows.start
-        || selection_rows.len() != selection.original_rows.len()
+    let visible_end = metadata.visible_rows.end;
+    let selection_end = selection.original_rows.end;
+    if dataset.rows.len() != visible_end
+        || selection_rows.len() != selection_end.saturating_sub(visible_end)
         || dataset.partitions.selection.as_ref() != Some(&selection.original_rows)
         || dataset.partitions.sealed_holdout.start != metadata.holdout.original_rows.start
     {
         return Err(EvaluationError::InvalidNativePreparedEvidence);
     }
-    validate_partition_clock(&selection_rows, &selection.window)?;
+    let first_context_time = selection_rows
+        .first()
+        .and_then(|row| row.available_time.timestamp_nanos_opt())
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
+    if first_context_time < metadata.development_window.end_ns {
+        return Err(EvaluationError::InvalidNativePreparedEvidence);
+    }
+    validate_partition_clock(
+        &selection_rows,
+        &hft_cex_research_input::data::Window {
+            start_ns: first_context_time,
+            end_ns: selection.window.end_ns,
+        },
+    )?;
     let holdout_start = DateTime::from_timestamp_nanos(metadata.holdout.window.start_ns);
+    let selection_offset = selection
+        .original_rows
+        .start
+        .checked_sub(visible_end)
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
+    let logical_selection_rows = selection_rows
+        .get(selection_offset..)
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
+    validate_partition_clock(logical_selection_rows, &selection.window)?;
     if dataset.rows[..dataset.partitions.search.end]
         .iter()
         .any(|row| {
             row.label_available_time >= DateTime::from_timestamp_nanos(selection.window.start_ns)
         })
-        || selection_rows
+        || logical_selection_rows
             .iter()
             .any(|row| row.label_available_time >= holdout_start)
     {

@@ -226,11 +226,21 @@ fn validate_native_bridge_metadata(
         .selection
         .as_ref()
         .context("native final bridge requires a reserved selection partition")?;
+    if selection.original_rows.start < metadata.visible_rows.end
+        || selection.original_rows.end < selection.original_rows.start
+    {
+        bail!("native selection range overlaps visible development rows or is inverted");
+    }
+    let selection_block_rows = selection
+        .original_rows
+        .end
+        .checked_sub(metadata.visible_rows.end)
+        .context("native selection range ends before visible development rows")?;
     let sealed_tail_rows = metadata
         .total_rows
         .checked_sub(selection.original_rows.end)
         .context("native selection range exceeds original source rows")?;
-    if bridge.selection.rows != selection.original_rows.len() as u64
+    if bridge.selection.rows != selection_block_rows as u64
         || bridge.selection.source_content_sha256 != selection.source_content_sha256
         || bridge.sealed_holdout.rows != sealed_tail_rows as u64
         || bridge.sealed_holdout.source_content_sha256 != metadata.holdout.source_content_sha256
@@ -1078,9 +1088,20 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
             &selection_path,
             "native final selection",
         )?;
+        let logical_selection_offset = native_metadata
+            .selection
+            .as_ref()
+            .expect("validated native selection metadata")
+            .original_rows
+            .start
+            .checked_sub(native_metadata.visible_rows.end)
+            .context("native selection begins before the visible development end")?;
+        let logical_selection_rows = selection_rows
+            .get(logical_selection_offset..)
+            .context("native selection context is shorter than its logical selection")?;
         verify_native_partition_source_rows(
             &bridge.selection,
-            &selection_rows,
+            logical_selection_rows,
             "native final selection",
         )?;
         let dataset =
@@ -2581,6 +2602,145 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("row count"));
+    }
+
+    #[test]
+    fn native_prepared_fixture_roundtrips_selection_then_sealed_tail() {
+        let fixture = super::super::tests::native_prepared_fixture_for_tests();
+        let metadata = fixture.inputs.prepared().original_metadata();
+        let selection = metadata.selection.as_ref().unwrap();
+        let source_rows = &fixture.source_rows;
+        assert_eq!(source_rows.len(), metadata.total_rows);
+
+        let encode_jsonl = |rows: &[alpha_engine::evaluation::ResearchRow]| {
+            let mut bytes = Vec::new();
+            for row in rows {
+                bytes.extend(serde_json::to_vec(row).unwrap());
+                bytes.push(b'\n');
+            }
+            bytes
+        };
+        let selection_context_rows =
+            &source_rows[metadata.visible_rows.end..selection.original_rows.end];
+        let logical_selection_offset = selection.original_rows.start - metadata.visible_rows.end;
+        let tail_rows = &source_rows[selection.original_rows.end..];
+        let selection_bytes = encode_jsonl(selection_context_rows);
+        let tail_bytes = encode_jsonl(tail_rows);
+        let selection_ref = NativeFinalPartitionRefV1 {
+            object_url: "/tmp/fixture-selection.jsonl".into(),
+            content_sha256: hex::encode(Sha256::digest(&selection_bytes)),
+            rows: selection_context_rows.len() as u64,
+            source_content_sha256: selection.source_content_sha256.clone(),
+        };
+        let tail_ref = NativeFinalPartitionRefV1 {
+            object_url: "/tmp/fixture-sealed-tail.jsonl".into(),
+            content_sha256: hex::encode(Sha256::digest(&tail_bytes)),
+            rows: tail_rows.len() as u64,
+            source_content_sha256: metadata.holdout.source_content_sha256.clone(),
+        };
+        let clocks = source_rows
+            .iter()
+            .map(|row| NativeFinalDecisionClockV1 {
+                series_id: row.series_id,
+                feature_available_time: row.available_time,
+                series_close_time: row.label_available_time,
+            })
+            .collect::<Vec<_>>();
+        let clock_bytes = clocks
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .flat_map(|line| line.into_iter().chain(std::iter::once(b'\n')))
+            .collect::<Vec<_>>();
+        let clock_ref = NativeFinalClockIndexRefV1 {
+            object_url: "/tmp/fixture-clocks.jsonl".into(),
+            content_sha256: hex::encode(Sha256::digest(&clock_bytes)),
+            rows: clocks.len() as u64,
+        };
+
+        let bridge = NativeFinalInputsV1 {
+            schema_version: NATIVE_FINAL_INPUTS_SCHEMA.into(),
+            final_grant_sha256: "a".repeat(64),
+            source_result_sha256: "b".repeat(64),
+            prepared_collection_sha256: fixture.inputs.collection_id().to_string(),
+            evaluation_protocol_sha256: metadata.protocol_sha256.clone(),
+            holdout_id: fixture.request.holdout_id.clone(),
+            selection: selection_ref.clone(),
+            sealed_holdout: tail_ref.clone(),
+            decision_clock_index: clock_ref.clone(),
+            selection_replay: NativeFinalReplayRefV1 {
+                artifact_url: "/tmp/fixture-selection-replay.parquet".into(),
+                artifact_sha256: "c".repeat(64),
+                manifest_url: "/tmp/fixture-selection-replay-manifest.json".into(),
+                manifest_sha256: "d".repeat(64),
+            },
+        };
+        validate_native_bridge_metadata(&bridge, metadata).unwrap();
+
+        let local = tempfile::tempdir().unwrap();
+        let selection_path = local.path().join("selection.jsonl");
+        std::fs::write(&selection_path, &selection_bytes).unwrap();
+        let tail_path = local.path().join("tail.jsonl");
+        std::fs::write(&tail_path, &tail_bytes).unwrap();
+        let clock_path = local.path().join("clocks.jsonl");
+        std::fs::write(&clock_path, &clock_bytes).unwrap();
+        let selection_rows =
+            read_native_final_partition_file(&selection_path, &selection_ref).unwrap();
+        verify_native_partition_source_rows(
+            &selection_ref,
+            &selection_rows[logical_selection_offset..],
+            "fixture selection",
+        )
+        .unwrap();
+        let clocks =
+            read_native_final_clock_index(&clock_path, &clock_ref, metadata.total_rows).unwrap();
+        assert_eq!(clocks.len(), metadata.total_rows);
+
+        let protocol: alpha_domain::EvaluationProtocolV1 =
+            serde_json::from_str(&metadata.protocol_json).unwrap();
+        let development = alpha_engine::evaluation::prepare_native_campaign_dataset(
+            fixture.inputs.prepared(),
+            &protocol,
+        )
+        .unwrap();
+        assert_eq!(
+            development.engine_context().rows().len(),
+            metadata.visible_rows.end,
+            "native development rows must end at visible_rows.end"
+        );
+        let selection_ready =
+            alpha_engine::evaluation::attach_native_selection_rows(development, selection_rows)
+                .unwrap();
+        assert_eq!(
+            selection_ready.engine_context().rows().len(),
+            metadata.search_rows.len(),
+            "selection remains hidden from search and proposal contexts"
+        );
+        assert!(
+            alpha_engine::evaluation::evaluate_sealed_holdout(&selection_ready, |_| Ok(()))
+                .is_err()
+        );
+
+        // This mirrors the final worker's read-after-claim callback boundary:
+        // the sealed tail isn't decoded until the caller enters that callback.
+        let tail_rows = read_native_final_partition_file(&tail_path, &tail_ref).unwrap();
+        let holdout_offset = metadata.holdout.original_rows.start - selection.original_rows.end;
+        verify_native_partition_source_rows(
+            &tail_ref,
+            &tail_rows[holdout_offset..],
+            "fixture sealed holdout",
+        )
+        .unwrap();
+        let sealed_ready =
+            alpha_engine::evaluation::attach_native_sealed_holdout_rows(selection_ready, tail_rows)
+                .unwrap();
+        assert_eq!(
+            alpha_engine::evaluation::evaluate_sealed_holdout(&sealed_ready, |rows| Ok(rows.len()))
+                .unwrap(),
+            metadata.holdout.original_rows.len()
+        );
     }
 
     #[test]
