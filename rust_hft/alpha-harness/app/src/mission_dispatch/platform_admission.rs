@@ -8,6 +8,22 @@ use clap::Args;
 use hft_research_dispatch_io::validate_cluster_target;
 use serde_json::json;
 use std::path::PathBuf;
+mod fixed_campaign;
+#[cfg(all(test, feature = "scientific"))]
+mod fixed_campaign_tests;
+mod native_witness;
+mod released_build;
+mod signed_export;
+mod signed_revocations;
+mod worker_configuration;
+pub use signed_export::PlatformExportArgs;
+pub use signed_revocations::PlatformRevocationsArgs;
+pub fn export(args: PlatformExportArgs) -> anyhow::Result<()> {
+    signed_export::export(args)
+}
+pub fn export_revocations(args: PlatformRevocationsArgs) -> anyhow::Result<()> {
+    signed_revocations::export(args)
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct PlatformPrepareArgs {
@@ -25,6 +41,8 @@ pub struct PlatformPrepareArgs {
 /// No deserializer or public constructor can turn caller JSON into this state.
 pub(super) struct PreparedPlatformCampaignBudget {
     admission: admission::Admission,
+    validated: super::ValidatedSubmission,
+    manifest: serde_json::Value,
 }
 impl PreparedPlatformCampaignBudget {
     pub(super) fn budget(&mut self) -> anyhow::Result<VerifiedCampaignPlatformBudget> {
@@ -90,7 +108,11 @@ fn prepare_budget_with(
         .context("canonical native reservation failed")?;
     publish(&mut source)
         .context("native charge retained; source receipt publication/readback failed")?;
-    Ok(PreparedPlatformCampaignBudget { admission: source })
+    Ok(PreparedPlatformCampaignBudget {
+        admission: source,
+        validated,
+        manifest,
+    })
 }
 
 #[cfg(test)]

@@ -1224,6 +1224,64 @@ mod tests {
     }
 
     #[test]
+    fn platform_handoff_clock_follows_approval_and_family_guards() {
+        let (mut store, verified) = registered();
+        let reservation = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &reservation, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let before = store.campaign_family_usage(FAMILY).unwrap();
+        let mut competing = store.connection.try_clone().unwrap();
+        let mut clock = |at| {
+            let tx = competing.transaction().unwrap();
+            assert!(serialize_approval_mutation(&tx, APPROVAL).is_err());
+            assert!(tx
+                .execute(
+                    "UPDATE campaign_family_heads SET sequence=sequence WHERE family_id=?",
+                    params![FAMILY],
+                )
+                .is_err());
+            tx.rollback().unwrap();
+            at
+        };
+        store
+            .with_campaign_platform_budget_with_clock(
+                &verified,
+                &reservation,
+                || clock(t0()),
+                |_| Ok::<_, StoreError>(()),
+            )
+            .unwrap();
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: reservation.operation_id().unwrap(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        assert!(store
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                || clock(verified.grant().expires_at),
+            )
+            .is_err());
+        assert!(store
+            .campaign_family_snapshot(FAMILY)
+            .unwrap()
+            .receipts
+            .iter()
+            .all(|entry| {
+                !matches!(
+                    entry.receipt.event,
+                    CampaignLedgerEventV1::PlatformTransferred { .. }
+                )
+            }));
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
+    }
+
+    #[test]
     fn platform_export_requires_published_exact_transfer_and_retains_unknown_charge() {
         let (mut store, verified) = registered();
         let reservation = reservation(&verified, 0, 40);
