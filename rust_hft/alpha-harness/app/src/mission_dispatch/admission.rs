@@ -332,7 +332,6 @@ impl Admission {
             })
     }
 
-    #[cfg(test)]
     pub(super) fn transfer_to_platform(
         &mut self,
         transfer: &alpha_store::campaign_ledger::CampaignPlatformTransferV1,
@@ -349,7 +348,6 @@ impl Admission {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(super) fn with_platform_export<T>(
         &mut self,
         transfer: &alpha_store::campaign_ledger::CampaignPlatformTransferV1,
