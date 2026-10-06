@@ -604,8 +604,37 @@ struct Broker {
     http: reqwest::Client,
     verifiers: tokio::sync::Semaphore,
     keys: tokio::sync::Mutex<Option<(std::time::Instant, KeySet)>>,
+    watchers: tokio::sync::Mutex<BTreeMap<String, Watcher>>,
+    snapshots: tokio::sync::Mutex<BTreeMap<String, (std::time::Instant, Value)>>,
+}
+struct Watcher {
+    hashes: BTreeSet<String>,
+    read_token: String,
 }
 impl Broker {
+    fn new(config: Config, policy: PublisherPolicy) -> Result<Self> {
+        Ok(Self {
+            config,
+            policy,
+            http: TlsConfig::default().client(Duration::from_secs(30), true)?,
+            verifiers: tokio::sync::Semaphore::new(2),
+            keys: tokio::sync::Mutex::new(None),
+            watchers: tokio::sync::Mutex::new(BTreeMap::new()),
+            snapshots: tokio::sync::Mutex::new(BTreeMap::new()),
+        })
+    }
+    async fn renewal_snapshot(&self, path: &str, binding: &str, token: &str) -> Result<Value> {
+        let key = format!("{path}:{binding}");
+        let mut cache = self.snapshots.lock().await;
+        cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(55));
+        if let Some((_, value)) = cache.get(&key) {
+            return Ok(value.clone());
+        }
+        ensure!(cache.len() < 128, "renewal snapshot bound exceeded");
+        let value = self.api(path, token).await?;
+        cache.insert(key, (std::time::Instant::now(), value.clone()));
+        Ok(value)
+    }
     async fn json(&self, url: &str, token: Option<&str>) -> Result<Value> {
         let request = self
             .http
@@ -944,27 +973,64 @@ impl Broker {
         let evidence = self.evidence(r, token).await?;
         verify_evidence(&evidence, &verified, &self.config, &self.policy, r)?;
         let response = install(&self.config, r, &verified, access, now_ms()?)?;
-        let broker = self.clone();
         let context = r.context.clone();
         let check_run_id = verified.0.check_run_id;
         let token_hash = sha256(response.token.as_bytes());
-        let read_token = token.to_owned();
-        tokio::spawn(async move {
-            broker
-                .renew_while_running(context, check_run_id, token_hash, read_token)
-                .await;
-        });
+        self.track(context, check_run_id, token_hash, token).await?;
         Ok(response)
+    }
+    async fn track(
+        self: &Arc<Self>,
+        context: contract::ContextBinding,
+        check_run_id: u64,
+        token_hash: String,
+        token: &str,
+    ) -> Result<()> {
+        let key = identity(&(
+            &context.repository,
+            &context.source_sha,
+            context.publisher_run_id,
+            context.publisher_run_attempt,
+            context.publisher_job_id,
+            check_run_id,
+            &context.image_repository,
+        ))?;
+        let mut watchers = self.watchers.lock().await;
+        if let Some(watcher) = watchers.get_mut(&key) {
+            watcher.hashes.insert(token_hash);
+            watcher.read_token = token.to_owned();
+        } else {
+            watchers.insert(
+                key.clone(),
+                Watcher {
+                    hashes: BTreeSet::from([token_hash]),
+                    read_token: token.to_owned(),
+                },
+            );
+            let broker = self.clone();
+            tokio::spawn(async move {
+                broker.renew_while_running(context, check_run_id, key).await;
+            });
+        }
+        Ok(())
     }
     async fn renew_while_running(
         &self,
         context: contract::ContextBinding,
         check_run_id: u64,
-        token_hash: String,
-        read_token: String,
+        key: String,
     ) {
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let Some((read_token, hashes)) = self
+                .watchers
+                .lock()
+                .await
+                .get(&key)
+                .map(|watcher| (watcher.read_token.clone(), watcher.hashes.clone()))
+            else {
+                return;
+            };
             let active = tokio::time::timeout(Duration::from_secs(35), async {
                 let job = self
                     .api(
@@ -972,10 +1038,13 @@ impl Broker {
                         &read_token,
                     )
                     .await?;
-                let main = self.api("git/ref/heads/main", &read_token).await?;
+                let main = self
+                    .renewal_snapshot("git/ref/heads/main", &context.source_sha, &read_token)
+                    .await?;
                 let run = self
-                    .api(
+                    .renewal_snapshot(
                         &format!("actions/runs/{}", context.publisher_run_id),
+                        &context.publisher_run_attempt.to_string(),
                         &read_token,
                     )
                     .await?;
@@ -993,9 +1062,36 @@ impl Broker {
             .ok()
             .and_then(Result::ok)
             .unwrap_or(false);
-            let Ok(now) = now_ms() else { break };
-            if !matches!(refresh(&self.config, &token_hash, active, now), Ok(true)) {
-                break;
+            let Ok(now) = now_ms() else {
+                self.watchers.lock().await.remove(&key);
+                return;
+            };
+            if !active {
+                let hashes = self
+                    .watchers
+                    .lock()
+                    .await
+                    .remove(&key)
+                    .map(|watcher| watcher.hashes)
+                    .unwrap_or_default();
+                for hash in hashes {
+                    let _ = refresh(&self.config, &hash, false, now);
+                }
+                return;
+            }
+            let mut removed = BTreeSet::new();
+            for hash in hashes {
+                if !matches!(refresh(&self.config, &hash, true, now), Ok(true)) {
+                    removed.insert(hash);
+                }
+            }
+            let mut watchers = self.watchers.lock().await;
+            if let Some(watcher) = watchers.get_mut(&key) {
+                watcher.hashes.retain(|hash| !removed.contains(hash));
+                if watcher.hashes.is_empty() {
+                    watchers.remove(&key);
+                    return;
+                }
             }
         }
     }
@@ -1130,13 +1226,7 @@ async fn main() -> Result<()> {
     let _broker_lock = private_lock(&config.replay_file.with_extension("broker.lock"))?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     revoke_after_restart(&config)?;
-    let broker = Arc::new(Broker {
-        config,
-        policy,
-        http: TlsConfig::default().client(Duration::from_secs(30), true)?,
-        verifiers: tokio::sync::Semaphore::new(2),
-        keys: tokio::sync::Mutex::new(None),
-    });
+    let broker = Arc::new(Broker::new(config, policy)?);
     let router = Router::new()
         .route("/broker/release-capability", post(handle))
         .layer(DefaultBodyLimit::max(64 * 1024))
@@ -1231,25 +1321,79 @@ mod tests {
             run_attempt: 1,
             check_run_id: 30,
         };
-        let keys = KeySet{keys:vec![Key{kid:"public-test-only".into(),kty:"RSA".into(),
-            n:"tsQsUV8QpqrygsY-2-JCQ6Fw8_omM71IM2N_R8pPbzbgOl0p78MZGsgPOQ2HSznjD0FPzsH8oO2B5Uftws04LHb2HJAYlz25-lN5cqfHAfa3fgmC38FfwBkn7l582UtPWZ_wcBOnyCgb3yLcvJrXyrt8QxHJgvWO23ITrUVYszImbXQ67YGS0YhMrbixRzmo2tpm3JcIBtnHrEUMsT0NfFdfsZhTT8YbxBvA8FdODgEwx7u_vf3J9qbi4-Kv8cvqyJuleIRSjVXPsIMnoejIn04APPKIjpMyQdnWlby7rNyQtE4-CV-jcFjqJbE_Xilcvqxt6DirjFCvYeKYl1uHLw".into(),
-            e:"AQAB".into(),alg:Some("RS256".into()),usage:Some("sig".into())}]};
+        let keys = KeySet {
+            keys: vec![ephemeral_crypto().1.clone()],
+        };
         (temp, config, policy, request, claims, keys)
     }
-    fn signed(claims: &Claims) -> String {
-        // Public upstream RSA fixture, converted to PKCS#1. Never an operator key.
-        // https://github.com/RustCrypto/RSA/blob/v0.9.10/tests/examples/pkcs8/rsa2048-priv.pem
-        let pem = include_str!("../../tests/fixtures/release-oidc-test-key.pem");
-        let data: String = pem
-            .lines()
-            .filter(|line| !line.starts_with("---"))
-            .collect();
-        let der = base64::engine::general_purpose::STANDARD
-            .decode(data)
+    fn openssl(args: &[&str], input: &[u8]) -> Vec<u8> {
+        let mut command = std::process::Command::new("openssl")
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ephemeral test RSA tool unavailable");
+        command.stdin.take().unwrap().write_all(input).unwrap();
+        let result = command.wait_with_output().unwrap();
+        assert!(result.status.success(), "ephemeral test RSA setup failed");
+        assert!(
+            result.stdout.len() <= 16 * 1024,
+            "ephemeral test RSA output exceeds bound"
+        );
+        result.stdout
+    }
+    fn ephemeral_crypto() -> &'static (EncodingKey, Key) {
+        static CRYPTO: std::sync::OnceLock<(EncodingKey, Key)> = std::sync::OnceLock::new();
+        CRYPTO.get_or_init(|| {
+            // Test-only, fresh private bytes remain in process memory and pipes.
+            // No private key file or production trust is created.
+            let generated = openssl(
+                &[
+                    "genpkey",
+                    "-algorithm",
+                    "RSA",
+                    "-pkeyopt",
+                    "rsa_keygen_bits:2048",
+                    "-pkeyopt",
+                    "rsa_keygen_pubexp:65537",
+                    "-outform",
+                    "DER",
+                ],
+                &[],
+            );
+            let der = openssl(
+                &["rsa", "-inform", "DER", "-traditional", "-outform", "DER"],
+                &generated,
+            );
+            let modulus = String::from_utf8(openssl(
+                &["rsa", "-inform", "DER", "-noout", "-modulus"],
+                &der,
+            ))
             .unwrap();
+            let hex = modulus.trim().strip_prefix("Modulus=").unwrap();
+            assert_eq!(hex.len(), 512);
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let public = Key {
+                kid: "public-test-only".into(),
+                kty: "RSA".into(),
+                n: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+                e: "AQAB".into(),
+                alg: Some("RS256".into()),
+                usage: Some("sig".into()),
+            };
+            (EncodingKey::from_rsa_der(&der), public)
+        })
+    }
+    fn signed(claims: &Claims) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("public-test-only".into());
-        encode(&header, claims, &EncodingKey::from_rsa_der(&der)).unwrap()
+        encode(&header, claims, &ephemeral_crypto().0).unwrap()
     }
     fn evidence(r: &Request) -> Evidence {
         let c = &r.context;
@@ -1590,17 +1734,29 @@ mod tests {
         assert!(read_private::<Vec<Capability>>(&c.capabilities_file).is_err());
     }
     #[tokio::test]
+    async fn source_publish_and_read_share_one_job_monitor() {
+        let (_temp, config, policy, request, _, _) = fixture();
+        let broker = Arc::new(Broker::new(config, policy).unwrap());
+        for i in 0..3 {
+            broker
+                .track(
+                    request.context.clone(),
+                    30,
+                    format!("{i:064x}"),
+                    "ephemeral-test-read-token",
+                )
+                .await
+                .unwrap();
+        }
+        let watchers = broker.watchers.lock().await;
+        assert_eq!(watchers.len(), 1);
+        assert_eq!(watchers.values().next().unwrap().hashes.len(), 3);
+    }
+    #[tokio::test]
     async fn http_rejection_never_echoes_forged_credentials() {
         let (_temp, config, policy, request, claims, keys) = fixture();
-        let broker = Arc::new(Broker {
-            config,
-            policy,
-            http: TlsConfig::default()
-                .client(Duration::from_secs(1), true)
-                .unwrap(),
-            verifiers: tokio::sync::Semaphore::new(2),
-            keys: tokio::sync::Mutex::new(Some((std::time::Instant::now(), keys))),
-        });
+        let broker = Arc::new(Broker::new(config, policy).unwrap());
+        *broker.keys.lock().await = Some((std::time::Instant::now(), keys));
         let mut forged = signed(&claims).into_bytes();
         let signature = forged.iter().rposition(|byte| *byte == b'.').unwrap() + 1;
         forged[signature] = if forged[signature] == b'A' {

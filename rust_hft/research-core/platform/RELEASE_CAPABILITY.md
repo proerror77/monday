@@ -140,7 +140,10 @@ Missing tools or failed namespace isolation deny issuance; there is no fallback.
 Two native plans may run concurrently; requests have a 150-second bound.
 
 Each response grants an initial lease of at most two minutes.
-Every 30 seconds, the broker reads job/run status and current main independently.
+One monitor serves all capabilities issued to the same signed publisher job.
+Every minute it reads that job independently.
+Main/run renewal snapshots are shared for at most 55 seconds.
+Issuance and its final authorization read always bypass that cache.
 It renews active leases up to the requested one-hour deadline.
 Completion, cancellation, source drift or authority-read failure stops renewal
 and removes that capability from the gateway projection.
@@ -152,8 +155,9 @@ OIDC replay identifiers and bearer tokens enter state only as SHA-256 hashes.
 Production acceptance still requires the chosen Linux host, real TLS ingress,
 operator policy/signing trust, original compiler artifact and gateway readback.
 Unit tests and a namespace probe do not prove a deployed release.
-The included RSA fixture is publicly known upstream test material.
-It must never configure production trust.
+RSA tests require OpenSSL and generate fresh test keys through in-memory pipes.
+They never write or track a private key file.
+These test keys do not configure production trust.
 
 ## Gateway integration
 
