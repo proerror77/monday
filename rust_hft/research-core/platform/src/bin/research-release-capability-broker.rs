@@ -30,6 +30,10 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, process::Command};
 
+// Probe the bundle reader inside the actual namespace before any source fetch.
+const PLANNER_BOOTSTRAP: &str =
+    "ruby -rrubygems/package -e 'Gem::Package::TarReader' && exec git init source";
+
 #[path = "../release_capability_contract.rs"]
 mod contract;
 use contract::{Phase, Plan, Request, Response};
@@ -899,7 +903,7 @@ impl Broker {
         let root_str = root.to_str().context("non-UTF8 verifier directory")?;
         common.extend(["--bind", root_str, "/work", "--chdir", "/work", "--"]);
         let mut bootstrap = common.clone();
-        bootstrap.extend(["git", "init", "source"]);
+        bootstrap.extend(["bash", "-c", PLANNER_BOOTSTRAP]);
         self.command(root, &self.config.verifier_sandbox, &bootstrap, token)
             .await?;
         let url = format!("https://github.com/{}.git", self.policy.trust.repository);

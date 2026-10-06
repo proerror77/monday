@@ -131,7 +131,11 @@ Git receives it through process environment, never command arguments or git file
 
 Planning requires Linux user, PID and mount namespaces plus installed `bubblewrap`.
 Install trusted regular executables under the configured tool roots.
-The required tools include git, bash, gh, jq, unzip, Python and the native publisher.
+The required tools include git, bash, gh, jq, unzip, Ruby, Python and the native
+publisher, with the standard Linux coreutils, diffutils, findutils and awk tools.
+Ruby must provide `rubygems/package`: the authenticated software downloader uses
+its tar reader to validate paths, file types and executable modes before unpacking.
+The broker probes that reader inside the namespace before fetching source.
 The sandbox exposes read-only tool/CA roots and a disposable work directory.
 It leaves `/proc` empty and clears inherited environment.
 Projection, journal and TLS private keys must stay outside mounted tool roots.
