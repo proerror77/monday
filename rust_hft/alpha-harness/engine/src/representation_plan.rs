@@ -43,9 +43,25 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
             ($path, include_bytes!($path).as_slice())
         };
     }
-    // Every registered renderer uses this replay, feature and reference path.
-    // Bind its modules once so a dependency change invalidates every affected tool.
+    // Shared closure for the registered renderer, its loader and exact domain
+    // predicates, plus replay, features and source-bound reference admission.
+    // Source bytes bind behavior without introducing functional imports.
     let mut sources = vec![
+        source!("../../app/src/mission_render.rs"),
+        source!("../../app/src/mission_runner.rs"),
+        source!("../../app/src/data_mission.rs"),
+        source!("../../app/src/mission_calendar.rs"),
+        source!("../../domain/src/lib.rs"),
+        source!("../../domain/src/representation.rs"),
+        source!("../../domain/src/campaign_horizon.rs"),
+        source!("../../domain/src/evaluation_calendar.rs"),
+        source!("../../domain/src/evaluation_partition.rs"),
+        source!("evaluation.rs"),
+        source!("baselines.rs"),
+        source!("baselines/classic.rs"),
+        source!("baselines/fitting.rs"),
+        source!("label_precheck.rs"),
+        source!("model_metrics.rs"),
         source!("../../../tools/collector/src/bin/lob-pit-materializer.rs"),
         source!("../../../tools/collector/src/bin/lob-pit-materializer/market_encoder.rs"),
         source!("../../../market-core/core/src/book_features.rs"),
@@ -57,9 +73,15 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../../data-pipelines/core/src/binance_usdm_reference.rs"),
         source!("../../../tools/collector/src/binance_spot_reference_artifact.rs"),
         source!("../../../tools/collector/src/binance_usdm_reference_artifact.rs"),
+        source!("../../../tools/collector/src/feature_matrix.rs"),
         source!("../../../research-core/manifest/src/lib.rs"),
         source!("../../../research-core/manifest/src/sequence.rs"),
         source!("../../../research-core/manifest/src/market_encoder.rs"),
+        source!("../../../research-core/manifest/src/model.rs"),
+        source!("../../../research-core/manifest/src/model/holding.rs"),
+        source!("../../../research-core/manifest/src/model/prepared.rs"),
+        source!("../../../research-core/manifest/src/model/numerical.rs"),
+        source!("../../../research-core/manifest/src/portable_network.rs"),
         source!("../../../data-pipelines/Cargo.lock"),
         source!("../../../research-core/Cargo.lock"),
     ];
@@ -68,13 +90,8 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         RepresentationToolV1::SolSequence | RepresentationToolV1::SolMarketEncoder
     ) {
         sources.extend([
-            source!("baselines.rs"),
-            source!("baselines/classic.rs"),
-            source!("baselines/fitting.rs"),
             source!("../../../research-core/ml/src/portable.rs"),
             source!("../../../research-core/ml/src/shared_input.rs"),
-            source!("../../../research-core/manifest/src/model.rs"),
-            source!("../../../research-core/manifest/src/portable_network.rs"),
         ]);
     }
     match tool {
@@ -879,5 +896,53 @@ mod tests {
         too_wide.labels.horizon_buckets = 1;
         assert!(too_wide.label_end_ns().is_err());
         assert!(propose_representation_comparison(&data, &too_wide).is_err());
+    }
+
+    #[test]
+    fn review_registry_binds_campaign_renderer_loader_and_goal_contract() {
+        let (data, goal) = input();
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        for dependency in [
+            "../../app/src/mission_render.rs",
+            "../../app/src/mission_runner.rs",
+            "../../app/src/data_mission.rs",
+            "../../domain/src/representation.rs",
+            "../../domain/src/campaign_horizon.rs",
+            "../../domain/src/evaluation_calendar.rs",
+        ] {
+            let tool = RepresentationToolV1::StaticTop5;
+            let sources = implementation_sources(tool);
+            let body = sources
+                .iter()
+                .find(|(path, _)| *path == dependency)
+                .unwrap_or_else(|| panic!("unbound registered contract {dependency}"))
+                .1;
+            let mut changed = body.to_vec();
+            changed.extend_from_slice(b"\n// changed registered renderer or contract condition\n");
+            let changed_sources = sources
+                .iter()
+                .map(|&(path, body)| {
+                    (
+                        path,
+                        if path == dependency {
+                            changed.as_slice()
+                        } else {
+                            body
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let current = implementation(tool);
+            let changed = source_reference(&current.id, &changed_sources);
+            assert_ne!(current, changed, "{dependency}");
+            let mut stale = plan.clone();
+            stale
+                .matches
+                .iter_mut()
+                .find(|entry| entry.tool == tool)
+                .unwrap()
+                .implementation = changed;
+            assert!(validate_representation_plan(&stale, &data, &goal).is_err());
+        }
     }
 }
