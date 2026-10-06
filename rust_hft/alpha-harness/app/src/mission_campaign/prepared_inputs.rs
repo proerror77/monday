@@ -90,7 +90,7 @@ pub(crate) fn inspect_planning_ready_metadata(
     {
         bail!("planning DataReady bytes differ from the signed root input identity");
     }
-    validate_request_for_execute(request)?;
+    validate_request_for_source(request)?;
     let receipt: CampaignInputsReceipt = serde_json::from_slice(bytes)?;
     let reference = request
         .prepared_inputs
@@ -161,7 +161,7 @@ pub(crate) fn inspect_finalized_campaign_prepared_inputs(
     source: &mut impl hft_cex_research_input::data::BlockSource,
     max_decoded_bytes: u64,
 ) -> anyhow::Result<VerifiedNativeCampaignPreparedInputs> {
-    validate_request_for_execute(request)?;
+    validate_request_for_source(request)?;
     let request_sha256 = hft_cex_research_input::sha256(&serialize_request(request)?);
     if request_sha256
         != normalized_sha256(

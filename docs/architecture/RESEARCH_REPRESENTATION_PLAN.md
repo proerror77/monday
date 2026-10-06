@@ -14,7 +14,11 @@ The signed DataReady reference must contain safe `planning_metadata`. The planne
 
 Fresh native preparation exports exactly the protocol's search rows, including fixed-calendar sources. The native consumer verifies that same range. Full schedule metadata and withheld identities stay bound; label and replay context still end before withheld data. Preparing this projection does not supply the unavailable diagnostic calendar validation view or complete a calendar research run.
 
+Native calendar scientific submission, dispatch and worker execution reject this incomplete validation contract before a new budget reservation. Read-only source inspection remains available. Historical status, parent and terminal readback keep their original structural checks and cannot dispatch another attempt.
+
 The existing normalized projection is not a `VerifiedBinanceMarketTapeSeries`. It does not mint raw replay, aggressor-direction or OFI regeneration qualification. It retains the original producer Build/source, receipt, four output identities and actual clocked values. Signed prepared-column reuse must preserve those facts and the exact authorized view.
+
+Planning callbacks receive a private normalized borrow with rows, feature names, source identities and safe metadata. They can inspect explicit plan, seed and render contracts. They cannot obtain the complete prepared object, replay payloads, blocks or request transports from that borrow.
 
 Public raw family-search adapters and their task-created proof wrappers were removed. Original market-tape and reference verifiers remain unchanged. Development-only raw representation planning remains unavailable until its original producer supplies a trustworthy view projection. Old public commits retain the repair history; obsolete adapters are not kept as test-only pseudo-features.
 

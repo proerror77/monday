@@ -1379,17 +1379,46 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(not(test))]
-pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
+pub(crate) fn validate_request_for_source(request: &CampaignRequest) -> anyhow::Result<()> {
     validate_request(request)
 }
 
 #[cfg(test)]
-pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
+pub(crate) fn validate_request_for_source(request: &CampaignRequest) -> anyhow::Result<()> {
     validate_request(request).or_else(|_| validate_local_test_request(request))
+}
+
+pub(crate) fn validate_execution_readiness(request: &CampaignRequest) -> anyhow::Result<()> {
+    if request.prepared_inputs.is_some() && request.research_plan.calendar.is_some() {
+        bail!("native calendar execution requires an independently admitted calendar validation projection; normalized search preparation alone is not executable");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
+    validate_request_for_source(request)?;
+    validate_execution_readiness(request)
+}
+
+pub(crate) fn validate_serialized_execution_readiness(
+    request_json: &str,
+    request_sha256: &str,
+) -> anyhow::Result<()> {
+    let value: serde_json::Value = serde_json::from_str(request_json)?;
+    // Sequence and encoder requests retain their original owning admission.
+    if value["schema_version"] != CAMPAIGN_REQUEST_SCHEMA_V6 {
+        return Ok(());
+    }
+    if hex::encode(Sha256::digest(request_json.as_bytes())) != request_sha256 {
+        bail!("native execution readiness request differs from inspected request identity");
+    }
+    let request: CampaignRequest = serde_json::from_value(value)?;
+    validate_execution_readiness(&request)
 }
 
 #[cfg(feature = "scientific")]
 fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> anyhow::Result<()> {
+    validate_request_for_execute(&loaded.request)?;
     if !args.pre_holdout {
         bail!(
             "campaign-execute cannot open sealed holdout; pass --pre-holdout, or --final-evaluation with an independent grant"

@@ -472,7 +472,6 @@ impl Admission {
         purpose: Purpose,
         read_only: bool,
     ) -> anyhow::Result<Self> {
-        let signed: SignedCampaignRootGrantV1 = read_json(&control.signed_root_grant_path)?;
         let InspectedDispatch {
             inspection,
             manifest,
@@ -485,6 +484,15 @@ impl Admission {
         if read_only && purpose != Purpose::Settlement {
             bail!("read-only admission cannot dispatch");
         }
+        if purpose == Purpose::Dispatch {
+            crate::mission_campaign::validate_serialized_execution_readiness(
+                manifest["items"][0]["stringData"]["campaign.json"]
+                    .as_str()
+                    .context("missing admitted Campaign request")?,
+                &inspection.request_sha256,
+            )?;
+        }
+        let signed: SignedCampaignRootGrantV1 = read_json(&control.signed_root_grant_path)?;
         // Opening the existing database read/write retains DuckDB's process
         // exclusion. Never create an empty replacement database.
         let store = if read_only {

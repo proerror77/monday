@@ -4,6 +4,39 @@ use super::*;
 use crate::mission_campaign::{prepared_inputs, CampaignRequest};
 use alpha_domain::representation::{PlanningViewV1, PlanningVisibilityV1};
 use alpha_store::campaign_ledger::VerifiedCampaignPlanningPermission;
+use hft_cex_research_input::campaign::{
+    NativeDatasetMetadataV1, NativeResearchRowV1, NativeSourceBindingV1,
+};
+
+/// Only the approved normalized projection is borrowable by a planner. The
+/// original decoder's replay, complete manifest and transports stay private.
+pub(crate) struct NormalizedPlanningColumns<'a> {
+    input: &'a hft_cex_research_input::campaign::VerifiedCampaignPreparedInputsV1,
+}
+
+impl NormalizedPlanningColumns<'_> {
+    pub(crate) fn rows(&self) -> &[NativeResearchRowV1] {
+        self.input.rows()
+    }
+    pub(crate) fn feature_names(&self) -> &[String] {
+        &self.input.manifest().features.manifest.spec.feature_names
+    }
+    pub(crate) fn source(&self) -> &NativeSourceBindingV1 {
+        &self.input.manifest().source
+    }
+    pub(crate) fn original_metadata(&self) -> &NativeDatasetMetadataV1 {
+        self.input.original_metadata()
+    }
+    pub(crate) fn collection_id(&self) -> &str {
+        self.input.id()
+    }
+    pub(crate) fn development_rows_sha256(&self) -> &str {
+        self.input.development_rows_sha256()
+    }
+    pub(crate) fn protocol_sha256(&self) -> &str {
+        self.input.native_protocol_sha256()
+    }
+}
 
 /// Process-local authority. Only the guarded original source path constructs it.
 pub(crate) struct VerifiedPlanningView<'a> {
@@ -17,8 +50,35 @@ impl VerifiedPlanningView<'_> {
     pub(crate) fn view(&self) -> &PlanningViewV1 {
         &self.view
     }
-    pub(crate) fn prepared(&self) -> &prepared_inputs::VerifiedNativeCampaignPreparedInputs {
-        &self.prepared
+    pub(crate) fn columns(&self) -> NormalizedPlanningColumns<'_> {
+        NormalizedPlanningColumns {
+            input: self.prepared.prepared(),
+        }
+    }
+    pub(crate) fn research_plan(&self) -> &crate::mission_render::CexCampaignResearchPlanV1 {
+        &self.prepared.finalized_request().research_plan
+    }
+    pub(crate) fn seeds(&self) -> Vec<u64> {
+        self.prepared
+            .finalized_request()
+            .rounds
+            .iter()
+            .map(|round| round.seed)
+            .collect()
+    }
+    pub(crate) fn runner_source_revision(&self) -> &str {
+        self.prepared.source_revision()
+    }
+    pub(crate) fn render_metadata(
+        &self,
+    ) -> anyhow::Result<&crate::mission_render::PreparedCexInputMetadata> {
+        Ok(&self
+            .prepared
+            .finalized_request()
+            .prepared_inputs
+            .as_ref()
+            .context("verified normalized projection is absent")?
+            .render_metadata)
     }
     pub(crate) fn recheck(&self) -> anyhow::Result<()> {
         check_current_authority(&self.permission, self.trusted_keys)
@@ -26,16 +86,22 @@ impl VerifiedPlanningView<'_> {
 
     fn inventory(&self) -> anyhow::Result<Value> {
         self.recheck()?;
-        let input = self.prepared().prepared();
+        let input = self.columns();
         Ok(json!({
             "planning_view": self.view(),
             "data_stage": "verified_original_normalized_search_projection",
-            "collection_sha256": input.id(),
+            "collection_sha256": input.collection_id(),
             "development_rows_sha256": input.development_rows_sha256(),
-            "source_receipt_sha256": input.source_receipt_sha256(),
-            "producer": input.source_build(),
-            "feature_names": input.manifest().features.manifest.spec.feature_names,
+            "source_receipt_sha256": input.source().preparation_receipt_sha256,
+            "producer": input.source().build,
+            "feature_names": input.feature_names(),
             "rows": input.rows().len(),
+            "search_rows": input.original_metadata().search_rows,
+            "evaluation_protocol_sha256": input.protocol_sha256(),
+            "research_plan_sha256": self.research_plan().content_hash()?,
+            "seeds": self.seeds(),
+            "runner_source_revision": self.runner_source_revision(),
+            "render_metadata_sha256": canonical_json_hash(self.render_metadata()?)?,
             "raw_planning_available": false,
             "status": "no_executable_comparison",
             "materializations": [], "arms": [], "hypothesis": null,
@@ -207,8 +273,16 @@ mod tests {
                     source_revision: request.build_source_revision.clone(),
                     runner_image: format!("registry/research@sha256:{}", request.image_identity),
                     controller_image: format!("registry/controller@sha256:{}", "b".repeat(64)),
-                    job_cpu_millis: 2000,
-                    job_memory_mib: 4096,
+                    job_cpu_millis:
+                        alpha_domain::research_accelerator::ADMITTED_CAMPAIGN_JOB_CPU_MILLIS,
+                    job_memory_mib:
+                        alpha_domain::research_accelerator::ADMITTED_CAMPAIGN_JOB_MEMORY_LIMIT
+                            .strip_suffix("Gi")
+                            .unwrap()
+                            .parse::<u32>()
+                            .unwrap()
+                            .checked_mul(1024)
+                            .unwrap(),
                     accelerator: alpha_domain::research_accelerator::ResearchAcceleratorV1::Cpu,
                 },
                 allowed_policy_revision_ids: BTreeSet::from([request
@@ -220,7 +294,7 @@ mod tests {
                 budget: CampaignRootBudgetV1 {
                     max_trials: 1000,
                     max_job_attempts: 10,
-                    max_job_seconds: 100000,
+                    max_job_seconds: 600,
                     max_llm_tokens: 0,
                 },
                 valid_from: now,
@@ -346,6 +420,213 @@ mod tests {
                 before
             );
         }
+    }
+
+    #[test]
+    fn calendar_source_inventory_does_not_admit_an_unfinishable_scientific_attempt() {
+        let fixture =
+            crate::mission_campaign::tests::native_prepared_calendar_fixture_for_tests(false);
+        let (store, root, _directory, keys) = authority(&fixture, false);
+        let before = store
+            .campaign_family_snapshot(&root.grant().family.family_id)
+            .unwrap();
+        let receipt = std::fs::read(fixture.augmented_receipt_path()).unwrap();
+        let request = fixture.request.clone();
+        crate::mission_campaign::validate_request_for_source(&request).unwrap();
+        assert!(crate::mission_campaign::validate_request_for_execute(&request).is_err());
+        let request_json =
+            String::from_utf8(crate::mission_campaign::serialize_request(&request).unwrap())
+                .unwrap();
+        assert!(
+            crate::mission_campaign::validate_serialized_execution_readiness(
+                &request_json,
+                &hft_cex_research_input::sha256(request_json.as_bytes())
+            )
+            .is_err()
+        );
+        let scope = authorize_projection(
+            store.inspect_campaign_planning_permission(&root).unwrap(),
+            &keys,
+            &request,
+            &receipt,
+            |expected, guard| {
+                guard()?;
+                assert_eq!(fixture.inputs.request_sha256(), expected);
+                Ok(fixture.inputs)
+            },
+        )
+        .unwrap();
+        scope.inventory().unwrap();
+        let submission = crate::mission_dispatch::MissionDispatchSubmission {
+            attempt_id: "calendar-not-executable".into(),
+            image: root.grant().execution.runner_image.clone(),
+            request,
+        };
+        // The original test transport check is the only local-fixture adapter;
+        // the shared submission intake must independently enforce readiness.
+        assert!(
+            crate::mission_dispatch::validate_submission_with_request_check(
+                submission,
+                crate::mission_campaign::validate_request_for_source
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store
+                .campaign_family_snapshot(&root.grant().family.family_id)
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            store
+                .campaign_family_usage(&root.grant().family.family_id)
+                .unwrap()
+                .job_attempts,
+            0
+        );
+    }
+
+    #[test]
+    fn normalized_callback_borrows_actual_approved_columns_and_safe_contracts() {
+        let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
+        let (store, root, _directory, keys) = authority(&fixture, false);
+        let receipt = std::fs::read(fixture.augmented_receipt_path()).unwrap();
+        let request = fixture.request.clone();
+        crate::mission_campaign::validate_request_for_execute(&request).unwrap();
+        let expected_rows = fixture.inputs.prepared().rows().to_vec();
+        let expected_collection = fixture.inputs.collection_id().to_string();
+        let expected_names = fixture
+            .inputs
+            .prepared()
+            .manifest()
+            .features
+            .manifest
+            .spec
+            .feature_names
+            .clone();
+        let expected = request.prepared_inputs.as_ref().unwrap();
+        let scope = authorize_projection(
+            store.inspect_campaign_planning_permission(&root).unwrap(),
+            &keys,
+            &request,
+            &receipt,
+            |_, guard| {
+                guard()?;
+                Ok(fixture.inputs)
+            },
+        )
+        .unwrap();
+        let columns: NormalizedPlanningColumns<'_> = scope.columns();
+        let rows: &[NativeResearchRowV1] = columns.rows();
+        let source: &NativeSourceBindingV1 = columns.source();
+        assert_eq!(rows, expected_rows);
+        assert!(!rows.is_empty());
+        assert_eq!(columns.collection_id(), expected_collection);
+        assert_eq!(source, &expected.expected_native.source);
+        assert_eq!(columns.feature_names(), expected_names);
+        assert_eq!(
+            columns.development_rows_sha256(),
+            expected.expected_native.development_rows_sha256
+        );
+        assert_eq!(
+            columns.protocol_sha256(),
+            expected.expected_native.native_protocol_sha256
+        );
+        assert_eq!(
+            columns.original_metadata(),
+            expected.planning_metadata.as_ref().unwrap()
+        );
+        assert_eq!(scope.research_plan(), &request.research_plan);
+        assert_eq!(
+            scope.seeds(),
+            request
+                .rounds
+                .iter()
+                .map(|round| round.seed)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scope.runner_source_revision(),
+            request.build_source_revision
+        );
+        assert_eq!(scope.render_metadata().unwrap(), &expected.render_metadata);
+        scope.recheck().unwrap();
+    }
+
+    #[test]
+    fn recorded_calendar_failure_remains_readable_without_authorizing_another_attempt() {
+        use alpha_domain::campaign_control::{
+            CampaignAttemptOutcomeV1, CampaignAttemptSettlementV1,
+        };
+        let fixture =
+            crate::mission_campaign::tests::native_prepared_calendar_fixture_for_tests(false);
+        let (mut store, root, _directory, _keys) = authority(&fixture, false);
+        let submission = crate::mission_dispatch::MissionDispatchSubmission {
+            attempt_id: "historical-calendar-failure".into(),
+            image: root.grant().execution.runner_image.clone(),
+            request: fixture.request.clone(),
+        };
+        let historical =
+            crate::mission_dispatch::validate_submission_for_readback(submission.clone()).unwrap();
+        let manifest = crate::mission_dispatch::render_manifest_with_deadline(
+            &historical,
+            "monday-research",
+            crate::mission_dispatch::ACTIVE_DEADLINE_SECONDS
+                .min(root.grant().budget.max_job_seconds),
+        )
+        .unwrap();
+        let inspection = super::super::reconstruct_binding(
+            &historical,
+            &manifest,
+            fixture.materialization_path(),
+            &root.grant().execution.controller_image,
+            0,
+        )
+        .unwrap();
+        assert_eq!(inspection.execution, root.grant().execution);
+        let reservation = inspection.reservation(&root);
+        let now = Utc::now();
+        // Model an immutable attempt recorded by the former intake, then its
+        // failure in the original ledger. This is not a cloud execution receipt.
+        store
+            .reserve_campaign_attempt(&root, &reservation, now)
+            .unwrap();
+        let failure = CampaignAttemptSettlementV1 {
+            operation_id: reservation.operation_id().unwrap(),
+            reservation_sha256: reservation.content_hash().unwrap(),
+            evidence_sha256: hft_cex_research_input::sha256(
+                b"recorded calendar validation unavailable",
+            ),
+            outcome: CampaignAttemptOutcomeV1::Failed,
+            consumed_trials: None,
+        };
+        store
+            .settle_campaign_attempt(&reservation.family_id, &failure, now)
+            .unwrap();
+        let before = store
+            .campaign_family_snapshot(&reservation.family_id)
+            .unwrap();
+        let readback =
+            crate::mission_dispatch::validate_submission_for_readback(submission.clone()).unwrap();
+        assert_eq!(readback.request_sha256, reservation.request_sha256);
+        assert_eq!(readback.request_json, historical.request_json);
+        let error = crate::mission_dispatch::validate_submission_with_request_check(
+            submission.clone(),
+            crate::mission_campaign::validate_request_for_source,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("calendar validation projection"));
+        assert!(crate::mission_dispatch::validate_submission(submission).is_err());
+        assert_eq!(
+            store
+                .campaign_family_snapshot(&reservation.family_id)
+                .unwrap(),
+            before
+        );
+        let usage = store.campaign_family_usage(&reservation.family_id).unwrap();
+        assert_eq!(usage.job_attempts, 1);
+        assert_eq!(usage.pending_trials, 0);
+        assert_eq!(usage.uncertain_trials, reservation.declared_trials);
     }
 
     #[test]

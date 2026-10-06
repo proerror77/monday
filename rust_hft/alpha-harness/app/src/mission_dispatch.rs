@@ -15,7 +15,7 @@ mod terminal;
 
 use crate::{
     cli::{print_json, MissionDispatchInspectArgs, MissionDispatchSubmitArgs},
-    mission_campaign::{serialize_request, validate_request, CampaignRequest},
+    mission_campaign::{serialize_request, CampaignRequest},
 };
 use alpha_domain::{
     campaign_control::{verify_campaign_root_grant, SignedCampaignRootGrantV1},
@@ -124,7 +124,7 @@ fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> anyhow::Result
     if final_admission::is_final_submission(&args.submission)? {
         bail!("Campaign workflow status is limited to pre-holdout dispatch");
     }
-    let validated = validate_submission(load_submission(&args.submission)?)?;
+    let validated = validate_submission_for_readback(load_submission(&args.submission)?)?;
     let manifest = render_controlled_manifest(
         &validated,
         &args.namespace,
@@ -248,7 +248,7 @@ pub(crate) fn read_authenticated_campaign_parent(
 ) -> anyhow::Result<AuthenticatedCampaignParent> {
     let control = admission::read_control(control_path)?;
     let submission = load_submission(submission_path)?;
-    let validated = validate_submission(submission)?;
+    let validated = validate_submission_for_readback(submission)?;
     let manifest = render_controlled_manifest(&validated, namespace, &control)?;
     let inspection = admission::inspect_binding(
         &validated,
@@ -1003,10 +1003,36 @@ fn load_submission(path: &std::path::Path) -> anyhow::Result<MissionDispatchSubm
 fn validate_submission(
     submission: MissionDispatchSubmission,
 ) -> anyhow::Result<ValidatedSubmission> {
-    validate_submission_with_request_check(submission, validate_request)
+    validate_submission_with_request_check(submission, |request| {
+        // The canonical intake retains its production transport restrictions
+        // when a unit fixture uses the worker's local-source test adapter.
+        #[cfg(test)]
+        crate::mission_campaign::validate_request(request)?;
+        crate::mission_campaign::validate_request_for_execute(request)
+    })
+}
+
+fn validate_submission_for_readback(
+    submission: MissionDispatchSubmission,
+) -> anyhow::Result<ValidatedSubmission> {
+    // Historical records still require their exact immutable request and the
+    // original source checks. This cannot admit or resume a new attempt.
+    validate_submission_structure(
+        submission,
+        crate::mission_campaign::validate_request_for_source,
+    )
 }
 
 fn validate_submission_with_request_check(
+    submission: MissionDispatchSubmission,
+    check: impl FnOnce(&CampaignRequest) -> anyhow::Result<()>,
+) -> anyhow::Result<ValidatedSubmission> {
+    let validated = validate_submission_structure(submission, check)?;
+    crate::mission_campaign::validate_execution_readiness(&validated.submission.request)?;
+    Ok(validated)
+}
+
+fn validate_submission_structure(
     submission: MissionDispatchSubmission,
     check: impl FnOnce(&CampaignRequest) -> anyhow::Result<()>,
 ) -> anyhow::Result<ValidatedSubmission> {

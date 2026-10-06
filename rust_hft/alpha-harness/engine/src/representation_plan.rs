@@ -67,6 +67,10 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../app/src/mission_dispatch.rs"),
         source!("../../app/src/mission_dispatch/admission.rs"),
         source!("../../app/src/mission_dispatch/admission/planning_view.rs"),
+        source!("../../app/src/mission_dispatch/terminal.rs"),
+        source!("../../app/src/mission_dispatch/platform_admission.rs"),
+        source!("../../app/src/mission_dispatch/platform_admission/fixed_campaign.rs"),
+        source!("../../app/src/mission_dispatch/platform_admission/signed_export.rs"),
         source!("../../app/src/mission_campaign.rs"),
         source!("../../app/src/mission_campaign/prepared_inputs.rs"),
         source!("../../store/src/lib.rs"),
@@ -1088,6 +1092,10 @@ mod tests {
         let (data, goal) = input();
         let plan = propose_representation_comparison(&data, &goal).unwrap();
         for dependency in [
+            "../../app/src/mission_dispatch/terminal.rs",
+            "../../app/src/mission_dispatch/platform_admission.rs",
+            "../../app/src/mission_dispatch/platform_admission/fixed_campaign.rs",
+            "../../app/src/mission_dispatch/platform_admission/signed_export.rs",
             "evaluation.rs",
             "../../domain/src/research_accelerator.rs",
             "../../app/src/representation_plan.rs",
