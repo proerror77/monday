@@ -1,13 +1,17 @@
 #![cfg(feature = "control")]
+#[cfg(feature = "publisher")]
 use hft_cex_research_input::data::{BlockRef, DataViewSpec, Exit, PublishedView, Split, Window};
+#[cfg(feature = "publisher")]
 use hft_research_platform::{
     execution::{Acceptance, Backend, Profile},
     identity,
     orchestrator::{State, TaskKind, TaskSpec},
     postgres::{Ledger, BUILD_RELEASE_MIGRATION, MIGRATION, SESSION_DELIVERY_MIGRATION},
 };
+#[cfg(feature = "publisher")]
 mod common;
 
+#[cfg(feature = "publisher")]
 fn hash(c: char) -> String {
     c.to_string().repeat(64)
 }
@@ -26,16 +30,16 @@ fn researchctl_rejects_direct_view_publication() {
 }
 
 #[test]
-fn researchctl_rejects_unsigned_build_registration_before_connecting_to_pg() {
+fn researchctl_rejects_removed_build_shortcut_before_connecting_to_pg() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_researchctl"))
         .args(["register-build", "unverified.json"])
         .env_remove("MONDAY_RESEARCH_DATABASE_URL")
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("SIGNED_RELEASE"));
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("usage: researchctl"));
+    assert!(!error.contains("register-build"));
 }
 
 #[test]
@@ -63,6 +67,7 @@ fn session_host_rejects_resume_without_registered_checkpoint_before_starting_chi
 
 /// Only the explicitly named disposable test database is permitted. This test
 /// never targets production, imports business data, or connects to Kubernetes.
+#[cfg(feature = "publisher")]
 #[tokio::test]
 #[ignore = "requires disposable MONDAY_TEST_DATABASE_URL ending /monday_foundation_test"]
 async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
@@ -247,14 +252,23 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .execute(&pool)
         .await?;
     assert!(ledger.build_artifact(&unsigned_id).await.is_err());
-    let (artifact, signed, trust) = common::attest(artifact);
+    let package = common::published::Package::new(artifact).await?;
+    let artifact = package.artifact.clone();
+    let trust = &package.trust;
     spec.source_sha256 = artifact.build.source_manifest_sha256.clone();
-    let verified = trust.verify(&artifact, &signed)?;
     sqlx_core::query::query("UPDATE research.authority SET mode='paused'")
         .execute(&pool)
         .await?;
-    let artifact_id = ledger.register_build(&verified).await?;
-    assert_eq!(ledger.register_build(&verified).await?, artifact_id);
+    // Native CI exercises the missing actual blob, not only signed metadata.
+    let source_path = package
+        .root
+        .join(&package.signed.receipt.source.archive.key);
+    std::fs::remove_file(&source_path)?;
+    assert!(package.import(&ledger).await.is_err());
+    assert!(ledger.build_artifact(&artifact.id()?).await.is_err());
+    std::fs::write(source_path, b"source fixture")?;
+    let artifact_id = package.import(&ledger).await?;
+    assert_eq!(package.import(&ledger).await?, artifact_id);
     assert_eq!(ledger.build_artifact(&artifact_id).await?, artifact);
     let mode: String = sqlx_core::query_scalar::query_scalar("SELECT mode FROM research.authority")
         .fetch_one(&pool)
@@ -327,6 +341,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .is_err());
     let admit = |spec: hft_research_platform::orchestrator::TaskSpec| {
         let ledger = &ledger;
+        let pool = &pool;
         async move {
             use hft_research_platform::admission::{NativeAdmission, NativeAdmissionTrust};
             let run = ledger
@@ -342,9 +357,13 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
                 release_admission_receipt_sha256: build.release_receipt_sha256,
                 max_attempts: spec.max_attempts,
             };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis() as i64;
+            // Fixture and admission share the PG clock; a Docker VM clock
+            // can differ from the macOS host by several milliseconds.
+            let now: i64 = sqlx_core::query_scalar::query_scalar(
+                "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint",
+            )
+            .fetch_one(pool)
+            .await?;
             let evidence = NativeAdmission {
                 schema: "monday.native_scientific_admission.v1".into(),
                 tenant: "fixture".into(),

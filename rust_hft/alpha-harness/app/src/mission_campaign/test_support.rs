@@ -20,6 +20,7 @@ pub(super) fn valid_request() -> CampaignRequest {
         build_source_revision: "a".repeat(40),
     };
     let mut request = CampaignRequest {
+        prepared_inputs: None,
         schema_version: CAMPAIGN_REQUEST_SCHEMA_V5.to_string(),
         campaign_id: String::new(),
         build_source_revision: "a".repeat(40),
