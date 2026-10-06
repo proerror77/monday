@@ -107,6 +107,7 @@ dependencies = [
  "hft-cex-research-input",
  "hft-cex-search-driver",
  "hft-collector",
+ "hft-data",
  "hft-factor-dsl",
  "hft-governance-contracts",
  "hft-prepared-market-io",

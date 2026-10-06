@@ -19,8 +19,8 @@ Current view permissions, signed allowlists, source/image identity and remaining
 | Static Top5 | Observed Top5 seed and suitable time coverage | Snapshot-only supports observed state, not complete event history |
 | Lagged continuous OFI | Continuous book history and 60-second warmup | No interpolation across gaps or recovery seeds |
 | Aggregate trade flow | Verified aggregate-trade aggressor direction | No inferred direction from undirected trades |
-| SOL sequence | Binance USD-M SOLUSDT, Top5 and directed trades | Existing 24 channels, 60 × 1-second context, 5/10/30-second labels |
-| SOL market encoder | Same SOL input requirements | Existing implementation; no generic market or horizon claim |
+| SOL sequence | Binance USD-M SOLUSDT, Top5 and directed trades | Existing 24 channels, 60 × 1-second context, fixed 30-second Study primary target |
+| SOL market encoder | Same SOL input requirements | Same fixed 30-second Study primary target; no generic market or horizon claim |
 
 The small registry binds the existing implementation source hashes. It does not create a plugin framework.
 The raw adapter preserves each recovery seed as a separate series. It never joins history across that boundary.
@@ -32,7 +32,9 @@ Suitable continuous inputs produce two registered field families without feature
 H1 uses the renderer's nine snapshot fields. H2 replaces aggregate trade imbalance with `cont_ofi_lag60s`.
 The comparison preserves the goal's target, horizon, model, scaling, cost and partition identities.
 It reports the different information histories and proposes two trials within declared finite resource limits.
-The current renderer supports one-second observations and 5/10/30-second targets. Other targets remain implementation gaps.
+The current H1/H2 renderer supports USD-M BTCUSDT/SOLUSDT/BNBUSDT and Spot BTCUSDT only.
+It uses one-second observations and registered 5/10/30-second targets. Other instruments or targets remain implementation gaps.
+SOL sequence and encoder Studies fix their primary target at 30 seconds. Their 5/10-second sequence labels are diagnostics, not Study goals.
 The proposal does not require GP. Later native admission must select a currently supported model/input path.
 
 A plan cannot widen an existing signed feature or policy revision allowlist.
@@ -44,6 +46,7 @@ The engine validates an imported plan by recomputing the full deterministic resu
 
 Snapshot-only, gaps and unseeded diffs cannot support continuous history.
 Missing direction blocks directed trade and SOL tools. Future availability blocks planning.
+Each field decision clock must lie within the frozen goal window. Its availability cannot exceed that window end.
 A lookback must fit within one continuous series. A resource requirement exceeding the declared limit emits no comparison arms.
 Independent validation, strategy sealed, meta certification and exposed terminal views cannot feed this family search.
 A caller's view label is a declaration. Raw verification does not establish exposure-ledger or permission truth.

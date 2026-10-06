@@ -81,6 +81,13 @@ pub fn propose_representation_comparison(
     ) {
         return Err("independent, sealed, meta certification and exposed terminal views cannot drive this family search".into());
     }
+    if data.fields.iter().any(|field| {
+        field.decision_ns < goal.window_start_ns
+            || field.decision_ns > goal.window_end_ns
+            || field.available_ns > goal.window_end_ns
+    }) {
+        return Err("field clock falls outside the frozen goal decision window".into());
+    }
     let mut matches = Vec::new();
     for tool in [
         RepresentationToolV1::CapturedBookReplay,
@@ -134,9 +141,9 @@ pub fn propose_representation_comparison(
         ) && (goal.symbol != "SOLUSDT"
             || goal.market != "usdm"
             || goal.labels.observation_frequency_millis != 1000
-            || ![5, 10, 30].contains(&goal.labels.horizon_buckets))
+            || goal.labels.horizon_buckets != 30)
         {
-            reasons.push("existing SOL tool supports Binance USD-M SOLUSDT, 24 channels, 60 x 1s context and 5/10/30s labels only".into());
+            reasons.push("existing SOL Study supports Binance USD-M SOLUSDT, 24 channels, 60 x 1s context and a fixed 30s primary target; 5/10s are diagnostic labels only".into());
         }
         matches.push(ToolMatchV1 {
             tool,
@@ -167,7 +174,11 @@ pub fn propose_representation_comparison(
         trials: 2,
     };
     let renderer_supported = goal.labels.observation_frequency_millis == 1000
-        && [5, 10, 30].contains(&goal.labels.horizon_buckets);
+        && [5, 10, 30].contains(&goal.labels.horizon_buckets)
+        && matches!(
+            (goal.market.as_str(), goal.symbol.as_str()),
+            ("usdm", "BTCUSDT" | "SOLUSDT" | "BNBUSDT") | ("spot", "BTCUSDT")
+        );
     let feasible = has(RepresentationToolV1::StaticTop5)
         && has(RepresentationToolV1::LaggedContinuousOfi)
         && has(RepresentationToolV1::AggregateTradeFlow)
@@ -183,7 +194,7 @@ pub fn propose_representation_comparison(
     ];
     if !renderer_supported {
         limitations.push(
-            "Current H1/H2 renderer has no registered target for this cadence or horizon.".into(),
+            "Current H1/H2 renderer has no registered instrument, cadence or horizon for this goal.".into(),
         );
     }
     if !requested_resources.fits(&goal.resource_limit) {
@@ -457,6 +468,65 @@ mod tests {
             RepresentationToolV1::SolSequence
         ));
         assert_eq!(SequenceInputSpecV1::sol_lob().ordered_channels.len(), 24);
+    }
+    #[test]
+    fn field_decision_and_availability_cannot_escape_the_frozen_goal_window() {
+        let (data, goal) = input();
+        let mut later = data.clone();
+        later.fields[0].decision_ns = goal.window_end_ns + 1;
+        later.fields[0].available_ns = goal.window_end_ns + 1;
+        // The declaration is internally causal, but belongs to a future window.
+        later.validate().unwrap();
+        assert!(propose_representation_comparison(&later, &goal).is_err());
+        later.fields[0].available_ns = data.fields[0].available_ns;
+        assert!(propose_representation_comparison(&later, &goal).is_err());
+        let mut earlier = data.clone();
+        earlier.fields[0].decision_ns = goal.window_start_ns - 1;
+        assert!(propose_representation_comparison(&earlier, &goal).is_err());
+        let mut edge = data;
+        edge.fields[0].available_ns = goal.window_end_ns;
+        edge.fields[0].decision_ns = goal.window_end_ns;
+        assert!(propose_representation_comparison(&edge, &goal).is_ok());
+    }
+    #[test]
+    fn comparison_uses_the_registered_renderer_instrument_allowlist() {
+        for (market, symbol, supported_instrument) in [
+            ("usdm", "BTCUSDT", true),
+            ("usdm", "SOLUSDT", true),
+            ("usdm", "BNBUSDT", true),
+            ("spot", "BTCUSDT", true),
+            ("spot", "SOLUSDT", false),
+            ("usdm", "ETHUSDT", false),
+        ] {
+            let (mut data, mut goal) = input();
+            data.market = market.into();
+            goal.market = market.into();
+            data.symbol = symbol.into();
+            goal.symbol = symbol.into();
+            let plan = propose_representation_comparison(&data, &goal).unwrap();
+            assert_eq!(
+                !plan.arms.is_empty(),
+                supported_instrument,
+                "{market}/{symbol}"
+            );
+            assert_eq!(plan.hypothesis.is_some(), supported_instrument);
+        }
+    }
+    #[test]
+    fn sol_diagnostic_horizons_are_not_registered_study_primary_targets() {
+        let (mut data, mut goal) = input();
+        data.symbol = "SOLUSDT".into();
+        goal.symbol = "SOLUSDT".into();
+        for horizon in [5, 10, 30] {
+            goal.labels.horizon_buckets = horizon;
+            let plan = propose_representation_comparison(&data, &goal).unwrap();
+            for tool in [
+                RepresentationToolV1::SolSequence,
+                RepresentationToolV1::SolMarketEncoder,
+            ] {
+                assert_eq!(supported(&plan, tool), horizon == 30, "{tool:?}/{horizon}");
+            }
+        }
     }
     #[test]
     fn json_claimed_verified_does_not_create_a_verified_capability() {

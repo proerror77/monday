@@ -332,7 +332,8 @@ mod tests {
             "trade_representation":"aggregate_trade_only","price_surface_derivation":"latest aggregate trade price",
             "lob_continuity":summary.finish().unwrap(),
         });
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest_bytes.push(b'\n');
         let triplet = BinanceMarketTapeTriplet {
             data: dir.join(name),
             manifest: dir.join(format!("{name}.manifest.json")),
