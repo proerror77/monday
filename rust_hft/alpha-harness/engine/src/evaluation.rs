@@ -1,7 +1,9 @@
 use alpha_domain::{DomainError, EvaluationProtocolV1, ResearchMission};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ops::Range};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::ops::Range;
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -36,25 +38,11 @@ pub enum EvaluationError {
     SelectionLabelReachesHoldout,
     #[error("dataset costs do not match the bound evaluation protocol")]
     ProtocolMismatch,
+    #[error("native prepared metadata does not match its verified source or protocol")]
+    InvalidNativePreparedEvidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResearchRow {
-    pub series_id: u64,
-    /// Clock at which the feature observation can be used for a decision.
-    pub available_time: DateTime<Utc>,
-    /// Actual availability of the supervised label, not a second observation clock.
-    pub label_available_time: DateTime<Utc>,
-    pub signal: f64,
-    #[serde(default)]
-    pub features: BTreeMap<String, f64>,
-    pub label: f64,
-    pub fee_bps: f64,
-    pub funding_bps: f64,
-    #[serde(default)]
-    pub pit_funding: bool,
-    pub latency_bps: f64,
-}
+pub use hft_cex_research_input::campaign::NativeResearchRowV1 as ResearchRow;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalkForwardFold {
@@ -137,6 +125,7 @@ pub struct PreparedDataset {
     plan: WalkForwardPlan,
     protocol: EvaluationProtocolV1,
     partitions: alpha_domain::EvaluationRowPartitionsV1,
+    withheld: Option<hft_cex_research_input::campaign::NativeDatasetMetadataV1>,
 }
 
 impl PreparedDataset {
@@ -184,6 +173,11 @@ impl PreparedDataset {
     pub fn protocol(&self) -> &EvaluationProtocolV1 {
         &self.protocol
     }
+    pub fn withheld_metadata(
+        &self,
+    ) -> Option<&hft_cex_research_input::campaign::NativeDatasetMetadataV1> {
+        self.withheld.as_ref()
+    }
 
     /// Calendar diagnostics can see development labels only, including mature
     /// development-tail rows excluded from fitting by the stricter purge.
@@ -191,7 +185,7 @@ impl PreparedDataset {
         self.protocol
             .calendar
             .as_ref()
-            .map(|calendar| &self.rows[..calendar.develop_end_row])
+            .and_then(|calendar| self.rows.get(..calendar.develop_end_row))
     }
 
     pub fn calendar_validation_rows(&self) -> Option<&[ResearchRow]> {
@@ -199,7 +193,7 @@ impl PreparedDataset {
         self.partitions
             .selection
             .as_ref()
-            .map(|range| &self.rows[range.clone()])
+            .and_then(|range| self.rows.get(range.clone()))
     }
 }
 
@@ -246,6 +240,51 @@ pub fn prepare_dataset(
         }
     }
     let config = &protocol.walk_forward;
+    let registered_features = validate_numeric_rows(&rows, protocol)?;
+    if rows.len() <= config.sealed_holdout_rows {
+        return Err(EvaluationError::InsufficientRows);
+    }
+    let partitions = protocol
+        .row_partitions(rows.len())
+        .map_err(|_| EvaluationError::InsufficientRows)?;
+    let holdout_start = partitions.sealed_holdout.start;
+    if let Some(selection) = &partitions.selection {
+        if rows[partitions.search.clone()]
+            .iter()
+            .any(|row| row.label_available_time >= rows[selection.start].available_time)
+        {
+            return Err(EvaluationError::SearchLabelReachesSelection);
+        }
+        if rows[selection.clone()]
+            .iter()
+            .any(|row| row.label_available_time >= rows[holdout_start].available_time)
+        {
+            return Err(EvaluationError::SelectionLabelReachesHoldout);
+        }
+    }
+    let folds = development_folds(
+        &rows,
+        protocol,
+        &partitions,
+        rows[holdout_start].available_time,
+    )?;
+    Ok(PreparedDataset {
+        rows,
+        feature_names: registered_features,
+        plan: WalkForwardPlan {
+            folds,
+            sealed_holdout: holdout_start..holdout_start + config.sealed_holdout_rows,
+        },
+        protocol: protocol.clone(),
+        partitions,
+        withheld: None,
+    })
+}
+
+fn validate_numeric_rows(
+    rows: &[ResearchRow],
+    protocol: &EvaluationProtocolV1,
+) -> Result<Vec<String>, EvaluationError> {
     if rows.iter().any(|row| {
         [
             row.signal,
@@ -319,28 +358,17 @@ pub fn prepare_dataset(
     }
     let mut registered_features = vec!["signal".to_string()];
     registered_features.extend(feature_names);
-    validate_row_clocks(&rows, protocol)?;
-    if rows.len() <= config.sealed_holdout_rows {
-        return Err(EvaluationError::InsufficientRows);
-    }
-    let partitions = protocol
-        .row_partitions(rows.len())
-        .map_err(|_| EvaluationError::InsufficientRows)?;
-    let holdout_start = partitions.sealed_holdout.start;
-    if let Some(selection) = &partitions.selection {
-        if rows[partitions.search.clone()]
-            .iter()
-            .any(|row| row.label_available_time >= rows[selection.start].available_time)
-        {
-            return Err(EvaluationError::SearchLabelReachesSelection);
-        }
-        if rows[selection.clone()]
-            .iter()
-            .any(|row| row.label_available_time >= rows[holdout_start].available_time)
-        {
-            return Err(EvaluationError::SelectionLabelReachesHoldout);
-        }
-    }
+    validate_row_clocks(rows, protocol)?;
+    Ok(registered_features)
+}
+
+fn development_folds(
+    rows: &[ResearchRow],
+    protocol: &EvaluationProtocolV1,
+    partitions: &alpha_domain::EvaluationRowPartitionsV1,
+    holdout_start_time: DateTime<Utc>,
+) -> Result<Vec<WalkForwardFold>, EvaluationError> {
+    let config = &protocol.walk_forward;
     let fold_step = config
         .validation_rows
         .checked_add(config.embargo_rows)
@@ -373,7 +401,7 @@ pub fn prepare_dataset(
         }
         if rows[validation_start..validation_end]
             .iter()
-            .any(|row| row.label_available_time >= rows[holdout_start].available_time)
+            .any(|row| row.label_available_time >= holdout_start_time)
         {
             return Err(EvaluationError::ValidationLabelReachesHoldout);
         }
@@ -384,15 +412,78 @@ pub fn prepare_dataset(
             embargo: validation_end..embargo_end,
         });
     }
+    Ok(folds)
+}
+
+/// Actual development bytes with original full-data schedule. No synthetic suffix rows.
+pub fn prepare_native_campaign_dataset(
+    input: &hft_cex_research_input::campaign::VerifiedCampaignPreparedInputsV1,
+    protocol: &EvaluationProtocolV1,
+) -> Result<PreparedDataset, EvaluationError> {
+    protocol
+        .validate()
+        .map_err(EvaluationError::InvalidConfiguration)?;
+    let metadata = input.original_metadata();
+    // The opaque importer already bound protocol bytes and native ResearchRow
+    // content. Reuse that immutable proof; only verify this caller's protocol.
+    if serde_json::from_str::<EvaluationProtocolV1>(&metadata.protocol_json)
+        .ok()
+        .as_ref()
+        != Some(protocol)
+    {
+        return Err(EvaluationError::InvalidNativePreparedEvidence);
+    }
+    let partitions = protocol
+        .row_partitions(metadata.total_rows)
+        .map_err(|_| EvaluationError::InvalidNativePreparedEvidence)?;
+    if partitions.search != metadata.search_rows
+        || partitions.selection != metadata.selection.as_ref().map(|p| p.original_rows.clone())
+        || partitions.sealed_holdout != metadata.holdout.original_rows
+        || input.rows().len() != metadata.visible_rows.end
+        || metadata.visible_rows.start != 0
+        || protocol
+            .calendar
+            .as_ref()
+            .is_some_and(|c| c.develop_end_row > metadata.visible_rows.end)
+    {
+        return Err(EvaluationError::InvalidNativePreparedEvidence);
+    }
+    let rows = input.rows().to_vec();
+    let feature_names = validate_numeric_rows(&rows, protocol)?;
+    if rows.first().is_none_or(|r| {
+        r.available_time.timestamp_nanos_opt() != Some(metadata.development_window.start_ns)
+    }) || rows.iter().any(|r| {
+        r.available_time
+            .timestamp_nanos_opt()
+            .is_none_or(|t| t >= metadata.development_window.end_ns)
+    }) {
+        return Err(EvaluationError::InvalidNativePreparedEvidence);
+    }
+    if let Some(selection) = &metadata.selection {
+        let boundary = DateTime::from_timestamp_nanos(selection.window.start_ns);
+        if rows[partitions.search.clone()]
+            .iter()
+            .any(|r| r.label_available_time >= boundary)
+        {
+            return Err(EvaluationError::SearchLabelReachesSelection);
+        }
+    }
+    let folds = development_folds(
+        &rows,
+        protocol,
+        &partitions,
+        DateTime::from_timestamp_nanos(metadata.holdout.window.start_ns),
+    )?;
     Ok(PreparedDataset {
         rows,
-        feature_names: registered_features,
+        feature_names,
         plan: WalkForwardPlan {
             folds,
-            sealed_holdout: holdout_start..holdout_start + config.sealed_holdout_rows,
+            sealed_holdout: partitions.sealed_holdout.clone(),
         },
         protocol: protocol.clone(),
         partitions,
+        withheld: Some(metadata.clone()),
     })
 }
 
@@ -406,14 +497,21 @@ pub(crate) fn independent_selection_rows(
         .selection
         .as_ref()
         .ok_or("independent selection was not reserved")?;
-    Ok(&dataset.rows[range.clone()])
+    dataset.rows.get(range.clone()).ok_or_else(|| {
+        "independent selection bytes are withheld; separate final authority/input is required"
+            .to_string()
+    })
 }
 
 pub fn evaluate_sealed_holdout<T>(
     dataset: &PreparedDataset,
-    evaluator: impl FnOnce(&[ResearchRow]) -> T,
-) -> T {
-    evaluator(&dataset.rows[dataset.plan.sealed_holdout.clone()])
+    evaluator: impl FnOnce(&[ResearchRow]) -> Result<T, String>,
+) -> Result<T, String> {
+    let rows = dataset
+        .rows
+        .get(dataset.plan.sealed_holdout.clone())
+        .ok_or("sealed holdout bytes are withheld; separate final authority/input is required")?;
+    evaluator(rows)
 }
 
 pub(crate) fn contiguous_series_ranges(rows: &[ResearchRow]) -> Vec<Range<usize>> {
@@ -490,6 +588,26 @@ mod tests {
     }
 
     #[test]
+    fn absent_withheld_bytes_cannot_invoke_selection_or_holdout_callback() {
+        let protocol = protocol().with_independent_selection(7).unwrap();
+        let mut dataset = prepare_dataset(rows(61), &protocol).unwrap();
+        let original = dataset.partitions.clone();
+        dataset.rows.truncate(original.search.end);
+        assert_eq!(dataset.engine_context().rows().len(), original.search.len());
+        assert_eq!(dataset.plan.sealed_holdout, original.sealed_holdout);
+        assert!(independent_selection_rows(&dataset)
+            .unwrap_err()
+            .contains("withheld"));
+        let called = std::cell::Cell::new(false);
+        let result = evaluate_sealed_holdout(&dataset, |_| {
+            called.set(true);
+            Ok(())
+        });
+        assert!(result.unwrap_err().contains("withheld"));
+        assert!(!called.get());
+    }
+
+    #[test]
     fn independent_selection_is_inaccessible_to_search_and_proposals() {
         let protocol = protocol().with_independent_selection(7).unwrap();
         let partitions = protocol.row_partitions(61).unwrap();
@@ -537,7 +655,10 @@ mod tests {
             Err(EvaluationError::SelectionLabelReachesHoldout)
         ));
         let prepared = prepare_dataset(rows(61), &protocol).unwrap();
-        assert_eq!(evaluate_sealed_holdout(&prepared, |rows| rows.len()), 10);
+        assert_eq!(
+            evaluate_sealed_holdout(&prepared, |rows| Ok(rows.len())).unwrap(),
+            10
+        );
     }
 
     #[test]
@@ -718,7 +839,10 @@ mod tests {
         let dataset = prepare_dataset(rows(50), &protocol()).unwrap();
         let context = dataset.engine_context();
         assert_eq!(context.rows().len(), 40);
-        assert_eq!(evaluate_sealed_holdout(&dataset, |rows| rows.len()), 10);
+        assert_eq!(
+            evaluate_sealed_holdout(&dataset, |rows| Ok(rows.len())).unwrap(),
+            10
+        );
     }
 
     #[test]
