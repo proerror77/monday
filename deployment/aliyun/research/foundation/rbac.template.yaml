@@ -1,0 +1,27 @@
+# Code-only namespace scope. No Role/credential is installed by the renderer.
+# The operator-projected kube token must read back this exact ServiceAccount.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: monday-foundation-controller, namespace: monday-research}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: monday-foundation-controller, namespace: monday-research}
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create, get, list, delete]
+  - apiGroups: ['']
+    resources: [pods]
+    verbs: [get, list]
+  # Late per-attempt identity only. No Secret update/patch or cluster-wide scope.
+  - apiGroups: ['']
+    resources: [secrets]
+    verbs: [create, get, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: monday-foundation-controller, namespace: monday-research}
+subjects: [{kind: ServiceAccount, name: monday-foundation-controller, namespace: monday-research}]
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: monday-foundation-controller}

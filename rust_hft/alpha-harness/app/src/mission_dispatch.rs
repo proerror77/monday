@@ -7,6 +7,7 @@ pub(crate) mod controller;
 pub(crate) mod final_admission;
 pub(crate) mod final_authority;
 pub(crate) mod platform_admission;
+pub(crate) mod platform_terminal;
 pub(crate) mod sequence_admission;
 pub(crate) mod stage_controller;
 pub(crate) mod study_authority;

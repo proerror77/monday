@@ -1,0 +1,5 @@
+# Reviewed source inputs override the repository's generated-JSON exclusion.
+!inventory.example.json
+!config/gateway.json
+!config/session.template.json
+!config/service.template.json
