@@ -1136,14 +1136,28 @@ pub fn plan(
 
 /// Independent importer consumes gateway proof/bytes and a public trust file.
 /// It has no signing key, grant, budget, task submission or backend activation.
-pub async fn import_build(
+/// Only the importer can construct this value, after independent bounded GETs
+/// of the exact package, proof, source and every program. Pure signature
+/// verification remains a separate, read-only contract.
+pub struct VerifiedPublishedBuildRelease {
+    verified: crate::release::VerifiedBuildRelease,
+}
+impl VerifiedPublishedBuildRelease {
+    pub fn artifact(&self) -> &BuildArtifact {
+        self.verified.artifact()
+    }
+    pub(crate) fn verified(&self) -> &crate::release::VerifiedBuildRelease {
+        &self.verified
+    }
+}
+
+pub async fn read_build_release(
     build_id: &str,
     oci_sha256: &str,
     publication_proof_sha256: &str,
     trust: &BuildReleaseTrust,
     gateway: &ReleaseGateway,
-    ledger: &crate::postgres::Ledger,
-) -> Result<String> {
+) -> Result<VerifiedPublishedBuildRelease> {
     ensure!(
         valid_digest(build_id)
             && valid_digest(oci_sha256)
@@ -1186,9 +1200,28 @@ pub async fn import_build(
     for executable in &artifact.executables {
         gateway.verify(&executable.blob).await?;
     }
-    let id = ledger.register_build(&verified).await?;
+    Ok(VerifiedPublishedBuildRelease { verified })
+}
+
+pub async fn import_build(
+    build_id: &str,
+    oci_sha256: &str,
+    publication_proof_sha256: &str,
+    trust: &BuildReleaseTrust,
+    gateway: &ReleaseGateway,
+    ledger: &crate::postgres::Ledger,
+) -> Result<String> {
+    let published = read_build_release(
+        build_id,
+        oci_sha256,
+        publication_proof_sha256,
+        trust,
+        gateway,
+    )
+    .await?;
+    let id = ledger.register_build(&published).await?;
     ensure!(
-        ledger.build_artifact(&id).await? == artifact,
+        ledger.build_artifact(&id).await? == *published.artifact(),
         "PG Build projection readback mismatch"
     );
     Ok(id)
