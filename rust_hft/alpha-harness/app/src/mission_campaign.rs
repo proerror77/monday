@@ -1,13 +1,14 @@
 use crate::mission_objects::{cex_campaign_round_root, cex_global_holdout_claim_object};
 #[cfg(feature = "scientific")]
-use crate::mission_runner::execute_report;
-#[cfg(feature = "scientific")]
 use hft_research_artifacts::publish_immutable_file;
 use hft_research_artifacts::{fetch_to_file, normalized_sha256};
 use hft_research_dispatch_io::{canonical_tokyo_oss_internal_object, validate_dns_label};
 pub(crate) mod final_evaluation;
 pub(crate) mod market_encoder;
+#[cfg(feature = "scientific")]
+mod platform_output;
 pub(crate) mod preparation;
+pub(crate) mod prepared_inputs;
 pub(crate) mod sequence;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -75,6 +76,7 @@ use {crate::cli::CampaignExecuteArgs, crate::cli::ExecuteMissionArgs, crate::dat
 const CAMPAIGN_FREEZE_SCHEMA_V1: &str = "cex-campaign-freeze-v1";
 const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
 const CAMPAIGN_REQUEST_SCHEMA_V5: &str = "cex-campaign-request-v5";
+const CAMPAIGN_REQUEST_SCHEMA_V6: &str = "cex-campaign-request-v6-prepared";
 const CAMPAIGN_RESULT_SCHEMA_V8: &str = "cex-campaign-result-v8";
 const CAMPAIGN_IDENTITY_SCHEMA_V5: &str = "cex-campaign-identity-v5";
 const CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1: &str = "cex-campaign-round-identity-v1";
@@ -122,6 +124,8 @@ pub(crate) struct CampaignRequest {
     pub(crate) campaign_inputs_sha256: String,
     pub(crate) producer_source_revision: String,
     pub(crate) producer_image_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prepared_inputs: Option<prepared_inputs::NativePreparedCampaignRefV1>,
     pub(crate) research_plan: CexCampaignResearchPlanV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) study_proposal: Option<CampaignNextFamilyProposalV1>,
@@ -192,6 +196,8 @@ struct CampaignInputsReceipt {
     materialization: CampaignInputReceiptItem,
     replay_artifact: CampaignInputReceiptItem,
     replay_manifest: CampaignInputReceiptItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_inputs: Option<prepared_inputs::NativePreparedCampaignRefV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,6 +481,19 @@ struct LoadedRequest {
 
 #[cfg(feature = "scientific")]
 pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
+    if std::env::var_os("MONDAY_ATTEMPT_CONTEXT").is_some() {
+        let plain = load_request(&args.request)
+            .context("platform CexCampaign requires the plain finalized native V6 request")?;
+        if args.final_evaluation
+            || !args.pre_holdout
+            || plain.request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V6
+            || plain.request.prepared_inputs.is_none()
+        {
+            bail!(
+                "platform CexCampaign cannot execute another native schema or withheld evaluation"
+            );
+        }
+    }
     if args.final_evaluation {
         return final_evaluation::execute(args);
     }
@@ -492,6 +511,11 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     let loaded = load_request(&args.request)?;
     if loaded.sha256 != normalized_sha256("campaign request", &args.request_sha256)? {
         bail!("campaign request SHA256 mismatch");
+    }
+    if loaded.request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V6
+        || loaded.request.prepared_inputs.is_none()
+    {
+        bail!("plain Campaign execution requires the frozen V6 prepared collection");
     }
     validate_request_for_execute(&loaded.request)?;
     if loaded.request.research_plan.calendar.is_some() && !args.pre_holdout {
@@ -1298,6 +1322,31 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
 
     let loaded = load_request(&args.signed_request)?;
     validate_request_matches_freeze(&loaded.request, &plan)?;
+    if loaded.request.prepared_inputs.is_some() {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .redirect(Policy::none())
+            .build()?;
+        let readback = tempfile::tempdir().context("native finalized input readback")?;
+        let verified = prepared_inputs::acquire_native_prepared(
+            &loaded.request,
+            &loaded.sha256,
+            &client,
+            readback.path(),
+        )?;
+        verified.render_inputs();
+        research_event(
+            "alpha-harness",
+            "campaign_prepared_input_readback_verified",
+            serde_json::json!({
+                "request_sha256":verified.request_sha256(), "campaign_inputs_sha256":verified.campaign_inputs_sha256(),
+                "collection_sha256":verified.collection_id(), "view_sha256":verified.view_ids(),
+                "evaluation_protocol_sha256":verified.evaluation_protocol_sha256(),
+                "source_revision":verified.source_revision(), "runner_image_identity":verified.runner_image_identity(),
+                "declared_trials":verified.declared_trials(),
+            }),
+        );
+    }
     hft_research_artifacts::write_json_atomic(&args.request_out, &loaded.request)?;
     let rendered = mission_dispatch::write_submission(
         &args.submission_out,
@@ -1387,67 +1436,27 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             },
         }),
     );
-    let feature_path = shared_input_dir.join("features.jsonl");
-    fetch_verified(
+    let native_inputs = prepared_inputs::acquire_native_prepared(
+        &loaded.request,
+        &loaded.sha256,
         &client,
-        "campaign feature",
-        &loaded.request.feature_url,
-        &feature_path,
-        &loaded.request.feature_sha256,
-        crate::mission_runner::MAX_FEATURE_BYTES,
+        &shared_input_dir,
     )?;
-    let materialization_path = shared_input_dir.join("materialization.json");
-    fetch_verified(
-        &client,
-        "campaign materialization",
-        &loaded.request.materialization_url,
-        &materialization_path,
-        &loaded.request.materialization_sha256,
-        crate::mission_runner::MAX_MATERIALIZATION_BYTES,
-    )?;
-    let replay_artifact_path = shared_input_dir.join(format!(
-        "{}.parquet",
-        normalized_sha256(
-            "campaign replay artifact",
-            &loaded.request.replay_artifact_sha256
-        )?
-    ));
-    fetch_verified(
-        &client,
-        "campaign replay artifact",
-        &loaded.request.replay_artifact_url,
-        &replay_artifact_path,
-        &loaded.request.replay_artifact_sha256,
-        1024 * 1024 * 1024,
-    )?;
-    let replay_manifest_path = shared_input_dir.join("replay-manifest.json");
-    fetch_verified(
-        &client,
-        "campaign replay manifest",
-        &loaded.request.replay_manifest_url,
-        &replay_manifest_path,
-        &loaded.request.replay_manifest_sha256,
-        16 * 1024 * 1024,
-    )?;
+    let platform_output = platform_output::BoundOutput::from_environment(&loaded, &native_inputs)?;
+    let render_inputs = native_inputs.render_inputs();
     research_event(
         "alpha-harness",
         "campaign_input_download_completed",
         serde_json::json!({
-            "campaign_id": &loaded.request.campaign_id,
-            "feature_sha256": &loaded.request.feature_sha256,
-            "materialization_sha256": &loaded.request.materialization_sha256,
-            "replay_artifact_sha256": &loaded.request.replay_artifact_sha256,
-            "replay_manifest_sha256": &loaded.request.replay_manifest_sha256,
+            "campaign_id":loaded.request.campaign_id,
+            "request_sha256":native_inputs.request_sha256(),
+            "prepared_collection_sha256":native_inputs.collection_id(),
+            "view_sha256":native_inputs.view_ids(),
+            "development_rows":native_inputs.prepared().rows().len(),
+            "original_rows":native_inputs.prepared().original_metadata().total_rows,
+            "selection_bytes_loaded":false,"holdout_bytes_loaded":false,
         }),
     );
-
-    // Independent worker admission happens once; all seeds render from that
-    // same verified snapshot instead of reimporting bulk features per round.
-    let render_inputs = PreparedCexInputs::load(
-        &feature_path,
-        &materialization_path,
-        loaded.request.research_plan.calendar.is_some(),
-    )?;
     let mut ledgers = Vec::with_capacity(loaded.request.rounds.len());
     let mut selected_round = None;
     for (round_index, round) in loaded.request.rounds.iter().enumerate() {
@@ -1465,7 +1474,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             }),
         );
         let rendered = render_prepared_cex_bundle(
-            &render_inputs,
+            render_inputs,
             &loaded.request.research_plan,
             round.seed,
             loaded.request.declared_total_trials,
@@ -1513,6 +1522,10 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
                 &rendered.mission_id,
                 &mission_sha256,
                 &binding,
+                Some((
+                    native_inputs.finalized_request(),
+                    native_inputs.request_sha256(),
+                )),
             )? {
             extract_bundle(&recovered_result_path, &execute_dir)?;
             (report, true)
@@ -1520,18 +1533,18 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             let (round_claim_put_url, round_claim_readback_url) =
                 campaign_round_claim_urls(&loaded.request, round)?;
             (
-                execute_report(
+                crate::mission_runner::execute_prepared_report(
                     ExecuteMissionArgs {
                         work_dir: execute_dir.clone(),
                         mission_id: rendered.mission_id.clone(),
                         holdout_id: loaded.request.holdout_id.clone(),
                         mission_url: mission_readback_path.to_string_lossy().into_owned(),
                         mission_sha256: mission_sha256.clone(),
-                        feature_url: feature_path.to_string_lossy().into_owned(),
-                        materialization_url: materialization_path.to_string_lossy().into_owned(),
-                        replay_artifact_url: replay_artifact_path.to_string_lossy().into_owned(),
+                        feature_url: String::new(),
+                        materialization_url: String::new(),
+                        replay_artifact_url: String::new(),
                         replay_artifact_sha256: loaded.request.replay_artifact_sha256.clone(),
-                        replay_manifest_url: replay_manifest_path.to_string_lossy().into_owned(),
+                        replay_manifest_url: String::new(),
                         replay_manifest_sha256: loaded.request.replay_manifest_sha256.clone(),
                         resume_url: None,
                         resume_sha256: None,
@@ -1541,10 +1554,17 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
                         holdout_claim_readback_url: round_claim_readback_url,
                     },
                     binding,
+                    &native_inputs,
+                    render_inputs,
+                    &shared_input_dir,
                 )?,
                 false,
             )
         };
+        crate::mission_runner::validate_native_campaign_result_binding(
+            &execute_dir.join("results"),
+            &native_inputs,
+        )?;
         let ledger = collect_round_ledger(&execute_dir, round, &report)?;
         research_event(
             "alpha-harness",
@@ -1690,6 +1710,17 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
             "consumed_trials": result.consumed_trials,
         }),
     );
+    if let Some(output) = platform_output {
+        tokio::runtime::Handle::try_current()
+            .context("platform worker requires the admitted async runtime")?
+            .block_on(output.publish(
+                &loaded,
+                &native_inputs,
+                &result,
+                &result_sha256,
+                &args.work_dir,
+            ))?;
+    }
     print_json(&serde_json::json!({
         "campaign_id": result.campaign_id,
         "request_sha256": result.request_sha256,
@@ -1704,6 +1735,11 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
 }
 
 struct ValidatedCampaignInputSet {
+    native_prepared:
+        std::collections::BTreeMap<String, prepared_inputs::NativePreparedCampaignRefV1>,
+    input_root: PathBuf,
+    replay_artifact_path: PathBuf,
+    replay_manifest_path: PathBuf,
     receipt: CampaignInputsReceipt,
     campaign_inputs_sha256: String,
     build_source_revision: String,
@@ -1789,6 +1825,10 @@ fn validated_campaign_inputs(
         None,
     )?;
     Ok(ValidatedCampaignInputSet {
+        native_prepared: std::collections::BTreeMap::new(),
+        input_root: args.input_root.clone(),
+        replay_artifact_path,
+        replay_manifest_path,
         receipt,
         campaign_inputs_sha256,
         build_source_revision,
@@ -1827,7 +1867,7 @@ fn freeze_request(args: &CampaignFreezeArgs) -> anyhow::Result<(CampaignRequest,
     if args.reuse.is_some() || args.reuse_sha256.is_some() {
         return reuse_frozen_request(args, &research_plan, study_proposal.as_ref());
     }
-    let inputs = validated_campaign_inputs(args, research_plan.calendar.is_some())?;
+    let inputs = validated_campaign_inputs(args, true)?;
     freeze_prepared_request(
         &inputs,
         &research_plan,
@@ -1861,6 +1901,39 @@ fn freeze_prepared_request(
         probe_seed,
         declared_total_trials,
     )?;
+    let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+        inputs.render_inputs.materialization(),
+        research_plan,
+    )?;
+    let prepared = if let Some(prepared) = inputs.native_prepared.get(&protocol.content_hash()?) {
+        let source = &prepared.expected_native.source;
+        if source.preparation_receipt_sha256 != inputs.campaign_inputs_sha256
+            || source.feature_sha256 != inputs.feature_sha256
+            || source.materialization_sha256 != inputs.materialization_sha256
+            || source.replay_artifact_sha256 != inputs.replay_artifact_sha256
+            || source.replay_manifest_sha256 != inputs.replay_manifest_sha256
+            || prepared.expected_native.native_protocol_sha256 != protocol.content_hash()?
+        {
+            bail!("trusted prepared collection differs from original native source/protocol");
+        }
+        prepared.clone()
+    } else {
+        prepared_inputs::freeze_native_prepared_reference(inputs, research_plan)?
+    };
+    let mut frozen_inputs = inputs.receipt.clone();
+    frozen_inputs.prepared_inputs = Some(prepared.clone());
+    let frozen_inputs_sha =
+        hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&frozen_inputs)?);
+    // Trusted cached preparation can render from an authenticated collection
+    // while the original source mount is offline. Do not create a shadow mount.
+    if inputs.input_root.try_exists()? {
+        write_json_create_once(
+            &inputs
+                .input_root
+                .join(format!("native-prepared/{frozen_inputs_sha}.inputs.json")),
+            &frozen_inputs,
+        )?;
+    }
     Ok((
         build_request_from_parts(
             &inputs.feature_url,
@@ -1871,9 +1944,10 @@ fn freeze_prepared_request(
             &inputs.replay_artifact_sha256,
             &inputs.replay_manifest_url,
             &inputs.replay_manifest_sha256,
-            &inputs.campaign_inputs_sha256,
+            &frozen_inputs_sha,
             &inputs.receipt.source_revision,
             &inputs.producer_image_identity,
+            Some(&prepared),
             research_plan,
             &inputs.build_source_revision,
             &inputs.image_identity,
@@ -1882,7 +1956,7 @@ fn freeze_prepared_request(
             seeds,
             study_proposal,
         )?,
-        inputs.campaign_inputs_sha256.clone(),
+        frozen_inputs_sha,
     ))
 }
 
@@ -1915,8 +1989,19 @@ fn reuse_frozen_request(
         &frozen,
         frozen.preparation_authentication_tag.as_deref(),
     )?;
-    let (receipt, receipt_sha) = load_campaign_inputs_receipt(&args.campaign_inputs)?;
+    let (mut receipt, original_receipt_sha) = load_campaign_inputs_receipt(&args.campaign_inputs)?;
     validate_campaign_inputs_receipt(&receipt)?;
+    let receipt_sha = if let Some(prepared) = &frozen.canonical_request.prepared_inputs {
+        if receipt.prepared_inputs.is_some()
+            || prepared.expected_native.source.preparation_receipt_sha256 != original_receipt_sha
+        {
+            bail!("authenticated prepared freeze differs from the original native source receipt");
+        }
+        receipt.prepared_inputs = Some(prepared.clone());
+        hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&receipt)?)
+    } else {
+        original_receipt_sha
+    };
     let source = normalized_source_revision("campaign source revision", &args.source_revision)?;
     if source != BUILD_SOURCE_REVISION {
         bail!("campaign source revision does not match this build");
@@ -1933,6 +2018,7 @@ fn reuse_frozen_request(
         &receipt_sha,
         &receipt.source_revision,
         &mission_dispatch::image_digest(&receipt.image_ref)?,
+        receipt.prepared_inputs.as_ref(),
         research_plan,
         &source,
         &mission_dispatch::image_digest(&args.image)?,
@@ -2178,6 +2264,7 @@ struct SupervisedRoundEvidence {
     replay: Option<CexEventReplayReceiptV1>,
     calendar_validation: Option<alpha_engine::final_models::CalendarValidationReportV1>,
     calendar_replay: Option<CexEventReplayReceiptV1>,
+    selection_required: bool,
 }
 
 fn load_supervised_round_evidence(
@@ -2267,21 +2354,30 @@ fn load_supervised_round_evidence(
         bail!("supervised replay report drifted from its receipt");
     }
     let calendar_validation = if let Some(calendar) = &mission.spec.evaluation_protocol.calendar {
-        let validation: alpha_engine::final_models::CalendarValidationReportV1 =
-            serde_json::from_slice(&std::fs::read(results.join("calendar-validation.json"))?)?;
-        validation.report.evaluation.validate()?;
-        if &validation.calendar != calendar
-            || validation.promotion_authority
-            || validation.source_candidate.id != ridge.artifact_id
-            || validation.source_candidate.content_sha256 != canonical_json_hash(&ridge)?
-            || validation.report.evaluation.protocol_binding()?.1
-                != mission.spec.evaluation_protocol.content_hash()?
-            || validation.report.evaluation.evaluator_version
-                != alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION
+        let path = results.join("calendar-validation.json");
+        if !path.try_exists()?
+            && results
+                .join("native-prepared-admission.json")
+                .try_exists()?
         {
-            bail!("calendar validation is not bound to this Ridge and calendar");
+            None
+        } else {
+            let validation: alpha_engine::final_models::CalendarValidationReportV1 =
+                serde_json::from_slice(&std::fs::read(path)?)?;
+            validation.report.evaluation.validate()?;
+            if &validation.calendar != calendar
+                || validation.promotion_authority
+                || validation.source_candidate.id != ridge.artifact_id
+                || validation.source_candidate.content_sha256 != canonical_json_hash(&ridge)?
+                || validation.report.evaluation.protocol_binding()?.1
+                    != mission.spec.evaluation_protocol.content_hash()?
+                || validation.report.evaluation.evaluator_version
+                    != alpha_domain::frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION
+            {
+                bail!("calendar validation is not bound to this Ridge and calendar");
+            }
+            Some(validation)
         }
-        Some(validation)
     } else {
         None
     };
@@ -2308,6 +2404,7 @@ fn load_supervised_round_evidence(
         replay,
         calendar_validation,
         calendar_replay,
+        selection_required: mission.spec.evaluation_protocol.calendar.is_some(),
     }))
 }
 
@@ -2500,7 +2597,14 @@ fn collect_round_ledger(
         let evidence = supervised
             .as_ref()
             .context("supervised ML round is missing model selection evidence")?;
-        if evidence
+        if evidence.selection_required && evidence.calendar_validation.is_none() {
+            (
+                "insufficient_selection_evidence".to_string(),
+                None,
+                None,
+                None,
+            )
+        } else if evidence
             .calendar_validation
             .as_ref()
             .is_some_and(|validation| !validation.report.evaluation.passed)
@@ -3269,6 +3373,10 @@ fn readback_pre_holdout_terminal_impl(
                 &expected.mission_id,
                 &expected.mission_sha256,
                 &binding,
+                request
+                    .prepared_inputs
+                    .as_ref()
+                    .map(|_| (request, request_sha256)),
             )?
         } else {
             recover_execution_report_from_published_result(
@@ -3278,6 +3386,10 @@ fn readback_pre_holdout_terminal_impl(
                 &expected.mission_id,
                 &expected.mission_sha256,
                 &binding,
+                request
+                    .prepared_inputs
+                    .as_ref()
+                    .map(|_| (request, request_sha256)),
             )
             .map_err(terminal_readback_error)?
             .context("terminal round bundle is absent")?
@@ -3712,6 +3824,7 @@ pub(crate) fn request_for_materialization_for_tests(path: &Path) -> CampaignRequ
         &base.campaign_inputs_sha256,
         &base.producer_source_revision,
         &base.producer_image_identity,
+        base.prepared_inputs.as_ref(),
         &base.research_plan,
         BUILD_SOURCE_REVISION,
         &base.image_identity,
@@ -3728,8 +3841,13 @@ pub(crate) fn request_for_materialization_for_tests(path: &Path) -> CampaignRequ
 }
 
 pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V5 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V5}");
+    if !matches!(
+        request.schema_version.as_str(),
+        CAMPAIGN_REQUEST_SCHEMA_V5 | CAMPAIGN_REQUEST_SCHEMA_V6
+    ) || (request.schema_version == CAMPAIGN_REQUEST_SCHEMA_V6)
+        != request.prepared_inputs.is_some()
+    {
+        bail!("campaign request schema and prepared input kind disagree");
     }
     request.research_plan.validate()?;
     if request.research_plan.calendar.is_some() {
@@ -3807,15 +3925,60 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign producer image identity must be a normalized SHA256");
     }
     validate_cex_holdout_id(&request.holdout_id)?;
-    canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?;
+    legacy_input_object(request, "campaign feature", &request.feature_url)?;
     normalized_sha256("campaign feature", &request.feature_sha256)?;
-    canonical_tokyo_oss_internal_object("campaign materialization", &request.materialization_url)?;
+    legacy_input_object(
+        request,
+        "campaign materialization",
+        &request.materialization_url,
+    )?;
     normalized_sha256("campaign materialization", &request.materialization_sha256)?;
-    canonical_tokyo_oss_internal_object("campaign replay artifact", &request.replay_artifact_url)?;
+    legacy_input_object(
+        request,
+        "campaign replay artifact",
+        &request.replay_artifact_url,
+    )?;
     normalized_sha256("campaign replay artifact", &request.replay_artifact_sha256)?;
-    canonical_tokyo_oss_internal_object("campaign replay manifest", &request.replay_manifest_url)?;
+    legacy_input_object(
+        request,
+        "campaign replay manifest",
+        &request.replay_manifest_url,
+    )?;
     normalized_sha256("campaign replay manifest", &request.replay_manifest_sha256)?;
 
+    if let Some(prepared) = &request.prepared_inputs {
+        normalized_sha256("native prepared collection", &prepared.collection_sha256)?;
+        let collection_object = canonical_tokyo_oss_internal_object(
+            "native prepared collection",
+            &prepared.collection_url,
+        )?;
+        let suffix = format!("/native-prepared/{}.json", prepared.collection_sha256);
+        let root = collection_object
+            .strip_suffix(&suffix)
+            .context("native collection object is not content addressed")?;
+        if prepared.block_urls.is_empty() || prepared.block_urls.len() > 50_000 {
+            bail!("native prepared block transport count exceeds its bound");
+        }
+        for (sha, url) in &prepared.block_urls {
+            normalized_sha256("native prepared block", sha)?;
+            if canonical_tokyo_oss_internal_object("native prepared block", url)?
+                != format!("{root}/native-prepared/{sha}.mondaybin")
+            {
+                bail!("native prepared transport does not bind its exact content address and source root");
+            }
+        }
+        let source = &prepared.expected_native.source;
+        if source.feature_sha256 != request.feature_sha256
+            || source.materialization_sha256 != request.materialization_sha256
+            || source.replay_artifact_sha256 != request.replay_artifact_sha256
+            || source.replay_manifest_sha256 != request.replay_manifest_sha256
+            || source.build.source_revision != request.producer_source_revision
+            || mission_dispatch::image_digest(&source.build.image_identity)?
+                != request.producer_image_identity
+        {
+            bail!("native prepared expectation differs from original source Build/input identity");
+        }
+    }
     let claim_object = canonical_tokyo_oss_internal_object(
         "campaign holdout claim",
         &request.holdout_claim_put_url,
@@ -3942,6 +4105,7 @@ fn build_request_from_parts(
     campaign_inputs_sha256: &str,
     producer_source_revision: &str,
     producer_image_identity: &str,
+    prepared_inputs: Option<&prepared_inputs::NativePreparedCampaignRefV1>,
     research_plan: &CexCampaignResearchPlanV1,
     build_source_revision: &str,
     image_identity: &str,
@@ -3964,7 +4128,13 @@ fn build_request_from_parts(
         replay_manifest_sha256,
     )?;
     let mut request = CampaignRequest {
-        schema_version: CAMPAIGN_REQUEST_SCHEMA_V5.to_string(),
+        prepared_inputs: prepared_inputs.cloned(),
+        schema_version: if prepared_inputs.is_some() {
+            CAMPAIGN_REQUEST_SCHEMA_V6
+        } else {
+            CAMPAIGN_REQUEST_SCHEMA_V5
+        }
+        .to_string(),
         campaign_id: "placeholder".to_string(),
         build_source_revision: build_source_revision.to_string(),
         image_identity: image_identity.to_string(),
@@ -3973,13 +4143,29 @@ fn build_request_from_parts(
         producer_image_identity: producer_image_identity.to_string(),
         research_plan: research_plan.clone(),
         study_proposal: study_proposal.cloned(),
-        feature_url: feature_url.to_string(),
+        feature_url: if prepared_inputs.is_some() {
+            String::new()
+        } else {
+            feature_url.to_string()
+        },
         feature_sha256: feature_sha256.to_string(),
-        materialization_url: materialization_url.to_string(),
+        materialization_url: if prepared_inputs.is_some() {
+            String::new()
+        } else {
+            materialization_url.to_string()
+        },
         materialization_sha256: materialization_sha256.to_string(),
-        replay_artifact_url: replay_artifact_url.to_string(),
+        replay_artifact_url: if prepared_inputs.is_some() {
+            String::new()
+        } else {
+            replay_artifact_url.to_string()
+        },
         replay_artifact_sha256: replay_artifact_sha256.to_string(),
-        replay_manifest_url: replay_manifest_url.to_string(),
+        replay_manifest_url: if prepared_inputs.is_some() {
+            String::new()
+        } else {
+            replay_manifest_url.to_string()
+        },
         replay_manifest_sha256: replay_manifest_sha256.to_string(),
         holdout_id: holdout_id.to_string(),
         declared_total_trials: declared_total_trials_for_rounds(research_plan, seeds.len())?,
@@ -4099,20 +4285,30 @@ fn canonicalize_request_transport(request: &CampaignRequest) -> anyhow::Result<C
         "campaign producer image identity",
         &canonical.producer_image_identity,
     )?;
-    canonical.feature_url =
-        canonical_tokyo_oss_internal_object("campaign feature", &canonical.feature_url)?;
-    canonical.materialization_url = canonical_tokyo_oss_internal_object(
-        "campaign materialization",
-        &canonical.materialization_url,
-    )?;
-    canonical.replay_artifact_url = canonical_tokyo_oss_internal_object(
-        "campaign replay artifact",
-        &canonical.replay_artifact_url,
-    )?;
-    canonical.replay_manifest_url = canonical_tokyo_oss_internal_object(
-        "campaign replay manifest",
-        &canonical.replay_manifest_url,
-    )?;
+    if let Some(prepared) = &mut canonical.prepared_inputs {
+        prepared.collection_url = canonical_tokyo_oss_internal_object(
+            "native prepared collection",
+            &prepared.collection_url,
+        )?;
+        for url in prepared.block_urls.values_mut() {
+            *url = canonical_tokyo_oss_internal_object("native prepared block", url)?;
+        }
+    } else {
+        canonical.feature_url =
+            canonical_tokyo_oss_internal_object("campaign feature", &canonical.feature_url)?;
+        canonical.materialization_url = canonical_tokyo_oss_internal_object(
+            "campaign materialization",
+            &canonical.materialization_url,
+        )?;
+        canonical.replay_artifact_url = canonical_tokyo_oss_internal_object(
+            "campaign replay artifact",
+            &canonical.replay_artifact_url,
+        )?;
+        canonical.replay_manifest_url = canonical_tokyo_oss_internal_object(
+            "campaign replay manifest",
+            &canonical.replay_manifest_url,
+        )?;
+    }
     canonical.holdout_claim_put_url = canonical_tokyo_oss_internal_object(
         "campaign holdout claim",
         &canonical.holdout_claim_put_url,
@@ -4145,20 +4341,6 @@ fn canonicalize_request_transport(request: &CampaignRequest) -> anyhow::Result<C
 }
 
 fn signing_plan(request: &CampaignRequest) -> anyhow::Result<CampaignSigningPlan> {
-    let feature_object =
-        canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?;
-    let materialization_object = canonical_tokyo_oss_internal_object(
-        "campaign materialization",
-        &request.materialization_url,
-    )?;
-    let replay_artifact_object = canonical_tokyo_oss_internal_object(
-        "campaign replay artifact",
-        &request.replay_artifact_url,
-    )?;
-    let replay_manifest_object = canonical_tokyo_oss_internal_object(
-        "campaign replay manifest",
-        &request.replay_manifest_url,
-    )?;
     let holdout_claim_object = canonical_tokyo_oss_internal_object(
         "campaign holdout claim",
         &request.holdout_claim_put_url,
@@ -4166,12 +4348,46 @@ fn signing_plan(request: &CampaignRequest) -> anyhow::Result<CampaignSigningPlan
     let campaign_result_object =
         canonical_tokyo_oss_internal_object("campaign result", &request.campaign_result_put_url)?;
     let _campaign_root = campaign_output_root(&campaign_result_object)?;
-    let mut actions = vec![
-        signing_action_get("feature_get", feature_object),
-        signing_action_get("materialization_get", materialization_object),
-        signing_action_get("replay_artifact_get", replay_artifact_object),
-        signing_action_get("replay_manifest_get", replay_manifest_object),
-    ];
+    let mut actions = Vec::new();
+    if let Some(prepared) = &request.prepared_inputs {
+        actions.push(signing_action_get(
+            "prepared_collection_get",
+            canonical_tokyo_oss_internal_object(
+                "native prepared collection",
+                &prepared.collection_url,
+            )?,
+        ));
+        for (sha, url) in &prepared.block_urls {
+            actions.push(signing_action_get(
+                &format!("prepared_block_{sha}_get"),
+                canonical_tokyo_oss_internal_object("native prepared block", url)?,
+            ));
+        }
+    } else {
+        for (name, label, url) in [
+            ("feature_get", "campaign feature", &request.feature_url),
+            (
+                "materialization_get",
+                "campaign materialization",
+                &request.materialization_url,
+            ),
+            (
+                "replay_artifact_get",
+                "campaign replay artifact",
+                &request.replay_artifact_url,
+            ),
+            (
+                "replay_manifest_get",
+                "campaign replay manifest",
+                &request.replay_manifest_url,
+            ),
+        ] {
+            actions.push(signing_action_get(
+                name,
+                canonical_tokyo_oss_internal_object(label, url)?,
+            ));
+        }
+    }
     for round in &request.rounds {
         actions.push(signing_action_put_json(
             &format!("{}_mission_put", round.round_id),
@@ -4271,7 +4487,7 @@ fn signing_action_put(name: &str, object: String, content_type: &str) -> Campaig
 }
 
 pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<String> {
-    let identity = serde_json::json!({
+    let mut identity = serde_json::json!({
         "identity_schema_version": CAMPAIGN_IDENTITY_SCHEMA_V5,
         "request_schema_version": request.schema_version,
         "build_source_revision": normalized_source_revision(
@@ -4292,20 +4508,21 @@ pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<
             &request.producer_image_identity,
         )?,
         "research_plan": &request.research_plan,
+        "prepared_inputs": request.prepared_inputs.as_ref().map(|p| serde_json::json!({"collection":p.collection_sha256,"expected_native":p.expected_native})),
         "feature": {
-            "object": canonical_tokyo_oss_internal_object("campaign feature", &request.feature_url)?,
+            "object": legacy_input_object(request,"campaign feature", &request.feature_url)?,
             "sha256": normalized_sha256("campaign feature", &request.feature_sha256)?,
         },
         "materialization": {
-            "object": canonical_tokyo_oss_internal_object("campaign materialization", &request.materialization_url)?,
+            "object": legacy_input_object(request,"campaign materialization", &request.materialization_url)?,
             "sha256": normalized_sha256("campaign materialization", &request.materialization_sha256)?,
         },
         "replay_artifact": {
-            "object": canonical_tokyo_oss_internal_object("campaign replay artifact", &request.replay_artifact_url)?,
+            "object": legacy_input_object(request,"campaign replay artifact", &request.replay_artifact_url)?,
             "sha256": normalized_sha256("campaign replay artifact", &request.replay_artifact_sha256)?,
         },
         "replay_manifest": {
-            "object": canonical_tokyo_oss_internal_object("campaign replay manifest", &request.replay_manifest_url)?,
+            "object": legacy_input_object(request,"campaign replay manifest", &request.replay_manifest_url)?,
             "sha256": normalized_sha256("campaign replay manifest", &request.replay_manifest_sha256)?,
         },
         "holdout_id": request.holdout_id,
@@ -4325,6 +4542,12 @@ pub(crate) fn expected_campaign_id(request: &CampaignRequest) -> anyhow::Result<
             .collect::<Vec<_>>(),
         "stop_rule": STOP_RULE_V2,
     });
+    if request.prepared_inputs.is_none() {
+        identity
+            .as_object_mut()
+            .context("Campaign identity object")?
+            .remove("prepared_inputs");
+    }
     Ok(format!(
         "cex-campaign-{}",
         &canonical_json_hash(&identity)?[..32]
@@ -4423,8 +4646,13 @@ fn immutable_publish_conflict(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> {
-    if request.schema_version != CAMPAIGN_REQUEST_SCHEMA_V5 {
-        bail!("campaign request schema_version must be {CAMPAIGN_REQUEST_SCHEMA_V5}");
+    if !matches!(
+        request.schema_version.as_str(),
+        CAMPAIGN_REQUEST_SCHEMA_V5 | CAMPAIGN_REQUEST_SCHEMA_V6
+    ) || (request.schema_version == CAMPAIGN_REQUEST_SCHEMA_V6)
+        != request.prepared_inputs.is_some()
+    {
+        bail!("local test request input kind is invalid");
     }
     request.research_plan.validate()?;
     validate_campaign_id(&request.campaign_id)?;
@@ -4466,10 +4694,6 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
         &request.replay_manifest_sha256,
     )?;
     for path in [
-        &request.feature_url,
-        &request.materialization_url,
-        &request.replay_artifact_url,
-        &request.replay_manifest_url,
         &request.holdout_claim_put_url,
         &request.holdout_claim_readback_url,
         &request.campaign_result_put_url,
@@ -4478,6 +4702,18 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
         if path.trim().is_empty() {
             bail!("local test request paths must be non-empty");
         }
+    }
+    if request.prepared_inputs.is_none()
+        && [
+            &request.feature_url,
+            &request.materialization_url,
+            &request.replay_artifact_url,
+            &request.replay_manifest_url,
+        ]
+        .iter()
+        .any(|url| url.is_empty())
+    {
+        bail!("legacy test input paths are required");
     }
     if request.holdout_claim_put_url != request.holdout_claim_readback_url
         || request.campaign_result_put_url != request.campaign_result_readback_url
@@ -4507,7 +4743,7 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
 }
 
 #[cfg(all(test, feature = "scientific"))]
-mod tests {
+pub(crate) mod tests {
     use super::test_support::{paired_mlp_plan_for_tests, valid_request};
     use super::*;
     use crate::mission_render;
@@ -4832,6 +5068,7 @@ mod tests {
                     target_inputs,
                     &loaded.request.producer_source_revision,
                     &loaded.request.producer_image_identity,
+                    loaded.request.prepared_inputs.as_ref(),
                     target_plan,
                     &loaded.request.build_source_revision,
                     &loaded.request.image_identity,
@@ -5676,6 +5913,540 @@ mod tests {
         validate_request(&rebased).unwrap();
     }
 
+    pub(crate) struct NativePreparedFixture {
+        pub(crate) request: CampaignRequest,
+        pub(crate) inputs: prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+        _source: CampaignE2eFixture,
+        _root: tempfile::TempDir,
+    }
+
+    impl NativePreparedFixture {
+        pub(crate) fn materialization_path(&self) -> &Path {
+            &self._source._render_fixture.materialization_path
+        }
+        pub(crate) fn original_receipt_path(&self) -> PathBuf {
+            self._root.path().join("native-source-inputs.json")
+        }
+        pub(crate) fn augmented_receipt_path(&self) -> PathBuf {
+            self._root.path().join("native-campaign-inputs.json")
+        }
+    }
+
+    pub(crate) fn native_prepared_fixture_for_tests() -> NativePreparedFixture {
+        let source_fixture = campaign_e2e_fixture("native-body-equivalence", false, false, true);
+        let (request, inputs, root) = prepare_native_source_fixture(&source_fixture).unwrap();
+        NativePreparedFixture {
+            request,
+            inputs,
+            _source: source_fixture,
+            _root: root,
+        }
+    }
+
+    fn prepare_native_source_fixture(
+        source_fixture: &CampaignE2eFixture,
+    ) -> anyhow::Result<(
+        CampaignRequest,
+        prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+        tempfile::TempDir,
+    )> {
+        use hft_cex_research_input::{
+            campaign::NativeSourceBindingV1, campaign::SourceBuildRefV1, prepared::AcquiredBlocks,
+        };
+        let mut request = load_request(&source_fixture.args.request).unwrap().request;
+        let render = PreparedCexInputs::load(
+            &source_fixture._render_fixture.feature_path,
+            &source_fixture._render_fixture.materialization_path,
+            true,
+        )
+        .unwrap();
+        let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+            render.materialization(),
+            &request.research_plan,
+        )
+        .unwrap();
+        let rows = render.native_source_rows(&protocol).unwrap();
+        let partitions = protocol.row_partitions(rows.len()).unwrap();
+        let end = rows[partitions
+            .selection
+            .as_ref()
+            .map_or(partitions.sealed_holdout.start, |p| p.start)]
+        .available_time
+        .timestamp_micros()
+            - 1;
+        let canonical = hft_backtest::config::verify_canonical_replay_artifact(
+            &source_fixture.replay_artifact_path,
+            &source_fixture.replay_manifest_path,
+            Some(&request.replay_artifact_sha256),
+            &request.replay_manifest_sha256,
+            None,
+            Some(end),
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let item = |path: &Path, sha: &str| CampaignInputReceiptItem {
+            relative_path: path.file_name().unwrap().into(),
+            object_url: path.to_string_lossy().into_owned(),
+            sha256: sha.into(),
+        };
+        let mut receipt = CampaignInputsReceipt {
+            prepared_inputs: None,
+            schema_version: CAMPAIGN_INPUTS_SCHEMA_V1.into(),
+            run_id: "native-source-test".into(),
+            source_revision: request.producer_source_revision.clone(),
+            image_ref: format!("registry/source@sha256:{}", request.producer_image_identity),
+            mission_id: render.materialization().mission_id.clone(),
+            market: render.materialization().market.clone(),
+            symbol: render.materialization().symbol.clone(),
+            output_prefix: "native-source-test".into(),
+            output_object_base_url: root.path().to_string_lossy().into_owned(),
+            readback_scope: "same-mounted-ossfs-prefix".into(),
+            feature: item(
+                &source_fixture._render_fixture.feature_path,
+                &request.feature_sha256,
+            ),
+            materialization: item(
+                &source_fixture._render_fixture.materialization_path,
+                &request.materialization_sha256,
+            ),
+            replay_artifact: item(
+                &source_fixture.replay_artifact_path,
+                &request.replay_artifact_sha256,
+            ),
+            replay_manifest: item(
+                &source_fixture.replay_manifest_path,
+                &request.replay_manifest_sha256,
+            ),
+        };
+        let original_receipt_bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        let original_receipt_sha = hft_cex_research_input::sha256(&original_receipt_bytes);
+        std::fs::write(
+            root.path().join("native-source-inputs.json"),
+            &original_receipt_bytes,
+        )
+        .unwrap();
+        let source = NativeSourceBindingV1 {
+            build: SourceBuildRefV1 {
+                source_revision: receipt.source_revision.clone(),
+                image_identity: receipt.image_ref.clone(),
+            },
+            preparation_run_id: receipt.run_id.clone(),
+            preparation_receipt_sha256: original_receipt_sha,
+            feature_sha256: request.feature_sha256.clone(),
+            materialization_sha256: request.materialization_sha256.clone(),
+            replay_artifact_sha256: request.replay_artifact_sha256.clone(),
+            replay_manifest_sha256: request.replay_manifest_sha256.clone(),
+        };
+        let artifacts = prepared_inputs::export_trusted_source(source, rows, &protocol, canonical)?;
+        let collection_path = root.path().join(format!("{}.json", artifacts.id));
+        std::fs::write(
+            &collection_path,
+            serde_json::to_vec(&artifacts.manifest).unwrap(),
+        )
+        .unwrap();
+        let mut block_urls = std::collections::BTreeMap::new();
+        for (sha, bytes) in &artifacts.blocks {
+            let path = root.path().join(format!("{sha}.mondaybin"));
+            std::fs::write(&path, bytes).unwrap();
+            block_urls.insert(sha.clone(), path.to_string_lossy().into_owned());
+        }
+        let reference = prepared_inputs::NativePreparedCampaignRefV1 {
+            collection_sha256: artifacts.id,
+            collection_url: collection_path.to_string_lossy().into_owned(),
+            expected_native: artifacts.manifest.expected_native().unwrap(),
+            block_urls,
+            render_metadata: render.native_metadata().unwrap(),
+        };
+        receipt.prepared_inputs = Some(reference.clone());
+        let augmented_receipt_bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        request.campaign_inputs_sha256 = hft_cex_research_input::sha256(&augmented_receipt_bytes);
+        std::fs::write(
+            root.path().join("native-campaign-inputs.json"),
+            &augmented_receipt_bytes,
+        )
+        .unwrap();
+        request.prepared_inputs = Some(reference);
+        request.schema_version = CAMPAIGN_REQUEST_SCHEMA_V6.into();
+        request.feature_url.clear();
+        request.materialization_url.clear();
+        request.replay_artifact_url.clear();
+        request.replay_manifest_url.clear();
+        let fingerprint = campaign_data_fingerprint_sha256(
+            &request.campaign_inputs_sha256,
+            &request.producer_source_revision,
+            &request.feature_sha256,
+            &request.materialization_sha256,
+            &request.replay_artifact_sha256,
+            &request.replay_manifest_sha256,
+        )
+        .unwrap();
+        for round in &mut request.rounds {
+            round.identity.data_fingerprint_sha256 = fingerprint.clone();
+        }
+        let expected_request_sha =
+            hft_cex_research_input::sha256(&serialize_request(&request).unwrap());
+        let inputs = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+            &request,
+            &expected_request_sha,
+            artifacts.manifest,
+            &mut AcquiredBlocks {
+                bytes: artifacts.blocks,
+            },
+            1024 * 1024 * 1024,
+        )
+        .unwrap();
+        Ok((request, inputs, root))
+    }
+
+    fn prepare_fixture_for_execute(fixture: &mut CampaignE2eFixture) -> anyhow::Result<()> {
+        let (request, inputs, root) = prepare_native_source_fixture(fixture)?;
+        std::fs::write(&fixture.args.request, serialize_request(&request).unwrap()).unwrap();
+        fixture.args.request_sha256 = inputs.request_sha256().into();
+        fixture._prepared_root = Some(root);
+        Ok(())
+    }
+
+    #[test]
+    fn native_finalized_fixture_matches_real_body_and_rejects_changed_request() {
+        let fixture = native_prepared_fixture_for_tests();
+        assert_eq!(
+            fixture.inputs.campaign_inputs_sha256(),
+            fixture.request.campaign_inputs_sha256
+        );
+        assert_eq!(
+            fixture.inputs.collection_id(),
+            fixture
+                .request
+                .prepared_inputs
+                .as_ref()
+                .unwrap()
+                .collection_sha256
+        );
+        assert!(fixture.materialization_path().is_file());
+        assert_eq!(
+            hft_research_artifacts::sha256_file(&fixture.original_receipt_path()).unwrap(),
+            fixture
+                .inputs
+                .prepared()
+                .manifest()
+                .source
+                .preparation_receipt_sha256
+        );
+        assert_eq!(
+            hft_research_artifacts::sha256_file(&fixture.augmented_receipt_path()).unwrap(),
+            fixture.request.campaign_inputs_sha256
+        );
+        let mut changed = fixture.request.clone();
+        changed.declared_total_trials += 1;
+        let result = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+            &changed,
+            fixture.inputs.request_sha256(),
+            fixture.inputs.prepared().manifest().clone(),
+            &mut hft_cex_research_input::prepared::AcquiredBlocks {
+                bytes: Default::default(),
+            },
+            1024 * 1024 * 1024,
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("admission/witness"));
+    }
+
+    #[test]
+    fn execute_native_prepared_development_retains_exact_round_readbacks() {
+        let fixture = native_prepared_fixture_for_tests();
+        // Preparation is complete. Neither execution nor scientific ZIP
+        // recovery may reopen the original files containing withheld data.
+        for path in [
+            &fixture._source._render_fixture.feature_path,
+            &fixture._source._render_fixture.materialization_path,
+            &fixture._source.replay_artifact_path,
+            &fixture._source.replay_manifest_path,
+        ] {
+            std::fs::remove_file(path).unwrap();
+        }
+        let request_path = fixture._root.path().join("native-execute-request.json");
+        let request_bytes = serialize_request(&fixture.request).unwrap();
+        std::fs::write(&request_path, &request_bytes).unwrap();
+        let work_dir = fixture._root.path().join("native-execute");
+        execute(CampaignExecuteArgs {
+            final_evaluation: false,
+            final_trusted_keys: None,
+            pre_holdout: true,
+            work_dir: work_dir.clone(),
+            campaign_id: fixture.request.campaign_id.clone(),
+            image_identity: fixture.request.image_identity.clone(),
+            request: request_path,
+            request_sha256: hft_cex_research_input::sha256(&request_bytes),
+        })
+        .unwrap();
+
+        let result: CampaignResultV1 = serde_json::from_slice(
+            &std::fs::read(work_dir.join("campaign-result-readback.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.request_sha256, fixture.inputs.request_sha256());
+        assert_eq!(result.rounds.len(), fixture.request.rounds.len());
+        assert!(result.finalization.is_none());
+        assert!(!fixture._source.global_claim_path.exists());
+        for name in ["features.jsonl", "materialization.json", "replay.parquet"] {
+            assert!(!work_dir.join("shared-inputs").join(name).exists());
+        }
+        for round in &fixture.request.rounds {
+            let execute_dir = work_dir.join(format!("mission/{}/execute", round.round_id));
+            crate::mission_runner::validate_native_campaign_result_binding(
+                &execute_dir.join("results"),
+                &fixture.inputs,
+            )
+            .unwrap();
+            let report = recover_round_report(&work_dir, &fixture.request, round);
+            let ledger = collect_round_ledger(&execute_dir, round, &report).unwrap();
+            let published = result
+                .rounds
+                .iter()
+                .find(|item| item.round_id == round.round_id)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(ledger).unwrap(),
+                serde_json::to_value(published).unwrap()
+            );
+        }
+        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let (_, consumed, hash) = readback_pre_holdout_terminal(
+            &client,
+            &fixture.request,
+            fixture.inputs.request_sha256(),
+            fixture.inputs.evaluation_protocol_sha256(),
+        )
+        .unwrap();
+        assert_eq!(consumed, result.consumed_trials as u64);
+        assert_eq!(
+            hash,
+            hft_research_artifacts::sha256_file(&work_dir.join("campaign-result-readback.json"))
+                .unwrap()
+        );
+
+        let round = &result.rounds[0];
+        let binding = ExecutionBinding::Campaign {
+            campaign_id: fixture.request.campaign_id.clone(),
+            round_id: round.round_id.clone(),
+            request_sha256: fixture.inputs.request_sha256().into(),
+        };
+        let source_zip = Path::new(&fixture.request.rounds[0].result_readback_url);
+        let expected_native = Some((
+            fixture.inputs.finalized_request(),
+            fixture.inputs.request_sha256(),
+        ));
+        assert!(
+            recover_execution_report_from_cached_result(
+                source_zip,
+                &round.result_bundle_sha256,
+                &round.mission_id,
+                &round.mission_sha256,
+                &binding,
+                None,
+            )
+            .is_err(),
+            "a native collection cannot fall through the generic full-source verifier"
+        );
+        let block_entry = format!(
+            "results/native-prepared-blocks/{}.mondaybin",
+            fixture
+                .inputs
+                .prepared()
+                .manifest()
+                .features
+                .manifest
+                .blocks[0]
+                .sha256
+        );
+        for mutation in 0..7 {
+            let changed = fixture
+                ._root
+                .path()
+                .join(format!("changed-native-{mutation}.zip"));
+            let mut source = ZipArchive::new(File::open(source_zip).unwrap()).unwrap();
+            let mut output = zip::ZipWriter::new(File::create(&changed).unwrap());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for index in 0..source.len() {
+                let mut entry = source.by_index(index).unwrap();
+                let name = entry.name().to_string();
+                if mutation == 0 && name == block_entry {
+                    continue;
+                }
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                if mutation == 1 && name == block_entry {
+                    bytes[0] ^= 1;
+                }
+                if mutation == 2 && name == "results/native-prepared-admission.json" {
+                    let mut admission: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    admission["loaded_development_rows"] = serde_json::json!(
+                        admission["loaded_development_rows"].as_u64().unwrap() + 1
+                    );
+                    bytes = serde_json::to_vec(&admission).unwrap();
+                }
+                if mutation == 4 && name == "results/feature-manifest.json" {
+                    let mut metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    metadata["symbol"] = serde_json::json!("FOREIGNUSDT");
+                    bytes = serde_json::to_vec(&metadata).unwrap();
+                }
+                if mutation == 5 && name == "results/materialization.json" {
+                    bytes.push(b' ');
+                }
+                if mutation == 6 && name == "results/cex-replay-dataset-manifest.json" {
+                    let mut metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    metadata["manifest_id"] = serde_json::json!("foreign-dataset");
+                    bytes = serde_json::to_vec(&metadata).unwrap();
+                }
+                output.start_file(name, options).unwrap();
+                output.write_all(&bytes).unwrap();
+            }
+            if mutation == 3 {
+                output
+                    .start_file("results/sealed-holdout-receipt.json", options)
+                    .unwrap();
+                output.write_all(b"{}").unwrap();
+            }
+            output.finish().unwrap();
+            // Use the actual changed archive hash: rejection must come from
+            // independently decoded scientific evidence, not a stale ZIP hash.
+            assert!(
+                recover_execution_report_from_cached_result(
+                    &changed,
+                    &hft_research_artifacts::sha256_file(&changed).unwrap(),
+                    &round.mission_id,
+                    &round.mission_sha256,
+                    &binding,
+                    expected_native,
+                )
+                .is_err(),
+                "native evidence mutation {mutation} was accepted"
+            );
+        }
+        platform_output::assert_publication(
+            &LoadedRequest {
+                request: fixture.request.clone(),
+                sha256: fixture.inputs.request_sha256().into(),
+            },
+            &fixture.inputs,
+            &result,
+            &hash,
+            &work_dir,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn native_collection_rebuilds_actual_rows_preserves_original_schedule_and_rejects_false_label()
+    {
+        use hft_cex_research_input::{
+            campaign::NativeSourceBindingV1, campaign::SourceBuildRefV1, prepared::AcquiredBlocks,
+        };
+        let fixture = campaign_e2e_fixture("native-prepared-rows", false, false, true);
+        let loaded = load_request(&fixture.args.request).unwrap();
+        let render = PreparedCexInputs::load(
+            &fixture._render_fixture.feature_path,
+            &fixture._render_fixture.materialization_path,
+            true,
+        )
+        .unwrap();
+        let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+            render.materialization(),
+            &loaded.request.research_plan,
+        )
+        .unwrap();
+        let original_rows = render.native_source_rows(&protocol).unwrap();
+        let partitions = protocol.row_partitions(original_rows.len()).unwrap();
+        let end = original_rows[partitions
+            .selection
+            .as_ref()
+            .map_or(partitions.sealed_holdout.start, |p| p.start)]
+        .available_time
+        .timestamp_micros()
+            - 1;
+        let canonical = || {
+            hft_backtest::config::verify_canonical_replay_artifact(
+                &fixture.replay_artifact_path,
+                &fixture.replay_manifest_path,
+                Some(&loaded.request.replay_artifact_sha256),
+                &loaded.request.replay_manifest_sha256,
+                None,
+                Some(end),
+            )
+            .unwrap()
+        };
+        let source = NativeSourceBindingV1 {
+            build: SourceBuildRefV1 {
+                source_revision: loaded.request.producer_source_revision.clone(),
+                image_identity: format!(
+                    "registry/native@sha256:{}",
+                    loaded.request.producer_image_identity
+                ),
+            },
+            preparation_run_id: "native-source-test".into(),
+            preparation_receipt_sha256: loaded.request.campaign_inputs_sha256.clone(),
+            feature_sha256: loaded.request.feature_sha256.clone(),
+            materialization_sha256: loaded.request.materialization_sha256.clone(),
+            replay_artifact_sha256: loaded.request.replay_artifact_sha256.clone(),
+            replay_manifest_sha256: loaded.request.replay_manifest_sha256.clone(),
+        };
+        let artifacts = prepared_inputs::export_trusted_source(
+            source.clone(),
+            original_rows.clone(),
+            &protocol,
+            canonical(),
+        )
+        .unwrap();
+        let expected = artifacts.manifest.expected_native().unwrap();
+        let verified = artifacts
+            .manifest
+            .verify(
+                &artifacts.id,
+                &expected,
+                &mut AcquiredBlocks {
+                    bytes: artifacts.blocks,
+                },
+                1024 * 1024 * 1024,
+            )
+            .unwrap();
+        assert_eq!(verified.rows(), &original_rows[..partitions.search.end]);
+        let native =
+            alpha_engine::evaluation::prepare_native_campaign_dataset(&verified, &protocol)
+                .unwrap();
+        let original =
+            alpha_engine::evaluation::prepare_dataset(original_rows.clone(), &protocol).unwrap();
+        assert_eq!(
+            native.engine_context().rows(),
+            original.engine_context().rows()
+        );
+        assert_eq!(
+            native.engine_context().folds(),
+            original.engine_context().folds()
+        );
+        assert_eq!(
+            native.withheld_metadata().unwrap().total_rows,
+            original_rows.len()
+        );
+        assert_eq!(
+            native.withheld_metadata().unwrap().holdout.original_rows,
+            partitions.sealed_holdout
+        );
+        assert!(native.calendar_validation_rows().is_none());
+        let mut false_rows = original_rows;
+        false_rows[0].label += 0.01;
+        assert!(
+            prepared_inputs::export_trusted_source(source, false_rows, &protocol, canonical())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("label")
+        );
+    }
+
     #[test]
     fn finalize_preserves_frozen_campaign_identity() {
         let root = tempfile::tempdir().unwrap();
@@ -5764,6 +6535,7 @@ mod tests {
             &"5".repeat(64),
             &"a".repeat(40),
             &"6".repeat(64),
+            None,
             &CexCampaignResearchPlanV1::canonical(),
             BUILD_SOURCE_REVISION,
             &"1".repeat(64),
@@ -5789,7 +6561,7 @@ mod tests {
         let producer_revision = "b".repeat(40);
         let producer_image_ref = format!("registry/research-runner@sha256:{}", "1".repeat(64));
         let executor_image_ref = format!("registry/research-runner@sha256:{}", "2".repeat(64));
-        let fixture = campaign_e2e_fixture("campaign-freeze", false, false, false);
+        let fixture = campaign_e2e_fixture("campaign-freeze", false, false, true);
         let root = tempfile::tempdir().unwrap();
         let input_root = root.path().join("remounted-run");
         std::fs::create_dir_all(&input_root).unwrap();
@@ -5821,6 +6593,7 @@ mod tests {
         .unwrap();
         let receipt_path = root.path().join("campaign-inputs.json");
         let receipt = CampaignInputsReceipt {
+            prepared_inputs: None,
             schema_version: CAMPAIGN_INPUTS_SCHEMA_V1.to_string(),
             run_id: "20260819t000000z-1".to_string(),
             source_revision: producer_revision.clone(),
@@ -5895,11 +6668,35 @@ mod tests {
         assert_eq!(receipt_again.source_revision, producer_revision);
         assert_eq!(receipt_again.image_ref, producer_image_ref);
         let frozen = load_freeze_plan(&output).unwrap();
-        assert_eq!(frozen.campaign_inputs_sha256, receipt_sha256);
+        let prepared = frozen.canonical_request.prepared_inputs.as_ref().unwrap();
         assert_eq!(
-            frozen.canonical_request.campaign_inputs_sha256,
+            prepared.expected_native.source.preparation_receipt_sha256,
             receipt_sha256
         );
+        let augmented = input_root.join(format!(
+            "native-prepared/{}.inputs.json",
+            frozen.campaign_inputs_sha256
+        ));
+        let (augmented_receipt, augmented_sha) = load_campaign_inputs_receipt(&augmented).unwrap();
+        assert_eq!(augmented_receipt.prepared_inputs.as_ref(), Some(prepared));
+        assert_eq!(frozen.campaign_inputs_sha256, augmented_sha);
+        assert_eq!(
+            frozen.canonical_request.campaign_inputs_sha256,
+            augmented_sha
+        );
+        assert_ne!(augmented_sha, receipt_sha256);
+        assert!(frozen.canonical_request.feature_url.is_empty());
+        assert!(frozen.canonical_request.materialization_url.is_empty());
+        assert!(frozen.canonical_request.replay_artifact_url.is_empty());
+        assert!(frozen.canonical_request.replay_manifest_url.is_empty());
+        assert!(frozen.signing_plan.actions.iter().all(|action| ![
+            "feature_get",
+            "materialization_get",
+            "replay_artifact_get",
+            "replay_manifest_get"
+        ]
+        .contains(&action.name.as_str())));
+
         assert_eq!(
             frozen.canonical_request.producer_source_revision,
             producer_revision
@@ -6464,8 +7261,32 @@ mod tests {
     }
 
     #[test]
-    fn execute_rejects_label_only_edge_before_event_replay() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false, false);
+    fn plain_v5_request_cannot_start_a_worker_or_create_work_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let request = valid_request();
+        let path = root.path().join("legacy-request.json");
+        let bytes = serialize_request(&request).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let work_dir = root.path().join("worker");
+        let error = execute(CampaignExecuteArgs {
+            final_evaluation: false,
+            final_trusted_keys: None,
+            pre_holdout: true,
+            work_dir: work_dir.clone(),
+            campaign_id: request.campaign_id,
+            image_identity: request.image_identity,
+            request: path,
+            request_sha256: hft_cex_research_input::sha256(&bytes),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("frozen V6 prepared collection"));
+        assert!(!work_dir.exists());
+    }
+
+    #[test]
+    fn execute_rejects_prediction_edge_that_fails_actual_event_replay() {
+        let mut fixture = campaign_e2e_fixture("campaign-e2e-positive", false, false, false);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         let request = load_request(&fixture.args.request).unwrap().request;
         execute(fixture.args.clone()).unwrap();
         for round in &request.rounds {
@@ -6482,16 +7303,15 @@ mod tests {
                 recovered.supervised_candidate_id.as_deref(),
                 Some(selection.selected_candidate.id.as_str())
             );
-            assert!(recovered.supervised_replay_receipt_id.is_none());
-        }
-        // Model ranking varies with fitted weights. Controlled negative
-        // selections exercise every recovery path without requiring a winner.
-        for model in ["ridge", "cart", "burn_mlp"] {
-            assert_negative_candidate_recovery(&fixture, &request, &request.rounds[0], model);
+            assert!(recovered.supervised_replay_receipt_id.is_some());
+            assert_eq!(recovered.supervised_replay_gate_passed, Some(false));
         }
         let work_dir = fixture.work_dir;
-        assert!(work_dir.join("shared-inputs/features.jsonl").exists());
-        assert!(work_dir.join("shared-inputs/materialization.json").exists());
+        assert!(work_dir
+            .join("shared-inputs/native-prepared-inputs.json")
+            .exists());
+        assert!(!work_dir.join("shared-inputs/features.jsonl").exists());
+        assert!(!work_dir.join("shared-inputs/materialization.json").exists());
         let result: serde_json::Value =
             serde_json::from_slice(&std::fs::read(work_dir.join("campaign-result.json")).unwrap())
                 .unwrap();
@@ -6534,7 +7354,7 @@ mod tests {
             assert!(results.join("supervised-model-selection.json").exists());
             assert!(results.join("burn-mlp-baseline.json").exists());
             assert!(results.join("burn_mlp-supervised-candidate.json").exists());
-            assert!(!results
+            assert!(results
                 .join("supervised-event-replay-receipt.json")
                 .exists());
             assert!(!results.join("factor-subset-mcts-result.json").exists());
@@ -6542,9 +7362,12 @@ mod tests {
         }
         assert_eq!(result["termination_reason"], "campaign_no_candidate");
         assert!(result["rounds"].as_array().unwrap().iter().all(|round| {
-            round["termination_reason"] == "no_passing_supervised_model"
-                && round["supervised_replay_gate_passed"].is_null()
-                && round["feedback"]["supervised_replay"].is_null()
+            round["termination_reason"] == "supervised_replay_gate_failed"
+                && round["supervised_replay_gate_passed"] == false
+                && round["feedback"]["supervised_replay"]["mean_net_return"]
+                    .as_f64()
+                    .unwrap()
+                    <= 0.0
         }));
         assert!(result["selected_round_id"].is_null());
         assert!(result["finalization"].is_null());
@@ -6575,12 +7398,12 @@ mod tests {
     }
 
     #[test]
-    fn calendar_h1_preserves_negative_validation_and_independent_bundle_readback() {
+    fn calendar_h1_negative_cannot_borrow_a_withheld_future_mark() {
         assert_calendar_h1_readback(true);
     }
 
     #[test]
-    fn calendar_h1_replays_nonzero_validation_without_opening_sealed() {
+    fn calendar_h1_positive_cannot_borrow_a_withheld_future_mark() {
         assert_calendar_h1_readback(false);
     }
 
@@ -6636,7 +7459,6 @@ mod tests {
         )
         .unwrap();
         plan.development_precheck = Some(inputs.development_precheck(plan).unwrap());
-        let protocol = plan.development_precheck.as_ref().unwrap().protocol.clone();
         request.holdout_id = render_prepared_cex_bundle(&inputs, plan, 7, 46)
             .unwrap()
             .mission
@@ -6648,175 +7470,20 @@ mod tests {
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
             hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
-        execute(fixture.args.clone()).unwrap();
-        let loaded = load_request(&fixture.args.request).unwrap();
-        let client = Client::builder().redirect(Policy::none()).build().unwrap();
-        let (_, trials, _) = readback_pre_holdout_terminal(
-            &client,
-            &loaded.request,
-            &loaded.sha256,
-            &protocol.content_hash().unwrap(),
-        )
-        .unwrap();
-        assert!(trials <= 46);
-        let result = load_campaign_result(&fixture.work_dir.join("campaign-result.json")).unwrap();
-        if negative {
-            assert_eq!(result.termination_reason, "campaign_no_candidate");
-        }
+        let error = prepare_fixture_for_execute(&mut fixture).unwrap_err();
+        assert!(
+            error.to_string().contains("withheld selection or holdout"),
+            "{error:#}"
+        );
+        assert!(!fixture.work_dir.exists());
         assert!(!fixture.global_claim_path.exists());
-        for round in &result.rounds {
-            assert!(round.feedback.calendar_validation.is_some());
-            let bank_path = fixture.work_dir.join(format!(
-                "mission/{}/execute/results/factor-bank.json",
-                round.round_id
-            ));
-            let bank: CexFactorBankRevisionV2 =
-                serde_json::from_slice(&std::fs::read(bank_path).unwrap()).unwrap();
-            assert!(
-                bank.entries
-                    .iter()
-                    .any(|entry| entry.source_features.iter().any(|field| field
-                        == alpha_domain::CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD)),
-                "calendar validation must exercise a fitted research-only factor"
-            );
-            let path = fixture.work_dir.join(format!(
-                "mission/{}/execute/results/calendar-validation.json",
-                round.round_id
-            ));
-            let report: alpha_engine::final_models::CalendarValidationReportV1 =
-                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-            assert!(!report.promotion_authority);
-            if negative {
-                assert!(!report.report.evaluation.passed);
-            }
-            assert!(report.last_training_time < report.calendar.calendar.develop_end);
-            assert!(report.report.ledger.iter().all(|row| row.available_time
-                >= report.calendar.calendar.develop_end
-                && row.available_time < report.calendar.calendar.validation_end));
-            let planned = loaded
+        assert_eq!(
+            load_request(&fixture.args.request)
+                .unwrap()
                 .request
-                .rounds
-                .iter()
-                .find(|planned| planned.round_id == round.round_id)
-                .unwrap();
-            let lightweight = crate::mission_metrics::campaign::collect_verified_archive(
-                Path::new(&planned.result_readback_url),
-                &round.round_id,
-                round.seed,
-                &round.mission_id,
-                &round.result_bundle_sha256,
-            )
-            .unwrap();
-            assert_eq!(
-                lightweight.calendar_validation.as_ref(),
-                Some(&report.summary().unwrap())
-            );
-            assert_eq!(
-                lightweight.label_space_precheck.as_ref().unwrap().scope,
-                "calendar_development_only_overlapping_labels"
-            );
-            let diagnostics = lightweight
-                .calendar_prediction_diagnostics
-                .as_ref()
-                .unwrap();
-            assert!(!diagnostics.training_performed && !diagnostics.promotion_authority);
-            assert_eq!(
-                diagnostics.source_validation_sha256,
-                report.summary().unwrap().report_content_sha256
-            );
-            assert_eq!(
-                diagnostics.counts.evaluated_rows,
-                report.report.ledger.len()
-            );
-            assert_eq!(
-                diagnostics.counts.horizon_eligible_rows + diagnostics.counts.tail_rows,
-                diagnostics.counts.evaluated_rows
-            );
-            if negative {
-                assert_eq!(diagnostics.counts.eligible_nonzero_entry_signals, 0);
-            } else {
-                assert!(diagnostics.counts.eligible_nonzero_entry_signals > 0);
-            }
-            assert_eq!(lightweight.calendar_replay.is_some(), !negative);
-            if negative {
-                assert!(report
-                    .report
-                    .ledger
-                    .iter()
-                    .all(|row| row.target_position == 0.0));
-            } else {
-                assert!(report
-                    .report
-                    .ledger
-                    .iter()
-                    .any(|row| row.target_position != 0.0));
-                let replay_path = fixture.work_dir.join(format!(
-                    "mission/{}/execute/results/calendar-validation-event-replay-receipt.json",
-                    round.round_id
-                ));
-                let replay: CexEventReplayReceiptV1 =
-                    serde_json::from_slice(&std::fs::read(replay_path).unwrap()).unwrap();
-                let holding = replay.metrics.holding.as_ref().unwrap();
-                assert!(holding.closed_episodes > 0);
-                assert_eq!(holding.incomplete_exit_orders, 0);
-                assert_eq!(holding.delayed_exit_decisions, 0);
-            }
-        }
-        if negative {
-            assert_metric_bundle_rejected(
-                &loaded,
-                &protocol.content_hash().unwrap(),
-                &client,
-                |entries| {
-                    let mut diagnostics: serde_json::Value = serde_json::from_slice(
-                        &entries["results/calendar-prediction-diagnostics.json"],
-                    )
-                    .unwrap();
-                    diagnostics["counts"]["eligible_predictions_above_cost"] =
-                        serde_json::json!(999);
-                    entries.insert(
-                        "results/calendar-prediction-diagnostics.json".into(),
-                        serde_json::to_vec(&diagnostics).unwrap(),
-                    );
-                },
-                "calendar prediction diagnostics differ from independently evaluated rows",
-            );
-            assert_metric_bundle_rejected(
-                &loaded,
-                &protocol.content_hash().unwrap(),
-                &client,
-                |entries| {
-                    entries.remove("results/calendar-prediction-diagnostics.json");
-                },
-                "calendar prediction diagnostics missing",
-            );
-            assert_metric_bundle_rejected(
-                &loaded,
-                &protocol.content_hash().unwrap(),
-                &client,
-                |entries| {
-                    let mut report: serde_json::Value =
-                        serde_json::from_slice(&entries["results/calendar-validation.json"])
-                            .unwrap();
-                    report["report"]["ledger"][0]["prediction"] = serde_json::json!(9999.0);
-                    entries.insert(
-                        "results/calendar-validation.json".into(),
-                        serde_json::to_vec(&report).unwrap(),
-                    );
-                },
-                "calendar validation differs from independently evaluated fitted weights",
-            );
-        } else {
-            assert_metric_bundle_rejected(
-                &loaded,
-                &protocol.content_hash().unwrap(),
-                &client,
-                |entries| {
-                    entries.remove("results/calendar-validation-event-replay-receipt.json");
-                },
-                "nonzero calendar validation is missing observed event replay",
-            );
-        }
+                .prepared_inputs,
+            None
+        );
     }
 
     fn assert_ridge_holding_campaign(mut fixture: CampaignE2eFixture, negative: bool) {
@@ -6834,6 +7501,7 @@ mod tests {
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
             hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
         let materialization = crate::mission_runner::decode_materialization(
@@ -6935,7 +7603,8 @@ mod tests {
 
     #[test]
     fn execute_keeps_profitable_ml_replay_without_legacy_finalization() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-ml-positive", false, false, true);
+        let mut fixture = campaign_e2e_fixture("campaign-e2e-ml-positive", false, false, true);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
 
         let result: serde_json::Value = serde_json::from_slice(
@@ -7132,28 +7801,27 @@ mod tests {
             |entries| {
                 let path = entries
                     .keys()
-                    .find(|name| name.starts_with("artifacts/") && name.ends_with(".jsonl"))
+                    .find(|name| {
+                        name.starts_with("results/native-prepared-blocks/")
+                            && name.ends_with(".mondaybin")
+                    })
                     .unwrap()
                     .clone();
                 entries.get_mut(&path).unwrap().push(b' ');
             },
-            "model metric feature bytes differ from the admitted Mission input SHA256",
+            "native archive changed a declared block length",
         );
 
         assert_cached_terminal_reporting(&fixture, &loaded, &protocol, &client, &hash);
 
-        assert_final_worker_outcome(
-            &fixture,
-            loaded,
-            hash,
-            &client,
-            alpha_store::campaign_ledger::CampaignFinalOutcomeV1::PromotionReady,
-        );
+        assert_development_request_requires_withheld_inputs(&fixture, loaded, hash);
     }
 
     #[test]
     fn execute_retains_paired_mlp_training_diagnostics() {
-        let control = campaign_e2e_fixture("campaign-e2e-ml-profile-control", false, false, true);
+        let mut control =
+            campaign_e2e_fixture("campaign-e2e-ml-profile-control", false, false, true);
+        prepare_fixture_for_execute(&mut control).unwrap();
         execute(control.args.clone()).unwrap();
         assert_paired_training_roundtrip(&control);
     }
@@ -7220,6 +7888,7 @@ mod tests {
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
             hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
         let materialization = crate::mission_runner::decode_materialization(
@@ -7555,16 +8224,13 @@ mod tests {
         );
     }
 
-    fn assert_final_worker_outcome(
+    fn assert_development_request_requires_withheld_inputs(
         fixture: &CampaignE2eFixture,
         loaded: LoadedRequest,
         hash: String,
-        client: &Client,
-        expected: alpha_store::campaign_ledger::CampaignFinalOutcomeV1,
     ) {
-        // Exercise the final worker with local transport and independent signed
-        // authority, after removing the original execution checkout artifacts.
-        // The controller's close/claim/revocation protocol has separate ledger tests.
+        // A signed final grant is not a withheld data capability. The V6
+        // search request cannot create a final worker that reads those bytes.
         use alpha_domain::campaign_finalization::{
             sign_campaign_final_evaluation_grant, CampaignFinalEvaluationGrantV1,
             FINAL_EVALUATION_GRANT_SCHEMA,
@@ -7602,7 +8268,7 @@ mod tests {
             &final_key,
         )
         .unwrap();
-        let final_request = final_evaluation::FinalRequest::new(
+        let result = final_evaluation::FinalRequest::new(
             signed,
             std::collections::BTreeMap::from([(operation, loaded.request)]),
             fixture
@@ -7611,130 +8277,37 @@ mod tests {
                 .join("final-published")
                 .to_string_lossy()
                 .into_owned(),
-        )
-        .unwrap();
-        let final_request_path = fixture._root.path().join("final-request.json");
-        hft_research_artifacts::write_json_atomic(&final_request_path, &final_request).unwrap();
-        let final_sha = hft_research_artifacts::sha256_file(&final_request_path).unwrap();
-        let keys = fixture._root.path().join("final-keys.json");
-        hft_research_artifacts::write_json_atomic(
-            &keys,
-            &std::collections::BTreeMap::from([(
-                "final-key",
-                hex::encode(final_key.verifying_key().as_bytes()),
-            )]),
-        )
-        .unwrap();
-        let final_work = fixture._root.path().join("final-work");
-        std::fs::remove_dir_all(fixture.work_dir.join("mission")).unwrap();
-        let final_args = CampaignExecuteArgs {
-            final_evaluation: true,
-            final_trusted_keys: Some(keys.clone()),
-            pre_holdout: false,
-            work_dir: final_work.clone(),
-            campaign_id: final_request.campaign_id.clone(),
-            image_identity: final_request.image_identity.clone(),
-            request: final_request_path,
-            request_sha256: final_sha.clone(),
-        };
-        if let Err(error) = execute(final_args.clone()) {
-            let selection = std::fs::read_to_string(
-                final_work
-                    .join(&final_request.campaign_id)
-                    .join("results/independent-selection.json"),
-            )
-            .unwrap_or_default();
-            panic!("final worker failed: {error:#}; selection: {selection}");
-        }
-        let final_result: final_evaluation::FinalResult = serde_json::from_slice(
-            &std::fs::read(
-                final_work
-                    .join(&final_request.campaign_id)
-                    .join("final-result.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            final_result.outcome,
-            expected,
-            "{}",
-            std::fs::read_to_string(
-                final_work
-                    .join(&final_request.campaign_id)
-                    .join("results/independent-selection.json")
-            )
-            .unwrap()
         );
-        assert!(fixture.global_claim_path.is_file());
-        if expected == alpha_store::campaign_ledger::CampaignFinalOutcomeV1::PromotionReady {
-            let bundle: alpha_domain::StrategyBundle = serde_json::from_slice(
-                &std::fs::read(
-                    final_work
-                        .join(&final_request.campaign_id)
-                        .join("results/strategy-bundle.json"),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            let alpha_domain::StrategyBundleArtifact::FrozenModel { strategy } = bundle.artifact
-            else {
-                panic!("expected native model bundle")
-            };
-            assert_eq!(
-                strategy.frozen.evaluator_config.multiple_testing_trials,
-                final_request.first_source().unwrap().declared_total_trials
-            );
-            assert_ne!(
-                strategy.frozen.evaluator_config.multiple_testing_trials, 2,
-                "benchmark comparison is not the final trial family"
-            );
-        } else {
-            assert!(final_result.strategy_bundle.is_none());
-            assert!(final_result.promotion.is_none());
-        }
-        let grant = crate::mission_dispatch::final_admission::verify_worker_grant(
-            &final_request.grant,
-            &keys,
-        )
-        .unwrap();
-        let (readback, _) =
-            final_evaluation::readback_terminal(client, &final_request, &final_sha, &grant)
-                .unwrap();
-        assert_eq!(readback, final_result);
-        assert!(execute(final_args)
-            .unwrap_err()
-            .to_string()
-            .contains("already exists"));
+        assert!(
+            result.is_err(),
+            "development-only source cannot invent withheld read capabilities"
+        );
+        assert!(!fixture.global_claim_path.exists());
+        assert!(!fixture._root.path().join("final-work").exists());
     }
 
     #[test]
-    fn final_model_rejected_holdout_keeps_claim_without_promotion() {
-        let fixture = campaign_e2e_fixture_with_rejected_holdout(
+    fn development_only_request_cannot_open_holdout_with_a_final_grant() {
+        let mut fixture = campaign_e2e_fixture_with_rejected_holdout(
             "campaign-final-negative",
             false,
             false,
             true,
             true,
         );
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
         let hash =
             hft_research_artifacts::sha256_file(&fixture.work_dir.join("campaign-result.json"))
                 .unwrap();
-        let client = Client::builder().redirect(Policy::none()).build().unwrap();
-        assert_final_worker_outcome(
-            &fixture,
-            loaded,
-            hash,
-            &client,
-            alpha_store::campaign_ledger::CampaignFinalOutcomeV1::HoldoutRejected,
-        );
+        assert_development_request_requires_withheld_inputs(&fixture, loaded, hash);
     }
 
     #[test]
     fn execute_negative_campaign_creates_no_claim() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-negative", true, false, false);
+        let mut fixture = campaign_e2e_fixture("campaign-e2e-negative", true, false, false);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
 
         let result: serde_json::Value = serde_json::from_slice(
@@ -7816,7 +8389,8 @@ mod tests {
 
     #[test]
     fn collect_round_ledger_rejects_supervised_replay_report_drift() {
-        let fixture = campaign_e2e_fixture("campaign-ledger-no-selection", false, false, true);
+        let mut fixture = campaign_e2e_fixture("campaign-ledger-no-selection", false, false, true);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
 
         let request = load_request(&fixture.args.request).unwrap().request;
@@ -7834,7 +8408,9 @@ mod tests {
 
     #[test]
     fn collect_round_ledger_rejects_missing_supervised_replay() {
-        let fixture = campaign_e2e_fixture("campaign-ledger-missing-result", false, false, true);
+        let mut fixture =
+            campaign_e2e_fixture("campaign-ledger-missing-result", false, false, true);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
 
         let request = load_request(&fixture.args.request).unwrap().request;
@@ -7857,7 +8433,8 @@ mod tests {
 
     #[test]
     fn supervised_search_does_not_touch_an_existing_global_claim() {
-        let fixture = campaign_e2e_fixture("campaign-e2e-existing-claim", false, true, false);
+        let mut fixture = campaign_e2e_fixture("campaign-e2e-existing-claim", false, true, false);
+        prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args).unwrap();
 
         assert_eq!(
@@ -7943,7 +8520,7 @@ mod tests {
         let binding = ExecutionBinding::Campaign {
             campaign_id: request.campaign_id.clone(),
             round_id: round.round_id.clone(),
-            request_sha256,
+            request_sha256: request_sha256.clone(),
         };
         let client = Client::builder().redirect(Policy::none()).build().unwrap();
         recover_execution_report_from_published_result(
@@ -7953,61 +8530,13 @@ mod tests {
             &mission_id,
             &mission_sha256,
             &binding,
+            request
+                .prepared_inputs
+                .as_ref()
+                .map(|_| (request, request_sha256.as_str())),
         )
         .unwrap()
         .unwrap()
-    }
-
-    fn assert_negative_candidate_recovery(
-        fixture: &CampaignE2eFixture,
-        request: &CampaignRequest,
-        round: &CampaignRoundRequest,
-        model: &str,
-    ) {
-        let mut source =
-            zip::ZipArchive::new(File::open(&round.result_readback_url).unwrap()).unwrap();
-        let mut entries = std::collections::BTreeMap::new();
-        for index in 0..source.len() {
-            let mut entry = source.by_index(index).unwrap();
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes).unwrap();
-            entries.insert(entry.name().to_string(), bytes);
-        }
-        let candidate: CexSupervisedModelCandidateV2 =
-            serde_json::from_slice(&entries[&format!("results/{model}-supervised-candidate.json")])
-                .unwrap();
-        assert!(!candidate.evaluation.passed);
-        let mut selection: CexSupervisedModelSelectionV1 =
-            serde_json::from_slice(&entries["results/supervised-model-selection.json"]).unwrap();
-        selection.selected_candidate = alpha_domain::CexResearchContentRefV1 {
-            id: candidate.artifact_id.clone(),
-            content_sha256: canonical_json_hash(&candidate).unwrap(),
-        };
-        selection.replay_eligible = false;
-        entries.insert(
-            "results/supervised-model-selection.json".into(),
-            serde_json::to_vec(&selection).unwrap(),
-        );
-        regenerate_metric_entries(&mut entries);
-        let bundle = fixture.work_dir.join(format!("negative-{model}.zip"));
-        let mut writer = zip::ZipWriter::new(File::create(&bundle).unwrap());
-        for (name, bytes) in entries {
-            writer
-                .start_file(name, zip::write::SimpleFileOptions::default())
-                .unwrap();
-            writer.write_all(&bytes).unwrap();
-        }
-        writer.finish().unwrap();
-        let mut controlled = round.clone();
-        controlled.result_readback_url = bundle.to_string_lossy().into_owned();
-        let recovered = recover_round_report(&fixture.work_dir, request, &controlled);
-        assert_eq!(
-            recovered.supervised_candidate_id.as_deref(),
-            Some(candidate.artifact_id.as_str())
-        );
-        assert!(recovered.supervised_replay_receipt_id.is_none());
-        assert!(recovered.supervised_replay_gate_passed.is_none());
-        assert!(recovered.sealed_receipt_id.is_none());
     }
 
     #[test]
@@ -8194,6 +8723,7 @@ mod tests {
     }
 
     struct CampaignE2eFixture {
+        _prepared_root: Option<tempfile::TempDir>,
         _root: tempfile::TempDir,
         _replay_root: tempfile::TempDir,
         _render_fixture: mission_render::tests::Fixture,
@@ -8268,6 +8798,7 @@ mod tests {
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
         if zero_labels {
             for row in &mut rows {
+                row.features.insert("mid_price".into(), 60_000.0);
                 row.label = 0.0;
             }
         } else {
@@ -8293,24 +8824,16 @@ mod tests {
                     .insert("vwap_center_deviation_top5_bps".to_string(), direction);
                 row.features
                     .insert("weighted_book_imbalance_top5".to_string(), direction);
-                if replay_tracks_features {
-                    row.features.insert("mid_price".to_string(), mid_price);
-                    mid_price *= 1.0 + direction * price_step;
-                } else {
-                    row.label = direction * 0.001;
-                }
+                row.features.insert("mid_price".to_string(), mid_price);
+                mid_price *= 1.0 + direction * price_step;
             }
-            if replay_tracks_features {
-                let mid_prices = rows
-                    .iter()
-                    .map(|row| row.features["mid_price"])
-                    .collect::<Vec<_>>();
-                for (index, row) in rows.iter_mut().enumerate() {
-                    let future = mid_prices
-                        .get(index + 5)
-                        .copied()
-                        .unwrap_or(mid_prices[index]);
-                    row.label = future / mid_prices[index] - 1.0;
+            let observations = rows
+                .iter()
+                .map(|row| (row.feature_available_time, row.features["mid_price"]))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            for row in &mut rows {
+                if let Some(future) = observations.get(&row.label_available_time) {
+                    row.label = future / row.features["mid_price"] - 1.0;
                 }
             }
         }
@@ -8368,6 +8891,7 @@ mod tests {
         let request_sha256 = hex::encode(Sha256::digest(&request_bytes));
         let work_dir = root.path().join("campaign-work");
         CampaignE2eFixture {
+            _prepared_root: None,
             _root: root,
             _replay_root: replay_root,
             _render_fixture: render_fixture,
@@ -8446,6 +8970,7 @@ mod tests {
             build_source_revision: BUILD_SOURCE_REVISION.to_string(),
         };
         CampaignRequest {
+            prepared_inputs: None,
             schema_version: CAMPAIGN_REQUEST_SCHEMA_V5.to_string(),
             campaign_id: campaign_id.clone(),
             build_source_revision: BUILD_SOURCE_REVISION.to_string(),
@@ -8762,5 +9287,20 @@ message binance_replay {
             request.campaign_id
         );
         request
+    }
+}
+
+fn legacy_input_object(
+    request: &CampaignRequest,
+    label: &str,
+    value: &str,
+) -> anyhow::Result<Option<String>> {
+    if request.prepared_inputs.is_some() {
+        if !value.is_empty() {
+            bail!("native request exposes whole-source/withheld input URI");
+        }
+        Ok(None)
+    } else {
+        Ok(Some(canonical_tokyo_oss_internal_object(label, value)?))
     }
 }

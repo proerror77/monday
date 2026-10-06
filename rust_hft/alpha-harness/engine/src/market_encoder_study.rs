@@ -671,6 +671,6 @@ pub fn predict_market_validation(
     Ok(report)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fitting"))]
 #[path = "market_encoder_study/tests.rs"]
 mod tests;

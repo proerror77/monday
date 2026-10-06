@@ -1528,15 +1528,18 @@ mod tests {
         ] {
             assert!(listed(command), "{command} must stay on the Campaign path");
         }
-        let mut worker = WorkerCli::command();
-        let worker_help = worker
-            .find_subcommand_mut("mission")
-            .unwrap()
-            .render_help()
-            .to_string();
-        assert!(worker_help
-            .lines()
-            .any(|line| { line.split_whitespace().next() == Some("campaign-execute") }));
+        #[cfg(feature = "scientific")]
+        {
+            let mut worker = WorkerCli::command();
+            let worker_help = worker
+                .find_subcommand_mut("mission")
+                .unwrap()
+                .render_help()
+                .to_string();
+            assert!(worker_help
+                .lines()
+                .any(|line| { line.split_whitespace().next() == Some("campaign-execute") }));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1622,23 +1625,29 @@ mod tests {
         let args = "alpha-harness mission campaign-execute --work-dir work --campaign-id cex-campaign-1234567890abcdef1234567890abcdef --image-identity aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --request campaign.json --request-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_err());
         assert!(Cli::try_parse_from(format!("{args} --pre-holdout").split_whitespace()).is_err());
-        assert!(WorkerCli::try_parse_from(args.split_whitespace()).is_err());
-        assert!(
-            WorkerCli::try_parse_from(format!("{args} --pre-holdout").split_whitespace()).is_ok()
-        );
-        for suffix in [
-            " --final-evaluation",
-            " --final-trusted-keys keys.json",
-            " --final-evaluation --final-trusted-keys keys.json --pre-holdout",
-        ] {
+        #[cfg(feature = "scientific")]
+        {
+            assert!(WorkerCli::try_parse_from(args.split_whitespace()).is_err());
             assert!(
-                WorkerCli::try_parse_from(format!("{args}{suffix}").split_whitespace()).is_err()
+                WorkerCli::try_parse_from(format!("{args} --pre-holdout").split_whitespace())
+                    .is_ok()
             );
+            for suffix in [
+                " --final-evaluation",
+                " --final-trusted-keys keys.json",
+                " --final-evaluation --final-trusted-keys keys.json --pre-holdout",
+            ] {
+                assert!(
+                    WorkerCli::try_parse_from(format!("{args}{suffix}").split_whitespace())
+                        .is_err()
+                );
+            }
+            assert!(WorkerCli::try_parse_from(
+                format!("{args} --final-evaluation --final-trusted-keys keys.json")
+                    .split_whitespace()
+            )
+            .is_ok());
         }
-        assert!(WorkerCli::try_parse_from(
-            format!("{args} --final-evaluation --final-trusted-keys keys.json").split_whitespace()
-        )
-        .is_ok());
     }
 
     #[test]
