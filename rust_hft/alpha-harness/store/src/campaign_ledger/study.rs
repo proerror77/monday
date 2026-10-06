@@ -52,6 +52,11 @@ pub enum CampaignStudyLedgerEventV1 {
         settlement: CampaignAttemptSettlementV1,
         family_receipt_sha256: String,
     },
+    PlatformSettled {
+        family_id: String,
+        audit: Box<CampaignPlatformTerminalAuditV1>,
+        family_receipt_sha256: String,
+    },
     ApprovalRevoked {
         revocation: ApprovalRevocationV1,
     },
@@ -78,6 +83,12 @@ impl CampaignStudyLedgerEventV1 {
             } => format!(
                 "campaign-study-attempt-settled:{family_id}:{}",
                 settlement.operation_id
+            ),
+            Self::PlatformSettled {
+                family_id, audit, ..
+            } => format!(
+                "campaign-study-platform-terminal:{family_id}:{}",
+                audit.transfer.operation_id
             ),
             Self::ApprovalRevoked { revocation } => {
                 format!("campaign-study-revocation:{}", revocation.approval_id)
@@ -144,6 +155,7 @@ struct StudyMember {
 struct StudyAttempt {
     reservation: CampaignAttemptReservationV1,
     settlement: Option<CampaignAttemptSettlementV1>,
+    platform_audit: Option<CampaignPlatformTerminalAuditV1>,
 }
 
 struct FamilyHistoryCache {
@@ -383,6 +395,7 @@ impl StudyState {
                     StudyAttempt {
                         reservation: reservation.clone(),
                         settlement: None,
+                        platform_audit: None,
                     },
                 );
             }
@@ -406,7 +419,7 @@ impl StudyState {
                 settlement
                     .validate_against(&attempt.reservation)
                     .map_err(err)?;
-                if attempt.settlement.is_some() {
+                if attempt.settlement.is_some() || attempt.platform_audit.is_some() {
                     return Err(err("study attempt already settled"));
                 }
                 self.usage.pending_trials = self
@@ -426,6 +439,36 @@ impl StudyState {
                     }
                 }
                 attempt.settlement = Some(settlement.clone());
+            }
+            CampaignStudyLedgerEventV1::PlatformSettled {
+                family_id,
+                audit,
+                family_receipt_sha256,
+            } => {
+                if receipt.study_id != self.grant()?.grant().study_id {
+                    return Err(err("study platform audit identity mismatch"));
+                }
+                self.member(family_id)?;
+                validate_digest(family_receipt_sha256)?;
+                let attempt = self
+                    .attempts
+                    .get_mut(&audit.transfer.operation_id)
+                    .ok_or_else(|| err("study platform audit has no reservation"))?;
+                audit.validate_against(&attempt.reservation, receipt.recorded_at)?;
+                if attempt.reservation.family_id != *family_id
+                    || attempt.settlement.is_some()
+                    || attempt.platform_audit.is_some()
+                {
+                    return Err(err("study platform audit operation or ownership mismatch"));
+                }
+                self.usage.pending_trials = self
+                    .usage
+                    .pending_trials
+                    .checked_sub(attempt.reservation.declared_trials)
+                    .ok_or_else(|| err("study pending usage underflow"))?;
+                self.usage.uncertain_trials =
+                    add(self.usage.uncertain_trials, audit.charging_trials)?;
+                attempt.platform_audit = Some((**audit).clone());
             }
             CampaignStudyLedgerEventV1::ApprovalRevoked { revocation } => {
                 let approval = self
@@ -639,6 +682,11 @@ fn validate_family_receipt_link(
             ..
         }
         | CampaignStudyLedgerEventV1::AttemptSettled {
+            family_id,
+            family_receipt_sha256,
+            ..
+        }
+        | CampaignStudyLedgerEventV1::PlatformSettled {
             family_id,
             family_receipt_sha256,
             ..
@@ -1343,6 +1391,32 @@ pub(super) fn append_member_settlement(
     )?))
 }
 
+pub(super) fn append_member_platform_audit(
+    conn: &Connection,
+    key: &[u8; 32],
+    study_id: Option<&str>,
+    family_id: &str,
+    audit: &CampaignPlatformTerminalAuditV1,
+    family_receipt: &AuthenticatedCampaignReceiptV1,
+    at: DateTime<Utc>,
+) -> Result<Option<AuthenticatedCampaignStudyReceiptV1>, StoreError> {
+    study_id
+        .map(|id| {
+            study_append(
+                conn,
+                key,
+                id,
+                CampaignStudyLedgerEventV1::PlatformSettled {
+                    family_id: family_id.into(),
+                    audit: Box::new(audit.clone()),
+                    family_receipt_sha256: family_receipt.content_sha256.clone(),
+                },
+                at,
+            )
+        })
+        .transpose()
+}
+
 pub(super) fn append_registered_study_revocation(
     conn: &Connection,
     key: &[u8; 32],
@@ -1540,6 +1614,11 @@ fn validate_study_snapshot(
                 family_id,
                 family_receipt_sha256,
                 ..
+            }
+            | CampaignStudyLedgerEventV1::PlatformSettled {
+                family_id,
+                family_receipt_sha256,
+                ..
             } => (family_id, family_receipt_sha256),
             _ => continue,
         };
@@ -1571,6 +1650,9 @@ fn validate_study_snapshot(
                     CampaignLedgerEventV1::DispatchSettled { evidence }
                         if evidence.settlement == *settlement
                 )
+            }
+            CampaignStudyLedgerEventV1::PlatformSettled { audit, .. } => {
+                matches!(&linked.receipt.event, CampaignLedgerEventV1::PlatformSettled { audit: observed } if observed == audit)
             }
             _ => true,
         };
@@ -1605,6 +1687,13 @@ fn state_member_usage(
                         add(usage.uncertain_trials, attempt.reservation.declared_trials)?
                 }
             }
+        }
+        if let Some(audit) = &attempt.platform_audit {
+            usage.pending_trials = usage
+                .pending_trials
+                .checked_sub(attempt.reservation.declared_trials)
+                .ok_or_else(|| err("study member pending usage underflow"))?;
+            usage.uncertain_trials = add(usage.uncertain_trials, audit.charging_trials)?;
         }
         usage.job_attempts = add(usage.job_attempts, 1)?;
         usage.reserved_job_seconds = add(
@@ -2594,6 +2683,82 @@ mod tests {
                 .campaign_study_receipts(&study.grant().study_id)
                 .unwrap(),
             before
+        );
+    }
+
+    #[test]
+    fn platform_terminal_audit_is_atomic_with_study_full_charge_and_restore() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let root = verify_root(root("platform-audit-root", "platform-audit-family", '1'));
+        register_root(&mut store, &root, "root-approval-1");
+        let study = register_study(&mut store, &[&root], 100);
+        let reservation = reservation(&root, 0, 40);
+        store
+            .reserve_campaign_attempt(&root, &reservation, at(1))
+            .unwrap();
+        acknowledge_family_receipts(&mut store, &reservation.family_id);
+        acknowledge_study_receipts(&mut store, &study.grant().study_id);
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: reservation.operation_id().unwrap(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        store
+            .transfer_campaign_execution_to_platform_with_clock(
+                &root,
+                &reservation,
+                &transfer,
+                || at(1),
+            )
+            .unwrap();
+        acknowledge_family_receipts(&mut store, &reservation.family_id);
+        let source = store
+            .campaign_platform_terminal_source(&reservation.family_id, &transfer.operation_id)
+            .unwrap();
+        store
+            .revoke_approval("study-approval", "operator", "historical stop", at(2))
+            .unwrap();
+        let before = store.campaign_study_usage(&study.grant().study_id).unwrap();
+        let audit = super::super::tests::terminal_audit(&source, at(1000));
+        let first = store
+            .record_campaign_platform_terminal_audit_with_clock(&source, &audit, || at(1001))
+            .unwrap();
+        assert_eq!(
+            first,
+            store
+                .record_campaign_platform_terminal_audit_with_clock(&source, &audit, || at(1002))
+                .unwrap()
+        );
+        let usage = store.campaign_study_usage(&study.grant().study_id).unwrap();
+        assert_eq!(
+            usage.accounted_trials().unwrap(),
+            before.accounted_trials().unwrap()
+        );
+        assert_eq!(usage.consumed_trials, 0);
+        assert_eq!(usage.uncertain_trials, 40);
+        assert_eq!(
+            usage,
+            store.campaign_family_usage(&reservation.family_id).unwrap()
+        );
+        let snapshot = store
+            .campaign_study_snapshot(&study.grant().study_id)
+            .unwrap();
+        assert!(snapshot.receipts.iter().any(|r| matches!(&r.receipt.event, CampaignStudyLedgerEventV1::PlatformSettled { audit: a, family_receipt_sha256, .. } if **a == audit && family_receipt_sha256 == &first.content_sha256)));
+        let mut restored = AlphaStore::open_in_memory().unwrap();
+        restored.integrity_key = store.integrity_key;
+        restored.import_campaign_study_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            restored
+                .campaign_study_usage(&study.grant().study_id)
+                .unwrap(),
+            usage
+        );
+        assert_eq!(
+            restored
+                .campaign_family_usage(&reservation.family_id)
+                .unwrap(),
+            usage
         );
     }
 

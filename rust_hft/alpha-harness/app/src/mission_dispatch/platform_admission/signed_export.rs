@@ -53,16 +53,20 @@ struct Projection {
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct HostTls {
+pub(in crate::mission_dispatch) struct HostTls {
     ca_file: Option<PathBuf>,
     identity_file: Option<PathBuf>,
 }
 
-pub(super) fn read<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
+pub(in crate::mission_dispatch) fn read<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
     let bytes = file_bytes(path, 1024 * 1024, false)?;
     serde_json::from_slice(&bytes).context("invalid typed native export metadata")
 }
-pub(super) fn file_bytes(path: &Path, limit: u64, private: bool) -> anyhow::Result<Vec<u8>> {
+pub(in crate::mission_dispatch) fn file_bytes(
+    path: &Path,
+    limit: u64,
+    private: bool,
+) -> anyhow::Result<Vec<u8>> {
     use rustix::fs::{open, Mode, OFlags};
     use std::os::unix::fs::PermissionsExt;
     ensure!(
@@ -99,7 +103,7 @@ pub(super) fn file_bytes(path: &Path, limit: u64, private: bool) -> anyhow::Resu
     );
     Ok(bytes)
 }
-pub(super) fn client(tls: &HostTls) -> anyhow::Result<Client> {
+pub(in crate::mission_dispatch) fn client(tls: &HostTls) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -447,7 +451,7 @@ fn publish_and_readback(
     );
     Ok(())
 }
-pub(super) fn retain(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(in crate::mission_dispatch) fn retain(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let parent = path.parent().context("export output parent is absent")?;
     ensure!(
