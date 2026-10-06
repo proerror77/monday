@@ -1,0 +1,20 @@
+<clickhouse>
+  <listen_host>0.0.0.0</listen_host>
+  <http_port remove="1"/>
+  <tcp_port remove="1"/>
+  <https_port>8443</https_port>
+  <tcp_port_secure>9440</tcp_port_secure>
+  <openSSL>
+    <server>
+      <certificateFile>/run/private/tls/server.crt</certificateFile>
+      <privateKeyFile>/run/private/tls/server.key</privateKeyFile>
+      <caConfig>/run/private/tls/ca.crt</caConfig>
+      <verificationMode>strict</verificationMode>
+      <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1</disableProtocols>
+    </server>
+  </openSSL>
+  <logger><level>warning</level><console>true</console><log remove="1"/><errorlog remove="1"/></logger>
+  <query_log remove="1"/><query_thread_log remove="1"/><trace_log remove="1"/>
+  <max_server_memory_usage>4294967296</max_server_memory_usage>
+  <max_concurrent_queries>4</max_concurrent_queries>
+</clickhouse>
