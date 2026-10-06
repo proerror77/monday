@@ -225,7 +225,7 @@ fn authorize_projection<'a>(
 }
 
 #[cfg(all(test, feature = "scientific"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alpha_domain::campaign_control::{
         sign_campaign_root_grant, CampaignExecutionScope, CampaignFamilyPolicyV1,
@@ -553,8 +553,12 @@ mod tests {
         scope.recheck().unwrap();
     }
 
-    #[test]
-    fn recorded_calendar_failure_remains_readable_without_authorizing_another_attempt() {
+    pub(in crate::mission_dispatch) fn recorded_calendar_failure_for_tests() -> (
+        crate::mission_campaign::tests::NativePreparedFixture,
+        AlphaStore,
+        crate::mission_dispatch::MissionDispatchSubmission,
+        alpha_domain::campaign_control::CampaignAttemptReservationV1,
+    ) {
         use alpha_domain::campaign_control::{
             CampaignAttemptOutcomeV1, CampaignAttemptSettlementV1,
         };
@@ -603,13 +607,19 @@ mod tests {
         store
             .settle_campaign_attempt(&reservation.family_id, &failure, now)
             .unwrap();
+        (fixture, store, submission, reservation)
+    }
+
+    #[test]
+    fn recorded_calendar_failure_remains_readable_without_authorizing_another_attempt() {
+        let (_fixture, store, submission, reservation) = recorded_calendar_failure_for_tests();
         let before = store
             .campaign_family_snapshot(&reservation.family_id)
             .unwrap();
         let readback =
             crate::mission_dispatch::validate_submission_for_readback(submission.clone()).unwrap();
         assert_eq!(readback.request_sha256, reservation.request_sha256);
-        assert_eq!(readback.request_json, historical.request_json);
+        assert_eq!(readback.submission.request, submission.request);
         let error = crate::mission_dispatch::validate_submission_with_request_check(
             submission.clone(),
             crate::mission_campaign::validate_request_for_source,
@@ -627,6 +637,16 @@ mod tests {
         assert_eq!(usage.job_attempts, 1);
         assert_eq!(usage.pending_trials, 0);
         assert_eq!(usage.uncertain_trials, reservation.declared_trials);
+    }
+
+    pub(crate) fn recorded_calendar_source_for_tests() -> (
+        crate::mission_campaign::tests::NativePreparedFixture,
+        AlphaStore,
+        CampaignRequest,
+        alpha_domain::campaign_control::CampaignAttemptReservationV1,
+    ) {
+        let (fixture, store, submission, reservation) = recorded_calendar_failure_for_tests();
+        (fixture, store, submission.request, reservation)
     }
 
     #[test]

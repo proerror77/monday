@@ -1,6 +1,7 @@
 use super::{platform_facts, scientific_results, stopped_execution, PlatformTerminalArgs};
 use crate::mission_dispatch::{
-    admission, load_submission, platform_admission, render_controlled_manifest, validate_submission,
+    admission, load_submission, platform_admission, render_controlled_manifest,
+    validate_submission_for_readback,
 };
 use alpha_domain::campaign_control::SignedCampaignRootGrantV1;
 use alpha_store::{
@@ -50,6 +51,51 @@ struct VerifiedPlatformTerminalEvidence {
     retained: PathBuf,
 }
 
+fn read_original_submission(
+    path: &Path,
+) -> anyhow::Result<crate::mission_dispatch::ValidatedSubmission> {
+    validate_submission_for_readback(load_submission(path)?)
+}
+
+#[cfg(all(test, feature = "scientific"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recorded_calendar_failure_reaches_original_observer_load_without_new_attempt() {
+        let (_fixture, store, submission, reservation) =
+            admission::planning_view::tests::recorded_calendar_failure_for_tests();
+        let before = store
+            .campaign_family_snapshot(&reservation.family_id)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("submission.json");
+        let bytes = serde_json::to_vec_pretty(&submission).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let validated = read_original_submission(&path).unwrap();
+        assert_eq!(validated.request_sha256, reservation.request_sha256);
+        assert_eq!(validated.submission.request, submission.request);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            store
+                .campaign_family_snapshot(&reservation.family_id)
+                .unwrap(),
+            before
+        );
+        let usage = store.campaign_family_usage(&reservation.family_id).unwrap();
+        assert_eq!(usage.job_attempts, 1);
+        assert_eq!(usage.pending_trials, 0);
+        assert_eq!(usage.uncertain_trials, reservation.declared_trials);
+        assert!(
+            crate::mission_dispatch::validate_submission_with_request_check(
+                submission,
+                crate::mission_campaign::validate_request_for_source
+            )
+            .is_err()
+        );
+    }
+}
+
 pub(super) fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
     crate::cli::require_cloud_data_host(std::env::consts::OS)?;
     ensure!(
@@ -62,7 +108,7 @@ pub(super) fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
             && !crate::mission_dispatch::final_admission::is_final_submission(&args.submission)?,
         "terminal audit accepts canonical pre-holdout Campaign operations"
     );
-    let validated = validate_submission(load_submission(&args.submission)?)?;
+    let validated = read_original_submission(&args.submission)?;
     let control = admission::read_control(&args.control)?;
     let manifest = render_controlled_manifest(&validated, &args.namespace, &control)?;
     let inspection = admission::reconstruct_binding(

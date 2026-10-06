@@ -127,7 +127,7 @@ pub(crate) fn verified_source_requests(
     }
     let mut requests = BTreeMap::new();
     for (index, (operation, path)) in control.source_submissions.iter().enumerate() {
-        let source = validate_submission(load_submission(path)?)?;
+        let source = validate_submission_for_readback(load_submission(path)?)?;
         let record = store.campaign_dispatch_record(&grant.grant().family_id, operation)?;
         let settlement = record.settlement.context("final source is unsettled")?;
         if record.reservation.request_sha256 != source.request_sha256
@@ -191,6 +191,7 @@ pub(crate) fn write_submission(
     image: &str,
     request: FinalRequest,
 ) -> anyhow::Result<SubmissionRenderReport> {
+    request.validate_execution_readiness()?;
     let validated = validate(FinalSubmission {
         purpose: Purpose::FinalEvaluation,
         attempt_id: attempt.into(),
@@ -273,6 +274,12 @@ impl FinalAdmission {
         namespace: &str,
         historical: bool,
     ) -> anyhow::Result<(Self, Value)> {
+        if !historical {
+            validated
+                .submission
+                .request
+                .validate_execution_readiness()?;
+        }
         let control = read_control(control_path)?;
         let store = AlphaStore::open(&control.ledger_path)?;
         let record = store
@@ -476,13 +483,15 @@ pub(crate) fn source_execution_binding(
     image: &str,
     controller_image: &str,
 ) -> anyhow::Result<alpha_domain::campaign_control::CampaignExecutionBindingV1> {
-    let source = validate_submission_with_request_check(
+    // This reconstructs an immutable source identity. It grants no new final
+    // execution; the final intake and worker enforce readiness independently.
+    let source = validate_submission_structure(
         MissionDispatchSubmission {
             attempt_id: "final-source-binding".into(),
             image: image.into(),
             request: source.clone(),
         },
-        crate::mission_campaign::validate_request_for_execute,
+        crate::mission_campaign::validate_request_for_source,
     )?;
     Ok(admission::inspect_binding(
         &source,
