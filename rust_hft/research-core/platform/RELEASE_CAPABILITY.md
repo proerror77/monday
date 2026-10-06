@@ -99,6 +99,7 @@ The broker accepts `--config CONFIG.json`. Configuration contains:
 
 The IDs above are placeholders. Resolve actual immutable IDs through GitHub.
 The endpoint must match the client audience exactly.
+Use its canonical HTTPS form, without an explicit default port.
 An existing TLS ingress must route that path to the loopback listener.
 Keep gateway and broker on the same configured TLS origin.
 Ingress must allow the bounded 150-second verification request.
