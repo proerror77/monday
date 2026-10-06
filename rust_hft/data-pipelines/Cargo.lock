@@ -2971,6 +2971,7 @@ dependencies = [
  "hft-data",
  "hft-data-adapter-binance",
  "hft-integration",
+ "hft-prepared-market-io",
  "hft-research-manifest",
  "http 0.2.12",
  "libc",
@@ -3300,12 +3301,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "hft-research-manifest"
+name = "hft-prepared-market-io"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "chrono",
+ "hft-research-manifest",
  "parquet",
+ "sha2",
+]
+
+[[package]]
+name = "hft-research-manifest"
+version = "0.1.0"
+dependencies = [
+ "chrono",
  "rust_decimal",
  "serde",
  "serde_json",

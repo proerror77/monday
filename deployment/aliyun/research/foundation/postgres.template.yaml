@@ -1,0 +1,66 @@
+# Offline template. Retain storage, zero replicas, no schema-init container.
+apiVersion: v1
+kind: Service
+metadata: {name: monday-foundation-postgres, namespace: monday-research}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector: {app: monday-foundation-postgres}
+  ports: [{name: postgres, port: 5432, targetPort: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: monday-foundation-postgres, namespace: monday-research}
+spec:
+  replicas: 0
+  serviceName: monday-foundation-postgres
+  persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}
+  selector: {matchLabels: {app: monday-foundation-postgres}}
+  template:
+    metadata: {labels: {app: monday-foundation-postgres, research.monday/foundation-access: admitted}}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 120
+      nodeSelector: {workload: research-data, kubernetes.io/arch: amd64}
+      securityContext: {runAsNonRoot: true, runAsUser: 999, runAsGroup: 999, fsGroup: 999, seccompProfile: {type: RuntimeDefault}}
+      initContainers:
+        - name: install-tls
+          image: __INIT_IMAGE__
+          command: [sh, /config/install-tls.sh]
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+          volumeMounts:
+            - {name: tls-secret, mountPath: /projection, readOnly: true}
+            - {name: private, mountPath: /private}
+            - {name: config, mountPath: /config, readOnly: true}
+      containers:
+        - name: postgres
+          image: __POSTGRES_IMAGE__
+          args: [postgres, -c, ssl=on, -c, ssl_cert_file=/run/private/tls/server.crt, -c, ssl_key_file=/run/private/tls/server.key, -c, ssl_ca_file=/run/private/tls/ca.crt, -c, hba_file=/config/pg_hba.conf, -c, password_encryption=scram-sha-256, -c, log_statement=none]
+          env:
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: POSTGRES_PASSWORD_FILE
+              value: /run/bootstrap/password
+            - {name: POSTGRES_DB, value: monday_research}
+          ports: [{name: postgres, containerPort: 5432}]
+          resources: {requests: {cpu: '1', memory: 1Gi}, limits: {cpu: '2', memory: 2Gi}}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+          readinessProbe: {exec: {command: [pg_isready, -d, monday_research]}, initialDelaySeconds: 10, periodSeconds: 10}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: runtime, mountPath: /var/run/postgresql}
+            - {name: private, mountPath: /run/private, readOnly: true}
+            - {name: bootstrap, mountPath: /run/bootstrap, readOnly: true}
+            - {name: config, mountPath: /config, readOnly: true}
+      volumes:
+        - {name: runtime, emptyDir: {sizeLimit: 64Mi}}
+        - {name: private, emptyDir: {medium: Memory, sizeLimit: 1Mi}}
+        - {name: config, configMap: {name: monday-foundation-postgres}}
+        - {name: tls-secret, secret: {secretName: monday-foundation-postgres-tls, defaultMode: 288}}
+        - {name: bootstrap, secret: {secretName: monday-foundation-postgres-bootstrap, defaultMode: 288}}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: __STORAGE_CLASS__
+        resources: {requests: {storage: __POSTGRES_STORAGE__}}

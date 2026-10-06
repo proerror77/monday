@@ -90,6 +90,15 @@ implementation; the input crate has no database or provider dependency.
 Prediction event/settlement inputs remain in their prediction owner. A shared
 Cargo owner does not make CEX time-horizon labels valid for event settlement.
 
+`hft-prepared-market-io` is the shared owner of bounded numerical Parquet IO.
+Its feature/target shard writers and `FeatureParquetReader`/`TargetParquetReader`
+serve the data-service producer and CEX streaming consumers. The original codec
+has one implementation; `hft-research-manifest` retains pure request, receipt,
+coverage, hash and format-limit contracts. Pure manifest, governance and runtime
+consumers do not import Parquet. The GP engine still enables CEX streaming and
+therefore retains this IO dependency; this extraction does not remove that
+separate dependency.
+
 The build boundary does not grant product or execution authority. Existing
 `ploy-*` names remain compatibility identifiers. New packages use functional
 Monday names. Legacy prediction risk and execution contracts remain migration

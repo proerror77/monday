@@ -1,0 +1,32 @@
+<clickhouse>
+  <profiles>
+    <foundation_prepare>
+      <max_threads>1</max_threads><max_memory_usage>1073741824</max_memory_usage>
+      <max_concurrent_queries_for_user>1</max_concurrent_queries_for_user><max_execution_time>120</max_execution_time>
+      <log_queries>0</log_queries>
+    </foundation_prepare>
+    <foundation_reader>
+      <readonly>1</readonly><max_threads>1</max_threads><max_memory_usage>536870912</max_memory_usage>
+      <max_concurrent_queries_for_user>2</max_concurrent_queries_for_user><max_execution_time>60</max_execution_time>
+      <log_queries>0</log_queries>
+    </foundation_reader>
+  </profiles>
+  <users>
+    <default remove="1"/>
+    <foundation_prepare>
+      <password from_env="MONDAY_FOUNDATION_PREPARE_PASSWORD"/>
+      <networks><ip>::/0</ip></networks><profile>foundation_prepare</profile><quota>default</quota>
+      <grants>
+        <query>GRANT SELECT ON research.normalized_books</query>
+        <query>GRANT SELECT ON research.normalized_events</query>
+        <query>GRANT SELECT, INSERT ON research.prepared_features</query>
+        <query>GRANT SELECT, INSERT ON research.prepared_labels</query>
+      </grants>
+    </foundation_prepare>
+    <foundation_reader>
+      <password from_env="MONDAY_FOUNDATION_READER_PASSWORD"/>
+      <networks><ip>::/0</ip></networks><profile>foundation_reader</profile><quota>default</quota>
+      <grants><query>GRANT SELECT ON research.*</query></grants>
+    </foundation_reader>
+  </users>
+</clickhouse>

@@ -67,3 +67,8 @@ pub fn attest(
     };
     (artifact, signed, trust)
 }
+
+#[cfg(feature = "publisher")]
+// Shared fixtures expose corruption handles used only by the import regression.
+#[allow(dead_code)]
+pub mod published;

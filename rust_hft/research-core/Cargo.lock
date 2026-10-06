@@ -109,6 +109,7 @@ dependencies = [
  "hft-collector",
  "hft-factor-dsl",
  "hft-governance-contracts",
+ "hft-prepared-market-io",
  "hft-research-artifacts",
  "hft-research-dispatch-io",
  "hft-research-manifest",
@@ -3114,6 +3115,7 @@ dependencies = [
  "anyhow",
  "bincode 1.3.3",
  "chrono",
+ "hft-prepared-market-io",
  "hft-research-manifest",
  "serde",
  "serde_json",
@@ -3160,6 +3162,7 @@ dependencies = [
  "hft-data",
  "hft-data-adapter-binance",
  "hft-integration",
+ "hft-prepared-market-io",
  "hft-research-manifest",
  "http 0.2.12",
  "libc",
@@ -3328,6 +3331,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-prepared-market-io"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hft-research-manifest",
+ "parquet",
+ "sha2",
+]
+
+[[package]]
 name = "hft-research-artifacts"
 version = "0.1.0"
 dependencies = [
@@ -3355,9 +3368,7 @@ dependencies = [
 name = "hft-research-manifest"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "chrono",
- "parquet",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -3376,6 +3387,7 @@ dependencies = [
  "clap",
  "hex",
  "hft-cex-research-input",
+ "hft-prepared-market-io",
  "hft-research-manifest",
  "rustix 0.38.44",
  "serde",
@@ -3400,6 +3412,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-util",
+ "zip 6.0.0",
 ]
 
 [[package]]

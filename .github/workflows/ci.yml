@@ -525,6 +525,12 @@ jobs:
           docker exec "${{ job.services.postgres.id }}" psql -U fixture -d monday_foundation_test -v ON_ERROR_STOP=1 -c 'CREATE DATABASE monday_foundation_retirement_test'
           MONDAY_TEST_DATABASE_URL="${MONDAY_TEST_DATABASE_URL%/monday_foundation_test}/monday_foundation_retirement_test" \
             "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --lib retirement::tests::native_retirement_real_pg_archive_delete_unknown_and_recovery --locked -- --ignored
+      - name: Validate actual Build import against isolated PG
+        working-directory: rust_hft
+        run: |
+          docker exec "${{ job.services.postgres.id }}" psql -U fixture -d monday_foundation_test -v ON_ERROR_STOP=1 -c 'CREATE DATABASE monday_foundation_build_import_test'
+          MONDAY_TEST_DATABASE_URL="${MONDAY_TEST_DATABASE_URL%/monday_foundation_test}/monday_foundation_build_import_test" \
+            "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --test build_import signed_release_requires_actual_blob_and_only_strong_import_reaches_pg --locked -- --ignored
       - name: Validate packaged CH SQL against the fixture server
         run: bash .github/scripts/test-clickhouse-preparation.sh
       - name: Validate raw protocol, standard Parquet and durable CH/PG import
@@ -532,6 +538,12 @@ jobs:
       - name: Validate optional data importer boundaries
         working-directory: rust_hft
         run: cargo clippy --manifest-path data-pipelines/Cargo.toml -p hft-market-pipeline --features import --all-targets --locked -- -D warnings
+      - name: Validate paused application roles against isolated PG
+        working-directory: rust_hft
+        run: |
+          docker exec "${{ job.services.postgres.id }}" psql -U fixture -d monday_foundation_test -v ON_ERROR_STOP=1 -c 'CREATE DATABASE monday_foundation_roles_test'
+          MONDAY_TEST_DATABASE_URL="${MONDAY_TEST_DATABASE_URL%/monday_foundation_test}/monday_foundation_roles_test" \
+            "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --test persistent_platform paused_database_roles_enforce_real_read_write_and_lock_boundaries --locked -- --ignored
 
   rust_fast_gates:
     name: Rust Fast Gates

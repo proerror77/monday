@@ -1,7 +1,7 @@
 prediction-policy-dependencies.v6
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:101b498a64003c2db24ee2553f612393996833ae35e3756b725a4fafbc97730f
+input:Cargo.lock=sha256:781decbf88c4ab71cbe12097ff3756a15ddff8f8e13dc67a1cde5c4235ae43f5
 input:Cargo.toml=sha256:a19d33379eee9a01a9a151f6a7a53997447ae5422895ee846d6b23b43a01be81
 input:crates/ploy-research/Cargo.toml=sha256:3d3cc6e52da9335b915c79d776fa335f21c88cda447daffc097cc9755d6c9291
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
@@ -14,9 +14,9 @@ input:../market-core/ports/Cargo.toml=sha256:b4a14d8c0da7c5db8b536228012587959de
 input:../market-core/snapshot/Cargo.toml=sha256:2531e664d3e1fb98777215393126c0561d949a15fcf9a412ba6efe217e60a31f
 input:../risk-control/oms-core/Cargo.toml=sha256:62ddf714dfdd4870c2dd2b194ebaa61e3a72e01263a1fceea0cef2f50758f7d9
 input:../risk-control/portfolio-core/Cargo.toml=sha256:7aa5c2f8524cf8007bb84733a2d90280915a74f74ba22020a42745360629c2fe
-input:../shared/Cargo.toml=sha256:cd278c4e2b5d0bd1b69f42251bc50600189ce49f25e87a97e78f98fc9a4b59e3
+input:../shared/Cargo.toml=sha256:478b39716047784e8efc3da24b972190bbf459fe58a8dcc6cc561bb74e0304ca
 input:../data-pipelines/Cargo.toml=sha256:7771b21350fe2b6fb7ad1588790fa28a4f60a5a0a00874bce897c0f6b4d0442e
-input:../research-core/Cargo.toml=sha256:3aabc8a95ee1e399dbe5c75e67341b50a2ae7d9ad22610fde80f7784c628e1fe
+input:../research-core/Cargo.toml=sha256:3d0e9e54b5cf153815116829601af9011d8cc3bf10de6f4993dca5188e71c678
 input:../runtime/Cargo.toml=sha256:11b6cae8ef4fe0019c778a0767016b4cfc0c92fb30e0bea5f051e00522a52cbf
 input:../research-core/search-kernel/Cargo.toml=sha256:d5a4731c11fce22c0e358097bd38fb05a674659ac2afbd7c72112285093bdec6
 package:allocator-api2@0.2.21|source=registry+https://github.com/rust-lang/crates.io-index|checksum=683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923|features=alloc

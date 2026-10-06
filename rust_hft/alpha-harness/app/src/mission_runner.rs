@@ -1315,7 +1315,7 @@ fn execute_report_inner(
     let db = results_dir.join("alpha.duckdb");
     let feature_manifest_path = results_dir.join("feature-manifest.json");
     let dataset_manifest_path = results_dir.join("cex-replay-dataset-manifest.json");
-    let mut store = AlphaStore::open(&db)?;
+    let mut store;
     let (materialization, feature_manifest, dataset_manifest, materialization_sha256) =
         if let Some((native, render, block_directory)) = native {
             archive_native_prepared_blocks(native, block_directory, &results_dir)?;
@@ -1371,6 +1371,7 @@ fn execute_report_inner(
             )?;
             // Register the actual collection identity. The original full-data manifest
             // remains lineage metadata and is never presented as locally imported bytes.
+            store = AlphaStore::open(&db)?;
             store.put_registry_revision(&RegistryRevision {
                 revision_id: native.collection_id().to_string(),
                 registry_kind: "cex_campaign_prepared_inputs".into(),
@@ -1443,6 +1444,7 @@ fn execute_report_inner(
                 bail!("CEX replay manifest SHA256 mismatch");
             }
 
+            store = AlphaStore::open(&db)?;
             let feature_manifest = data_mission::import_and_register_features(
                 &mut store,
                 &control_mission.spec.data_mission_id,
