@@ -54,7 +54,8 @@ fn prefix_valid(prefix: &str) -> bool {
             && crate::retirement::source_receipt_key_valid(&format!("{prefix}receipt.json")))
 }
 
-pub(crate) fn read_capabilities(path: &std::path::Path) -> Result<Vec<Capability>> {
+/// Read a private projection using the same invariants as gateway admission.
+pub fn read_capabilities(path: &std::path::Path) -> Result<Vec<Capability>> {
     private_directory(path.parent().context("projection parent absent")?)?;
     // The broker owns this file and its private parent, never the Agent.
     // O_NOFOLLOW excludes a substituted symlink even during atomic reload.
