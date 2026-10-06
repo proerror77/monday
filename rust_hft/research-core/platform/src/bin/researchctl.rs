@@ -51,14 +51,6 @@ async fn main() -> Result<()> {
             println!("{}", client.execute(&tool).await?);
         }
         ["plan-build",path]=>{let build:hft_research_platform::build::BuildSpec=read(path)?;println!("{}",serde_json::to_string(&build.cargo_arguments()?)?);}
-        ["register-build",path,release]=>{
-            let value:hft_research_platform::build::BuildArtifact=read(path)?;
-            let signed:hft_research_platform::release::SignedBuildRelease=read(release)?;
-            let trust_path=std::env::var("MONDAY_RESEARCH_BUILD_TRUST_FILE").context("operator release trust file required")?;
-            let trust:hft_research_platform::release::BuildReleaseTrust=read(&trust_path)?;
-            let verified=trust.verify(&value,&signed)?;
-            println!("{}",ledger().await?.register_build(&verified).await?);
-        }
         ["register-native-admission",path]=>{
             let signed:hft_research_platform::admission::SignedNativeAdmission=read(path)?;
             let trust_path=std::env::var("MONDAY_RESEARCH_NATIVE_ADMISSION_TRUST_FILE").context("operator native reservation trust file required")?;
@@ -107,7 +99,7 @@ async fn main() -> Result<()> {
                 hft_research_platform::service::read_secret(&config.artifact_token_file)?,&config.artifact_tls)?;
             println!("{}",serde_json::to_string(&hft_research_platform::retirement::retire(&config.terminal_retirement,&ledger().await?,&kube,&artifacts,&request).await?)?);
         }
-        _ => bail!("usage: researchctl plan-build BUILD | register-build ARTIFACT SIGNED_RELEASE | register-native-admission SIGNED_NATIVE_RESERVATION | register-native-request-revocation SIGNED_NATIVE_REVOCATION | register-native-campaign-inputs SIGNED_NATIVE_RESERVATION COLLECTION BLOCK_DIRECTORY | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID | terminal-snapshot TENANT REQUEST | retire-native-terminal CONFIG REQUEST"),
+        _ => bail!("usage: researchctl plan-build BUILD | register-native-admission SIGNED_NATIVE_RESERVATION | register-native-request-revocation SIGNED_NATIVE_REVOCATION | register-native-campaign-inputs SIGNED_NATIVE_RESERVATION COLLECTION BLOCK_DIRECTORY | subscribe TENANT SESSION RUN | tool ENDPOINT TOKEN_FILE REQUEST | register-experiment TENANT FILE | register-run TENANT FILE | register-session TENANT FILE | snapshot-session TENANT FILE | validate TASK | submit TENANT KEY TASK | register-plan PLAN | view SPEC | cancel ID | status ID | terminal-snapshot TENANT REQUEST | retire-native-terminal CONFIG REQUEST"),
     }
     Ok(())
 }
