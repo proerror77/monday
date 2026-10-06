@@ -2320,6 +2320,8 @@ mod tests {
         config.engine.ack_timeout_ms = 0;
         config.engine.reconcile_interval_ms = 0;
         config.engine.intent_max_latency_us = 1_000_000;
+        // This rate-limit wiring test tolerates scheduler jitter in the quote age.
+        config.engine.stale_us = 1_000_000;
         config.engine.intent_max_slippage_bps = Some(25);
         config.engine.intent_max_order_notional = Some(Decimal::from(1000));
         config.engine.intent_max_order_quantity = Some(Decimal::from(10));
@@ -3676,5 +3678,33 @@ mod tests {
             .expect("compiled Binance quote plans are available without execution");
         assert_eq!(builder.market_stream_plans.len(), 1);
         assert!(builder.execution_clients.is_empty());
+    }
+
+    #[cfg(all(
+        feature = "adapter-binance-execution",
+        not(feature = "adapter-binance-data")
+    ))]
+    #[tokio::test]
+    #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
+    async fn execution_only_account_control_skips_implicit_market_plan() {
+        for catalog in [Vec::new(), vec![InstrumentId::new("BTCUSDT@BINANCE")]] {
+            let mut venue = live_venue_config();
+            venue.execution_mode = Some("Paper".into());
+            venue.simulate_execution = true;
+            venue.symbol_catalog = catalog;
+            let config = SystemConfig {
+                venues: vec![venue],
+                ..Default::default()
+            };
+            let builder = SystemBuilder::new(config)
+                .auto_register_adapters_strict()
+                .expect("account control needs no quote feature or implicit quote plan");
+            assert!(builder.market_stream_plans.is_empty());
+            assert_eq!(builder.execution_clients.len(), 1);
+            let mut runtime = builder.build();
+            runtime.start().await.expect("account control starts");
+            assert!(runtime.exec_control_tx.is_some());
+            runtime.stop().await.expect("account control stops");
+        }
     }
 }

@@ -57,6 +57,17 @@ impl SystemBuilder {
         venue: &VenueConfig,
         instruments: &[InstrumentSpec],
     ) -> Self {
+        if self.config.strategies.is_empty()
+            && !super::quotes_only_enabled(&self.config)
+            && venue.ws_public.is_none()
+            && venue.data_config.is_none()
+        {
+            info!(
+                venue = %venue.name,
+                "account control has no market data request; skipping implicit market plan"
+            );
+            return self;
+        }
         if venue.venue_type == VenueType::BinancePrediction
             && (venue.symbol_catalog.is_empty() || venue.data_config.is_none())
         {
@@ -185,7 +196,10 @@ mod tests {
 
     #[test]
     fn symbol_catalog_drives_market_plan() {
-        let mut config = SystemConfig::default();
+        let mut config = SystemConfig {
+            quotes_only: true,
+            ..Default::default()
+        };
         config.venues.push(VenueConfig {
             name: "binance".into(),
             account_id: None,
@@ -231,7 +245,10 @@ mod tests {
 
     #[test]
     fn explicit_usdm_execution_market_uses_binance_futures_instrument_identity() {
-        let mut config = SystemConfig::default();
+        let mut config = SystemConfig {
+            quotes_only: true,
+            ..Default::default()
+        };
         config.venues.push(VenueConfig {
             name: "binance-usdm".into(),
             account_id: None,
@@ -263,7 +280,10 @@ mod tests {
 
     #[test]
     fn execution_market_alone_selects_usdm_market_data_identity() {
-        let mut config = SystemConfig::default();
+        let mut config = SystemConfig {
+            quotes_only: true,
+            ..Default::default()
+        };
         config.venues.push(VenueConfig {
             name: "binance-usdm".into(),
             account_id: None,
@@ -295,7 +315,10 @@ mod tests {
 
     #[test]
     fn bstock_catalog_drives_tokenized_security_market_plan() {
-        let mut config = SystemConfig::default();
+        let mut config = SystemConfig {
+            quotes_only: true,
+            ..Default::default()
+        };
         config.venues.push(VenueConfig {
             name: "binance-bstocks".into(),
             account_id: None,
@@ -334,7 +357,10 @@ mod tests {
 
     #[test]
     fn ondo_catalog_drives_restricted_perp_market_plan() {
-        let mut config = SystemConfig::default();
+        let mut config = SystemConfig {
+            quotes_only: true,
+            ..Default::default()
+        };
         config.venues.push(VenueConfig {
             name: "ondo-perps".into(),
             account_id: None,
@@ -468,7 +494,10 @@ mod tests {
 
     #[test]
     fn polymarket_catalog_preserves_outcome_token_identity() {
-        let mut config = SystemConfig::default();
+        let mut config = SystemConfig {
+            quotes_only: true,
+            ..Default::default()
+        };
         config.venues.push(VenueConfig {
             name: "polymarket".into(),
             account_id: None,
