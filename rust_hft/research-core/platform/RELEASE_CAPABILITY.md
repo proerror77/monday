@@ -136,8 +136,10 @@ publisher, with the standard Linux coreutils, diffutils, findutils and awk tools
 Ruby must provide `rubygems/package`: the authenticated software downloader uses
 its tar reader to validate paths, file types and executable modes before unpacking.
 The broker probes that reader inside the namespace before fetching source.
-The sandbox exposes read-only tool/CA roots and a disposable work directory.
-It leaves `/proc` empty and clears inherited environment.
+The sandbox exposes read-only tool/CA roots, Linux tool alternatives and a disposable work directory.
+It mounts procfs inside the private PID namespace and clears inherited environment.
+Bash process substitution uses `/dev/fd`; host processes remain outside that namespace.
+The disposable work filesystem must permit execution of the checked-out verifier scripts.
 Projection, journal and TLS private keys must stay outside mounted tool roots.
 The child receives no signing key, ACR password or broker state.
 Missing tools or failed namespace isolation deny issuance; there is no fallback.
@@ -145,7 +147,9 @@ Two native plans may run concurrently; requests have a 150-second bound.
 
 Each response grants an initial lease of at most two minutes.
 One monitor serves all capabilities issued to the same signed publisher job.
-Every minute it reads that job independently.
+Every minute it reads that job and the latest authenticated required checks independently.
+Queued, failed or missing exact-source checks stop renewal and remove issued access.
+Required-check reads never use the renewal snapshot cache.
 Main/run renewal snapshots are shared for at most 55 seconds.
 Issuance and its final authorization read always bypass that cache.
 It renews active leases up to the requested one-hour deadline.

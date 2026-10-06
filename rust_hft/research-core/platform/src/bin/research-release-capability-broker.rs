@@ -256,13 +256,16 @@ fn verify_evidence(
             == 1,
         "successful software producer job absent or ambiguous"
     );
+    required_checks(&e.checks, &c.source_sha)
+}
+
+fn required_checks(checks: &[Value], source: &str) -> Result<()> {
     for name in [
         "Monorepo CI gate",
         "Prediction Markets CI gate",
         "Security Summary Report",
     ] {
-        let check = e
-            .checks
+        let check = checks
             .iter()
             .filter(|x| {
                 x["name"] == name && x["app"]["id"] == 15368 && x["app"]["slug"] == "github-actions"
@@ -270,7 +273,8 @@ fn verify_evidence(
             .max_by_key(|x| x["id"].as_u64().unwrap_or_default())
             .context("authenticated required CI absent")?;
         ensure!(
-            check["head_sha"] == c.source_sha
+            check["id"].as_u64().is_some_and(|id| id > 0)
+                && check["head_sha"] == source
                 && check["status"] == "completed"
                 && check["conclusion"] == "success",
             "required exact-source CI did not pass"
@@ -602,6 +606,24 @@ fn job_matches(c: &contract::ContextBinding, check_run_id: u64, job: &Value) -> 
                 c.repository
             )
 }
+fn renewal_active(
+    context: &contract::ContextBinding,
+    check_run_id: u64,
+    repository_id: u64,
+    job: &Value,
+    main: &Value,
+    run: &Value,
+    checks: &[Value],
+) -> Result<bool> {
+    required_checks(checks, &context.source_sha)?;
+    Ok(job_matches(context, check_run_id, job)
+        && main["object"]["sha"] == context.source_sha
+        && run["id"] == context.publisher_run_id
+        && run["head_sha"] == context.source_sha
+        && run["head_repository"]["id"] == repository_id
+        && run["status"] == "in_progress"
+        && run["run_attempt"] == context.publisher_run_attempt)
+}
 struct Broker {
     config: Config,
     policy: PublisherPolicy,
@@ -871,12 +893,13 @@ impl Broker {
         )?;
         // Only tool roots, CA roots and this disposable directory enter the sandbox.
         // Projection, replay journal, broker configuration and TLS keys stay outside.
+        // A private PID namespace supplies /dev/fd without exposing host processes.
         let mut common = vec![
             "--die-with-parent",
             "--unshare-all",
             "--share-net",
             "--new-session",
-            "--dir",
+            "--proc",
             "/proc",
             "--dev",
             "/dev",
@@ -892,6 +915,7 @@ impl Broker {
         for path in [
             "/lib",
             "/lib64",
+            "/etc/alternatives",
             "/etc/ssl/certs",
             "/etc/resolv.conf",
             "/etc/hosts",
@@ -1052,14 +1076,22 @@ impl Broker {
                         &read_token,
                     )
                     .await?;
-                Ok::<bool, anyhow::Error>(
-                    job_matches(&context, check_run_id, &job)
-                        && main["object"]["sha"] == context.source_sha
-                        && run["id"] == context.publisher_run_id
-                        && run["head_sha"] == context.source_sha
-                        && run["head_repository"]["id"] == self.config.repository_id
-                        && run["status"] == "in_progress"
-                        && run["run_attempt"] == context.publisher_run_attempt,
+                // A rerun may replace successful checks after issuance. Never cache them.
+                let checks = self
+                    .pages(
+                        &format!("commits/{}/check-runs?filter=latest", context.source_sha),
+                        "check_runs",
+                        &read_token,
+                    )
+                    .await?;
+                renewal_active(
+                    &context,
+                    check_run_id,
+                    self.config.repository_id,
+                    &job,
+                    &main,
+                    &run,
+                    &checks,
                 )
             })
             .await
@@ -1736,6 +1768,60 @@ mod tests {
         std::fs::set_permissions(&c.capabilities_file, std::fs::Permissions::from_mode(0o644))
             .unwrap();
         assert!(read_private::<Vec<Capability>>(&c.capabilities_file).is_err());
+    }
+    #[test]
+    fn rerun_required_checks_revoke_issued_readers_and_publishers() {
+        for phase in [Phase::Source, Phase::Publish] {
+            for gate in 0..3 {
+                for (status, conclusion) in [("queued", None), ("completed", Some("failure"))] {
+                    let (_temp, c, p, mut r, claims, keys) = fixture();
+                    let now = now_ms().unwrap();
+                    let plan = native_plan(&r, &p);
+                    if phase == Phase::Publish {
+                        bind_plan(&mut r, &plan, phase);
+                    }
+                    let verified =
+                        verify_identity(&signed(&claims), &keys, &c, &p, &r, now).unwrap();
+                    let mut e = evidence(&r);
+                    verify_evidence(&e, &verified, &c, &p, &r).unwrap();
+                    let access =
+                        scope(&r, &p, (phase == Phase::Publish).then_some(&plan), now).unwrap();
+                    let response = install(&c, &r, &verified, access, now).unwrap();
+                    assert!(renewal_active(
+                        &r.context,
+                        claims.check_run_id,
+                        c.repository_id,
+                        &e.job,
+                        &e.main,
+                        &e.publisher,
+                        &e.checks
+                    )
+                    .unwrap());
+                    let mut rerun = e.checks[gate].clone();
+                    rerun["id"] = json!(999);
+                    rerun["status"] = json!(status);
+                    rerun["conclusion"] = json!(conclusion);
+                    e.checks.push(rerun);
+                    let active = renewal_active(
+                        &r.context,
+                        claims.check_run_id,
+                        c.repository_id,
+                        &e.job,
+                        &e.main,
+                        &e.publisher,
+                        &e.checks,
+                    )
+                    .unwrap_or(false);
+                    assert!(!active, "{phase:?} gate {gate} {status}");
+                    let token_hash = sha256(response.token.as_bytes());
+                    assert!(!refresh(&c, &token_hash, active, now + 60_000).unwrap());
+                    assert!(read_private::<Vec<Capability>>(&c.capabilities_file)
+                        .unwrap()
+                        .is_empty());
+                    assert!(journal(&c).unwrap().issued.is_empty());
+                }
+            }
+        }
     }
     #[tokio::test]
     async fn source_publish_and_read_share_one_job_monitor() {
