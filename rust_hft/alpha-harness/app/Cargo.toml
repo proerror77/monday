@@ -7,10 +7,11 @@ publish = false
 
 [features]
 default = []
-scientific = ["alpha-engine/fitting"]
+scientific = ["alpha-engine/fitting", "hft-research-platform/artifact-io"]
 onnx-compatibility = ["dep:alpha-onnx-evaluator"]
 
 [dependencies]
+hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["native-admission", "release-verification"] }
 hft-cex-research-input = { path = "../../research-core/cex-input", features = ["streaming"] }
 hft-research-artifacts = { path = "../../research-core/artifacts" }
 hft-research-dispatch-io = { path = "../../research-core/dispatch-io" }
@@ -19,6 +20,8 @@ alpha-engine = { path = "../engine", default-features = false, features = ["kern
 alpha-onnx-evaluator = { path = "../onnx-evaluator", optional = true }
 alpha-store = { path = "../store" }
 anyhow = "1"
+base64 = "0.22"
+rustix = { version = "0.38", features = ["fs"] }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -42,3 +45,4 @@ path = "src/main.rs"
 
 [dev-dependencies]
 parquet = { version = "59.1", default-features = false, features = ["zstd"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
