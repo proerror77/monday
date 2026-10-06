@@ -497,18 +497,40 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> anyhow::
 }
 
 fn show_available_adapters() {
-    info!("可用適配器:");
-
-    #[cfg(feature = "bitget")]
-    info!("  ✓ Bitget 交易所");
-    #[cfg(feature = "ondo-perps")]
-    info!("  ✓ Ondo Perps 行情與執行適配器");
-
-    #[cfg(feature = "binance")]
-    info!("  ✓ Binance 交易所");
-
-    #[cfg(feature = "okx")]
-    info!("  ✓ OKX 交易所");
+    info!("構建包含的功能:");
+    for (name, included) in [
+        ("Bitget 行情", cfg!(feature = "bitget-data")),
+        ("Bitget 執行適配器", cfg!(feature = "bitget-execution")),
+        ("Binance 行情", cfg!(feature = "binance-data")),
+        ("Binance 執行適配器", cfg!(feature = "binance-execution")),
+        (
+            "Binance Prediction 行情",
+            cfg!(feature = "binance-prediction-data"),
+        ),
+        (
+            "Binance Prediction 執行適配器",
+            cfg!(feature = "binance-prediction-execution"),
+        ),
+        ("Bybit 行情", cfg!(feature = "bybit-data")),
+        ("Bybit 執行適配器", cfg!(feature = "bybit-execution")),
+        ("Ondo Perps 行情", cfg!(feature = "ondo-perps-data")),
+        (
+            "Ondo Perps 執行適配器",
+            cfg!(feature = "ondo-perps-execution"),
+        ),
+        ("Polymarket 行情", cfg!(feature = "polymarket-data")),
+        (
+            "Polymarket 執行適配器",
+            cfg!(feature = "polymarket-execution"),
+        ),
+        ("Aster DEX 行情", cfg!(feature = "asterdex-data")),
+        ("Aster DEX 執行適配器", cfg!(feature = "asterdex-execution")),
+        ("OKX 執行適配器", cfg!(feature = "okx")),
+    ] {
+        if included {
+            info!("  ✓ {name}");
+        }
+    }
 
     #[cfg(feature = "mock")]
     info!("  ✓ 模擬交易所");
