@@ -699,8 +699,9 @@ name = "hft-cex-research-input"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "bincode",
+ "chrono",
+ "hft-prepared-market-io",
  "hft-research-manifest",
  "serde",
  "serde_json",
@@ -778,6 +779,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-prepared-market-io"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hft-research-manifest",
+ "parquet",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "hft-research-artifacts"
 version = "0.1.0"
 dependencies = [
@@ -805,9 +817,7 @@ dependencies = [
 name = "hft-research-manifest"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "chrono",
- "parquet",
  "rust_decimal",
  "serde",
  "serde_json",

@@ -1,10 +1,7 @@
 //! Verified streaming feature/target readers. Pretraining cannot deserialize labels.
 use crate::sequence_storage::{Frame, Frames};
-use hft_research_manifest::{
-    market_encoder::*,
-    prepared_market::{FeatureParquetReader, TargetParquetReader},
-    sequence::SequenceInputSpecV1,
-};
+use hft_prepared_market_io::{FeatureParquetReader, TargetParquetReader};
+use hft_research_manifest::{market_encoder::*, sequence::SequenceInputSpecV1};
 use std::{
     collections::VecDeque,
     fs::File,

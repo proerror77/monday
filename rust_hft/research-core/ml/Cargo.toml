@@ -21,6 +21,7 @@ thiserror.workspace = true
 rustix = { version = "0.38", features = ["fs"] }
 
 [dev-dependencies]
+hft-prepared-market-io = { path = "../prepared-market-io" }
 tempfile = "3"
 
 [[bin]]

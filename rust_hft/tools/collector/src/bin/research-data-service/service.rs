@@ -1,14 +1,17 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use hft_prepared_market_io::{
+    write_feature_parquet_shard, write_target_parquet_shard, FeatureParquetReader,
+    TargetParquetReader,
+};
 use hft_research_manifest::market_encoder::{
     bytes_digest, digest, MarketFeatureDatasetV1, MarketFeatureFrameV1, MarketTargetDatasetV1,
     MarketTargetFrameV1, MarketTrainingAnchorSetV1, MarketTrainingAnchorV1, FEATURE_PARQUET_SCHEMA,
     FEATURE_SCHEMA, TARGET_PARQUET_SCHEMA, TARGET_SCHEMA,
 };
 use hft_research_manifest::prepared_market::{
-    validate_prepared_producer, write_feature_parquet_shard, write_target_parquet_shard,
-    FeatureParquetReader, PreparedMarketGapV1, PreparedMarketReadyReceiptV2,
-    PreparedMarketSeriesV1, PreparedMarketSourceV1, PreparedMarketViewV1, TargetParquetReader,
+    validate_prepared_producer, PreparedMarketGapV1, PreparedMarketReadyReceiptV2,
+    PreparedMarketSeriesV1, PreparedMarketSourceV1, PreparedMarketViewV1,
     PREPARED_MARKET_VIEW_SCHEMA,
 };
 use hft_research_manifest::sequence::{
