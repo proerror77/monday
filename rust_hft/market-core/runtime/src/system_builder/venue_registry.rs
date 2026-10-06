@@ -24,8 +24,27 @@ impl SystemBuilder {
 
         let venues = self.config.venues.clone();
         for (index, venue) in venues.into_iter().enumerate() {
-            if requested.contains(&index) && !self.has_market_plan_for(&venue) {
-                self = self.register_market_streams_for_venue(&venue, &instruments);
+            if !requested.contains(&index) {
+                continue;
+            }
+            let base_instruments = match Self::requested_market_instruments(&venue, &instruments) {
+                Ok(instruments) => instruments,
+                Err(error) => {
+                    self.market_data_planning_error = Some(error);
+                    return self;
+                }
+            };
+            let mut shard_filtered_empty = false;
+            if !self.has_market_plan_for(&venue) {
+                (self, shard_filtered_empty) =
+                    self.register_market_streams_for_venue(&venue, base_instruments);
+            }
+            if !shard_filtered_empty && !self.has_market_plan_for(&venue) {
+                self.market_data_planning_error = Some(format!(
+                    "requested market venue '{}' emitted no subscription plan",
+                    venue.name
+                ));
+                return self;
             }
         }
 
@@ -130,6 +149,7 @@ impl SystemBuilder {
                             strategy.id()
                         ));
                     }
+                    requested.insert(index);
                 }
                 continue;
             }
@@ -224,12 +244,16 @@ impl SystemBuilder {
                         self.require_existing_plan_coverage(id, *index, symbols)?;
                         requested.insert(*index);
                     }
-                    _ if matching.iter().any(|index| {
-                        self.market_plan_covers(&self.config.venues[*index], symbols)
-                    }) => {}
-                    _ => return Err(format!(
-                        "strategy '{id}' market venue '{target}' has ambiguous instances without matching market and instrument coverage in its explicit plans"
-                    )),
+                    _ => {
+                        let Some(index) = matching.iter().find(|index| {
+                            self.market_plan_covers(&self.config.venues[**index], symbols)
+                        }) else {
+                            return Err(format!(
+                                "strategy '{id}' market venue '{target}' has ambiguous instances without matching market and instrument coverage in its explicit plans"
+                            ));
+                        };
+                        requested.insert(*index);
+                    }
                 }
             }
             return Ok(requested.into_iter().collect());
@@ -361,60 +385,78 @@ impl SystemBuilder {
             .collect()
     }
 
-    fn register_market_streams_for_venue(
-        self,
+    fn requested_market_instruments(
         venue: &VenueConfig,
         instruments: &[InstrumentSpec],
-    ) -> Self {
+    ) -> Result<Vec<InstrumentSpec>, String> {
         if venue.venue_type == VenueType::BinancePrediction
             && (venue.symbol_catalog.is_empty() || venue.data_config.is_none())
         {
-            info!(
-                "Binance Prediction needs an explicit outcome catalog and data_config; keeping the venue execution-only"
-            );
-            return self;
+            return Err(format!(
+                "requested market venue '{}' requires an explicit Binance Prediction outcome catalog and data_config",
+                venue.name
+            ));
         }
-        let venue_id = match super::venue_config_to_market_venue_id(venue) {
-            Ok(venue_id) => venue_id,
-            Err(error) => {
-                tracing::warn!(
-                    venue = %venue.name,
-                    %error,
-                    "Binance market identity is invalid; market stream plan omitted"
-                );
-                return self;
-            }
-        };
+        let venue_id = super::venue_config_to_market_venue_id(venue).map_err(|error| {
+            format!(
+                "requested market venue '{}' has invalid market identity: {error}",
+                venue.name
+            )
+        })?;
         let explicit_usdm = venue_id == VenueId::BINANCE_FUTURES;
 
         let base_instruments: Vec<InstrumentSpec> = if !venue.symbol_catalog.is_empty() {
             venue
                 .symbol_catalog
                 .iter()
-                .filter_map(|instrument_id| {
-                    let (symbol, catalog_venue_id) = instrument_id.split()?;
+                .map(|instrument_id| {
+                    let (symbol, catalog_venue_id) = instrument_id.split().ok_or_else(|| {
+                        format!("requested market venue '{}' has an invalid instrument catalog entry", venue.name)
+                    })?;
+                    if symbol.as_str().is_empty() {
+                        return Err(format!(
+                            "requested market venue '{}' has an empty catalog symbol",
+                            venue.name
+                        ));
+                    }
                     let instrument_venue =
                         if matches!(catalog_venue_id, VenueId::BINANCE | VenueId::BINANCE_SPOT)
                             && explicit_usdm
                         {
                             VenueId::BINANCE_FUTURES
                         } else if catalog_venue_id == VenueId::BINANCE_FUTURES && !explicit_usdm {
-                            return None;
+                            return Err(format!(
+                                "requested market venue '{}' has a USD-M catalog instrument outside its configured market",
+                                venue.name
+                            ));
                         } else if catalog_venue_id == VenueId::BINANCE_SPOT {
                             VenueId::BINANCE
                         } else {
                             catalog_venue_id
                         };
-                    Some(instrument_for_venue(symbol, instrument_venue))
+                    Ok(instrument_for_venue(symbol, instrument_venue))
                 })
-                .collect()
+                .collect::<Result<_, String>>()?
         } else {
             instruments
                 .iter()
                 .map(|instrument| instrument_for_venue(instrument.symbol.clone(), venue_id))
                 .collect()
         };
+        if base_instruments.is_empty() {
+            return Err(format!(
+                "requested market venue '{}' has no valid subscription instruments",
+                venue.name
+            ));
+        }
+        Ok(base_instruments)
+    }
 
+    fn register_market_streams_for_venue(
+        self,
+        venue: &VenueConfig,
+        base_instruments: Vec<InstrumentSpec>,
+    ) -> (Self, bool) {
         let filtered_instruments: Vec<InstrumentSpec> =
             if let Some(ref shard_config) = self.shard_config {
                 let filtered: Vec<InstrumentSpec> = base_instruments
@@ -442,16 +484,22 @@ impl SystemBuilder {
             };
 
         if filtered_instruments.is_empty() {
-            if self.shard_config.is_some() {
+            // The caller already admitted a valid nonempty base catalog. Only
+            // sharding can produce this legitimate local no-subscription case.
+            let shard_filtered_empty = self.shard_config.is_some();
+            if shard_filtered_empty {
                 info!("分片過濾後，交易所 {} 無符號需要處理，跳過註冊", venue.name);
             }
-            return self;
+            return (self, shard_filtered_empty);
         }
 
-        self.register_market_instrument_plan(
-            venue.venue_type.clone(),
-            venue.name.clone(),
-            filtered_instruments,
+        (
+            self.register_market_instrument_plan(
+                venue.venue_type.clone(),
+                venue.name.clone(),
+                filtered_instruments,
+            ),
+            false,
         )
     }
 }
@@ -1295,5 +1343,112 @@ mod tests {
             .register_market_streams_from_config();
         assert!(replanned.market_data_planning_error.is_none());
         assert_eq!(replanned.market_stream_plans.len(), 1);
+    }
+
+    #[test]
+    fn requested_prediction_requires_both_quote_inputs_even_with_manual_plan() {
+        for missing_catalog in [false, true] {
+            let mut venue = demand_venue(
+                "prediction-quotes",
+                VenueType::BinancePrediction,
+                "prediction-account",
+            );
+            if missing_catalog {
+                venue.data_config = Some(serde_yaml::Value::Mapping(Default::default()));
+            } else {
+                venue.symbol_catalog = vec![InstrumentId::new("112233@BINANCE_PREDICTION")];
+            }
+            let config = SystemConfig {
+                quotes_only: true,
+                venues: vec![venue],
+                ..Default::default()
+            };
+            let builder = SystemBuilder::new(config)
+                .register_market_instrument_plan(
+                    VenueType::BinancePrediction,
+                    "prediction-quotes".into(),
+                    vec![InstrumentSpec::prediction_market_outcome(Symbol::new(
+                        "112233",
+                    ))],
+                )
+                .register_market_streams_from_config();
+            assert!(builder
+                .market_data_planning_error
+                .as_deref()
+                .unwrap()
+                .contains("outcome catalog and data_config"));
+            assert_eq!(builder.market_stream_plans.len(), 1);
+        }
+    }
+
+    #[test]
+    fn requested_invalid_market_identity_does_not_silently_omit_plan() {
+        let mut config = demand_config();
+        config.venues.truncate(1);
+        config.quotes_only = true;
+        config.venues[0].inst_type = Some("not-a-market".into());
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        assert!(builder
+            .market_data_planning_error
+            .as_deref()
+            .unwrap()
+            .contains("invalid market identity"));
+        assert!(builder.market_stream_plans.is_empty());
+    }
+
+    #[test]
+    fn requested_partial_invalid_catalog_is_rejected_before_sharding() {
+        let mut config = demand_config();
+        config.venues.truncate(1);
+        config.quotes_only = true;
+        config.venues[0].symbol_catalog = vec![
+            InstrumentId::new("BTCUSDT@BINANCE"),
+            InstrumentId::new("broken-catalog-entry"),
+        ];
+        let builder = SystemBuilder::new(config)
+            .with_sharding(super::super::ShardConfig::new(
+                0,
+                2,
+                crate::ShardStrategy::SymbolHash,
+            ))
+            .register_market_streams_from_config();
+        assert!(builder
+            .market_data_planning_error
+            .as_deref()
+            .unwrap()
+            .contains("invalid instrument catalog entry"));
+        assert!(builder.market_stream_plans.is_empty());
+    }
+
+    #[test]
+    fn requested_usdm_catalog_cannot_disappear_from_a_spot_plan() {
+        let mut config = demand_config();
+        config.venues.truncate(1);
+        config.quotes_only = true;
+        config.venues[0].symbol_catalog = vec![InstrumentId::new("BTCUSDT@BINANCE_FUTURES")];
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        assert!(builder
+            .market_data_planning_error
+            .as_deref()
+            .unwrap()
+            .contains("USD-M catalog instrument"));
+        assert!(builder.market_stream_plans.is_empty());
+    }
+
+    #[test]
+    fn valid_requested_catalog_empty_on_this_shard_is_a_legitimate_no_plan() {
+        let mut config = demand_config();
+        config.venues.truncate(1);
+        config.quotes_only = true;
+        config.venues[0].symbol_catalog = vec![InstrumentId::new("BTCUSDT@BINANCE")];
+        let mut shard =
+            super::super::ShardConfig::new(0, 2, crate::ShardStrategy::SymbolHash);
+        let owner = shard.get_target_shard(&BaseSymbol::from("BTCUSDT"), &VenueId::BINANCE);
+        shard.shard_index = 1 - owner;
+        let builder = SystemBuilder::new(config)
+            .with_sharding(shard)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert!(builder.market_stream_plans.is_empty());
     }
 }

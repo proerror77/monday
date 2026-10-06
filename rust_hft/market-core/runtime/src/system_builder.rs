@@ -4009,4 +4009,26 @@ mod tests {
         assert!(builder.market_data_planning_error.is_none());
         assert_eq!(builder.market_stream_plans.len(), 1);
     }
+
+    #[test]
+    fn subscription_followup_rejects_requested_prediction_target_without_quote_inputs() {
+        let mut binance = live_venue_config();
+        binance.name = "binance".into();
+        let mut prediction = binance.clone();
+        prediction.name = "prediction".into();
+        prediction.venue_type = VenueType::BinancePrediction;
+        prediction.symbol_catalog.clear();
+        prediction.data_config = None;
+        let config = SystemConfig {
+            venues: vec![binance, prediction],
+            router: Some(ports::RouterConfig::RoundRobin {
+                venues: vec!["BINANCE".into(), "BINANCE_PREDICTION".into()],
+            }),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+    }
 }
