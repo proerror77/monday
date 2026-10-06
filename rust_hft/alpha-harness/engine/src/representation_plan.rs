@@ -71,6 +71,9 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../../data-pipelines/core/src/binance_reference_common.rs"),
         source!("../../../data-pipelines/core/src/binance_spot_reference.rs"),
         source!("../../../data-pipelines/core/src/binance_usdm_reference.rs"),
+        source!("../../../data-pipelines/adapters/adapter-binance/src/reference.rs"),
+        source!("../../../tools/collector/src/binance_usdm_reference_collector.rs"),
+        source!("../../../tools/collector/src/polymarket_upload.rs"),
         source!("../../../tools/collector/src/binance_spot_reference_artifact.rs"),
         source!("../../../tools/collector/src/binance_usdm_reference_artifact.rs"),
         source!("../../../tools/collector/src/feature_matrix.rs"),
@@ -919,6 +922,51 @@ mod tests {
                 .1;
             let mut changed = body.to_vec();
             changed.extend_from_slice(b"\n// changed registered renderer or contract condition\n");
+            let changed_sources = sources
+                .iter()
+                .map(|&(path, body)| {
+                    (
+                        path,
+                        if path == dependency {
+                            changed.as_slice()
+                        } else {
+                            body
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let current = implementation(tool);
+            let changed = source_reference(&current.id, &changed_sources);
+            assert_ne!(current, changed, "{dependency}");
+            let mut stale = plan.clone();
+            stale
+                .matches
+                .iter_mut()
+                .find(|entry| entry.tool == tool)
+                .unwrap()
+                .implementation = changed;
+            assert!(validate_representation_plan(&stale, &data, &goal).is_err());
+        }
+    }
+
+    #[test]
+    fn review_reference_origin_and_path_admission_dependencies_invalidate_old_plans() {
+        let (data, goal) = input();
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        for dependency in [
+            "../../../data-pipelines/adapters/adapter-binance/src/reference.rs",
+            "../../../tools/collector/src/binance_usdm_reference_collector.rs",
+            "../../../tools/collector/src/polymarket_upload.rs",
+        ] {
+            let tool = RepresentationToolV1::StaticTop5;
+            let sources = implementation_sources(tool);
+            let body = sources
+                .iter()
+                .find(|(path, _)| *path == dependency)
+                .unwrap_or_else(|| panic!("unbound provenance admission dependency {dependency}"))
+                .1;
+            let mut changed = body.to_vec();
+            changed.extend_from_slice(b"\n// changed source origin or artifact path admission\n");
             let changed_sources = sources
                 .iter()
                 .map(|&(path, body)| {

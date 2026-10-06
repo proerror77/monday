@@ -29,6 +29,7 @@ Current view permissions, signed allowlists, source/image identity and remaining
 The small registry binds the existing implementation source hashes. It does not create a plugin framework.
 All six tool identities bind the shared materializer, feature calculations, replay and reference verification modules, manifest contracts and owning lockfiles.
 Their shared source closure also binds the Campaign renderer, actual materialization loader, feature-matrix metadata, and the domain's exact horizon, protocol, calendar, rule and label predicates.
+Reference admission also binds the adapter's official-origin constants, their collector reexport and the original verifier's shared canonical-directory helper. Local path dependencies are source inputs; their edits are not covered by lockfiles alone.
 Renderer conditions and planner conditions cannot change while keeping the same registry identity.
 The two SOL Study identities also bind their own Study, readers and fitting implementation sources. Including source bytes does not import or run those implementations.
 The digest frames both paths and source bodies. Changing a materializer changes all affected tool identities; a Study-only identity cannot validate against this registry.
