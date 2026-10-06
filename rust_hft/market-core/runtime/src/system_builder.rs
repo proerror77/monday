@@ -814,7 +814,10 @@ enum BinanceMarketIdentity {
     Usdm,
 }
 
-#[cfg(feature = "adapter-binance-data")]
+#[cfg(any(
+    feature = "adapter-binance-data",
+    feature = "adapter-binance-execution"
+))]
 fn execution_config_value<'a>(
     execution_config: Option<&'a serde_yaml::Value>,
     key: &str,
@@ -2222,11 +2225,6 @@ mod tests {
             }
         }
 
-        // This mock has no market-data source. Admission still uses every account and product gate.
-        fn price_protection(&self) -> ExecutionPriceProtection {
-            ExecutionPriceProtection::VenueQuote
-        }
-
         async fn connect(&mut self) -> HftResult<()> {
             Ok(())
         }
@@ -2275,6 +2273,9 @@ mod tests {
         config.engine.ack_timeout_ms = 0;
         config.engine.reconcile_interval_ms = 0;
         config.engine.intent_max_latency_us = 1_000_000;
+        config.engine.intent_max_slippage_bps = Some(25);
+        config.engine.intent_max_order_notional = Some(Decimal::from(1000));
+        config.engine.intent_max_order_quantity = Some(Decimal::from(10));
         config
             .strategy_accounts
             .insert("rate-budget".into(), account.0.clone());
@@ -2385,6 +2386,26 @@ mod tests {
                 .unwrap();
             response.await.unwrap();
             let mut engine = runtime.engine.lock().await;
+            // Pass the CEX price and size gates before testing rate admission.
+            let now = now_micros();
+            let ingester = engine.create_event_ingester_pair();
+            ingester
+                .lock()
+                .unwrap()
+                .ingest(MarketEvent::Snapshot(MarketSnapshot {
+                    symbol: Symbol::new("BTCUSDT"),
+                    timestamp: now,
+                    bids: vec![BookLevel::new_unchecked(99.9, 10.0)],
+                    asks: vec![BookLevel::new_unchecked(100.0, 10.0)],
+                    sequence: 1,
+                    source_venue: Some(venue),
+                    timestamps: hft_core::MarketDataTimestamps::local_only(
+                        hft_core::LocalReceiveTimestamp::new(now),
+                    ),
+                    provider_identity: None,
+                }))
+                .unwrap();
+            engine.tick().unwrap();
             for _ in 0..2 {
                 let mut intent = ports::OrderIntent::crypto_spot(
                     Symbol::new("BTCUSDT"),
