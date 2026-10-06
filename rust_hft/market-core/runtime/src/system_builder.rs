@@ -3920,4 +3920,93 @@ mod tests {
             .register_market_streams_from_config();
         assert!(builder.market_data_planning_error.is_some());
     }
+
+    #[test]
+    fn subscription_followup_keeps_distinct_instance_catalogs() {
+        let mut btc = live_venue_config();
+        btc.name = "binance-btc".into();
+        btc.symbol_catalog = vec![InstrumentId::new("BTCUSDT@BINANCE")];
+        let mut eth = btc.clone();
+        eth.name = "binance-eth".into();
+        eth.symbol_catalog = vec![InstrumentId::new("ETHUSDT@BINANCE")];
+        let config = SystemConfig {
+            quotes_only: true,
+            venues: vec![btc, eth],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 2);
+        assert_eq!(builder.market_stream_plans[0].2[0].symbol, Symbol::new("BTCUSDT"));
+        assert_eq!(builder.market_stream_plans[1].2[0].symbol, Symbol::new("ETHUSDT"));
+    }
+
+    #[test]
+    fn subscription_followup_rejects_undeclared_account_name() {
+        let mut binance = live_venue_config();
+        binance.name = "name-is-not-an-account".into();
+        binance.account_id = None;
+        let config = SystemConfig {
+            venues: vec![binance],
+            strategy_accounts: HashMap::from([(
+                "manual-market-plan:BTCUSDT".into(),
+                "name-is-not-an-account".into(),
+            )]),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+    }
+
+    #[test]
+    fn subscription_followup_plans_every_explicit_round_robin_target() {
+        let mut binance = live_venue_config();
+        binance.name = "binance".into();
+        let mut bitget = binance.clone();
+        bitget.name = "bitget".into();
+        bitget.venue_type = VenueType::Bitget;
+        bitget.symbol_catalog = vec![InstrumentId::new("BTCUSDT@BITGET")];
+        let config = SystemConfig {
+            venues: vec![binance, bitget],
+            router: Some(ports::RouterConfig::RoundRobin {
+                venues: vec!["BINANCE".into(), "BITGET".into()],
+            }),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 2);
+        assert!(builder.market_stream_plans.iter().any(|p| p.0 == VenueType::Binance));
+        assert!(builder.market_stream_plans.iter().any(|p| p.0 == VenueType::Bitget));
+    }
+
+    #[test]
+    fn subscription_followup_clears_error_after_manual_plan_repairs_scope() {
+        let mut binance = live_venue_config();
+        binance.name = "binance".into();
+        let mut bitget = binance.clone();
+        bitget.name = "bitget-control".into();
+        bitget.venue_type = VenueType::Bitget;
+        let config = SystemConfig {
+            venues: vec![binance, bitget],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+        let builder = builder
+            .register_market_stream_plan(
+                VenueType::Binance,
+                "binance".into(),
+                vec![Symbol::new("BTCUSDT")],
+            )
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 1);
+    }
 }
