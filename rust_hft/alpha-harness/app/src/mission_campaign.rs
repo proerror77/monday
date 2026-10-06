@@ -6342,6 +6342,7 @@ pub(crate) mod tests {
         for round in &mut request.rounds {
             round.identity.data_fingerprint_sha256 = fingerprint.clone();
         }
+        validate_request_for_source(&request)?;
         let expected_request_sha =
             hft_cex_research_input::sha256(&serialize_request(&request).unwrap());
         let inputs = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
