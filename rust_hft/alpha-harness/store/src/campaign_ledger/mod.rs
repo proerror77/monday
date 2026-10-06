@@ -12,11 +12,16 @@ pub use final_dispatch::{
     CampaignFinalOutcomeV1,
 };
 mod platform_budget;
+mod platform_terminal;
 mod platform_transfer;
 mod state;
 pub use platform_budget::{
     VerifiedCampaignPlatformBudget, VerifiedCampaignPlatformExport,
     VerifiedCampaignPlatformRevocation,
+};
+pub use platform_terminal::{
+    CampaignPlatformScientificStatusV1, CampaignPlatformTerminalAuditV1,
+    CampaignPlatformTerminalStateV1, VerifiedCampaignPlatformTerminalSource,
 };
 pub use platform_transfer::CampaignPlatformTransferV1;
 
@@ -82,6 +87,9 @@ pub enum CampaignLedgerEventV1 {
     PlatformTransferred {
         transfer: CampaignPlatformTransferV1,
     },
+    PlatformSettled {
+        audit: Box<CampaignPlatformTerminalAuditV1>,
+    },
     DispatchJobBound {
         operation_id: String,
         job_uid: String,
@@ -133,6 +141,9 @@ impl CampaignLedgerEventV1 {
             }
             Self::PlatformTransferred { transfer } => {
                 format!("campaign-platform-transfer:{}", transfer.operation_id)
+            }
+            Self::PlatformSettled { audit } => {
+                format!("campaign-platform-terminal:{}", audit.transfer.operation_id)
             }
             Self::DispatchJobBound { operation_id, .. } => format!("campaign-job:{operation_id}"),
             Self::DispatchCancelled { evidence } => {
@@ -1224,6 +1235,118 @@ mod tests {
     }
 
     #[test]
+    fn platform_terminal_source_is_historical_and_requires_published_exclusive_transfer() {
+        let (mut store, verified) = registered();
+        let reservation = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &reservation, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let operation = reservation.operation_id().unwrap();
+        assert!(store
+            .campaign_platform_terminal_source(FAMILY, &operation)
+            .is_err());
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: operation.clone(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        let receipt = store
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+            )
+            .unwrap();
+        assert!(store
+            .campaign_platform_terminal_source(FAMILY, &operation)
+            .is_err());
+        acknowledge_all(&mut store);
+        store
+            .revoke_approval(APPROVAL, "operator", "source revoked", minutes(1))
+            .unwrap();
+        let before = store.campaign_family_usage(FAMILY).unwrap();
+        let witness = store
+            .campaign_platform_terminal_source(FAMILY, &operation)
+            .unwrap();
+        assert_eq!(witness.root().signed_grant(), verified.signed_grant());
+        assert_eq!(witness.reservation(), &reservation);
+        assert_eq!(witness.transfer(), &transfer);
+        assert_eq!(witness.transfer_receipt(), &receipt);
+        assert_eq!(
+            witness.operation_sha256().unwrap(),
+            alpha_domain::canonical_json_hash(&operation).unwrap()
+        );
+        assert!(store
+            .campaign_platform_terminal_source("foreign", &operation)
+            .is_err());
+        assert!(store
+            .campaign_platform_terminal_source(FAMILY, "caller-renamed-op")
+            .is_err());
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
+    }
+
+    #[test]
+    fn platform_handoff_clock_follows_approval_and_family_guards() {
+        let (mut store, verified) = registered();
+        let reservation = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &reservation, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let before = store.campaign_family_usage(FAMILY).unwrap();
+        let mut competing = store.connection.try_clone().unwrap();
+        let mut clock = |at| {
+            let tx = competing.transaction().unwrap();
+            assert!(serialize_approval_mutation(&tx, APPROVAL).is_err());
+            assert!(tx
+                .execute(
+                    "UPDATE campaign_family_heads SET sequence=sequence WHERE family_id=?",
+                    params![FAMILY],
+                )
+                .is_err());
+            tx.rollback().unwrap();
+            at
+        };
+        store
+            .with_campaign_platform_budget_with_clock(
+                &verified,
+                &reservation,
+                || clock(t0()),
+                |_| Ok::<_, StoreError>(()),
+            )
+            .unwrap();
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: reservation.operation_id().unwrap(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        assert!(store
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                || clock(verified.grant().expires_at),
+            )
+            .is_err());
+        assert!(store
+            .campaign_family_snapshot(FAMILY)
+            .unwrap()
+            .receipts
+            .iter()
+            .all(|entry| {
+                !matches!(
+                    entry.receipt.event,
+                    CampaignLedgerEventV1::PlatformTransferred { .. }
+                )
+            }));
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
+    }
+
+    #[test]
     fn platform_export_requires_published_exact_transfer_and_retains_unknown_charge() {
         let (mut store, verified) = registered();
         let reservation = reservation(&verified, 0, 40);
@@ -1583,6 +1706,141 @@ mod tests {
             r.receipt.event,
             CampaignLedgerEventV1::PlatformTransferred { .. }
         )));
+    }
+
+    #[test]
+    fn platform_terminal_audit_keeps_charge_after_revoke_and_expiry() {
+        let (mut store, verified) = registered();
+        let reservation = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &reservation, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: reservation.operation_id().unwrap(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        store
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+            )
+            .unwrap();
+        acknowledge_all(&mut store);
+        let source = store
+            .campaign_platform_terminal_source(FAMILY, &transfer.operation_id)
+            .unwrap();
+        store
+            .revoke_approval(APPROVAL, "operator", "historical stop", minutes(1))
+            .unwrap();
+        let before = store.campaign_family_usage(FAMILY).unwrap();
+        let audit = terminal_audit(&source, minutes(800));
+        for mutate in [
+            |v: &mut CampaignPlatformTerminalAuditV1| v.charging_trials -= 1,
+            |v: &mut CampaignPlatformTerminalAuditV1| v.task_id = "foreign-task".into(),
+            |v: &mut CampaignPlatformTerminalAuditV1| v.attempt = 2,
+            |v: &mut CampaignPlatformTerminalAuditV1| v.fence = 0,
+            |v: &mut CampaignPlatformTerminalAuditV1| v.retained_manifest_sha256.clear(),
+            |v: &mut CampaignPlatformTerminalAuditV1| v.transfer.tenant = "foreign".into(),
+            |v: &mut CampaignPlatformTerminalAuditV1| v.known_scientific_consumption = Some(1),
+            |v: &mut CampaignPlatformTerminalAuditV1| {
+                v.platform_state = CampaignPlatformTerminalStateV1::Succeeded
+            },
+        ] {
+            let mut changed = audit.clone();
+            mutate(&mut changed);
+            assert!(store
+                .record_campaign_platform_terminal_audit_with_clock(&source, &changed, || minutes(
+                    801
+                ))
+                .is_err());
+        }
+        let first = store
+            .record_campaign_platform_terminal_audit_with_clock(&source, &audit, || minutes(801))
+            .unwrap();
+        assert_eq!(
+            first,
+            store
+                .record_campaign_platform_terminal_audit_with_clock(&source, &audit, || minutes(
+                    802
+                ))
+                .unwrap()
+        );
+        assert_eq!(
+            store.campaign_platform_terminal_audit(&source).unwrap(),
+            Some(audit.clone())
+        );
+        let after = store.campaign_family_usage(FAMILY).unwrap();
+        assert_eq!(
+            before.accounted_trials().unwrap(),
+            after.accounted_trials().unwrap()
+        );
+        assert_eq!(
+            after.consumed_trials, 0,
+            "full policy charge is not fabricated scientific consumption"
+        );
+        assert_eq!(after.uncertain_trials, reservation.declared_trials);
+        assert_eq!(after.pending_trials, 0);
+        assert!(store
+            .settle_campaign_attempt(
+                FAMILY,
+                &settlement(&reservation, CampaignAttemptOutcomeV1::Failed, None),
+                minutes(803)
+            )
+            .is_err());
+        assert!(store
+            .claim_campaign_dispatch(&verified, &reservation, &dispatch_target(), minutes(803))
+            .is_err());
+        let mut changed = audit.clone();
+        changed.job_uid = "another-job".into();
+        assert!(store
+            .record_campaign_platform_terminal_audit_with_clock(&source, &changed, || minutes(803))
+            .is_err());
+        let (state, _) = load(&store.connection, &store.integrity_key, FAMILY).unwrap();
+        let attempt = &state.attempts[&transfer.operation_id];
+        assert_eq!(attempt.platform_transfer.as_ref(), Some(&transfer));
+        assert!(attempt.settlement.is_none() && attempt.dispatch.is_none());
+        let snapshot = store.campaign_family_snapshot(FAMILY).unwrap();
+        let mut restored = AlphaStore::open_in_memory().unwrap();
+        restored.integrity_key = store.integrity_key;
+        restored.import_campaign_family_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.campaign_family_usage(FAMILY).unwrap(), after);
+    }
+
+    pub(super) fn terminal_audit(
+        source: &VerifiedCampaignPlatformTerminalSource,
+        observed_at: DateTime<Utc>,
+    ) -> CampaignPlatformTerminalAuditV1 {
+        CampaignPlatformTerminalAuditV1 {
+            schema_version: "monday.campaign_platform_terminal_audit.v1".into(),
+            transfer: source.transfer().clone(),
+            platform_state: CampaignPlatformTerminalStateV1::Failed,
+            scientific_status: CampaignPlatformScientificStatusV1::Unknown,
+            charging_trials: source.reservation().declared_trials,
+            known_scientific_consumption: None,
+            retained_manifest_sha256: "9".repeat(64),
+            platform_snapshot_sha256: "1".repeat(64),
+            observer_release_sha256: "0".repeat(64),
+            native_admission_sha256: "2".repeat(64),
+            native_trust_sha256: "3".repeat(64),
+            collection_sha256: "4".repeat(64),
+            task_id: source.transfer().request_sha256.clone(),
+            attempt: 1,
+            fence: 7,
+            terminal_revision: 7,
+            terminal_event_sha256: "5".repeat(64),
+            execution_event_sha256: "6".repeat(64),
+            job_uid: "fixture-job".into(),
+            pod_uid: "fixture-pod".into(),
+            job_sha256: "7".repeat(64),
+            pod_sha256: "8".repeat(64),
+            native_result_sha256: None,
+            observed_at,
+        }
     }
 
     #[test]
@@ -2587,6 +2845,7 @@ mod tests {
                 CampaignLedgerEventV1::AttemptReserved { .. } => "attempt_reserved",
                 CampaignLedgerEventV1::DispatchClaimed { .. } => "dispatch_claimed",
                 CampaignLedgerEventV1::PlatformTransferred { .. } => "platform_transferred",
+                CampaignLedgerEventV1::PlatformSettled { .. } => "platform_settled",
                 CampaignLedgerEventV1::DispatchJobBound { .. } => "dispatch_job_bound",
                 CampaignLedgerEventV1::AttemptSettled { .. } => "attempt_settled",
                 CampaignLedgerEventV1::DispatchSettled { .. } => "dispatch_settled",

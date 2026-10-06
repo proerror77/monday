@@ -64,3 +64,6 @@ pub mod worker;
 
 #[cfg(feature = "artifact-io")]
 pub mod transport;
+
+#[cfg(feature = "control")]
+pub mod foundation;

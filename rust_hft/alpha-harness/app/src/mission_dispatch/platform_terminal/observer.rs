@@ -1,0 +1,647 @@
+use super::{platform_facts, scientific_results, stopped_execution, PlatformTerminalArgs};
+use crate::mission_dispatch::{
+    admission, load_submission, platform_admission, render_controlled_manifest, validate_submission,
+};
+use alpha_domain::campaign_control::SignedCampaignRootGrantV1;
+use alpha_store::{
+    campaign_ledger::{
+        CampaignPlatformScientificStatusV1, CampaignPlatformTerminalAuditV1,
+        CampaignPlatformTerminalStateV1, VerifiedCampaignPlatformTerminalSource,
+    },
+    AlphaStore,
+};
+use anyhow::{ensure, Context};
+use hft_research_platform::{
+    admission::NativeAdmissionTrust,
+    build::BuildArtifact,
+    orchestrator::State,
+    release::{BuildReleaseTrust, SignedBuildRelease},
+};
+use serde::Deserialize;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Observation {
+    schema: String,
+    observer_binary: PathBuf,
+    observer_build: PathBuf,
+    observer_release: PathBuf,
+    observer_trust: PathBuf,
+    native_trust: PathBuf,
+    native_witness_key: PathBuf,
+    native_witness_key_id: String,
+    witness_publication: super::publication::Publication,
+    /// URLs must name each exact PG receipt artifact. Bytes remain independently
+    /// bound to its task/attempt/fence, digest and size, including ZIP contents.
+    artifact_readback: BTreeMap<String, String>,
+    publications: BTreeMap<String, super::publication::Publication>,
+    #[serde(default)]
+    artifact_tls: platform_admission::HostTls,
+}
+
+/// Neither caller JSON nor a deserializer can construct this value. Its only
+/// producer joins the original source operation and independent observations.
+struct VerifiedPlatformTerminalEvidence {
+    audit: CampaignPlatformTerminalAuditV1,
+    retained: PathBuf,
+}
+
+pub(super) fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
+    crate::cli::require_cloud_data_host(std::env::consts::OS)?;
+    ensure!(
+        std::env::var("MONDAY_EXECUTION_HOST").as_deref() == Ok("ack"),
+        "terminal audit requires the controlled ACK source observer"
+    );
+    hft_research_dispatch_io::validate_cluster_target(&args.context, &args.namespace)?;
+    ensure!(
+        !crate::mission_dispatch::sequence_admission::is_study_submission(&args.submission)?
+            && !crate::mission_dispatch::final_admission::is_final_submission(&args.submission)?,
+        "terminal audit accepts canonical pre-holdout Campaign operations"
+    );
+    let validated = validate_submission(load_submission(&args.submission)?)?;
+    let control = admission::read_control(&args.control)?;
+    let manifest = render_controlled_manifest(&validated, &args.namespace, &control)?;
+    let inspection = admission::reconstruct_binding(
+        &validated,
+        &manifest,
+        &control.materialization_path,
+        &control.controller_image,
+        control.attempt_ordinal,
+    )?;
+    let signed: SignedCampaignRootGrantV1 =
+        platform_admission::read_metadata(&control.signed_root_grant_path)?;
+    let expected = inspection
+        .historical_reservation_for(&signed.content_sha256, &signed.grant.family.family_id);
+    let mut store = AlphaStore::open(&control.ledger_path)?;
+    let source =
+        store.campaign_platform_terminal_source(&expected.family_id, &expected.operation_id()?)?;
+    ensure!(
+        source.reservation() == &expected && source.root().signed_grant() == &signed,
+        "terminal observer changed original finalized request or historical Root"
+    );
+    let path = args.observation.canonicalize()?;
+    let mut observation: Observation =
+        serde_json::from_slice(&platform_admission::file_bytes(&path, 1024 * 1024, true)?)?;
+    ensure!(
+        observation.schema == "monday.native_campaign_terminal_observer.v1"
+            && observation.artifact_readback.len() <= 258
+            && observation.publications.len() <= 522,
+        "invalid bounded terminal observer configuration"
+    );
+    let base = path
+        .parent()
+        .context("observer configuration parent absent")?;
+    for path in [
+        &mut observation.observer_binary,
+        &mut observation.observer_build,
+        &mut observation.observer_release,
+        &mut observation.observer_trust,
+        &mut observation.native_trust,
+        &mut observation.native_witness_key,
+    ] {
+        if !path.is_absolute() {
+            *path = base.join(&*path);
+        }
+    }
+    let build: BuildArtifact = platform_admission::read_metadata(&observation.observer_build)?;
+    let release: SignedBuildRelease =
+        platform_admission::read_metadata(&observation.observer_release)?;
+    let release_trust: BuildReleaseTrust =
+        platform_admission::read_metadata(&observation.observer_trust)?;
+    let verified_release = release_trust.verify(&build, &release)?;
+    let native_trust: NativeAdmissionTrust =
+        platform_admission::read_metadata(&observation.native_trust)?;
+    let output = args.output.canonicalize()?;
+    ensure_private_directory(&output)?;
+    let evidence = if let Some(audit) = store.campaign_platform_terminal_audit(&source)? {
+        let original_receipt = store.record_campaign_platform_terminal_audit(&source, &audit)?;
+        let expected_witness = witness(
+            &source,
+            &audit,
+            &original_receipt,
+            &output.join(super::audit_package_id(&audit)?),
+        )?;
+        let signed_path = output.join(format!(
+            "{}-signed-terminal-audit.json",
+            expected_witness.id()?
+        ));
+        if signed_path.try_exists()? {
+            let signed: hft_research_platform::terminal_audit::SignedNativeTerminalAuditWitness =
+                platform_admission::read_metadata(&signed_path)?;
+            verify_retained_witness(
+                &signed,
+                &expected_witness,
+                &observation.native_witness_key_id,
+                &native_trust,
+                &store.campaign_platform_terminal_authority_public_keys(&source)?,
+                &platform_admission::release_public_keys(&release_trust)?,
+            )?;
+        } else {
+            verify_unsigned_retry(RetryInspection {
+                source: &source,
+                audit: &audit,
+                observation: &observation,
+                release: &verified_release,
+                trust: &native_trust,
+                context: &args.context,
+                request: &validated.submission.request,
+                output: &output,
+            })?;
+        }
+        restore(&source, audit, &output, &native_trust, &verified_release)?
+    } else {
+        let facts = platform_facts::read(
+            &source,
+            &observation.observer_binary,
+            &verified_release,
+            &native_trust,
+        )?;
+        let stopped = stopped_execution::read(
+            &args.context,
+            &facts.snapshot.task.spec,
+            &facts.lease,
+            &facts.handle,
+        )?;
+        stopped_execution::verify_controlled_identity(
+            &stopped,
+            facts
+                .snapshot
+                .task
+                .attempt_identity
+                .as_ref()
+                .context("controlled identity missing")?,
+        )?;
+        construct(
+            &source,
+            &validated.submission.request,
+            facts,
+            stopped,
+            &observation,
+            &output,
+        )?
+    };
+    let receipt = store.record_campaign_platform_terminal_audit(&source, &evidence.audit)?;
+    if args.retain_only {
+        let prefix = format!(
+            "research/native-terminal-audits/{}/{}",
+            source.operation_sha256()?,
+            super::audit_package_id(&evidence.audit)?
+        );
+        let publication_keys = super::retained_files::objects(&evidence.retained)?
+            .into_iter()
+            .map(|(name, _, _)| format!("{prefix}/{name}"))
+            .collect::<Vec<_>>();
+        let witness_key = format!(
+            "research/native-terminal-audits/{}/signed-{}.json",
+            source.operation_sha256()?,
+            witness(&source, &evidence.audit, &receipt, &evidence.retained)?.id()?
+        );
+        let family_receipt_keys = store
+            .campaign_family_receipts(&source.reservation().family_id)?
+            .into_iter()
+            .map(|r| r.object_key())
+            .collect::<Vec<_>>();
+        let study_receipt_keys =
+            match store.campaign_study_id_for_family(&source.reservation().family_id)? {
+                Some(study) => store
+                    .campaign_study_receipts(&study)?
+                    .into_iter()
+                    .map(|r| r.object_key())
+                    .collect::<Vec<_>>(),
+                None => Vec::new(),
+            };
+        return crate::cli::print_json(
+            &serde_json::json!({"schema":"monday.native_campaign_terminal_retained.v1", "audit_receipt_sha256":receipt.object_sha256()?, "retained_observation":evidence.retained, "publication_keys":publication_keys, "witness_publication_key":witness_key, "family_receipt_keys":family_receipt_keys, "study_receipt_keys":study_receipt_keys, "publication_stage":"pending", "cleanup_authority":"not_issued", "budget_released":false}),
+        );
+    }
+    // A durable append precedes publication. Retries recover this exact audit
+    // and its complete retained content instead of replacing observation time.
+    let origin = reqwest::Url::parse(
+        &hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
+            "Campaign result",
+            &validated.submission.request.campaign_result_readback_url,
+        )?,
+    )?
+    .origin()
+    .ascii_serialization();
+    let client = platform_admission::host_client(&platform_admission::HostTls::default())?;
+    admission::publish_family_receipts_with(
+        &mut store,
+        &source.reservation().family_id,
+        &origin,
+        &control.receipt_access,
+        |access, bytes| admission::publish_and_readback(&client, access, bytes),
+    )?;
+    if let Some(study) = store.campaign_study_id_for_family(&source.reservation().family_id)? {
+        admission::publish_study_receipts_with(
+            &mut store,
+            &study,
+            &origin,
+            &control.receipt_access,
+            |access, bytes| admission::publish_and_readback(&client, access, bytes),
+        )?;
+    }
+    super::publication::publish(
+        &client,
+        &evidence.retained,
+        &source.operation_sha256()?,
+        &evidence.audit,
+        &origin,
+        &observation.publications,
+    )?;
+    let witness = witness(&source, &evidence.audit, &receipt, &evidence.retained)?;
+    let signed_path = output.join(format!("{}-signed-terminal-audit.json", witness.id()?));
+    let witness_url = format!(
+        "{origin}/research/native-terminal-audits/{}/signed-{}.json",
+        source.operation_sha256()?,
+        witness.id()?
+    );
+    super::publication::validate_witness_access(&witness_url, &observation.witness_publication)?;
+    let authority_keys = store.campaign_platform_terminal_authority_public_keys(&source)?;
+    let release_keys = platform_admission::release_public_keys(&release_trust)?;
+    let signed = if signed_path.try_exists()? {
+        let signed: hft_research_platform::terminal_audit::SignedNativeTerminalAuditWitness =
+            platform_admission::read_metadata(&signed_path)?;
+        verify_retained_witness(
+            &signed,
+            &witness,
+            &observation.native_witness_key_id,
+            &native_trust,
+            &authority_keys,
+            &release_keys,
+        )?;
+        signed
+    } else {
+        let key = platform_admission::load_native_witness(
+            &observation.native_witness_key,
+            &observation.native_witness_key_id,
+            &native_trust,
+            &authority_keys,
+            &release_keys,
+        )?;
+        let signed = hft_research_platform::terminal_audit::sign_terminal_audit(
+            witness,
+            observation.native_witness_key_id.clone(),
+            &key,
+        )?;
+        native_trust.verify_terminal_audit(&signed)?;
+        platform_admission::retain(&signed_path, &serde_json::to_vec_pretty(&signed)?)?;
+        signed
+    };
+    let key = format!(
+        "research/native-terminal-audits/{}/signed-{}.json",
+        source.operation_sha256()?,
+        signed.evidence_sha256
+    );
+    let bytes = platform_admission::file_bytes(&signed_path, 1024 * 1024, true)?;
+    super::publication::publish_witness(
+        &client,
+        &signed_path,
+        &bytes,
+        &format!("{origin}/{key}"),
+        &observation.witness_publication,
+    )?;
+    crate::cli::print_json(
+        &serde_json::json!({"schema":"monday.native_campaign_terminal_audit_result.v1", "operation_sha256":source.operation_sha256()?, "task_id":evidence.audit.task_id, "attempt":evidence.audit.attempt, "fence":evidence.audit.fence, "terminal_revision":evidence.audit.terminal_revision, "job_uid":evidence.audit.job_uid, "pod_uid":evidence.audit.pod_uid, "audit_receipt_sha256":receipt.object_sha256()?, "retained_observation":evidence.retained, "charging_trials":evidence.audit.charging_trials, "known_scientific_consumption":evidence.audit.known_scientific_consumption, "signed_terminal_witness_sha256":signed.evidence_sha256, "signed_terminal_witness":signed_path, "cleanup_consumer_stage":"not_performed_by_source", "budget_released":false}),
+    )
+}
+
+/// Restored signatures keep the original audit time and must still obey the
+/// actual scientific/software signer roles. This reads no private key.
+pub(super) fn verify_retained_witness(
+    signed: &hft_research_platform::terminal_audit::SignedNativeTerminalAuditWitness,
+    expected: &hft_research_platform::terminal_audit::NativeTerminalAuditWitness,
+    key_id: &str,
+    trust: &NativeAdmissionTrust,
+    authority_keys: &[[u8; 32]],
+    release_keys: &[[u8; 32]],
+) -> anyhow::Result<()> {
+    platform_admission::check_native_witness_public_role(
+        key_id,
+        trust,
+        authority_keys,
+        release_keys,
+    )?;
+    trust.verify_terminal_audit(signed)?;
+    ensure!(
+        signed.evidence == *expected && signed.key_id == key_id,
+        "retained terminal witness changed original audit, issuer or signer role"
+    );
+    Ok(())
+}
+
+fn witness(
+    source: &VerifiedCampaignPlatformTerminalSource,
+    audit: &CampaignPlatformTerminalAuditV1,
+    receipt: &alpha_store::campaign_ledger::AuthenticatedCampaignReceiptV1,
+    retained: &Path,
+) -> anyhow::Result<hft_research_platform::terminal_audit::NativeTerminalAuditWitness> {
+    let snapshot: hft_research_platform::research::NativeTerminalSnapshot =
+        serde_json::from_slice(&platform_admission::file_bytes(
+            &retained.join("platform-snapshot.json"),
+            1024 * 1024,
+            true,
+        )?)?;
+    Ok(
+        hft_research_platform::terminal_audit::NativeTerminalAuditWitness {
+            schema: hft_research_platform::terminal_audit::NATIVE_TERMINAL_AUDIT_SCHEMA.into(),
+            tenant: source.transfer().tenant.clone(),
+            operation_sha256: source.operation_sha256()?,
+            request_sha256: audit.task_id.clone(),
+            run_sha256: source.transfer().run_sha256.clone(),
+            native_evidence_sha256: snapshot.native_admission.evidence_sha256,
+            audit_receipt_sha256: receipt.object_sha256()?,
+            retained_manifest_sha256: audit.retained_manifest_sha256.clone(),
+            task_id: audit.task_id.clone(),
+            attempt: audit.attempt,
+            fence: audit.fence,
+            job_uid: audit.job_uid.clone(),
+            pod_uid: audit.pod_uid.clone(),
+            terminal_revision: audit.terminal_revision,
+            issued_ms: receipt.receipt.recorded_at.timestamp_millis(),
+        },
+    )
+}
+
+struct RetryInspection<'a> {
+    source: &'a VerifiedCampaignPlatformTerminalSource,
+    audit: &'a CampaignPlatformTerminalAuditV1,
+    observation: &'a Observation,
+    release: &'a hft_research_platform::release::VerifiedBuildRelease,
+    trust: &'a NativeAdmissionTrust,
+    context: &'a str,
+    request: &'a crate::mission_campaign::CampaignRequest,
+    output: &'a Path,
+}
+fn verify_unsigned_retry(inspect: RetryInspection<'_>) -> anyhow::Result<()> {
+    let RetryInspection {
+        source,
+        audit,
+        observation,
+        release,
+        trust,
+        context,
+        request,
+        output,
+    } = inspect;
+    // HMAC audit metadata alone cannot produce a terminal signature. Until a
+    // genuine witness exists, retry repeats the actual readonly/provider gates.
+    let facts = platform_facts::read(source, &observation.observer_binary, release, trust)?;
+    ensure!(
+        facts.snapshot_sha256 == audit.platform_snapshot_sha256
+            && facts.snapshot.task.id == audit.task_id
+            && facts.lease.attempt == audit.attempt
+            && facts.lease.fence == audit.fence,
+        "unsigned retry changed actual readonly terminal facts"
+    );
+    let stopped = stopped_execution::read(
+        context,
+        &facts.snapshot.task.spec,
+        &facts.lease,
+        &facts.handle,
+    )?;
+    stopped_execution::verify_controlled_identity(
+        &stopped,
+        facts
+            .snapshot
+            .task
+            .attempt_identity
+            .as_ref()
+            .context("controlled identity missing")?,
+    )?;
+    ensure!(
+        stopped.handle.uid == audit.job_uid
+            && stopped.pod_uid == audit.pod_uid
+            && stopped.job_sha256 == audit.job_sha256
+            && stopped.pod_sha256 == audit.pod_sha256,
+        "unsigned audit lacks actual original stopped provider bytes"
+    );
+    if facts.snapshot.task.state == State::Succeeded {
+        let client = platform_admission::host_client(&platform_admission::HostTls::default())?;
+        let (_, consumed, sha) = crate::mission_campaign::readback_pre_holdout_terminal_cached(
+            &client,
+            request,
+            &source.reservation().request_sha256,
+            &facts.snapshot.run.evaluation_protocol_sha256,
+            &output.join(super::audit_package_id(audit)?),
+        )?;
+        ensure!(
+            audit.platform_state == CampaignPlatformTerminalStateV1::Succeeded
+                && audit.scientific_status
+                    == CampaignPlatformScientificStatusV1::InsufficientEvidence
+                && audit.known_scientific_consumption == Some(consumed)
+                && audit.native_result_sha256.as_ref() == Some(&sha),
+            "unsigned audit changed actual original scientific validation"
+        );
+    } else {
+        let expected_state = match facts.snapshot.task.state {
+            State::Failed => CampaignPlatformTerminalStateV1::Failed,
+            State::Cancelled => CampaignPlatformTerminalStateV1::Cancelled,
+            State::TimedOut => CampaignPlatformTerminalStateV1::TimedOut,
+            _ => anyhow::bail!("unsigned audit changed terminal compute state"),
+        };
+        ensure!(
+            audit.platform_state == expected_state,
+            "unsigned audit changed actual terminal compute state"
+        );
+        ensure!(
+            audit.known_scientific_consumption.is_none()
+                && audit.scientific_status == CampaignPlatformScientificStatusV1::Unknown
+                && audit.native_result_sha256.is_none(),
+            "failed compute cannot nominate scientific consumption"
+        );
+    }
+    Ok(())
+}
+
+fn construct(
+    source: &VerifiedCampaignPlatformTerminalSource,
+    request: &crate::mission_campaign::CampaignRequest,
+    facts: platform_facts::VerifiedPlatformFacts,
+    stopped: stopped_execution::VerifiedStoppedExecution,
+    observation: &Observation,
+    output: &Path,
+) -> anyhow::Result<VerifiedPlatformTerminalEvidence> {
+    let temporary = tempfile::tempdir_in(output)?;
+    let root = temporary.path().canonicalize()?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let client = platform_admission::host_client(&observation.artifact_tls)?;
+    let input = tempfile::tempdir_in(output)?;
+    let source_client = platform_admission::host_client(&platform_admission::HostTls::default())?;
+    let data = crate::mission_campaign::prepared_inputs::acquire_native_prepared(
+        request,
+        &source.reservation().request_sha256,
+        &source_client,
+        input.path(),
+    )?;
+    let execution = &source.reservation().execution;
+    ensure!(
+        data.campaign_inputs_sha256() == execution.campaign_inputs_sha256
+            && data.evaluation_protocol_sha256() == execution.evaluation_protocol_sha256
+            && data.source_revision() == execution.source_revision
+            && data.runner_image_identity()
+                == crate::mission_dispatch::image_digest(&execution.runner_image)?
+            && data.declared_trials() as u64 == source.reservation().declared_trials
+            && data.collection_id() == facts.snapshot.task.spec.view_manifest_sha256
+            && data.collection_id() == facts.snapshot.run.data_manifest_sha256,
+        "native decoded inputs changed original reserved source or fixed Run"
+    );
+    let state = match facts.snapshot.task.state {
+        State::Succeeded => CampaignPlatformTerminalStateV1::Succeeded,
+        State::Failed => CampaignPlatformTerminalStateV1::Failed,
+        State::Cancelled => CampaignPlatformTerminalStateV1::Cancelled,
+        State::TimedOut => CampaignPlatformTerminalStateV1::TimedOut,
+        _ => anyhow::bail!("nonterminal compute cannot produce a source audit"),
+    };
+    let (science, consumed, result) = if state == CampaignPlatformTerminalStateV1::Succeeded {
+        ensure!(
+            stopped.worker_exit_code == 0,
+            "successful compute has a failed original process"
+        );
+        scientific_results::read(
+            &facts,
+            data.finalized_request(),
+            &source.reservation().request_sha256,
+            &client,
+            &source_client,
+            &observation.artifact_readback,
+            &root,
+        )?
+    } else {
+        (CampaignPlatformScientificStatusV1::Unknown, None, None)
+    };
+    for (name, bytes) in [
+        ("platform-snapshot.json", facts.snapshot_bytes.clone()),
+        ("job.json", serde_json::to_vec_pretty(&stopped.job)?),
+        ("pod.json", serde_json::to_vec_pretty(&stopped.pod)?),
+        (
+            "prepared-inputs.json",
+            serde_json::to_vec_pretty(data.prepared().manifest())?,
+        ),
+        (
+            "source-transfer.json",
+            source.transfer_receipt().publication_bytes()?,
+        ),
+    ] {
+        platform_admission::retain(&root.join(name), &bytes)?;
+    }
+    let retained_manifest_sha256 = super::retained_files::retain(&root)?;
+    let audit = CampaignPlatformTerminalAuditV1 {
+        schema_version: "monday.campaign_platform_terminal_audit.v1".into(),
+        transfer: source.transfer().clone(),
+        platform_state: state,
+        scientific_status: science,
+        charging_trials: source.reservation().declared_trials,
+        known_scientific_consumption: consumed,
+        retained_manifest_sha256,
+        platform_snapshot_sha256: facts.snapshot_sha256,
+        observer_release_sha256: facts.observer_release_sha256,
+        native_admission_sha256: hft_research_platform::identity(&facts.snapshot.native_admission)?,
+        native_trust_sha256: hft_research_platform::identity(&facts.snapshot.native_trust)?,
+        collection_sha256: facts.snapshot.task.spec.view_manifest_sha256.clone(),
+        task_id: facts.snapshot.task.id.clone(),
+        attempt: facts.lease.attempt,
+        fence: facts.lease.fence,
+        terminal_revision: facts.snapshot.terminal_revision,
+        terminal_event_sha256: hft_research_platform::identity(&facts.snapshot.terminal_event)?,
+        execution_event_sha256: hft_research_platform::identity(&facts.snapshot.execution_event)?,
+        job_uid: stopped.handle.uid,
+        pod_uid: stopped.pod_uid,
+        job_sha256: stopped.job_sha256,
+        pod_sha256: stopped.pod_sha256,
+        native_result_sha256: result,
+        observed_at: stopped.observed_at,
+    };
+    for (name, bytes) in [
+        ("platform-snapshot.json", facts.snapshot_bytes),
+        ("job.json", serde_json::to_vec_pretty(&stopped.job)?),
+        ("pod.json", serde_json::to_vec_pretty(&stopped.pod)?),
+        ("terminal-audit.json", serde_json::to_vec_pretty(&audit)?),
+    ] {
+        platform_admission::retain(&root.join(name), &bytes)?;
+    }
+    let retained = output.join(super::audit_package_id(&audit)?);
+    ensure!(
+        !retained.exists(),
+        "uncommitted terminal observation already occupies immutable output"
+    );
+    std::fs::rename(temporary.keep(), &retained)?;
+    std::fs::File::open(output)?.sync_all()?;
+    Ok(VerifiedPlatformTerminalEvidence { audit, retained })
+}
+
+fn restore(
+    source: &VerifiedCampaignPlatformTerminalSource,
+    audit: CampaignPlatformTerminalAuditV1,
+    output: &Path,
+    trust: &NativeAdmissionTrust,
+    release: &hft_research_platform::release::VerifiedBuildRelease,
+) -> anyhow::Result<VerifiedPlatformTerminalEvidence> {
+    let retained = output.join(super::audit_package_id(&audit)?);
+    ensure_private_directory(&retained)?;
+    super::retained_files::verify(&retained, &audit.retained_manifest_sha256)?;
+    let bytes =
+        platform_admission::file_bytes(&retained.join("terminal-audit.json"), 1024 * 1024, true)?;
+    ensure!(
+        serde_json::from_slice::<CampaignPlatformTerminalAuditV1>(&bytes)? == audit
+            && audit.transfer == *source.transfer()
+            && audit.observer_release_sha256 == release.artifact().id()?,
+        "retained audit changed the authenticated source event or observer release"
+    );
+    let snapshot = platform_admission::file_bytes(
+        &retained.join("platform-snapshot.json"),
+        1024 * 1024,
+        true,
+    )?;
+    ensure!(
+        hft_research_platform::sha256(&snapshot) == audit.platform_snapshot_sha256,
+        "retained readonly facts changed"
+    );
+    let snapshot: hft_research_platform::research::NativeTerminalSnapshot =
+        serde_json::from_slice(&snapshot)?;
+    trust.verify(&snapshot.native_admission)?;
+    ensure!(
+        hft_research_platform::identity(&snapshot.native_admission)?
+            == audit.native_admission_sha256
+            && hft_research_platform::identity(trust)? == audit.native_trust_sha256
+            && snapshot.task.id == audit.task_id
+            && snapshot.terminal_revision == audit.terminal_revision,
+        "retained audit changed native identity or terminal revision"
+    );
+    for (name, digest) in [
+        ("job.json", &audit.job_sha256),
+        ("pod.json", &audit.pod_sha256),
+    ] {
+        let value: serde_json::Value = serde_json::from_slice(&platform_admission::file_bytes(
+            &retained.join(name),
+            1024 * 1024,
+            true,
+        )?)?;
+        ensure!(
+            alpha_domain::canonical_json_hash(&value)? == *digest,
+            "retained provider bytes changed"
+        );
+    }
+    // The original audit already owns this mechanical record. This retry does
+    // not execute science, nominate new stopped resources or create GC authority.
+    Ok(VerifiedPlatformTerminalEvidence { audit, retained })
+}
+
+fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    ensure!(
+        path.is_absolute()
+            && path.canonicalize()? == path
+            && path.is_dir()
+            && path.metadata()?.permissions().mode() & 0o077 == 0,
+        "terminal output requires canonical private storage"
+    );
+    Ok(())
+}
