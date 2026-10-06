@@ -22,6 +22,41 @@ pub(crate) struct NativeFinalPartitionRefV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct NativeFinalClockIndexRefV1 {
+    pub object_url: String,
+    pub content_sha256: String,
+    pub rows: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeFinalReplayRefV1 {
+    pub artifact_url: String,
+    pub artifact_sha256: String,
+    pub manifest_url: String,
+    pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeFinalDecisionClockV1 {
+    series_id: u64,
+    feature_available_time: chrono::DateTime<Utc>,
+    series_close_time: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeSealedAccessBindingV1 {
+    final_grant_sha256: String,
+    source_result_sha256: String,
+    frozen_candidate_sha256: String,
+    holdout_id: String,
+    sealed_input_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct NativeFinalInputsV1 {
     pub schema_version: String,
     pub final_grant_sha256: String,
@@ -29,8 +64,17 @@ pub(crate) struct NativeFinalInputsV1 {
     pub prepared_collection_sha256: String,
     pub evaluation_protocol_sha256: String,
     pub holdout_id: String,
+    /// Exact independent-selection rows only; the protocol's embargo gap is
+    /// kept out of pre-claim selection evaluation.
     pub selection: NativeFinalPartitionRefV1,
+    /// Rows from selection.end through the final source end. This starts with
+    /// any selection-to-holdout embargo context and includes the sealed cohort;
+    /// it is fetched only after the global one-time claim is read back.
     pub sealed_holdout: NativeFinalPartitionRefV1,
+    /// Time-only index for placing selection replay decisions on the original
+    /// timeline. It carries no prices, features, or labels.
+    pub decision_clock_index: NativeFinalClockIndexRefV1,
+    pub selection_replay: NativeFinalReplayRefV1,
 }
 
 impl NativeFinalInputsV1 {
@@ -58,6 +102,10 @@ impl NativeFinalInputsV1 {
             || !valid_digest(&self.selection.source_content_sha256)
             || !valid_digest(&self.sealed_holdout.content_sha256)
             || !valid_digest(&self.sealed_holdout.source_content_sha256)
+            || !valid_digest(&self.decision_clock_index.content_sha256)
+            || self.decision_clock_index.rows == 0
+            || !valid_digest(&self.selection_replay.artifact_sha256)
+            || !valid_digest(&self.selection_replay.manifest_sha256)
         {
             bail!("native final-input bridge identity or partition binding changed");
         }
@@ -67,6 +115,18 @@ impl NativeFinalInputsV1 {
         ] {
             canonical_final_object(label, &partition.object_url)?;
         }
+        canonical_final_object(
+            "native decision clock index",
+            &self.decision_clock_index.object_url,
+        )?;
+        canonical_final_object(
+            "native selection replay",
+            &self.selection_replay.artifact_url,
+        )?;
+        canonical_final_object(
+            "native selection replay manifest",
+            &self.selection_replay.manifest_url,
+        )?;
         Ok(())
     }
 }
@@ -93,6 +153,106 @@ fn decode_native_final_partition(
         bail!("native final partition row count differs from its manifest");
     }
     Ok(rows)
+}
+
+fn read_native_final_partition_file(
+    path: &Path,
+    reference: &NativeFinalPartitionRefV1,
+) -> anyhow::Result<Vec<alpha_engine::evaluation::ResearchRow>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_NATIVE_FINAL_PARTITION_BYTES as u64
+    {
+        bail!("native final partition is not a bounded regular file");
+    }
+    decode_native_final_partition(reference, &std::fs::read(path)?)
+}
+
+fn fetch_native_final_partition(
+    client: &Client,
+    request: &FinalRequest,
+    reference: &NativeFinalPartitionRefV1,
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<Vec<alpha_engine::evaluation::ResearchRow>> {
+    fetch_verified(
+        client,
+        label,
+        request.read_url(&reference.object_url)?,
+        path,
+        &reference.content_sha256,
+        MAX_NATIVE_FINAL_PARTITION_BYTES as u64,
+    )?;
+    read_native_final_partition_file(path, reference)
+}
+
+fn bind_native_sealed_access(
+    bridge: &NativeFinalInputsV1,
+    grant: &alpha_domain::campaign_finalization::VerifiedCampaignFinalEvaluationGrant,
+    source_operation: &str,
+    frozen_candidate_sha256: &str,
+    holdout_id: &str,
+) -> anyhow::Result<NativeSealedAccessBindingV1> {
+    let selected_result = grant
+        .grant()
+        .selected_results
+        .get(source_operation)
+        .context("native sealed access source is absent from the final grant")?;
+    if bridge.final_grant_sha256 != grant.content_sha256()
+        || bridge.source_result_sha256 != *selected_result
+        || bridge.holdout_id != holdout_id
+        || frozen_candidate_sha256.len() != 64
+        || !frozen_candidate_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("native sealed input is not bound to this grant, source, candidate and holdout");
+    }
+    Ok(NativeSealedAccessBindingV1 {
+        final_grant_sha256: grant.content_sha256().to_string(),
+        source_result_sha256: selected_result.clone(),
+        frozen_candidate_sha256: frozen_candidate_sha256.to_string(),
+        holdout_id: holdout_id.to_string(),
+        sealed_input_sha256: bridge.sealed_holdout.content_sha256.clone(),
+    })
+}
+
+fn read_native_final_clock_index(
+    path: &Path,
+    reference: &NativeFinalClockIndexRefV1,
+    expected_rows: usize,
+) -> anyhow::Result<Vec<data_mission::FeatureDecisionClock>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_NATIVE_FINAL_PARTITION_BYTES as u64
+    {
+        bail!("native decision clock index is not a bounded regular file");
+    }
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty()
+        || hex::encode(Sha256::digest(&bytes)) != reference.content_sha256
+        || reference.rows != expected_rows as u64
+    {
+        bail!("native decision clock index identity or row count is invalid");
+    }
+    let clocks = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice::<NativeFinalDecisionClockV1>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|row| data_mission::FeatureDecisionClock {
+            series_id: row.series_id,
+            feature_available_time: row.feature_available_time,
+            series_close_time: row.series_close_time,
+        })
+        .collect::<Vec<_>>();
+    if clocks.len() != expected_rows {
+        bail!("native decision clock index row count differs from materialization");
+    }
+    Ok(clocks)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -210,13 +370,16 @@ impl FinalRequest {
     fn read_objects(&self) -> anyhow::Result<BTreeSet<String>> {
         let mut objects = BTreeSet::new();
         for source in self.sources.values() {
-            for url in [
-                &source.feature_url,
-                &source.materialization_url,
-                &source.replay_artifact_url,
-                &source.replay_manifest_url,
-                &source.campaign_result_readback_url,
-            ] {
+            let mut source_urls = vec![&source.campaign_result_readback_url];
+            if source.prepared_inputs.is_none() {
+                source_urls.extend([
+                    &source.feature_url,
+                    &source.materialization_url,
+                    &source.replay_artifact_url,
+                    &source.replay_manifest_url,
+                ]);
+            }
+            for url in source_urls {
                 objects.insert(canonical_final_object("final source", url)?);
             }
             for round in &source.rounds {
@@ -233,6 +396,18 @@ impl FinalRequest {
             objects.insert(canonical_final_object(
                 "native sealed input",
                 &bridge.sealed_holdout.object_url,
+            )?);
+            objects.insert(canonical_final_object(
+                "native decision clock index",
+                &bridge.decision_clock_index.object_url,
+            )?);
+            objects.insert(canonical_final_object(
+                "native selection replay",
+                &bridge.selection_replay.artifact_url,
+            )?);
+            objects.insert(canonical_final_object(
+                "native selection replay manifest",
+                &bridge.selection_replay.manifest_url,
             )?);
         }
         Ok(objects)
@@ -611,10 +786,12 @@ fn access_overlay(
     source: &CampaignRequest,
 ) -> anyhow::Result<CampaignRequest> {
     let mut source = source.clone();
-    source.feature_url = request.read_url(&source.feature_url)?.into();
-    source.materialization_url = request.read_url(&source.materialization_url)?.into();
-    source.replay_artifact_url = request.read_url(&source.replay_artifact_url)?.into();
-    source.replay_manifest_url = request.read_url(&source.replay_manifest_url)?.into();
+    if source.prepared_inputs.is_none() {
+        source.feature_url = request.read_url(&source.feature_url)?.into();
+        source.materialization_url = request.read_url(&source.materialization_url)?.into();
+        source.replay_artifact_url = request.read_url(&source.replay_artifact_url)?.into();
+        source.replay_manifest_url = request.read_url(&source.replay_manifest_url)?.into();
+    }
     source.campaign_result_readback_url = request
         .read_url(&source.campaign_result_readback_url)?
         .into();
@@ -800,84 +977,209 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     std::fs::create_dir(&results)?;
     std::fs::create_dir(&inputs)?;
     let first = request.first_source()?;
+    let first_operation = request
+        .sources
+        .keys()
+        .next()
+        .context("final request has no source operation")?
+        .clone();
+    let family = collect_sources(&client, &request, &work)?;
+    let mission = family.first_mission().clone();
     let feature_path = inputs.join("features.jsonl");
     let materialization_path = inputs.join("materialization.json");
     let replay_path = inputs.join(format!("{}.parquet", first.replay_artifact_sha256));
     let replay_manifest_path = inputs.join("replay-manifest.json");
-    for (label, url, path, hash, limit) in [
-        (
-            "final features",
-            &first.feature_url,
-            &feature_path,
-            &first.feature_sha256,
-            crate::mission_runner::MAX_FEATURE_BYTES,
-        ),
-        (
-            "final materialization",
-            &first.materialization_url,
+    let (
+        materialization,
+        dataset,
+        clocks,
+        replay_path,
+        replay_manifest_path,
+        replay_artifact_sha256,
+        replay_manifest_sha256,
+        native_bridge,
+    ) = if first.prepared_inputs.is_some() {
+        let bridge = request
+            .native_final_inputs
+            .get(&first_operation)
+            .context("native final request is missing its separately admitted inputs")?;
+        let native_dir = inputs.join("native-prepared");
+        std::fs::create_dir(&native_dir)?;
+        let expected_request_sha256 = hex::encode(Sha256::digest(serialize_request(first)?));
+        let native = prepared_inputs::acquire_native_prepared(
+            first,
+            &expected_request_sha256,
+            &client,
+            &native_dir,
+        )?;
+        let original_materialization = native.render_inputs().materialization_bytes();
+        if hex::encode(Sha256::digest(original_materialization)) != first.materialization_sha256 {
+            bail!("native final materialization differs from its source identity");
+        }
+        std::fs::write(&materialization_path, original_materialization)?;
+        mission_dispatch::final_admission::validate_worker_dataset_binding(
+            &request,
             &materialization_path,
+        )?;
+        let materialization =
+            crate::mission_runner::decode_materialization(&std::fs::read(&materialization_path)?)?;
+        crate::mission_runner::validate_mission_materialization_binding(
+            &mission,
+            &materialization,
             &first.materialization_sha256,
-            crate::mission_runner::MAX_MATERIALIZATION_BYTES,
-        ),
-        (
-            "final replay",
-            &first.replay_artifact_url,
-            &replay_path,
-            &first.replay_artifact_sha256,
+            &first.feature_sha256,
+        )?;
+        let development = alpha_engine::evaluation::prepare_native_campaign_dataset(
+            native.prepared(),
+            &mission.spec.evaluation_protocol,
+        )?;
+        let selection_path = inputs.join("native-selection.rows.jsonl");
+        let selection_rows = fetch_native_final_partition(
+            &client,
+            &request,
+            &bridge.selection,
+            &selection_path,
+            "native final selection",
+        )?;
+        let dataset =
+            alpha_engine::evaluation::attach_native_selection_rows(development, selection_rows)?;
+        let clocks_path = inputs.join("native-decision-clocks.jsonl");
+        fetch_verified(
+            &client,
+            "native final decision clocks",
+            request.read_url(&bridge.decision_clock_index.object_url)?,
+            &clocks_path,
+            &bridge.decision_clock_index.content_sha256,
+            MAX_NATIVE_FINAL_PARTITION_BYTES as u64,
+        )?;
+        let clocks = read_native_final_clock_index(
+            &clocks_path,
+            &bridge.decision_clock_index,
+            materialization.rows,
+        )?;
+        if clocks.len() != materialization.rows
+            || clocks.windows(2).any(|pair| {
+                pair[0].series_id > pair[1].series_id
+                    || (pair[0].series_id == pair[1].series_id
+                        && pair[0].feature_available_time >= pair[1].feature_available_time)
+            })
+        {
+            bail!("native final decision clock index is not in source order");
+        }
+        let replay = &bridge.selection_replay;
+        let selection_replay_path = inputs.join(format!("{}.parquet", replay.artifact_sha256));
+        let selection_replay_manifest_path = inputs.join("selection-replay-manifest.json");
+        fetch_verified(
+            &client,
+            "native selection replay",
+            request.read_url(&replay.artifact_url)?,
+            &selection_replay_path,
+            &replay.artifact_sha256,
             1024 * 1024 * 1024,
-        ),
-        (
-            "final replay manifest",
-            &first.replay_manifest_url,
-            &replay_manifest_path,
-            &first.replay_manifest_sha256,
+        )?;
+        fetch_verified(
+            &client,
+            "native selection replay manifest",
+            request.read_url(&replay.manifest_url)?,
+            &selection_replay_manifest_path,
+            &replay.manifest_sha256,
             16 * 1024 * 1024,
-        ),
-    ] {
-        fetch_verified(&client, label, request.read_url(url)?, path, hash, limit)?;
-    }
-    mission_dispatch::final_admission::validate_worker_dataset_binding(
-        &request,
-        &materialization_path,
-    )?;
-    let materialization =
-        crate::mission_runner::decode_materialization(&std::fs::read(&materialization_path)?)?;
-    let family = collect_sources(&client, &request, &work)?;
-    let mission = family.first_mission().clone();
-    crate::mission_runner::validate_mission_materialization_binding(
-        &mission,
-        &materialization,
-        &first.materialization_sha256,
-        &first.feature_sha256,
-    )?;
-    // Re-admit content-addressed features at this Job's local path; archived
-    // source databases keep their historical paths and bytes unchanged.
-    let mut data_store = AlphaStore::open_in_memory()?;
-    let artifacts = work.join("artifacts");
-    let feature_manifest = data_mission::import_and_register_features(
-        &mut data_store,
-        &mission.spec.data_mission_id,
-        &feature_path,
-        &artifacts,
-    )?;
-    let dataset_manifest = data_mission::admit_cex_replay_dataset(
-        &mut data_store,
-        &feature_manifest,
-        &materialization.snapshot,
-    )?;
-    crate::mission_runner::validate_mission_dataset_binding(
-        &mission,
-        &feature_manifest,
-        &dataset_manifest,
-    )?;
-    let dataset_path = inputs.join("dataset-manifest.json");
-    hft_research_artifacts::write_json_atomic(&dataset_path, &dataset_manifest)?;
-    let registered = data_mission::read_registered_research_dataset(&data_store, &dataset_path)?;
-    let dataset = prepare_dataset(
-        registered.load_rows(&mission.spec.evaluation_protocol.costs)?,
-        &mission.spec.evaluation_protocol,
-    )?;
-    let clocks = data_mission::feature_decision_clocks(&feature_manifest)?;
+        )?;
+        (
+            materialization,
+            dataset,
+            clocks,
+            selection_replay_path,
+            selection_replay_manifest_path,
+            replay.artifact_sha256.clone(),
+            replay.manifest_sha256.clone(),
+            Some(bridge),
+        )
+    } else {
+        for (label, url, path, hash, limit) in [
+            (
+                "final features",
+                &first.feature_url,
+                &feature_path,
+                &first.feature_sha256,
+                crate::mission_runner::MAX_FEATURE_BYTES,
+            ),
+            (
+                "final materialization",
+                &first.materialization_url,
+                &materialization_path,
+                &first.materialization_sha256,
+                crate::mission_runner::MAX_MATERIALIZATION_BYTES,
+            ),
+            (
+                "final replay",
+                &first.replay_artifact_url,
+                &replay_path,
+                &first.replay_artifact_sha256,
+                1024 * 1024 * 1024,
+            ),
+            (
+                "final replay manifest",
+                &first.replay_manifest_url,
+                &replay_manifest_path,
+                &first.replay_manifest_sha256,
+                16 * 1024 * 1024,
+            ),
+        ] {
+            fetch_verified(&client, label, request.read_url(url)?, path, hash, limit)?;
+        }
+        mission_dispatch::final_admission::validate_worker_dataset_binding(
+            &request,
+            &materialization_path,
+        )?;
+        let materialization =
+            crate::mission_runner::decode_materialization(&std::fs::read(&materialization_path)?)?;
+        crate::mission_runner::validate_mission_materialization_binding(
+            &mission,
+            &materialization,
+            &first.materialization_sha256,
+            &first.feature_sha256,
+        )?;
+        // Re-admit content-addressed features at this Job's local path; archived
+        // source databases keep their historical paths and bytes unchanged.
+        let mut data_store = AlphaStore::open_in_memory()?;
+        let artifacts = work.join("artifacts");
+        let feature_manifest = data_mission::import_and_register_features(
+            &mut data_store,
+            &mission.spec.data_mission_id,
+            &feature_path,
+            &artifacts,
+        )?;
+        let dataset_manifest = data_mission::admit_cex_replay_dataset(
+            &mut data_store,
+            &feature_manifest,
+            &materialization.snapshot,
+        )?;
+        crate::mission_runner::validate_mission_dataset_binding(
+            &mission,
+            &feature_manifest,
+            &dataset_manifest,
+        )?;
+        let dataset_path = inputs.join("dataset-manifest.json");
+        hft_research_artifacts::write_json_atomic(&dataset_path, &dataset_manifest)?;
+        let registered =
+            data_mission::read_registered_research_dataset(&data_store, &dataset_path)?;
+        let dataset = prepare_dataset(
+            registered.load_rows(&mission.spec.evaluation_protocol.costs)?,
+            &mission.spec.evaluation_protocol,
+        )?;
+        let clocks = data_mission::feature_decision_clocks(&feature_manifest)?;
+        (
+            materialization,
+            dataset,
+            clocks,
+            replay_path,
+            replay_manifest_path,
+            first.replay_artifact_sha256.clone(),
+            first.replay_manifest_sha256.clone(),
+            None,
+        )
+    };
     let (selection, evaluated, outcome, precommit_ref, sealed_ref, bundle_ref, promotion_ref) =
         match family {
             ClosedFamily::Supervised(sources) => finalize_supervised_family(
@@ -890,12 +1192,22 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
                 first,
                 &replay_path,
                 &replay_manifest_path,
+                &replay_artifact_sha256,
+                &replay_manifest_sha256,
+                &inputs,
                 &client,
                 &request,
             )?,
-            ClosedFamily::Formula(sources) => {
-                finalize_formula_family(&grant, &sources, &dataset, &results, &client, &request)?
-            }
+            ClosedFamily::Formula(sources) => finalize_formula_family(
+                &grant,
+                &sources,
+                &dataset,
+                &results,
+                &inputs,
+                native_bridge,
+                &client,
+                &request,
+            )?,
         };
     let bundle_path = work.join("final-result.zip");
     hft_research_artifacts::create_bundle(&work, &bundle_path, [&results])?;
@@ -1012,6 +1324,9 @@ fn finalize_supervised_family(
     first: &CampaignRequest,
     replay_path: &Path,
     replay_manifest_path: &Path,
+    replay_artifact_sha256: &str,
+    replay_manifest_sha256: &str,
+    native_inputs_dir: &Path,
     client: &Client,
     request: &FinalRequest,
 ) -> anyhow::Result<FamilyOutcome> {
@@ -1101,9 +1416,9 @@ fn finalize_supervised_family(
             evaluation,
             &replay_policy,
             replay_path,
-            &first.replay_artifact_sha256,
+            replay_artifact_sha256,
             replay_manifest_path,
-            &first.replay_manifest_sha256,
+            replay_manifest_sha256,
         )?;
         outcome = CampaignFinalOutcomeV1::ReplayRejected;
         if replay.gate.passed {
@@ -1221,6 +1536,20 @@ fn finalize_supervised_family(
                 &candidate,
             )?;
             let claim = CexSealedHoldoutClaimV1::from_model_precommit(&precommit)?;
+            let bridge = request.native_final_inputs.get(&source.operation);
+            if let Some(bridge) = bridge {
+                let access = bind_native_sealed_access(
+                    bridge,
+                    grant,
+                    &source.operation,
+                    &precommit.final_candidate.content_sha256,
+                    &precommit.holdout_id,
+                )?;
+                hft_research_artifacts::write_json_atomic(
+                    &results.join("native-sealed-access-binding.json"),
+                    &access,
+                )?;
+            }
             grant.validate_active_at(Utc::now())?;
             let sealed = crate::mission_runner::open_cex_holdout(
                 &mut store,
@@ -1230,7 +1559,29 @@ fn finalize_supervised_family(
                 &request.holdout_claim_put_url,
                 &request.holdout_claim_readback_url,
                 || {
-                    evaluate_frozen_holdout(frozen, dataset)
+                    let sealed_dataset = if let Some(bridge) = bridge {
+                        grant.validate_active_at(Utc::now())?;
+                        let path = native_inputs_dir.join(format!(
+                            "native-sealed-{}.jsonl",
+                            bridge.sealed_holdout.content_sha256
+                        ));
+                        let rows = fetch_native_final_partition(
+                            client,
+                            request,
+                            &bridge.sealed_holdout,
+                            &path,
+                            "native sealed holdout",
+                        )?;
+                        let attached = alpha_engine::evaluation::attach_native_sealed_holdout_rows(
+                            dataset.clone(),
+                            rows,
+                        )?;
+                        std::fs::remove_file(path)?;
+                        attached
+                    } else {
+                        dataset.clone()
+                    };
+                    evaluate_frozen_holdout(frozen, &sealed_dataset)
                         .map(|report| report.evaluation)
                         .map_err(anyhow::Error::msg)
                 },
@@ -1273,11 +1624,14 @@ fn finalize_supervised_family(
 }
 
 #[cfg(feature = "scientific")]
+#[allow(clippy::too_many_arguments)]
 fn finalize_formula_family(
     grant: &alpha_domain::campaign_finalization::VerifiedCampaignFinalEvaluationGrant,
     sources: &[FormulaWinner],
     dataset: &alpha_engine::evaluation::PreparedDataset,
     results: &Path,
+    native_inputs_dir: &Path,
+    native_bridge: Option<&NativeFinalInputsV1>,
     client: &Client,
     request: &FinalRequest,
 ) -> anyhow::Result<FamilyOutcome> {
@@ -1373,6 +1727,54 @@ fn finalize_formula_family(
             &source.mission,
             &mut store,
             dataset,
+            |precommit| {
+                if let Some(bridge) = native_bridge {
+                    let access = bind_native_sealed_access(
+                        bridge,
+                        grant,
+                        &source.operation,
+                        &precommit.final_candidate.content_sha256,
+                        &precommit.holdout_id,
+                    )?;
+                    hft_research_artifacts::write_json_atomic(
+                        &results.join("native-sealed-access-binding.json"),
+                        &access,
+                    )?;
+                }
+                Ok(())
+            },
+            |precommit| {
+                if let Some(bridge) = native_bridge {
+                    grant.validate_active_at(Utc::now())?;
+                    let path = native_inputs_dir.join(format!(
+                        "native-sealed-{}.jsonl",
+                        bridge.sealed_holdout.content_sha256
+                    ));
+                    let rows = fetch_native_final_partition(
+                        client,
+                        request,
+                        &bridge.sealed_holdout,
+                        &path,
+                        "native sealed holdout",
+                    )?;
+                    let attached = alpha_engine::evaluation::attach_native_sealed_holdout_rows(
+                        dataset.clone(),
+                        rows,
+                    )?;
+                    hft_research_artifacts::write_json_atomic(
+                        &results.join("native-sealed-dataset-binding.json"),
+                        &serde_json::json!({
+                            "precommit_id": precommit.precommit_id,
+                            "sealed_input_sha256": bridge.sealed_holdout.content_sha256,
+                            "holdout_id": precommit.holdout_id,
+                        }),
+                    )?;
+                    std::fs::remove_file(path)?;
+                    Ok(attached)
+                } else {
+                    Ok(dataset.clone())
+                }
+            },
         )?;
         let replay_src = source.results_dir.join("cex-event-replay-receipt.json");
         if replay_src.try_exists()? {
@@ -1893,6 +2295,17 @@ mod tests {
                 rows: 1,
                 source_content_sha256: "2".repeat(64),
             },
+            decision_clock_index: NativeFinalClockIndexRefV1 {
+                object_url: "/tmp/decision-clocks.rows".into(),
+                content_sha256: "3".repeat(64),
+                rows: 1,
+            },
+            selection_replay: NativeFinalReplayRefV1 {
+                artifact_url: "/tmp/selection-replay.parquet".into(),
+                artifact_sha256: "4".repeat(64),
+                manifest_url: "/tmp/selection-replay-manifest.json".into(),
+                manifest_sha256: "5".repeat(64),
+            },
         };
         assert!(
             bridge
@@ -1924,6 +2337,44 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("byte identity"));
+    }
+
+    #[test]
+    fn native_final_partition_reads_an_immutable_local_fixture_and_checks_row_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selection.rows");
+        let now = Utc::now();
+        let row = alpha_engine::evaluation::ResearchRow {
+            series_id: 1,
+            available_time: now,
+            label_available_time: now + chrono::TimeDelta::seconds(1),
+            signal: 0.5,
+            features: BTreeMap::from([("mid_price".into(), 100.0)]),
+            label: 0.01,
+            fee_bps: 1.0,
+            funding_bps: 0.0,
+            pit_funding: false,
+            latency_bps: 0.2,
+        };
+        let mut bytes = serde_json::to_vec(&row).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+        let reference = NativeFinalPartitionRefV1 {
+            object_url: path.to_string_lossy().into_owned(),
+            content_sha256: hex::encode(Sha256::digest(&bytes)),
+            rows: 1,
+            source_content_sha256: "1".repeat(64),
+        };
+        assert_eq!(
+            read_native_final_partition_file(&path, &reference).unwrap(),
+            vec![row]
+        );
+        let mut wrong_count = reference;
+        wrong_count.rows = 2;
+        assert!(read_native_final_partition_file(&path, &wrong_count)
+            .unwrap_err()
+            .to_string()
+            .contains("row count"));
     }
 
     #[test]
