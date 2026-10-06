@@ -11,7 +11,6 @@ scientific = ["alpha-engine/fitting", "hft-research-platform/artifact-io", "dep:
 onnx-compatibility = ["dep:alpha-onnx-evaluator"]
 
 [dependencies]
-data = { package = "hft-data", path = "../../data-pipelines/core", default-features = false }
 hft-cex-search-driver = { path = "../search-driver", optional = true }
 hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["artifact-io", "native-admission", "release-verification", "campaign-result-validation"] }
 hft-cex-research-input = { path = "../../research-core/cex-input", features = ["streaming", "market-parquet"] }

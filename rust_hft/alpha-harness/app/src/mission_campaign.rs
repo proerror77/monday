@@ -5983,6 +5983,7 @@ pub(crate) mod tests {
             expected_native: artifacts.manifest.expected_native().unwrap(),
             block_urls,
             render_metadata: render.native_metadata().unwrap(),
+            planning_metadata: Some(artifacts.manifest.original.clone()),
         };
         receipt.prepared_inputs = Some(reference.clone());
         let augmented_receipt_bytes = serde_json::to_vec_pretty(&receipt).unwrap();

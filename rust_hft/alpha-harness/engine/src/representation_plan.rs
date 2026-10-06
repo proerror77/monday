@@ -43,19 +43,49 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
             ($path, include_bytes!($path).as_slice())
         };
     }
-    // Shared closure for the registered renderer, its loader and exact domain
-    // predicates, plus replay, features and source-bound reference admission.
+    // Shared closure for the renderer, signed planning source and current
+    // authority, plus replay, features and source-bound reference admission.
     // Source bytes bind behavior without introducing functional imports.
     let mut sources = vec![
+        source!("../Cargo.toml"),
+        source!("../../app/Cargo.toml"),
+        source!("../../domain/Cargo.toml"),
+        source!("../../store/Cargo.toml"),
+        source!("../../../research-core/Cargo.toml"),
+        source!("../../../research-core/cex-input/Cargo.toml"),
+        source!("../../../research-core/manifest/Cargo.toml"),
+        source!("../../../research-core/ml/Cargo.toml"),
+        source!("../../../tools/collector/Cargo.toml"),
+        source!("../../../data-pipelines/Cargo.toml"),
+        source!("../../../data-pipelines/core/Cargo.toml"),
+        source!("../../../data-pipelines/adapters/adapter-binance/Cargo.toml"),
         source!("../../app/src/mission_render.rs"),
         source!("../../app/src/mission_runner.rs"),
         source!("../../app/src/data_mission.rs"),
         source!("../../app/src/mission_calendar.rs"),
+        source!("../../app/src/representation_plan.rs"),
+        source!("../../app/src/mission_dispatch.rs"),
+        source!("../../app/src/mission_dispatch/admission.rs"),
+        source!("../../app/src/mission_dispatch/admission/planning_view.rs"),
+        source!("../../app/src/mission_campaign.rs"),
+        source!("../../app/src/mission_campaign/prepared_inputs.rs"),
+        source!("../../store/src/lib.rs"),
+        source!("../../store/src/campaign_ledger/mod.rs"),
+        source!("../../store/src/campaign_ledger/planning.rs"),
+        source!("../../store/src/campaign_ledger/state.rs"),
+        source!("../../store/src/campaign_ledger/study.rs"),
+        source!("../../store/src/approval_revocations.rs"),
+        source!("../../store/migrations/004_approval_revocations.sql"),
+        source!("../../store/migrations/005_campaign_family_ledger.sql"),
+        source!("../../store/migrations/006_campaign_study_ledger.sql"),
         source!("../../domain/src/lib.rs"),
         source!("../../domain/src/representation.rs"),
         source!("../../domain/src/campaign_horizon.rs"),
         source!("../../domain/src/evaluation_calendar.rs"),
         source!("../../domain/src/evaluation_partition.rs"),
+        source!("../../domain/src/campaign_control.rs"),
+        source!("../../domain/src/campaign_study.rs"),
+        source!("../../domain/src/research_accelerator.rs"),
         source!("evaluation.rs"),
         source!("baselines.rs"),
         source!("baselines/classic.rs"),
@@ -84,6 +114,10 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../../research-core/manifest/src/model/holding.rs"),
         source!("../../../research-core/manifest/src/model/prepared.rs"),
         source!("../../../research-core/manifest/src/model/numerical.rs"),
+        source!("../../../research-core/cex-input/src/lib.rs"),
+        source!("../../../research-core/cex-input/src/campaign.rs"),
+        source!("../../../research-core/cex-input/src/data.rs"),
+        source!("../../../research-core/cex-input/src/prepared.rs"),
         source!("../../../research-core/manifest/src/portable_network.rs"),
         source!("../../../data-pipelines/Cargo.lock"),
         source!("../../../research-core/Cargo.lock"),
@@ -121,8 +155,36 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
 }
 
 fn source_reference(id: &str, sources: &[(&str, &[u8])]) -> CexResearchContentRefV1 {
+    source_reference_for_build(
+        id,
+        sources,
+        [
+            u8::from(cfg!(feature = "kernel")),
+            u8::from(cfg!(feature = "fitting")),
+            u8::from(cfg!(feature = "llm")),
+            u8::from(cfg!(debug_assertions)),
+        ],
+        [
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::env::consts::FAMILY,
+        ],
+    )
+}
+
+fn source_reference_for_build(
+    id: &str,
+    sources: &[(&str, &[u8])],
+    features: [u8; 4],
+    target: [&str; 3],
+) -> CexResearchContentRefV1 {
     let mut digest = Sha256::new();
     digest.update(b"monday.representation-tool-sources.v2\0");
+    digest.update(features);
+    for target in target {
+        digest.update((target.len() as u64).to_le_bytes());
+        digest.update(target.as_bytes());
+    }
     for (path, body) in sources {
         digest.update((path.len() as u64).to_le_bytes());
         digest.update(path.as_bytes());
@@ -250,6 +312,13 @@ pub fn propose_representation_comparison(
         if matches!(
             tool,
             RepresentationToolV1::SolSequence | RepresentationToolV1::SolMarketEncoder
+        ) && !cfg!(feature = "fitting")
+        {
+            reasons.push("this executable does not enable the fitted Study entrypoints".into());
+        }
+        if matches!(
+            tool,
+            RepresentationToolV1::SolSequence | RepresentationToolV1::SolMarketEncoder
         ) && (goal.symbol != "SOLUSDT"
             || goal.market != "usdm"
             || goal.target_name != "forward_mid_return"
@@ -282,6 +351,14 @@ pub fn propose_representation_comparison(
     // Materializations are not trials. Only the future native execution template
     // and accounting contract can resolve a scientific comparison's resources.
     let requested_resources = None;
+    let observation_ns = goal
+        .labels
+        .observation_frequency_millis
+        .checked_mul(1_000_000)
+        .ok_or("observation cadence overflow")?;
+    let maximum_rows = (goal.window_end_ns - goal.window_start_ns) / observation_ns + 1;
+    let row_capacity_supported = registered_materialization_minimum_rows(&goal.labels)
+        .is_ok_and(|minimum| maximum_rows >= minimum as u64);
     let renderer_supported = goal.target_name == "forward_mid_return"
         && goal.labels.observation_frequency_millis == 1000
         && [5, 10, 30].contains(&goal.labels.horizon_buckets)
@@ -294,7 +371,8 @@ pub fn propose_representation_comparison(
         && has(RepresentationToolV1::LaggedContinuousOfi)
         && has(RepresentationToolV1::AggregateTradeFlow)
         && renderer_supported
-        && rules_cover_window;
+        && rules_cover_window
+        && row_capacity_supported;
     let mut limitations = vec![
         "Raw declarations and hashes are not verification receipts or read permissions.".into(),
         "Captured L2 depth does not establish full venue depth, L3 queue position, or exact cancellations.".into(),
@@ -311,6 +389,9 @@ pub fn propose_representation_comparison(
     }
     if !rules_cover_window {
         limitations.push("Verified instrument-rule artifacts must cover the same instrument, lookback and label availability window before materialization candidates are emitted.".into());
+    }
+    if !row_capacity_supported {
+        limitations.push("Even the maximum one-second rows in this frozen goal cannot meet the registered Campaign renderer's shared partition/horizon floor.".into());
     }
     let materializations = if feasible {
         vec![
@@ -405,8 +486,8 @@ mod tests {
             series: vec![BookSeriesCapabilityV1 {
                 session_id: "one".into(),
                 start_available_ns: 1_000_000_000,
-                end_available_ns: 200_000_000_000,
-                label_available_through_ns: 300_000_000_000,
+                end_available_ns: 30_000_000_000_000,
+                label_available_through_ns: 31_000_000_000_000,
                 snapshots: 1,
                 diffs: 10,
                 captured_seed_depth: 100,
@@ -427,7 +508,7 @@ mod tests {
                 sources: vec![content("rule-data"), content("rule-manifest")],
                 rules_identity_sha256: content("rules").content_sha256,
                 first_available_ns: 1_000_000_000,
-                last_available_ns: 300_000_000_000,
+                last_available_ns: 31_000_000_000_000,
                 max_gap_ns: 60_000_000_000,
             }),
             view: PlanningViewV1 {
@@ -449,7 +530,7 @@ mod tests {
                 observation_frequency_millis: 1000,
             },
             window_start_ns: 61_000_000_000,
-            window_end_ns: 180_000_000_000,
+            window_end_ns: 27_000_000_000_000,
             model: content("ridge"),
             scaling: content("train-scaler"),
             costs: content("costs"),
@@ -592,10 +673,13 @@ mod tests {
         data.instrument_rules.as_mut().unwrap().symbol = "SOLUSDT".into();
         goal.symbol = "SOLUSDT".into();
         goal.labels.horizon_buckets = 30;
-        assert!(supported(
-            &propose_representation_comparison(&data, &goal).unwrap(),
-            RepresentationToolV1::SolSequence
-        ));
+        assert_eq!(
+            supported(
+                &propose_representation_comparison(&data, &goal).unwrap(),
+                RepresentationToolV1::SolSequence
+            ),
+            cfg!(feature = "fitting")
+        );
         assert_eq!(SequenceInputSpecV1::sol_lob().ordered_channels.len(), 24);
     }
     #[test]
@@ -656,7 +740,11 @@ mod tests {
                 RepresentationToolV1::SolSequence,
                 RepresentationToolV1::SolMarketEncoder,
             ] {
-                assert_eq!(supported(&plan, tool), horizon == 30, "{tool:?}/{horizon}");
+                assert_eq!(
+                    supported(&plan, tool),
+                    cfg!(feature = "fitting") && horizon == 30,
+                    "{tool:?}/{horizon}"
+                );
             }
         }
     }
@@ -871,6 +959,7 @@ mod tests {
     #[test]
     fn decision_only_or_recovery_label_coverage_does_not_claim_mature_materials() {
         let (mut data, goal) = input();
+        data.series[0].end_available_ns = goal.window_end_ns;
         data.series[0].label_available_through_ns = data.series[0].end_available_ns;
         let plan = propose_representation_comparison(&data, &goal).unwrap();
         assert!(plan.materializations.is_empty());
@@ -992,5 +1081,167 @@ mod tests {
                 .implementation = changed;
             assert!(validate_representation_plan(&stale, &data, &goal).is_err());
         }
+    }
+
+    #[test]
+    fn signed_planning_authority_changes_invalidate_every_registered_tool() {
+        let (data, goal) = input();
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        for dependency in [
+            "../../domain/src/research_accelerator.rs",
+            "../../app/src/representation_plan.rs",
+            "../../app/src/mission_dispatch.rs",
+            "../../app/src/mission_dispatch/admission.rs",
+            "../../app/src/mission_dispatch/admission/planning_view.rs",
+            "../../app/src/mission_campaign.rs",
+            "../../app/src/mission_campaign/prepared_inputs.rs",
+            "../../store/Cargo.toml",
+            "../../store/src/lib.rs",
+            "../../store/src/campaign_ledger/mod.rs",
+            "../../store/src/campaign_ledger/planning.rs",
+            "../../store/src/campaign_ledger/state.rs",
+            "../../store/src/campaign_ledger/study.rs",
+            "../../store/src/approval_revocations.rs",
+            "../../store/migrations/004_approval_revocations.sql",
+            "../../store/migrations/005_campaign_family_ledger.sql",
+            "../../store/migrations/006_campaign_study_ledger.sql",
+            "../../domain/src/campaign_control.rs",
+            "../../domain/src/campaign_study.rs",
+            "../../../research-core/cex-input/src/lib.rs",
+            "../../../research-core/cex-input/src/campaign.rs",
+            "../../../research-core/cex-input/src/data.rs",
+            "../../../research-core/cex-input/src/prepared.rs",
+        ] {
+            for entry in &plan.matches {
+                let sources = implementation_sources(entry.tool);
+                let body = sources
+                    .iter()
+                    .find(|(path, _)| *path == dependency)
+                    .unwrap_or_else(|| panic!("unbound signed planning dependency {dependency}"))
+                    .1;
+                let mut changed = body.to_vec();
+                changed
+                    .extend_from_slice(b"\n// changed signed planning authority or projection\n");
+                let changed_sources = sources
+                    .iter()
+                    .map(|&(path, body)| {
+                        (
+                            path,
+                            if path == dependency {
+                                changed.as_slice()
+                            } else {
+                                body
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let changed = source_reference(&entry.implementation.id, &changed_sources);
+                assert_ne!(entry.implementation, changed, "{dependency}");
+                let mut stale = plan.clone();
+                stale
+                    .matches
+                    .iter_mut()
+                    .find(|stale| stale.tool == entry.tool)
+                    .unwrap()
+                    .implementation = changed;
+                assert!(validate_representation_plan(&stale, &data, &goal).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn review_tool_identity_binds_manifests_and_actual_fitting_availability() {
+        let (mut data, mut goal) = input();
+        data.symbol = "SOLUSDT".into();
+        data.instrument_rules.as_mut().unwrap().symbol = "SOLUSDT".into();
+        goal.symbol = "SOLUSDT".into();
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        for tool in [
+            RepresentationToolV1::SolSequence,
+            RepresentationToolV1::SolMarketEncoder,
+        ] {
+            assert_eq!(supported(&plan, tool), cfg!(feature = "fitting"));
+            let sources = implementation_sources(tool);
+            assert!(sources.iter().any(|(path, _)| *path == "../Cargo.toml"));
+            assert!(sources
+                .iter()
+                .any(|(path, _)| *path == "../../app/Cargo.toml"));
+        }
+    }
+
+    #[test]
+    fn review_short_goal_cannot_claim_registered_renderer_row_capacity() {
+        let (data, mut goal) = input();
+        goal.window_end_ns = 180_000_000_000;
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        assert!(plan.materializations.is_empty());
+        assert!(plan.hypothesis.is_none());
+        assert_eq!(
+            plan.status,
+            RepresentationPlanStatusV1::NoFeasibleComparison
+        );
+        assert!(supported(&plan, RepresentationToolV1::CapturedBookReplay));
+    }
+
+    #[test]
+    fn registered_row_floor_has_exact_horizon_boundaries_and_checked_parameters() {
+        for horizon in [5, 10, 30] {
+            let (data, mut goal) = input();
+            goal.labels.horizon_buckets = horizon;
+            let minimum = registered_materialization_minimum_rows(&goal.labels).unwrap();
+            goal.window_end_ns = goal.window_start_ns + (minimum as u64 - 1) * 1_000_000_000;
+            assert_eq!(
+                propose_representation_comparison(&data, &goal)
+                    .unwrap()
+                    .materializations
+                    .len(),
+                2
+            );
+            goal.window_end_ns -= 1;
+            assert!(propose_representation_comparison(&data, &goal)
+                .unwrap()
+                .materializations
+                .is_empty());
+        }
+        assert_eq!(
+            campaign_minimum_rows(10, 5).unwrap(),
+            CAMPAIGN_DEFAULT_MIN_ROWS
+        );
+        assert!(campaign_minimum_rows(usize::MAX, 5).is_err());
+        assert!(campaign_minimum_rows(10, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn compiled_feature_variation_cannot_validate_as_the_current_executable() {
+        let (data, goal) = input();
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        let tool = RepresentationToolV1::SolSequence;
+        let current = implementation(tool);
+        let mut flags = [
+            u8::from(cfg!(feature = "kernel")),
+            u8::from(cfg!(feature = "fitting")),
+            u8::from(cfg!(feature = "llm")),
+            u8::from(cfg!(debug_assertions)),
+        ];
+        flags[1] ^= 1;
+        let foreign = source_reference_for_build(
+            &current.id,
+            &implementation_sources(tool),
+            flags,
+            [
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                std::env::consts::FAMILY,
+            ],
+        );
+        assert_ne!(current, foreign);
+        let mut stale = plan;
+        stale
+            .matches
+            .iter_mut()
+            .find(|entry| entry.tool == tool)
+            .unwrap()
+            .implementation = foreign;
+        assert!(validate_representation_plan(&stale, &data, &goal).is_err());
     }
 }

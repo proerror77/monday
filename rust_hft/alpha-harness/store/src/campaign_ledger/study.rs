@@ -1051,6 +1051,58 @@ pub(super) fn lock_campaign_guards(
 
 /// Read-only membership and study authority check used by reservation
 /// inspection and by dispatch admission after its guards have been locked.
+pub(super) fn check_planning_member(
+    conn: &Connection,
+    key: &[u8; 32],
+    root: &VerifiedCampaignRootGrant,
+    at: DateTime<Utc>,
+) -> Result<Option<(String, VerifyingKey)>, StoreError> {
+    let family = &root.grant().family.family_id;
+    let Some((study_id, root_hash, binding)) = read_member_projection(conn, key, family)? else {
+        return Ok(None);
+    };
+    if root_hash != root.content_sha256()
+        || !binding.matches_root(root.grant(), root.content_sha256())
+    {
+        return Err(err(
+            "planning root is outside its authenticated study member",
+        ));
+    }
+    let (state, _) = study_load(conn, key, &study_id)?;
+    let state = state.ok_or_else(|| err("planning study registration is incomplete"))?;
+    let verified = state.grant()?;
+    verified.validate_active_at(at).map_err(err)?;
+    let approval = state
+        .approval
+        .as_ref()
+        .ok_or_else(|| err("planning study approval is missing"))?;
+    let approval_hash = state
+        .approval_hash
+        .as_deref()
+        .ok_or_else(|| err("planning study approval hash is missing"))?;
+    validate_study_approval(approval, approval_hash, verified, at)?;
+    if state.revoked_at.is_some_and(|when| at >= when)
+        || !read_effective_approval(conn, key, &approval.approval_id)?.is_active_at(at)
+    {
+        return Err(err("planning study approval is inactive"));
+    }
+    let (family_state, _) = super::load(conn, key, family)?;
+    if family_state.usage(None)? != state_member_usage(&state, family)? {
+        return Err(err("planning study/member usage diverged"));
+    }
+    let budget = &verified.grant().budget;
+    if state.usage.accounted_trials()? >= budget.max_trials
+        || state.usage.job_attempts >= budget.max_job_attempts
+        || state.usage.reserved_job_seconds >= budget.max_job_seconds
+    {
+        return Err(err("planning cannot reopen an exhausted study budget"));
+    }
+    Ok(Some((
+        verified.signed_grant().key_id.clone(),
+        *verified.verifying_key(),
+    )))
+}
+
 pub(super) fn check_member_reservation(
     conn: &Connection,
     key: &[u8; 32],
@@ -2593,6 +2645,73 @@ mod tests {
         max_trials: u64,
     ) -> VerifiedCampaignStudyGrant {
         register_study_at(store, roots, max_trials, t0())
+    }
+
+    #[test]
+    fn planning_requires_current_signed_study_authority_without_new_receipts() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let root = verify_root(root("planning-study-root", "planning-study-family", '1'));
+        register_root(&mut store, &root, "planning-root-approval");
+        let study = register_study(&mut store, &[&root], 100);
+        let before = store
+            .campaign_study_snapshot(&study.grant().study_id)
+            .unwrap();
+        store
+            .inspect_campaign_planning_permission_at(&root, at(1))
+            .unwrap();
+        assert_eq!(
+            store
+                .campaign_study_snapshot(&study.grant().study_id)
+                .unwrap(),
+            before
+        );
+        assert!(store
+            .inspect_campaign_planning_permission_at(&root, study.grant().expires_at)
+            .is_err());
+        store
+            .revoke_approval("study-approval", "operator", "stop planning", at(2))
+            .unwrap();
+        let stopped = store
+            .campaign_study_snapshot(&study.grant().study_id)
+            .unwrap();
+        assert!(store
+            .inspect_campaign_planning_permission_at(&root, at(3))
+            .is_err());
+        assert_eq!(
+            store
+                .campaign_study_snapshot(&study.grant().study_id)
+                .unwrap(),
+            stopped
+        );
+    }
+
+    #[test]
+    fn planning_cannot_reset_an_exhausted_signed_study_budget() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let root = verify_root(root("planning-budget-root", "planning-budget-family", '1'));
+        register_root(&mut store, &root, "planning-budget-approval");
+        let study = register_study(&mut store, &[&root], 10);
+        let attempt = reservation(&root, 0, 10);
+        store
+            .reserve_campaign_attempt(&root, &attempt, at(1))
+            .unwrap();
+        let before = store
+            .campaign_study_snapshot(&study.grant().study_id)
+            .unwrap();
+        let usage = store.campaign_study_usage(&study.grant().study_id).unwrap();
+        assert!(store
+            .inspect_campaign_planning_permission_at(&root, at(2))
+            .is_err());
+        assert_eq!(
+            store
+                .campaign_study_snapshot(&study.grant().study_id)
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            store.campaign_study_usage(&study.grant().study_id).unwrap(),
+            usage
+        );
     }
 
     fn register_study_at(

@@ -10,6 +10,50 @@ pub const REPRESENTATION_PLAN_SCHEMA: &str = "monday.cex_representation_plan.v1"
 pub const MAX_CAPABILITY_SERIES: usize = 256;
 pub const MAX_CAPABILITY_SOURCES: usize = 4096;
 
+// Existing canonical Campaign partitions, shared with the actual renderer.
+pub const CAMPAIGN_INITIAL_TRAIN_ROWS: usize = 7_200;
+pub const CAMPAIGN_VALIDATION_ROWS: usize = 3_600;
+pub const CAMPAIGN_FOLD_COUNT: usize = 3;
+pub const CAMPAIGN_HOLDOUT_ROWS: usize = 3_600;
+pub const CAMPAIGN_SELECTION_ROWS: usize = 3_600;
+pub const CAMPAIGN_DEFAULT_PURGE_ROWS: usize = 10;
+pub const CAMPAIGN_DEFAULT_EMBARGO_ROWS: usize = 5;
+pub const CAMPAIGN_DEFAULT_MIN_ROWS: usize = CAMPAIGN_INITIAL_TRAIN_ROWS
+    + CAMPAIGN_FOLD_COUNT * (CAMPAIGN_VALIDATION_ROWS + CAMPAIGN_DEFAULT_EMBARGO_ROWS)
+    + CAMPAIGN_DEFAULT_PURGE_ROWS
+    + CAMPAIGN_SELECTION_ROWS
+    + 2 * CAMPAIGN_DEFAULT_PURGE_ROWS
+    + CAMPAIGN_HOLDOUT_ROWS;
+
+pub fn campaign_minimum_rows(purge_rows: usize, embargo_rows: usize) -> Result<usize, String> {
+    let fold_rows = CAMPAIGN_VALIDATION_ROWS
+        .checked_add(embargo_rows)
+        .and_then(|rows| CAMPAIGN_FOLD_COUNT.checked_mul(rows))
+        .ok_or("typed Campaign horizon row budget overflowed")?;
+    CAMPAIGN_INITIAL_TRAIN_ROWS
+        .checked_add(fold_rows)
+        .and_then(|rows| rows.checked_add(purge_rows))
+        .and_then(|rows| rows.checked_add(CAMPAIGN_SELECTION_ROWS))
+        .and_then(|rows| rows.checked_add(purge_rows.checked_mul(2)?))
+        .and_then(|rows| rows.checked_add(CAMPAIGN_HOLDOUT_ROWS))
+        .ok_or_else(|| "typed Campaign horizon row budget overflowed".into())
+}
+
+pub fn registered_materialization_minimum_rows(
+    labels: &EvaluationLabelSpecV1,
+) -> Result<usize, String> {
+    if labels.observation_frequency_millis != 1_000
+        || ![5, 10, 30].contains(&labels.horizon_buckets)
+    {
+        return Err("unregistered Campaign cadence or horizon".into());
+    }
+    let horizon = labels.horizon_buckets;
+    campaign_minimum_rows(
+        horizon.checked_mul(2).ok_or("purge rows overflow")?,
+        horizon,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BookContinuityV1 {

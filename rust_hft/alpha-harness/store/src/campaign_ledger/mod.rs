@@ -11,10 +11,12 @@ pub use final_dispatch::{
     CampaignFinalDispatchClaimV1, CampaignFinalDispatchRecord, CampaignFinalDispatchSettlementV1,
     CampaignFinalOutcomeV1,
 };
+mod planning;
 mod platform_budget;
 mod platform_terminal;
 mod platform_transfer;
 mod state;
+pub use planning::VerifiedCampaignPlanningPermission;
 pub use platform_budget::{
     VerifiedCampaignPlatformBudget, VerifiedCampaignPlatformExport,
     VerifiedCampaignPlatformRevocation,
@@ -1189,6 +1191,71 @@ mod tests {
 
     fn registered() -> (AlphaStore, VerifiedCampaignRootGrant) {
         registered_grant(grant("root-1"))
+    }
+
+    #[test]
+    fn planning_permission_is_current_readonly_and_allows_zero_llm_budget() {
+        let mut definition = grant("read-only-planning-root");
+        definition.budget.max_llm_tokens = 0;
+        let (store, root) = registered_grant(definition);
+        let before = store.campaign_family_snapshot(FAMILY).unwrap();
+        let usage = store.campaign_family_usage(FAMILY).unwrap();
+        let permission = store
+            .inspect_campaign_planning_permission_at(&root, minutes(1))
+            .unwrap();
+        assert_eq!(permission.root().signed_grant(), root.signed_grant());
+        permission.recheck_at(minutes(2)).unwrap();
+        assert!(permission.recheck_at(root.grant().expires_at).is_err());
+        assert_eq!(store.campaign_family_snapshot(FAMILY).unwrap(), before);
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), usage);
+    }
+
+    #[test]
+    fn planning_rejects_unregistered_revoked_expired_and_exhausted_roots_without_reserving() {
+        let (mut store, root) = registered();
+        let unregistered = verify(grant("unregistered-planning-root"));
+        let before = store.campaign_family_snapshot(FAMILY).unwrap();
+        assert!(store
+            .inspect_campaign_planning_permission_at(&unregistered, minutes(1))
+            .is_err());
+        assert!(store
+            .inspect_campaign_planning_permission_at(&root, root.grant().expires_at)
+            .is_err());
+        assert_eq!(store.campaign_family_snapshot(FAMILY).unwrap(), before);
+        store
+            .revoke_approval(APPROVAL, "operator", "stop planning", minutes(1))
+            .unwrap();
+        let revoked = store.campaign_family_snapshot(FAMILY).unwrap();
+        assert!(store
+            .inspect_campaign_planning_permission_at(&root, minutes(2))
+            .is_err());
+        assert_eq!(store.campaign_family_snapshot(FAMILY).unwrap(), revoked);
+
+        let (mut store, root) = registered();
+        let attempt = reservation(&root, 0, root.grant().budget.max_trials);
+        store
+            .reserve_campaign_attempt(&root, &attempt, minutes(1))
+            .unwrap();
+        let exhausted = store.campaign_family_snapshot(FAMILY).unwrap();
+        let usage = store.campaign_family_usage(FAMILY).unwrap();
+        assert!(store
+            .inspect_campaign_planning_permission_at(&root, minutes(2))
+            .is_err());
+        assert_eq!(store.campaign_family_snapshot(FAMILY).unwrap(), exhausted);
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), usage);
+    }
+
+    #[test]
+    fn planning_cannot_reopen_a_closed_family() {
+        let (store, final_grant) = closed_final_family();
+        let family = &final_grant.grant().family_id;
+        let (state, _) = load(&store.connection, &store.integrity_key, family).unwrap();
+        let root = &state.roots.values().next().unwrap().grant;
+        let before = store.campaign_family_snapshot(family).unwrap();
+        assert!(store
+            .inspect_campaign_planning_permission_at(root, minutes(3))
+            .is_err());
+        assert_eq!(store.campaign_family_snapshot(family).unwrap(), before);
     }
 
     fn registered_grant(

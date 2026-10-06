@@ -1,87 +1,50 @@
-# Read-only research representation planning
+# Read-only research representation inventory
 
-The planner proposes a comparison from data capabilities and a frozen research goal. It does not execute research.
+This slice distinguishes declared tool capabilities from an authorized research view. It does not execute research or reserve a scientific budget.
 
-`alpha-domain::representation` owns declarations, clocks, view bindings, resource requirements and proposal identities.
-`alpha-engine::representation_plan` matches those declarations to six existing tools. It imports no acquisition, fitting or LLM implementation.
-`alpha-harness::representation_plan` accepts the existing opaque `VerifiedBinanceMarketTapeSeries` handle. It derives a bounded summary from verified source identities and replay events.
-The tape-only API produces inventory and a missing instrument-rule limitation. It emits no materialization candidates.
-`plan_from_verified_tape_with_rules` also borrows `VerifiedInstrumentRuleReferences::Spot` or `Usdm`.
-These contain the source-bound handles returned by `verify_bound_spot_reference_artifact` and `verify_bound_reference_artifact_read_only_current_batch` in the original collector artifact owners.
-The handles have private fields, no JSON constructor and no `Clone` or `Deserialize`. Publicly constructible reference batches cannot replace them.
+`alpha-domain::representation` owns declarations, clocks, finite goal limits and proposal identities. `alpha-engine::representation_plan` matches declarations to six registered tools without importing acquisition, fitting or LLM implementations. Declaration output is unqualified inventory; it is not a data credential or permission to inspect protected inputs.
 
-The engine accepts declarations for inventory planning. Its serialized rule coverage is a declaration, not an artifact credential.
-The app returns an opaque proposal handle after raw verification. This handle has no JSON constructor.
-Its JSON output is a report. Restoring the report does not restore verification or permission.
-Current view permissions, signed allowlists, source/image identity and remaining budgets require the existing Campaign admission.
+The production app entry is `inspect_signed_normalized_inventory`. It follows the original current Root/Study authority, read-only ledger guards and admitted normalized development projection. Source hashes, column names and caller-provided visibility labels cannot replace those checks. Its JSON report cannot restore verification or permission.
 
-## Existing tool limits
+## Authority and source scope
 
-| Tool | Required input | Boundary |
+Independent selection, sealed holdout and meta certification data cannot be relabeled as development data. Permission must be established before a protected source informs representation choices.
+
+The signed DataReady reference must contain safe `planning_metadata`. The planner reconstructs the protocol, partitions and permitted window from that header before opening the collection JSON or its blocks. Missing metadata rejects planning. Older execution and audit records may still parse without it; parsing does not grant planning access.
+
+The existing normalized projection is not a `VerifiedBinanceMarketTapeSeries`. It does not mint raw replay, aggressor-direction or OFI regeneration qualification. It retains the original producer Build/source, receipt, four output identities and actual clocked values. Signed prepared-column reuse must preserve those facts and the exact authorized view.
+
+Public raw family-search adapters and their task-created proof wrappers were removed. Original market-tape and reference verifiers remain unchanged. Development-only raw representation planning remains unavailable until its original producer supplies a trustworthy view projection. Old public commits retain the repair history; obsolete adapters are not kept as test-only pseudo-features.
+
+## Registered tool limits
+
+| Tool | Required declared inputs | Boundary |
 | --- | --- | --- |
-| Captured book replay | Any positive-depth snapshot seed and sequence-checked diffs covering its replay window | Captured L2 depth only; quantities replace levels; no Top5, rule or scientific-label prerequisite |
-| Static Top5 | Observed Top5 seed and suitable time coverage | Snapshot-only supports observed state, not complete event history |
-| Lagged continuous OFI | Continuous book history and 60-second warmup | No interpolation across gaps or recovery seeds |
-| Aggregate trade flow | Verified aggregate-trade aggressor direction | No inferred direction from undirected trades |
-| SOL sequence | Binance USD-M SOLUSDT, Top5 and directed trades | Existing 24 channels, 60 × 1-second context, fixed 30-second Study primary target |
-| SOL market encoder | Same SOL input requirements | Same fixed 30-second Study primary target; no generic market or horizon claim |
+| Captured book replay | Positive-depth seed, sequence-checked diffs and its own replay window | Captured L2 only; no Top5, rule or scientific-label prerequisite |
+| Static Top5 | Top5 seed, compatible coverage and instrument rules | Snapshot-only describes observed state, not complete history |
+| Lagged continuous OFI | One continuous series and 60-second warmup | No interpolation through gaps or recovery seeds |
+| Aggregate trade flow | Verified direction for every contributing series | No inference from undirected trades |
+| SOL sequence | USD-M SOLUSDT, Top5, directed trades and enabled fitting entrypoints | 24 channels, 60 × 1-second context and a fixed 30-second primary target |
+| SOL market encoder | The same declared SOL and compiled-fitting prerequisites | Existing Study only; no generic market or horizon claim |
 
-The small registry binds the existing implementation source hashes. It does not create a plugin framework.
-All six tool identities bind the shared materializer, feature calculations, replay and reference verification modules, manifest contracts and owning lockfiles.
-Their shared source closure also binds the Campaign renderer, actual materialization loader, feature-matrix metadata, and the domain's exact horizon, protocol, calendar, rule and label predicates.
-Reference admission also binds the adapter's official-origin constants, their collector reexport and the original verifier's shared canonical-directory helper. Local path dependencies are source inputs; their edits are not covered by lockfiles alone.
-Renderer conditions and planner conditions cannot change while keeping the same registry identity.
-The two SOL Study identities also bind their own Study, readers and fitting implementation sources. Including source bytes does not import or run those implementations.
-The digest frames both paths and source bodies. Changing a materializer changes all affected tool identities; a Study-only identity cannot validate against this registry.
-The raw adapter preserves each recovery seed as a separate series. It never joins history across that boundary.
-The original verifier retains dataset and shard scope in the opaque handle. The planner requires one market/dataset/shard scope, unique capture sessions and ordered, nonoverlapping receive intervals across supplied series.
-Trade direction requires the requested symbol's verified trade modality and causal trade evidence in every supplied series. A trade in one session cannot qualify a LOB-only session.
-Feature coverage and clocks stop at the frozen decision-window end. `label_available_through_ns` separately records the same recovery series' label-only book coverage after that decision.
-Post-decision diffs can extend this label endpoint. They never update feature clocks, depth, snapshot/diff counts or feature continuity.
-A post-decision recovery snapshot cuts the old series' label interval; a later series cannot mature its targets.
-Legacy H1/H2 and sequence materializers ignore checkpoints, so checkpoints extend neither feature nor label coverage.
-Market encoder checkpoint flushing is not advertised through these conservative summaries.
-Top5, flow and Study materials require at least five observed seed levels. Shallow books remain usable raw replay inventory.
-Observed seed depth does not prove every replay row has enough levels. Materialization must verify that condition independently.
+Top5, flow and Study inventories require five observed seed levels. One-to-four-level books remain usable raw replay inventory. Declared depth does not prove every materialized row has enough levels.
 
-## Automatic comparison
+The identity binds source paths, lengths and bytes across the renderer, loaders, domain predicates, replay, features, reference admission, model contracts and Study implementations. It includes the actual signed planning entry, safe prepared-source metadata, current Root/Study authority, authenticated ledger readers and their schemas. It also binds owning locks, Cargo manifests and actual kernel/fitting/LLM flags, debug profile and target OS/architecture/family. Local path edits are not covered by lockfiles alone.
 
-Suitable continuous inputs plus matching verified rule artifacts propose two registered materialization field families without feature hints.
-H1 uses the renderer's nine snapshot fields. H2 replaces aggregate trade imbalance with `cont_ofi_lag60s`.
-The comparison preserves the goal's target, horizon, model, scaling, cost and partition identities.
-It reports the different information histories in `materializations`. These candidates are not trials.
-Scientific `arms` remain empty. `requested_resources` is `None`, and candidate plans have status `NoExecutableComparison` because no executable comparison and accounting contract is bound.
-A hypothesis is an unfunded comparison proposal. It is not proof that the frozen resource limit admits that comparison.
-The calendar renderer's 138-trial comparison family controls statistical correction. Its own source distinguishes this from individually reserved Campaign trials. Neither two materials nor the statistical family can substitute for actual trial accounting.
-The next native execution slice must resolve the real template, counter and signed budget before accepting a scientific comparison.
-The current H1/H2 renderer supports USD-M BTCUSDT/SOLUSDT/BNBUSDT and Spot BTCUSDT only.
-It uses one-second observations and registered 5/10/30-second horizons for the exact `forward_mid_return` target. Other target names emit no comparison arms or hypothesis.
-Other instruments or horizons remain implementation gaps.
-SOL sequence and encoder Studies fix their primary target at 30 seconds. Their 5/10-second sequence labels are diagnostics, not Study goals.
-The proposal does not require GP. Later native admission must select a currently supported model/input path.
+## Window and row conditions
 
-A plan cannot widen an existing signed feature or policy revision allowlist.
-The current falsification text is a proposal. Native admission must bind executable thresholds before running it.
-Plan hashes bind data sources, view and permission references, tools, columns, clocks, target and resource requirements.
-The engine validates an imported plan by recomputing the full deterministic result.
+Feature clocks cannot exceed their decision window. A distinct `label_available_through_ns` describes label-only coverage in the same recovery series. Restoring that field from JSON does not establish qualification.
 
-## Rejection and evidence
+Registered materials require history, decision coverage and mature labels in one series. The first subsequent diff can close an unchanged quiet tail through the label endpoint, matching `Replay::emit_before`; its new state cannot become an earlier feature. A same-clock recovery snapshot blocks that extension. Checkpoints do not close the legacy H1/H2 or sequence tail.
 
-Snapshot-only, gaps and unseeded diffs cannot support continuous history.
-Missing direction in any supplied series blocks directed trade and SOL tools. Future availability blocks planning.
-Materialization tools also require instrument-rule coverage for their own history and label availability window.
-H1/H2 material candidates require a single continuous book series covering the complete decision window and `window_end + observation_frequency × horizon`. Immature tape emits no candidates, even when rule artifacts cover the label end.
-The goal computes this endpoint with checked arithmetic before tape scanning. Post-decision label data is not a feature input or a permission grant.
-The raw replay tool can still describe book replay when rule inputs are missing; inventory never upgrades that fact into materialization readiness.
-Reference artifacts must match the same market and symbol, preserve stable rules, bracket the sixty-second lookback and forward-label end, and satisfy the original 90-second maximum observation gap. Spot references also preserve the materializer's enabled fill-bound checks.
-Verified rule data and manifest hashes participate in the capability and proposal identities.
-Opaque results from separate verifier calls cannot be concatenated to bypass dataset, shard, session or receive-order boundaries.
-Each field decision clock must lie within the frozen goal window. Its availability cannot exceed that window end.
-A lookback, decision coverage and mature label coverage must fit within one continuous series. The frozen resource limit remains a future admission constraint; this planner neither estimates nor reserves scientific compute or trials.
-The label coverage field is a serialized declaration. Restoring it from JSON never restores raw verification or current DataView permission.
-Independent validation, strategy sealed, meta certification and exposed terminal views cannot feed this family search.
-A caller's view label is a declaration. Raw verification does not establish exposure-ledger or permission truth.
-The next execution slice must verify those bindings through the current governed Campaign contract.
+The goal computes label maturity with checked arithmetic. The planner and actual Campaign renderer share the existing partition/minimum-row formula. If even the maximum one-second rows cannot satisfy the registered horizon floor, the result is `NoFeasibleComparison`, with no material candidates or hypothesis. Fixed-calendar protocols retain their stronger row constraints.
 
-This slice provides a library API. CLI registration and Campaign execution belong to their own coordinated slices.
-Unit cases verify software behavior. They do not prove real data coverage, training, profitability, RSI improvement or deployment.
+## Materials and scientific authority
+
+Unqualified declarations may describe the registered H1 nine-field family and H2 replacement of aggregate trade imbalance with lagged continuous OFI. These are not fitted experiments or authorized source reads.
+
+Candidate `materializations` are separate from scientifically executable `arms`. Scientific arms remain empty, and `requested_resources` remains `None`. `NoExecutableComparison` explicitly means no executable comparison and accounting contract is bound. The calendar's 138-trial statistical comparison family is distinct from individual Campaign reservations; neither it nor two materials prices or reserves a run.
+
+A future native execution contract must bind the actual template, evaluator, trial counter, signed grant, cumulative budget, permitted inputs and source/image identity. The canonical Campaign seam remains the only scientific production entry.
+
+Software tests establish code behavior. They do not prove real data readiness, training, profitability, RSI improvement, notification delivery or deployment.

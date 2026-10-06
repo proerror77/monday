@@ -42,28 +42,6 @@ pub struct PublishedSpotReferenceArtifact {
     pub manifest_sha256: String,
 }
 
-/// Source-bound, read-only rules produced only by the original artifact verifier.
-#[derive(Debug)]
-pub struct VerifiedSpotReferenceArtifact {
-    batch: SpotReferenceBatch,
-    data_sha256: String,
-    manifest_sha256: String,
-}
-
-impl VerifiedSpotReferenceArtifact {
-    pub fn rules(&self) -> &[SpotInstrumentRules] {
-        self.batch.rules()
-    }
-
-    pub fn data_sha256(&self) -> &str {
-        &self.data_sha256
-    }
-
-    pub fn manifest_sha256(&self) -> &str {
-        &self.manifest_sha256
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct VerifiedSpotReferenceCounts {
     pub metadata: usize,
@@ -213,20 +191,6 @@ pub fn verify_spot_reference_artifact(
         expected_manifest_sha256,
         true,
     )
-}
-
-pub fn verify_bound_spot_reference_artifact(
-    artifact: &PublishedSpotReferenceArtifact,
-    expected_data_sha256: &str,
-    expected_manifest_sha256: &str,
-) -> Result<VerifiedSpotReferenceArtifact> {
-    let batch =
-        verify_spot_reference_artifact(artifact, expected_data_sha256, expected_manifest_sha256)?;
-    Ok(VerifiedSpotReferenceArtifact {
-        batch,
-        data_sha256: expected_data_sha256.to_owned(),
-        manifest_sha256: expected_manifest_sha256.to_owned(),
-    })
 }
 
 fn verify_spot_reference_artifact_inner(
@@ -566,33 +530,6 @@ mod tests {
         )
         .unwrap();
         (temp, artifact)
-    }
-
-    #[test]
-    fn bound_spot_rules_keep_verified_sources_and_reject_wrong_anchors() {
-        let (_root, published) = fixture();
-        let verified = verify_bound_spot_reference_artifact(
-            &published,
-            &published.data_sha256,
-            &published.manifest_sha256,
-        )
-        .unwrap();
-        assert_eq!(verified.rules()[0].symbol, "BTCUSDT");
-        assert_eq!(verified.data_sha256(), published.data_sha256);
-        assert_eq!(verified.manifest_sha256(), published.manifest_sha256);
-        assert!(verify_bound_spot_reference_artifact(
-            &published,
-            &"0".repeat(64),
-            &published.manifest_sha256,
-        )
-        .is_err());
-        fs::write(&published.data_path, b"changed Spot reference rows\n").unwrap();
-        assert!(verify_bound_spot_reference_artifact(
-            &published,
-            &published.data_sha256,
-            &published.manifest_sha256,
-        )
-        .is_err());
     }
 
     #[test]
