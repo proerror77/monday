@@ -153,6 +153,12 @@ enum DataCommand {
 enum MissionDispatchCommand {
     /// Reserve the inspected canonical request and independently publish/read back native receipts.
     PreparePlatform(mission_dispatch::platform_admission::PlatformPrepareArgs),
+    /// Export one source-reserved Campaign after actual software/data/configuration readback.
+    ExportPlatform(mission_dispatch::platform_admission::PlatformExportArgs),
+    /// Export authenticated Root/Study constraints for already transferred native operations.
+    ExportPlatformRevocations(mission_dispatch::platform_admission::PlatformRevocationsArgs),
+    /// Audit one transferred terminal Attempt using independent stopped/native readback.
+    AuditPlatformTerminal(mission_dispatch::platform_terminal::PlatformTerminalArgs),
     CloseFamily(CampaignCloseFamilyArgs),
     Inspect(MissionDispatchInspectArgs),
     /// Read authenticated historical dispatch identity without submitting or settling.
@@ -1249,6 +1255,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     .context("platform Campaign budget preparation task failed")?
                 }
+                MissionDispatchCommand::ExportPlatform(args) => {
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_admission::export(args)
+                    })
+                    .await
+                    .context("native platform signed export task failed")?
+                }
+                MissionDispatchCommand::ExportPlatformRevocations(args) => {
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_admission::export_revocations(args)
+                    })
+                    .await
+                    .context("native platform revocation export task failed")?
+                }
+                MissionDispatchCommand::AuditPlatformTerminal(args) => {
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_terminal::audit(args)
+                    })
+                    .await
+                    .context("native platform terminal observation failed")?
+                }
                 MissionDispatchCommand::DescribeStudy(args) => {
                     mission_dispatch::sequence_admission::describe(args)
                 }
@@ -1522,15 +1549,18 @@ mod tests {
         ] {
             assert!(listed(command), "{command} must stay on the Campaign path");
         }
-        let mut worker = WorkerCli::command();
-        let worker_help = worker
-            .find_subcommand_mut("mission")
-            .unwrap()
-            .render_help()
-            .to_string();
-        assert!(worker_help
-            .lines()
-            .any(|line| { line.split_whitespace().next() == Some("campaign-execute") }));
+        #[cfg(feature = "scientific")]
+        {
+            let mut worker = WorkerCli::command();
+            let worker_help = worker
+                .find_subcommand_mut("mission")
+                .unwrap()
+                .render_help()
+                .to_string();
+            assert!(worker_help
+                .lines()
+                .any(|line| { line.split_whitespace().next() == Some("campaign-execute") }));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1616,23 +1646,29 @@ mod tests {
         let args = "alpha-harness mission campaign-execute --work-dir work --campaign-id cex-campaign-1234567890abcdef1234567890abcdef --image-identity aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --request campaign.json --request-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_err());
         assert!(Cli::try_parse_from(format!("{args} --pre-holdout").split_whitespace()).is_err());
-        assert!(WorkerCli::try_parse_from(args.split_whitespace()).is_err());
-        assert!(
-            WorkerCli::try_parse_from(format!("{args} --pre-holdout").split_whitespace()).is_ok()
-        );
-        for suffix in [
-            " --final-evaluation",
-            " --final-trusted-keys keys.json",
-            " --final-evaluation --final-trusted-keys keys.json --pre-holdout",
-        ] {
+        #[cfg(feature = "scientific")]
+        {
+            assert!(WorkerCli::try_parse_from(args.split_whitespace()).is_err());
             assert!(
-                WorkerCli::try_parse_from(format!("{args}{suffix}").split_whitespace()).is_err()
+                WorkerCli::try_parse_from(format!("{args} --pre-holdout").split_whitespace())
+                    .is_ok()
             );
+            for suffix in [
+                " --final-evaluation",
+                " --final-trusted-keys keys.json",
+                " --final-evaluation --final-trusted-keys keys.json --pre-holdout",
+            ] {
+                assert!(
+                    WorkerCli::try_parse_from(format!("{args}{suffix}").split_whitespace())
+                        .is_err()
+                );
+            }
+            assert!(WorkerCli::try_parse_from(
+                format!("{args} --final-evaluation --final-trusted-keys keys.json")
+                    .split_whitespace()
+            )
+            .is_ok());
         }
-        assert!(WorkerCli::try_parse_from(
-            format!("{args} --final-evaluation --final-trusted-keys keys.json").split_whitespace()
-        )
-        .is_ok());
     }
 
     #[test]
