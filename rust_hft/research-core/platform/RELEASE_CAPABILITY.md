@@ -73,16 +73,91 @@ Errors never include response/token contents. It writes only a new mode-0600 fil
 inside a private canonical directory. It refuses existing files and symlinks.
 The wrapper removes the file on every exit. No token enters retained artifacts.
 
-## Required broker implementation
+## Native broker
 
-The response is a transport contract, not proof that server authorization exists.
-The operator broker must enforce the matching gateway projection itself.
-Before issuance it must verify GitHub OIDC signature/JWKS, issuer, audience,
-expiry, immutable repository/owner IDs, main and permitted workflow identity.
-It must independently authenticate run/attempt/job, current source and required
-checks. It must derive allowed product/Build scope from immutable producer inputs;
-caller-supplied prefixes or a plan hash are insufficient authorization.
-It must reject replay outside that job lifetime and revoke issued capabilities.
+The native `research-release-capability-broker` implements the exchange.
+It is code only. This change does not install, configure or deploy it.
+Build it from this owning manifest with the `publisher` feature.
+
+The broker accepts `--config CONFIG.json`. Configuration contains:
+
+```json
+{
+  "bind": "127.0.0.1:8092",
+  "endpoint": "https://gateway.example/broker/release-capability",
+  "policy_file": "/var/lib/monday-broker/publisher-policy.json",
+  "repository_id": 123,
+  "owner_id": 456,
+  "capabilities_file": "/var/lib/monday-identity/capabilities.json",
+  "replay_file": "/var/lib/monday-broker/issuance.json",
+  "scratch_root": "/var/lib/monday-broker/scratch",
+  "publisher_binary": "/usr/local/bin/research-release-publisher",
+  "verifier_sandbox": "/usr/bin/bwrap",
+  "tools_path": "/usr/local/bin:/usr/bin:/bin"
+}
+```
+
+The IDs above are placeholders. Resolve actual immutable IDs through GitHub.
+The endpoint must match the client audience exactly.
+An existing TLS ingress must route that path to the loopback listener.
+Keep gateway and broker on the same configured TLS origin.
+Ingress must allow the bounded 150-second verification request.
+
+The operator owns configuration, projection, journal and their private parents.
+Directories require mode 0700; state files require mode 0600.
+Initialize a new projection to `[]` only when no gateway identities exist.
+Initialize the journal to `{"schema":1,"replays":{},"issued":{}}`.
+The broker shares the gateway issuer's `identity.lock` sidecar.
+Only one broker process may own a journal.
+It acquires a journal lock and binds the listener before startup revocation.
+It preserves unrelated AttemptWriter capabilities during updates and recovery.
+Never copy a runner token into either state file.
+
+GitHub RS256 verification uses the fixed issuer and fixed GitHub JWKS URL.
+The broker rejects other algorithms, ambiguous keys and caller-selected key URLs.
+It binds immutable repository/owner IDs, main, workflow, source, run and attempt.
+The signed `check_run_id` must match the independently fetched publisher job.
+The job name must match the policy's selected image repository.
+It authenticates current main, three required GitHub Actions checks and software
+producer inputs before issuance. It repeats mutable checks after native planning.
+
+Publisher and import scopes require an independently computed native `plan`.
+The broker downloads the authenticated compiler artifact from GitHub.
+It checks out the exact source and reuses the existing native publisher verifier.
+Caller prefixes and hashes select requests; they never define allowed authority.
+The short-lived job read token authenticates GitHub API and Git reads.
+Git receives it through process environment, never command arguments or git files.
+
+Planning requires Linux user, PID and mount namespaces plus installed `bubblewrap`.
+Install trusted regular executables under the configured tool roots.
+The required tools include git, bash, gh, jq, unzip, Python and the native publisher.
+The sandbox exposes read-only tool/CA roots and a disposable work directory.
+It leaves `/proc` empty and clears inherited environment.
+Projection, journal and TLS private keys must stay outside mounted tool roots.
+The child receives no signing key, ACR password or broker state.
+Missing tools or failed namespace isolation deny issuance; there is no fallback.
+Two native plans may run concurrently; requests have a 150-second bound.
+
+Each response grants an initial lease of at most two minutes.
+Every 30 seconds, the broker reads job/run status and current main independently.
+It renews active leases up to the requested one-hour deadline.
+Completion, cancellation, source drift or authority-read failure stops renewal
+and removes that capability from the gateway projection.
+Loss of the broker leaves a maximum two-minute lease.
+Restart removes journal-owned capabilities before accepting requests.
+Revoked or expired capabilities cannot reappear through renewal.
+OIDC replay identifiers and bearer tokens enter state only as SHA-256 hashes.
+
+Production acceptance still requires the chosen Linux host, real TLS ingress,
+operator policy/signing trust, original compiler artifact and gateway readback.
+Unit tests and a namespace probe do not prove a deployed release.
+The included RSA fixture is publicly known upstream test material.
+It must never configure production trust.
+
+## Gateway integration
+
+The broker must share the actual host-owned projection read by the gateway.
+A successful HTTP response alone does not establish that integration.
 
 The gateway remains the object authority. Its existing projection accepts only
 an exact source/Build publisher prefix and at most 24 hours of remaining lifetime.

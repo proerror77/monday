@@ -21,6 +21,7 @@ rustix = { version = "0.38", features = ["fs"], optional = true }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 futures-util = { version = "0.3", optional = true }
 getrandom = { version = "=0.2.17", optional = true }
+jsonwebtoken = { version = "=9.3.1", optional = true, default-features = false }
 # PG only: the umbrella crate resolves unused MySQL/RSA and SQLite drivers.
 sqlx-core = { version = "=0.8.6", optional = true, default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json"] }
 sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false, features = ["json"] }
@@ -32,7 +33,7 @@ campaign-result-validation = ["dep:zip"]
 control = ["artifact-io", "campaign-result-validation", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:tempfile", "dep:getrandom", "native-admission", "release-verification"]
 native-admission = ["dep:ed25519-dalek"]
 release-verification = ["dep:ed25519-dalek"]
-publisher = ["control", "dep:rustix", "dep:tokio-util", "dep:tempfile", "tokio/fs", "reqwest/stream"]
+publisher = ["control", "dep:rustix", "dep:tokio-util", "dep:tempfile", "dep:jsonwebtoken", "tokio/fs", "reqwest/stream"]
 gateway = ["control", "dep:rustix", "dep:tokio-util", "dep:futures-util", "tokio/fs", "reqwest/stream"]
 
 [[bin]]
@@ -68,6 +69,11 @@ required-features = ["publisher"]
 [[bin]]
 name = "research-release-capability"
 path = "src/bin/research-release-capability.rs"
+required-features = ["publisher"]
+
+[[bin]]
+name = "research-release-capability-broker"
+path = "src/bin/research-release-capability-broker.rs"
 required-features = ["publisher"]
 
 [dev-dependencies]
