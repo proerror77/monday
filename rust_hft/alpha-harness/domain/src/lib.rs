@@ -12,6 +12,7 @@ pub mod frozen_model;
 pub mod market_encoder_study;
 pub mod mlp_training;
 pub mod research_accelerator;
+pub mod representation;
 pub mod sec_orderflow;
 pub mod sequence_study;
 pub use evaluation_calendar::{EvaluationCalendarBindingV1, EvaluationCalendarV1};

@@ -1,0 +1,311 @@
+//! Read-only representation proposals. Serialized declarations grant no data or compute authority.
+use crate::{
+    canonical_json_hash, CexResearchContentRefV1, CexResearchHypothesisV1, EvaluationLabelSpecV1,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+pub const CAPABILITY_SCHEMA: &str = "monday.cex_data_capability.v1";
+pub const REPRESENTATION_PLAN_SCHEMA: &str = "monday.cex_representation_plan.v1";
+pub const MAX_CAPABILITY_SERIES: usize = 256;
+pub const MAX_CAPABILITY_SOURCES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BookContinuityV1 {
+    SnapshotOnly,
+    Unseeded,
+    Gap,
+    SequenceChecked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningVisibilityV1 {
+    Training,
+    Development,
+    IndependentValidation,
+    StrategySealed,
+    MetaCertification,
+    ExposedTerminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningViewV1 {
+    pub view: CexResearchContentRefV1,
+    pub family_id: String,
+    pub visibility: PlanningVisibilityV1,
+    /// A permission binding, not proof that a current grant permits reading this view.
+    pub permission: CexResearchContentRefV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BookSeriesCapabilityV1 {
+    pub session_id: String,
+    pub start_available_ns: u64,
+    pub end_available_ns: u64,
+    pub snapshots: u64,
+    pub diffs: u64,
+    /// Observed snapshot depth; this does not certify every future replay state.
+    pub captured_seed_depth: u16,
+    pub continuity: BookContinuityV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldClockV1 {
+    pub field: String,
+    pub unit: String,
+    pub event_ns: Option<u64>,
+    pub received_ns: u64,
+    pub available_ns: u64,
+    pub decision_ns: u64,
+}
+
+impl FieldClockV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.field.is_empty()
+            || self.unit.is_empty()
+            || self.received_ns == 0
+            || self.available_ns < self.received_ns
+            || self.available_ns > self.decision_ns
+            || self
+                .event_ns
+                .is_some_and(|v| v == 0 || v > self.available_ns)
+        {
+            return Err("field is unavailable at its decision clock".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataCapabilityV1 {
+    pub schema: String,
+    pub venue: String,
+    pub market: String,
+    pub symbol: String,
+    pub sources: Vec<CexResearchContentRefV1>,
+    pub normalizer: CexResearchContentRefV1,
+    pub series: Vec<BookSeriesCapabilityV1>,
+    pub fields: Vec<FieldClockV1>,
+    pub aggregate_trade_direction: bool,
+    pub view: PlanningViewV1,
+}
+
+impl DataCapabilityV1 {
+    /// Validates a declaration. Neither this check nor its hash verifies raw data.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != CAPABILITY_SCHEMA
+            || self.venue != "binance"
+            || !matches!(self.market.as_str(), "usdm" | "spot")
+            || self.symbol.is_empty()
+            || self.symbol.len() > 32
+            || !self
+                .symbol
+                .bytes()
+                .all(|v| v.is_ascii_uppercase() || v.is_ascii_digit())
+            || self.sources.is_empty()
+            || self.sources.len() > MAX_CAPABILITY_SOURCES
+            || self.series.is_empty()
+            || self.series.len() > MAX_CAPABILITY_SERIES
+            || self.fields.is_empty()
+            || self.fields.len() > 64
+            || self.view.family_id.is_empty()
+        {
+            return Err("invalid data capability declaration".into());
+        }
+        self.normalizer.validate().map_err(|e| e.to_string())?;
+        self.view.view.validate().map_err(|e| e.to_string())?;
+        self.view.permission.validate().map_err(|e| e.to_string())?;
+        let mut sources = BTreeSet::new();
+        for source in &self.sources {
+            source.validate().map_err(|e| e.to_string())?;
+            if !sources.insert(&source.content_sha256) {
+                return Err("repeated source identity".into());
+            }
+        }
+        let mut sessions = BTreeSet::new();
+        for series in &self.series {
+            if series.session_id.is_empty()
+                || !sessions.insert(&series.session_id)
+                || series.start_available_ns == 0
+                || series.end_available_ns < series.start_available_ns
+                || series.captured_seed_depth > 4096
+                || (series.continuity == BookContinuityV1::SequenceChecked
+                    && (series.snapshots == 0 || series.diffs == 0))
+                || (series.continuity == BookContinuityV1::SnapshotOnly
+                    && (series.snapshots == 0 || series.diffs != 0))
+            {
+                return Err("invalid book series declaration".into());
+            }
+        }
+        let mut fields = BTreeSet::new();
+        for field in &self.fields {
+            field.validate()?;
+            if !fields.insert(&field.field) {
+                return Err("repeated field".into());
+            }
+        }
+        Ok(())
+    }
+    pub fn digest(&self) -> Result<String, String> {
+        self.validate()?;
+        canonical_json_hash(self).map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningResourcesV1 {
+    pub cpu_millis: u32,
+    pub memory_mib: u32,
+    pub wall_seconds: u32,
+    pub trials: u32,
+}
+impl PlanningResourcesV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cpu_millis == 0
+            || self.memory_mib == 0
+            || self.wall_seconds == 0
+            || self.trials == 0
+        {
+            return Err("positive finite planning limits required".into());
+        }
+        Ok(())
+    }
+    pub fn fits(&self, limit: &Self) -> bool {
+        self.cpu_millis <= limit.cpu_millis
+            && self.memory_mib <= limit.memory_mib
+            && self.wall_seconds <= limit.wall_seconds
+            && self.trials <= limit.trials
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepresentationGoalV1 {
+    pub goal: CexResearchContentRefV1,
+    pub family_id: String,
+    pub venue: String,
+    pub market: String,
+    pub symbol: String,
+    pub target_name: String,
+    pub labels: EvaluationLabelSpecV1,
+    pub window_start_ns: u64,
+    pub window_end_ns: u64,
+    pub model: CexResearchContentRefV1,
+    pub scaling: CexResearchContentRefV1,
+    pub costs: CexResearchContentRefV1,
+    pub partition: CexResearchContentRefV1,
+    /// Both arms require their own future admission. This is not a budget reservation.
+    pub resource_limit: PlanningResourcesV1,
+}
+impl RepresentationGoalV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        for reference in [
+            &self.goal,
+            &self.model,
+            &self.scaling,
+            &self.costs,
+            &self.partition,
+        ] {
+            reference.validate().map_err(|e| e.to_string())?;
+        }
+        self.resource_limit.validate()?;
+        if self.family_id.is_empty()
+            || self.target_name.is_empty()
+            || self.window_start_ns == 0
+            || self.window_end_ns <= self.window_start_ns
+            || self.labels.horizon_buckets == 0
+            || self.labels.observation_frequency_millis == 0
+            || self
+                .labels
+                .observation_frequency_millis
+                .checked_mul(self.labels.horizon_buckets as u64)
+                .is_none()
+        {
+            return Err("invalid frozen representation goal".into());
+        }
+        Ok(())
+    }
+    pub fn digest(&self) -> Result<String, String> {
+        self.validate()?;
+        canonical_json_hash(self).map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepresentationToolV1 {
+    CapturedBookReplay,
+    StaticTop5,
+    LaggedContinuousOfi,
+    AggregateTradeFlow,
+    SolSequence,
+    SolMarketEncoder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolMatchV1 {
+    pub tool: RepresentationToolV1,
+    pub implementation: CexResearchContentRefV1,
+    pub history_ms: u64,
+    pub supported: bool,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepresentationArmV1 {
+    pub name: String,
+    pub fields: Vec<String>,
+    pub history_ms: u64,
+    pub tools: Vec<RepresentationToolV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepresentationPlanStatusV1 {
+    RequiresDataVerificationAndNativeAdmission,
+    NoFeasibleComparison,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepresentationPlanV1 {
+    pub schema: String,
+    pub capability_sha256: String,
+    pub goal_sha256: String,
+    pub registry_sha256: String,
+    pub status: RepresentationPlanStatusV1,
+    pub goal: RepresentationGoalV1,
+    pub matches: Vec<ToolMatchV1>,
+    pub arms: Vec<RepresentationArmV1>,
+    pub hypothesis: Option<CexResearchHypothesisV1>,
+    pub requested_resources: PlanningResourcesV1,
+    pub limitations: Vec<String>,
+}
+impl RepresentationPlanV1 {
+    pub fn digest(&self) -> Result<String, String> {
+        canonical_json_hash(self).map_err(|e| e.to_string())
+    }
+    pub fn validate_binding(
+        &self,
+        data: &DataCapabilityV1,
+        goal: &RepresentationGoalV1,
+    ) -> Result<(), String> {
+        if self.schema != REPRESENTATION_PLAN_SCHEMA
+            || self.capability_sha256 != data.digest()?
+            || self.goal_sha256 != goal.digest()?
+            || &self.goal != goal
+        {
+            return Err("representation source or frozen goal drift".into());
+        }
+        Ok(())
+    }
+}

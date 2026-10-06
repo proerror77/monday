@@ -12,6 +12,7 @@ mod mission_objects;
 mod mission_render;
 mod mission_runner;
 mod sec_orderflow;
+pub mod representation_plan;
 
 use clap::Parser;
 
