@@ -3,7 +3,7 @@
 use super::*;
 use crate::cli::CampaignPrepareArgs;
 use crate::mission_render::PreparedCexInputMetadata;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const PLAN_SCHEMA: &str = "monday.cex_campaign_preparation_plan.v1";
 const INDEX_SCHEMA: &str = "monday.cex_campaign_preparation.v1";
@@ -63,6 +63,8 @@ struct SharedInputs {
     campaign_inputs_sha256: String,
     /// Only a metadata summary. Its digest must be pinned by the caller before reuse.
     render_metadata: PreparedCexInputMetadata,
+    #[serde(default)]
+    native_prepared: BTreeMap<String, prepared_inputs::NativePreparedCampaignRefV1>,
 }
 
 fn authentication_payload<T: Serialize>(value: &T) -> anyhow::Result<String> {
@@ -299,7 +301,14 @@ fn restore_inputs(
         &receipt.feature.sha256,
         &receipt.materialization.sha256,
     )?;
+    if shared.native_prepared.is_empty() {
+        bail!("historical prepared metadata lacks actual frozen native input collections");
+    }
     Ok(ValidatedCampaignInputSet {
+        native_prepared: shared.native_prepared,
+        input_root: plan.input_root.clone(),
+        replay_artifact_path: plan.input_root.join(&receipt.replay_artifact.relative_path),
+        replay_manifest_path: plan.input_root.join(&receipt.replay_manifest.relative_path),
         feature_url: receipt.feature.object_url.clone(),
         feature_sha256: receipt.feature.sha256.clone(),
         materialization_url: receipt.materialization.object_url.clone(),
@@ -551,12 +560,21 @@ pub(super) fn prepare_report(
             let shared: SharedInputs = serde_json::from_slice(&data)?;
             (restore_inputs(&plan, receipt, shared, &ledger)?, data, true)
         } else {
-            let inputs = validated_campaign_inputs(
-                &args_for_freeze,
-                plans.iter().any(|plan| plan.calendar.is_some()),
-            )?;
+            let mut inputs = validated_campaign_inputs(&args_for_freeze, true)?;
             for research in &plans {
                 inputs.render_inputs.verify_development_precheck(research)?;
+            }
+            for research in &plans {
+                let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+                    inputs.render_inputs.materialization(),
+                    research,
+                )?;
+                let key = protocol.content_hash()?;
+                if !inputs.native_prepared.contains_key(&key) {
+                    let prepared =
+                        prepared_inputs::freeze_native_prepared_reference(&inputs, research)?;
+                    inputs.native_prepared.insert(key, prepared);
+                }
             }
             let mut shared = SharedInputs {
                 preparation_authentication_tag: None,
@@ -565,6 +583,7 @@ pub(super) fn prepare_report(
                 image_identity: inputs.image_identity.clone(),
                 campaign_inputs_sha256: inputs.campaign_inputs_sha256.clone(),
                 render_metadata: inputs.render_inputs.metadata()?,
+                native_prepared: inputs.native_prepared.clone(),
             };
             shared.preparation_authentication_tag = Some(authenticate(&ledger, &shared)?);
             let mut data = serde_json::to_vec_pretty(&shared)?;
