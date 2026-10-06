@@ -9,6 +9,7 @@ publish = false
 default = ["kernel", "fitting"]
 fitting = ["dep:hft-research-ml"]
 kernel = ["dep:alpha-store"]
+llm = ["dep:reqwest"]
 
 [dependencies]
 hft-cex-research-input = { path = "../../research-core/cex-input", features = ["streaming"] }
@@ -21,7 +22,7 @@ hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 hft-research-manifest = { path = "../../research-core/manifest" }
 hft-research-ml = { path = "../../research-core/ml", optional = true }
 hft-search-kernel = { path = "../../research-core/search-kernel" }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -33,3 +34,8 @@ alpha-store = { path = "../store", features = ["test-support"] }
 hft-core = { path = "../../market-core/core" }
 hft-strategy-formula = { path = "../../strategy-framework/strategies/formula" }
 rust_decimal = { workspace = true }
+
+[[test]]
+name = "llm_live"
+path = "tests/llm_live.rs"
+required-features = ["llm"]

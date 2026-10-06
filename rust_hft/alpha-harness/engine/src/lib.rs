@@ -9,6 +9,7 @@ pub mod final_models;
 pub mod formula_evaluator;
 #[cfg(feature = "kernel")]
 pub mod learning;
+#[cfg(feature = "llm")]
 pub mod llm;
 pub mod market_encoder_study;
 pub mod model_metrics;

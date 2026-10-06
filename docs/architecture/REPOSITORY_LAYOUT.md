@@ -95,9 +95,9 @@ Its feature/target shard writers and `FeatureParquetReader`/`TargetParquetReader
 serve the data-service producer and CEX streaming consumers. The original codec
 has one implementation; `hft-research-manifest` retains pure request, receipt,
 coverage, hash and format-limit contracts. Pure manifest, governance and runtime
-consumers do not import Parquet. The GP engine still enables CEX streaming and
-therefore retains this IO dependency; this extraction does not remove that
-separate dependency.
+consumers do not import Parquet. The `market-parquet` feature explicitly includes
+this IO dependency. Streaming-only GP consumers exclude Parquet and this IO
+dependency.
 
 The build boundary does not grant product or execution authority. Existing
 `ploy-*` names remain compatibility identifiers. New packages use functional
@@ -129,6 +129,13 @@ cluster credentials.
 identity. It imports no venue, scientific model, scheduler, database, risk or
 execution crate. CEX Campaign and holdout object bindings remain CEX-owned.
 The CEX harness contains no Prediction command or Prediction-owned dependency.
+
+`alpha-engine` selects the persistent search kernel and LLM proposals separately.
+The `kernel` feature includes the original budgeted search implementation. The
+`llm` feature includes the original HTTP proposal and failure-critic client.
+The diagnostic CEX harness explicitly enables both; deterministic search callers
+can select `kernel` without including the LLM client in their normal dependency
+graph. Build tools retain their own transport dependencies.
 
 ## Runtime strategy handoff
 
