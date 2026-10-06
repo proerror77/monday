@@ -118,7 +118,9 @@ pub(super) fn from_test_readback_peer(
     Ok(ReadbackBuildRelease { release })
 }
 
-pub(super) fn public_keys(trust: &BuildReleaseTrust) -> anyhow::Result<Vec<[u8; 32]>> {
+pub(in crate::mission_dispatch) fn public_keys(
+    trust: &BuildReleaseTrust,
+) -> anyhow::Result<Vec<[u8; 32]>> {
     trust
         .keys
         .values()

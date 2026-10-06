@@ -425,4 +425,14 @@ fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
     )
     .unwrap();
     native_trust.verify_revocation(&signed).unwrap();
+    let source = store
+        .campaign_platform_terminal_source(&reservation.family_id, &transfer.operation_id)
+        .unwrap();
+    super::super::platform_terminal::tests::assert_original_snapshot_bindings(
+        &source,
+        &fixed.run,
+        &fixed.spec,
+        &native_trust,
+        &witness,
+    );
 }
