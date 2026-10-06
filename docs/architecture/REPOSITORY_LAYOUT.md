@@ -64,6 +64,25 @@ Use the owning manifest for feature matrices. `scripts/cargo-scoped.sh` routes
 explicit package lists to their owners. No default command builds all workspaces.
 Cross-domain path dependencies and their contract tests remain explicit.
 
+### Market data and execution selection
+
+Venue ownership does not combine quote transport with account mutation.
+`hft-live` exposes separate `*-data` and `*-execution` features for its Binance,
+Binance Prediction, Bitget, Bybit, Ondo Perps, Asterdex and Polymarket adapters.
+The existing venue feature selects both. Build with `--no-default-features`
+when selecting a single function; defaults include Bitget execution.
+
+| Function | Interface | Required behavior |
+| --- | --- | --- |
+| Quotes and depth | `hft-ports::MarketStream` | Data-only builds exclude concrete execution adapters; `quotes_only` prevents execution workers |
+| Venue orders and account reports | `hft-ports::ExecutionClient` | Execution-only registration does not require the same venue's data adapter; canonical fresh quote and account checks still apply |
+| Risk, OMS and reconciliation | `risk-control` and the canonical engine | Every accepted intent uses the existing shared order envelope and account authority |
+
+An execution feature only includes an implementation. Signed admission,
+runtime-owned policy and Paper/Shadow/Live gates determine its authority.
+The explicitly configured in-process simulator remains available to replay;
+it does not create another venue execution path.
+
 The shared owner includes `hft-cex-research-input`: immutable CEX DataView contracts,
 bounded binary decoding, and verified batch reuse. Backtest and control consume
 this crate directly. SQL plans and HTTPS acquisition remain in the control
