@@ -2,6 +2,7 @@
 //! no dependency on workflow_run, Actions artifacts, or CI resource controllers.
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use crate::{
     execution::{Backend, Kubernetes, Observation},
@@ -9,6 +10,32 @@ use crate::{
     postgres::Ledger,
     sha256,
 };
+
+type LeasePulse = Pin<Box<dyn Future<Output = Result<Option<crate::orchestrator::Lease>>> + Send>>;
+
+/// Keep a multi-object readback alive only while its same-fence lease can be
+/// renewed. A lost/cancelled fence drops the in-flight HTTP future immediately.
+async fn readback_with_heartbeats<T>(
+    task: &mut Task,
+    reads: impl Future<Output = Result<T>>,
+    period: Duration,
+    mut renew: impl FnMut(Task) -> LeasePulse,
+) -> Result<Option<T>> {
+    tokio::pin!(reads);
+    let mut pulse = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            result = &mut reads => return result.map(Some),
+            _ = pulse.tick() => {
+                let Some(lease) = renew(task.clone()).await? else {
+                    return Ok(None);
+                };
+                task.lease = Some(lease);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -480,36 +507,106 @@ impl Reconciler {
                 // Scientific Jobs additionally require Kubernetes completion.
                 let complete = observed == Observation::Succeeded
                     || locked.task.spec.profile.backend == Backend::AgentSandbox;
-                if complete {
-                    if let Some(readback) = self.artifacts.receipt(&locked.task).await? {
-                        if let Some(science) = &readback.campaign {
-                            self.ledger
-                                .validate_campaign_result(&locked.task, science)
-                                .await?;
-                        }
-                        let now = locked.refresh_clock().await?;
-                        if !locked.task.expire(now)? {
-                            locked.task.stage_result(&lease, now, readback.receipt)?;
-                        }
+                // Artifact reads can involve many independently fetched
+                // objects. Release PG locks while they run and renew only the
+                // same live fence in short transactions. Cancellation and
+                // revocation can then commit during a slow gateway response.
+                let (mut heartbeat_task, _) = locked.release().await?;
+                let read_task = heartbeat_task.clone();
+                let reads = async {
+                    let receipt = if complete {
+                        self.artifacts.receipt(&read_task).await?
+                    } else {
+                        None
+                    };
+                    let checkpoint = if receipt.is_none() {
+                        self.artifacts.checkpoint(&read_task).await?
+                    } else {
+                        None
+                    };
+                    Ok::<_, anyhow::Error>((receipt, checkpoint))
+                };
+                let period = Duration::from_millis((self.lease_ms / 3).clamp(1, 10_000) as u64);
+                let ledger = self.ledger.clone();
+                let lease_ms = self.lease_ms;
+                let Some((readback, checkpoint)) =
+                    readback_with_heartbeats(&mut heartbeat_task, reads, period, move |expected| {
+                        let ledger = ledger.clone();
+                        Box::pin(
+                            async move { ledger.renew_running_lease(&expected, lease_ms).await },
+                        )
+                    })
+                    .await?
+                else {
+                    return Ok(true);
+                };
+
+                // Reacquire the newest revision after I/O. A cancel, revoke,
+                // deadline expiry, or replacement fence makes this readback
+                // observational only; it cannot stage or publish a result.
+                locked = self.ledger.lock_id(&heartbeat_task.id).await?;
+                if locked.task.state != State::Running {
+                    if locked.task.state == State::Stopping {
+                        locked.commit("readback_superseded").await?;
+                    }
+                    return Ok(true);
+                }
+                let current_lease = locked
+                    .task
+                    .lease
+                    .as_ref()
+                    .context("running attempt lacks lease after readback")?
+                    .clone();
+                let expected_lease = heartbeat_task
+                    .lease
+                    .as_ref()
+                    .context("readback attempt lost its lease")?;
+                if current_lease.owner != expected_lease.owner
+                    || current_lease.attempt != expected_lease.attempt
+                    || current_lease.fence != expected_lease.fence
+                    || current_lease.task_id != expected_lease.task_id
+                    || locked.task.deadline_ms > heartbeat_task.deadline_ms
+                {
+                    return Ok(true);
+                }
+                let now = locked.refresh_clock().await?;
+                if locked.task.expire(now)? {
+                    locked.commit("readback_expired").await?;
+                    return Ok(true);
+                }
+                let Some(native_deadline) = locked.native_request_deadline_ms().await? else {
+                    locked.task.stop(State::Cancelled, false)?;
+                    locked.commit("readback_admission_revoked").await?;
+                    return Ok(true);
+                };
+                if native_deadline <= now {
+                    locked.task.stop(State::Cancelled, false)?;
+                    locked.commit("readback_admission_expired").await?;
+                    return Ok(true);
+                }
+                if let Some(deadline) = locked.task.deadline_ms.as_mut() {
+                    *deadline = (*deadline).min(native_deadline);
+                }
+                lease = current_lease;
+                if let Some(readback) = readback {
+                    if let Some(science) = &readback.campaign {
+                        self.ledger
+                            .validate_campaign_result(&locked.task, science)
+                            .await?;
+                    }
+                    locked.task.stage_result(&lease, now, readback.receipt)?;
+                }
+                if locked.task.state == State::Running {
+                    if let Some(checkpoint) = checkpoint {
+                        locked.task.stage_checkpoint(&lease, now, checkpoint)?;
                     }
                 }
                 if locked.task.state == State::Running {
-                    if let Some(checkpoint) = self.artifacts.checkpoint(&locked.task).await? {
-                        let now = locked.refresh_clock().await?;
-                        if !locked.task.expire(now)? {
-                            locked.task.stage_checkpoint(&lease, now, checkpoint)?;
-                        }
-                    }
-                }
-                if locked.task.state == State::Running {
-                    let now = locked.refresh_clock().await?;
-                    if !locked.task.expire(now)? {
-                        lease = locked.task.heartbeat(&lease, now, self.lease_ms)?;
-                        ensure!(
-                            lease.owner == self.owner,
-                            "cannot renew another owner's live lease"
-                        );
-                    }
+                    lease = locked.task.heartbeat(&lease, now, self.lease_ms)?;
+                    ensure!(
+                        lease.owner == self.owner,
+                        "cannot renew another owner's live lease"
+                    );
                 }
             }
         }
@@ -674,6 +771,7 @@ mod tests {
                     let received = received.clone();
                     async move {
                         *received.lock().unwrap().entry(key.clone()).or_default() += 1;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
                         match objects.get(&key) {
                             Some(bytes) => (reqwest::StatusCode::OK, bytes.clone()),
                             None => (reqwest::StatusCode::NOT_FOUND, Vec::new()),
@@ -691,12 +789,34 @@ mod tests {
             base,
             token: "fixture".into(),
         };
-        let result = gateway.receipt(&task).await;
+        let mut heartbeat_task = task.clone();
+        let pulses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pulse_count = pulses.clone();
+        let result = readback_with_heartbeats(
+            &mut heartbeat_task,
+            gateway.receipt(&task),
+            Duration::from_millis(50),
+            move |mut expected| {
+                let pulse_count = pulse_count.clone();
+                Box::pin(async move {
+                    pulse_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let lease = expected
+                        .lease
+                        .as_mut()
+                        .context("fixture task lacks lease")?;
+                    lease.expires_ms += 1000;
+                    Ok(Some(lease.clone()))
+                })
+            },
+        )
+        .await;
         server.abort();
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("artifact readback rejected"));
+        assert!(pulses.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(heartbeat_task.lease.unwrap().expires_ms > lease.expires_ms);
         assert_eq!(requests.lock().unwrap().get(&block_key), Some(&1));
         Ok(())
     }
