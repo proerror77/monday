@@ -16,6 +16,7 @@ pub(super) struct Attempt {
     pub settlement: Option<CampaignAttemptSettlementV1>,
     pub dispatch: Option<CampaignDispatchClaimV1>,
     pub platform_transfer: Option<CampaignPlatformTransferV1>,
+    pub platform_audit: Option<CampaignPlatformTerminalAuditV1>,
     pub terminal_pod_uid: Option<String>,
     pub cancellation: Option<CampaignDispatchCancellationV1>,
     pub completion_provenance: Option<CampaignDispatchCompletionProvenanceV1>,
@@ -48,6 +49,12 @@ impl State {
             .filter(|a| root.is_none_or(|id| a.reservation.root_grant_sha256 == id))
         {
             match &a.settlement {
+                None if a.platform_audit.is_some() => {
+                    // The original full debit stays charged. Science metrics
+                    // in the audit never lower this conservative accounting.
+                    usage.uncertain_trials =
+                        add(usage.uncertain_trials, a.reservation.declared_trials)?
+                }
                 None => {
                     usage.pending_trials = add(usage.pending_trials, a.reservation.declared_trials)?
                 }
@@ -288,6 +295,7 @@ impl State {
                         settlement: None,
                         dispatch: None,
                         platform_transfer: None,
+                        platform_audit: None,
                         terminal_pod_uid: None,
                         cancellation: None,
                         completion_provenance: None,
@@ -320,6 +328,21 @@ impl State {
                     return Err(err("platform transfer root is revoked"));
                 }
                 attempt.platform_transfer = Some(transfer.clone());
+            }
+            CampaignLedgerEventV1::PlatformSettled { audit } => {
+                let attempt = self
+                    .attempts
+                    .get_mut(&audit.transfer.operation_id)
+                    .ok_or_else(|| err("platform audit has no reservation"))?;
+                audit.validate_against(&attempt.reservation, receipt.recorded_at)?;
+                if attempt.platform_transfer.as_ref() != Some(&audit.transfer)
+                    || attempt.dispatch.is_some()
+                    || attempt.settlement.is_some()
+                    || attempt.platform_audit.is_some()
+                {
+                    return Err(err("platform audit has no exclusive original transfer"));
+                }
+                attempt.platform_audit = Some((**audit).clone());
             }
             CampaignLedgerEventV1::DispatchClaimed {
                 operation_id,
