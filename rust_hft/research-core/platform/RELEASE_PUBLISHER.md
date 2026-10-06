@@ -73,9 +73,11 @@ resulting BuildArtifact. `MONDAY_RESEARCH_DATABASE_URL` must refer to the dedica
 Build importer role; installing schema/roles remains an independent operation.
 
 ACR wiring uses `MONDAY_RESEARCH_RELEASE_POLICY` and
-`MONDAY_RESEARCH_RELEASE_GATEWAY` variables plus dedicated
-`MONDAY_RESEARCH_RELEASE_SIGNING_KEY` and
-`MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN` secrets. Missing configuration blocks
+`MONDAY_RESEARCH_RELEASE_GATEWAY` and `MONDAY_RESEARCH_RELEASE_BROKER` variables
+plus the dedicated `MONDAY_RESEARCH_RELEASE_SIGNING_KEY` secret.
+The [per-job capability exchange](RELEASE_CAPABILITY.md) replaces the static
+gateway token secret. It obtains Reader scope before registry writes and exact
+source/Build Publisher scope after the native plan. Missing configuration blocks
 research publication before registry writes. PG projection is explicitly enabled
 only by `MONDAY_RESEARCH_RELEASE_IMPORT_ENABLED=true` and requires the dedicated
 `MONDAY_RESEARCH_RELEASE_IMPORT_DATABASE_URL` secret. Public plan/artifact

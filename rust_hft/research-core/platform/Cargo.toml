@@ -65,6 +65,11 @@ name = "research-release-publisher"
 path = "src/bin/research-release-publisher.rs"
 required-features = ["publisher"]
 
+[[bin]]
+name = "research-release-capability"
+path = "src/bin/research-release-capability.rs"
+required-features = ["publisher"]
+
 [dev-dependencies]
 tempfile = "3"
 
