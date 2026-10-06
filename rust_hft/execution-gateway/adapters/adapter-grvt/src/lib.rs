@@ -223,10 +223,9 @@ impl ExecutionClient for GrvtExecutionClient {
     }
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
-        // 私有 WS 回報需 Cookie + X-Grvt-Account-Id；未提供明確 stream 名稱，此處先回傳空流
-        let (_tx, rx) = mpsc::unbounded_channel::<HftResult<ExecutionEvent>>();
-        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-        Ok(Box::pin(stream))
+        Err(HftError::Config(
+            "GRVT private execution stream is not implemented".to_string(),
+        ))
     }
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
@@ -264,7 +263,11 @@ impl ExecutionClient for GrvtExecutionClient {
     }
 
     async fn connect(&mut self) -> HftResult<()> {
-        self.login().await
+        // REST login is available to read-only queries, but cannot establish
+        // an execution connection while order submission and private WS are absent.
+        Err(HftError::Config(
+            "GRVT execution connection is not implemented".to_string(),
+        ))
     }
 
     async fn disconnect(&mut self) -> HftResult<()> {
@@ -273,7 +276,7 @@ impl ExecutionClient for GrvtExecutionClient {
 
     async fn health(&self) -> ConnectionHealth {
         ConnectionHealth {
-            connected: true,
+            connected: false,
             latency_ms: None,
             last_heartbeat: 0,
         }
@@ -283,6 +286,34 @@ impl ExecutionClient for GrvtExecutionClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn unsupported_execution_never_reports_a_healthy_connection() {
+        let mut client = GrvtExecutionClient::new(GrvtExecutionConfig::default());
+
+        assert!(!client.health().await.connected);
+        assert!(client.connect().await.is_err());
+        assert!(!client.health().await.connected);
+        assert!(client.state.lock().await.cookie.is_none());
+        client.disconnect().await.unwrap();
+        assert!(!client.health().await.connected);
+    }
+
+    #[tokio::test]
+    async fn unsupported_execution_stream_rejects_subscription_instead_of_ending_normally() {
+        let client = GrvtExecutionClient::new(GrvtExecutionConfig::default());
+
+        match client.execution_stream().await {
+            Err(error) => assert!(error.to_string().contains("stream is not implemented")),
+            Ok(mut stream) => {
+                let first =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+                        .await;
+                panic!("unsupported execution subscription succeeded: first event {first:?}");
+            }
+        }
+    }
 
     #[test]
     fn parse_open_orders_response_accepts_authoritative_empty_array() {
