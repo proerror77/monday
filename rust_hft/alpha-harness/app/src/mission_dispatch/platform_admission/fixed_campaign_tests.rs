@@ -194,9 +194,21 @@ fn exercise_exact_native_task(represented: bool) {
         now,
     )
     .unwrap();
+    let mut store = AlphaStore::open_in_memory().unwrap();
+    store.record_approval(&ApprovalRecord {
+        approval_id: "native-export-approval".into(), approval_class: "campaign_root".into(), subject_id: root.grant().root_id.clone(),
+        payload: json!({"grant_sha256":root.content_sha256(),"family_id":root.grant().family.family_id}), signer_id: Some("authority".into()),
+        valid_from: Some(root.grant().valid_from), expires_at: Some(root.grant().expires_at), revoked_at: None,
+        revoked_by: None, revocation_reason: None, created_at: root.grant().valid_from,
+    }).unwrap();
+    store
+        .register_campaign_root(&root, "native-export-approval", now)
+        .unwrap();
     let (validated, manifest, inspection) = if represented {
         let original = validated.request_sha256.clone();
-        fixture.bind_representation_for_tests(&root).unwrap();
+        fixture
+            .bind_representation_for_tests(&root, &store)
+            .unwrap();
         for changed_source in ["unknown", "abcdef0123456789abcdef0123456789abcdef01"] {
             let mut changed = fixture.request.clone();
             changed.build_source_revision = changed_source.into();
@@ -245,16 +257,6 @@ fn exercise_exact_native_task(represented: bool) {
     } else {
         (validated, manifest, inspection)
     };
-    let mut store = AlphaStore::open_in_memory().unwrap();
-    store.record_approval(&ApprovalRecord {
-        approval_id: "native-export-approval".into(), approval_class: "campaign_root".into(), subject_id: root.grant().root_id.clone(),
-        payload: json!({"grant_sha256":root.content_sha256(),"family_id":root.grant().family.family_id}), signer_id: Some("authority".into()),
-        valid_from: Some(root.grant().valid_from), expires_at: Some(root.grant().expires_at), revoked_at: None,
-        revoked_by: None, revocation_reason: None, created_at: root.grant().valid_from,
-    }).unwrap();
-    store
-        .register_campaign_root(&root, "native-export-approval", now)
-        .unwrap();
     let reservation = inspection.reservation(&root);
     store
         .reserve_campaign_attempt(&root, &reservation, now)
@@ -554,9 +556,17 @@ fn representation_https_canonical_freeze_finalize_binds_exact_request() {
         now,
     )
     .unwrap();
-    let bound =
-        crate::mission_campaign::tests::representation_https_request_for_tests(&request, &root)
-            .unwrap();
+    let mut store = AlphaStore::open_in_memory().unwrap();
+    store.record_approval(&ApprovalRecord {approval_id:"https-planning-approval".into(),approval_class:"campaign_root".into(),subject_id:root.grant().root_id.clone(),
+        payload:json!({"grant_sha256":root.content_sha256(),"family_id":root.grant().family.family_id}),signer_id:Some("authority".into()),
+        valid_from:Some(root.grant().valid_from),expires_at:Some(root.grant().expires_at),revoked_at:None,revoked_by:None,revocation_reason:None,created_at:root.grant().valid_from}).unwrap();
+    store
+        .register_campaign_root(&root, "https-planning-approval", now)
+        .unwrap();
+    let bound = crate::mission_campaign::tests::representation_https_request_for_tests(
+        &request, &root, &store, &objects,
+    )
+    .unwrap();
     assert_ne!(bound.campaign_id, request.campaign_id);
     assert_ne!(
         hft_research_platform::sha256(&crate::mission_campaign::serialize_request(&bound).unwrap()),

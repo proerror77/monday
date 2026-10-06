@@ -5971,6 +5971,7 @@ pub(crate) mod tests {
         pub(crate) fn bind_representation_for_tests(
             &mut self,
             root: &alpha_domain::campaign_control::VerifiedCampaignRootGrant,
+            store: &alpha_store::AlphaStore,
         ) -> anyhow::Result<()> {
             let original_request_sha = self.inputs.request_sha256().to_owned();
             let original_inputs_sha = self.request.campaign_inputs_sha256.clone();
@@ -5980,7 +5981,6 @@ pub(crate) mod tests {
                 .as_ref()
                 .context("missing fixture prepared input")?;
             let original_reference = original.clone();
-            representation::bind_native_request_for_test(&mut self.request, root)?;
             if self.request.campaign_inputs_sha256 != original_inputs_sha
                 || self.request.campaign_inputs_sha256
                     != root.grant().execution.campaign_inputs_sha256
@@ -6031,6 +6031,47 @@ pub(crate) mod tests {
                     }
                     Ok(bytes)
                 }
+            }
+            let keys = self._root.path().join("planning-current-trust.json");
+            std::fs::write(
+                &keys,
+                serde_json::to_vec(&std::collections::BTreeMap::from([(
+                    root.signed_grant().key_id.clone(),
+                    hex::encode(root.verifying_key().as_bytes()),
+                )]))?,
+            )?;
+            let receipt = std::fs::read(self.augmented_receipt_path())?;
+            let original_request = self.request.clone();
+            let collection = self.inputs.prepared().manifest().clone();
+            let plan = crate::mission_dispatch::admission::planning_view::with_fixture_view(
+                store,
+                root,
+                &keys,
+                &original_request,
+                &receipt,
+                |expected, guard| {
+                    guard()?;
+                    let mut source = FrozenBlocks {
+                        root: self._root.path().to_path_buf(),
+                        declared: original_reference.block_urls.clone(),
+                    };
+                    let verified = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+                        &original_request,
+                        expected,
+                        collection.clone(),
+                        &mut source,
+                        1024 * 1024 * 1024,
+                    )?;
+                    guard()?;
+                    Ok(verified)
+                },
+                |scope| representation::prepared_plan_for_fixture(scope, root),
+            )?;
+            self.request.research_plan = plan;
+            if self.request.campaign_inputs_sha256 != original_inputs_sha
+                || self.request.prepared_inputs.as_ref() != Some(&original_reference)
+            {
+                bail!("column selection changed the frozen DataReady identity");
             }
             let mut source = FrozenBlocks {
                 root: self._root.path().to_path_buf(),
@@ -6360,7 +6401,9 @@ pub(crate) mod tests {
         let mut receipt: CampaignInputsReceipt =
             serde_json::from_slice(&std::fs::read(fixture.augmented_receipt_path())?)?;
         receipt.prepared_inputs = Some(reference.clone());
-        let input_sha = hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&receipt)?);
+        let receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
+        let input_sha = hft_cex_research_input::sha256(&receipt_bytes);
+        objects.insert(format!("{ORIGIN}/data-ready.json"), receipt_bytes);
         let request = build_request_from_parts(
             "",
             &fixture.request.feature_sha256,
@@ -6394,8 +6437,62 @@ pub(crate) mod tests {
     pub(crate) fn representation_https_request_for_tests(
         request: &CampaignRequest,
         authority: &alpha_domain::campaign_control::VerifiedCampaignRootGrant,
+        store: &alpha_store::AlphaStore,
+        objects: &std::collections::BTreeMap<String, Vec<u8>>,
     ) -> anyhow::Result<CampaignRequest> {
-        let plan = representation::research_plan_for_native_test(request, authority)?;
+        let keys_dir = tempfile::tempdir()?;
+        let keys = keys_dir.path().join("planning-current-trust.json");
+        std::fs::write(
+            &keys,
+            serde_json::to_vec(&std::collections::BTreeMap::from([(
+                authority.signed_grant().key_id.clone(),
+                hex::encode(authority.verifying_key().as_bytes()),
+            )]))?,
+        )?;
+        let receipt = objects
+            .get("https://unit.oss-ap-northeast-1-internal.aliyuncs.com/research/data-ready.json")
+            .context("missing exact published DataReady fixture")?;
+        let plan = crate::mission_dispatch::admission::planning_view::with_fixture_view(
+            store,
+            authority,
+            &keys,
+            request,
+            receipt,
+            |expected, guard| {
+                guard()?;
+                let reference = request
+                    .prepared_inputs
+                    .as_ref()
+                    .context("missing collection")?;
+                let collection: hft_cex_research_input::campaign::CampaignPreparedInputsV1 =
+                    serde_json::from_slice(
+                        objects
+                            .get(&reference.collection_url)
+                            .context("missing exact fixture collection")?,
+                    )?;
+                let mut bytes = std::collections::BTreeMap::new();
+                for (sha, url) in &reference.block_urls {
+                    guard()?;
+                    bytes.insert(
+                        sha.clone(),
+                        objects
+                            .get(url)
+                            .context("missing exact fixture block")?
+                            .clone(),
+                    );
+                }
+                let verified = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+                    request,
+                    expected,
+                    collection,
+                    &mut hft_cex_research_input::prepared::AcquiredBlocks { bytes },
+                    1024 * 1024 * 1024,
+                )?;
+                guard()?;
+                Ok(verified)
+            },
+            |scope| representation::prepared_plan_for_fixture(scope, authority),
+        )?;
         build_request_from_parts(
             "",
             &request.feature_sha256,
@@ -6491,7 +6588,6 @@ pub(crate) mod tests {
                         .representation_binding
                         .as_mut()
                         .unwrap()
-                        .proposal
                         .goal
                         .model
                         .content_sha256 = "0".repeat(64)

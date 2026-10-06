@@ -228,6 +228,29 @@ fn authorize_projection<'a>(
     })
 }
 
+/// Offline composition tests retain the same permission, DataReady and projection guards.
+/// The caller supplies original acquired bytes through the existing opaque decoder.
+#[cfg(all(test, feature = "scientific"))]
+pub(crate) fn with_fixture_view<T>(
+    store: &AlphaStore,
+    root: &VerifiedCampaignRootGrant,
+    trusted_keys: &Path,
+    request: &CampaignRequest,
+    receipt: &[u8],
+    acquire: impl FnOnce(
+        &str,
+        &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<prepared_inputs::VerifiedNativeCampaignPreparedInputs>,
+    action: impl FnOnce(&VerifiedPlanningView<'_>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let permission = store.inspect_campaign_planning_permission(root)?;
+    let scope = authorize_projection(permission, trusted_keys, request, receipt, acquire)?;
+    scope.recheck()?;
+    let output = action(&scope)?;
+    scope.recheck()?;
+    Ok(output)
+}
+
 #[cfg(all(test, feature = "scientific"))]
 pub(crate) mod tests {
     use super::*;

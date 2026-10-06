@@ -431,50 +431,95 @@ impl RepresentationPlanV1 {
     }
 }
 
-/// A request binding, not a signature or an execution grant.
+/// Reuse of existing native columns. This binds a request, not a raw qualification or grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepresentationCampaignBindingV1 {
     pub schema: String,
-    pub capability: DataCapabilityV1,
-    pub proposal: RepresentationPlanV1,
+    /// Prepared reuse binds the native development window with an exclusive end.
+    /// This does not change raw-declaration goal semantics or prove raw label maturity.
+    pub goal: RepresentationGoalV1,
+    pub planning_view: PlanningViewV1,
     pub selected_arm: String,
-    /// Exact software Git identity. The raw dataset revision remains a separate SHA-256 binding.
     pub runner_source_revision: String,
+    pub collection_sha256: String,
+    pub development_rows_sha256: String,
+    pub producer_source_revision: String,
+    pub producer_image_identity: String,
+    pub preparation_run_id: String,
+    pub preparation_receipt_sha256: String,
+    pub feature_sha256: String,
+    pub materialization_sha256: String,
+    pub replay_artifact_sha256: String,
+    pub replay_manifest_sha256: String,
+    pub protocol_sha256: String,
+    pub materialized_columns: Vec<String>,
     pub seeds: Vec<u64>,
-    /// The existing Campaign accounting function determines this value.
     pub declared_total_trials: usize,
 }
 impl RepresentationCampaignBindingV1 {
     pub fn validate(&self) -> Result<(), String> {
+        let git = |value: &str| {
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        };
+        let digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        };
+        self.goal.validate()?;
+        self.planning_view
+            .view
+            .validate()
+            .map_err(|e| e.to_string())?;
+        self.planning_view
+            .permission
+            .validate()
+            .map_err(|e| e.to_string())?;
         if self.schema != "monday.representation_campaign_binding.v1"
-            || self.runner_source_revision.len() != 40
+            || !git(&self.runner_source_revision)
+            || !git(&self.producer_source_revision)
             || !self
-                .runner_source_revision
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || self.proposal.status
-                != RepresentationPlanStatusV1::RequiresDataVerificationAndNativeAdmission
+                .producer_image_identity
+                .rsplit_once("@sha256:")
+                .is_some_and(|(_, sha)| digest(sha))
             || !matches!(
                 self.selected_arm.as_str(),
                 "registered_h1_snapshot_family" | "registered_h2_lagged_ofi_family"
             )
+            || self.planning_view.visibility != PlanningVisibilityV1::Development
+            || self.planning_view.family_id != self.goal.family_id
+            || self.preparation_run_id.is_empty()
             || self.seeds.len() < 2
             || self.seeds.len() > 16
             || self.seeds.iter().collect::<BTreeSet<_>>().len() != self.seeds.len()
             || self.declared_total_trials == 0
+            || self.declared_total_trials > self.goal.resource_limit.trials as usize
+            || self.materialized_columns.is_empty()
+            || self.materialized_columns.len() > 4096
+            || self
+                .materialized_columns
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self.materialized_columns.iter().any(|name| name.is_empty())
+            || [
+                &self.collection_sha256,
+                &self.development_rows_sha256,
+                &self.preparation_receipt_sha256,
+                &self.feature_sha256,
+                &self.materialization_sha256,
+                &self.replay_artifact_sha256,
+                &self.replay_manifest_sha256,
+                &self.protocol_sha256,
+            ]
+            .into_iter()
+            .any(|sha| !digest(sha))
         {
-            return Err("invalid representation Campaign binding".into());
-        }
-        self.proposal
-            .validate_binding(&self.capability, &self.proposal.goal)?;
-        if !self
-            .proposal
-            .arms
-            .iter()
-            .any(|arm| arm.name == self.selected_arm)
-        {
-            return Err("selected representation arm is absent from the validated proposal".into());
+            return Err("invalid prepared-column Campaign binding".into());
         }
         Ok(())
     }

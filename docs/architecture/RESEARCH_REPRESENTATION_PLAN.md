@@ -76,35 +76,30 @@ Software tests establish code behavior. They do not prove real data readiness, t
 This slice provides a library API. CLI registration and Campaign execution belong to their own coordinated slices.
 Unit cases verify software behavior. They do not prove real data coverage, training, profitability, RSI improvement or deployment.
 
-## Binding a proposal to the canonical Campaign
+## Reusing materialized columns in the canonical Campaign
 
-The library exposes `preview_representation_campaign_contracts` and `bind_verified_representation_campaign`.
-The preview reads the existing template and admitted source through `PreparedCexInputs`. It reports actual native contract references.
-The mapper accepts the first slice's opaque raw-verification handle. It emits the existing research-plan JSON with a representation binding.
-The caller supplies one registered arm and the actual seed schedule. H1 and H2 retain their exact nine-field families.
-The existing `--research-plan` path continues through freeze, finalize and dispatch. No separate runner or Run schema is introduced.
+The second slice exposes `preview_representation_campaign_contracts` and `bind_signed_prepared_representation_campaign`.
+Both accept the original control and request paths. They use the shared current Root/Study planning guard before inspecting prepared inputs.
+The binder selects exact registered H1 or H2 columns from the original decoded development projection. It does not regenerate columns.
+A missing `cont_ofi_lag60s` column requires the original producer to prepare it. Its name alone cannot establish raw OFI qualification.
 
-The binding includes the full proposal, capability declaration, selected arm, runner Git revision, seeds and actual Campaign trial charge.
-The runner revision has exactly 40 lowercase hexadecimal characters. Raw data revisions remain separate SHA-256 identities.
-Render, imported request and native admission retain the same actual runner Build revision; neither identity substitutes for the other.
-Every rendered Mission checks the instrument, `forward_mid_return` target, label cadence and horizon, raw source digests and development window.
-Model references include the resolved baseline policy and seeds. Scaling binds the existing training implementation.
-Cost references bind the fixed evaluator costs, position policy and replay policy. Partition references bind the protocol and its row partitions.
-Imported research-plan JSON remains a declaration. Actual native prepared blocks still require the existing opaque data verifier.
+The binding retains the producer Build, preparation Run/receipt, four original outputs, collection, actual development rows and native protocol identities.
+It also binds real column names, the current signed search view, frozen goal and original seed schedule.
+The goal must match the actual renderer's model, training implementation, costs, partitions, instrument, target and window.
+For prepared-column reuse, this is the verified native development window with an exclusive end, including fixed-calendar search rows only.
+It does not claim the raw planner's label endpoint is available. Original decoded anchors and authorized label/replay context remain separate checks.
+Runner Git identities remain separate from raw data SHA-256 revisions.
 
-The actual Campaign accounting function determines trials. Two proposed arms do not mean two scientific trials.
-An ordinary Campaign retains its current GP and supervised-model behavior. A Ridge-only template retains its own current accounting and holding contract.
-The mapper does not claim that selecting a representation bypasses GP. A new direct-input execution mode requires a separate change.
-A fresh representation proposal cannot widen the signed policy revision list or discard its frozen goal during automatic follow-up.
+The binder preserves the existing research template and finite policy revision list. It changes only a registered materialized field family.
+The existing `--research-plan` path continues through freeze, finalize and dispatch. No new Run schema or runner is introduced.
+Original accounting determines the charge. An ordinary GP Campaign retains GP; Ridge-only templates retain their current charge and holding rules.
+The calendar's statistical family bound does not replace the current Campaign reservation.
 
-Dispatch compares the planned family and permission digest with the authenticated current root grant.
-It also checks the actual search-view digest and Job CPU, memory, deadline and trial charge against the frozen goal limits.
-The original approval, revocation, cumulative Root/Study budget and withheld-data gates remain authoritative.
-The full request identity contains the representation binding. The existing native Run configuration and result readback consume that request identity.
+Imported JSON cannot restore a planning permission or raw qualification. Native restoration independently checks the binding against decoded prepared values.
+Dispatch rechecks actual resources, signed search-view identity and current Root permission before original cumulative budget admission.
+The complete canonical request includes the column binding. Existing Run configuration and result readback retain that request identity.
+Prepared metadata and its audit timestamp remain frozen; selecting columns does not re-import or rewrite DataReady.
 
-Software fixtures check model, scaler, cost, partition, target, window, source, arm, registry, seed and resource drift.
-A native assembly test checks that the changed request identity reaches the exact Run configuration.
-The HTTPS protocol fixture freezes publication references before signing its Root. It binds the new canonical Campaign ID and finalized request SHA.
-A private readback seam uses the original production fetcher by default. The fixture registers exact acquired bytes under canonical HTTPS objects.
-It runs the original opaque verifier and rejects data, plan, runner, object and acquisition-byte drift. It performs no network request.
-These checks do not establish a real cloud research result or restore raw verification from JSON.
+Software fixtures use the same current permission guard and original native decoder. They reject goal, source, column and accounting drift.
+The HTTPS protocol fixture freezes mock publication references before Root signing. It checks canonical ID, finalized request SHA and acquired bytes.
+Its private readback seam uses the original fetcher in production. The fixture performs no network request and proves no cloud research result.
