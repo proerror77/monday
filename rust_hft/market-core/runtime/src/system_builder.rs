@@ -3937,8 +3937,14 @@ mod tests {
         let builder = SystemBuilder::new(config).register_market_streams_from_config();
         assert!(builder.market_data_planning_error.is_none());
         assert_eq!(builder.market_stream_plans.len(), 2);
-        assert_eq!(builder.market_stream_plans[0].2[0].symbol, Symbol::new("BTCUSDT"));
-        assert_eq!(builder.market_stream_plans[1].2[0].symbol, Symbol::new("ETHUSDT"));
+        assert_eq!(
+            builder.market_stream_plans[0].2[0].symbol,
+            Symbol::new("BTCUSDT")
+        );
+        assert_eq!(
+            builder.market_stream_plans[1].2[0].symbol,
+            Symbol::new("ETHUSDT")
+        );
     }
 
     #[test]
@@ -3980,8 +3986,14 @@ mod tests {
             .register_market_streams_from_config();
         assert!(builder.market_data_planning_error.is_none());
         assert_eq!(builder.market_stream_plans.len(), 2);
-        assert!(builder.market_stream_plans.iter().any(|p| p.0 == VenueType::Binance));
-        assert!(builder.market_stream_plans.iter().any(|p| p.0 == VenueType::Bitget));
+        assert!(builder
+            .market_stream_plans
+            .iter()
+            .any(|p| p.0 == VenueType::Binance));
+        assert!(builder
+            .market_stream_plans
+            .iter()
+            .any(|p| p.0 == VenueType::Bitget));
     }
 
     #[test]
@@ -4030,5 +4042,99 @@ mod tests {
             .register_strategy(MarketPlanTestStrategy)
             .register_market_streams_from_config();
         assert!(builder.market_data_planning_error.is_some());
+    }
+
+    #[test]
+    fn requested_target_catalog_must_cover_each_strategy_before_sharding() {
+        for account_bound in [false, true] {
+            let mut binance = live_venue_config();
+            binance.name = "binance".into();
+            binance.symbol_catalog = vec![InstrumentId::new("BTCUSDT@BINANCE")];
+            let mut bitget = binance.clone();
+            bitget.name = "bitget".into();
+            bitget.venue_type = VenueType::Bitget;
+            bitget.account_id = Some("bitget-account".into());
+            bitget.symbol_catalog = vec![InstrumentId::new("ETHUSDT@BITGET")];
+            let strategy = configured_strategy();
+            let mut config = SystemConfig {
+                venues: vec![binance, bitget],
+                strategies: vec![strategy.clone()],
+                router: Some(ports::RouterConfig::RoundRobin {
+                    venues: vec!["BINANCE".into(), "BITGET".into()],
+                }),
+                ..Default::default()
+            };
+            if account_bound {
+                config
+                    .strategy_accounts
+                    .insert(strategy.name.clone(), "bitget-account".into());
+            }
+            let builder = SystemBuilder::new(config)
+                .register_market_stream_plan(
+                    VenueType::Binance,
+                    "binance".into(),
+                    vec![Symbol::new("BTCUSDT")],
+                )
+                .with_sharding(crate::ShardConfig::new(
+                    0,
+                    2,
+                    crate::ShardStrategy::SymbolHash,
+                ))
+                .register_market_streams_from_config();
+            assert!(
+                builder.market_data_planning_error.is_some(),
+                "account_bound={account_bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_quote_validation_rejects_foreign_catalog_before_empty_shard() {
+        let mut venue = live_venue_config();
+        venue.name = "prediction".into();
+        venue.venue_type = VenueType::BinancePrediction;
+        venue.symbol_catalog = vec![InstrumentId::new("112233@BINANCE")];
+        venue.data_config = Some(
+            serde_yaml::from_str("outcomes:\n  - token_id: '112233'\n    market_id: 1\n").unwrap(),
+        );
+        let shard = (0..2)
+            .map(|i| crate::ShardConfig::new(i, 2, crate::ShardStrategy::SymbolHash))
+            .find(|s| !s.should_handle(&BaseSymbol::from("112233"), &VenueId::BINANCE))
+            .unwrap();
+        let config = SystemConfig {
+            quotes_only: true,
+            venues: vec![venue],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .with_sharding(shard)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+    }
+
+    #[test]
+    fn requested_quote_validation_checks_outcome_coverage_before_empty_shard() {
+        for yaml in ["{}", "outcomes:\n  - token_id: 'other'\n    market_id: 1\n"] {
+            let mut venue = live_venue_config();
+            venue.name = "prediction".into();
+            venue.venue_type = VenueType::BinancePrediction;
+            venue.symbol_catalog = vec![InstrumentId::new("112233@BINANCE_PREDICTION")];
+            venue.data_config = Some(serde_yaml::from_str(yaml).unwrap());
+            let shard = (0..2)
+                .map(|i| crate::ShardConfig::new(i, 2, crate::ShardStrategy::SymbolHash))
+                .find(|s| {
+                    !s.should_handle(&BaseSymbol::from("112233"), &VenueId::BINANCE_PREDICTION)
+                })
+                .unwrap();
+            let config = SystemConfig {
+                quotes_only: true,
+                venues: vec![venue],
+                ..Default::default()
+            };
+            let builder = SystemBuilder::new(config)
+                .with_sharding(shard)
+                .register_market_streams_from_config();
+            assert!(builder.market_data_planning_error.is_some());
+        }
     }
 }
