@@ -7,10 +7,11 @@ publish = false
 
 [features]
 default = []
-scientific = ["alpha-engine/fitting", "hft-research-platform/artifact-io"]
+scientific = ["alpha-engine/fitting", "hft-research-platform/artifact-io", "dep:hft-cex-search-driver"]
 onnx-compatibility = ["dep:alpha-onnx-evaluator"]
 
 [dependencies]
+hft-cex-search-driver = { path = "../search-driver", optional = true }
 hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["artifact-io", "native-admission", "release-verification", "campaign-result-validation"] }
 hft-cex-research-input = { path = "../../research-core/cex-input", features = ["streaming"] }
 hft-research-artifacts = { path = "../../research-core/artifacts" }
