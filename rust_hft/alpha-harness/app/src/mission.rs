@@ -88,14 +88,15 @@ fn execute_mission_inner(
 
     let manifest =
         data_mission::read_registered_research_dataset(&store, &args.dataset.dataset_manifest)?;
-    if mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
-        bail!("mission dataset id does not match the supplied manifest");
-    }
     let labels = manifest.evaluation_label_spec()?;
     let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
-    let rows = manifest.load_rows(&protocol.costs)?;
-    let evaluation_protocol_hash = protocol.content_hash()?;
-    let dataset = prepare_dataset(rows, &protocol)?;
+    let owned_dataset = prepare_dataset(manifest.load_rows(&protocol.costs)?, &protocol)?;
+    let dataset = &owned_dataset;
+    let manifest_id = manifest.manifest_id().to_string();
+    if mission.dataset_manifest_id.as_str() != manifest_id {
+        bail!("mission dataset id does not match the supplied manifest");
+    }
+    let evaluation_protocol_hash = dataset.protocol().content_hash()?;
     let research_context = dataset.engine_context();
     let research_dataset_sha256 = canonical_json_hash(&research_context.rows())?;
     let research_dataset = CexResearchContentRefV1 {
@@ -127,11 +128,11 @@ fn execute_mission_inner(
         FormulaEvaluator::for_mission(&mission)
     }
     .map_err(anyhow::Error::msg)?;
-    let proposal_engine = build_engine(args, &dataset, &mission, governed_gp)?;
+    let proposal_engine = build_engine(args, dataset, &mission, governed_gp)?;
     let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
     let outcome = kernel.run(
         &args.mission_id,
-        &dataset,
+        dataset,
         RunControl {
             max_new_iterations: args.max_new_iterations,
         },
@@ -147,7 +148,7 @@ fn execute_mission_inner(
             EngineChoice::OfflineRl => ResearchEngineAuthority::LabSearchPolicyOnly,
             _ => ResearchEngineAuthority::CandidateResearchOnly,
         },
-        dataset_manifest_id: manifest.manifest_id().to_string(),
+        dataset_manifest_id: manifest_id,
         research_dataset,
         walk_forward_partition,
     })
@@ -527,6 +528,103 @@ mod tests {
     use chrono::Utc;
     use hft_research_manifest::ManifestId;
     use std::path::PathBuf;
+
+    #[test]
+    #[cfg(feature = "scientific")]
+    fn native_search_driver_rejects_scope_drift_without_spending_trials() -> anyhow::Result<()> {
+        let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
+        let protocol: alpha_domain::EvaluationProtocolV1 =
+            serde_json::from_str(&fixture.inputs.prepared().original_metadata().protocol_json)?;
+        let dataset = alpha_engine::evaluation::prepare_native_campaign_dataset(
+            fixture.inputs.prepared(),
+            &protocol,
+        )?;
+        let fields = vec!["book_imbalance".to_owned()];
+        let budget = SearchBudget {
+            max_candidates: 2,
+            max_expansions: 2,
+            max_tokens: 0,
+            max_seconds: 0,
+        };
+        let policy =
+            CexGpPolicyV1::controlled_v1("native-policy-denial", fields.clone(), 7, &budget)?;
+        let mut store = AlphaStore::open_in_memory()?;
+        let mission = ResearchMission {
+            mission_id: "native-driver-denial".into(),
+            objective: "test rejection".into(),
+            hypothesis_scope: "genuine development rows".into(),
+            mutable_scope: vec!["factor_ast".into()],
+            dataset_manifest_id: ManifestId::new("native-driver-dataset")?,
+            baseline_artifact_id: None,
+            validation_mode: ValidatorMode::MissionValidator,
+            validator_spec: serde_json::json!({}),
+            search_budget: budget,
+            completion_policy: MissionCompletionPolicy::default(),
+            prompt_snapshot_id: None,
+            search_policy_snapshot_id: policy.policy_id.clone(),
+            status: MissionStatus::Pending,
+            terminal_reason: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.create_mission(&mission)?;
+        let invoke = |store: &mut AlphaStore,
+                      data: &alpha_engine::evaluation::PreparedDataset,
+                      expected: &alpha_domain::EvaluationProtocolV1,
+                      selected: &CexGpPolicyV1,
+                      seed| {
+            hft_cex_search_driver::run(
+                store,
+                hft_cex_search_driver::NativeGpRequest {
+                    mission_id: &mission.mission_id,
+                    resume: false,
+                    dataset: data,
+                    original_manifest_id: mission.dataset_manifest_id.as_str(),
+                    expected_protocol: expected,
+                    feature_fields: &fields,
+                    seed,
+                    policy: selected,
+                    candidate_namespace: "native-denial",
+                    max_new_iterations: Some(1),
+                },
+            )
+        };
+        let mut wrong_protocol = protocol.clone();
+        wrong_protocol.costs.fee_bps += 1.0;
+        assert!(invoke(&mut store, &dataset, &wrong_protocol, &policy, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("protocol"));
+        assert!(invoke(&mut store, &dataset, &protocol, &policy, 8)
+            .unwrap_err()
+            .to_string()
+            .contains("frozen policy"));
+        let mut wrong_budget = policy.clone();
+        wrong_budget.budget.max_candidates += 1;
+        assert!(invoke(&mut store, &dataset, &protocol, &wrong_budget, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("frozen policy"));
+        let mut generic_protocol = protocol.clone();
+        generic_protocol.walk_forward.initial_train_rows = 20;
+        generic_protocol.walk_forward.validation_rows = 5;
+        generic_protocol.walk_forward.fold_count = 1;
+        generic_protocol.walk_forward.purge_rows = 20;
+        generic_protocol.walk_forward.embargo_rows = 1;
+        generic_protocol.walk_forward.sealed_holdout_rows = 10;
+        let generic =
+            prepare_dataset(fixture.inputs.prepared().rows().to_vec(), &generic_protocol)?;
+        assert!(invoke(&mut store, &generic, &protocol, &policy, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("metadata-only withheld"));
+        let lineage = store.mission_lineage(&mission.mission_id)?;
+        assert!(lineage.iterations.is_empty());
+        assert!(lineage.candidates.is_empty());
+        assert!(lineage.evaluations.is_empty());
+        assert_eq!(lineage.mission.status, MissionStatus::Pending);
+        Ok(())
+    }
 
     #[test]
     fn live_feature_fields_reject_mixed_event_domains() {

@@ -928,7 +928,7 @@ pub(crate) struct PreparedCexInputs {
     _feature_artifacts: Option<tempfile::TempDir>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreparedCexInputMetadata {
     materialization_json: String,
@@ -946,6 +946,13 @@ impl PreparedCexInputs {
         })
     }
 
+    pub(crate) fn native_metadata(&self) -> anyhow::Result<PreparedCexInputMetadata> {
+        let mut metadata = self.metadata()?;
+        // The importer staging file is not an allowed worker transport. Preserve
+        // every original content, row, clock and provenance fact independently.
+        metadata.feature_manifest.artifact_path = std::path::PathBuf::new();
+        Ok(metadata)
+    }
     /// The preparation controller must first authenticate the enclosing receipt
     /// against its independently retained digest and source/input bindings.
     pub(crate) fn restore_metadata(
@@ -978,6 +985,13 @@ impl PreparedCexInputs {
         })
     }
 
+    #[cfg(feature = "scientific")]
+    pub(crate) fn materialization_bytes(&self) -> &[u8] {
+        &self.materialization_bytes
+    }
+    pub(crate) fn feature_manifest(&self) -> &FeatureDatasetManifest {
+        &self.feature_manifest
+    }
     pub(crate) fn materialization(&self) -> &crate::mission_runner::Materialization {
         &self.materialization
     }
@@ -1048,6 +1062,22 @@ impl PreparedCexInputs {
             bail!("trusted preparation snapshot lacks this development precheck");
         }
         Ok(())
+    }
+    pub(crate) fn native_source_rows(
+        &self,
+        protocol: &alpha_domain::EvaluationProtocolV1,
+    ) -> anyhow::Result<Vec<alpha_engine::evaluation::ResearchRow>> {
+        let mut rows = self
+            .feature_rows
+            .as_ref()
+            .context("native prepared export requires the original admitted rows")?
+            .clone();
+        for row in &mut rows {
+            row.fee_bps = protocol.costs.fee_bps;
+            row.funding_bps = protocol.costs.funding_bps;
+            row.latency_bps = protocol.costs.latency_bps;
+        }
+        Ok(rows)
     }
     pub(crate) fn feature_sha256(&self) -> &str {
         &self.feature_sha256

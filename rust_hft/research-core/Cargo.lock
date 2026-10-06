@@ -98,12 +98,14 @@ dependencies = [
  "alpha-onnx-evaluator",
  "alpha-store",
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "ed25519-dalek",
  "hex",
  "hft-backtest",
  "hft-cex-research-input",
+ "hft-cex-search-driver",
  "hft-collector",
  "hft-factor-dsl",
  "hft-governance-contracts",
@@ -111,8 +113,11 @@ dependencies = [
  "hft-research-artifacts",
  "hft-research-dispatch-io",
  "hft-research-manifest",
+ "hft-research-platform",
  "parquet",
  "reqwest",
+ "rustix 0.38.44",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -3127,6 +3132,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-cex-search-driver"
+version = "0.1.0"
+dependencies = [
+ "alpha-domain",
+ "alpha-engine",
+ "alpha-store",
+ "anyhow",
+ "serde_json",
+]
+
+[[package]]
 name = "hft-collector"
 version = "0.2.0"
 dependencies = [
@@ -3379,6 +3395,23 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hft-research-platform"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "hft-cex-research-input",
+ "reqwest",
+ "rustix 0.38.44",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -5200,12 +5233,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.7",
 ]
@@ -6860,6 +6895,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
