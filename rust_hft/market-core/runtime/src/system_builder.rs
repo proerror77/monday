@@ -3849,4 +3849,75 @@ mod tests {
             assert!(target.adapter_bridge.is_none());
         }
     }
+
+    #[test]
+    fn market_data_scope_rejects_account_and_actual_instance_route_conflict() {
+        let mut binance = live_venue_config();
+        binance.account_id = Some("binance-account".into());
+        let mut okx = binance.clone();
+        okx.name = "okx-control".into();
+        okx.account_id = Some("okx-account".into());
+        okx.venue_type = VenueType::Okx;
+        let config = SystemConfig {
+            venues: vec![binance, okx],
+            strategy_accounts: HashMap::from([(
+                "manual-market-plan:BTCUSDT".into(),
+                "binance-account".into(),
+            )]),
+            router: Some(ports::RouterConfig::StrategyMap {
+                strategy_venues: HashMap::from([(
+                    "manual-market-plan:BTCUSDT".into(),
+                    "OKX".into(),
+                )]),
+                default_venue: "BINANCE".into(),
+            }),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+    }
+
+    #[test]
+    fn market_data_scope_rejects_unrelated_manual_plan_for_typed_strategy() {
+        let mut first = live_venue_config();
+        first.account_id = Some("binance-first".into());
+        let mut second = first.clone();
+        second.name = "binance-second".into();
+        second.account_id = Some("binance-second".into());
+        let strategy = StrategyConfig {
+            name: "typed-binance".into(),
+            strategy_type: StrategyType::Formula,
+            symbols: vec![Symbol::new("BTCUSDT")],
+            params: StrategyParams::Formula {
+                ast: hft_factor_dsl::FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                    "book_imbalance".into(),
+                )),
+                max_order_notional: Decimal::ONE,
+                signal_threshold: 0.0,
+                target_position: false,
+                evaluation_interval_millis: None,
+                execution_contract: Some(FormulaExecutionContract {
+                    venue: VenueId::BINANCE,
+                    venue_spec: ports::VenueSpec::default(),
+                    cross_spread: false,
+                }),
+            },
+            risk_limits: StrategyRiskLimits::default(),
+        };
+        let config = SystemConfig {
+            venues: vec![first, second],
+            strategies: vec![strategy],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_market_stream_plan(
+                VenueType::Bitget,
+                "unrelated-bitget".into(),
+                vec![Symbol::new("BTCUSDT")],
+            )
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+    }
 }
