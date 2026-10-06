@@ -104,6 +104,7 @@ acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
   abort 'incorrect release boundary' unless upload.fetch('with').fetch('path')=='${{ runner.temp }}/research-image-release.tar' && upload.fetch('with').fetch('if-no-files-found')=='error'
 end
 publication=acr.fetch('jobs').fetch('publish')
+abort 'release job cannot obtain its own OIDC identity' unless publication.fetch('permissions')=={'actions'=>'read','checks'=>'read','contents'=>'read','id-token'=>'write'}
 abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']
 steps=publication.fetch('steps')
 presence=steps.index { |s|s.fetch('name','')=='Require research publication settings before preparation' }
@@ -114,19 +115,26 @@ login=steps.index { |s|s.fetch('name','')=='Log in to ACR' }
 push=steps.index { |s|s.fetch('name','')=='Build and push' }
 abort 'issuer policy/TLS validation occurs after registry mutation' unless preflight && login && push && preflight<login && preflight<push
 abort 'issuer compilation can access injected release credentials' unless compile && compile<preflight && steps.fetch(compile).fetch('if')=='matrix.research_artifact' && steps.fetch(compile).fetch('env').keys==['CARGO_TARGET_DIR'] && steps.fetch(compile).fetch('run').include?('cargo build')
+abort 'capability exchange was not compiled before secrets' unless steps.fetch(compile).fetch('run').include?('--bin research-release-capability')
 abort 'missing settings can reach expensive publication preparation' unless presence && download && presence<download && presence<compile && steps.fetch(presence).fetch('if')=='matrix.research_artifact' && steps.fetch(presence).fetch('run').include?('publish-research-build-release.sh check-presence')
 presence_env=steps.fetch(presence).fetch('env')
 expected_presence={
   'MONDAY_RELEASE_POLICY_PRESENT'=>"${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}",
   'MONDAY_RELEASE_SIGNING_KEY_PRESENT'=>"${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}",
   'MONDAY_RELEASE_GATEWAY_PRESENT'=>"${{ vars.MONDAY_RESEARCH_RELEASE_GATEWAY != '' }}",
-  'MONDAY_RELEASE_GATEWAY_TOKEN_PRESENT'=>"${{ secrets.MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN != '' }}",
+  'MONDAY_RELEASE_BROKER_PRESENT'=>"${{ vars.MONDAY_RESEARCH_RELEASE_BROKER != '' }}",
   'MONDAY_RELEASE_IMPORT_ENABLED'=>"${{ vars.MONDAY_RESEARCH_RELEASE_IMPORT_ENABLED == 'true' }}",
   'MONDAY_RELEASE_IMPORT_DATABASE_URL_PRESENT'=>"${{ secrets.MONDAY_RESEARCH_RELEASE_IMPORT_DATABASE_URL != '' }}"
 }
 abort 'cheap configuration check receives credentials or loses optional importer binding' unless presence_env==expected_presence
 wrapper=File.read(File.join(File.dirname(ARGV[0]),'../scripts/publish-research-build-release.sh'))
 abort 'issuer wrapper compiles while holding release credentials' if wrapper.match?(/\bcargo\s+(?:build|run)\b/)
+abort 'static gateway credential still authorizes publication' if steps.any? { |s| s.fetch('env',{}).values.any? { |v| v.to_s.include?('secrets.MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN') } }
+abort 'source preflight or readonly import capability exchange missing' unless wrapper.include?('"$capability" source') && wrapper.include?('"$capability" read')
+plan=wrapper.index('"${native[@]}" plan')
+exchange=wrapper.index('"$capability" publish')
+sign=wrapper.index('"${native[@]}" publish')
+abort 'Build writing is not scoped from the actual native plan before signing' unless plan && exchange && sign && plan<exchange && exchange<sign
 config=steps.fetch(preflight)
 abort 'issuer preflight does not bind the selected image product' unless config.fetch('if')=='matrix.research_artifact' && config.fetch('env').fetch('PRODUCT')=='${{ matrix.product }}' && config.fetch('env').fetch('PUBLISH_IMAGE_REPOSITORY')=='${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}' && config.fetch('run').include?('publish-research-build-release.sh check-config')
 readback=publication.fetch('steps').find { |s|s.fetch('name','')=='Read back research image source and executable bytes' }
@@ -144,7 +152,7 @@ Dir.mktmpdir('release-presence-contract') do |sandbox|
   base={'PATH'=>sandbox,'TMPDIR'=>sandbox,'RUNNER_TEMP'=>sandbox,
     'MONDAY_RELEASE_SIGNING_KEY'=>'private-key-must-not-appear',
     'MONDAY_RELEASE_GATEWAY_TOKEN'=>'private-token-must-not-appear'}
-  present=%w[POLICY SIGNING_KEY GATEWAY GATEWAY_TOKEN].to_h { |name| ["MONDAY_RELEASE_#{name}_PRESENT",'true'] }
+  present=%w[POLICY SIGNING_KEY GATEWAY BROKER].to_h { |name| ["MONDAY_RELEASE_#{name}_PRESENT",'true'] }
   run=lambda do |env,mode|
     stdout,stderr,status=Open3.capture3(base.merge(env),'/bin/bash',wrapper,mode,unsetenv_others:true)
     abort 'configuration preflight wrote private files' unless Dir.children(sandbox).empty?
@@ -153,11 +161,13 @@ Dir.mktmpdir('release-presence-contract') do |sandbox|
   end
   text,ok=run.call({},'check-presence')
   abort 'missing release settings were admitted' if ok
-  %w[POLICY SIGNING_KEY GATEWAY GATEWAY_TOKEN].each do |name|
+  %w[POLICY SIGNING_KEY GATEWAY BROKER].each do |name|
     abort "operator diagnostic omitted repository setting #{name}" unless text.include?("MONDAY_RESEARCH_RELEASE_#{name}")
   end
   _,ok=run.call(present,'check-presence')
   abort 'configured publication requires a compiler or credentials during cheap preflight' unless ok
+  _,ok=run.call(present.merge('MONDAY_RELEASE_BROKER_PRESENT'=>'false','MONDAY_RELEASE_GATEWAY_TOKEN_PRESENT'=>'true'),'check-presence')
+  abort 'old static secret presence bypassed the missing broker' if ok
   text,ok=run.call(present.merge('MONDAY_RELEASE_IMPORT_ENABLED'=>'true'),'check-presence')
   abort 'enabled PG import can fail only after publication' if ok
   abort 'missing importer setting was not identified' unless text.include?('MONDAY_RESEARCH_RELEASE_IMPORT_DATABASE_URL')
