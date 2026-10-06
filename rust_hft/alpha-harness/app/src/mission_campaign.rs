@@ -9,6 +9,7 @@ pub(crate) mod market_encoder;
 mod platform_output;
 pub(crate) mod preparation;
 pub(crate) mod prepared_inputs;
+pub(crate) mod representation;
 pub(crate) mod sequence;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -93,6 +94,21 @@ fn declared_total_trials_for_rounds(
     round_count: usize,
 ) -> anyhow::Result<usize> {
     let gp_trials = research_plan.max_candidates()?;
+    declared_trials_from_candidate_count(research_plan, round_count, gp_trials)
+}
+
+fn declared_total_trials_for_validated_plan(
+    base: &crate::mission_render::ValidatedCexResearchPlanBase<'_>,
+    round_count: usize,
+) -> anyhow::Result<usize> {
+    declared_trials_from_candidate_count(base.plan(), round_count, base.max_candidates()?)
+}
+
+fn declared_trials_from_candidate_count(
+    research_plan: &CexCampaignResearchPlanV1,
+    round_count: usize,
+    gp_trials: usize,
+) -> anyhow::Result<usize> {
     let per_round = if !research_plan.supervised_model_scope.is_default() {
         gp_trials
             .checked_add(research_plan.supervised_model_scope.names().len())
@@ -1237,6 +1253,14 @@ fn follow_up_plan(
     search_policy_revision: CexCampaignSearchPolicyRevisionV1,
     parent_evidence_signature: CexCampaignResearchEvidenceSignatureV2,
 ) -> anyhow::Result<CexCampaignResearchPlanV1> {
+    if loaded
+        .request
+        .research_plan
+        .representation_binding
+        .is_some()
+    {
+        bail!("representation comparison requires a new validated proposal; automatic follow-up cannot discard its frozen goal");
+    }
     if loaded.request.research_plan.mlp_training.is_some() {
         bail!("paired MLP diagnostics require a new root plan with matched factors and initialization; automatic follow-up is not supported");
     }
@@ -1321,6 +1345,7 @@ fn follow_up_plan(
         }),
         learning_directive: Some(learning_directive),
         llm: None,
+        representation_binding: None,
     };
     plan.validate()?;
     Ok(plan)
@@ -1363,6 +1388,23 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     if final_evaluation::is_final_freeze(&args.freeze)? {
         return final_evaluation::finalize(args);
     }
+    finalize_with_native_readback(args, |request, request_sha256| {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .redirect(Policy::none())
+            .build()?;
+        let readback = tempfile::tempdir().context("native finalized input readback")?;
+        prepared_inputs::acquire_native_prepared(request, request_sha256, &client, readback.path())
+    })
+}
+
+fn finalize_with_native_readback(
+    args: CampaignFinalizeArgs,
+    acquire: impl FnOnce(
+        &CampaignRequest,
+        &str,
+    ) -> anyhow::Result<prepared_inputs::VerifiedNativeCampaignPreparedInputs>,
+) -> anyhow::Result<()> {
     let plan = load_freeze_plan(&args.freeze)?;
     validate_request(&plan.canonical_request)?;
     if expected_campaign_id(&plan.canonical_request)? != plan.canonical_request.campaign_id {
@@ -1372,17 +1414,12 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     let loaded = load_request(&args.signed_request)?;
     validate_request_matches_freeze(&loaded.request, &plan)?;
     if loaded.request.prepared_inputs.is_some() {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .redirect(Policy::none())
-            .build()?;
-        let readback = tempfile::tempdir().context("native finalized input readback")?;
-        let verified = prepared_inputs::acquire_native_prepared(
-            &loaded.request,
-            &loaded.sha256,
-            &client,
-            readback.path(),
-        )?;
+        let verified = acquire(&loaded.request, &loaded.sha256)?;
+        if verified.finalized_request() != &loaded.request
+            || verified.request_sha256() != loaded.sha256
+        {
+            bail!("native finalized readback verified a different request identity");
+        }
         verified.render_inputs();
         research_event(
             "alpha-harness",
@@ -1961,6 +1998,7 @@ fn freeze_prepared_request(
     study_proposal: Option<&CampaignNextFamilyProposalV1>,
 ) -> anyhow::Result<(CampaignRequest, String)> {
     research_plan.validate()?;
+    representation::validate_campaign_seeds(research_plan, seeds)?;
     if research_plan.calendar.is_some() && seeds != [7, 11] {
         bail!("calendar H1 requires exactly seeds 7 and 11");
     }
@@ -3927,6 +3965,7 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign request schema and prepared input kind disagree");
     }
     request.research_plan.validate()?;
+    representation::validate_campaign_request(request)?;
     if request.research_plan.calendar.is_some() {
         if request
             .rounds
@@ -4732,6 +4771,7 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("local test request input kind is invalid");
     }
     request.research_plan.validate()?;
+    representation::validate_campaign_request(request)?;
     validate_campaign_id(&request.campaign_id)?;
     normalized_sha256("campaign image identity", &request.image_identity)?;
     normalized_sha256(
@@ -5928,6 +5968,89 @@ pub(crate) mod tests {
         pub(crate) fn materialization_path(&self) -> &Path {
             &self._source._render_fixture.materialization_path
         }
+        pub(crate) fn bind_representation_for_tests(
+            &mut self,
+            root: &alpha_domain::campaign_control::VerifiedCampaignRootGrant,
+        ) -> anyhow::Result<()> {
+            let original_request_sha = self.inputs.request_sha256().to_owned();
+            let original_inputs_sha = self.request.campaign_inputs_sha256.clone();
+            let original = self
+                .request
+                .prepared_inputs
+                .as_ref()
+                .context("missing fixture prepared input")?;
+            let original_reference = original.clone();
+            representation::bind_native_request_for_test(&mut self.request, root)?;
+            if self.request.campaign_inputs_sha256 != original_inputs_sha
+                || self.request.campaign_inputs_sha256
+                    != root.grant().execution.campaign_inputs_sha256
+                || self.request.prepared_inputs.as_ref() != Some(&original_reference)
+            {
+                bail!("representation fixture changed the existing signed source/data identity");
+            }
+            struct FrozenBlocks {
+                root: PathBuf,
+                declared: std::collections::BTreeMap<String, String>,
+            }
+            impl hft_cex_research_input::data::BlockSource for FrozenBlocks {
+                fn read(
+                    &mut self,
+                    block: &hft_cex_research_input::data::BlockRef,
+                ) -> anyhow::Result<Vec<u8>> {
+                    if !hft_cex_research_input::valid_digest(&block.sha256) {
+                        bail!("frozen fixture block digest is invalid");
+                    }
+                    let expected = self.root.join(format!("{}.mondaybin", block.sha256));
+                    let declared = self
+                        .declared
+                        .get(&block.sha256)
+                        .context("frozen fixture block was not declared")?;
+                    if declared != expected.to_string_lossy().as_ref() {
+                        bail!("frozen fixture block is outside its exact original root/hash path");
+                    }
+                    let metadata = std::fs::symlink_metadata(&expected)?;
+                    if !metadata.is_file()
+                        || metadata.file_type().is_symlink()
+                        || metadata.len() != block.bytes
+                    {
+                        bail!("frozen fixture block is not the declared regular byte object");
+                    }
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(&expected)?
+                        .take(
+                            block
+                                .bytes
+                                .checked_add(1)
+                                .context("fixture byte limit overflow")?,
+                        )
+                        .read_to_end(&mut bytes)?;
+                    if bytes.len() as u64 != block.bytes
+                        || hex::encode(Sha256::digest(&bytes)) != block.sha256
+                    {
+                        bail!("frozen fixture block content differs from the declared hash");
+                    }
+                    Ok(bytes)
+                }
+            }
+            let mut source = FrozenBlocks {
+                root: self._root.path().to_path_buf(),
+                declared: original_reference.block_urls.clone(),
+            };
+            let expected = hex::encode(Sha256::digest(serialize_request(&self.request)?));
+            self.inputs = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+                &self.request,
+                &expected,
+                self.inputs.prepared().manifest().clone(),
+                &mut source,
+                1024 * 1024 * 1024,
+            )?;
+            if self.inputs.request_sha256() == original_request_sha {
+                bail!("representation fixture did not bind the new complete request identity");
+            }
+            validate_request_for_execute(&self.request)?;
+            Ok(())
+        }
+
         pub(crate) fn original_receipt_path(&self) -> PathBuf {
             self._root.path().join("native-source-inputs.json")
         }
@@ -6198,6 +6321,275 @@ pub(crate) mod tests {
         std::fs::write(&fixture.args.request, serialize_request(&request).unwrap()).unwrap();
         fixture.args.request_sha256 = inputs.request_sha256().into();
         fixture._prepared_root = Some(root);
+        Ok(())
+    }
+
+    /// Software publication objects; no network request or cloud readback occurs.
+    pub(crate) fn canonical_https_fixture_for_tests(
+        fixture: &NativePreparedFixture,
+    ) -> anyhow::Result<(CampaignRequest, std::collections::BTreeMap<String, Vec<u8>>)> {
+        const ORIGIN: &str = "https://unit.oss-ap-northeast-1-internal.aliyuncs.com/research";
+        let original = fixture
+            .request
+            .prepared_inputs
+            .as_ref()
+            .context("missing HTTPS fixture prepared reference")?;
+        let mut reference = original.clone();
+        let mut objects = std::collections::BTreeMap::new();
+        reference.collection_url = format!(
+            "{ORIGIN}/native-prepared/{}.json",
+            reference.collection_sha256
+        );
+        objects.insert(
+            reference.collection_url.clone(),
+            serde_json::to_vec(fixture.inputs.prepared().manifest())?,
+        );
+        for (sha, url) in &mut reference.block_urls {
+            let path = original
+                .block_urls
+                .get(sha)
+                .context("missing original exported block")?;
+            let bytes = std::fs::read(path)?;
+            if hft_cex_research_input::sha256(&bytes) != *sha {
+                bail!("original HTTPS fixture block bytes changed");
+            }
+            *url = format!("{ORIGIN}/native-prepared/{sha}.mondaybin");
+            objects.insert(url.clone(), bytes);
+        }
+        // Freeze the publication URI/receipt before signing its Root. Do not rewrite the original receipt.
+        let mut receipt: CampaignInputsReceipt =
+            serde_json::from_slice(&std::fs::read(fixture.augmented_receipt_path())?)?;
+        receipt.prepared_inputs = Some(reference.clone());
+        let input_sha = hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&receipt)?);
+        let request = build_request_from_parts(
+            "",
+            &fixture.request.feature_sha256,
+            "",
+            &fixture.request.materialization_sha256,
+            "",
+            &fixture.request.replay_artifact_sha256,
+            "",
+            &fixture.request.replay_manifest_sha256,
+            &input_sha,
+            &fixture.request.producer_source_revision,
+            &fixture.request.producer_image_identity,
+            Some(&reference),
+            &fixture.request.research_plan,
+            &fixture.request.build_source_revision,
+            &fixture.request.image_identity,
+            &format!("{ORIGIN}/campaigns"),
+            &fixture.request.holdout_id,
+            &fixture
+                .request
+                .rounds
+                .iter()
+                .map(|round| round.seed)
+                .collect::<Vec<_>>(),
+            None,
+        )?;
+        validate_request(&request)?;
+        Ok((request, objects))
+    }
+
+    pub(crate) fn representation_https_request_for_tests(
+        request: &CampaignRequest,
+        authority: &alpha_domain::campaign_control::VerifiedCampaignRootGrant,
+    ) -> anyhow::Result<CampaignRequest> {
+        let plan = representation::research_plan_for_native_test(request, authority)?;
+        build_request_from_parts(
+            "",
+            &request.feature_sha256,
+            "",
+            &request.materialization_sha256,
+            "",
+            &request.replay_artifact_sha256,
+            "",
+            &request.replay_manifest_sha256,
+            &request.campaign_inputs_sha256,
+            &request.producer_source_revision,
+            &request.producer_image_identity,
+            request.prepared_inputs.as_ref(),
+            &plan,
+            &request.build_source_revision,
+            &request.image_identity,
+            &campaign_output_root(&canonical_tokyo_oss_internal_object(
+                "HTTPS fixture result",
+                &request.campaign_result_put_url,
+            )?)?,
+            &request.holdout_id,
+            &request
+                .rounds
+                .iter()
+                .map(|round| round.seed)
+                .collect::<Vec<_>>(),
+            None,
+        )
+    }
+
+    pub(crate) fn assert_https_finalize_binding_for_tests(
+        request: &CampaignRequest,
+        objects: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        use hft_cex_research_input::{
+            campaign::CampaignPreparedInputsV1, prepared::AcquiredBlocks,
+        };
+        let root = tempfile::tempdir()?;
+        let canonical = canonicalize_request_transport(request)?;
+        let frozen = FrozenCampaignPlan {
+            preparation_authentication_tag: None,
+            schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.into(),
+            campaign_inputs_sha256: canonical.campaign_inputs_sha256.clone(),
+            signing_plan: signing_plan(&canonical)?,
+            canonical_request: canonical.clone(),
+        };
+        let mut signed = canonical.clone();
+        let prepared = signed
+            .prepared_inputs
+            .as_mut()
+            .context("HTTPS finalize needs actual native collection")?;
+        prepared
+            .collection_url
+            .push_str("?fixture-signature=collection");
+        for url in prepared.block_urls.values_mut() {
+            url.push_str("?fixture-signature=block");
+        }
+        signed
+            .holdout_claim_put_url
+            .push_str("?fixture-signature=put");
+        signed
+            .holdout_claim_readback_url
+            .push_str("?fixture-signature=read");
+        signed
+            .campaign_result_put_url
+            .push_str("?fixture-signature=result-put");
+        signed
+            .campaign_result_readback_url
+            .push_str("?fixture-signature=result-read");
+        for round in &mut signed.rounds {
+            round
+                .mission_put_url
+                .push_str("?fixture-signature=mission-put");
+            round
+                .mission_readback_url
+                .push_str("?fixture-signature=mission-read");
+            round
+                .result_put_url
+                .push_str("?fixture-signature=result-put");
+            round
+                .result_readback_url
+                .push_str("?fixture-signature=result-read");
+        }
+        validate_request(&signed)?;
+        validate_request_matches_freeze(&signed, &frozen)?;
+        for kind in ["data", "plan", "runner", "object"] {
+            let mut changed = signed.clone();
+            match kind {
+                "data" => changed.feature_sha256 = "0".repeat(64),
+                "plan" => {
+                    changed
+                        .research_plan
+                        .representation_binding
+                        .as_mut()
+                        .unwrap()
+                        .proposal
+                        .goal
+                        .model
+                        .content_sha256 = "0".repeat(64)
+                }
+                "runner" => {
+                    changed.build_source_revision =
+                        "abcdef0123456789abcdef0123456789abcdef01".into()
+                }
+                "object" => {
+                    changed.prepared_inputs.as_mut().unwrap().collection_url =
+                        "https://foreign.oss-ap-northeast-1-internal.aliyuncs.com/other.json".into()
+                }
+                _ => unreachable!(),
+            }
+            if validate_request_matches_freeze(&changed, &frozen).is_ok() {
+                bail!("HTTPS freeze accepted {kind} drift");
+            }
+        }
+        let acquire = |observed: &CampaignRequest,
+                       expected_sha: &str,
+                       source_objects: &std::collections::BTreeMap<String, Vec<u8>>|
+         -> anyhow::Result<_> {
+            let reference = observed
+                .prepared_inputs
+                .as_ref()
+                .context("missing frozen collection")?;
+            let collection_object = canonical_tokyo_oss_internal_object(
+                "fixture collection",
+                &reference.collection_url,
+            )?;
+            let bytes = source_objects
+                .get(&collection_object)
+                .context("unregistered HTTPS collection")?;
+            let collection: CampaignPreparedInputsV1 = serde_json::from_slice(bytes)?;
+            let mut blocks = std::collections::BTreeMap::new();
+            for (sha, url) in &reference.block_urls {
+                let object = canonical_tokyo_oss_internal_object("fixture block", url)?;
+                let bytes = source_objects
+                    .get(&object)
+                    .context("unregistered HTTPS block")?;
+                blocks.insert(sha.clone(), bytes.clone());
+            }
+            prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+                observed,
+                expected_sha,
+                collection,
+                &mut AcquiredBlocks { bytes: blocks },
+                1024 * 1024 * 1024,
+            )
+        };
+        let signed_sha = hft_cex_research_input::sha256(&serialize_request(&signed)?);
+        acquire(&signed, &signed_sha, objects)?;
+        let mut corrupt = objects.clone();
+        let block_uri = canonical
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .block_urls
+            .values()
+            .next()
+            .unwrap();
+        let bytes = corrupt
+            .get_mut(block_uri)
+            .context("missing declared corruption target")?;
+        bytes[0] ^= 1;
+        if acquire(&signed, &signed_sha, &corrupt).is_ok() {
+            bail!("HTTPS native verifier accepted changed acquisition bytes");
+        }
+        let freeze_path = root.path().join("freeze.json");
+        let signed_path = root.path().join("signed.json");
+        let request_out = root.path().join("request.json");
+        let submission_out = root.path().join("submission.json");
+        hft_research_artifacts::write_json_atomic(&freeze_path, &frozen)?;
+        hft_research_artifacts::write_json_atomic(&signed_path, &signed)?;
+        finalize_with_native_readback(
+            CampaignFinalizeArgs {
+                freeze: freeze_path,
+                signed_request: signed_path,
+                attempt_id: "https-represented-fixture".into(),
+                image: format!("registry/worker@sha256:{}", request.image_identity),
+                request_out: request_out.clone(),
+                submission_out: submission_out.clone(),
+            },
+            |observed, sha| acquire(observed, sha, objects),
+        )?;
+        let finalized_bytes = std::fs::read(&request_out)?;
+        let finalized: CampaignRequest = serde_json::from_slice(&finalized_bytes)?;
+        if canonicalize_request_transport(&finalized)? != canonical
+            || finalized.campaign_id != expected_campaign_id(&canonical)?
+            || hft_cex_research_input::sha256(&finalized_bytes) != signed_sha
+        {
+            bail!("finalized HTTPS fixture lost its exact canonical binding");
+        }
+        let submission: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(submission_out)?)?;
+        if submission["request"] != serde_json::to_value(&finalized)? {
+            bail!("HTTPS submission does not retain the full finalized request");
+        }
         Ok(())
     }
 

@@ -430,3 +430,66 @@ impl RepresentationPlanV1 {
         Ok(())
     }
 }
+
+/// A request binding, not a signature or an execution grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepresentationCampaignBindingV1 {
+    pub schema: String,
+    pub capability: DataCapabilityV1,
+    pub proposal: RepresentationPlanV1,
+    pub selected_arm: String,
+    /// Exact software Git identity. The raw dataset revision remains a separate SHA-256 binding.
+    pub runner_source_revision: String,
+    pub seeds: Vec<u64>,
+    /// The existing Campaign accounting function determines this value.
+    pub declared_total_trials: usize,
+}
+impl RepresentationCampaignBindingV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != "monday.representation_campaign_binding.v1"
+            || self.runner_source_revision.len() != 40
+            || !self
+                .runner_source_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.proposal.status
+                != RepresentationPlanStatusV1::RequiresDataVerificationAndNativeAdmission
+            || !matches!(
+                self.selected_arm.as_str(),
+                "registered_h1_snapshot_family" | "registered_h2_lagged_ofi_family"
+            )
+            || self.seeds.len() < 2
+            || self.seeds.len() > 16
+            || self.seeds.iter().collect::<BTreeSet<_>>().len() != self.seeds.len()
+            || self.declared_total_trials == 0
+        {
+            return Err("invalid representation Campaign binding".into());
+        }
+        self.proposal
+            .validate_binding(&self.capability, &self.proposal.goal)?;
+        if !self
+            .proposal
+            .arms
+            .iter()
+            .any(|arm| arm.name == self.selected_arm)
+        {
+            return Err("selected representation arm is absent from the validated proposal".into());
+        }
+        Ok(())
+    }
+}
+
+/// Preview of the actual renderer contracts. It grants no data or execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepresentationCampaignContractRefsV1 {
+    pub model: CexResearchContentRefV1,
+    pub scaling: CexResearchContentRefV1,
+    pub costs: CexResearchContentRefV1,
+    pub partition: CexResearchContentRefV1,
+    pub planning_view: CexResearchContentRefV1,
+    pub window_start_ns: u64,
+    pub window_end_ns: u64,
+    pub declared_total_trials: usize,
+}

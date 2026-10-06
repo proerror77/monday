@@ -131,9 +131,18 @@ fn software(source: &str, image: &str) -> super::released_build::ReadbackBuildRe
 
 #[test]
 fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
-    let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
+    exercise_exact_native_task(false);
+}
+
+#[test]
+fn representation_bound_request_is_the_exact_native_run_configuration() {
+    exercise_exact_native_task(true);
+}
+
+fn exercise_exact_native_task(represented: bool) {
+    let mut fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
     let image = format!("registry/worker@sha256:{}", fixture.request.image_identity);
-    let submission = super::super::MissionDispatchSubmission {
+    let mut submission = super::super::MissionDispatchSubmission {
         attempt_id: "native-export-fixture".into(),
         image: image.clone(),
         request: fixture.request.clone(),
@@ -142,7 +151,7 @@ fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
     // Production continues to reject its file-backed collection URLs.
     assert!(super::super::validate_submission(submission.clone()).is_err());
     let validated = super::super::validate_submission_with_request_check(
-        submission,
+        submission.clone(),
         crate::mission_campaign::validate_request_for_execute,
     )
     .unwrap();
@@ -185,6 +194,57 @@ fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
         now,
     )
     .unwrap();
+    let (validated, manifest, inspection) = if represented {
+        let original = validated.request_sha256.clone();
+        fixture.bind_representation_for_tests(&root).unwrap();
+        for changed_source in ["unknown", "abcdef0123456789abcdef0123456789abcdef01"] {
+            let mut changed = fixture.request.clone();
+            changed.build_source_revision = changed_source.into();
+            assert!(crate::mission_campaign::validate_request_for_execute(&changed).is_err());
+        }
+        submission.request = fixture.request.clone();
+        let validated = super::super::validate_submission_with_request_check(
+            submission,
+            crate::mission_campaign::validate_request_for_execute,
+        )
+        .unwrap();
+        assert_ne!(validated.request_sha256, original);
+        let manifest = super::super::render_manifest(&validated, "monday-research").unwrap();
+        let inspection = super::super::admission::reconstruct_binding(
+            &validated,
+            &manifest,
+            fixture.materialization_path(),
+            &format!("controller@sha256:{}", "e".repeat(64)),
+            0,
+        )
+        .unwrap();
+        crate::mission_campaign::representation::validate_manifest_authority(
+            &manifest,
+            &validated.request_sha256,
+            &root,
+        )
+        .unwrap();
+        let mut wrong = signed.grant.clone();
+        wrong.family.family_id = "another-family".into();
+        let wrong = sign_campaign_root_grant(wrong, "authority".into(), &key).unwrap();
+        let wrong = verify_campaign_root_grant(
+            &wrong,
+            &[("authority".into(), key.verifying_key())].into(),
+            now,
+        )
+        .unwrap();
+        assert!(
+            crate::mission_campaign::representation::validate_manifest_authority(
+                &manifest,
+                &validated.request_sha256,
+                &wrong
+            )
+            .is_err()
+        );
+        (validated, manifest, inspection)
+    } else {
+        (validated, manifest, inspection)
+    };
     let mut store = AlphaStore::open_in_memory().unwrap();
     store.record_approval(&ApprovalRecord {
         approval_id: "native-export-approval".into(), approval_class: "campaign_root".into(), subject_id: root.grant().root_id.clone(),
@@ -435,4 +495,101 @@ fn genuine_finalized_budget_data_and_actual_config_construct_one_exact_task() {
         &native_trust,
         &witness,
     );
+}
+
+#[test]
+fn representation_https_canonical_freeze_finalize_binds_exact_request() {
+    // This is a software protocol fixture. Objects are exact local acquisition bytes,
+    // registered under canonical HTTPS identities. No network or cloud claim is made.
+    let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
+    let (request, objects) =
+        crate::mission_campaign::tests::canonical_https_fixture_for_tests(&fixture).unwrap();
+    let submission = super::super::MissionDispatchSubmission {
+        attempt_id: "https-original-fixture".into(),
+        image: format!("registry/worker@sha256:{}", request.image_identity),
+        request: request.clone(),
+    };
+    let validated = super::super::validate_submission(submission).unwrap();
+    let manifest = super::super::render_manifest(&validated, "monday-research").unwrap();
+    let inspection = super::super::admission::reconstruct_binding(
+        &validated,
+        &manifest,
+        fixture.materialization_path(),
+        &format!("controller@sha256:{}", "e".repeat(64)),
+        0,
+    )
+    .unwrap();
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[19; 32]);
+    // Sign only after the HTTPS publication receipt/data identity has been frozen.
+    let signed = sign_campaign_root_grant(
+        CampaignRootGrantV1 {
+            schema_version: ROOT_GRANT_SCHEMA.into(),
+            root_id: "https-represented-root".into(),
+            family: CampaignFamilyPolicyV1 {
+                family_id: "https-represented-family".into(),
+                definition_sha256: "a".repeat(64),
+                max_trials: 1000,
+            },
+            execution_scope: CampaignExecutionScope::PreHoldout,
+            execution: inspection.execution.clone(),
+            allowed_policy_revision_ids: BTreeSet::from([inspection.policy_revision_id.clone()]),
+            max_follow_ups: 1,
+            budget: CampaignRootBudgetV1 {
+                max_trials: 1000,
+                max_job_attempts: 2,
+                max_job_seconds: 100_000,
+                max_llm_tokens: 0,
+            },
+            valid_from: now - TimeDelta::minutes(1),
+            expires_at: now + TimeDelta::hours(24),
+        },
+        "authority".into(),
+        &key,
+    )
+    .unwrap();
+    let root = verify_campaign_root_grant(
+        &signed,
+        &[("authority".into(), key.verifying_key())].into(),
+        now,
+    )
+    .unwrap();
+    let bound =
+        crate::mission_campaign::tests::representation_https_request_for_tests(&request, &root)
+            .unwrap();
+    assert_ne!(bound.campaign_id, request.campaign_id);
+    assert_ne!(
+        hft_research_platform::sha256(&crate::mission_campaign::serialize_request(&bound).unwrap()),
+        validated.request_sha256
+    );
+    assert_eq!(
+        bound.campaign_inputs_sha256,
+        root.grant().execution.campaign_inputs_sha256
+    );
+    let validated = super::super::validate_submission(super::super::MissionDispatchSubmission {
+        attempt_id: "https-bound-fixture".into(),
+        image: format!("registry/worker@sha256:{}", bound.image_identity),
+        request: bound.clone(),
+    })
+    .unwrap();
+    let manifest = super::super::render_manifest(&validated, "monday-research").unwrap();
+    let bound_inspection = super::super::admission::reconstruct_binding(
+        &validated,
+        &manifest,
+        fixture.materialization_path(),
+        &format!("controller@sha256:{}", "e".repeat(64)),
+        0,
+    )
+    .unwrap();
+    assert_eq!(bound_inspection.execution, inspection.execution);
+    root.validate_attempt_scope(&bound_inspection.reservation(&root), now)
+        .unwrap();
+    crate::mission_campaign::representation::validate_manifest_authority(
+        &manifest,
+        &validated.request_sha256,
+        &root,
+    )
+    .unwrap();
+    crate::mission_campaign::tests::assert_https_finalize_binding_for_tests(&bound, &objects)
+        .unwrap();
 }

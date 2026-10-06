@@ -13,6 +13,9 @@ mod mission_render;
 mod mission_runner;
 pub mod representation_plan;
 mod sec_orderflow;
+pub use mission_campaign::representation::{
+    bind_verified_representation_campaign, preview_representation_campaign_contracts,
+};
 
 use clap::Parser;
 

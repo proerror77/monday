@@ -73,3 +73,38 @@ Candidate `materializations` are separate from scientifically executable `arms`.
 A future native execution contract must bind the actual template, evaluator, trial counter, signed grant, cumulative budget, permitted inputs and source/image identity. The canonical Campaign seam remains the only scientific production entry.
 
 Software tests establish code behavior. They do not prove real data readiness, training, profitability, RSI improvement, notification delivery or deployment.
+This slice provides a library API. CLI registration and Campaign execution belong to their own coordinated slices.
+Unit cases verify software behavior. They do not prove real data coverage, training, profitability, RSI improvement or deployment.
+
+## Binding a proposal to the canonical Campaign
+
+The library exposes `preview_representation_campaign_contracts` and `bind_verified_representation_campaign`.
+The preview reads the existing template and admitted source through `PreparedCexInputs`. It reports actual native contract references.
+The mapper accepts the first slice's opaque raw-verification handle. It emits the existing research-plan JSON with a representation binding.
+The caller supplies one registered arm and the actual seed schedule. H1 and H2 retain their exact nine-field families.
+The existing `--research-plan` path continues through freeze, finalize and dispatch. No separate runner or Run schema is introduced.
+
+The binding includes the full proposal, capability declaration, selected arm, runner Git revision, seeds and actual Campaign trial charge.
+The runner revision has exactly 40 lowercase hexadecimal characters. Raw data revisions remain separate SHA-256 identities.
+Render, imported request and native admission retain the same actual runner Build revision; neither identity substitutes for the other.
+Every rendered Mission checks the instrument, `forward_mid_return` target, label cadence and horizon, raw source digests and development window.
+Model references include the resolved baseline policy and seeds. Scaling binds the existing training implementation.
+Cost references bind the fixed evaluator costs, position policy and replay policy. Partition references bind the protocol and its row partitions.
+Imported research-plan JSON remains a declaration. Actual native prepared blocks still require the existing opaque data verifier.
+
+The actual Campaign accounting function determines trials. Two proposed arms do not mean two scientific trials.
+An ordinary Campaign retains its current GP and supervised-model behavior. A Ridge-only template retains its own current accounting and holding contract.
+The mapper does not claim that selecting a representation bypasses GP. A new direct-input execution mode requires a separate change.
+A fresh representation proposal cannot widen the signed policy revision list or discard its frozen goal during automatic follow-up.
+
+Dispatch compares the planned family and permission digest with the authenticated current root grant.
+It also checks the actual search-view digest and Job CPU, memory, deadline and trial charge against the frozen goal limits.
+The original approval, revocation, cumulative Root/Study budget and withheld-data gates remain authoritative.
+The full request identity contains the representation binding. The existing native Run configuration and result readback consume that request identity.
+
+Software fixtures check model, scaler, cost, partition, target, window, source, arm, registry, seed and resource drift.
+A native assembly test checks that the changed request identity reaches the exact Run configuration.
+The HTTPS protocol fixture freezes publication references before signing its Root. It binds the new canonical Campaign ID and finalized request SHA.
+A private readback seam uses the original production fetcher by default. The fixture registers exact acquired bytes under canonical HTTPS objects.
+It runs the original opaque verifier and rejects data, plan, runner, object and acquisition-byte drift. It performs no network request.
+These checks do not establish a real cloud research result or restore raw verification from JSON.
