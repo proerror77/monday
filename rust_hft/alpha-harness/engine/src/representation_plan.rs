@@ -48,6 +48,10 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
     // Source bytes bind behavior without introducing functional imports.
     let mut sources = vec![
         source!("../Cargo.toml"),
+        source!("../../../shared/Cargo.toml"),
+        source!("lib.rs"),
+        source!("representation_plan.rs"),
+        source!("../../app/src/lib.rs"),
         source!("../../app/Cargo.toml"),
         source!("../../domain/Cargo.toml"),
         source!("../../store/Cargo.toml"),
@@ -56,6 +60,9 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../../research-core/manifest/Cargo.toml"),
         source!("../../../research-core/ml/Cargo.toml"),
         source!("../../../tools/collector/Cargo.toml"),
+        source!("../../../market-core/core/Cargo.toml"),
+        source!("../../../research-core/factor-dsl/Cargo.toml"),
+        source!("../../../apps/backtest/Cargo.toml"),
         source!("../../../data-pipelines/Cargo.toml"),
         source!("../../../data-pipelines/core/Cargo.toml"),
         source!("../../../data-pipelines/adapters/adapter-binance/Cargo.toml"),
@@ -96,11 +103,25 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("baselines.rs"),
         source!("baselines/classic.rs"),
         source!("baselines/fitting.rs"),
+        source!("engines/mod.rs"),
+        source!("engines/bayesian.rs"),
+        source!("../../../research-core/ml/src/lib.rs"),
+        source!("formula_evaluator.rs"),
+        source!("formula_evaluator/holding_ledger.rs"),
+        source!("../../domain/src/frozen_model.rs"),
+        source!("../../../research-core/factor-dsl/src/lib.rs"),
+        source!("../../../research-core/factor-dsl/src/model_program.rs"),
         source!("label_precheck.rs"),
         source!("model_metrics.rs"),
         source!("../../../tools/collector/src/bin/lob-pit-materializer.rs"),
         source!("../../../tools/collector/src/bin/lob-pit-materializer/market_encoder.rs"),
         source!("../../../market-core/core/src/book_features.rs"),
+        source!("../../../market-core/core/src/lib.rs"),
+        source!("../../../data-pipelines/core/src/lib.rs"),
+        source!("../../../tools/collector/src/lib.rs"),
+        source!("../../../apps/backtest/src/lib.rs"),
+        source!("../../../apps/backtest/src/config.rs"),
+        source!("../../../apps/backtest/src/event.rs"),
         source!("../../../data-pipelines/core/src/binance_lob_replay.rs"),
         source!("../../../data-pipelines/core/src/binance_market_tape.rs"),
         source!("../../../data-pipelines/core/src/binance_market_tape_artifact.rs"),
@@ -116,6 +137,7 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../../research-core/manifest/src/lib.rs"),
         source!("../../../research-core/manifest/src/sequence.rs"),
         source!("../../../research-core/manifest/src/market_encoder.rs"),
+        source!("../../../research-core/manifest/src/prepared_market.rs"),
         source!("../../../research-core/manifest/src/mlp_training.rs"),
         source!("../../../research-core/manifest/src/model.rs"),
         source!("../../../research-core/manifest/src/model/holding.rs"),
@@ -134,16 +156,17 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         RepresentationToolV1::SolSequence | RepresentationToolV1::SolMarketEncoder
     ) {
         sources.extend([
+            source!("sequence_study.rs"),
+            source!("../../../research-core/cex-input/src/sequence_storage.rs"),
             source!("../../../research-core/ml/src/portable.rs"),
             source!("../../../research-core/ml/src/shared_input.rs"),
         ]);
     }
     match tool {
         RepresentationToolV1::SolSequence => sources.extend([
-            source!("sequence_study.rs"),
             source!("../../domain/src/sequence_study.rs"),
             source!("../../../research-core/cex-input/src/sequence.rs"),
-            source!("../../../research-core/cex-input/src/sequence_storage.rs"),
+            source!("../../../research-core/ml/src/sequence.rs"),
             source!("../../../research-core/ml/src/sequence/training.rs"),
             source!("../../../research-core/manifest/src/portable_sequence.rs"),
         ]),
@@ -151,6 +174,9 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
             source!("market_encoder_study.rs"),
             source!("../../domain/src/market_encoder_study.rs"),
             source!("../../../research-core/cex-input/src/market_encoder.rs"),
+            source!("../../../research-core/prepared-market-io/Cargo.toml"),
+            source!("../../../research-core/prepared-market-io/src/lib.rs"),
+            source!("../../../research-core/ml/src/market_encoder/mod.rs"),
             source!("../../../research-core/ml/src/market_encoder/artifacts.rs"),
             source!("../../../research-core/ml/src/market_encoder/network.rs"),
             source!("../../../research-core/ml/src/market_encoder/training.rs"),
@@ -1034,6 +1060,215 @@ mod tests {
             let current = implementation(tool);
             let changed = source_reference(&current.id, &changed_sources);
             assert_ne!(current, changed, "{dependency}");
+            let mut stale = plan.clone();
+            stale
+                .matches
+                .iter_mut()
+                .find(|entry| entry.tool == tool)
+                .unwrap()
+                .implementation = changed;
+            assert!(validate_representation_plan(&stale, &data, &goal).is_err());
+        }
+    }
+
+    #[test]
+    fn review_production_tool_closure_ridge_solver() {
+        assert_registered_dependency_bound(
+            "engines/bayesian.rs",
+            include_bytes!("engines/bayesian.rs"),
+            &[
+                RepresentationToolV1::SolSequence,
+                RepresentationToolV1::SolMarketEncoder,
+            ],
+        );
+    }
+
+    #[test]
+    fn review_production_tool_closure_market_entry() {
+        assert_registered_dependency_bound(
+            "sequence_study.rs",
+            include_bytes!("sequence_study.rs"),
+            &[RepresentationToolV1::SolMarketEncoder],
+        );
+    }
+
+    #[test]
+    fn review_production_tool_closure_backend() {
+        assert_registered_dependency_bound(
+            "../../../research-core/ml/src/lib.rs",
+            include_bytes!("../../../research-core/ml/src/lib.rs"),
+            &[
+                RepresentationToolV1::SolSequence,
+                RepresentationToolV1::SolMarketEncoder,
+            ],
+        );
+    }
+
+    #[test]
+    fn review_production_tool_closure_routes_readers_and_model_contracts() {
+        let all_tools = [
+            RepresentationToolV1::CapturedBookReplay,
+            RepresentationToolV1::StaticTop5,
+            RepresentationToolV1::LaggedContinuousOfi,
+            RepresentationToolV1::AggregateTradeFlow,
+            RepresentationToolV1::SolSequence,
+            RepresentationToolV1::SolMarketEncoder,
+        ];
+        for (path, body) in [
+            (
+                "representation_plan.rs",
+                include_bytes!("representation_plan.rs").as_slice(),
+            ),
+            (
+                "engines/mod.rs",
+                include_bytes!("engines/mod.rs").as_slice(),
+            ),
+            (
+                "engines/bayesian.rs",
+                include_bytes!("engines/bayesian.rs").as_slice(),
+            ),
+            (
+                "../../../research-core/ml/src/lib.rs",
+                include_bytes!("../../../research-core/ml/src/lib.rs").as_slice(),
+            ),
+            ("lib.rs", include_bytes!("lib.rs").as_slice()),
+            (
+                "../../app/src/lib.rs",
+                include_bytes!("../../app/src/lib.rs").as_slice(),
+            ),
+            (
+                "formula_evaluator.rs",
+                include_bytes!("formula_evaluator.rs").as_slice(),
+            ),
+            (
+                "formula_evaluator/holding_ledger.rs",
+                include_bytes!("formula_evaluator/holding_ledger.rs").as_slice(),
+            ),
+            (
+                "../../domain/src/frozen_model.rs",
+                include_bytes!("../../domain/src/frozen_model.rs").as_slice(),
+            ),
+            (
+                "../../../research-core/factor-dsl/Cargo.toml",
+                include_bytes!("../../../research-core/factor-dsl/Cargo.toml").as_slice(),
+            ),
+            (
+                "../../../research-core/factor-dsl/src/lib.rs",
+                include_bytes!("../../../research-core/factor-dsl/src/lib.rs").as_slice(),
+            ),
+            (
+                "../../../research-core/factor-dsl/src/model_program.rs",
+                include_bytes!("../../../research-core/factor-dsl/src/model_program.rs").as_slice(),
+            ),
+            (
+                "../../../market-core/core/Cargo.toml",
+                include_bytes!("../../../market-core/core/Cargo.toml").as_slice(),
+            ),
+            (
+                "../../../market-core/core/src/lib.rs",
+                include_bytes!("../../../market-core/core/src/lib.rs").as_slice(),
+            ),
+            (
+                "../../../data-pipelines/core/src/lib.rs",
+                include_bytes!("../../../data-pipelines/core/src/lib.rs").as_slice(),
+            ),
+            (
+                "../../../tools/collector/src/lib.rs",
+                include_bytes!("../../../tools/collector/src/lib.rs").as_slice(),
+            ),
+            (
+                "../../../apps/backtest/Cargo.toml",
+                include_bytes!("../../../apps/backtest/Cargo.toml").as_slice(),
+            ),
+            (
+                "../../../apps/backtest/src/lib.rs",
+                include_bytes!("../../../apps/backtest/src/lib.rs").as_slice(),
+            ),
+            (
+                "../../../apps/backtest/src/config.rs",
+                include_bytes!("../../../apps/backtest/src/config.rs").as_slice(),
+            ),
+            (
+                "../../../apps/backtest/src/event.rs",
+                include_bytes!("../../../apps/backtest/src/event.rs").as_slice(),
+            ),
+            (
+                "../../../research-core/manifest/src/prepared_market.rs",
+                include_bytes!("../../../research-core/manifest/src/prepared_market.rs").as_slice(),
+            ),
+            (
+                "../../../shared/Cargo.toml",
+                include_bytes!("../../../shared/Cargo.toml").as_slice(),
+            ),
+        ] {
+            assert_registered_dependency_bound(path, body, &all_tools);
+        }
+        assert_registered_dependency_bound(
+            "../../../research-core/cex-input/src/sequence_storage.rs",
+            include_bytes!("../../../research-core/cex-input/src/sequence_storage.rs"),
+            &[
+                RepresentationToolV1::SolSequence,
+                RepresentationToolV1::SolMarketEncoder,
+            ],
+        );
+        assert_registered_dependency_bound(
+            "../../../research-core/ml/src/sequence.rs",
+            include_bytes!("../../../research-core/ml/src/sequence.rs"),
+            &[RepresentationToolV1::SolSequence],
+        );
+        for (path, body) in [
+            (
+                "../../../research-core/ml/src/market_encoder/mod.rs",
+                include_bytes!("../../../research-core/ml/src/market_encoder/mod.rs").as_slice(),
+            ),
+            (
+                "../../../research-core/prepared-market-io/Cargo.toml",
+                include_bytes!("../../../research-core/prepared-market-io/Cargo.toml").as_slice(),
+            ),
+            (
+                "../../../research-core/prepared-market-io/src/lib.rs",
+                include_bytes!("../../../research-core/prepared-market-io/src/lib.rs").as_slice(),
+            ),
+        ] {
+            assert_registered_dependency_bound(
+                path,
+                body,
+                &[RepresentationToolV1::SolMarketEncoder],
+            );
+        }
+    }
+
+    fn assert_registered_dependency_bound(
+        dependency: &str,
+        body: &[u8],
+        tools: &[RepresentationToolV1],
+    ) {
+        let (data, goal) = input();
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        let mut changed = body.to_vec();
+        changed.extend_from_slice(b"\n// changed registered tool production dependency\n");
+        for &tool in tools {
+            let entry = plan
+                .matches
+                .iter()
+                .find(|entry| entry.tool == tool)
+                .unwrap();
+            let sources = implementation_sources(tool);
+            let changed_sources = sources
+                .iter()
+                .map(|&(path, body)| {
+                    (
+                        path,
+                        if path == dependency {
+                            changed.as_slice()
+                        } else {
+                            body
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let changed = source_reference(&entry.implementation.id, &changed_sources);
+            assert_ne!(entry.implementation, changed, "{tool:?}: {dependency}");
             let mut stale = plan.clone();
             stale
                 .matches

@@ -39,6 +39,23 @@ Top5, flow and Study inventories require five observed seed levels. One-to-four-
 
 The identity binds source paths, lengths and bytes across the renderer, loaders, domain predicates, replay, features, reference admission, model contracts and Study implementations. It includes the actual signed planning entry, safe prepared-source metadata, current Root/Study authority, authenticated ledger readers and their schemas. It also binds owning locks, Cargo manifests and actual kernel/fitting/LLM flags, debug profile and target OS/architecture/family. The renderer’s MLP plan validation and seed resolution bind both original domain and manifest MLP contract modules. The freeze-attestation payload verifier is bound with the planning entry and original keyed ledger implementation. Local path edits are not covered by lockfiles alone.
 
+## Tool implementation closure
+
+Source identities cover the matching implementation itself, registered read/materialization and Study fitting/prediction paths, plus the normalized planning admission they reuse. They do not establish scientific execution authority, a terminal result or equivalence of unrelated operational paths. Complete Build/source admission remains separate.
+
+| Tool | Production dependencies bound by the identity |
+| --- | --- |
+| Captured book replay | Original triplet verifier, market tape and sequence-checked replay; their data and collector module routes |
+| Static Top5 | Replay sampling, Top5 arithmetic and the original Spot/USD-M reference readers; core module routes and package declaration |
+| Lagged continuous OFI | The same verified replay and the materializer's causal bucket/history construction |
+| Aggregate trade flow | The original aggregate-trade decoder, directed summaries and materializer output contracts |
+| SOL sequence | Sequence Study validation, chronological reader/storage, Ridge solver, sequence trainer, backend lock/types and portable inference |
+| SOL market encoder | Encoder Study validation, the same Ridge solver and entry-decision helper, feature/target readers, encoder trainer, backend lock/types and portable inference |
+
+The Ridge path binds `engines/mod.rs` and `engines/bayesian.rs`; the encoder's entry decision also binds `sequence_study.rs`. Both Studies bind the shared sequence storage and original ML backend definitions. Each binds its own trainer module route. The actual `market-parquet` reader path also binds prepared-market IO, its package declaration and the prepared-market format/size contract.
+
+The shared renderer/model contracts bind formula evaluation and its holding ledger, frozen model validation and the bounded factor interpreter/model program. Original normalized preparation binds the backtest replay verifier and event decoder, including their module routes; this does not import its execution engine. Owning package and shared workspace declarations are bound. Effective research/data build locks are retained; an unused shared-workspace lock is not presented as a build input.
+
 ## Window and row conditions
 
 Feature clocks cannot exceed their decision window. A distinct `label_available_through_ns` describes label-only coverage in the same recovery series. Restoring that field from JSON does not establish qualification.
