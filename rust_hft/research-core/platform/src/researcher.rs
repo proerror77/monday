@@ -313,14 +313,12 @@ impl<'a> MetaVerificationContext<'a> {
             expected.task,
             expected.binding.attempt,
         )?;
+        let evidence_sha256 = content_sha256(&(&evaluated, &cost))?;
         Ok(VerifiedMetaEvaluation {
             context_sha256: self.context_sha256.clone(),
             evaluation: evaluated.payload,
             cost: cost.payload,
-            evidence_sha256: content_sha256(&(
-                sha256(signed_evaluation_bytes),
-                sha256(signed_cost_bytes),
-            ))?,
+            evidence_sha256,
         })
     }
 
@@ -1166,6 +1164,52 @@ mod tests {
             HeadTransition::Rejected(PromotionRejection::FailedEvaluation)
         );
         assert_eq!(parent, before);
+    }
+
+    #[test]
+    fn receipt_reformatting_preserves_decision_identity_and_replay() {
+        let fixture = Fixture::new(false);
+        let context = fixture.context();
+        let mut original = Vec::new();
+        let mut reformatted = Vec::new();
+        for index in 0..fixture.executions.len() {
+            let (evaluated, result, cost, cost_bytes) = fixture.payloads(index);
+            let (wire, cost_wire) =
+                fixture.signed(evaluated, cost, &fixture.evaluator_key, &fixture.cost_key);
+            original.push(
+                context
+                    .verify_evaluation(&wire, &result, &cost_wire, &cost_bytes)
+                    .unwrap(),
+            );
+            // A relay can reorder fields and change whitespace without keys.
+            let relayed = serde_json::to_vec_pretty(
+                &serde_json::from_slice::<serde_json::Value>(&wire).unwrap(),
+            )
+            .unwrap();
+            let relayed_cost = serde_json::to_vec_pretty(
+                &serde_json::from_slice::<serde_json::Value>(&cost_wire).unwrap(),
+            )
+            .unwrap();
+            assert_ne!(wire, relayed);
+            assert_ne!(cost_wire, relayed_cost);
+            reformatted.push(
+                context
+                    .verify_evaluation(&relayed, &result, &relayed_cost, &cost_bytes)
+                    .unwrap(),
+            );
+        }
+        let mut head = fixture.head();
+        let decision = context.verify_promotion(&head, &original).unwrap();
+        let replay = context.verify_promotion(&head, &reformatted).unwrap();
+        assert_eq!(decision.id(), replay.id());
+        assert_eq!(
+            apply_expected_head(&context, &mut head, &decision).unwrap(),
+            HeadTransition::Adopted
+        );
+        assert_eq!(
+            apply_expected_head(&context, &mut head, &replay).unwrap(),
+            HeadTransition::Reused
+        );
     }
 
     #[test]
