@@ -8,6 +8,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod consumption;
+
 pub const CONTRACT_SCHEMA_V1: u32 = 1;
 pub const META_EVALUATION_SIGNING_DOMAIN: &str = "monday.research_agent.meta_evaluation.v1";
 pub const META_COST_SIGNING_DOMAIN: &str = "monday.research_agent.meta_cost.v1";

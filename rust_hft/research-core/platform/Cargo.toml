@@ -79,6 +79,7 @@ path = "src/bin/research-release-capability-broker.rs"
 required-features = ["publisher"]
 
 [dev-dependencies]
+hft-research-agent-improvement = { path = "../agent-improvement" }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 

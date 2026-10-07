@@ -59,7 +59,7 @@ for profile in default researcher-verification control,gateway,publisher,researc
   [[ $profile == default ]] || options=(--features "$profile")
   cargo tree --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" \
     -p hft-research-platform "${options[@]}" --locked --edges normal --prefix none >"$work/control.tree"
-  if grep -E '^(alpha-(domain|engine|harness|store|onnx-evaluator) |burn|ort |hft-(collector|research-ml|data|backtest|cex-research-worker) |parquet )' "$work/control.tree"; then
+  if grep -E '^(alpha-(domain|engine|harness|store|onnx-evaluator) |burn|ort |hft-(collector|research-ml|research-agent-improvement|data|backtest|cex-research-worker) |parquet )' "$work/control.tree"; then
     echo 'control pulls scientific domain, acquisition, training or Parquet' >&2; exit 1
   fi
 done

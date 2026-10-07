@@ -616,6 +616,178 @@ pub fn apply_expected_head(
     }
 }
 
+/// Actual content for the next configuration. References in the adopted version
+/// must match these complete bodies, not caller-declared corpus hashes.
+pub struct PrepareResearcherConfigurationRequest<'a> {
+    pub candidate: &'a ResearcherVersionV1,
+    pub released_build: &'a VerifiedBuildRelease,
+    pub query: hft_research_agent_contracts::consumption::ExperienceQueryV1,
+    pub corpora: Vec<hft_research_agent_contracts::consumption::FrozenExperienceCorpusV1>,
+}
+
+/// Constructed only from an applied, verified adoption in this exact context.
+/// Exported bytes are configuration data, not a grant or a serialized proof.
+pub struct PreparedResearcherConfiguration {
+    context_sha256: String,
+    applied_head: ResearcherHead,
+    decision_sha256: String,
+    configuration: hft_research_agent_contracts::consumption::ResearcherConsumptionConfigV1,
+    canonical_bytes: Vec<u8>,
+    configuration_sha256: String,
+    build: crate::build::BuildArtifact,
+}
+impl PreparedResearcherConfiguration {
+    pub fn bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+    pub fn id(&self) -> &str {
+        &self.configuration_sha256
+    }
+    pub fn version_sha256(&self) -> &str {
+        self.applied_head.version_sha256()
+    }
+}
+
+impl MetaVerificationContext<'_> {
+    pub fn prepare_configuration(
+        &self,
+        decision: &VerifiedPromotionDecision,
+        applied_head: &ResearcherHead,
+        request: PrepareResearcherConfigurationRequest<'_>,
+    ) -> Result<PreparedResearcherConfiguration> {
+        applied_head.validate()?;
+        ensure!(
+            decision.context_sha256 == self.context_sha256
+                && decision.outcome == PromotionOutcome::Adopt,
+            "configuration requires an Adopt decision from this controlled context"
+        );
+        ensure!(
+            decision.expected_head.revision.checked_add(1) == Some(applied_head.revision)
+                && applied_head.version_sha256 == decision.challenger_version_sha256
+                && applied_head.last_decision_sha256.as_deref() == Some(decision.id()),
+            "adoption is unapplied or the actual head changed"
+        );
+        let candidate_sha256 = request.candidate.id()?;
+        ensure!(
+            candidate_sha256 == applied_head.version_sha256
+                && candidate_sha256 == self.study.challenger_version_sha256,
+            "configuration candidate differs from the adopted version"
+        );
+        let artifact = request.released_build.artifact();
+        ensure!(
+            artifact.id()? == request.candidate.snapshot.build_sha256
+                && artifact.build.code_commit == request.candidate.snapshot.source_commit,
+            "configuration uses a different verified Build or source"
+        );
+        ensure!(
+            self.executions
+                .values()
+                .all(|expected| expected.released_build.artifact() == artifact
+                    && expected.released_build.trust_sha256()
+                        == request.released_build.trust_sha256()),
+            "configuration Build differs from the original controlled release"
+        );
+        let configuration =
+            hft_research_agent_contracts::consumption::ResearcherConsumptionConfigV1 {
+                schema: 1,
+                version: request.candidate.clone(),
+                query: request.query,
+                corpora: request.corpora,
+            };
+        configuration.validate()?;
+        let canonical_bytes = configuration.canonical_bytes()?;
+        let configuration_sha256 = configuration.id()?;
+        ensure!(
+            sha256(&canonical_bytes) == configuration_sha256,
+            "configuration identity differs from its actual canonical bytes"
+        );
+        Ok(PreparedResearcherConfiguration {
+            context_sha256: self.context_sha256.clone(),
+            applied_head: applied_head.clone(),
+            decision_sha256: decision.id().into(),
+            configuration,
+            canonical_bytes,
+            configuration_sha256,
+            build: artifact.clone(),
+        })
+    }
+
+    /// A metadata binding preflight. Success neither admits, reserves, registers,
+    /// stages nor submits this Run; the original scientific gates remain required.
+    pub fn bind_next_run(
+        &self,
+        actual_head: &ResearcherHead,
+        prepared: &PreparedResearcherConfiguration,
+        run: &Run,
+        task: &TaskSpec,
+    ) -> Result<()> {
+        actual_head.validate()?;
+        ensure!(
+            prepared.context_sha256 == self.context_sha256
+                && prepared.applied_head == *actual_head
+                && actual_head.last_decision_sha256.as_deref()
+                    == Some(prepared.decision_sha256.as_str()),
+            "prepared configuration belongs to a foreign, stale or unapplied head"
+        );
+        ensure!(
+            prepared.configuration.version.id()? == actual_head.version_sha256
+                && prepared.configuration.id()? == prepared.configuration_sha256
+                && prepared.configuration.canonical_bytes()? == prepared.canonical_bytes,
+            "prepared configuration content or adopted version changed"
+        );
+        ensure!(
+            run.configuration_sha256 == prepared.configuration_sha256,
+            "next Run does not bind the complete consumed configuration"
+        );
+        task.validate()?;
+        task.profile.validate()?;
+        run.admit_build(&prepared.build)?;
+        run.admit(task)?;
+        ensure!(run.data_manifest_sha256 == prepared.configuration.query.data_view_sha256, "next Run input differs from the consumed query view");
+        ensure!(
+            prepared
+                .configuration
+                .version
+                .snapshot
+                .retrieval
+                .information_policy
+                .allowed_data_view_sha256
+                .contains(&run.data_manifest_sha256),
+            "next Run input is outside the adopted information scope"
+        );
+        let program = prepared
+            .build
+            .executables
+            .iter()
+            .find(|program| {
+                run.command.first() == Some(&format!("/usr/local/bin/{}", program.name))
+            })
+            .context("next Run program is not a verified executable")?;
+        ensure!(
+            prepared
+                .configuration
+                .version
+                .snapshot
+                .tools
+                .iter()
+                .any(|tool| tool.content_sha256 == program.blob.sha256),
+            "next Run selects a program absent from the adopted tool snapshot"
+        );
+        let architecture = match prepared.build.build.target.as_str() {
+            "x86_64-unknown-linux-gnu" => "amd64",
+            "aarch64-unknown-linux-gnu" => "arm64",
+            _ => anyhow::bail!("unsupported next Run Build target"),
+        };
+        ensure!(
+            task.profile.architecture == architecture
+                && task.profile.worker_secret.is_none()
+                && task.worker_configuration.is_none(),
+            "next Run architecture or unverified worker configuration changed"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1566,5 +1738,311 @@ mod tests {
         };
         assert!(apply_expected_head(loser.0, &mut head.lock().unwrap(), loser.1).is_err());
         assert_eq!(*head.lock().unwrap(), after);
+    }
+
+    fn consumption_inputs() -> (
+        Fixture,
+        Vec<hft_research_agent_contracts::consumption::FrozenExperienceCorpusV1>,
+        hft_research_agent_contracts::consumption::ExperienceQueryV1,
+    ) {
+        use hft_research_agent_contracts::consumption::{
+            ExperienceEvidenceV1, ExperienceQueryV1, FrozenExperienceCorpusV1, ResearchExperienceV1,
+        };
+        let query = ExperienceQueryV1 {
+            task_context_sha256: h('d'),
+            data_view_sha256: h('1'),
+            as_of_ns: 100,
+            query_text: "retrieve the frozen development experience".into(),
+        };
+        let entries = [("older-match", h('d'), 10), ("newer-other", h('e'), 20)]
+            .into_iter()
+            .map(|(id, task, time)| {
+                let source = ExperienceEvidenceV1 {
+                    content: ContentReferenceV1 {
+                        id: format!("source-{id}"),
+                        content_sha256: h('c'),
+                    },
+                    phase: MetaTaskPhase::Development,
+                    data_view_sha256: h('1'),
+                    available_ns: time,
+                };
+                ResearchExperienceV1 {
+                    id: id.into(),
+                    task_context_sha256: task,
+                    observed_ns: time,
+                    available_ns: time,
+                    text: format!("bounded development experience {id}"),
+                    source: source.clone(),
+                    evidence: vec![source],
+                }
+            })
+            .collect();
+        let corpus = FrozenExperienceCorpusV1 {
+            id: "development-experience".into(),
+            entries,
+        };
+        let mut fixture = Fixture::new(false);
+        for version in [&mut fixture.incumbent, &mut fixture.challenger] {
+            version.snapshot.retrieval.corpus[0].content = corpus.content_reference().unwrap();
+            version.snapshot.retrieval.top_k = 1;
+        }
+        fixture.rebind();
+        (fixture, vec![corpus], query)
+    }
+
+    #[test]
+    fn applied_configuration_actual_bytes_drive_leaf_and_bind_next_run() {
+        use hft_research_agent_contracts::consumption::ResearcherConsumptionConfigV1;
+        let (mut fixture, corpora, query) = consumption_inputs();
+        for version in [&mut fixture.incumbent, &mut fixture.challenger] {
+            version.snapshot.retrieval.information_policy.allowed_data_view_sha256.push(h('4'));
+        }
+        fixture.rebind();
+        let context = fixture.context();
+        let mut head = fixture.head();
+        let decision = context
+            .verify_promotion(&head, &fixture.all(&context))
+            .unwrap();
+        assert!(context
+            .prepare_configuration(
+                &decision,
+                &head,
+                PrepareResearcherConfigurationRequest {
+                    candidate: &fixture.challenger,
+                    released_build: &fixture.released,
+                    query: query.clone(),
+                    corpora: corpora.clone(),
+                }
+            )
+            .is_err());
+        apply_expected_head(&context, &mut head, &decision).unwrap();
+        let prepared = context
+            .prepare_configuration(
+                &decision,
+                &head,
+                PrepareResearcherConfigurationRequest {
+                    candidate: &fixture.challenger,
+                    released_build: &fixture.released,
+                    query: query.clone(),
+                    corpora: corpora.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(sha256(prepared.bytes()), prepared.id());
+        assert_eq!(prepared.version_sha256(), fixture.challenger.id().unwrap());
+        assert_ne!(prepared.id(), prepared.version_sha256());
+        let mut run = fixture.executions[1].run.clone();
+        run.configuration_sha256 = prepared.id().into();
+        let mut task = fixture.executions[1].task.clone();
+        task.run_manifest_sha256 = run.id().unwrap();
+        context
+            .bind_next_run(&head, &prepared, &run, &task)
+            .unwrap();
+        let observed = hft_research_agent_improvement::consume_config(
+            prepared.bytes(),
+            &run.configuration_sha256,
+        )
+        .unwrap();
+        assert_eq!(observed.receipt.configuration_sha256, prepared.id());
+        assert_eq!(
+            observed.receipt.researcher_version_sha256,
+            head.version_sha256()
+        );
+        assert_eq!(observed.receipt.selected_experience_ids, ["newer-other"]);
+        assert_eq!(
+            observed.context.prompt_text,
+            fixture.challenger.snapshot.prompt_text
+        );
+        let baseline = ResearcherConsumptionConfigV1 {
+            schema: 1,
+            version: fixture.incumbent.clone(),
+            query,
+            corpora,
+        };
+        let old_usage = hft_research_agent_improvement::consume_config(
+            &baseline.canonical_bytes().unwrap(),
+            &baseline.id().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old_usage.receipt.selected_experience_ids, ["older-match"]);
+        assert_ne!(
+            observed.receipt.context_sha256,
+            old_usage.receipt.context_sha256
+        );
+        // This is actual local configuration consumption, not a submitted Run,
+        // budget admission, persisted incumbent or scientific result.
+    }
+
+    #[test]
+    fn configuration_preparation_rejects_false_adoption_stale_parent_trust_and_build() {
+        let (fixture, corpora, query) = consumption_inputs();
+        let context = fixture.context();
+        let mut head = fixture.head();
+        let decision = context
+            .verify_promotion(&head, &fixture.all(&context))
+            .unwrap();
+        let fake_adopted =
+            ResearcherHead::new(fixture.challenger.id().unwrap(), head.revision() + 1).unwrap();
+        assert!(context
+            .prepare_configuration(
+                &decision,
+                &fake_adopted,
+                PrepareResearcherConfigurationRequest {
+                    candidate: &fixture.challenger,
+                    released_build: &fixture.released,
+                    query: query.clone(),
+                    corpora: corpora.clone(),
+                }
+            )
+            .is_err());
+        apply_expected_head(&context, &mut head, &decision).unwrap();
+        let before = head.clone();
+        for (candidate, stale) in [
+            (&fixture.incumbent, head.clone()),
+            (
+                &fixture.challenger,
+                ResearcherHead::new(head.version_sha256().into(), head.revision() + 1).unwrap(),
+            ),
+        ] {
+            assert!(context
+                .prepare_configuration(
+                    &decision,
+                    &stale,
+                    PrepareResearcherConfigurationRequest {
+                        candidate,
+                        released_build: &fixture.released,
+                        query: query.clone(),
+                        corpora: corpora.clone(),
+                    }
+                )
+                .is_err());
+        }
+        let wrong_build = release(true);
+        assert!(context
+            .prepare_configuration(
+                &decision,
+                &head,
+                PrepareResearcherConfigurationRequest {
+                    candidate: &fixture.challenger,
+                    released_build: &wrong_build,
+                    query: query.clone(),
+                    corpora: corpora.clone(),
+                }
+            )
+            .is_err());
+        let evaluator = SigningKey::from_bytes(&[40; 32]);
+        let cost = SigningKey::from_bytes(&[41; 32]);
+        let other_trust = Fixture::trust(&evaluator, &cost);
+        let foreign = fixture.context_with(&other_trust).unwrap();
+        assert!(foreign
+            .prepare_configuration(
+                &decision,
+                &head,
+                PrepareResearcherConfigurationRequest {
+                    candidate: &fixture.challenger,
+                    released_build: &fixture.released,
+                    query: query.clone(),
+                    corpora: corpora.clone(),
+                }
+            )
+            .is_err());
+        let mut altered_corpus = corpora;
+        altered_corpus[0].entries[0].text.push_str(" drift");
+        assert!(context
+            .prepare_configuration(
+                &decision,
+                &head,
+                PrepareResearcherConfigurationRequest {
+                    candidate: &fixture.challenger,
+                    released_build: &fixture.released,
+                    query,
+                    corpora: altered_corpus,
+                }
+            )
+            .is_err());
+        assert_eq!(head, before);
+
+        let (mut rejected_fixture, corpora, query) = consumption_inputs();
+        rejected_fixture
+            .study
+            .promotion_policy
+            .min_certification_score_gain = 0.4;
+        rejected_fixture.rebind();
+        let rejected_context = rejected_fixture.context();
+        let parent = rejected_fixture.head();
+        let rejected = rejected_context
+            .verify_promotion(&parent, &rejected_fixture.all(&rejected_context))
+            .unwrap();
+        assert!(rejected_context
+            .prepare_configuration(
+                &rejected,
+                &parent,
+                PrepareResearcherConfigurationRequest {
+                    candidate: &rejected_fixture.challenger,
+                    released_build: &rejected_fixture.released,
+                    query,
+                    corpora,
+                }
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn next_run_rejects_version_only_config_wrong_source_input_or_stale_head() {
+        let (mut fixture, corpora, query) = consumption_inputs();
+        for version in [&mut fixture.incumbent, &mut fixture.challenger] {
+            version.snapshot.retrieval.information_policy.allowed_data_view_sha256.push(h('4'));
+        }
+        fixture.rebind();
+        let context = fixture.context();
+        let mut head = fixture.head();
+        let decision = context
+            .verify_promotion(&head, &fixture.all(&context))
+            .unwrap();
+        apply_expected_head(&context, &mut head, &decision).unwrap();
+        let prepared = context
+            .prepare_configuration(
+                &decision,
+                &head,
+                PrepareResearcherConfigurationRequest {
+                    candidate: &fixture.challenger,
+                    released_build: &fixture.released,
+                    query,
+                    corpora,
+                },
+            )
+            .unwrap();
+        for change in ["version-only", "source", "input", "allowed-wrong-view", "build", "stale", "invalid-profile"] {
+            let mut run = fixture.executions[1].run.clone();
+            run.configuration_sha256 = prepared.id().into();
+            match change {
+                "version-only" => run.configuration_sha256 = prepared.version_sha256().into(),
+                "source" => run.code_commit = "b".repeat(40),
+                "input" => run.data_manifest_sha256 = h('f'),
+                "allowed-wrong-view" => run.data_manifest_sha256 = h('4'),
+                "build" => run.build_artifact_sha256 = h('f'),
+                _ => {}
+            }
+            let mut task = fixture.executions[1].task.clone();
+            task.run_manifest_sha256 = run.id().unwrap();
+            task.view_manifest_sha256
+                .clone_from(&run.data_manifest_sha256);
+            if change == "invalid-profile" { task.profile.namespace = "Invalid_Namespace".into(); }
+            let mut current = head.clone();
+            if change == "stale" {
+                current.revision += 1;
+            }
+            assert!(
+                context
+                    .bind_next_run(&current, &prepared, &run, &task)
+                    .is_err(),
+                "{change}"
+            );
+        }
+        let decoded: hft_research_agent_contracts::consumption::ResearcherConsumptionConfigV1 =
+            serde_json::from_slice(prepared.bytes()).unwrap();
+        assert_eq!(decoded.id().unwrap(), prepared.id());
+        // An ordinary decoded DTO has no constructor for the private prepared
+        // handle consumed by bind_next_run.
     }
 }

@@ -3351,6 +3351,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-research-agent-improvement"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hft-research-agent-contracts",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "hft-research-artifacts"
 version = "0.1.0"
 dependencies = [

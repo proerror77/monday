@@ -83,6 +83,20 @@ The pure verifier accepts only a first Attempt for each frozen Run. Retried or
 uncertain attempts need complete cumulative cost and exposure ledger evidence
 before they can be admitted by a later storage adapter.
 
+`research-core/agent-improvement` belongs to the research owner. Its fixed library
+entry consumes canonical configuration bytes, verifies the complete frozen
+development corpus and query, and applies the selected experience ranking. It
+emits the actual selected context and a configuration-consumption receipt. That
+receipt has no adoption, grant or scientific-result authority. Control imports
+this leaf only in tests; its normal dependency graph excludes the consumer.
+
+Control can prepare those bytes from a verified decision and an actually applied
+in-memory head, then check their full hash against the next Run's configuration
+and query view. This metadata preflight neither reserves nor submits a Run.
+The existing CEX worker configuration whitelist stays closed to this format.
+Active-head storage, qualified corpus export, worker staging and real execution
+still need their own authority adapters and receipts.
+
 Research algorithms remain in the research owner. Control invokes published
 programs through existing Build/Run/Task/Attempt boundaries; it does not import
 `alpha-domain`, `alpha-engine`, fitters or evaluators to make an adoption decision.
