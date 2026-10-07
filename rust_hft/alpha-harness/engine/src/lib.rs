@@ -14,6 +14,7 @@ pub mod llm;
 pub mod market_encoder_study;
 pub mod model_metrics;
 pub mod prediction_diagnostics;
+pub mod representation_plan;
 pub mod sec_orderflow;
 pub mod sequence_study;
 

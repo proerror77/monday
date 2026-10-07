@@ -6,6 +6,13 @@ use crate::{
         MAX_MATERIALIZATION_BYTES,
     },
 };
+use alpha_domain::representation::{
+    campaign_minimum_rows, CAMPAIGN_DEFAULT_EMBARGO_ROWS as EMBARGO_ROWS,
+    CAMPAIGN_DEFAULT_MIN_ROWS as MIN_ROWS, CAMPAIGN_DEFAULT_PURGE_ROWS as PURGE_ROWS,
+    CAMPAIGN_FOLD_COUNT as FOLD_COUNT, CAMPAIGN_HOLDOUT_ROWS as HOLDOUT_ROWS,
+    CAMPAIGN_INITIAL_TRAIN_ROWS as INITIAL_TRAIN_ROWS, CAMPAIGN_SELECTION_ROWS as SELECTION_ROWS,
+    CAMPAIGN_VALIDATION_ROWS as VALIDATION_ROWS,
+};
 use alpha_domain::{
     campaign_horizon::CampaignLabelHorizonV1, canonical_json_hash, CexBaselinePolicyV1,
     CexEqualAbsoluteWeightPolicyV1, CexEventReplayPolicyV1, CexGpPolicyV1, CexResearchContentRefV1,
@@ -39,22 +46,6 @@ const SEARCH_POLICY_REVISION_SCHEMA_V2: &str = "cex-campaign-search-policy-revis
 const LEARNING_DIRECTIVE_SCHEMA_V1: &str = "cex-campaign-learning-directive-v1";
 const RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V2: &str = "cex-campaign-research-evidence-signature-v2";
 pub(crate) const MAX_RESEARCH_PLAN_GENERATION: u8 = 3;
-const INITIAL_TRAIN_ROWS: usize = 7_200;
-const VALIDATION_ROWS: usize = 3_600;
-const FOLD_COUNT: usize = 3;
-// Labels mature five seconds after observation. Leave another full horizon
-// before validation so the bound trainer's purge/embargo contract is real.
-const PURGE_ROWS: usize = 10;
-// Keep the last validation label strictly before the sealed holdout.
-const EMBARGO_ROWS: usize = 5;
-const HOLDOUT_ROWS: usize = 3_600;
-const SELECTION_ROWS: usize = 3_600;
-const MIN_ROWS: usize = INITIAL_TRAIN_ROWS
-    + FOLD_COUNT * (VALIDATION_ROWS + EMBARGO_ROWS)
-    + PURGE_ROWS
-    + SELECTION_ROWS
-    + 2 * PURGE_ROWS
-    + HOLDOUT_ROWS;
 const MAX_EXPANSIONS: u64 = 256;
 const GP_POLICY_ID: &str = "binance-cex-1s-top5-factor-plan-v5-gp-policy";
 const BASELINE_POLICY_ID: &str = "binance-cex-1s-top5-baseline-policy";
@@ -1707,17 +1698,7 @@ fn rendered_research_market(
 }
 
 fn minimum_rows_for_horizon(horizon: &CampaignLabelHorizonV1) -> anyhow::Result<usize> {
-    let fold_rows = VALIDATION_ROWS
-        .checked_add(horizon.embargo_rows)
-        .and_then(|rows| FOLD_COUNT.checked_mul(rows))
-        .context("typed Campaign horizon row budget overflowed")?;
-    INITIAL_TRAIN_ROWS
-        .checked_add(fold_rows)
-        .and_then(|rows| rows.checked_add(horizon.purge_rows))
-        .and_then(|rows| rows.checked_add(SELECTION_ROWS))
-        .and_then(|rows| rows.checked_add(horizon.purge_rows.checked_mul(2)?))
-        .and_then(|rows| rows.checked_add(HOLDOUT_ROWS))
-        .context("typed Campaign horizon row budget overflowed")
+    campaign_minimum_rows(horizon.purge_rows, horizon.embargo_rows).map_err(anyhow::Error::msg)
 }
 
 fn ensure_materialization_scope(

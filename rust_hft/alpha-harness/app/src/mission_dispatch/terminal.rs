@@ -2,7 +2,8 @@
 
 use super::{
     admission::{self, Admission},
-    load_submission, render_controlled_manifest, validate_job_readback, validate_submission,
+    load_submission, render_controlled_manifest, validate_job_readback,
+    validate_submission_for_readback,
 };
 use crate::{
     cli::{print_json, MissionDispatchSubmitArgs},
@@ -26,7 +27,7 @@ pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| cache.join("model-report.json"));
     validate_cluster_target(&args.context, &args.namespace)?;
-    let validated = validate_submission(load_submission(&args.submission)?)?;
+    let validated = validate_submission_for_readback(load_submission(&args.submission)?)?;
     let control = args
         .control
         .or_else(|| std::env::var_os("MONDAY_CAMPAIGN_CONTROL").map(Into::into))

@@ -6,6 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) const REQUEST_SCHEMA: &str = "monday.campaign_final_request.v1";
 const FREEZE_SCHEMA: &str = "monday.campaign_final_freeze.v1";
 
+fn validate_original_source(source: &CampaignRequest) -> anyhow::Result<()> {
+    // Settled source bytes are historical evidence. New final executions
+    // separately require readiness before any allocation or artifact read.
+    validate_request_for_source(source)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FinalRequest {
@@ -155,7 +161,7 @@ impl FinalRequest {
             }
         }
         for source in self.sources.values() {
-            validate_request_for_execute(source)?;
+            validate_original_source(source)?;
             if source.campaign_inputs_sha256 != grant.execution.campaign_inputs_sha256
                 || source.feature_sha256 != first.feature_sha256
                 || source.materialization_sha256 != first.materialization_sha256
@@ -195,6 +201,13 @@ impl FinalRequest {
         }
         if serde_json::to_vec(self)?.len() as u64 > MAX_REQUEST_BYTES {
             bail!("final request exceeds byte budget");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_execution_readiness(&self) -> anyhow::Result<()> {
+        for source in self.sources.values() {
+            super::validate_execution_readiness(source)?;
         }
         Ok(())
     }
@@ -630,6 +643,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     }
     let request: FinalRequest = serde_json::from_slice(&bytes)?;
     request.validate()?;
+    request.validate_execution_readiness()?;
     if request.campaign_id != args.campaign_id
         || request.image_identity != args.image_identity
         || request.build_source_revision != BUILD_SOURCE_REVISION
@@ -1643,6 +1657,32 @@ mod tests {
         FINAL_EVALUATION_GRANT_SCHEMA,
     };
 
+    #[test]
+    fn recorded_calendar_failure_remains_structural_final_source_evidence() {
+        let (_fixture, store, source, reservation) =
+            crate::mission_dispatch::admission::planning_view::tests::recorded_calendar_source_for_tests();
+        let before = store
+            .campaign_family_snapshot(&reservation.family_id)
+            .unwrap();
+        let bytes = serialize_request(&source).unwrap();
+        validate_original_source(&source).unwrap();
+        assert_eq!(
+            hft_cex_research_input::sha256(&bytes),
+            reservation.request_sha256
+        );
+        assert_eq!(serialize_request(&source).unwrap(), bytes);
+        assert!(validate_request_for_execute(&source).is_err());
+        assert_eq!(
+            store
+                .campaign_family_snapshot(&reservation.family_id)
+                .unwrap(),
+            before
+        );
+        // This checks the actual source-validation step. The independent native
+        // final URI/projection gap remains unsupported by the complete request.
+        assert!(source.feature_url.is_empty());
+    }
+
     fn request() -> FinalRequest {
         let source = super::super::valid_request_for_tests();
         let operation = format!("campaign-attempt-{}", "a".repeat(64));
@@ -1700,6 +1740,7 @@ mod tests {
     #[test]
     fn final_request_allows_presign_refresh_without_rewriting_sources() {
         let original = request();
+        original.validate_execution_readiness().unwrap();
         let mut signed = original.clone();
         for value in signed.read_urls.values_mut() {
             value.push_str("?signature=test");

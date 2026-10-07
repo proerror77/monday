@@ -46,6 +46,7 @@ pub(super) fn construct(inputs: Inputs<'_>) -> anyhow::Result<FixedCampaign> {
     let execution = &reservation.execution;
     let artifact = build.release().artifact();
     let request = &validated.submission.request;
+    crate::mission_campaign::validate_execution_readiness(request)?;
     ensure!(
         data.request_sha256() == reservation.request_sha256
             && data.campaign_inputs_sha256() == execution.campaign_inputs_sha256

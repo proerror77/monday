@@ -42,6 +42,8 @@ use std::{
     time::Duration,
 };
 
+pub(crate) mod planning_view;
+
 const CONTROL_SCHEMA: &str = "monday.campaign_dispatch_control.v1";
 const MAX_CONTROL_BYTES: u64 = 1024 * 1024;
 
@@ -55,6 +57,9 @@ pub(super) struct DispatchControl {
     pub(super) materialization_path: PathBuf,
     #[serde(default)]
     pub(super) campaign_inputs_path: Option<PathBuf>,
+    /// Existing producer-authenticated freeze. Required only for readonly planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) planning_freeze_path: Option<PathBuf>,
     pub(super) approval_id: String,
     pub(super) controller_image: String,
     pub(super) attempt_ordinal: u32,
@@ -139,6 +144,50 @@ pub(super) fn inspect_binding(
 /// Reconstruct immutable execution evidence independently of the reader build.
 /// Settlement must subsequently match an already registered dispatch record;
 /// this function alone is never authority to reserve or submit another Job.
+pub(super) fn evaluation_views_for_materialization(
+    request: &crate::mission_campaign::CampaignRequest,
+    materialization: &crate::mission_runner::Materialization,
+) -> anyhow::Result<(
+    alpha_domain::EvaluationProtocolV1,
+    CampaignEvaluationViewsV1,
+)> {
+    let protocol = approved_evaluation_protocol_for_plan(materialization, &request.research_plan)?;
+    let protocol_sha256 = protocol.content_hash()?;
+    let partitions = protocol.row_partitions(materialization.rows)?;
+    let selection = partitions
+        .selection
+        .as_ref()
+        .context("canonical Campaign requires a withheld independent selection window")?;
+    let view_hash = |purpose: &str, range: &std::ops::Range<usize>| {
+        canonical_json_hash(&json!({
+            "schema_version": "monday.campaign_evaluation_view.v2",
+            "purpose": purpose,
+            "materialization_sha256": request.materialization_sha256,
+            "feature_sha256": request.feature_sha256,
+            "snapshot_sha256": materialization.snapshot.sha256(),
+            "evaluation_protocol_sha256": protocol_sha256,
+            "source_revision": request.build_source_revision,
+            "rows": range,
+        }))
+    };
+    let selection_feedback = if protocol.calendar.is_some() {
+        CampaignSelectionFeedbackV1::FixedCalendarValidationPreHoldout
+    } else {
+        CampaignSelectionFeedbackV1::IndependentSelectionWithheld
+    };
+    let selection_purpose = if protocol.calendar.is_some() {
+        "fixed_calendar_validation_pre_holdout"
+    } else {
+        "independent_selection_withheld"
+    };
+    let views = CampaignEvaluationViewsV1 {
+        search_view_sha256: view_hash("search_and_learning", &partitions.search)?,
+        selection_view_sha256: view_hash(selection_purpose, selection)?,
+        selection_feedback,
+    };
+    Ok((protocol, views))
+}
+
 pub(super) fn reconstruct_binding(
     validated: &ValidatedSubmission,
     manifest: &Value,
@@ -167,39 +216,9 @@ pub(super) fn reconstruct_binding(
         &request.feature_sha256,
         &approved_validation(&materialization)?,
     )?;
-    let protocol = approved_evaluation_protocol_for_plan(&materialization, &request.research_plan)?;
+    let (protocol, evaluation_views) =
+        evaluation_views_for_materialization(request, &materialization)?;
     let protocol_sha256 = protocol.content_hash()?;
-    // The same partition function is used by PreparedDataset readers. Bind the
-    // complete protocol, exact data identity and source, not just two view labels.
-    let partitions = protocol.row_partitions(materialization.rows)?;
-    let selection = partitions
-        .selection
-        .as_ref()
-        .context("canonical Campaign requires a withheld independent selection window")?;
-    let view_hash = |purpose: &str, range: &std::ops::Range<usize>| {
-        canonical_json_hash(&serde_json::json!({
-            "schema_version": "monday.campaign_evaluation_view.v2",
-            "purpose": purpose,
-            "materialization_sha256": request.materialization_sha256,
-            "feature_sha256": request.feature_sha256,
-            "snapshot_sha256": materialization.snapshot.sha256(),
-            "evaluation_protocol_sha256": protocol_sha256,
-            "source_revision": request.build_source_revision,
-            "rows": range,
-        }))
-    };
-    let search_view_sha256 = view_hash("search_and_learning", &partitions.search)?;
-    let selection_feedback = if protocol.calendar.is_some() {
-        CampaignSelectionFeedbackV1::FixedCalendarValidationPreHoldout
-    } else {
-        CampaignSelectionFeedbackV1::IndependentSelectionWithheld
-    };
-    let selection_purpose = if protocol.calendar.is_some() {
-        "fixed_calendar_validation_pre_holdout"
-    } else {
-        "independent_selection_withheld"
-    };
-    let selection_view_sha256 = view_hash(selection_purpose, selection)?;
     let job = &manifest["items"][1];
     let container = &job["spec"]["template"]["spec"]["containers"][0];
     if !container["args"]
@@ -221,11 +240,7 @@ pub(super) fn reconstruct_binding(
     let execution = CampaignExecutionBindingV1 {
         campaign_inputs_sha256: request.campaign_inputs_sha256.clone(),
         evaluation_protocol_sha256: protocol_sha256,
-        evaluation_views: CampaignEvaluationViewsV1 {
-            search_view_sha256,
-            selection_view_sha256,
-            selection_feedback,
-        },
+        evaluation_views,
         source_revision: request.build_source_revision.clone(),
         runner_image: container["image"]
             .as_str()
@@ -460,7 +475,6 @@ impl Admission {
         purpose: Purpose,
         read_only: bool,
     ) -> anyhow::Result<Self> {
-        let signed: SignedCampaignRootGrantV1 = read_json(&control.signed_root_grant_path)?;
         let InspectedDispatch {
             inspection,
             manifest,
@@ -473,6 +487,15 @@ impl Admission {
         if read_only && purpose != Purpose::Settlement {
             bail!("read-only admission cannot dispatch");
         }
+        if purpose == Purpose::Dispatch {
+            crate::mission_campaign::validate_serialized_execution_readiness(
+                manifest["items"][0]["stringData"]["campaign.json"]
+                    .as_str()
+                    .context("missing admitted Campaign request")?,
+                &inspection.request_sha256,
+            )?;
+        }
+        let signed: SignedCampaignRootGrantV1 = read_json(&control.signed_root_grant_path)?;
         // Opening the existing database read/write retains DuckDB's process
         // exclusion. Never create an empty replacement database.
         let store = if read_only {
@@ -1143,6 +1166,11 @@ pub(super) fn read_control(path: &Path) -> anyhow::Result<DispatchControl> {
         *campaign_inputs_path = campaign_inputs_path
             .canonicalize()
             .context("resolve existing Campaign inputs receipt")?;
+    }
+    if let Some(freeze_path) = &mut control.planning_freeze_path {
+        if freeze_path.is_relative() {
+            *freeze_path = base.join(&*freeze_path);
+        }
     }
     Ok(control)
 }

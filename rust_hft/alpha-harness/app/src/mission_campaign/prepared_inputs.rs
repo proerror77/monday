@@ -21,6 +21,10 @@ pub(crate) struct NativePreparedCampaignRefV1 {
     pub expected_native: ExpectedNativeCampaignInputsV1,
     pub block_urls: BTreeMap<String, String>,
     pub render_metadata: crate::mission_render::PreparedCexInputMetadata,
+    /// Safe partition metadata frozen in DataReady before Root signing. Older
+    /// audit records can omit it; planning never derives it from a fetched body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning_metadata: Option<NativeDatasetMetadataV1>,
 }
 
 pub(crate) struct PreparedCampaignArtifacts {
@@ -72,6 +76,82 @@ impl VerifiedNativeCampaignPreparedInputs {
     }
 }
 
+/// Inspect the original DataReady bytes anchored by the already signed Root.
+/// This returns metadata only, not raw-data qualification or a restored view grant.
+pub(crate) fn inspect_planning_ready_metadata(
+    bytes: &[u8],
+    expected_receipt_sha256: &str,
+    request: &CampaignRequest,
+) -> anyhow::Result<PreparedCexInputs> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_COLLECTION_BYTES as usize
+        || hft_cex_research_input::sha256(bytes) != expected_receipt_sha256
+        || request.campaign_inputs_sha256 != expected_receipt_sha256
+    {
+        bail!("planning DataReady bytes differ from the signed root input identity");
+    }
+    validate_request_for_source(request)?;
+    let receipt: CampaignInputsReceipt = serde_json::from_slice(bytes)?;
+    let reference = request
+        .prepared_inputs
+        .as_ref()
+        .context("planning requires the original development-only prepared reference")?;
+    let frozen = receipt
+        .prepared_inputs
+        .as_ref()
+        .context("planning DataReady has no prepared source")?;
+    let mut canonical_reference = reference.clone();
+    if canonical_reference.collection_url != frozen.collection_url {
+        canonical_reference.collection_url = canonical_tokyo_oss_internal_object(
+            "planning collection",
+            &canonical_reference.collection_url,
+        )?;
+    }
+    for (sha, url) in &mut canonical_reference.block_urls {
+        if frozen.block_urls.get(sha) != Some(&*url) {
+            *url = canonical_tokyo_oss_internal_object("planning block", url)?;
+        }
+    }
+    if receipt.schema_version != CAMPAIGN_INPUTS_SCHEMA_V1
+        || frozen != &canonical_reference
+        || receipt.source_revision != request.producer_source_revision
+        || mission_dispatch::image_digest(&receipt.image_ref)? != request.producer_image_identity
+        || receipt.feature.sha256 != request.feature_sha256
+        || receipt.materialization.sha256 != request.materialization_sha256
+        || receipt.replay_artifact.sha256 != request.replay_artifact_sha256
+        || receipt.replay_manifest.sha256 != request.replay_manifest_sha256
+        || receipt.run_id != reference.expected_native.source.preparation_run_id
+    {
+        bail!("planning DataReady changed its original producer or prepared sources");
+    }
+    let mut original = receipt.clone();
+    original.prepared_inputs = None;
+    if hft_cex_research_input::sha256(&serde_json::to_vec_pretty(&original)?)
+        != reference.expected_native.source.preparation_receipt_sha256
+    {
+        bail!("planning DataReady does not retain the original preparation receipt");
+    }
+    let inputs = PreparedCexInputs::restore_metadata(
+        reference.render_metadata.clone(),
+        &request.feature_sha256,
+        &request.materialization_sha256,
+    )?;
+    let materialization = inputs.materialization();
+    if receipt.market != materialization.market
+        || receipt.symbol != materialization.symbol
+        || receipt.mission_id != materialization.mission_id
+        || !inputs
+            .feature_manifest()
+            .artifact_path
+            .as_os_str()
+            .is_empty()
+    {
+        bail!("planning metadata changed the actual instrument or exposes whole-source inputs");
+    }
+    validate_signed_planning_metadata(request)?;
+    Ok(inputs)
+}
+
 /// `independently_expected_request_sha256` comes from the authenticated reservation/witness.
 /// Verifying data cannot replace that admission, transfer its budget, or launch a Run.
 pub(crate) fn inspect_finalized_campaign_prepared_inputs(
@@ -81,7 +161,7 @@ pub(crate) fn inspect_finalized_campaign_prepared_inputs(
     source: &mut impl hft_cex_research_input::data::BlockSource,
     max_decoded_bytes: u64,
 ) -> anyhow::Result<VerifiedNativeCampaignPreparedInputs> {
-    validate_request_for_execute(request)?;
+    validate_request_for_source(request)?;
     let request_sha256 = hft_cex_research_input::sha256(&serialize_request(request)?);
     if request_sha256
         != normalized_sha256(
@@ -263,6 +343,7 @@ pub(super) fn freeze_native_prepared_reference(
         expected_native: artifacts.manifest.expected_native()?,
         block_urls,
         render_metadata: inputs.render_inputs.native_metadata()?,
+        planning_metadata: Some(artifacts.manifest.original.clone()),
     })
 }
 
@@ -292,21 +373,67 @@ pub(crate) fn acquire_native_prepared(
     client: &Client,
     directory: &Path,
 ) -> anyhow::Result<VerifiedNativeCampaignPreparedInputs> {
+    acquire_prepared_with_guard(
+        request,
+        expected_request_sha256,
+        client,
+        directory,
+        false,
+        || Ok(()),
+    )
+}
+
+/// Planning reads only the original search projection, with current authority
+/// checked before each transport read and again after original verification.
+pub(crate) fn acquire_planning_prepared(
+    request: &CampaignRequest,
+    expected_request_sha256: &str,
+    client: &Client,
+    directory: &Path,
+    guard: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<VerifiedNativeCampaignPreparedInputs> {
+    acquire_prepared_with_guard(
+        request,
+        expected_request_sha256,
+        client,
+        directory,
+        true,
+        guard,
+    )
+}
+
+fn acquire_prepared_with_guard(
+    request: &CampaignRequest,
+    expected_request_sha256: &str,
+    client: &Client,
+    directory: &Path,
+    planning: bool,
+    mut guard: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<VerifiedNativeCampaignPreparedInputs> {
+    guard()?;
     let reference = request
         .prepared_inputs
         .as_ref()
         .context("native Campaign requires a frozen prepared collection")?;
     let metadata_path = directory.join("native-prepared-inputs.json");
-    fetch_verified(
-        client,
-        "native prepared collection",
-        &reference.collection_url,
-        &metadata_path,
-        &reference.collection_sha256,
-        MAX_COLLECTION_BYTES,
-    )?;
-    let collection: CampaignPreparedInputsV1 =
-        serde_json::from_slice(&std::fs::read(&metadata_path)?)?;
+    let read_collection = || {
+        fetch_verified(
+            client,
+            "native prepared collection",
+            &reference.collection_url,
+            &metadata_path,
+            &reference.collection_sha256,
+            MAX_COLLECTION_BYTES,
+        )?;
+        Ok(serde_json::from_slice::<CampaignPreparedInputsV1>(
+            &std::fs::read(&metadata_path)?,
+        )?)
+    };
+    let collection = if planning {
+        with_signed_planning_metadata(request, read_collection)?
+    } else {
+        read_collection()?
+    };
     collection.validate_metadata()?;
     if collection.id()? != reference.collection_sha256
         || collection.expected_native()? != reference.expected_native
@@ -325,30 +452,272 @@ pub(crate) fn acquire_native_prepared(
     if declared != reference.block_urls.keys().cloned().collect() {
         bail!("native collection transports do not match the actual allowed views");
     }
-    let mut files = BTreeMap::new();
-    for (sha, url) in &reference.block_urls {
-        let path = directory.join(format!("{sha}.mondaybin"));
-        fetch_verified(
-            client,
-            "native prepared block",
-            url,
-            &path,
-            sha,
-            16 * 1024 * 1024,
-        )?;
-        files.insert(sha.clone(), path);
+    let mut read = |collection| {
+        let mut files = BTreeMap::new();
+        for (sha, url) in &reference.block_urls {
+            guard()?;
+            let path = directory.join(format!("{sha}.mondaybin"));
+            fetch_verified(
+                client,
+                "native prepared block",
+                url,
+                &path,
+                sha,
+                16 * 1024 * 1024,
+            )?;
+            files.insert(sha.clone(), path);
+        }
+        inspect_finalized_campaign_prepared_inputs(
+            request,
+            expected_request_sha256,
+            collection,
+            &mut ReadbackBlocks { files },
+            MAX_NATIVE_DECODED_BYTES,
+        )
+    };
+    let verified = if planning {
+        with_planning_projection(collection, request, read)?
+    } else {
+        read(collection)?
+    };
+    guard()?;
+    Ok(verified)
+}
+
+fn with_planning_projection<T>(
+    collection: CampaignPreparedInputsV1,
+    request: &CampaignRequest,
+    read: impl FnOnce(CampaignPreparedInputsV1) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    validate_planning_projection_metadata(&collection, request)?;
+    read(collection)
+}
+
+fn with_signed_planning_metadata<T>(
+    request: &CampaignRequest,
+    read: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    validate_signed_planning_metadata(request)?;
+    read()
+}
+
+pub(crate) fn validate_signed_planning_metadata(request: &CampaignRequest) -> anyhow::Result<()> {
+    let reference = request
+        .prepared_inputs
+        .as_ref()
+        .context("planning source reference missing")?;
+    let original = reference.planning_metadata.as_ref().context(
+        "planning needs safe original partition metadata before reading collection rows",
+    )?;
+    if identity(original)? != reference.expected_native.original_metadata_sha256 {
+        bail!("planning safe header differs from the signed DataReady metadata identity");
     }
-    inspect_finalized_campaign_prepared_inputs(
-        request,
-        expected_request_sha256,
-        collection,
-        &mut ReadbackBlocks { files },
-        MAX_NATIVE_DECODED_BYTES,
-    )
+    validate_planning_metadata(original, request)
+}
+
+fn validate_planning_metadata(
+    original: &NativeDatasetMetadataV1,
+    request: &CampaignRequest,
+) -> anyhow::Result<()> {
+    let reference = request
+        .prepared_inputs
+        .as_ref()
+        .context("planning request has no prepared metadata")?;
+    let render = PreparedCexInputs::restore_metadata(
+        reference.render_metadata.clone(),
+        &request.feature_sha256,
+        &request.materialization_sha256,
+    )?;
+    let materialization = render.materialization();
+    let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+        materialization,
+        &request.research_plan,
+    )?;
+    let partitions = protocol.row_partitions(materialization.rows)?;
+    if original.total_rows != materialization.rows
+        || original.protocol_sha256 != protocol.content_hash()?
+        || serde_json::from_str::<EvaluationProtocolV1>(&original.protocol_json)? != protocol
+        || original.search_rows != partitions.search
+        || original.visible_rows != partitions.search
+        || original.selection.as_ref().map(|view| &view.original_rows)
+            != partitions.selection.as_ref()
+        || original.holdout.original_rows != partitions.sealed_holdout
+    {
+        bail!("planning source is not the original search-only development projection");
+    }
+    let first = materialization
+        .snapshot
+        .first_event_time
+        .timestamp_nanos_opt()
+        .context("planning first feature clock overflow")?;
+    let cadence = i64::try_from(materialization.bucket_ms)?
+        .checked_mul(1_000_000)
+        .context("planning cadence overflow")?;
+    let clock = |row: usize| -> anyhow::Result<i64> {
+        first
+            .checked_add(
+                i64::try_from(row)?
+                    .checked_mul(cadence)
+                    .context("planning row clock overflow")?,
+            )
+            .context("planning clock overflow")
+    };
+    let search_window = Window {
+        start_ns: clock(partitions.search.start)?,
+        end_ns: clock(partitions.search.end)?,
+    };
+    let withheld_start = partitions
+        .selection
+        .as_ref()
+        .map_or(partitions.sealed_holdout.start, |view| view.start);
+    let context_end = clock(withheld_start)?;
+    if original.development_window != search_window
+        || original.authorized_context_end_ns != context_end
+        || original.holdout.window.start_ns != clock(partitions.sealed_holdout.start)?
+    {
+        bail!("planning source clocks extend outside the signed original search/label context");
+    }
+    if let Some(selection) = &original.selection {
+        if selection.window.start_ns != clock(selection.original_rows.start)?
+            || selection.window.end_ns != clock(selection.original_rows.end)?
+        {
+            bail!("planning original selection clocks differ from the actual protocol");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_planning_projection_metadata(
+    collection: &CampaignPreparedInputsV1,
+    request: &CampaignRequest,
+) -> anyhow::Result<()> {
+    validate_signed_planning_metadata(request)?;
+    let header = request
+        .prepared_inputs
+        .as_ref()
+        .unwrap()
+        .planning_metadata
+        .as_ref()
+        .unwrap();
+    if &collection.original != header
+        || collection.features.manifest.spec.split != Split::Validation
+        || collection.features.manifest.spec.window != header.development_window
+        || collection.future_marks.manifest.spec.window.end_ns > header.authorized_context_end_ns
+        || collection.replay.manifest.spec.window.end_ns > header.authorized_context_end_ns
+    {
+        bail!("fetched planning collection differs from its original signed safe scope");
+    }
+    Ok(())
 }
 
 struct ReadbackBlocks {
     files: BTreeMap<String, PathBuf>,
+}
+
+#[cfg(all(test, feature = "scientific"))]
+mod planning_projection_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn calendar_search_projection_preserves_actual_producer_and_blocks_overbroad_header_before_read(
+    ) {
+        let fixture =
+            crate::mission_campaign::tests::native_prepared_calendar_fixture_for_tests(false);
+        let reads = Cell::new(0);
+        with_signed_planning_metadata(&fixture.request, || {
+            reads.set(reads.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        let original = fixture.inputs.prepared().original_metadata();
+        let protocol: EvaluationProtocolV1 = serde_json::from_str(&original.protocol_json).unwrap();
+        assert!(protocol.calendar.as_ref().unwrap().develop_end_row > original.visible_rows.end);
+        assert_eq!(original.visible_rows, original.search_rows);
+        assert!(
+            original.visible_rows.end < original.selection.as_ref().unwrap().original_rows.start
+        );
+        for boundary in ["calendar-tail", "selection", "sealed"] {
+            let mut request = fixture.request.clone();
+            let reference = request.prepared_inputs.as_mut().unwrap();
+            let header = reference.planning_metadata.as_mut().unwrap();
+            header.visible_rows.end = match boundary {
+                "calendar-tail" => protocol.calendar.as_ref().unwrap().develop_end_row,
+                "selection" => original.selection.as_ref().unwrap().original_rows.end,
+                "sealed" => original.holdout.original_rows.end,
+                _ => unreachable!(),
+            };
+            reference.expected_native.original_metadata_sha256 = identity(header).unwrap();
+            assert!(
+                with_signed_planning_metadata(&request, || {
+                    reads.set(reads.get() + 1);
+                    Ok(())
+                })
+                .is_err(),
+                "{boundary}"
+            );
+            assert_eq!(reads.get(), 1, "{boundary} read collection anchors");
+        }
+    }
+
+    #[test]
+    fn safe_scope_is_verified_before_any_collection_or_block_read() {
+        let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
+        let reads = Cell::new(0);
+        with_signed_planning_metadata(&fixture.request, || {
+            reads.set(reads.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(reads.get(), 1);
+        for change in ["absent", "range", "protocol", "rows", "context"] {
+            let mut request = fixture.request.clone();
+            let reference = request.prepared_inputs.as_mut().unwrap();
+            if change == "absent" {
+                reference.planning_metadata = None;
+                assert!(serde_json::to_value(&reference)
+                    .unwrap()
+                    .get("planning_metadata")
+                    .is_none());
+            } else {
+                let header = reference.planning_metadata.as_mut().unwrap();
+                match change {
+                    "range" => {
+                        header.search_rows.end += 1;
+                        header.visible_rows.end += 1;
+                    }
+                    "protocol" => header.protocol_sha256 = "0".repeat(64),
+                    "rows" => header.total_rows += 1,
+                    "context" => header.authorized_context_end_ns += 1,
+                    _ => unreachable!(),
+                }
+                // Even an internally rehashed declaration cannot replace actual protocol bounds.
+                reference.expected_native.original_metadata_sha256 = identity(header).unwrap();
+            }
+            assert!(
+                with_signed_planning_metadata(&request, || {
+                    reads.set(reads.get() + 1);
+                    Ok(())
+                })
+                .is_err(),
+                "{change}"
+            );
+            assert_eq!(reads.get(), 1, "{change} read protected collection anchors");
+        }
+        let mut collection = fixture.inputs.prepared().manifest().clone();
+        collection.original.search_rows.end += 1;
+        collection.original.visible_rows.end += 1;
+        assert!(with_planning_projection(collection, &fixture.request, |_| {
+            reads.set(reads.get() + 1);
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(
+            reads.get(),
+            1,
+            "changed collection fetched protected blocks"
+        );
+    }
 }
 impl hft_cex_research_input::data::BlockSource for ReadbackBlocks {
     fn read(&mut self, block: &hft_cex_research_input::data::BlockRef) -> anyhow::Result<Vec<u8>> {
@@ -382,10 +751,9 @@ pub(super) fn export_trusted_source(
 ) -> anyhow::Result<PreparedCampaignArtifacts> {
     prepare_dataset(full_rows.clone(), protocol)?;
     let partitions = protocol.row_partitions(full_rows.len())?;
-    let visible_end = protocol
-        .calendar
-        .as_ref()
-        .map_or(partitions.search.end, |c| c.develop_end_row);
+    // Publish only the actual search prefix. Calendar's wider development tail
+    // is purge/context metadata, not permission to import labels from selection.
+    let visible_end = partitions.search.end;
     if visible_end == 0
         || visible_end > partitions.sealed_holdout.start
         || full_rows.iter().any(|row| row.series_id != 1)

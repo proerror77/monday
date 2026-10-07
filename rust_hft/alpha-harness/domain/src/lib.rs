@@ -11,6 +11,7 @@ mod evaluation_partition;
 pub mod frozen_model;
 pub mod market_encoder_study;
 pub mod mlp_training;
+pub mod representation;
 pub mod research_accelerator;
 pub mod sec_orderflow;
 pub mod sequence_study;

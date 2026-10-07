@@ -1261,6 +1261,7 @@ mod tests {
             trusted_keys_path: root.path().join("keys.json"),
             materialization_path: root.path().join("inputs.json"),
             campaign_inputs_path: None,
+            planning_freeze_path: None,
             approval_id: "sequence-approval".into(),
             controller_image: controller,
             attempt_ordinal: 0,
