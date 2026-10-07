@@ -140,7 +140,11 @@ fn representation_bound_request_is_the_exact_native_run_configuration() {
 }
 
 fn exercise_exact_native_task(represented: bool) {
-    let mut fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
+    let mut fixture = if represented {
+        crate::mission_campaign::tests::native_prepared_planning_fixture_for_tests()
+    } else {
+        crate::mission_campaign::tests::native_prepared_fixture_for_tests()
+    };
     let image = format!("registry/worker@sha256:{}", fixture.request.image_identity);
     let mut submission = super::super::MissionDispatchSubmission {
         attempt_id: "native-export-fixture".into(),
@@ -149,7 +153,11 @@ fn exercise_exact_native_task(represented: bool) {
     };
     // This genuine local-data fixture is not a cloud transport acceptance.
     // Production continues to reject its file-backed collection URLs.
-    assert!(super::super::validate_submission(submission.clone()).is_err());
+    if represented {
+        super::super::validate_submission(submission.clone()).unwrap();
+    } else {
+        assert!(super::super::validate_submission(submission.clone()).is_err());
+    }
     let validated = super::super::validate_submission_with_request_check(
         submission.clone(),
         crate::mission_campaign::validate_request_for_execute,
@@ -164,6 +172,17 @@ fn exercise_exact_native_task(represented: bool) {
         0,
     )
     .unwrap();
+    let mut store = AlphaStore::open_in_memory().unwrap();
+    let freeze_directory = tempfile::tempdir().unwrap();
+    let freeze_path = freeze_directory.path().join("original-freeze.json");
+    if represented {
+        // The original producer authenticates its complete canonical request before Root signing.
+        crate::mission_campaign::tests::write_planning_freeze_for_tests(
+            &store,
+            &fixture.request,
+            &freeze_path,
+        );
+    }
     let now = Utc::now();
     let root = CampaignRootGrantV1 {
         schema_version: ROOT_GRANT_SCHEMA.into(),
@@ -194,7 +213,6 @@ fn exercise_exact_native_task(represented: bool) {
         now,
     )
     .unwrap();
-    let mut store = AlphaStore::open_in_memory().unwrap();
     store.record_approval(&ApprovalRecord {
         approval_id: "native-export-approval".into(), approval_class: "campaign_root".into(), subject_id: root.grant().root_id.clone(),
         payload: json!({"grant_sha256":root.content_sha256(),"family_id":root.grant().family.family_id}), signer_id: Some("authority".into()),
@@ -207,7 +225,7 @@ fn exercise_exact_native_task(represented: bool) {
     let (validated, manifest, inspection) = if represented {
         let original = validated.request_sha256.clone();
         fixture
-            .bind_representation_for_tests(&root, &store)
+            .bind_representation_for_tests(&root, &store, &freeze_path)
             .unwrap();
         for changed_source in ["unknown", "abcdef0123456789abcdef0123456789abcdef01"] {
             let mut changed = fixture.request.clone();
@@ -525,9 +543,9 @@ fn exercise_exact_native_task(represented: bool) {
 fn representation_https_canonical_freeze_finalize_binds_exact_request() {
     // This is a software protocol fixture. Objects are exact local acquisition bytes,
     // registered under canonical HTTPS identities. No network or cloud claim is made.
-    let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
-    let (request, objects) =
-        crate::mission_campaign::tests::canonical_https_fixture_for_tests(&fixture).unwrap();
+    let fixture = crate::mission_campaign::tests::native_prepared_planning_fixture_for_tests();
+    let request = fixture.request.clone();
+    let objects = crate::mission_campaign::tests::published_objects_for_tests(&fixture).unwrap();
     let submission = super::super::MissionDispatchSubmission {
         attempt_id: "https-original-fixture".into(),
         image: format!("registry/worker@sha256:{}", request.image_identity),
@@ -543,6 +561,10 @@ fn representation_https_canonical_freeze_finalize_binds_exact_request() {
         0,
     )
     .unwrap();
+    let mut store = AlphaStore::open_in_memory().unwrap();
+    let freeze_directory = tempfile::tempdir().unwrap();
+    let freeze_path = freeze_directory.path().join("original-freeze.json");
+    crate::mission_campaign::tests::write_planning_freeze_for_tests(&store, &request, &freeze_path);
     let now = Utc::now();
     let key = SigningKey::from_bytes(&[19; 32]);
     // Sign only after the HTTPS publication receipt/data identity has been frozen.
@@ -578,7 +600,6 @@ fn representation_https_canonical_freeze_finalize_binds_exact_request() {
         now,
     )
     .unwrap();
-    let mut store = AlphaStore::open_in_memory().unwrap();
     store.record_approval(&ApprovalRecord {approval_id:"https-planning-approval".into(),approval_class:"campaign_root".into(),subject_id:root.grant().root_id.clone(),
         payload:json!({"grant_sha256":root.content_sha256(),"family_id":root.grant().family.family_id}),signer_id:Some("authority".into()),
         valid_from:Some(root.grant().valid_from),expires_at:Some(root.grant().expires_at),revoked_at:None,revoked_by:None,revocation_reason:None,created_at:root.grant().valid_from}).unwrap();
@@ -586,7 +607,11 @@ fn representation_https_canonical_freeze_finalize_binds_exact_request() {
         .register_campaign_root(&root, "https-planning-approval", now)
         .unwrap();
     let bound = crate::mission_campaign::tests::representation_https_request_for_tests(
-        &request, &root, &store, &objects,
+        &request,
+        &root,
+        &store,
+        &freeze_path,
+        &objects,
     )
     .unwrap();
     assert_ne!(bound.campaign_id, request.campaign_id);

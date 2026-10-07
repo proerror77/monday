@@ -79,7 +79,7 @@ Unit cases verify software behavior. They do not prove real data coverage, train
 ## Reusing materialized columns in the canonical Campaign
 
 The second slice exposes `preview_representation_campaign_contracts` and `bind_signed_prepared_representation_campaign`.
-Both accept the original control and request paths. They use the shared current Root/Study planning guard before inspecting prepared inputs.
+Both accept the original control and request paths. They use the shared current Root/Study planning guard and independently authenticated original complete request freeze before inspecting prepared inputs.
 Planner callbacks borrow only normalized rows, column names, source identities, protocol and window facts. Replay, full manifests and transports remain private to IO.
 The current source-only fixed-calendar projection cannot execute a scientific Campaign. Its readiness gate rejects execution before budget reservation.
 The binder selects exact registered H1 or H2 columns from the original decoded development projection. It does not regenerate columns.
@@ -103,5 +103,5 @@ The complete canonical request includes the column binding. Existing Run configu
 Prepared metadata and its audit timestamp remain frozen; selecting columns does not re-import or rewrite DataReady.
 
 Software fixtures use the same current permission guard and original native decoder. They reject goal, source, column and accounting drift.
-The HTTPS protocol fixture freezes mock publication references before Root signing. It checks canonical ID, finalized request SHA and acquired bytes.
+The HTTPS protocol fixture uses the original producer to freeze canonical publication references, DataReady bytes and a same-ledger authenticated complete request before Root signing. The planning helper only verifies that freeze. It checks canonical ID, finalized request SHA and acquired bytes.
 Its private readback seam uses the original fetcher in production. The fixture performs no network request and proves no cloud research result.

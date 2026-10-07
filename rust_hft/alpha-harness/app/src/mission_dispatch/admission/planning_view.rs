@@ -235,7 +235,7 @@ pub(crate) fn with_fixture_view<T>(
     store: &AlphaStore,
     root: &VerifiedCampaignRootGrant,
     trusted_keys: &Path,
-    request: &CampaignRequest,
+    frozen_request: (&CampaignRequest, &Path),
     receipt: &[u8],
     acquire: impl FnOnce(
         &str,
@@ -243,8 +243,18 @@ pub(crate) fn with_fixture_view<T>(
     ) -> anyhow::Result<prepared_inputs::VerifiedNativeCampaignPreparedInputs>,
     action: impl FnOnce(&VerifiedPlanningView<'_>) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    let (request, freeze_path) = frozen_request;
     let permission = store.inspect_campaign_planning_permission(root)?;
-    let scope = authorize_projection(permission, trusted_keys, request, receipt, acquire)?;
+    check_current_authority(&permission, trusted_keys)?;
+    let anchored_request =
+        crate::mission_campaign::verify_planning_request(store, Some(freeze_path), request)?;
+    let scope = authorize_projection(
+        permission,
+        trusted_keys,
+        &anchored_request,
+        receipt,
+        acquire,
+    )?;
     scope.recheck()?;
     let output = action(&scope)?;
     scope.recheck()?;

@@ -5972,123 +5972,44 @@ pub(crate) mod tests {
             &mut self,
             root: &alpha_domain::campaign_control::VerifiedCampaignRootGrant,
             store: &alpha_store::AlphaStore,
+            freeze_path: &Path,
         ) -> anyhow::Result<()> {
             let original_request_sha = self.inputs.request_sha256().to_owned();
             let original_inputs_sha = self.request.campaign_inputs_sha256.clone();
-            let original = self
-                .request
+            let original_reference = self.request.prepared_inputs.clone();
+            let objects = published_objects_for_tests(self)?;
+            let request =
+                representation_https_request_for_tests(&self.request, root, store, freeze_path, &objects)?;
+            if request.campaign_inputs_sha256 != original_inputs_sha
+                || request.campaign_inputs_sha256 != root.grant().execution.campaign_inputs_sha256
+                || request.prepared_inputs != original_reference
+            {
+                bail!("column selection changed the frozen signed DataReady identity");
+            }
+            let reference = request
                 .prepared_inputs
                 .as_ref()
-                .context("missing fixture prepared input")?;
-            let original_reference = original.clone();
-            if self.request.campaign_inputs_sha256 != original_inputs_sha
-                || self.request.campaign_inputs_sha256
-                    != root.grant().execution.campaign_inputs_sha256
-                || self.request.prepared_inputs.as_ref() != Some(&original_reference)
-            {
-                bail!("representation fixture changed the existing signed source/data identity");
+                .context("missing fixture reference")?;
+            let mut bytes = std::collections::BTreeMap::new();
+            for (sha, url) in &reference.block_urls {
+                bytes.insert(
+                    sha.clone(),
+                    objects.get(url).context("missing frozen block")?.clone(),
+                );
             }
-            struct FrozenBlocks {
-                root: PathBuf,
-                declared: std::collections::BTreeMap<String, String>,
-            }
-            impl hft_cex_research_input::data::BlockSource for FrozenBlocks {
-                fn read(
-                    &mut self,
-                    block: &hft_cex_research_input::data::BlockRef,
-                ) -> anyhow::Result<Vec<u8>> {
-                    if !hft_cex_research_input::valid_digest(&block.sha256) {
-                        bail!("frozen fixture block digest is invalid");
-                    }
-                    let expected = self.root.join(format!("{}.mondaybin", block.sha256));
-                    let declared = self
-                        .declared
-                        .get(&block.sha256)
-                        .context("frozen fixture block was not declared")?;
-                    if declared != expected.to_string_lossy().as_ref() {
-                        bail!("frozen fixture block is outside its exact original root/hash path");
-                    }
-                    let metadata = std::fs::symlink_metadata(&expected)?;
-                    if !metadata.is_file()
-                        || metadata.file_type().is_symlink()
-                        || metadata.len() != block.bytes
-                    {
-                        bail!("frozen fixture block is not the declared regular byte object");
-                    }
-                    let mut bytes = Vec::new();
-                    std::fs::File::open(&expected)?
-                        .take(
-                            block
-                                .bytes
-                                .checked_add(1)
-                                .context("fixture byte limit overflow")?,
-                        )
-                        .read_to_end(&mut bytes)?;
-                    if bytes.len() as u64 != block.bytes
-                        || hex::encode(Sha256::digest(&bytes)) != block.sha256
-                    {
-                        bail!("frozen fixture block content differs from the declared hash");
-                    }
-                    Ok(bytes)
-                }
-            }
-            let keys = self._root.path().join("planning-current-trust.json");
-            std::fs::write(
-                &keys,
-                serde_json::to_vec(&std::collections::BTreeMap::from([(
-                    root.signed_grant().key_id.clone(),
-                    hex::encode(root.verifying_key().as_bytes()),
-                )]))?,
-            )?;
-            let receipt = std::fs::read(self.augmented_receipt_path())?;
-            let original_request = self.request.clone();
-            let collection = self.inputs.prepared().manifest().clone();
-            let plan = crate::mission_dispatch::admission::planning_view::with_fixture_view(
-                store,
-                root,
-                &keys,
-                &original_request,
-                &receipt,
-                |expected, guard| {
-                    guard()?;
-                    let mut source = FrozenBlocks {
-                        root: self._root.path().to_path_buf(),
-                        declared: original_reference.block_urls.clone(),
-                    };
-                    let verified = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
-                        &original_request,
-                        expected,
-                        collection.clone(),
-                        &mut source,
-                        1024 * 1024 * 1024,
-                    )?;
-                    guard()?;
-                    Ok(verified)
-                },
-                |scope| representation::prepared_plan_for_fixture(scope, root),
-            )?;
-            self.request.research_plan = plan;
-            if self.request.campaign_inputs_sha256 != original_inputs_sha
-                || self.request.prepared_inputs.as_ref() != Some(&original_reference)
-            {
-                bail!("column selection changed the frozen DataReady identity");
-            }
-            let mut source = FrozenBlocks {
-                root: self._root.path().to_path_buf(),
-                declared: original_reference.block_urls.clone(),
-            };
-            let expected = hex::encode(Sha256::digest(serialize_request(&self.request)?));
+            let expected = hft_cex_research_input::sha256(&serialize_request(&request)?);
             self.inputs = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
-                &self.request,
+                &request,
                 &expected,
                 self.inputs.prepared().manifest().clone(),
-                &mut source,
+                &mut hft_cex_research_input::prepared::AcquiredBlocks { bytes },
                 1024 * 1024 * 1024,
             )?;
             if self.inputs.request_sha256() == original_request_sha {
                 bail!("representation fixture did not bind the new complete request identity");
             }
-            validate_request_for_execute(&self.request)?;
+            validate_request_for_execute(&request)?;
+            self.request = request;
             Ok(())
         }
 
@@ -6367,78 +6288,64 @@ pub(crate) mod tests {
     }
 
     /// Software publication objects; no network request or cloud readback occurs.
-    pub(crate) fn canonical_https_fixture_for_tests(
+    const PLANNING_FIXTURE_ORIGIN: &str = "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/native-planning-fixture";
+
+    pub(crate) fn published_objects_for_tests(
         fixture: &NativePreparedFixture,
-    ) -> anyhow::Result<(CampaignRequest, std::collections::BTreeMap<String, Vec<u8>>)> {
-        const ORIGIN: &str = "https://unit.oss-ap-northeast-1-internal.aliyuncs.com/research";
-        let original = fixture
+    ) -> anyhow::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        let reference = fixture
             .request
             .prepared_inputs
             .as_ref()
-            .context("missing HTTPS fixture prepared reference")?;
-        let mut reference = original.clone();
-        let mut objects = std::collections::BTreeMap::new();
-        reference.collection_url = format!(
-            "{ORIGIN}/native-prepared/{}.json",
+            .context("missing published reference")?;
+        let collection_url = format!(
+            "{PLANNING_FIXTURE_ORIGIN}/native-prepared/{}.json",
             reference.collection_sha256
         );
-        objects.insert(
-            reference.collection_url.clone(),
-            serde_json::to_vec(fixture.inputs.prepared().manifest())?,
-        );
-        for (sha, url) in &mut reference.block_urls {
-            let path = original
-                .block_urls
-                .get(sha)
-                .context("missing original exported block")?;
-            let bytes = std::fs::read(path)?;
-            if hft_cex_research_input::sha256(&bytes) != *sha {
-                bail!("original HTTPS fixture block bytes changed");
-            }
-            *url = format!("{ORIGIN}/native-prepared/{sha}.mondaybin");
-            objects.insert(url.clone(), bytes);
+        if reference.collection_url != collection_url {
+            bail!("fixture is not the original producer's exact publication");
         }
-        // Freeze the publication URI/receipt before signing its Root. Do not rewrite the original receipt.
-        let mut receipt: CampaignInputsReceipt =
-            serde_json::from_slice(&std::fs::read(fixture.augmented_receipt_path())?)?;
-        receipt.prepared_inputs = Some(reference.clone());
-        let receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
-        let input_sha = hft_cex_research_input::sha256(&receipt_bytes);
-        objects.insert(format!("{ORIGIN}/data-ready.json"), receipt_bytes);
-        let request = build_request_from_parts(
-            "",
-            &fixture.request.feature_sha256,
-            "",
-            &fixture.request.materialization_sha256,
-            "",
-            &fixture.request.replay_artifact_sha256,
-            "",
-            &fixture.request.replay_manifest_sha256,
-            &input_sha,
-            &fixture.request.producer_source_revision,
-            &fixture.request.producer_image_identity,
-            Some(&reference),
-            &fixture.request.research_plan,
-            &fixture.request.build_source_revision,
-            &fixture.request.image_identity,
-            &format!("{ORIGIN}/campaigns"),
-            &fixture.request.holdout_id,
-            &fixture
-                .request
-                .rounds
-                .iter()
-                .map(|round| round.seed)
-                .collect::<Vec<_>>(),
-            None,
-        )?;
-        validate_request(&request)?;
-        Ok((request, objects))
+        let read_object = |name: String, sha: &str| -> anyhow::Result<Vec<u8>> {
+            let path = fixture._root.path().join(name);
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!("published fixture object is not an original regular file");
+            }
+            let bytes = std::fs::read(path)?;
+            if hft_cex_research_input::sha256(&bytes) != sha {
+                bail!("original published fixture object bytes changed");
+            }
+            Ok(bytes)
+        };
+        let mut objects = std::collections::BTreeMap::from([(
+            collection_url,
+            read_object(
+                format!("{}.json", reference.collection_sha256),
+                &reference.collection_sha256,
+            )?,
+        )]);
+        for (sha, url) in &reference.block_urls {
+            if *url != format!("{PLANNING_FIXTURE_ORIGIN}/native-prepared/{sha}.mondaybin") {
+                bail!("published block URI differs from the original producer identity");
+            }
+            objects.insert(url.clone(), read_object(format!("{sha}.mondaybin"), sha)?);
+        }
+        let receipt = std::fs::read(fixture.augmented_receipt_path())?;
+        if hft_cex_research_input::sha256(&receipt) != fixture.request.campaign_inputs_sha256 {
+            bail!("original published DataReady receipt bytes changed");
+        }
+        objects.insert(
+            format!("{PLANNING_FIXTURE_ORIGIN}/data-ready.json"),
+            receipt,
+        );
+        Ok(objects)
     }
 
     pub(crate) fn representation_https_request_for_tests(
         request: &CampaignRequest,
         authority: &alpha_domain::campaign_control::VerifiedCampaignRootGrant,
         store: &alpha_store::AlphaStore,
+        freeze_path: &Path,
         objects: &std::collections::BTreeMap<String, Vec<u8>>,
     ) -> anyhow::Result<CampaignRequest> {
         let keys_dir = tempfile::tempdir()?;
@@ -6451,13 +6358,13 @@ pub(crate) mod tests {
             )]))?,
         )?;
         let receipt = objects
-            .get("https://unit.oss-ap-northeast-1-internal.aliyuncs.com/research/data-ready.json")
+            .get(&format!("{PLANNING_FIXTURE_ORIGIN}/data-ready.json"))
             .context("missing exact published DataReady fixture")?;
         let plan = crate::mission_dispatch::admission::planning_view::with_fixture_view(
             store,
             authority,
             &keys,
-            request,
+            (request, freeze_path),
             receipt,
             |expected, guard| {
                 guard()?;
