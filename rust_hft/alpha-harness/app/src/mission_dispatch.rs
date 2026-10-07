@@ -40,6 +40,39 @@ pub(crate) struct AuthenticatedCampaignParent {
     pub(crate) parent: CampaignNextFamilyParentV1,
     pub(crate) study_grant: alpha_domain::campaign_study::SignedCampaignStudyGrantV1,
     pub(crate) request: CampaignRequest,
+    pub(crate) result_bytes: Vec<u8>,
+}
+
+/// Original settled dispatch identity. Caller JSON and hashes cannot construct it.
+pub(crate) struct AuthenticatedSettledCampaignSource {
+    store: AlphaStore,
+    request: CampaignRequest,
+    reservation: alpha_domain::campaign_control::CampaignAttemptReservationV1,
+    settlement: alpha_domain::campaign_control::CampaignAttemptSettlementV1,
+    result_sha256: String,
+    result_bytes: Vec<u8>,
+    family_receipt_sha256: String,
+    terminal_job_uid: String,
+    terminal_pod_uid: String,
+}
+
+impl AuthenticatedSettledCampaignSource {
+    pub(crate) fn request(&self) -> &CampaignRequest {
+        &self.request
+    }
+    pub(crate) fn request_sha256(&self) -> &str {
+        &self.reservation.request_sha256
+    }
+    pub(crate) fn result_sha256(&self) -> &str {
+        &self.result_sha256
+    }
+    pub(crate) fn result_bytes(&self) -> &[u8] {
+        &self.result_bytes
+    }
+    pub(crate) fn is_negative(&self) -> bool {
+        self.settlement.outcome
+            == alpha_domain::campaign_control::CampaignAttemptOutcomeV1::NoCandidate
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,19 +271,18 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
 /// Read back the parent terminal through the authenticated dispatch ledger.
 /// Caller-provided hashes are only cross-checks; the family and Study receipts
 /// are the source of truth for a next-family proposal.
-pub(crate) fn read_authenticated_campaign_parent(
+pub(crate) fn read_authenticated_settled_campaign_source(
     control_path: &Path,
     submission_path: &Path,
     result_path: &Path,
     settlement_path: &Path,
-    study_id: &str,
     namespace: &str,
-) -> anyhow::Result<AuthenticatedCampaignParent> {
+) -> anyhow::Result<AuthenticatedSettledCampaignSource> {
     let control = admission::read_control(control_path)?;
     let submission = load_submission(submission_path)?;
     let validated = validate_submission_for_readback(submission)?;
     let manifest = render_controlled_manifest(&validated, namespace, &control)?;
-    let inspection = admission::inspect_binding(
+    let inspection = admission::reconstruct_binding(
         &validated,
         &manifest,
         &control.materialization_path,
@@ -267,7 +299,7 @@ pub(crate) fn read_authenticated_campaign_parent(
         &admission::read_trusted_keys(&control.trusted_keys_path)?,
         signed.grant.expires_at - chrono::TimeDelta::seconds(1),
     )?;
-    let store = AlphaStore::open(&control.ledger_path)?;
+    let store = AlphaStore::open_read_only(&control.ledger_path)?;
     let reservation = inspection
         .historical_reservation_for(&signed.content_sha256, &signed.grant.family.family_id);
     let operation_id = reservation.operation_id()?;
@@ -288,10 +320,8 @@ pub(crate) fn read_authenticated_campaign_parent(
         .terminal_pod_uid
         .clone()
         .context("parent dispatch has no independently read-back terminal Pod UID")?;
-    let result_sha256 = hex::encode(Sha256::digest(admission::read_bounded(
-        result_path,
-        MAX_SUBMISSION_BYTES,
-    )?));
+    let result_bytes = admission::read_bounded(result_path, MAX_SUBMISSION_BYTES)?;
+    let result_sha256 = hex::encode(Sha256::digest(&result_bytes));
     if result_sha256 != settlement.evidence_sha256 {
         bail!("parent terminal result differs from the settled ledger evidence");
     }
@@ -320,6 +350,45 @@ pub(crate) fn read_authenticated_campaign_parent(
             _ => None,
         })
         .context("parent settlement is missing from the authenticated family ledger")?;
+    Ok(AuthenticatedSettledCampaignSource {
+        store,
+        request: validated.submission.request,
+        reservation,
+        settlement,
+        result_sha256,
+        result_bytes,
+        family_receipt_sha256,
+        terminal_job_uid,
+        terminal_pod_uid,
+    })
+}
+
+pub(crate) fn read_authenticated_campaign_parent(
+    control_path: &Path,
+    submission_path: &Path,
+    result_path: &Path,
+    settlement_path: &Path,
+    study_id: &str,
+    namespace: &str,
+) -> anyhow::Result<AuthenticatedCampaignParent> {
+    let source = read_authenticated_settled_campaign_source(
+        control_path,
+        submission_path,
+        result_path,
+        settlement_path,
+        namespace,
+    )?;
+    let AuthenticatedSettledCampaignSource {
+        store,
+        request,
+        reservation,
+        settlement,
+        result_sha256,
+        result_bytes,
+        family_receipt_sha256,
+        terminal_job_uid,
+        terminal_pod_uid,
+    } = source;
     let study_snapshot: CampaignStudySnapshotV1 = store.campaign_study_snapshot(study_id)?;
     let study_grant = store
         .campaign_study_grant(study_id)?
@@ -358,7 +427,7 @@ pub(crate) fn read_authenticated_campaign_parent(
         family_id: reservation.family_id,
         root_grant_sha256: reservation.root_grant_sha256,
         request_sha256: reservation.request_sha256,
-        campaign_inputs_sha256: validated.submission.request.campaign_inputs_sha256.clone(),
+        campaign_inputs_sha256: request.campaign_inputs_sha256.clone(),
         campaign_result_sha256: result_sha256,
         family_settlement_receipt_sha256: family_receipt_sha256,
         study_settlement_receipt_sha256: study_receipt_sha256.clone(),
@@ -372,7 +441,8 @@ pub(crate) fn read_authenticated_campaign_parent(
     Ok(AuthenticatedCampaignParent {
         parent,
         study_grant,
-        request: validated.submission.request,
+        request,
+        result_bytes,
     })
 }
 
@@ -1934,6 +2004,22 @@ mod tests {
             now: chrono::DateTime<chrono::Utc>,
             source_revision: &str,
         ) -> Self {
+            Self::with_execution_source_inputs(
+                max_job_seconds,
+                valid_for,
+                now,
+                source_revision,
+                crate::mission_render::tests::Fixture::canonical(),
+            )
+        }
+
+        fn with_execution_source_inputs(
+            max_job_seconds: u64,
+            valid_for: chrono::TimeDelta,
+            now: chrono::DateTime<chrono::Utc>,
+            source_revision: &str,
+            inputs: crate::mission_render::tests::Fixture,
+        ) -> Self {
             use crate::mission_render::CexCampaignSearchPolicyRevisionV1;
             use alpha_domain::campaign_control::*;
             use alpha_domain::campaign_horizon::CampaignLabelHorizonV1;
@@ -1942,7 +2028,6 @@ mod tests {
             use chrono::TimeDelta;
             use ed25519_dalek::SigningKey;
             use std::collections::{BTreeMap, BTreeSet};
-            let inputs = crate::mission_render::tests::Fixture::canonical();
             let mut submission = valid_submission();
             submission.request = crate::mission_campaign::request_for_materialization_for_tests(
                 &inputs.materialization_path,
@@ -2289,6 +2374,81 @@ mod tests {
                 "monday-research",
             )
             .unwrap()
+        }
+
+        fn settle_learning_result(&self, bytes: &[u8]) -> crate::cli::CampaignLearnArgs {
+            use alpha_domain::campaign_control::{
+                CampaignAttemptOutcomeV1, CampaignAttemptSettlementV1,
+            };
+            use alpha_store::campaign_ledger::CampaignDispatchSettlementV1;
+            let directory = self.control.parent().unwrap();
+            let submission = directory.join("learning-submission.json");
+            let request = directory.join("learning-request.json");
+            let result = directory.join("learning-result.json");
+            let settlement = directory.join("learning-settlement.json");
+            let result_sha256 = hex::encode(Sha256::digest(bytes));
+            let consumed_trials = serde_json::from_slice::<Value>(bytes).unwrap()
+                ["consumed_trials"]
+                .as_u64()
+                .unwrap_or(20);
+            std::fs::write(&result, bytes).unwrap();
+            std::fs::write(
+                &request,
+                serialize_request(&self.validated.submission.request).unwrap(),
+            )
+            .unwrap();
+            hft_research_artifacts::write_json_atomic(&submission, &self.validated.submission)
+                .unwrap();
+            let mut gate = self.open();
+            gate.prepare().unwrap();
+            gate.publish_receipts_with(|_, data| Ok(data.to_vec()))
+                .unwrap();
+            gate.claim().unwrap();
+            gate.publish_receipts_with(|_, data| Ok(data.to_vec()))
+                .unwrap();
+            gate.bind_job("learning-job").unwrap();
+            gate.publish_receipts_with(|_, data| Ok(data.to_vec()))
+                .unwrap();
+            let reservation = gate.reservation.clone();
+            drop(gate);
+            let mut gate = admission::Admission::open_for_settlement(
+                &self.control,
+                &self.validated,
+                &self.manifest,
+                "research-context",
+                "monday-research",
+            )
+            .unwrap();
+            gate.settle(&CampaignDispatchSettlementV1 {
+                completion_provenance: None,
+                job_uid: "learning-job".into(),
+                pod_uid: "learning-pod".into(),
+                settlement: CampaignAttemptSettlementV1 {
+                    operation_id: reservation.operation_id().unwrap(),
+                    reservation_sha256: reservation.content_hash().unwrap(),
+                    evidence_sha256: result_sha256.clone(),
+                    outcome: CampaignAttemptOutcomeV1::NoCandidate,
+                    consumed_trials: Some(consumed_trials),
+                },
+            })
+            .unwrap();
+            gate.publish_receipts_with(|_, data| Ok(data.to_vec()))
+                .unwrap();
+            drop(gate);
+            let report = json!({"status":"settled","operation_id":reservation.operation_id().unwrap(),
+                "request_sha256":reservation.request_sha256,"campaign_result_sha256":result_sha256,
+                "job_uid":"learning-job","pod_uid":"learning-pod"});
+            hft_research_artifacts::write_json_atomic(&settlement, &report).unwrap();
+            crate::cli::CampaignLearnArgs {
+                control: self.control.clone(),
+                submission,
+                settlement,
+                namespace: "monday-research".into(),
+                request,
+                result,
+                result_sha256,
+                output: directory.join("next-plan.json"),
+            }
         }
 
         fn usage(&self) -> alpha_store::campaign_ledger::CampaignBudgetUsageV1 {
@@ -3404,6 +3564,130 @@ mod tests {
             &tampered,
         )
         .is_err());
+    }
+
+    #[test]
+    fn authenticated_negative_learning_source_freezes_settled_bytes_and_rejects_drift() {
+        let fixture = AdmissionFixture::new();
+        let bytes = br#"{"terminal":"original negative fixture"}"#.to_vec();
+        let args = fixture.settle_learning_result(&bytes);
+        let submission_path = args.submission;
+        let result_path = args.result;
+        let settlement_path = args.settlement;
+        let report: Value =
+            serde_json::from_slice(&std::fs::read(&settlement_path).unwrap()).unwrap();
+        let source = read_authenticated_settled_campaign_source(
+            &fixture.control,
+            &submission_path,
+            &result_path,
+            &settlement_path,
+            "monday-research",
+        )
+        .unwrap();
+        assert!(source.is_negative());
+        assert_eq!(source.request_sha256(), fixture.validated.request_sha256);
+        assert_eq!(source.result_bytes(), bytes);
+        let before = source
+            .store
+            .campaign_family_snapshot(&source.reservation.family_id)
+            .unwrap();
+        std::fs::write(&result_path, br#"{"terminal":"caller replacement"}"#).unwrap();
+        assert_eq!(source.result_bytes(), bytes);
+        assert_eq!(source.result_sha256(), hex::encode(Sha256::digest(&bytes)));
+        assert!(read_authenticated_settled_campaign_source(
+            &fixture.control,
+            &submission_path,
+            &result_path,
+            &settlement_path,
+            "monday-research"
+        )
+        .is_err());
+        std::fs::write(&result_path, &bytes).unwrap();
+        let mut changed = report;
+        changed["pod_uid"] = json!("caller-pod");
+        hft_research_artifacts::write_json_atomic(&settlement_path, &changed).unwrap();
+        assert!(read_authenticated_settled_campaign_source(
+            &fixture.control,
+            &submission_path,
+            &result_path,
+            &settlement_path,
+            "monday-research"
+        )
+        .is_err());
+        assert_eq!(
+            source
+                .store
+                .campaign_family_snapshot(&source.reservation.family_id)
+                .unwrap(),
+            before
+        );
+    }
+
+    #[cfg(feature = "scientific")]
+    #[test]
+    fn qualified_cost_learning_from_authenticated_negative_source_creates_one_child() {
+        // Source data is fixed before the factory derives and signs its Root.
+        let inputs = crate::mission_render::tests::Fixture::canonical();
+        let mut rows = crate::mission_render::tests::read_feature_rows(&inputs.feature_path);
+        for (index, row) in rows.iter_mut().enumerate() {
+            let high = index % 2 == 0;
+            row.features
+                .insert("book_imbalance".into(), if high { 0.1 } else { -0.1 });
+            row.features
+                .insert("mid_price".into(), if high { 60_000.0 } else { 60_006.0 });
+            row.label = if high {
+                60_006.0 / 60_000.0 - 1.0
+            } else {
+                60_000.0 / 60_006.0 - 1.0
+            };
+        }
+        crate::mission_render::tests::rewrite_feature_rows(&inputs.feature_path, &rows);
+        crate::mission_campaign::tests::rebind_materialization_feature_artifact(
+            &inputs.materialization_path,
+            &inputs.feature_path,
+        );
+        let fixture = AdmissionFixture::with_execution_source_inputs(
+            100_000,
+            chrono::TimeDelta::hours(24),
+            chrono::Utc::now(),
+            crate::cli::BUILD_SOURCE_REVISION,
+            inputs,
+        );
+        let bytes = crate::mission_campaign::tests::qualified_cost_learning_result_bytes(
+            &fixture.validated.submission.request,
+            &fixture.inputs.feature_path,
+            &fixture.inputs.materialization_path,
+        );
+        let args = fixture.settle_learning_result(&bytes);
+        let before = fixture.usage();
+        crate::mission_campaign::learn(args.clone()).unwrap();
+        let first = std::fs::read(&args.output).unwrap();
+        let plan: crate::mission_render::CexCampaignResearchPlanV1 =
+            serde_json::from_slice(&first).unwrap();
+        assert_eq!(plan.generation, 1);
+        assert_eq!(
+            plan.parent.as_ref().unwrap().request_sha256,
+            fixture.validated.request_sha256
+        );
+        assert_eq!(
+            plan.parent.as_ref().unwrap().campaign_result_sha256,
+            args.result_sha256
+        );
+        assert_eq!(
+            plan.learning_directive.as_ref().unwrap().failure_class,
+            crate::mission_render::CexCampaignFailureClassV1::PositiveIcNegativeNet
+        );
+        assert!(plan.llm.is_none());
+        crate::mission_campaign::learn(args.clone()).unwrap();
+        assert_eq!(std::fs::read(&args.output).unwrap(), first);
+        assert_eq!(fixture.usage(), before);
+        // A caller hash cannot qualify another result as the settled parent.
+        let mut changed = args;
+        changed.output = changed.output.with_file_name("wrong-hash-plan.json");
+        changed.result_sha256 = "f".repeat(64);
+        assert!(crate::mission_campaign::learn(changed.clone()).is_err());
+        assert!(!changed.output.exists());
+        assert_eq!(fixture.usage(), before);
     }
 
     #[test]

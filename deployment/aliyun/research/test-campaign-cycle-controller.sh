@@ -253,6 +253,10 @@ case "$1 $2" in
     ;;
   "mission campaign-learn")
     [[ -e "$FAKE_STATE/settled-$(<"$FAKE_STATE/job-name")" ]] || { echo "learning before ledger settlement" >&2; exit 1; }
+    [[ -s "$(value_after --control "$@")" ]]
+    [[ -s "$(value_after --submission "$@")" ]]
+    [[ -s "$(value_after --settlement "$@")" ]]
+    [[ -n "$(value_after --namespace "$@")" ]]
     [[ " $* " != *" --max-tokens "* ]]
     output="$(value_after --output "$@")"
     increment "$FAKE_STATE/learn-count"
@@ -524,6 +528,7 @@ controller_args=(
   --work-dir "$submit_work_dir"
   --seed 7 --seed 11
   --max-follow-ups 1
+  --control "$bin/control"
 )
 ack_g0_args=(
   ack-readback
@@ -664,6 +669,20 @@ report_before="$(shasum -a 256 "$root/campaign-root/cycle/generation-0/model-rep
 bulk_gets_before="$(grep -Ec 'ossutil cp oss://.*(mission.json|results.zip)' "$FAKE_STATE/ossutil-calls")"
 FAKE_UNAME=Darwin "$controller" status --work-dir "$root/campaign-root/cycle" >"$root/report-status.json"
 jq -e '.next_stage == "model_report_publication"' "$root/report-status.json" >/dev/null
+
+# A settled negative checkpoint still needs its original dispatch authority to learn.
+missing_control_cycle="$root/missing-control-cycle"
+cp -R "$root/campaign-root/cycle" "$missing_control_cycle"
+missing_control_args=("${ack_g0_args[@]}")
+missing_control_args[10]="$missing_control_cycle"
+mv "$bin/control" "$bin/control.offline"
+if env -u MONDAY_CAMPAIGN_CONTROL "$controller" "${missing_control_args[@]}" >"$root/no-control.out" 2>"$root/no-control.err"; then
+  echo "learning accepted an unavailable original control" >&2
+  exit 1
+fi
+grep -Fq 'Campaign learning requires its original dispatch control' "$root/no-control.err"
+test ! -e "$FAKE_STATE/learn-count"
+mv "$bin/control.offline" "$bin/control"
 
 if ! "$controller" "${ack_g0_args[@]}" >"$root/learn.stdout" 2>"$root/learn.stderr"; then
   cat "$root/learn.stderr" >&2

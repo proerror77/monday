@@ -1973,7 +1973,17 @@ while ((generation <= max_follow_ups)); do
     "parent_result_sha256=$result_sha256"
   learning_checkpoint="$generation_dir/learning-checkpoint.json"
   if [[ ! -e "$learning_checkpoint" ]]; then
+    dispatch_control="${dispatch_control:-$control}"
+    if [[ -z "$dispatch_control" ]]; then
+      dispatch_control="$(printenv MONDAY_CAMPAIGN_CONTROL 2>/dev/null || true)"
+    fi
+    [[ -n "$dispatch_control" && -f "$dispatch_control" ]] \
+      || die "Campaign learning requires its original dispatch control"
     "$alpha_harness" mission campaign-learn \
+      --control "$dispatch_control" \
+      --submission "$submission" \
+      --settlement "$generation_dir/settlement-report.json" \
+      --namespace "$namespace" \
       --request "$request" \
       --result "$result" \
       --result-sha256 "$result_sha256" \
