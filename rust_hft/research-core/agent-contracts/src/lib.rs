@@ -8,6 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod consumption;
 mod validated_study;
 pub use validated_study::{ValidatedMetaStudyV1, ValidatedMetaTaskV1};
 

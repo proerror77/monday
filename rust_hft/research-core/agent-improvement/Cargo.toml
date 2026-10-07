@@ -1,0 +1,12 @@
+[package]
+workspace = ".."
+name = "hft-research-agent-improvement"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+hft-research-agent-contracts = { path = "../agent-contracts" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

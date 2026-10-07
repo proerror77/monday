@@ -1,7 +1,7 @@
 # research workspace; source paths and runtime behavior are preserved.
 [workspace]
 resolver = "2"
-members = ["ml", "search-kernel", "../alpha-harness/domain", "../alpha-harness/store", "../alpha-harness/engine", "../alpha-harness/onnx-evaluator", "../alpha-harness/app", "../alpha-harness/worker", "../alpha-harness/search-driver", "../apps/backtest", "../tools/harnessctl"]
+members = ["ml", "search-kernel", "agent-improvement", "../alpha-harness/domain", "../alpha-harness/store", "../alpha-harness/engine", "../alpha-harness/onnx-evaluator", "../alpha-harness/app", "../alpha-harness/worker", "../alpha-harness/search-driver", "../apps/backtest", "../tools/harnessctl"]
 default-members = ["search-kernel"]
 exclude = ["artifacts", "dispatch-io", "factor-dsl", "manifest", "prepared-market-io", "platform", "cex-input", "agent-contracts"]
 

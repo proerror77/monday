@@ -59,7 +59,7 @@ for profile in default researcher-verification control,gateway,publisher,researc
   [[ $profile == default ]] || options=(--features "$profile")
   cargo tree --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" \
     -p hft-research-platform "${options[@]}" --locked --edges normal --prefix none >"$work/control.tree"
-  if grep -E '^(alpha-(domain|engine|harness|store|onnx-evaluator) |burn|ort |hft-(collector|research-ml|data|backtest|cex-research-worker) |parquet )' "$work/control.tree"; then
+  if grep -E '^(alpha-(domain|engine|harness|store|onnx-evaluator) |burn|ort |hft-(collector|research-ml|research-agent-improvement|data|backtest|cex-research-worker) |parquet )' "$work/control.tree"; then
     echo 'control pulls scientific domain, acquisition, training or Parquet' >&2; exit 1
   fi
 done
@@ -67,6 +67,11 @@ cargo tree --manifest-path "$root/rust_hft/shared/Cargo.toml" \
   -p hft-research-agent-contracts --locked --edges normal --prefix none >"$work/agent-contracts.tree"
 if grep -E '^(alpha-|burn|ort |parquet |tokio |reqwest |axum |sqlx|hft-(collector|research-platform|research-ml|data|execution-adapter-[a-z-]+) )' "$work/agent-contracts.tree"; then
   echo 'researcher contracts pull science, transport, database or execution' >&2; exit 1
+fi
+cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
+  -p hft-research-agent-improvement --locked --edges normal --prefix none >"$work/agent-improvement.tree"
+if grep -E '^(alpha-|burn|ort |parquet |tokio |reqwest |axum |sqlx|hft-(collector|research-platform|research-ml|data|execution-adapter-[a-z-]+) )' "$work/agent-improvement.tree"; then
+  echo 'configuration consumer pulls scientific engines, control, transport or execution' >&2; exit 1
 fi
 for features in formula-strategy,binance full; do
   cargo tree --manifest-path "$root/rust_hft/runtime/Cargo.toml" -p hft-live \
