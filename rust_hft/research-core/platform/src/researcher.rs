@@ -786,7 +786,7 @@ impl MetaVerificationContext<'_> {
                 .snapshot
                 .tools
                 .iter()
-                .any(|tool| tool.content_sha256 == program.blob.sha256),
+                .any(|tool| tool.id == program.name && tool.content_sha256 == program.blob.sha256),
             "next Run selects a program absent from the adopted tool snapshot"
         );
         let architecture = match prepared.build.build.target.as_str() {
@@ -2149,6 +2149,72 @@ mod tests {
                     corpora,
                 }
             )
+            .is_err());
+    }
+
+    #[test]
+    fn next_run_cannot_select_an_unapproved_same_bytes_program_name() {
+        let (mut fixture, corpora, query) = consumption_inputs();
+        let released = release(true);
+        let mut artifact = released.artifact().clone();
+        let mut signed = released.signed().clone();
+        artifact.executables[1].blob.sha256 = artifact.executables[0].blob.sha256.clone();
+        signed.receipt.executables = artifact.executables.clone();
+        let key = SigningKey::from_bytes(&[17; 32]);
+        signed.signature_hex = hex(&key.sign(&signed.signing_bytes().unwrap()).to_bytes());
+        artifact.release_receipt_sha256 = identity(&signed).unwrap();
+        fixture.released = BuildReleaseTrust {
+            schema: 1,
+            repository: "fixture/monday".into(),
+            producer_workflow_path: ".github/workflows/fixture.yml".into(),
+            keys: BTreeMap::from([("release".into(), hex(key.verifying_key().as_bytes()))]),
+        }
+        .verify(&artifact, &signed)
+        .unwrap();
+        let build = fixture.released.artifact().id().unwrap();
+        for version in [&mut fixture.incumbent, &mut fixture.challenger] {
+            version.snapshot.build_sha256 = build.clone();
+        }
+        for execution in &mut fixture.executions {
+            execution.run.build_artifact_sha256 = build.clone();
+        }
+        fixture.rebind();
+        let context = fixture.context();
+        let mut head = fixture.head();
+        let decision = context
+            .verify_promotion(&head, &fixture.all(&context))
+            .unwrap();
+        apply_expected_head(&context, &mut head, &decision).unwrap();
+        let prepared = context
+            .prepare_configuration(
+                &decision,
+                &head,
+                PrepareResearcherConfigurationRequest {
+                    candidate: &fixture.challenger,
+                    released_build: &fixture.released,
+                    query,
+                    corpora,
+                },
+            )
+            .unwrap();
+        let mut run = fixture.executions[1].run.clone();
+        run.configuration_sha256 = prepared.id().into();
+        let mut task = fixture.executions[1].task.clone();
+        task.run_manifest_sha256 = run.id().unwrap();
+        context
+            .bind_next_run(&head, &prepared, &run, &task)
+            .unwrap();
+        assert_eq!(
+            artifact.executables[0].blob.sha256,
+            artifact.executables[1].blob.sha256
+        );
+        run.command[0] = "/usr/local/bin/other-evaluator".into();
+        task.command.clone_from(&run.command);
+        task.run_manifest_sha256 = run.id().unwrap();
+        run.admit_build(&artifact).unwrap();
+        run.admit(&task).unwrap();
+        assert!(context
+            .bind_next_run(&head, &prepared, &run, &task)
             .is_err());
     }
 
