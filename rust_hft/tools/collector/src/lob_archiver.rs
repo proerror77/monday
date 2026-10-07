@@ -803,7 +803,12 @@ fn finalize_segment_with_recovered_file(
             .arg(path)
             .arg("-o")
             .arg(&temporary_data);
-        let status = command_status_with_timeout(&mut command, config.zstd_timeout)?;
+        let status = compression_status_with_timeout(
+            &mut command,
+            config.zstd_timeout,
+            path,
+            path.metadata()?.len(),
+        )?;
         if !status.success() {
             anyhow::bail!("zstd failed with {status}");
         }
@@ -1552,19 +1557,121 @@ pub fn command_status_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> anyhow::Result<ExitStatus> {
+    run_command_with_timeout(command, timeout, |_, _| {})
+}
+
+fn compression_status_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    path: &Path,
+    input_bytes: u64,
+) -> anyhow::Result<ExitStatus> {
+    run_command_with_timeout(command, timeout, |child_pid, elapsed| {
+        tracing::error!(
+            phase = "segment_compression",
+            compression_path = ?path,
+            input_bytes,
+            child_pid,
+            elapsed_ms = elapsed.as_millis() as u64,
+            timeout_ms = timeout.as_millis() as u64,
+            "segment compression child timed out"
+        );
+    })
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    on_timeout: impl FnOnce(u32, Duration),
+) -> anyhow::Result<ExitStatus> {
     let mut child = command.spawn()?;
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
         if Instant::now() >= deadline {
+            // Record the child before kill/wait can fail or block. Never log its arguments.
+            on_timeout(child.id(), started.elapsed());
             child.kill()?;
             let _ = child.wait();
             anyhow::bail!("child process timed out after {}s", timeout.as_secs());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Bound error formatting, hide URLs and credential-bearing messages, and remove control characters.
+pub fn bounded_log_error(error: &anyhow::Error) -> String {
+    const LIMIT: usize = 2048;
+    struct BoundedText {
+        text: String,
+        truncated: bool,
+    }
+    impl std::fmt::Write for BoundedText {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let mut end = value.len().min(LIMIT - self.text.len());
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.push_str(&value[..end]);
+            if end < value.len() {
+                self.truncated = true;
+                return Err(std::fmt::Error);
+            }
+            Ok(())
+        }
+    }
+    let mut output = BoundedText {
+        text: String::new(),
+        truncated: false,
+    };
+    let _ = std::fmt::write(&mut output, format_args!("{error:#}"));
+    let text: String = output
+        .text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let mut text = text
+        .split_whitespace()
+        .map(|word| {
+            if word.contains("://") {
+                "[redacted-url]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = text.to_ascii_lowercase();
+    if [
+        "password",
+        "authorization",
+        "credential",
+        "api_key",
+        "api-key",
+        "access_key",
+        "secret",
+        "bearer ",
+        "token=",
+        "signature=",
+    ]
+    .iter()
+    .any(|key| lower.contains(key))
+    {
+        return "[redacted-sensitive-error]".to_owned();
+    }
+    if output.truncated {
+        text.push_str(" [truncated]");
+    }
+    text
 }
 
 fn atomic_write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
@@ -1920,6 +2027,77 @@ mod tests {
         aborted.abort();
         assert!(aborted.await.unwrap_err().is_cancelled());
         assert_eq!(ACTIVE_SENDS.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compression_timeout_records_child_context_and_preserves_input() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("part-1.jsonl.part");
+        fs::write(&input, b"original raw tape\n").unwrap();
+        let trace = root.path().join("trace.log");
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(File::create(&trace).unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 5 # private-command-marker"]);
+            let error = compression_status_with_timeout(
+                &mut command,
+                Duration::from_millis(20),
+                &input,
+                input.metadata().unwrap().len(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("timed out"));
+        });
+        let logs = fs::read_to_string(trace).unwrap();
+        assert!(
+            logs.contains("segment compression child timed out"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains(&format!("compression_path={input:?}")),
+            "{logs}"
+        );
+        assert!(logs.contains("input_bytes=18"), "{logs}");
+        assert!(logs.contains("timeout_ms=20"), "{logs}");
+        for field in ["child_pid=", "elapsed_ms="] {
+            let value = logs
+                .split_once(field)
+                .unwrap()
+                .1
+                .split_whitespace()
+                .next()
+                .unwrap();
+            assert!(value.parse::<u64>().unwrap() > 0, "{logs}");
+        }
+        assert!(!logs.contains("private-command-marker"));
+        assert_eq!(fs::read(input).unwrap(), b"original raw tape\n");
+        eprintln!("{logs}");
+    }
+
+    #[test]
+    fn bounded_error_logging_keeps_causes_without_urls_credentials_or_control_characters() {
+        let error = anyhow::anyhow!("sequence gap expected=10 received=12")
+            .context("producer failed for https://example.test/private?token=fixture-value\nretry");
+        let text = bounded_log_error(&error);
+        assert!(
+            text.contains("sequence gap expected=10 received=12"),
+            "{text}"
+        );
+        assert!(text.contains("[redacted-url]"));
+        assert!(!text.contains("fixture-value"));
+        assert!(!text.chars().any(char::is_control));
+        assert_eq!(
+            bounded_log_error(&anyhow::anyhow!("Authorization: Bearer fixture-value")),
+            "[redacted-sensitive-error]"
+        );
+        let text = bounded_log_error(&anyhow::anyhow!("界".repeat(10_000)));
+        assert!(text.len() <= 2060);
+        assert!(text.ends_with("[truncated]"));
     }
 
     #[cfg(unix)]
