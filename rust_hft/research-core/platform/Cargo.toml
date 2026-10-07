@@ -13,6 +13,7 @@ base64 = { version = "0.22", optional = true }
 zip = { version = "6", optional = true, default-features = false, features = ["deflate"] }
 tempfile = { version = "3", optional = true }
 hft-cex-research-input = { path = "../cex-input" }
+hft-research-agent-contracts = { path = "../agent-contracts" }
 ed25519-dalek = { version = "=2.2.0", optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "process", "io-util", "io-std"] }
 reqwest = { workspace = true, optional = true, features = ["rustls-tls", "json"] }
@@ -30,9 +31,10 @@ sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false,
 default = []
 artifact-io = ["dep:tokio", "dep:reqwest", "dep:rustix", "dep:tokio-util", "dep:base64", "tokio/fs", "reqwest/stream"]
 campaign-result-validation = ["dep:zip"]
-control = ["artifact-io", "campaign-result-validation", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:tempfile", "dep:getrandom", "native-admission", "release-verification"]
+control = ["artifact-io", "campaign-result-validation", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:tempfile", "dep:getrandom", "native-admission", "release-verification", "researcher-verification"]
 native-admission = ["dep:ed25519-dalek"]
 release-verification = ["dep:ed25519-dalek"]
+researcher-verification = ["release-verification"]
 publisher = ["control", "dep:rustix", "dep:tokio-util", "dep:tempfile", "dep:jsonwebtoken", "tokio/fs", "reqwest/stream"]
 gateway = ["control", "dep:rustix", "dep:tokio-util", "dep:futures-util", "tokio/fs", "reqwest/stream"]
 
