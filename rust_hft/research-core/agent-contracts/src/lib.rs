@@ -8,6 +8,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod validated_study;
+pub use validated_study::{ValidatedMetaStudyV1, ValidatedMetaTaskV1};
+
 pub const CONTRACT_SCHEMA_V1: u32 = 1;
 pub const META_EVALUATION_SIGNING_DOMAIN: &str = "monday.research_agent.meta_evaluation.v1";
 pub const META_COST_SIGNING_DOMAIN: &str = "monday.research_agent.meta_cost.v1";
@@ -612,7 +615,7 @@ impl MetaRunBindingV1 {
 }
 
 impl MetaStudyV1 {
-    pub fn validate(&self) -> Result<()> {
+    fn validate_structure(&self) -> Result<()> {
         ensure!(
             self.schema == CONTRACT_SCHEMA_V1,
             "unsupported meta-study schema"
@@ -699,9 +702,17 @@ impl MetaStudyV1 {
         Ok(())
     }
 
+    fn validated_encoding(&self) -> Result<Vec<u8>> {
+        self.validate_structure()?;
+        canonical_bytes(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validated_encoding().map(|_| ())
+    }
+
     pub fn id(&self) -> Result<String> {
-        self.validate()?;
-        content_sha256(self)
+        Ok(format!("{:x}", Sha256::digest(self.validated_encoding()?)))
     }
 }
 
@@ -715,29 +726,7 @@ impl MetaExecutionBindingV1 {
     }
 
     pub fn validate_for(&self, study: &MetaStudyV1) -> Result<()> {
-        self.validate()?;
-        ensure!(
-            self.study_sha256 == study.id()?,
-            "execution Study identity differs from frozen study"
-        );
-        ensure!(
-            study.runs.contains(&self.run),
-            "execution Run binding differs from frozen matrix"
-        );
-        let task = study
-            .tasks
-            .iter()
-            .find(|task| task.task_id == self.run.task_id)
-            .ok_or_else(|| anyhow::anyhow!("execution task is absent"))?;
-        ensure!(
-            task.id()? == self.task_sha256,
-            "execution task content differs from frozen task"
-        );
-        ensure!(
-            self.attempt <= study.per_arm_budget.max_job_attempts,
-            "execution Attempt exceeds declared arm limit"
-        );
-        Ok(())
+        ValidatedMetaStudyV1::new(study)?.validate_execution(self)
     }
 }
 
@@ -811,27 +800,7 @@ impl MetaEvaluationV1 {
     }
 
     pub fn validate_for(&self, study: &MetaStudyV1) -> Result<()> {
-        self.validate()?;
-        self.binding.validate_for(study)?;
-        let task = study
-            .tasks
-            .iter()
-            .find(|task| task.task_id == self.binding.run.task_id)
-            .ok_or_else(|| anyhow::anyhow!("evaluation task is absent"))?;
-        ensure!(
-            self.data_view_sha256 == task.data_view_sha256
-                && self.visibility == task.visibility
-                && self.evaluator_code_sha256 == task.evaluator_code_sha256
-                && self.scoring_rule_sha256 == task.scoring_rule_sha256()?,
-            "evaluation input/visibility/evaluator/scoring differs from frozen task"
-        );
-        ensure!(
-            self.grant_sha256 == study.grant_sha256
-                && self.budget_scope_sha256 == study.budget_scope_sha256
-                && self.resources == study.resources,
-            "evaluation grant/budget/resources differ between frozen arms"
-        );
-        Ok(())
+        ValidatedMetaStudyV1::new(study)?.validate_evaluation(self)
     }
 }
 
@@ -859,21 +828,7 @@ impl MetaCostV1 {
     }
 
     pub fn validate_for(&self, study: &MetaStudyV1) -> Result<()> {
-        self.validate()?;
-        self.binding.validate_for(study)?;
-        ensure!(
-            self.grant_sha256 == study.grant_sha256
-                && self.budget_scope_sha256 == study.budget_scope_sha256
-                && self.resources == study.resources,
-            "cost grant/budget/resources differ from frozen study"
-        );
-        ensure!(
-            self.usage.trials <= study.per_arm_budget.max_trials
-                && self.usage.llm_tokens <= study.per_arm_budget.max_llm_tokens
-                && self.usage.cost_microusd <= study.per_arm_budget.max_cost_microusd,
-            "individual cost receipt exceeds frozen arm limits"
-        );
-        Ok(())
+        ValidatedMetaStudyV1::new(study)?.validate_cost(self)
     }
 }
 
@@ -1337,5 +1292,127 @@ mod tests {
         let old = version.id().unwrap();
         version.snapshot.prompt_text.push('!');
         assert_ne!(old, version.id().unwrap());
+    }
+
+    #[test]
+    fn combined_study_encoding_rejects_actual_128_task_64_seed_two_arm_matrix() {
+        let mut large = study();
+        let templates = large.tasks.clone();
+        large.tasks = (0..128)
+            .map(|index| {
+                let mut task = templates[index % templates.len()].clone();
+                task.task_id = format!("bounded-task-{index:03}");
+                task.seeds = (0..64).collect();
+                task
+            })
+            .collect();
+        large.runs.clear();
+        for task in &large.tasks {
+            for &seed in &task.seeds {
+                for (arm, version) in [
+                    (MetaStudyArm::Incumbent, &large.incumbent_version_sha256),
+                    (MetaStudyArm::Challenger, &large.challenger_version_sha256),
+                ] {
+                    large.runs.push(MetaRunBindingV1 {
+                        task_id: task.task_id.clone(),
+                        phase: task.phase,
+                        arm,
+                        version_sha256: version.clone(),
+                        run_sha256: content_sha256(&(&task.task_id, seed, arm, version)).unwrap(),
+                        seed,
+                    });
+                }
+            }
+        }
+        large.per_arm_budget.max_trials = 8192;
+        large.per_arm_budget.max_job_attempts = 8192;
+        assert_eq!(large.tasks.len(), 128);
+        assert_eq!(large.runs.len(), 128 * 64 * 2);
+        // Every original per-field/matrix guard succeeds. The aggregate bytes
+        // are the independent failure, not a bad seed or budget fixture.
+        large.validate_structure().unwrap();
+        assert!(serde_json::to_vec(&large).unwrap().len() > 2 * 1024 * 1024);
+        assert!(large.validate().is_err());
+        assert!(large.id().is_err());
+        assert!(ValidatedMetaStudyV1::new(&large).is_err());
+    }
+
+    #[test]
+    fn borrowed_study_cache_matches_fresh_checks_and_rejects_foreign_receipts() {
+        let original = study();
+        let (evaluation, cost) = receipts(&original);
+        let cache = ValidatedMetaStudyV1::new(&original).unwrap();
+        assert_eq!(cache.id(), original.id().unwrap());
+        for run in &original.runs {
+            assert_eq!(cache.run_for(&run.task_id, run.seed, run.arm), Some(run));
+        }
+        let task = &original.tasks[0];
+        let cached_task = cache.task(&task.task_id).unwrap();
+        assert_eq!(cached_task.definition(), task);
+        assert_eq!(cached_task.id(), task.id().unwrap());
+        assert_eq!(
+            cached_task.scoring_rule_sha256(),
+            task.scoring_rule_sha256().unwrap()
+        );
+        cache.validate_execution(&evaluation.binding).unwrap();
+        cache.validate_evaluation(&evaluation).unwrap();
+        cache.validate_cost(&cost).unwrap();
+        for change in [
+            "foreign_run",
+            "wrong_task",
+            "wrong_scoring",
+            "wrong_budget",
+            "wrong_resources",
+        ] {
+            let mut changed = evaluation.clone();
+            match change {
+                "foreign_run" => changed.binding.run.run_sha256 = hash('f'),
+                "wrong_task" => changed.binding.task_sha256 = hash('f'),
+                "wrong_scoring" => changed.scoring_rule_sha256 = hash('f'),
+                "wrong_budget" => changed.budget_scope_sha256 = hash('f'),
+                "wrong_resources" => changed.resources.cpu_millis += 1,
+                _ => unreachable!(),
+            }
+            assert!(cache.validate_evaluation(&changed).is_err(), "{change}");
+            assert!(changed.validate_for(&original).is_err(), "{change}");
+        }
+        let mut changed = cost.clone();
+        changed.grant_sha256 = hash('f');
+        assert!(cache.validate_cost(&changed).is_err());
+        changed = cost;
+        changed.usage.cost_microusd = original.per_arm_budget.max_cost_microusd + 1;
+        assert!(cache.validate_cost(&changed).is_err());
+    }
+
+    #[test]
+    fn cached_snapshot_cannot_accept_a_mutated_study_with_rebound_task_identity() {
+        let original = study();
+        let (evaluation, cost) = receipts(&original);
+        let cache = ValidatedMetaStudyV1::new(&original).unwrap();
+        let mut changed = original.clone();
+        changed.tasks[0].score_direction = MetaScoreDirectionV1::LowerIsBetter;
+        changed.tasks[0].scoring_rule["metric"] = serde_json::json!("fixed_normalized_error");
+        let fresh = ValidatedMetaStudyV1::new(&changed).unwrap();
+        assert_ne!(cache.id(), fresh.id());
+        assert!(fresh.validate_evaluation(&evaluation).is_err());
+        let mut rebound = evaluation.clone();
+        rebound.binding.study_sha256 = fresh.id().into();
+        rebound.binding.task_sha256 = fresh
+            .task(&rebound.binding.run.task_id)
+            .unwrap()
+            .id()
+            .into();
+        rebound.scoring_rule_sha256 = fresh
+            .task(&rebound.binding.run.task_id)
+            .unwrap()
+            .scoring_rule_sha256()
+            .into();
+        fresh.validate_evaluation(&rebound).unwrap();
+        assert!(cache.validate_evaluation(&rebound).is_err());
+        cache.validate_evaluation(&evaluation).unwrap();
+        cache.validate_cost(&cost).unwrap();
+        // The cache has no ownable mutable Study: it borrows exactly this
+        // immutable original. A fresh independent definition needs a new cache.
+        assert!(std::ptr::eq(cache.study(), &original));
     }
 }

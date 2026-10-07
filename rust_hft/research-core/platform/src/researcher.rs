@@ -9,6 +9,7 @@ use hft_research_agent_contracts::{
     content_sha256, MetaArtifactReferenceV1, MetaCostV1, MetaEvaluationOutcomeV1, MetaEvaluationV1,
     MetaExecutionBindingV1, MetaScoreDirectionV1, MetaStudyArm, MetaStudyV1, MetaTaskPhase,
     RankingChangeProposalV1, ResearcherVersionV1, SignedMetaCostV1, SignedMetaEvaluationV1,
+    ValidatedMetaStudyV1,
 };
 
 use crate::{
@@ -82,6 +83,7 @@ pub struct ExpectedMetaExecution<'a> {
 /// JSON cannot supply an opaque release or self-assert a trusted Build boolean.
 pub struct MetaVerificationContext<'a> {
     study: &'a MetaStudyV1,
+    validated_study: ValidatedMetaStudyV1<'a>,
     trust: &'a MetaVerificationTrust,
     context_sha256: String,
     executions: BTreeMap<String, ExpectedMetaExecution<'a>>,
@@ -94,7 +96,7 @@ impl<'a> MetaVerificationContext<'a> {
         challenger: &'a ResearcherVersionV1,
         executions: Vec<ExpectedMetaExecution<'a>>,
     ) -> Result<Self> {
-        study.validate()?;
+        let validated_study = ValidatedMetaStudyV1::new(study)?;
         RankingChangeProposalV1 {
             schema: 1,
             incumbent_version_sha256: incumbent.id()?,
@@ -125,13 +127,12 @@ impl<'a> MetaVerificationContext<'a> {
         );
         let mut by_run = BTreeMap::new();
         for execution in executions {
-            execution.binding.validate_for(study)?;
+            validated_study.validate_execution(execution.binding)?;
             let frozen = &execution.binding.run;
-            let task = study
-                .tasks
-                .iter()
-                .find(|task| task.task_id == frozen.task_id)
+            let cached_task = validated_study
+                .task(&frozen.task_id)
                 .context("expected task absent")?;
+            let task = cached_task.definition();
             let version = match frozen.arm {
                 MetaStudyArm::Incumbent => incumbent,
                 MetaStudyArm::Challenger => challenger,
@@ -166,7 +167,8 @@ impl<'a> MetaVerificationContext<'a> {
                     && execution.run.seed == frozen.seed
                     && execution.run.data_manifest_sha256 == task.data_view_sha256
                     && execution.run.evaluator_sha256 == task.evaluator_code_sha256
-                    && execution.run.evaluation_protocol_sha256 == task.scoring_rule_sha256()?
+                    && execution.run.evaluation_protocol_sha256
+                        == cached_task.scoring_rule_sha256()
                     && artifact.id()? == version.snapshot.build_sha256
                     && artifact.build.code_commit == version.snapshot.source_commit,
                 "expected Run changed the version, Build, source, input, seed or evaluator"
@@ -209,12 +211,8 @@ impl<'a> MetaVerificationContext<'a> {
         for task in &study.tasks {
             for seed in &task.seeds {
                 let paired = |arm| {
-                    study
-                        .runs
-                        .iter()
-                        .find(|run| {
-                            run.task_id == task.task_id && run.seed == *seed && run.arm == arm
-                        })
+                    validated_study
+                        .run_for(&task.task_id, *seed, arm)
                         .and_then(|run| by_run.get(&run.run_sha256))
                         .context("paired expected execution absent")
                 };
@@ -249,12 +247,13 @@ impl<'a> MetaVerificationContext<'a> {
             .collect::<Result<Vec<_>>>()?;
         let context_sha256 = content_sha256(&(
             "monday.meta_verification_context.v1",
-            study.id()?,
+            validated_study.id(),
             trust.id()?,
             execution_identities,
         ))?;
         Ok(Self {
             study,
+            validated_study,
             trust,
             context_sha256,
             executions: by_run,
@@ -289,8 +288,9 @@ impl<'a> MetaVerificationContext<'a> {
             &cost.signing_bytes()?,
             &cost.signature_hex,
         )?;
-        evaluated.payload.validate_for(self.study)?;
-        cost.payload.validate_for(self.study)?;
+        self.validated_study
+            .validate_evaluation(&evaluated.payload)?;
+        self.validated_study.validate_cost(&cost.payload)?;
         let expected = self
             .executions
             .get(&evaluated.payload.binding.run.run_sha256)
@@ -347,8 +347,9 @@ impl<'a> MetaVerificationContext<'a> {
                 evaluated.context_sha256 == self.context_sha256,
                 "verified receipt belongs to another trust or execution context"
             );
-            evaluated.evaluation.validate_for(self.study)?;
-            evaluated.cost.validate_for(self.study)?;
+            self.validated_study
+                .validate_evaluation(&evaluated.evaluation)?;
+            self.validated_study.validate_cost(&evaluated.cost)?;
             let binding = &evaluated.evaluation.binding;
             ensure!(
                 self.executions
@@ -398,12 +399,8 @@ impl<'a> MetaVerificationContext<'a> {
                 for seed in &task.seeds {
                     let score = |arm| -> Result<f64> {
                         let frozen = self
-                            .study
-                            .runs
-                            .iter()
-                            .find(|run| {
-                                run.task_id == task.task_id && run.seed == *seed && run.arm == arm
-                            })
+                            .validated_study
+                            .run_for(&task.task_id, *seed, arm)
                             .context("paired Run missing")?;
                         by_run
                             .get(&frozen.run_sha256)
@@ -447,7 +444,7 @@ impl<'a> MetaVerificationContext<'a> {
             }
         };
         evidence.sort();
-        let study_sha256 = self.study.id()?;
+        let study_sha256 = self.validated_study.id();
         let decision_sha256 = content_sha256(&(
             &self.context_sha256,
             &study_sha256,
@@ -1726,5 +1723,98 @@ mod tests {
         };
         assert!(apply_expected_head(loser.0, &mut head.lock().unwrap(), loser.1).is_err());
         assert_eq!(*head.lock().unwrap(), after);
+    }
+
+    #[test]
+    fn indexed_context_validates_moderate_full_matrix_and_rejects_signed_tamper() {
+        let mut fixture = Fixture::new(false);
+        let templates = fixture.study.tasks.clone();
+        let run_template = fixture.executions[0].run.clone();
+        let task_template = fixture.executions[0].task.clone();
+        let versions = [
+            (MetaStudyArm::Incumbent, fixture.incumbent.id().unwrap()),
+            (MetaStudyArm::Challenger, fixture.challenger.id().unwrap()),
+        ];
+        let mut tasks = Vec::new();
+        for template in templates {
+            for ordinal in 0..4 {
+                let mut task = template.clone();
+                task.task_id = format!("{}-{ordinal}", template.task_id);
+                task.seeds = (1..=8).collect();
+                tasks.push(task);
+            }
+        }
+        let mut executions = Vec::new();
+        let mut runs = Vec::new();
+        for meta_task in &tasks {
+            let task_id = meta_task.id().unwrap();
+            let scoring_rule = meta_task.scoring_rule_sha256().unwrap();
+            let experiment = content_sha256(&("moderate-matrix-experiment", &task_id)).unwrap();
+            for seed in &meta_task.seeds {
+                for (arm, version) in &versions {
+                    let mut run = run_template.clone();
+                    run.experiment_sha256.clone_from(&experiment);
+                    run.configuration_sha256.clone_from(version);
+                    run.data_manifest_sha256
+                        .clone_from(&meta_task.data_view_sha256);
+                    run.evaluation_protocol_sha256.clone_from(&scoring_rule);
+                    run.seed = *seed;
+                    let frozen = MetaRunBindingV1 {
+                        task_id: meta_task.task_id.clone(),
+                        phase: meta_task.phase,
+                        arm: *arm,
+                        version_sha256: version.clone(),
+                        run_sha256: run.id().unwrap(),
+                        seed: *seed,
+                    };
+                    let mut task = task_template.clone();
+                    task.run_manifest_sha256.clone_from(&frozen.run_sha256);
+                    task.view_manifest_sha256
+                        .clone_from(&meta_task.data_view_sha256);
+                    runs.push(frozen.clone());
+                    executions.push(Execution {
+                        binding: MetaExecutionBindingV1 {
+                            study_sha256: h('a'),
+                            run: frozen,
+                            task_sha256: task_id.clone(),
+                            attempt: 1,
+                            fence: executions.len() as u64 + 10,
+                        },
+                        run,
+                        task,
+                    });
+                }
+            }
+        }
+        fixture.study.tasks = tasks;
+        fixture.study.runs = runs;
+        fixture.study.per_arm_budget.max_trials = 128;
+        fixture.study.per_arm_budget.max_job_attempts = 96;
+        fixture.study.per_arm_budget.max_cost_microusd = 2000;
+        fixture.executions = executions;
+        fixture.rebind();
+        assert_eq!(fixture.study.tasks.len(), 12);
+        assert_eq!(fixture.executions.len(), 192);
+        let context = fixture.context();
+        assert_eq!(context.validated_study.id(), fixture.study.id().unwrap());
+        let evidence = fixture.all(&context);
+        let decision = context
+            .verify_promotion(&fixture.head(), &evidence)
+            .unwrap();
+        assert_eq!(decision.outcome(), PromotionOutcome::Adopt);
+        let (mut evaluated, result, cost, cost_bytes) = fixture.payloads(0);
+        evaluated.payload.binding.task_sha256 = fixture.study.tasks[1].id().unwrap();
+        let (wire, cost_wire) =
+            fixture.signed(evaluated, cost, &fixture.evaluator_key, &fixture.cost_key);
+        assert!(context
+            .verify_evaluation(&wire, &result, &cost_wire, &cost_bytes)
+            .is_err());
+        let (evaluated, result, mut cost, cost_bytes) = fixture.payloads(0);
+        cost.payload.evaluated_result_sha256 = h('f');
+        let (wire, cost_wire) =
+            fixture.signed(evaluated, cost, &fixture.evaluator_key, &fixture.cost_key);
+        assert!(context
+            .verify_evaluation(&wire, &result, &cost_wire, &cost_bytes)
+            .is_err());
     }
 }
