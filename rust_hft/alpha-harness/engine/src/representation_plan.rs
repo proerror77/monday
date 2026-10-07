@@ -73,6 +73,7 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../app/src/mission_dispatch/platform_admission/signed_export.rs"),
         source!("../../app/src/mission_campaign.rs"),
         source!("../../app/src/mission_campaign/prepared_inputs.rs"),
+        source!("../../app/src/mission_campaign/preparation.rs"),
         source!("../../store/src/lib.rs"),
         source!("../../store/src/campaign_ledger/mod.rs"),
         source!("../../store/src/campaign_ledger/planning.rs"),
@@ -85,6 +86,7 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../domain/src/lib.rs"),
         source!("../../domain/src/representation.rs"),
         source!("../../domain/src/campaign_horizon.rs"),
+        source!("../../domain/src/mlp_training.rs"),
         source!("../../domain/src/evaluation_calendar.rs"),
         source!("../../domain/src/evaluation_partition.rs"),
         source!("../../domain/src/campaign_control.rs"),
@@ -114,6 +116,7 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../../research-core/manifest/src/lib.rs"),
         source!("../../../research-core/manifest/src/sequence.rs"),
         source!("../../../research-core/manifest/src/market_encoder.rs"),
+        source!("../../../research-core/manifest/src/mlp_training.rs"),
         source!("../../../research-core/manifest/src/model.rs"),
         source!("../../../research-core/manifest/src/model/holding.rs"),
         source!("../../../research-core/manifest/src/model/prepared.rs"),
@@ -1043,6 +1046,55 @@ mod tests {
     }
 
     #[test]
+    fn review_mlp_contract_domain_module_invalidates_registered_tool_identities() {
+        assert_mlp_contract_identity_bound(
+            "../../domain/src/mlp_training.rs",
+            include_bytes!("../../domain/src/mlp_training.rs"),
+        );
+    }
+
+    #[test]
+    fn review_mlp_contract_manifest_module_invalidates_registered_tool_identities() {
+        assert_mlp_contract_identity_bound(
+            "../../../research-core/manifest/src/mlp_training.rs",
+            include_bytes!("../../../research-core/manifest/src/mlp_training.rs"),
+        );
+    }
+
+    fn assert_mlp_contract_identity_bound(dependency: &str, body: &[u8]) {
+        let (data, goal) = input();
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        let mut changed = body.to_vec();
+        changed.extend_from_slice(b"\n// changed renderer MLP admission or resolution contract\n");
+        for entry in &plan.matches {
+            let sources = implementation_sources(entry.tool);
+            let changed_sources = sources
+                .iter()
+                .map(|&(path, body)| {
+                    (
+                        path,
+                        if path == dependency {
+                            changed.as_slice()
+                        } else {
+                            body
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let changed = source_reference(&entry.implementation.id, &changed_sources);
+            assert_ne!(entry.implementation, changed, "{dependency}");
+            let mut stale = plan.clone();
+            stale
+                .matches
+                .iter_mut()
+                .find(|stale| stale.tool == entry.tool)
+                .unwrap()
+                .implementation = changed;
+            assert!(validate_representation_plan(&stale, &data, &goal).is_err());
+        }
+    }
+
+    #[test]
     fn review_reference_origin_and_path_admission_dependencies_invalidate_old_plans() {
         let (data, goal) = input();
         let plan = propose_representation_comparison(&data, &goal).unwrap();
@@ -1092,6 +1144,7 @@ mod tests {
         let (data, goal) = input();
         let plan = propose_representation_comparison(&data, &goal).unwrap();
         for dependency in [
+            "../../app/src/mission_campaign/preparation.rs",
             "../../app/src/mission_dispatch/terminal.rs",
             "../../app/src/mission_dispatch/platform_admission.rs",
             "../../app/src/mission_dispatch/platform_admission/fixed_campaign.rs",

@@ -1,7 +1,7 @@
 //! The original signed search view and its verified normalized projection.
 //! This module cannot qualify original high-frequency raw books or create grants.
 use super::*;
-use crate::mission_campaign::{prepared_inputs, CampaignRequest};
+use crate::mission_campaign::{prepared_inputs, CampaignRequest, VerifiedPlanningRequest};
 use alpha_domain::representation::{PlanningViewV1, PlanningVisibilityV1};
 use alpha_store::campaign_ledger::VerifiedCampaignPlanningPermission;
 use hft_cex_research_input::campaign::{
@@ -127,9 +127,13 @@ pub(crate) fn with_authorized_prepared_view<T>(
     let root = verify(&signed, &control.trusted_keys_path)?;
     let store = AlphaStore::open_read_only(&control.ledger_path)?;
     let permission = store.inspect_campaign_planning_permission(&root)?;
-    permission.recheck()?;
+    check_current_authority(&permission, &control.trusted_keys_path)?;
     let request: CampaignRequest = read_json(request_path)?;
-    crate::mission_campaign::validate_request(&request)?;
+    let anchored_request = crate::mission_campaign::verify_planning_request(
+        &store,
+        control.planning_freeze_path.as_deref(),
+        &request,
+    )?;
     let receipt_path = control
         .campaign_inputs_path
         .as_ref()
@@ -143,7 +147,7 @@ pub(crate) fn with_authorized_prepared_view<T>(
     let scope = authorize_projection(
         permission,
         &control.trusted_keys_path,
-        &request,
+        &anchored_request,
         &receipt,
         |sha, guard| {
             prepared_inputs::acquire_planning_prepared(
@@ -164,13 +168,14 @@ pub(crate) fn with_authorized_prepared_view<T>(
 fn authorize_projection<'a>(
     permission: VerifiedCampaignPlanningPermission<'a>,
     trusted_keys: &'a Path,
-    request: &CampaignRequest,
+    anchored_request: &VerifiedPlanningRequest<'_>,
     receipt: &[u8],
     acquire: impl FnOnce(
         &str,
         &dyn Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<prepared_inputs::VerifiedNativeCampaignPreparedInputs>,
 ) -> anyhow::Result<VerifiedPlanningView<'a>> {
+    let request = anchored_request.request();
     let root = permission.root();
     let guard = || check_current_authority(&permission, trusted_keys);
     guard()?;
@@ -197,11 +202,10 @@ fn authorize_projection<'a>(
             bail!("planning target horizon differs from the original signed Study member");
         }
     }
-    let request_sha256 =
-        hft_cex_research_input::sha256(&crate::mission_campaign::serialize_request(request)?);
-    // This local request hash checks source/request consistency under signed
-    // DataReady/view scope. It is not a reservation, native witness, or Run admission.
-    let prepared = acquire(&request_sha256, &guard)?;
+    let request_sha256 = anchored_request.request_sha256();
+    // The complete request has already matched the authenticated producer freeze.
+    // This proves source consistency, not a reservation or Native Run witness.
+    let prepared = acquire(request_sha256, &guard)?;
     guard()?;
     if prepared.campaign_inputs_sha256() != root.grant().execution.campaign_inputs_sha256
         || prepared.source_revision() != root.grant().execution.source_revision
@@ -255,6 +259,22 @@ pub(crate) mod tests {
             );
         }
         let now = Utc::now();
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        if request
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .collection_url
+            .starts_with("https://")
+        {
+            // Original producer freeze, before the fixture Root is signed.
+            crate::mission_campaign::tests::write_planning_freeze_for_tests(
+                &store,
+                request,
+                &directory.path().join("original-freeze.json"),
+            );
+        }
         let key = SigningKey::from_bytes(&[71; 32]);
         let signed = sign_campaign_root_grant(
             CampaignRootGrantV1 {
@@ -310,7 +330,6 @@ pub(crate) mod tests {
             now,
         )
         .unwrap();
-        let mut store = AlphaStore::open_in_memory().unwrap();
         store.record_approval(&alpha_store::ApprovalRecord {
             approval_id: "planning-approval".into(), approval_class: "campaign_root".into(),
             subject_id: root.grant().root_id.clone(),
@@ -322,7 +341,6 @@ pub(crate) mod tests {
         store
             .register_campaign_root(&root, "planning-approval", now)
             .unwrap();
-        let directory = tempfile::tempdir().unwrap();
         let keys = directory.path().join("current-trust.json");
         std::fs::write(
             &keys,
@@ -336,9 +354,22 @@ pub(crate) mod tests {
         (store, root, directory, keys)
     }
 
+    fn anchor<'a>(
+        store: &AlphaStore,
+        keys: &Path,
+        request: &'a CampaignRequest,
+    ) -> VerifiedPlanningRequest<'a> {
+        crate::mission_campaign::verify_planning_request(
+            store,
+            Some(&keys.parent().unwrap().join("original-freeze.json")),
+            request,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn signed_scope_reuses_original_validation_projection_without_raw_or_run_authority() {
-        let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
+        let fixture = crate::mission_campaign::tests::native_prepared_planning_fixture_for_tests();
         let (store, root, _directory, keys) = authority(&fixture, false);
         let before = store
             .campaign_family_snapshot(&root.grant().family.family_id)
@@ -359,7 +390,7 @@ pub(crate) mod tests {
         let scope = authorize_projection(
             store.inspect_campaign_planning_permission(&root).unwrap(),
             &keys,
-            &request,
+            &anchor(&store, &keys, &request),
             &receipt,
             |expected, guard| {
                 guard()?;
@@ -390,7 +421,8 @@ pub(crate) mod tests {
     #[test]
     fn wrong_signed_partition_or_damaged_ready_is_rejected_before_projection_fetch() {
         for wrong_view in [true, false] {
-            let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
+            let fixture =
+                crate::mission_campaign::tests::native_prepared_planning_fixture_for_tests();
             let (store, root, _directory, keys) = authority(&fixture, wrong_view);
             let before = store
                 .campaign_family_snapshot(&root.grant().family.family_id)
@@ -404,7 +436,7 @@ pub(crate) mod tests {
             assert!(authorize_projection(
                 store.inspect_campaign_planning_permission(&root).unwrap(),
                 &keys,
-                &request,
+                &anchor(&store, &keys, &request),
                 &receipt,
                 |_, _| {
                     calls.set(calls.get() + 1);
@@ -425,7 +457,7 @@ pub(crate) mod tests {
     #[test]
     fn calendar_source_inventory_does_not_admit_an_unfinishable_scientific_attempt() {
         let fixture =
-            crate::mission_campaign::tests::native_prepared_calendar_fixture_for_tests(false);
+            crate::mission_campaign::tests::native_prepared_calendar_planning_fixture_for_tests();
         let (store, root, _directory, keys) = authority(&fixture, false);
         let before = store
             .campaign_family_snapshot(&root.grant().family.family_id)
@@ -447,7 +479,7 @@ pub(crate) mod tests {
         let scope = authorize_projection(
             store.inspect_campaign_planning_permission(&root).unwrap(),
             &keys,
-            &request,
+            &anchor(&store, &keys, &request),
             &receipt,
             |expected, guard| {
                 guard()?;
@@ -487,8 +519,124 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn caller_replaced_seeds_and_objective_are_rejected_before_projection_acquisition() {
+        for replace_seed in [true, false] {
+            let fixture =
+                crate::mission_campaign::tests::native_prepared_planning_fixture_for_tests();
+            let (store, root, _directory, keys) = authority(&fixture, false);
+            let before = store
+                .campaign_family_snapshot(&root.grant().family.family_id)
+                .unwrap();
+            let receipt = std::fs::read(fixture.augmented_receipt_path()).unwrap();
+            let mut request = fixture.request.clone();
+            if replace_seed {
+                request.rounds[0].seed += 1000;
+            } else {
+                request
+                    .research_plan
+                    .objective
+                    .push_str(" under a caller-replaced question");
+            }
+            // These mutations retain the original input/view/protocol bindings
+            // and pass original source shape checks. They are not independent
+            // authority for the newly claimed complete request identity.
+            crate::mission_campaign::validate_request_for_source(&request).unwrap();
+            let calls = Cell::new(0);
+            let result = crate::mission_campaign::verify_planning_request(
+                &store,
+                Some(&keys.parent().unwrap().join("original-freeze.json")),
+                &request,
+            )
+            .and_then(|anchored| {
+                authorize_projection(
+                    store.inspect_campaign_planning_permission(&root).unwrap(),
+                    &keys,
+                    &anchored,
+                    &receipt,
+                    |_, guard| {
+                        guard()?;
+                        calls.set(calls.get() + 1);
+                        Ok(fixture.inputs)
+                    },
+                )
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                calls.get(),
+                0,
+                "caller request drift reached protected input acquisition"
+            );
+            assert_eq!(
+                store
+                    .campaign_family_snapshot(&root.grant().family.family_id)
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn missing_unattested_or_foreign_freeze_is_rejected_before_projection_acquisition() {
+        for case in 0..3 {
+            let fixture =
+                crate::mission_campaign::tests::native_prepared_planning_fixture_for_tests();
+            let (store, root, directory, keys) = authority(&fixture, false);
+            let before = store
+                .campaign_family_snapshot(&root.grant().family.family_id)
+                .unwrap();
+            let original = directory.path().join("original-freeze.json");
+            let bytes = std::fs::read(&original).unwrap();
+            let mut path = Some(original.as_path());
+            let missing_tag = directory.path().join("missing-tag.json");
+            if case == 0 {
+                path = None;
+            }
+            if case == 1 {
+                let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("preparation_authentication_tag");
+                std::fs::write(&missing_tag, serde_json::to_vec(&value).unwrap()).unwrap();
+                path = Some(&missing_tag);
+            }
+            let foreign = AlphaStore::open_in_memory().unwrap();
+            let verification_store = if case == 2 { &foreign } else { &store };
+            let calls = Cell::new(0);
+            let receipt = std::fs::read(fixture.augmented_receipt_path()).unwrap();
+            let request = fixture.request.clone();
+            let result = crate::mission_campaign::verify_planning_request(
+                verification_store,
+                path,
+                &request,
+            )
+            .and_then(|anchored| {
+                authorize_projection(
+                    store.inspect_campaign_planning_permission(&root).unwrap(),
+                    &keys,
+                    &anchored,
+                    &receipt,
+                    |_, _| {
+                        calls.set(calls.get() + 1);
+                        Ok(fixture.inputs)
+                    },
+                )
+            });
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 0);
+            assert_eq!(std::fs::read(original).unwrap(), bytes);
+            assert_eq!(
+                store
+                    .campaign_family_snapshot(&root.grant().family.family_id)
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
     fn normalized_callback_borrows_actual_approved_columns_and_safe_contracts() {
-        let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
+        let fixture = crate::mission_campaign::tests::native_prepared_planning_fixture_for_tests();
         let (store, root, _directory, keys) = authority(&fixture, false);
         let receipt = std::fs::read(fixture.augmented_receipt_path()).unwrap();
         let request = fixture.request.clone();
@@ -508,7 +656,7 @@ pub(crate) mod tests {
         let scope = authorize_projection(
             store.inspect_campaign_planning_permission(&root).unwrap(),
             &keys,
-            &request,
+            &anchor(&store, &keys, &request),
             &receipt,
             |_, guard| {
                 guard()?;
@@ -655,7 +803,7 @@ pub(crate) mod tests {
             sign_campaign_study_grant, verify_campaign_study_grant, CampaignStudyBudgetV1,
             CampaignStudyGrantV1, CampaignStudyMemberV1, STUDY_GRANT_SCHEMA,
         };
-        let fixture = crate::mission_campaign::tests::native_prepared_fixture_for_tests();
+        let fixture = crate::mission_campaign::tests::native_prepared_planning_fixture_for_tests();
         let (mut store, root, _directory, keys) = authority(&fixture, false);
         let key = SigningKey::from_bytes(&[72; 32]);
         let signed = sign_campaign_study_grant(

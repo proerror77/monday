@@ -10,6 +10,8 @@ The production app entry is `inspect_signed_normalized_inventory`. It follows th
 
 Independent selection, sealed holdout and meta certification data cannot be relabeled as development data. Permission must be established before a protected source informs representation choices.
 
+Planning also requires `planning_freeze_path` in its control. The existing ledger verifies the producer’s original freeze attestation, complete canonical request, signing plan and Campaign identity before DataReady or collection reads. Caller-computed hashes, changed seeds and changed research objectives cannot create an authorized request. Missing, unattested or foreign-ledger freezes deny planning; other control paths do not require this optional pointer.
+
 The signed DataReady reference must contain safe `planning_metadata`. The planner reconstructs the protocol, partitions and permitted window from that header before opening the collection JSON or its blocks. Missing metadata rejects planning. Older execution and audit records may still parse without it; parsing does not grant planning access.
 
 Fresh native preparation exports exactly the protocol's search rows, including fixed-calendar sources. The native consumer verifies that same range. Full schedule metadata and withheld identities stay bound; label and replay context still end before withheld data. Preparing this projection does not supply the unavailable diagnostic calendar validation view or complete a calendar research run.
@@ -35,7 +37,7 @@ Public raw family-search adapters and their task-created proof wrappers were rem
 
 Top5, flow and Study inventories require five observed seed levels. One-to-four-level books remain usable raw replay inventory. Declared depth does not prove every materialized row has enough levels.
 
-The identity binds source paths, lengths and bytes across the renderer, loaders, domain predicates, replay, features, reference admission, model contracts and Study implementations. It includes the actual signed planning entry, safe prepared-source metadata, current Root/Study authority, authenticated ledger readers and their schemas. It also binds owning locks, Cargo manifests and actual kernel/fitting/LLM flags, debug profile and target OS/architecture/family. Local path edits are not covered by lockfiles alone.
+The identity binds source paths, lengths and bytes across the renderer, loaders, domain predicates, replay, features, reference admission, model contracts and Study implementations. It includes the actual signed planning entry, safe prepared-source metadata, current Root/Study authority, authenticated ledger readers and their schemas. It also binds owning locks, Cargo manifests and actual kernel/fitting/LLM flags, debug profile and target OS/architecture/family. The renderer’s MLP plan validation and seed resolution bind both original domain and manifest MLP contract modules. The freeze-attestation payload verifier is bound with the planning entry and original keyed ledger implementation. Local path edits are not covered by lockfiles alone.
 
 ## Window and row conditions
 

@@ -57,6 +57,9 @@ pub(super) struct DispatchControl {
     pub(super) materialization_path: PathBuf,
     #[serde(default)]
     pub(super) campaign_inputs_path: Option<PathBuf>,
+    /// Existing producer-authenticated freeze. Required only for readonly planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) planning_freeze_path: Option<PathBuf>,
     pub(super) approval_id: String,
     pub(super) controller_image: String,
     pub(super) attempt_ordinal: u32,
@@ -1163,6 +1166,11 @@ pub(super) fn read_control(path: &Path) -> anyhow::Result<DispatchControl> {
         *campaign_inputs_path = campaign_inputs_path
             .canonicalize()
             .context("resolve existing Campaign inputs receipt")?;
+    }
+    if let Some(freeze_path) = &mut control.planning_freeze_path {
+        if freeze_path.is_relative() {
+            *freeze_path = base.join(&*freeze_path);
+        }
     }
     Ok(control)
 }

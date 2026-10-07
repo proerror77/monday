@@ -180,6 +180,59 @@ struct FrozenCampaignPlan {
     signing_plan: CampaignSigningPlan,
 }
 
+/// Complete request identity verified against the original producer's ledger
+/// attestation. Caller hashes and JSON cannot construct this process-local value.
+pub(crate) struct VerifiedPlanningRequest<'a> {
+    request: &'a CampaignRequest,
+    request_sha256: String,
+}
+
+impl VerifiedPlanningRequest<'_> {
+    pub(crate) fn request(&self) -> &CampaignRequest {
+        self.request
+    }
+    pub(crate) fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+}
+
+pub(crate) fn verify_planning_request<'a>(
+    ledger: &alpha_store::AlphaStore,
+    freeze_path: Option<&Path>,
+    request: &'a CampaignRequest,
+) -> anyhow::Result<VerifiedPlanningRequest<'a>> {
+    let frozen = load_freeze_plan(
+        freeze_path.context("planning requires an authenticated original freeze")?,
+    )?;
+    preparation::verify_authentication(
+        ledger,
+        &frozen,
+        frozen.preparation_authentication_tag.as_deref(),
+    )?;
+    validate_request_matches_freeze(request, &frozen)?;
+    Ok(VerifiedPlanningRequest {
+        request,
+        request_sha256: hft_cex_research_input::sha256(&serialize_request(request)?),
+    })
+}
+
+fn authenticated_freeze_plan(
+    request: &CampaignRequest,
+    ledger: Option<&alpha_store::AlphaStore>,
+) -> anyhow::Result<FrozenCampaignPlan> {
+    let mut plan = FrozenCampaignPlan {
+        preparation_authentication_tag: None,
+        schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
+        campaign_inputs_sha256: request.campaign_inputs_sha256.clone(),
+        signing_plan: signing_plan(request)?,
+        canonical_request: request.clone(),
+    };
+    if let Some(ledger) = ledger {
+        plan.preparation_authentication_tag = Some(preparation::authenticate(ledger, &plan)?);
+    }
+    Ok(plan)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CampaignInputsReceipt {
@@ -575,18 +628,13 @@ pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
     if args.final_evaluation_control.is_some() {
         return final_evaluation::freeze(args);
     }
-    let (request, campaign_inputs_sha256) = freeze_request(&args)?;
-    let mut plan = FrozenCampaignPlan {
-        preparation_authentication_tag: None,
-        schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
-        campaign_inputs_sha256,
-        signing_plan: signing_plan(&request)?,
-        canonical_request: request.clone(),
-    };
-    if let Some(path) = &args.preparation_ledger {
-        let ledger = alpha_store::AlphaStore::open_read_only(path)?;
-        plan.preparation_authentication_tag = Some(preparation::authenticate(&ledger, &plan)?);
-    }
+    let (request, _) = freeze_request(&args)?;
+    let ledger = args
+        .preparation_ledger
+        .as_ref()
+        .map(alpha_store::AlphaStore::open_read_only)
+        .transpose()?;
+    let plan = authenticated_freeze_plan(&request, ledger.as_ref())?;
     hft_research_artifacts::write_json_atomic(&args.output, &plan)?;
     research_event(
         "alpha-harness",
@@ -5899,8 +5947,58 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn native_prepared_planning_fixture_for_tests() -> NativePreparedFixture {
+        let source_fixture = campaign_e2e_fixture("native-planning-freeze", false, false, true);
+        let (request, inputs, root) = prepare_native_source_fixture_with_publication(
+            &source_fixture,
+            Some("https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/native-planning-fixture"),
+        ).unwrap();
+        NativePreparedFixture {
+            request,
+            inputs,
+            _source: source_fixture,
+            _root: root,
+        }
+    }
+
+    pub(crate) fn native_prepared_calendar_planning_fixture_for_tests() -> NativePreparedFixture {
+        let source_fixture = calendar_source_fixture(false);
+        let (request, inputs, root) = prepare_native_source_fixture_with_publication(
+            &source_fixture,
+            Some("https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/native-calendar-planning-fixture"),
+        ).unwrap();
+        NativePreparedFixture {
+            request,
+            inputs,
+            _source: source_fixture,
+            _root: root,
+        }
+    }
+
+    pub(crate) fn write_planning_freeze_for_tests(
+        ledger: &alpha_store::AlphaStore,
+        request: &CampaignRequest,
+        path: &Path,
+    ) {
+        validate_request(request).unwrap();
+        assert_eq!(expected_campaign_id(request).unwrap(), request.campaign_id);
+        let plan = authenticated_freeze_plan(request, Some(ledger)).unwrap();
+        hft_research_artifacts::write_json_atomic(path, &plan).unwrap();
+    }
+
     fn prepare_native_source_fixture(
         source_fixture: &CampaignE2eFixture,
+    ) -> anyhow::Result<(
+        CampaignRequest,
+        prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+        tempfile::TempDir,
+    )> {
+        prepare_native_source_fixture_with_publication(source_fixture, None)
+    }
+
+    fn prepare_native_source_fixture_with_publication(
+        source_fixture: &CampaignE2eFixture,
+        publication: Option<&str>,
     ) -> anyhow::Result<(
         CampaignRequest,
         prepared_inputs::VerifiedNativeCampaignPreparedInputs,
@@ -5942,7 +6040,10 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let item = |path: &Path, sha: &str| CampaignInputReceiptItem {
             relative_path: path.file_name().unwrap().into(),
-            object_url: path.to_string_lossy().into_owned(),
+            object_url: publication.map_or_else(
+                || path.to_string_lossy().into_owned(),
+                |base| format!("{base}/{}", path.file_name().unwrap().to_string_lossy()),
+            ),
             sha256: sha.into(),
         };
         let mut receipt = CampaignInputsReceipt {
@@ -5955,7 +6056,8 @@ pub(crate) mod tests {
             market: render.materialization().market.clone(),
             symbol: render.materialization().symbol.clone(),
             output_prefix: "native-source-test".into(),
-            output_object_base_url: root.path().to_string_lossy().into_owned(),
+            output_object_base_url: publication
+                .map_or_else(|| root.path().to_string_lossy().into_owned(), String::from),
             readback_scope: "same-mounted-ossfs-prefix".into(),
             feature: item(
                 &source_fixture._render_fixture.feature_path,
@@ -6004,11 +6106,20 @@ pub(crate) mod tests {
         for (sha, bytes) in &artifacts.blocks {
             let path = root.path().join(format!("{sha}.mondaybin"));
             std::fs::write(&path, bytes).unwrap();
-            block_urls.insert(sha.clone(), path.to_string_lossy().into_owned());
+            block_urls.insert(
+                sha.clone(),
+                publication.map_or_else(
+                    || path.to_string_lossy().into_owned(),
+                    |base| format!("{base}/native-prepared/{sha}.mondaybin"),
+                ),
+            );
         }
         let reference = prepared_inputs::NativePreparedCampaignRefV1 {
-            collection_sha256: artifacts.id,
-            collection_url: collection_path.to_string_lossy().into_owned(),
+            collection_sha256: artifacts.id.clone(),
+            collection_url: publication.map_or_else(
+                || collection_path.to_string_lossy().into_owned(),
+                |base| format!("{base}/native-prepared/{}.json", artifacts.id),
+            ),
             expected_native: artifacts.manifest.expected_native().unwrap(),
             block_urls,
             render_metadata: render.native_metadata().unwrap(),
@@ -6028,6 +6139,33 @@ pub(crate) mod tests {
         request.materialization_url.clear();
         request.replay_artifact_url.clear();
         request.replay_manifest_url.clear();
+        if let Some(base) = publication {
+            request = build_request_from_parts(
+                "",
+                &request.feature_sha256,
+                "",
+                &request.materialization_sha256,
+                "",
+                &request.replay_artifact_sha256,
+                "",
+                &request.replay_manifest_sha256,
+                &request.campaign_inputs_sha256,
+                &request.producer_source_revision,
+                &request.producer_image_identity,
+                request.prepared_inputs.as_ref(),
+                &request.research_plan,
+                &request.build_source_revision,
+                &request.image_identity,
+                base,
+                &request.holdout_id,
+                &request
+                    .rounds
+                    .iter()
+                    .map(|round| round.seed)
+                    .collect::<Vec<_>>(),
+                request.study_proposal.as_ref(),
+            )?;
+        }
         let fingerprint = campaign_data_fingerprint_sha256(
             &request.campaign_inputs_sha256,
             &request.producer_source_revision,
