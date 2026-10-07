@@ -64,6 +64,29 @@ Use the owning manifest for feature matrices. `scripts/cargo-scoped.sh` routes
 explicit package lists to their owners. No default command builds all workspaces.
 Cross-domain path dependencies and their contract tests remain explicit.
 
+### Researcher version and evaluation boundaries
+
+`research-core/agent-contracts` declares the shared Cargo owner. It owns immutable
+researcher configuration, bounded ranking proposals, frozen meta-study task and
+resource identities, and signed evaluation/cost receipt wire formats. These are
+data contracts and pure validation, with no database, transport or scientific
+implementation. Receipt JSON carries no authority by itself.
+
+The control platform's `researcher-verification` feature checks independently
+configured evaluator and cost keys, actual receipt bytes, the frozen comparison,
+and a parent/revision condition before changing an in-memory incumbent. Only
+experience ranking may differ in this first implementation. It does not activate
+PG, create a second experiment ledger, authorize a meta run, or prove an executed
+evaluation. Persistent adoption, worker execution and subsequent version
+consumption require their own control/research integration and real evidence.
+The pure verifier accepts only a first Attempt for each frozen Run. Retried or
+uncertain attempts need complete cumulative cost and exposure ledger evidence
+before they can be admitted by a later storage adapter.
+
+Research algorithms remain in the research owner. Control invokes published
+programs through existing Build/Run/Task/Attempt boundaries; it does not import
+`alpha-domain`, `alpha-engine`, fitters or evaluators to make an adoption decision.
+
 ### Market data and execution selection
 
 Venue ownership does not combine quote transport with account mutation.

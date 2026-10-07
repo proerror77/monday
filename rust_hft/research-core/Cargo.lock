@@ -3341,6 +3341,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-research-agent-contracts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "hft-research-artifacts"
 version = "0.1.0"
 dependencies = [
@@ -3405,6 +3415,7 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
  "hft-cex-research-input",
+ "hft-research-agent-contracts",
  "reqwest",
  "rustix 0.38.44",
  "serde",

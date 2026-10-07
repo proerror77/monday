@@ -656,6 +656,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-research-agent-contracts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "hft-research-platform"
 version = "0.1.0"
 dependencies = [
@@ -666,6 +676,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hft-cex-research-input",
+ "hft-research-agent-contracts",
  "jsonwebtoken",
  "reqwest",
  "rustix 0.38.44",

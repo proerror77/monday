@@ -54,10 +54,19 @@ for profile in default db full; do
     echo 'prediction research pulls the CEX input, evaluator or control chain' >&2; exit 1
   fi
 done
-cargo tree --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" \
-  -p hft-research-platform --features control,gateway,publisher --locked --edges normal --prefix none >"$work/control.tree"
-if grep -E '^(burn|ort |hft-(collector|research-ml|data) |parquet )' "$work/control.tree"; then
-  echo 'control pulls acquisition, training or Parquet' >&2; exit 1
+for profile in default researcher-verification control,gateway,publisher,researcher-verification; do
+  options=()
+  [[ $profile == default ]] || options=(--features "$profile")
+  cargo tree --manifest-path "$root/rust_hft/research-core/platform/Cargo.toml" \
+    -p hft-research-platform "${options[@]}" --locked --edges normal --prefix none >"$work/control.tree"
+  if grep -E '^(alpha-(domain|engine|harness|store|onnx-evaluator) |burn|ort |hft-(collector|research-ml|data|backtest|cex-research-worker) |parquet )' "$work/control.tree"; then
+    echo 'control pulls scientific domain, acquisition, training or Parquet' >&2; exit 1
+  fi
+done
+cargo tree --manifest-path "$root/rust_hft/shared/Cargo.toml" \
+  -p hft-research-agent-contracts --locked --edges normal --prefix none >"$work/agent-contracts.tree"
+if grep -E '^(alpha-|burn|ort |parquet |tokio |reqwest |axum |sqlx|hft-(collector|research-platform|research-ml|data|execution-adapter-[a-z-]+) )' "$work/agent-contracts.tree"; then
+  echo 'researcher contracts pull science, transport, database or execution' >&2; exit 1
 fi
 for features in formula-strategy,binance full; do
   cargo tree --manifest-path "$root/rust_hft/runtime/Cargo.toml" -p hft-live \

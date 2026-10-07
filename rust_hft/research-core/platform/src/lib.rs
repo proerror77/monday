@@ -28,6 +28,8 @@ pub mod release;
 #[cfg(feature = "publisher")]
 pub mod release_publisher;
 pub mod research;
+#[cfg(feature = "researcher-verification")]
+pub mod researcher;
 #[cfg(feature = "control")]
 pub mod retirement;
 #[cfg(feature = "native-admission")]
