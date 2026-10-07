@@ -639,13 +639,15 @@ impl Segment {
         self.writer.get_ref().sync_all()?;
         drop(self.writer);
         let trade_summaries = self.trade_summaries.finish()?;
-        if self.path.metadata()?.len() == 0 {
+        let input_bytes = self.path.metadata()?.len();
+        if input_bytes == 0 {
             fs::remove_file(self.path)?;
             return Ok(None);
         }
         finalize_segment(
             &self.config,
             &self.path,
+            input_bytes,
             self.counts,
             trade_summaries,
             RAW_SCHEMA,
@@ -664,6 +666,7 @@ impl Segment {
 fn finalize_segment(
     config: &SegmentConfig,
     path: &Path,
+    input_bytes: u64,
     counts: BTreeMap<String, u64>,
     trade_summaries: BTreeMap<String, AggregateTradeSummary>,
     schema: &str,
@@ -677,6 +680,7 @@ fn finalize_segment(
     finalize_segment_with_recovered_file(
         config,
         path,
+        input_bytes,
         counts,
         trade_summaries,
         schema,
@@ -710,6 +714,7 @@ fn finalize_recovered_segment(
     finalize_segment_with_recovered_file(
         config,
         path,
+        recovered_bytes,
         counts,
         trade_summaries,
         schema,
@@ -727,6 +732,7 @@ fn finalize_recovered_segment(
 fn finalize_segment_with_recovered_file(
     config: &SegmentConfig,
     path: &Path,
+    input_bytes: u64,
     counts: BTreeMap<String, u64>,
     trade_summaries: BTreeMap<String, AggregateTradeSummary>,
     schema: &str,
@@ -807,7 +813,7 @@ fn finalize_segment_with_recovered_file(
             &mut command,
             config.zstd_timeout,
             path,
-            path.metadata()?.len(),
+            input_bytes,
         )?;
         if !status.success() {
             anyhow::bail!("zstd failed with {status}");
@@ -1628,7 +1634,7 @@ pub fn bounded_log_error(error: &anyhow::Error) -> String {
         truncated: false,
     };
     let _ = std::fmt::write(&mut output, format_args!("{error:#}"));
-    let text: String = output
+    let mut text: String = output
         .text
         .chars()
         .map(|character| {
@@ -1639,6 +1645,16 @@ pub fn bounded_log_error(error: &anyhow::Error) -> String {
             }
         })
         .collect();
+    // Snapshot errors carry response bodies. Keep their status and omit the body.
+    let lower = text.to_ascii_lowercase();
+    if let Some(start) = ["body=", "body:", "body =", "body\":"]
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()
+    {
+        text.truncate(start);
+        text.push_str("body=[redacted-body]");
+    }
     let mut text = text
         .split_whitespace()
         .map(|word| {
@@ -1650,25 +1666,34 @@ pub fn bounded_log_error(error: &anyhow::Error) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let lower = text.to_ascii_lowercase();
+    let credential_keys: String = text
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
     if [
         "password",
         "authorization",
         "credential",
-        "api_key",
-        "api-key",
-        "access_key",
+        "apikey",
+        "accesskey",
         "secret",
-        "bearer ",
-        "token=",
-        "signature=",
+        "bearer",
+        "token",
+        "signature",
+        "cookie",
     ]
     .iter()
-    .any(|key| lower.contains(key))
+    .any(|key| credential_keys.contains(key))
     {
         return "[redacted-sensitive-error]".to_owned();
     }
-    if output.truncated {
+    if output.truncated || text.len() > LIMIT {
+        let mut end = text.len().min(LIMIT - " [truncated]".len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
         text.push_str(" [truncated]");
     }
     text
@@ -2096,8 +2121,39 @@ mod tests {
             "[redacted-sensitive-error]"
         );
         let text = bounded_log_error(&anyhow::anyhow!("界".repeat(10_000)));
-        assert!(text.len() <= 2060);
+        assert!(text.len() <= 2048);
         assert!(text.ends_with("[truncated]"));
+        let expanded = bounded_log_error(&anyhow::anyhow!("a:// ".repeat(409)));
+        assert!(expanded.len() <= 2048);
+        assert!(expanded.ends_with("[truncated]"));
+        assert!(!expanded.contains("://"));
+    }
+
+    #[test]
+    fn bounded_error_logging_omits_response_bodies_and_variant_credential_keys() {
+        for key in [
+            "apiKey",
+            "X-MBX-APIKEY",
+            "token",
+            "session_token",
+            "accessKey",
+            "Set-Cookie",
+            "signature",
+        ] {
+            let error = anyhow::anyhow!("HTTP error: {{\"{key}\":\"fixture-value\"}}");
+            assert_eq!(
+                bounded_log_error(&error),
+                "[redacted-sensitive-error]",
+                "{key}"
+            );
+        }
+        let error = anyhow::anyhow!(
+            "snapshot failed status=403 body={{\"private-field\":\"fixture-response\"}}"
+        );
+        assert_eq!(
+            bounded_log_error(&error),
+            "snapshot failed status=403 body=[redacted-body]"
+        );
     }
 
     #[cfg(unix)]

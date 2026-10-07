@@ -1263,12 +1263,16 @@ fn publish_global_shutdown(shutdown: &watch::Sender<bool>, watchdog: &ProcessWat
     true
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    init_tracing();
     let args = Args::parse();
     if let Some(path) = &args.audit_archive_index {
         let report = hft_collector::archive_continuity::audit_archive_index(path)?;
@@ -13324,11 +13328,7 @@ mod tests {
         if let Some(root) = env::var_os(CHILD_ROOT) {
             let root = PathBuf::from(root);
             std::fs::write(root.join("part-1.jsonl.part"), SOURCE).unwrap();
-            tracing_subscriber::fmt()
-                .without_time()
-                .with_ansi(false)
-                .with_writer(std::io::stderr)
-                .init();
+            init_tracing();
             let (_release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let mut pending = Some(spawn_segment_finalizer(move || {
@@ -13366,37 +13366,39 @@ mod tests {
         child
             .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
             .env(CHILD_ROOT, root.path())
+            .env("RUST_LOG", "info")
+            .env("NO_COLOR", "1")
             .kill_on_drop(true);
         let output = tokio::time::timeout(Duration::from_secs(8), child.output())
             .await
             .expect("watchdog child did not terminate")
             .unwrap();
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert_eq!(output.status.code(), Some(75), "{stderr}");
-        let first = stderr
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(75), "{stdout}");
+        let first = stdout
             .find("capture session failure")
             .expect("first cause was lost");
-        let exit = stderr
+        let exit = stdout
             .find("process watchdog exiting")
             .expect("watchdog did not fire");
-        assert!(first < exit, "{stderr}");
+        assert!(first < exit, "{stdout}");
         assert!(
-            stderr.contains("session_id=\"blocked-session\""),
-            "{stderr}"
+            stdout.contains("session_id=\"blocked-session\""),
+            "{stdout}"
         );
-        assert!(stderr.contains("phase=\"process_event\""), "{stderr}");
-        assert!(stderr.contains("failure_role=\"primary\""), "{stderr}");
+        assert!(stdout.contains("phase=\"process_event\""), "{stdout}");
+        assert!(stdout.contains("failure_role=\"primary\""), "{stdout}");
         assert!(
-            stderr.contains("aggregate_trade_sequence_gap symbol=BTCUSDT expected=10 received=12")
+            stdout.contains("aggregate_trade_sequence_gap symbol=BTCUSDT expected=10 received=12")
         );
-        assert!(!stderr.contains("session failed; reconnecting"));
+        assert!(!stdout.contains("session failed; reconnecting"));
         assert!(root.path().join("finalizer-entered").is_file());
         assert!(!root.path().join("finalizer-completed").exists());
         assert_eq!(
             std::fs::read(root.path().join("part-1.jsonl.part")).unwrap(),
             SOURCE
         );
-        eprintln!("{stderr}");
+        eprintln!("{stdout}");
     }
 
     #[test]
