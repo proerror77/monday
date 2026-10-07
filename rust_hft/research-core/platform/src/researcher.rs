@@ -7,8 +7,8 @@ use anyhow::{ensure, Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
 use hft_research_agent_contracts::{
     content_sha256, MetaArtifactReferenceV1, MetaCostV1, MetaEvaluationOutcomeV1, MetaEvaluationV1,
-    MetaExecutionBindingV1, MetaStudyArm, MetaStudyV1, MetaTaskPhase, RankingChangeProposalV1,
-    ResearcherVersionV1, SignedMetaCostV1, SignedMetaEvaluationV1,
+    MetaExecutionBindingV1, MetaScoreDirectionV1, MetaStudyArm, MetaStudyV1, MetaTaskPhase,
+    RankingChangeProposalV1, ResearcherVersionV1, SignedMetaCostV1, SignedMetaEvaluationV1,
 };
 
 use crate::{
@@ -112,12 +112,12 @@ impl<'a> MetaVerificationContext<'a> {
             .information_policy
             .allowed_data_view_sha256;
         ensure!(
-            study
-                .tasks
-                .iter()
-                .filter(|task| task.phase != MetaTaskPhase::Development)
-                .all(|task| !proposal_views.contains(&task.data_view_sha256)),
-            "proposal scope exposes selection or certification views"
+            study.tasks.iter().all(|task| match task.phase {
+                MetaTaskPhase::Development => proposal_views.contains(&task.data_view_sha256),
+                MetaTaskPhase::Selection | MetaTaskPhase::Certification =>
+                    !proposal_views.contains(&task.data_view_sha256),
+            }),
+            "development view is outside allowed scope or hidden views are exposed"
         );
         ensure!(
             executions.len() == study.runs.len(),
@@ -139,6 +139,14 @@ impl<'a> MetaVerificationContext<'a> {
             let artifact = execution.released_build.artifact();
             execution.task.validate()?;
             execution.task.profile.validate()?;
+            ensure!(
+                execution
+                    .task
+                    .output_prefix
+                    .split('/')
+                    .all(|part| !part.is_empty()),
+                "task output prefix contains an empty segment"
+            );
             execution.run.admit_build(artifact)?;
             execution.run.admit(execution.task)?;
             let architecture = match artifact.build.target.as_str() {
@@ -404,7 +412,14 @@ impl<'a> MetaVerificationContext<'a> {
                             .score
                             .context("successful result lacks score")
                     };
-                    let gain = score(MetaStudyArm::Challenger)? - score(MetaStudyArm::Incumbent)?;
+                    let gain = match task.score_direction {
+                        MetaScoreDirectionV1::HigherIsBetter => {
+                            score(MetaStudyArm::Challenger)? - score(MetaStudyArm::Incumbent)?
+                        }
+                        MetaScoreDirectionV1::LowerIsBetter => {
+                            score(MetaStudyArm::Incumbent)? - score(MetaStudyArm::Challenger)?
+                        }
+                    };
                     ensure!(gain.is_finite(), "paired score difference is not finite");
                     let (sum, count) = gains.entry(task.phase).or_insert((0_f64, 0_usize));
                     *sum += gain;
@@ -438,6 +453,7 @@ impl<'a> MetaVerificationContext<'a> {
             &study_sha256,
             &expected_head.version_sha256,
             expected_head.revision,
+            &expected_head.last_decision_sha256,
             &self.study.challenger_version_sha256,
             &evidence,
             format!("{outcome:?}"),
@@ -981,6 +997,7 @@ mod tests {
                 data_view_sha256: h(view),
                 evaluator_code_sha256: code.clone(),
                 scoring_rule: json!({"metric":"correct-bounded-outcomes"}),
+                score_direction: MetaScoreDirectionV1::HigherIsBetter,
                 seeds: vec![7, 11],
             })
             .collect::<Vec<_>>();
@@ -1125,6 +1142,14 @@ mod tests {
                     MetaStudyArm::Challenger => &self.challenger,
                 };
                 execution.run.configuration_sha256 = version.id().unwrap();
+                let meta_task = self
+                    .study
+                    .tasks
+                    .iter()
+                    .find(|task| task.task_id == execution.binding.run.task_id)
+                    .unwrap();
+                execution.run.evaluation_protocol_sha256 = meta_task.scoring_rule_sha256().unwrap();
+                execution.binding.task_sha256 = meta_task.id().unwrap();
                 execution.binding.run.version_sha256 = version.id().unwrap();
                 execution.binding.run.run_sha256 = execution.run.id().unwrap();
                 execution.task.run_manifest_sha256 = execution.run.id().unwrap();
@@ -1609,6 +1634,141 @@ mod tests {
         assert!(context
             .verify_promotion(&fixture.head(), &evidence)
             .is_err());
+    }
+
+    #[test]
+    fn development_scope_and_usable_output_prefix_are_required() {
+        let mut fixture = Fixture::new(false);
+        assert!(fixture.context_with(&fixture.trust).is_ok());
+        fixture
+            .incumbent
+            .snapshot
+            .retrieval
+            .information_policy
+            .allowed_data_view_sha256 = vec![h('4')];
+        fixture
+            .challenger
+            .snapshot
+            .retrieval
+            .information_policy
+            .allowed_data_view_sha256 = vec![h('4')];
+        fixture.rebind();
+        assert!(fixture
+            .context_with(&fixture.trust)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("development view"));
+        for prefix in ["research/meta-results/", "research//meta-results"] {
+            let mut fixture = Fixture::new(false);
+            for execution in &mut fixture.executions {
+                execution.task.output_prefix = prefix.into();
+            }
+            fixture.rebind();
+            assert!(fixture
+                .context_with(&fixture.trust)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("empty segment"));
+        }
+    }
+
+    #[test]
+    fn lower_error_is_an_improvement_and_direction_is_frozen() {
+        let mut fixture = Fixture::new(false);
+        let old_protocol = fixture.study.tasks[0].scoring_rule_sha256().unwrap();
+        for task in &mut fixture.study.tasks {
+            task.score_direction = MetaScoreDirectionV1::LowerIsBetter;
+        }
+        assert_ne!(
+            old_protocol,
+            fixture.study.tasks[0].scoring_rule_sha256().unwrap()
+        );
+        fixture.rebind();
+        let context = fixture.context();
+        let worse = context
+            .verify_promotion(&fixture.head(), &fixture.all(&context))
+            .unwrap();
+        assert_eq!(
+            worse.outcome(),
+            PromotionOutcome::Rejected(PromotionRejection::InsufficientGain)
+        );
+        let evidence = (0..fixture.executions.len())
+            .map(|index| {
+                let (mut evaluated, _, mut cost, cost_bytes) = fixture.payloads(index);
+                let score = if evaluated.payload.binding.run.arm == MetaStudyArm::Incumbent {
+                    0.2
+                } else {
+                    0.0
+                };
+                evaluated.payload.score = Some(score);
+                let result = serde_json::to_vec(&json!({"error":score})).unwrap();
+                evaluated.payload.result_artifact.sha256 = sha256(&result);
+                evaluated.payload.result_artifact.bytes = result.len() as u64;
+                evaluated.payload.result_readback_sha256 = sha256(&result);
+                cost.payload.evaluated_result_sha256 = sha256(&result);
+                let (wire, cost_wire) =
+                    fixture.signed(evaluated, cost, &fixture.evaluator_key, &fixture.cost_key);
+                context
+                    .verify_evaluation(&wire, &result, &cost_wire, &cost_bytes)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            context
+                .verify_promotion(&fixture.head(), &evidence)
+                .unwrap()
+                .outcome(),
+            PromotionOutcome::Adopt
+        );
+    }
+
+    #[test]
+    fn distinct_valid_prior_decisions_produce_distinct_successor_decisions() {
+        let first = Fixture::new(false);
+        let mut other = Fixture::new(false);
+        other.study.grant_sha256 = h('f');
+        other.rebind();
+        let first_context = first.context();
+        let other_context = other.context();
+        let mut first_head = first.head();
+        let mut other_head = other.head();
+        let first_decision = first_context
+            .verify_promotion(&first_head, &first.all(&first_context))
+            .unwrap();
+        let other_decision = other_context
+            .verify_promotion(&other_head, &other.all(&other_context))
+            .unwrap();
+        apply_expected_head(&first_context, &mut first_head, &first_decision).unwrap();
+        apply_expected_head(&other_context, &mut other_head, &other_decision).unwrap();
+        assert_eq!(first_head.version_sha256(), other_head.version_sha256());
+        assert_eq!(first_head.revision(), other_head.revision());
+        assert_ne!(
+            first_head.last_decision_sha256,
+            other_head.last_decision_sha256
+        );
+        let mut next = Fixture::new(false);
+        next.incumbent = first.challenger.clone();
+        next.challenger = next.incumbent.clone();
+        next.challenger.snapshot.retrieval.ranking = ExperienceRankingOrder::TaskMatchThenRecency;
+        next.rebind();
+        let next_context = next.context();
+        let evidence = next.all(&next_context);
+        let decision_a = next_context
+            .verify_promotion(&first_head, &evidence)
+            .unwrap();
+        let decision_b = next_context
+            .verify_promotion(&other_head, &evidence)
+            .unwrap();
+        assert_ne!(decision_a.id(), decision_b.id());
+        let before = other_head.clone();
+        assert!(apply_expected_head(&next_context, &mut other_head, &decision_a).is_err());
+        assert_eq!(other_head, before);
+        assert_eq!(
+            apply_expected_head(&next_context, &mut other_head, &decision_b).unwrap(),
+            HeadTransition::Adopted
+        );
     }
 
     #[test]

@@ -184,6 +184,9 @@ Candidate 与 incumbent 在相同预声明任务、数据可见度、预算与 s
 实际 prompt、search-policy 内容、检索语句、corpus、top-k、上下文大小、允许数据范围、
 工具、源码和 Build 均保持固定。选择和认证的任务、seed、评分规则、晋级阈值、资源和
 预算进入不可变 Study 身份。开发反馈不能充当选择或认证得分。
+每个任务明确冻结评分方向；误差或损失下降才产生正增益。开发任务的视图必须在
+允许范围内，选择和认证视图不得进入提议器范围。晋级决定的身份包含完整前置 head
+条件，包括前次决定，防止不同历史共用同一审计身份。
 
 共享合同属于 `hft-research-agent-contracts`。控制侧通过
 `researcher-verification` 复用 opaque 发布 Build 和现有 Run/Task 校验，逐项核对

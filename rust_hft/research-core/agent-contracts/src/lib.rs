@@ -36,6 +36,13 @@ pub enum MetaStudyArm {
     Challenger,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaScoreDirectionV1 {
+    HigherIsBetter,
+    LowerIsBetter,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContentReferenceV1 {
@@ -130,6 +137,7 @@ pub struct MetaTaskV1 {
     pub visibility: MetaTaskPhase,
     pub evaluator_code_sha256: String,
     pub scoring_rule: Value,
+    pub score_direction: MetaScoreDirectionV1,
     pub seeds: Vec<u64>,
 }
 
@@ -147,7 +155,8 @@ pub struct MetaRunBindingV1 {
 }
 
 /// For each phase, compare matching (task, seed) pairs with equal weight and
-/// average challenger-minus-incumbent scores. Both fixed thresholds must pass.
+/// average gains normalized by each task's frozen scoring direction. Both
+/// fixed thresholds must pass.
 /// Development feedback never contributes to this promotion comparison.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -592,7 +601,7 @@ impl MetaTaskV1 {
 
     pub fn scoring_rule_sha256(&self) -> Result<String> {
         self.validate()?;
-        content_sha256(&self.scoring_rule)
+        content_sha256(&(self.score_direction, &self.scoring_rule))
     }
 }
 
@@ -963,6 +972,7 @@ mod tests {
                 visibility: phase,
                 evaluator_code_sha256: hash('a'),
                 scoring_rule: serde_json::json!({"metric":"fixed_normalized_score"}),
+                score_direction: MetaScoreDirectionV1::HigherIsBetter,
                 seeds: vec![7, 19],
             });
         }
