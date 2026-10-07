@@ -612,21 +612,6 @@ pub(crate) fn validate_execution_limits(
     Ok(())
 }
 
-#[cfg(test)]
-mod base_tests {
-    use super::*;
-    #[test]
-    fn ordinary_accounting_still_requires_complete_plan_validation() {
-        let plan = CexCampaignResearchPlanV1::canonical();
-        assert_eq!(plan.max_candidates().unwrap(), 22);
-        assert_eq!(declared_total_trials_for_rounds(&plan, 2).unwrap(), 88);
-        let mut invalid = plan;
-        invalid.schema_version = "untrusted-schema".into();
-        assert!(invalid.max_candidates().is_err());
-        assert!(declared_total_trials_for_rounds(&invalid, 2).is_err());
-    }
-}
-
 #[cfg(all(test, feature = "scientific"))]
 pub(crate) fn prepared_plan_for_fixture(
     scope: &VerifiedPlanningView<'_>,
@@ -770,4 +755,19 @@ fn assert_scope_regressions_for_fixture(
     );
     scope.recheck()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod base_tests {
+    use super::*;
+    #[test]
+    fn ordinary_accounting_still_requires_complete_plan_validation() {
+        let plan = CexCampaignResearchPlanV1::canonical();
+        assert_eq!(plan.max_candidates().unwrap(), 22);
+        assert_eq!(declared_total_trials_for_rounds(&plan, 2).unwrap(), 88);
+        let mut invalid = plan;
+        invalid.schema_version = "untrusted-schema".into();
+        assert!(invalid.max_candidates().is_err());
+        assert!(declared_total_trials_for_rounds(&invalid, 2).is_err());
+    }
 }
