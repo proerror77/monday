@@ -494,6 +494,10 @@ control-plane process may create one parent-bound follow-up plan:
 
 ```bash
 alpha-harness mission campaign-learn \
+  --control /private/path/dispatch-control.json \
+  --submission /private/path/submission.json \
+  --settlement /private/path/settlement-report.json \
+  --namespace monday-research \
   --request /private/path/campaign-request.json \
   --result /private/path/campaign-result.json \
   --result-sha256 REPLACE_EXACT_RESULT_SHA256 \
@@ -504,7 +508,13 @@ alpha-harness mission campaign-freeze \
   --research-plan /private/path/next-research-plan.json
 ```
 
-The Campaign result schema is `cex-campaign-result-v8`. It carries bounded,
+New Campaign results use `cex-campaign-result-v9`. Original v8 results remain
+readable as historical evidence and do not authorize new automatic cost learning.
+The new result carries the complete selected evaluation and its content hash.
+Learning first authenticates its finalized request and result against the signed
+Root, readonly ledger settlement, Job/Pod identities and family receipt. The
+content hash checks consistency; the settled terminal readback proves provenance.
+The result also carries bounded,
 structured continuous-factor screening, Ridge/CART OOS metrics, selected-model
 identity, cost-aware L2 replay feedback, the deterministic failure class, and
 the exact learning-directive/search-policy revision lineage for each round.
