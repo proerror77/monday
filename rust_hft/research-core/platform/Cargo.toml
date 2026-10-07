@@ -9,6 +9,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 anyhow = "1"
+hmac = { version = "0.12", optional = true }
+chrono = { version = "0.4", optional = true }
 base64 = { version = "0.22", optional = true }
 zip = { version = "6", optional = true, default-features = false, features = ["deflate"] }
 tempfile = { version = "3", optional = true }
@@ -35,7 +37,7 @@ control = ["artifact-io", "campaign-result-validation", "dep:sqlx-core", "dep:sq
 native-admission = ["dep:ed25519-dalek"]
 release-verification = ["dep:ed25519-dalek"]
 researcher-verification = ["release-verification"]
-publisher = ["control", "dep:rustix", "dep:tokio-util", "dep:tempfile", "dep:jsonwebtoken", "tokio/fs", "reqwest/stream"]
+publisher = ["dep:hmac", "dep:chrono", "control", "dep:rustix", "dep:tokio-util", "dep:tempfile", "dep:jsonwebtoken", "tokio/fs", "reqwest/stream"]
 gateway = ["control", "dep:rustix", "dep:tokio-util", "dep:futures-util", "tokio/fs", "reqwest/stream"]
 
 [[bin]]

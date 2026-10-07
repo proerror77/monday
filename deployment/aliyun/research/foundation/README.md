@@ -1,5 +1,9 @@
 # Paused persistent research foundation assets
 
+研究发行改用 [GitHub/ACR/OSS 与 ACK 独立导入](RELEASE_OSS.md)。
+该入口复用既有 ACK 容量，不新增 Gateway/Broker Pod。
+下面的 runtime Gateway 与 AttemptWriter 模板继续保留。
+
 这些资产补齐持久 PG、CH、artifact gateway 和 Session 的部署包装。它们是
 离线代码与模板。仓库没有应用生产迁移、创建资源、修改 IAM/network、启动模型、
 运行科学任务或启用 backend。参考 [research foundation](../../../../docs/architecture/RESEARCH_FOUNDATION.md)。

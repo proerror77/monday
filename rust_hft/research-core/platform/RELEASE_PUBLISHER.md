@@ -1,5 +1,9 @@
 # Independent Build release publisher
 
+Ordinary CI uses direct OSS publication and independent ACK import.
+See the [responsibilities, authorization limits, configuration and migration contract](../../../deployment/aliyun/research/foundation/RELEASE_OSS.md).
+The HTTPS commands below remain for the existing gateway integration; ordinary CI no longer requires that service.
+
 `research-release-publisher` is a separate native CI publisher and importer.
 Research services only verify releases using operator public trust. They do not
 load the issuer's private key. Issuance and import do not issue scientific grants,
@@ -26,7 +30,7 @@ the publication proof additionally retains the producer's full input capture.
 The issuer creates a deterministic `git archive` from exact committed source,
 checks actual immutable OCI-contained programs against authenticated producer
 bytes, publishes the source and programs, and independently streams their
-HTTPS gateway readbacks. It publishes and reads back `release-proof.json`,
+HTTPS object readbacks. It publishes and reads back `release-proof.json`,
 then rechecks mutable GitHub authority before Ed25519 signing. Immutable producer
 verification is reused internally; store-boundary readbacks remain independent.
 Signed release and BuildArtifact JSON are also published and read back.
@@ -35,8 +39,8 @@ Images can share the same compiled programs/Build without overwriting each
 other's signed OCI binding. The proof identity also isolates authenticated
 publisher attempts, so a new attempt cannot overwrite earlier evidence. Their common executable blobs keep the Build prefix.
 
-`plan SOURCE_ROOT REQUEST POLICY` emits actual Build identities and exact broker
-prefixes without signing, uploading, importing or granting a Run. The broker
+`plan SOURCE_ROOT REQUEST POLICY` emits actual Build identities and exact release
+prefixes without signing, uploading, importing or granting a Run. For the retained Gateway integration, the broker
 must independently issue a capability scoped to these source/Build prefixes.
 The code does not provision a broker or issue credentials.
 
@@ -72,33 +76,21 @@ It registers through the existing immutable PG transaction and reads back the
 resulting BuildArtifact. `MONDAY_RESEARCH_DATABASE_URL` must refer to the dedicated
 Build importer role; installing schema/roles remains an independent operation.
 
-ACR wiring uses `MONDAY_RESEARCH_RELEASE_POLICY` and
-`MONDAY_RESEARCH_RELEASE_GATEWAY` and `MONDAY_RESEARCH_RELEASE_BROKER` variables
-plus the dedicated `MONDAY_RESEARCH_RELEASE_SIGNING_KEY` secret.
-The [per-job capability exchange](RELEASE_CAPABILITY.md) replaces the static
-gateway token secret. It obtains Reader scope before registry writes and exact
-source/Build Publisher scope after the native plan. Missing configuration blocks
-research publication before registry writes. PG projection is explicitly enabled
-only by `MONDAY_RESEARCH_RELEASE_IMPORT_ENABLED=true` and requires the dedicated
-`MONDAY_RESEARCH_RELEASE_IMPORT_DATABASE_URL` secret. Public plan/artifact
-metadata is retained as an Actions artifact. Private key/token files are removed
-on every wrapper exit. This change creates none of that production configuration.
+ACR research publication uses `MONDAY_RESEARCH_RELEASE_POLICY`, including its
+`oss` configuration, and the dedicated `MONDAY_RESEARCH_RELEASE_SIGNING_KEY`.
+The capability executable exchanges GitHub OIDC directly with RAM STS.
+It requests only exact source/Build prefixes from the authenticated native plan.
+CI no longer imports PG or requires a release Gateway/Broker endpoint.
+ACK uses separate read-only OSS credentials, public trust and a host admission file.
+It independently verifies completed GitHub producers and object bytes before immutable PG import.
 
-The publication job first runs `check-presence` before artifact download and
-issuer preparation. GitHub passes only presence booleans for the named variables
-and secrets, never their values. It reports all absent settings together using
-the actual repository setting names. If PG import is enabled, its importer URL
-must also be present before any publication begins. Non-research matrix rows do
-not run this check.
+The cheap `check-presence` receives only booleans. Native signer, policy,
+OIDC, exact-scope and authenticated OSS preflight remain mandatory before ACR login.
+Publication keys and STS files stay outside Cargo and retained Actions artifacts.
+No production credentials, permissions or services are created by this code.
 
-Passing this inexpensive check proves only that settings exist. The later native
-`check-config` still verifies policy, signer, selected product/repository and TLS
-before registry login; presence booleans cannot authorize publication. Cargo
-still compiles the issuer before private credentials are injected. A configured
-importer must independently verify and read back its immutable PG projection.
-
-An operator must supply the real digest-pinned builder, product repositories and
-public trust policy, approve the independent signer and scoped gateway capability,
-and, when import is enabled, the dedicated existing PG importer role and URL.
-Creating persistent keys, permissions or services is a separate authorized
-operation. This preflight creates none, probes no endpoint and grants no Run.
+The OSS commands are `oss-check-config`, `oss-publish` and `oss-import`.
+Their actual argument forms are documented in the ACK/OSS contract above.
+Retained Gateway code still supports runtime AttemptWriter and existing integration tests.
+STS has a fifteen-minute minimum and cannot reproduce the old Broker's two-minute revocation lease.
+Deployment requires independent RAM denial tests and a never-versioned existing OSS bucket.

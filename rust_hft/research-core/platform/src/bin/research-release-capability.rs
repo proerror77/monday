@@ -172,7 +172,7 @@ async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn exchange(request: &Request, broker: &reqwest::Url, tls: &TlsConfig) -> Result<String> {
+async fn github_oidc(audience: &str) -> Result<String> {
     let mut oidc = reqwest::Url::parse(
         &std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL")
             .context("GitHub job OIDC request URL required")?,
@@ -196,7 +196,7 @@ async fn exchange(request: &Request, broker: &reqwest::Url, tls: &TlsConfig) -> 
     oidc.set_query(None);
     oidc.query_pairs_mut()
         .extend_pairs(query)
-        .append_pair("audience", broker.as_str());
+        .append_pair("audience", audience);
     let job_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
         .context("GitHub job id-token permission required")?;
     let client = TlsConfig::default().client(Duration::from_secs(30), true)?;
@@ -213,6 +213,10 @@ async fn exchange(request: &Request, broker: &reqwest::Url, tls: &TlsConfig) -> 
         .as_str()
         .filter(|v| !v.is_empty())
         .context("GitHub OIDC identity missing")?;
+    Ok(oidc_token.to_owned())
+}
+async fn exchange(request: &Request, broker: &reqwest::Url, tls: &TlsConfig) -> Result<String> {
+    let oidc_token = github_oidc(broker.as_str()).await?;
     let client = tls.client(Duration::from_secs(180), true)?;
     let github_read_token =
         std::env::var("GH_TOKEN").context("job read-only GitHub token required")?;
@@ -247,6 +251,149 @@ fn write_token(path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
+fn oss_identity(
+    token: &str,
+    request: &Request,
+    config: &hft_research_platform::release_oss::OssConfig,
+    job: &serde_json::Value,
+) -> Result<()> {
+    use base64::Engine;
+    // RAM verifies the signature. This check narrows the exact job before exchange.
+    let payload = token.split('.').nth(1).context("OIDC payload missing")?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| anyhow::anyhow!("invalid OIDC payload"))?;
+    let c: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid OIDC claims"))?;
+    let r = &request.context;
+    ensure!(
+        c["iss"] == "https://token.actions.githubusercontent.com"
+            && c["aud"] == config.audience
+            && c["repository"] == r.repository
+            && c["repository_id"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                == Some(config.repository_id)
+            && c["repository_owner_id"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                == Some(config.owner_id)
+            && c["sha"] == r.source_sha
+            && c["ref"] == "refs/heads/main"
+            && c["workflow_ref"]
+                == format!(
+                    "{}/.github/workflows/acr-publish.yml@refs/heads/main",
+                    r.repository
+                )
+            && c["run_id"].as_str().and_then(|s| s.parse::<u64>().ok()) == Some(r.publisher_run_id)
+            && c["run_attempt"]
+                .as_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                == Some(r.publisher_run_attempt)
+            && job["id"] == r.publisher_job_id
+            && job["run_id"] == r.publisher_run_id
+            && job["run_attempt"] == r.publisher_run_attempt
+            && job["head_sha"] == r.source_sha
+            && job["status"] == "in_progress"
+            && job["conclusion"].is_null()
+            && job["name"]
+                == format!(
+                    "Publish {}",
+                    r.image_repository.rsplit('/').next().unwrap_or_default()
+                )
+            && c["check_run_id"].as_u64().is_some_and(|id| id > 0
+                && job["check_run_url"]
+                    == format!(
+                        "https://api.github.com/repos/{}/check-runs/{id}",
+                        r.repository
+                    ))
+            && c["exp"]
+                .as_u64()
+                .is_some_and(|exp| exp > now_ms().unwrap_or(u64::MAX) / 1000),
+        "OIDC does not bind the exact approved repository/workflow/job"
+    );
+    Ok(())
+}
+
+async fn oss_exchange(
+    request: &Request,
+    config: &hft_research_platform::release_oss::OssConfig,
+) -> Result<String> {
+    use hft_research_platform::release_oss::{session_policy, Session};
+    let publisher = request.phase == Phase::Publish;
+    let policy = session_policy(config, &request.publisher_prefixes, publisher)?;
+    ensure!(policy.len() <= 2048, "STS session policy exceeds RAM bound");
+    let oidc = github_oidc(&config.audience).await?;
+    let output = std::process::Command::new("gh")
+        .args([
+            "api",
+            &format!(
+                "repos/{}/actions/jobs/{}",
+                request.context.repository, request.context.publisher_job_id
+            ),
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .context("GitHub job reader unavailable")?;
+    ensure!(
+        output.status.success() && output.stdout.len() <= 65536,
+        "GitHub job read rejected"
+    );
+    let job: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("invalid GitHub job response")?;
+    oss_identity(&oidc, request, config, &job)?;
+    let client = TlsConfig::default().client(Duration::from_secs(30), true)?;
+    let fields = [
+        ("Action", "AssumeRoleWithOIDC".to_owned()),
+        ("Version", "2015-04-01".to_owned()),
+        ("Format", "JSON".to_owned()),
+        ("RoleArn", config.role_arn.clone()),
+        ("OIDCProviderArn", config.oidc_provider_arn.clone()),
+        ("OIDCToken", oidc),
+        (
+            "RoleSessionName",
+            format!("monday-{}", &identity(request)?[..40]),
+        ),
+        ("DurationSeconds", "900".to_owned()),
+        ("Policy", policy),
+    ];
+    let form = reqwest::Url::parse_with_params("https://sts.aliyuncs.com/", &fields)?
+        .query()
+        .context("STS request missing")?
+        .to_owned();
+    let response = client
+        .post("https://sts.aliyuncs.com/")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(form)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("RAM OIDC exchange unavailable"))?;
+    let body: serde_json::Value = serde_json::from_slice(&bounded_body(response).await?)
+        .map_err(|_| anyhow::anyhow!("invalid STS response"))?;
+    let c = &body["Credentials"];
+    let field = |name: &str| {
+        c[name]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .context("STS credential missing")
+    };
+    let expiration = chrono::DateTime::parse_from_rfc3339(&field("Expiration")?)
+        .map_err(|_| anyhow::anyhow!("invalid STS expiration"))?
+        .timestamp_millis();
+    let session = Session {
+        access_key_id: field("AccessKeyId")?,
+        access_key_secret: field("AccessKeySecret")?,
+        security_token: field("SecurityToken")?,
+        expires_ms: expiration,
+        publisher,
+        prefixes: request.publisher_prefixes.clone(),
+        versions: Default::default(),
+    };
+    session.validate(i64::try_from(now_ms()?)?)?;
+    Ok(serde_json::to_string(&session)?)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args_os()
@@ -256,11 +403,42 @@ async fn main() -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("arguments require UTF-8"))
         })
         .collect::<Result<_>>()?;
+    let words: Vec<_> = args.iter().map(String::as_str).collect();
+    if let [mode @ ("oss-source" | "oss-publish"), policy, context, plan, output] = words.as_slice()
+    {
+        let policy: PublisherPolicy = read_json(Path::new(policy))?;
+        let phase = if *mode == "oss-source" {
+            Phase::Source
+        } else {
+            Phase::Publish
+        };
+        let plan = if phase == Phase::Source {
+            ensure!(*plan == "-", "source cannot use Build plan");
+            None
+        } else {
+            Some(read_json(Path::new(plan))?)
+        };
+        let request = request(
+            &policy,
+            read_json(Path::new(context))?,
+            phase,
+            plan,
+            now_ms()?,
+        )?;
+        return write_token(
+            Path::new(output),
+            &oss_exchange(
+                &request,
+                policy.oss.as_ref().context("OSS policy required")?,
+            )
+            .await?,
+        );
+    }
     let (phase, policy, context, plan, broker, gateway, output) = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["source", policy, context, broker, gateway, output] => (Phase::Source, *policy, *context, None, *broker, *gateway, *output),
         ["publish", policy, context, plan, broker, gateway, output] => (Phase::Publish, *policy, *context, Some(*plan), *broker, *gateway, *output),
         ["read", policy, context, plan, broker, gateway, output] => (Phase::Read, *policy, *context, Some(*plan), *broker, *gateway, *output),
-        _ => bail!("usage: research-release-capability source POLICY CONTEXT HTTPS_BROKER HTTPS_GATEWAY TOKEN_FILE | publish|read POLICY CONTEXT PLAN HTTPS_BROKER HTTPS_GATEWAY TOKEN_FILE"),
+        _ => bail!("usage: research-release-capability oss-source POLICY CONTEXT - SESSION_FILE | oss-publish POLICY CONTEXT PLAN SESSION_FILE | source POLICY CONTEXT HTTPS_BROKER HTTPS_GATEWAY TOKEN_FILE | publish|read POLICY CONTEXT PLAN HTTPS_BROKER HTTPS_GATEWAY TOKEN_FILE"),
     };
     let policy: PublisherPolicy = read_json(Path::new(policy))?;
     let broker = endpoint(broker)?;
@@ -306,6 +484,55 @@ mod tests {
             plan_sha256: None,
             expires_ms: 10_000 + LIFETIME_MS,
         }
+    }
+    #[test]
+    fn oss_oidc_rejects_wrong_workflow_source_attempt_owner_expiry_and_job() {
+        use base64::Engine;
+        let config = hft_research_platform::release_oss::OssConfig {
+            bucket: "fixture".into(),
+            region: "cn-hangzhou".into(),
+            endpoint: "https://fixture.oss-cn-hangzhou.aliyuncs.com/".into(),
+            role_arn: "acs:ram::1:role/test".into(),
+            oidc_provider_arn: "acs:ram::1:oidc-provider/test".into(),
+            audience: "test".into(),
+            repository_id: 1,
+            owner_id: 2,
+        };
+        let request = request(
+            &policy(),
+            source().context,
+            Phase::Source,
+            None,
+            now_ms().unwrap(),
+        )
+        .unwrap();
+        let c = &request.context;
+        let claims = json!({"iss":"https://token.actions.githubusercontent.com","aud":"test","repository":c.repository,"repository_id":"1","repository_owner_id":"2","sha":c.source_sha,"ref":"refs/heads/main","workflow_ref":format!("{}/.github/workflows/acr-publish.yml@refs/heads/main",c.repository),"run_id":c.publisher_run_id.to_string(),"run_attempt":c.publisher_run_attempt.to_string(),"check_run_id":99,"exp":now_ms().unwrap()/1000+60});
+        let job = json!({"id":c.publisher_job_id,"run_id":c.publisher_run_id,"run_attempt":c.publisher_run_attempt,"head_sha":c.source_sha,"status":"in_progress","conclusion":null,"name":"Publish controller","check_run_url":format!("https://api.github.com/repos/{}/check-runs/99",c.repository)});
+        let token = |v: &serde_json::Value| {
+            format!(
+                "test.{}.test",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(v).unwrap())
+            )
+        };
+        assert!(oss_identity(&token(&claims), &request, &config, &job).is_ok());
+        for (key, value) in [
+            ("workflow_ref", json!("foreign")),
+            ("sha", json!("b".repeat(40))),
+            ("run_attempt", json!("999")),
+            ("repository_owner_id", json!("3")),
+            ("exp", json!(0)),
+            ("check_run_id", json!(98)),
+        ] {
+            let mut bad = claims.clone();
+            bad[key] = value;
+            assert!(oss_identity(&token(&bad), &request, &config, &job).is_err());
+        }
+        let mut cancelled = job.clone();
+        cancelled["status"] = json!("completed");
+        cancelled["conclusion"] = json!("cancelled");
+        assert!(oss_identity(&token(&claims), &request, &config, &cancelled).is_err());
     }
     fn policy() -> PublisherPolicy {
         serde_json::from_value(json!({
