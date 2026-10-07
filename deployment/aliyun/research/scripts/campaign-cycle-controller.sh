@@ -378,6 +378,72 @@ validate_learning_checkpoint() {
   ' "$checkpoint" >/dev/null
 }
 
+# Checkpoint hashes preserve history. Only the original learning entry can
+# revalidate its settled source and complete prediction proof before a new child.
+invoke_campaign_learning() {
+  local dir="$1" result_sha="$2" report="$3" learning_control="${dispatch_control:-$control}"
+  [[ -n "$learning_control" ]] || learning_control="$(printenv MONDAY_CAMPAIGN_CONTROL 2>/dev/null || true)"
+  [[ -n "$learning_control" && -f "$learning_control" ]] \
+    || die "Campaign learning requires its original dispatch control"
+  [[ -s "$dir/request.json" && -s "$dir/submission.json" && -s "$dir/settlement-report.json" ]] \
+    || die "Campaign learning requires its retained original request, submission and settlement"
+  "$alpha_harness" mission campaign-learn \
+    --control "$learning_control" --submission "$dir/submission.json" \
+    --settlement "$dir/settlement-report.json" --namespace "$namespace" \
+    --request "$dir/request.json" --result "$dir/campaign-result.json" \
+    --result-sha256 "$result_sha" --output "$dir/next-research-plan.json" >"$report"
+}
+
+revalidate_learning_origin() {
+  local dir="$1" request_sha="$2" result_sha="$3" report
+  validate_learning_checkpoint "$dir" "$request_sha" "$result_sha" \
+    || die "saved Campaign learning checkpoint is invalid"
+  report=$(mktemp "$dir/.learn-origin-recheck.XXXXXX")
+  if ! invoke_campaign_learning "$dir" "$result_sha" "$report"; then
+    rm -f -- "$report"
+    return 1
+  fi
+  if ! jq -e --slurpfile fresh "$report" --arg request "$request_sha" --arg result "$result_sha" '
+    def identity: {parent_campaign_id,parent_request_sha256,parent_campaign_result_sha256,
+      failure_class,outcome,evidence_signature,learning_directive_sha256,
+      search_policy_revision_id,research_plan_sha256};
+    .parent_request_sha256 == $request and .parent_campaign_result_sha256 == $result
+    and (identity == ($fresh[0] | identity))
+  ' "$dir/learn-report.json" >/dev/null; then
+    rm -f -- "$report"
+    die "saved Campaign learning report differs from its authenticated source"
+  fi
+  rm -f -- "$report"
+  validate_learning_checkpoint "$dir" "$request_sha" "$result_sha" \
+    || die "saved Campaign learning artifact changed during source revalidation"
+}
+
+# A file marker does not prove handoff. Status authenticates the child's exact
+# submission, signed Root, immutable ledger record and already-bound Job UID.
+authenticated_child_dispatch() {
+  local dir="$1" ordinal child report handoff_control="${dispatch_control:-$control}"
+  ordinal="${dir##*/generation-}"
+  child="${dir%/*}/generation-$((ordinal + 1))"
+  [[ -e "$child/dispatched" && -s "$child/submission.json" && -s "$child/finalize-report.json" ]] || return 1
+  [[ -n "$handoff_control" ]] || handoff_control="$(printenv MONDAY_CAMPAIGN_CONTROL 2>/dev/null || true)"
+  [[ -n "$handoff_control" && -f "$handoff_control" ]] || return 1
+  report=$(mktemp "$child/.parent-handoff-status.XXXXXX")
+  if ! "$alpha_harness" mission dispatch status --control "$handoff_control" \
+    --submission "$child/submission.json" --context "$context" --namespace "$namespace" >"$report"; then
+    rm -f -- "$report"
+    return 1
+  fi
+  if ! jq -e --slurpfile finalized "$child/finalize-report.json" '
+    .schema_version == "monday.campaign_dispatch_status.v1"
+    and .request_sha256 == $finalized[0].request_sha256 and .job_name == $finalized[0].job_name
+    and (.job_uid | type == "string" and length > 0) and .accounting_changed == false
+  ' "$report" >/dev/null; then
+    rm -f -- "$report"
+    return 1
+  fi
+  rm -f -- "$report"
+}
+
 validate_generation_completion() {
   local dir="$1" expected_generation="$2"
   local checkpoint="$dir/generation-complete"
@@ -880,10 +946,14 @@ cleanup_sensitive_files() {
   [[ -z "$state_tmp" || ! -e "$state_tmp" ]] || rm -f -- "$state_tmp"
   for generation_dir in "$work_dir"/generation-*; do
     [[ -d "$generation_dir" ]] || continue
-    rm -f -- "$generation_dir/signed-request.json"
-    if [[ ! -e "$generation_dir/finalized" ]] \
-      || validate_generation_completion "$generation_dir" "${generation_dir##*/generation-}"; then
+    rm -f -- "$generation_dir/signed-request.json" "$generation_dir"/.learn-origin-recheck.* "$generation_dir"/.parent-handoff-status.*
+    if [[ ! -e "$generation_dir/finalized" ]]; then
       rm -f -- "$generation_dir/request.json" "$generation_dir/submission.json"
+    elif validate_generation_completion "$generation_dir" "${generation_dir##*/generation-}"; then
+      if [[ "$(jq -er '.outcome' "$generation_dir/generation-complete")" != follow_up ]] \
+        || authenticated_child_dispatch "$generation_dir"; then
+        rm -f -- "$generation_dir/request.json" "$generation_dir/submission.json"
+      fi
     fi
   done
 }
@@ -1518,6 +1588,16 @@ while ((generation <= max_follow_ups)); do
       generation=$((generation + 1))
       continue
     fi
+    next_generation_dir="$work_dir/generation-$((generation + 1))"
+    if [[ -e "$next_generation_dir/dispatched" ]]; then
+      authenticated_child_dispatch "$generation_dir" \
+        || die "saved child dispatch has no authenticated ledger origin"
+    else
+      revalidate_learning_origin "$generation_dir" \
+        "$(jq -er '.request_sha256' "$generation_dir/finalize-report.json")" \
+        "$(sha256_file "$generation_dir/campaign-result.json")" \
+        || die "Campaign learning source revalidation failed before child handoff"
+    fi
     research_plan="$generation_dir/next-research-plan.json"
     [[ -s "$research_plan" ]] || die "completed generation is missing its follow-up plan"
     if [[ "$mode" == ack-readback \
@@ -1739,7 +1819,7 @@ while ((generation <= max_follow_ups)); do
     jq -e --slurpfile request_doc "$request" \
       --arg request_sha256 "$request_sha256" \
       --arg expected_learning_directive_sha256 "$expected_learning_directive_sha256" '
-      .schema_version == "cex-campaign-result-v8"
+      (.schema_version == "cex-campaign-result-v8" or .schema_version == "cex-campaign-result-v9")
       and .campaign_id == $request_doc[0].campaign_id
       and .request_sha256 == $request_sha256
       and .build_source_revision == $request_doc[0].build_source_revision
@@ -1973,21 +2053,7 @@ while ((generation <= max_follow_ups)); do
     "parent_result_sha256=$result_sha256"
   learning_checkpoint="$generation_dir/learning-checkpoint.json"
   if [[ ! -e "$learning_checkpoint" ]]; then
-    dispatch_control="${dispatch_control:-$control}"
-    if [[ -z "$dispatch_control" ]]; then
-      dispatch_control="$(printenv MONDAY_CAMPAIGN_CONTROL 2>/dev/null || true)"
-    fi
-    [[ -n "$dispatch_control" && -f "$dispatch_control" ]] \
-      || die "Campaign learning requires its original dispatch control"
-    "$alpha_harness" mission campaign-learn \
-      --control "$dispatch_control" \
-      --submission "$submission" \
-      --settlement "$generation_dir/settlement-report.json" \
-      --namespace "$namespace" \
-      --request "$request" \
-      --result "$result" \
-      --result-sha256 "$result_sha256" \
-      --output "$research_plan" >"$generation_dir/learn-report.json.partial"
+    invoke_campaign_learning "$generation_dir" "$result_sha256" "$generation_dir/learn-report.json.partial"
     mv -f -- "$generation_dir/learn-report.json.partial" "$generation_dir/learn-report.json"
     learning_outcome="$(jq -er '.outcome' "$generation_dir/learn-report.json")"
     research_plan_file_sha256=""
@@ -2004,6 +2070,8 @@ while ((generation <= max_follow_ups)); do
       }' >"$learning_checkpoint.partial"
     mv -f -- "$learning_checkpoint.partial" "$learning_checkpoint"
   else
+    revalidate_learning_origin "$generation_dir" "$request_sha256" "$result_sha256" \
+      || die "Campaign learning source revalidation failed before child handoff"
     log_event stage_checkpoint_reused "generation=$generation" "stage=campaign_learning"
   fi
   validate_learning_checkpoint "$generation_dir" "$request_sha256" "$result_sha256" \
@@ -2048,7 +2116,6 @@ while ((generation <= max_follow_ups)); do
     exit 0
   fi
   commit_generation_completion follow_up
-  rm -f -- "$request" "$submission"
   if [[ "$mode" == "ack-readback" ]]; then
     controller_stage="approval_handoff"
     log_event stage_completed \

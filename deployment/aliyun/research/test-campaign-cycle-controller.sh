@@ -219,6 +219,7 @@ case "$1 $2" in
   "mission dispatch")
     submission="$(value_after --submission "$@")"
     if [[ "$3" == status ]]; then
+      [[ -e "$FAKE_STATE/dispatched-$(jq -r '.job_name' "$submission")" ]] || { echo "fixture child has no durable dispatch" >&2; exit 1; }
       jq '{schema_version:"monday.campaign_dispatch_status.v1",request_sha256,job_name,
         operation_id:("op-" + .request_sha256),job_uid:("uid-" + .job_name),authority_deadline_epoch:4102444800,
         accounting_changed:false}' "$submission"
@@ -249,9 +250,15 @@ case "$1 $2" in
     jq -r '.request_sha256' "$submission" >"$FAKE_STATE/request-sha256"
     jq -r '.job_name' "$submission" >"$FAKE_STATE/job-name"
     increment "$FAKE_STATE/dispatch-count"
+    : >"$FAKE_STATE/dispatched-$(jq -r '.job_name' "$submission")"
     printf '{"submitted":true}\n'
     ;;
   "mission campaign-learn")
+    increment "$FAKE_STATE/learn-attempt-count"
+    if [[ "${FAKE_REJECT_LEARNING_ORIGIN:-0}" == 1 ]]; then
+      echo "fixture original learning source rejected" >&2
+      exit 1
+    fi
     [[ -e "$FAKE_STATE/settled-$(<"$FAKE_STATE/job-name")" ]] || { echo "learning before ledger settlement" >&2; exit 1; }
     [[ -s "$(value_after --control "$@")" ]]
     [[ -s "$(value_after --submission "$@")" ]]
@@ -259,10 +266,13 @@ case "$1 $2" in
     [[ -n "$(value_after --namespace "$@")" ]]
     [[ " $* " != *" --max-tokens "* ]]
     output="$(value_after --output "$@")"
+    parent_campaign_id="$(jq -er '.campaign_id' "$(value_after --request "$@")")"
+    parent_request_sha="$(sha_file "$(value_after --request "$@")")"
+    parent_result_sha="$(value_after --result-sha256 "$@")"
     increment "$FAKE_STATE/learn-count"
     if [[ "${FAKE_LEARN_OUTCOME:-}" == "no_improvement" || "${FAKE_LEARN_OUTCOME:-}" == "fixed_comparison_complete" ]]; then
       rm -f -- "$output"
-      jq -n --arg outcome "$FAKE_LEARN_OUTCOME" '{failure_class:"overtrade_capacity",outcome:$outcome,evidence_signature:{schema_version:"cex-campaign-research-evidence-signature-v1",feature_fields_sha256:("7" * 64),factor_signatures_sha256:("8" * 64)}}'
+      jq -n --arg outcome "$FAKE_LEARN_OUTCOME" --arg parent "$parent_campaign_id" --arg request "$parent_request_sha" --arg result "$parent_result_sha" '{parent_campaign_id:$parent,parent_request_sha256:$request,parent_campaign_result_sha256:$result,failure_class:"overtrade_capacity",outcome:$outcome,evidence_signature:{schema_version:"cex-campaign-research-evidence-signature-v1",feature_fields_sha256:("7" * 64),factor_signatures_sha256:("8" * 64)}}'
       exit 0
     fi
     reused_existing=false
@@ -276,7 +286,7 @@ case "$1 $2" in
       : >"$FAKE_STATE/plan-failed-once"
       exit 75
     fi
-    jq -n --argjson reused_existing "$reused_existing" '{failure_class:"no_trades_after_costs",outcome:"follow_up",reused_existing:$reused_existing,evidence_signature:{schema_version:"cex-campaign-research-evidence-signature-v1",feature_fields_sha256:("7" * 64),factor_signatures_sha256:("8" * 64)},learning_directive_sha256:("9" * 64),search_policy_revision_id:("cex-search-policy-" + ("1" * 64)),research_plan_sha256:("e" * 64)}'
+    jq -n --argjson reused_existing "$reused_existing" --arg parent "$parent_campaign_id" --arg request "$parent_request_sha" --arg result "$parent_result_sha" '{parent_campaign_id:$parent,parent_request_sha256:$request,parent_campaign_result_sha256:$result,failure_class:"no_trades_after_costs",outcome:"follow_up",reused_existing:$reused_existing,evidence_signature:{schema_version:"cex-campaign-research-evidence-signature-v1",feature_fields_sha256:("7" * 64),factor_signatures_sha256:("8" * 64)},learning_directive_sha256:("9" * 64),search_policy_revision_id:("cex-search-policy-" + ("1" * 64)),research_plan_sha256:("e" * 64)}'
     ;;
   *)
     echo "unexpected alpha-harness invocation: $*" >&2
@@ -428,8 +438,9 @@ if [[ "$source_object" == *"/campaign-result.json"* ]]; then
     --arg bundle_r1_sha "$bundle_r1_sha" \
     --arg bundle_r2_sha "$bundle_r2_sha" \
     --arg directive_sha "$directive_sha" \
+    --arg schema "${FAKE_RESULT_SCHEMA:-cex-campaign-result-v9}" \
     --argjson generation "$generation" '{
-      schema_version:"cex-campaign-result-v8",
+      schema_version:$schema,
       campaign_id:$request[0].campaign_id,
       request_sha256:$request_sha256,
       build_source_revision:$request[0].build_source_revision,
@@ -590,6 +601,56 @@ for host in Darwin Windows_NT; do
     test ! -e "$FAKE_STATE/dispatch-count"
   done
 done
+
+# Bounded causal checks for the current result writer and restored learning authority.
+if [[ -n "${CAMPAIGN_CONTROLLER_REGRESSION:-}" ]]; then
+  focused_learning_case() (
+    local label="$1" fault="${2:-}"
+    local case_root="$root/focused-$label" case_work="$root/focused-$label/cycle"
+    local fake_state="$case_root/state" initial_args=("${controller_args[@]}")
+    local readback_args=("${ack_g0_args[@]}")
+    mkdir -p "$fake_state"
+    : >"$fake_state/result-failed-once"
+    initial_args[20]="$case_work"
+    readback_args[10]="$case_work"
+    (cd "$start_dir" && FAKE_STATE="$fake_state" "$controller" "${initial_args[@]}") >"$case_root/start.out" 2>"$case_root/start.err"
+    if [[ "$label" == result-v9 ]]; then
+      if ! FAKE_STATE="$fake_state" FAKE_RESULT_SCHEMA=cex-campaign-result-v9 "$controller" "${readback_args[@]}" >"$case_root/readback.out" 2>"$case_root/readback.err"; then
+        cat "$case_root/readback.err" >&2
+        echo "canonical v9 result did not reach settled learning handoff" >&2
+        exit 1
+      fi
+      jq -e '.schema_version == "cex-campaign-result-v9"' "$case_work/generation-0/campaign-result.json" >/dev/null
+      test "$(<"$fake_state/settlement-count")" == 1
+      test -s "$case_work/generation-0/next-research-plan.json"
+    else
+      if FAKE_STATE="$fake_state" FAKE_RESULT_SCHEMA=cex-campaign-result-v8 env "$fault=1" "$controller" "${readback_args[@]}" >"$case_root/interrupted.out" 2>"$case_root/interrupted.err"; then
+        echo "fixture recovery interruption did not occur" >&2
+        exit 1
+      fi
+      test -s "$case_work/generation-0/learning-checkpoint.json"
+      [[ "$label" != completed-learning-origin ]] || test -s "$case_work/generation-0/generation-complete"
+      if FAKE_STATE="$fake_state" FAKE_REJECT_LEARNING_ORIGIN=1 "$controller" "${readback_args[@]}" >"$case_root/rejected.out" 2>"$case_root/rejected.err"; then
+        echo "restored learning checkpoint bypassed the original qualified source: $label" >&2
+        exit 1
+      fi
+      grep -Fq 'fixture original learning source rejected' "$case_root/rejected.err"
+      test "$(<"$fake_state/learn-attempt-count")" == 2
+      test "$(<"$fake_state/dispatch-count")" == 1
+      test ! -d "$case_work/generation-1"
+    fi
+    printf 'campaign focused %s: PASS\n' "$label"
+  )
+  case "$CAMPAIGN_CONTROLLER_REGRESSION" in
+    result-v9) focused_learning_case result-v9 ;;
+    learning-origin-resume)
+      focused_learning_case learning-origin FAKE_FAIL_LEARN_READBACK
+      focused_learning_case completed-learning-origin FAKE_CRASH_AFTER_COMPLETION_COMMIT
+      ;;
+    *) echo "unknown focused controller regression" >&2; exit 1 ;;
+  esac
+  exit 0
+fi
 
 if ! (cd "$start_dir" && FAKE_UNAME=Linux "$controller" "${controller_args[@]}") \
   >"$root/start.stdout" 2>"$root/start.stderr"; then
@@ -888,7 +949,11 @@ recovery_case() (
       return 1
     fi
     grep -Fq "$expected_error" "$case_root/rejected.err"
-    test "$(<"$fake_state/learn-count")" == 1
+    if [[ "$fault" == TAMPER_REMOTE_REPORT ]]; then
+      test "$(<"$fake_state/learn-count")" == 2
+    else
+      test "$(<"$fake_state/learn-count")" == 1
+    fi
     test "$(<"$fake_state/dispatch-count")" == 1
     test -s "$request_dir/request.json"
     if [[ "$fault" != TAMPER_COMPLETION && "$fault" != TAMPER_EMPTY_COMPLETION ]]; then
@@ -913,16 +978,33 @@ recovery_case() (
         < <(FAKE_STATE="$fake_state" "$controller" status --work-dir "$case_work") >/dev/null
     fi
   fi
+  local original_learn_report_sha="" original_plan_sha=""
+  if [[ -s "$request_dir/learn-report.json" ]]; then
+    original_learn_report_sha="$(shasum -a 256 "$request_dir/learn-report.json" | awk '{print $1}')"
+  fi
+  if [[ "$outcome" == follow_up && -s "$request_dir/next-research-plan.json" ]]; then
+    original_plan_sha="$(shasum -a 256 "$request_dir/next-research-plan.json" | awk '{print $1}')"
+    # Original inputs remain available until the authenticated child handoff.
+    test -s "$request_dir/request.json"
+    test -s "$request_dir/submission.json"
+  fi
   if ! FAKE_STATE="$fake_state" FAKE_LEARN_OUTCOME="$outcome" "$controller" "${readback_args[@]}" >"$case_root/resumed.out" 2>"$case_root/resumed.err"; then
     echo "controller failed to recover: $label" >&2
     cat "$case_root/resumed.err" >&2
     return 1
   fi
+  [[ -z "$original_learn_report_sha" ]] || test "$(shasum -a 256 "$request_dir/learn-report.json" | awk '{print $1}')" == "$original_learn_report_sha"
+  [[ -z "$original_plan_sha" ]] || test "$(shasum -a 256 "$request_dir/next-research-plan.json" | awk '{print $1}')" == "$original_plan_sha"
   test "$(<"$fake_state/dispatch-count")" == 1
   test "$(<"$fake_state/signer-count")" == 1
   test ! -d "$case_work/generation-1"
-  test ! -e "$request_dir/request.json"
-  test ! -e "$request_dir/submission.json"
+  if [[ "$outcome" == follow_up ]]; then
+    test -s "$request_dir/request.json"
+    test -s "$request_dir/submission.json"
+  else
+    test ! -e "$request_dir/request.json"
+    test ! -e "$request_dir/submission.json"
+  fi
   test "$(<"$fake_state/settlement-count")" == 1
   if [[ "$outcome" != bounded ]]; then
     cmp "$request_dir/learn-report.json" "$request_dir/learn-report-readback.json"
@@ -938,10 +1020,17 @@ recovery_case() (
     test ! -e "$fake_state/learn-count"
     test ! -e "$request_dir/learning-checkpoint.json"
   fi
-  if [[ "$fault" == FAKE_FAIL_AFTER_PLAN ]]; then
-    test "$(<"$fake_state/learn-count")" == 2
-  elif [[ "$outcome" != bounded ]]; then
-    test "$(<"$fake_state/learn-count")" == 1
+  if [[ "$outcome" != bounded ]]; then
+    local expected_learn_count
+    case "$fault" in
+      FAKE_FAIL_SETTLEMENT_ONCE) expected_learn_count=1 ;;
+      FAKE_FAIL_AFTER_PLAN|FAKE_FAIL_LEARN_READBACK) expected_learn_count=2 ;;
+      FAKE_LOSE_PUT_RESPONSE|FAKE_CRASH_AFTER_REQUEST_REMOVE|FAKE_CRASH_AFTER_COMPLETION_COMMIT|FAKE_FAIL_CYCLE_SUMMARY)
+        if [[ "$outcome" == follow_up ]]; then expected_learn_count=2; else expected_learn_count=1; fi
+        ;;
+      *) echo "unknown learning recovery stage: $fault" >&2; return 1 ;;
+    esac
+    test "$(<"$fake_state/learn-count")" == "$expected_learn_count"
   fi
   printf 'campaign recovery %s: PASS\n' "$label"
 )
@@ -952,7 +1041,6 @@ for scenario in \
   'report-readback FAKE_FAIL_LEARN_READBACK' \
   'plan-written FAKE_FAIL_AFTER_PLAN' \
   'lost-put-response FAKE_LOSE_PUT_RESPONSE' \
-  'follow-up-cleanup FAKE_CRASH_AFTER_REQUEST_REMOVE' \
   'terminal-cleanup FAKE_CRASH_AFTER_REQUEST_REMOVE no_improvement' \
   'follow-up-commit FAKE_CRASH_AFTER_COMPLETION_COMMIT' \
   'terminal-commit FAKE_CRASH_AFTER_COMPLETION_COMMIT no_improvement' \
