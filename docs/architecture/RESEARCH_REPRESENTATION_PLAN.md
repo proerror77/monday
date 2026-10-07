@@ -99,6 +99,7 @@ The calendar's statistical family bound does not replace the current Campaign re
 
 Imported JSON cannot restore a planning permission or raw qualification. Native restoration independently checks the binding against decoded prepared values.
 Dispatch rechecks actual resources, signed search-view identity and current Root permission before original cumulative budget admission.
+The registered source identity also binds the Campaign representation checker module called by request, renderer and admission validation. Changing that checker invalidates every registered tool identity.
 The complete canonical request includes the column binding. Existing Run configuration and result readback retain that request identity.
 Prepared metadata and its audit timestamp remain frozen; selecting columns does not re-import or rewrite DataReady.
 

@@ -79,6 +79,7 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../app/src/mission_dispatch/platform_admission/fixed_campaign.rs"),
         source!("../../app/src/mission_dispatch/platform_admission/signed_export.rs"),
         source!("../../app/src/mission_campaign.rs"),
+        source!("../../app/src/mission_campaign/representation.rs"),
         source!("../../app/src/mission_campaign/prepared_inputs.rs"),
         source!("../../app/src/mission_campaign/preparation.rs"),
         source!("../../store/src/lib.rs"),
@@ -1278,6 +1279,22 @@ mod tests {
                 .implementation = changed;
             assert!(validate_representation_plan(&stale, &data, &goal).is_err());
         }
+    }
+
+    #[test]
+    fn representation_campaign_checker_change_invalidates_registered_tool_identities() {
+        assert_registered_dependency_bound(
+            "../../app/src/mission_campaign/representation.rs",
+            include_bytes!("../../app/src/mission_campaign/representation.rs"),
+            &[
+                RepresentationToolV1::CapturedBookReplay,
+                RepresentationToolV1::StaticTop5,
+                RepresentationToolV1::LaggedContinuousOfi,
+                RepresentationToolV1::AggregateTradeFlow,
+                RepresentationToolV1::SolSequence,
+                RepresentationToolV1::SolMarketEncoder,
+            ],
+        );
     }
 
     #[test]
