@@ -73,3 +73,36 @@ Candidate `materializations` are separate from scientifically executable `arms`.
 A future native execution contract must bind the actual template, evaluator, trial counter, signed grant, cumulative budget, permitted inputs and source/image identity. The canonical Campaign seam remains the only scientific production entry.
 
 Software tests establish code behavior. They do not prove real data readiness, training, profitability, RSI improvement, notification delivery or deployment.
+This slice provides a library API. CLI registration and Campaign execution belong to their own coordinated slices.
+Unit cases verify software behavior. They do not prove real data coverage, training, profitability, RSI improvement or deployment.
+
+## Reusing materialized columns in the canonical Campaign
+
+The second slice exposes `preview_representation_campaign_contracts` and `bind_signed_prepared_representation_campaign`.
+Both accept the original control and request paths. They use the shared current Root/Study planning guard and independently authenticated original complete request freeze before inspecting prepared inputs.
+Planner callbacks borrow only normalized rows, column names, source identities, protocol and window facts. Replay, full manifests and transports remain private to IO.
+The current source-only fixed-calendar projection cannot execute a scientific Campaign. Its readiness gate rejects execution before budget reservation.
+The binder selects exact registered H1 or H2 columns from the original decoded development projection. It does not regenerate columns.
+A missing `cont_ofi_lag60s` column requires the original producer to prepare it. Its name alone cannot establish raw OFI qualification.
+
+The binding retains the producer Build, preparation Run/receipt, four original outputs, collection, actual development rows and native protocol identities.
+It also binds real column names, the current signed search view, frozen goal and original seed schedule.
+The goal must match the actual renderer's model, training implementation, costs, partitions, instrument, target and window.
+For prepared-column reuse, this is the verified native development window with an exclusive end, including fixed-calendar search rows only.
+It does not claim the raw planner's label endpoint is available. Original decoded anchors and authorized label/replay context remain separate checks.
+Runner Git identities remain separate from raw data SHA-256 revisions.
+
+The binder preserves the existing research template and finite policy revision list. It changes only a registered materialized field family.
+The existing `--research-plan` path continues through freeze, finalize and dispatch. No new Run schema or runner is introduced.
+Original accounting determines the charge. An ordinary GP Campaign retains GP; Ridge-only templates retain their current charge and holding rules.
+The calendar's statistical family bound does not replace the current Campaign reservation.
+
+Imported JSON cannot restore a planning permission or raw qualification. Native restoration independently checks the binding against decoded prepared values.
+Dispatch rechecks actual resources, signed search-view identity and current Root permission before original cumulative budget admission.
+The registered source identity also binds the Campaign representation checker module called by request, renderer and admission validation. Changing that checker invalidates every registered tool identity.
+The complete canonical request includes the column binding. Existing Run configuration and result readback retain that request identity.
+Prepared metadata and its audit timestamp remain frozen; selecting columns does not re-import or rewrite DataReady.
+
+Software fixtures use the same current permission guard and original native decoder. They reject goal, source, column and accounting drift.
+The HTTPS protocol fixture uses the original producer to freeze canonical publication references, DataReady bytes and a same-ledger authenticated complete request before Root signing. The planning helper only verifies that freeze. It checks canonical ID, finalized request SHA and acquired bytes.
+Its private readback seam uses the original fetcher in production. The fixture performs no network request and proves no cloud research result.

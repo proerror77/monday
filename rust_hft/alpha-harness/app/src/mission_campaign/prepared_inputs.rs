@@ -270,6 +270,7 @@ fn verify_native_render_binding(
         bail!("native prepared source metadata/protocol differs from the original Mission");
     }
     alpha_engine::evaluation::prepare_native_campaign_dataset(prepared, &protocol)?;
+    super::representation::validate_verified_prepared_binding(&request.research_plan, prepared)?;
     Ok(render)
 }
 

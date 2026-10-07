@@ -255,6 +255,16 @@ pub(super) fn reconstruct_binding(
             .map_err(anyhow::Error::msg)?,
     };
     execution.validate()?;
+    crate::mission_campaign::representation::validate_execution_limits(
+        &request.research_plan,
+        execution.job_cpu_millis,
+        execution.job_memory_mib,
+        job["spec"]["activeDeadlineSeconds"]
+            .as_u64()
+            .context("missing Job deadline")?,
+        request.declared_total_trials,
+        &execution.evaluation_views.search_view_sha256,
+    )?;
     if let Some(proposal) = request.study_proposal.as_ref() {
         proposal.validate().map_err(anyhow::Error::msg)?;
         if proposal.target_execution != execution {
@@ -517,6 +527,11 @@ impl Admission {
                 record.root
             }
         };
+        crate::mission_campaign::representation::validate_manifest_authority(
+            manifest,
+            &inspection.request_sha256,
+            &verified,
+        )?;
         let reservation = inspection.reservation(&verified);
         if let Some(proposal) = study_proposal {
             validate_study_member_binding(

@@ -415,6 +415,9 @@ impl CexCampaignLearningDirectiveV1 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CexCampaignResearchPlanV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) representation_binding:
+        Option<alpha_domain::representation::RepresentationCampaignBindingV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) calendar: Option<alpha_domain::EvaluationCalendarV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) development_precheck: Option<crate::mission_calendar::DevelopmentPrecheckReceiptV1>,
@@ -576,10 +579,10 @@ impl CexCampaignResearchPlanV1 {
             parent: None,
             learning_directive: None,
             llm: None,
+            representation_binding: None,
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn h2() -> Self {
         let mut plan = Self::canonical();
         plan.objective = "Generate and screen continuous L2 microstructure factors, including lagged sixty-second Cont best-quote order-flow imbalance, inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on the bound Binance instrument and prediction horizon under governed dynamic-v4 GP"
@@ -842,6 +845,9 @@ impl CexCampaignResearchPlanV1 {
             }
             _ => bail!("CEX Campaign follow-up requires parent and learning directive"),
         }
+        crate::mission_campaign::representation::validate_research_plan_binding(
+            &ValidatedCexResearchPlanBase { plan: self },
+        )?;
         Ok(())
     }
 
@@ -852,6 +858,10 @@ impl CexCampaignResearchPlanV1 {
 
     pub(crate) fn max_candidates(&self) -> anyhow::Result<usize> {
         self.validate()?;
+        self.candidate_count_from_validated_base()
+    }
+
+    fn candidate_count_from_validated_base(&self) -> anyhow::Result<usize> {
         self.search_policy_revision
             .research_delta
             .as_ref()
@@ -875,6 +885,20 @@ impl CexCampaignResearchPlanV1 {
                     .gp_template_count()
                 },
             )
+    }
+}
+
+/// Only the completed base validation above can construct this borrow.
+/// The representation check uses it to count candidates without entering validation again.
+pub(crate) struct ValidatedCexResearchPlanBase<'a> {
+    plan: &'a CexCampaignResearchPlanV1,
+}
+impl ValidatedCexResearchPlanBase<'_> {
+    pub(crate) fn plan(&self) -> &CexCampaignResearchPlanV1 {
+        self.plan
+    }
+    pub(crate) fn max_candidates(&self) -> anyhow::Result<usize> {
+        self.plan.candidate_count_from_validated_base()
     }
 }
 
@@ -1497,6 +1521,12 @@ pub(crate) fn render_prepared_cex_bundle(
         operational: CexResearchOperationalMetadataV1::default(),
     };
     mission.validate()?;
+    crate::mission_campaign::representation::validate_rendered_binding(
+        research_plan,
+        &mission,
+        materialization,
+        multiple_testing_trials,
+    )?;
     let mission_id = mission.semantic_id()?;
     Ok(RenderedCexMission {
         mission,
@@ -2531,6 +2561,7 @@ pub(crate) mod tests {
             ),
             parent: Some(parent),
             learning_directive: Some(learning_directive),
+            representation_binding: None,
             llm: Some(CexCampaignLlmProvenanceV1 {
                 provider: "test".to_string(),
                 model: "test".to_string(),
@@ -2734,6 +2765,7 @@ pub(crate) mod tests {
             parent: Some(parent),
             learning_directive: Some(directive),
             llm: None,
+            representation_binding: None,
         };
         plan.validate().unwrap();
         let rendered = render_cex_bundle(
