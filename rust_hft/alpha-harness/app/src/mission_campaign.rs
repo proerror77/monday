@@ -5978,8 +5978,13 @@ pub(crate) mod tests {
             let original_inputs_sha = self.request.campaign_inputs_sha256.clone();
             let original_reference = self.request.prepared_inputs.clone();
             let objects = published_objects_for_tests(self)?;
-            let request =
-                representation_https_request_for_tests(&self.request, root, store, freeze_path, &objects)?;
+            let request = representation_https_request_for_tests(
+                &self.request,
+                root,
+                store,
+                freeze_path,
+                &objects,
+            )?;
             if request.campaign_inputs_sha256 != original_inputs_sha
                 || request.campaign_inputs_sha256 != root.grant().execution.campaign_inputs_sha256
                 || request.prepared_inputs != original_reference
