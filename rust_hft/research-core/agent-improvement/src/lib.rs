@@ -253,6 +253,7 @@ mod tests {
             "observed_after_available",
             "source_after_entry",
             "duplicate_entry",
+            "conflicting_source",
             "empty_evidence",
             "negative_clock",
         ] {
@@ -268,6 +269,10 @@ mod tests {
                 "observed_after_available" => entry.observed_ns = entry.available_ns + 1,
                 "source_after_entry" => entry.source.available_ns = entry.available_ns + 1,
                 "duplicate_entry" => entry.id = "old-matching".into(),
+                "conflicting_source" => {
+                    entry.evidence[0].content.id = entry.source.content.id.clone();
+                    entry.evidence[0].content.content_sha256 = hash('f');
+                }
                 "empty_evidence" => entry.evidence.clear(),
                 "negative_clock" => entry.observed_ns = -1,
                 _ => unreachable!(),

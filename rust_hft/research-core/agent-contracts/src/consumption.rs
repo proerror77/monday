@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -214,6 +214,7 @@ impl ResearcherConsumptionConfigV1 {
         );
         let mut corpora = BTreeSet::new();
         let mut entries = BTreeSet::new();
+        let mut original_contents = BTreeMap::new();
         for corpus in &self.corpora {
             let reference = corpus.content_reference()?;
             ensure!(corpora.insert(&corpus.id), "duplicate actual corpus id");
@@ -228,6 +229,16 @@ impl ResearcherConsumptionConfigV1 {
             );
             for entry in &corpus.entries {
                 entry.validate_for(&self.version, self.query.as_of_ns)?;
+                for original in std::iter::once(&entry.source).chain(&entry.evidence) {
+                    if let Some(previous) = original_contents
+                        .insert(&original.content.id, &original.content.content_sha256)
+                    {
+                        ensure!(
+                            previous == &original.content.content_sha256,
+                            "one immutable source identity has conflicting content hashes"
+                        );
+                    }
+                }
                 ensure!(
                     entries.insert(&entry.id),
                     "experience id repeats across frozen corpus"

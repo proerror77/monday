@@ -759,7 +759,10 @@ impl MetaVerificationContext<'_> {
         task.profile.validate()?;
         run.admit_build(&prepared.build)?;
         run.admit(task)?;
-        ensure!(run.data_manifest_sha256 == prepared.configuration.query.data_view_sha256, "next Run input differs from the consumed query view");
+        ensure!(
+            run.data_manifest_sha256 == prepared.configuration.query.data_view_sha256,
+            "next Run input differs from the consumed query view"
+        );
         ensure!(
             prepared
                 .configuration
@@ -1955,7 +1958,12 @@ mod tests {
         use hft_research_agent_contracts::consumption::ResearcherConsumptionConfigV1;
         let (mut fixture, corpora, query) = consumption_inputs();
         for version in [&mut fixture.incumbent, &mut fixture.challenger] {
-            version.snapshot.retrieval.information_policy.allowed_data_view_sha256.push(h('4'));
+            version
+                .snapshot
+                .retrieval
+                .information_policy
+                .allowed_data_view_sha256
+                .push(h('4'));
         }
         fixture.rebind();
         let context = fixture.context();
@@ -2151,7 +2159,12 @@ mod tests {
     fn next_run_rejects_version_only_config_wrong_source_input_or_stale_head() {
         let (mut fixture, corpora, query) = consumption_inputs();
         for version in [&mut fixture.incumbent, &mut fixture.challenger] {
-            version.snapshot.retrieval.information_policy.allowed_data_view_sha256.push(h('4'));
+            version
+                .snapshot
+                .retrieval
+                .information_policy
+                .allowed_data_view_sha256
+                .push(h('4'));
         }
         fixture.rebind();
         let context = fixture.context();
@@ -2172,7 +2185,15 @@ mod tests {
                 },
             )
             .unwrap();
-        for change in ["version-only", "source", "input", "allowed-wrong-view", "build", "stale", "invalid-profile"] {
+        for change in [
+            "version-only",
+            "source",
+            "input",
+            "allowed-wrong-view",
+            "build",
+            "stale",
+            "invalid-profile",
+        ] {
             let mut run = fixture.executions[1].run.clone();
             run.configuration_sha256 = prepared.id().into();
             match change {
@@ -2187,7 +2208,9 @@ mod tests {
             task.run_manifest_sha256 = run.id().unwrap();
             task.view_manifest_sha256
                 .clone_from(&run.data_manifest_sha256);
-            if change == "invalid-profile" { task.profile.namespace = "Invalid_Namespace".into(); }
+            if change == "invalid-profile" {
+                task.profile.namespace = "Invalid_Namespace".into();
+            }
             let mut current = head.clone();
             if change == "stale" {
                 current.revision += 1;
