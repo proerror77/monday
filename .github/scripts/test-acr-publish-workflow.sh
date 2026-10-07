@@ -303,3 +303,14 @@ fi
 "$script_dir/test-download-research-release.sh"
 bash "$script_dir/test-research-controller-image.sh"
 printf 'ACR native build, fixed domain tests and release metadata contracts passed\n'
+
+# Exercise the exact policy selector used by CI, including multiple products.
+selector="$script_dir/select-research-oss-policy.jq"
+jq -n '{trust:{schema:1},oss_by_product:{"cex-runner":{role_arn:"role/cex",role_prefixes:["cex-exact"]},"prediction-runner":{role_arn:"role/prediction",role_prefixes:["prediction-exact"]},controller:{role_arn:"role/controller",role_prefixes:["controller-exact"]}}}' >"$tmp_dir/oss-products.json"
+for product in cex-runner prediction-runner controller; do
+  jq -e --arg product "$product" -f "$selector" "$tmp_dir/oss-products.json" >"$tmp_dir/oss-selected.json"
+  jq -e --arg product "$product" --slurpfile approved "$tmp_dir/oss-products.json" '.oss==$approved[0].oss_by_product[$product] and (.oss.role_prefixes|length)==1 and (has("oss_by_product")|not) and .trust.schema==1' "$tmp_dir/oss-selected.json" >/dev/null
+done
+if jq -e --arg product foreign -f "$selector" "$tmp_dir/oss-products.json" >/dev/null 2>&1; then exit 1; fi
+jq '.oss_by_product.controller.role_arn=.oss_by_product["cex-runner"].role_arn' "$tmp_dir/oss-products.json" >"$tmp_dir/oss-shared-role.json"
+if jq -e --arg product controller -f "$selector" "$tmp_dir/oss-shared-role.json" >/dev/null 2>&1; then exit 1; fi

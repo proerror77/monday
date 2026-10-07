@@ -16,6 +16,8 @@ pub struct OssConfig {
     pub role_arn: String,
     pub oidc_provider_arn: String,
     pub audience: String,
+    pub subject: String,
+    pub role_prefixes: Vec<String>,
     pub repository_id: u64,
     pub owner_id: u64,
 }
@@ -53,7 +55,11 @@ impl OssConfig {
                 && self.oidc_provider_arn.contains(":oidc-provider/")
                 && !self.audience.is_empty()
                 && self.repository_id > 0
-                && self.owner_id > 0,
+                && self.owner_id > 0
+                && !self.subject.is_empty()
+                && !self.role_prefixes.is_empty()
+                && self.role_prefixes.iter().all(|p| exact_prefix(p))
+                && self.role_prefixes.windows(2).all(|w| w[0] < w[1]),
             "approved RAM OIDC configuration required"
         );
         Ok(())
@@ -144,6 +150,19 @@ impl Oss {
         let session: Session = serde_json::from_slice(&crate::transport::read_private_file(path)?)
             .map_err(|_| anyhow::anyhow!("invalid private OSS session file"))?;
         session.validate(Utc::now().timestamp_millis())?;
+        ensure!(
+            session
+                .prefixes
+                .iter()
+                .all(|p| config.role_prefixes.contains(p)),
+            "session exceeds operator-approved RAM role scope"
+        );
+        if session.publisher {
+            ensure!(
+                session.prefixes == config.role_prefixes,
+                "publisher requires the exact approved RAM role scope"
+            );
+        }
         Ok(Self {
             config: config.clone(),
             session,
@@ -336,6 +355,16 @@ pub fn session_policy(config: &OssConfig, prefixes: &[String], publisher: bool) 
             && prefixes.windows(2).all(|w| w[0] < w[1]),
         "invalid OSS session prefixes"
     );
+    ensure!(
+        prefixes.iter().all(|p| config.role_prefixes.contains(p)),
+        "requested prefix outside approved RAM role scope"
+    );
+    if publisher {
+        ensure!(
+            prefixes == config.role_prefixes,
+            "native plan must equal approved RAM role prefixes"
+        );
+    }
     let actions = if publisher {
         vec!["oss:GetObject", "oss:GetObjectVersion", "oss:PutObject"]
     } else {
@@ -410,6 +439,8 @@ mod tests {
             role_arn: "acs:ram::123:role/test".into(),
             oidc_provider_arn: "acs:ram::123:oidc-provider/test".into(),
             audience: "test".into(),
+            subject: "operator-approved-subject".into(),
+            role_prefixes: vec![format!("research/builds/{}/", "a".repeat(64))],
             repository_id: 1,
             owner_id: 2,
         }
@@ -464,6 +495,15 @@ mod tests {
         );
         oss.session.expires_ms = Utc::now().timestamp_millis() - 1;
         assert!(oss.request(reqwest::Method::GET, &key, None).is_err());
+        assert!(session_policy(
+            &config(),
+            &[format!("research/builds/{}/", "b".repeat(64))],
+            true
+        )
+        .is_err());
+        let mut empty = config();
+        empty.role_prefixes.clear();
+        assert!(empty.validate().is_err());
         let mut invalid = config();
         invalid.endpoint = "https://foreign/".into();
         assert!(invalid.validate().is_err());

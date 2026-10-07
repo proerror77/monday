@@ -77,11 +77,11 @@ resulting BuildArtifact. `MONDAY_RESEARCH_DATABASE_URL` must refer to the dedica
 Build importer role; installing schema/roles remains an independent operation.
 
 ACR research publication uses `MONDAY_RESEARCH_RELEASE_POLICY`, including its
-`oss` configuration, and the dedicated `MONDAY_RESEARCH_RELEASE_SIGNING_KEY`.
+per-product `oss_by_product` configuration (projected to native `oss`), and the dedicated `MONDAY_RESEARCH_RELEASE_SIGNING_KEY`.
 The capability executable exchanges GitHub OIDC directly with RAM STS.
 It requests only exact source/Build prefixes from the authenticated native plan.
 CI no longer imports PG or requires a release Gateway/Broker endpoint.
-ACK uses separate read-only OSS credentials, public trust and a host admission file.
+ACK uses separate read-only OSS credentials, pinned public trust and an independently signed host admission envelope. Its operator key must differ from every CI release key.
 It independently verifies completed GitHub producers and object bytes before immutable PG import.
 
 The cheap `check-presence` receives only booleans. Native signer, policy,
@@ -93,4 +93,4 @@ The OSS commands are `oss-check-config`, `oss-publish` and `oss-import`.
 Their actual argument forms are documented in the ACK/OSS contract above.
 Retained Gateway code still supports runtime AttemptWriter and existing integration tests.
 STS has a fifteen-minute minimum and cannot reproduce the old Broker's two-minute revocation lease.
-Deployment requires independent RAM denial tests and a never-versioned existing OSS bucket.
+Deployment remains blocked without independent RAM exact-prefix base-role and denial tests, trusted read-only ACK mounts, and a never-versioned existing OSS bucket. Versioning refusal is a constraint of this adapter.

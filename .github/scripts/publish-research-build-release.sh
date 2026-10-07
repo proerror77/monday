@@ -27,7 +27,8 @@ test -x "$capability"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 umask 077
-printf '%s' "$MONDAY_RELEASE_POLICY_JSON" >"$work/policy.json"
+: "${PRODUCT:?image product required}"
+printf '%s' "$MONDAY_RELEASE_POLICY_JSON" | jq -e --arg product "$PRODUCT" -f "$root/.github/scripts/select-research-oss-policy.jq" >"$work/policy.json"
 unset MONDAY_RELEASE_GATEWAY_TOKEN
 jq -e '.trust.schema==1 and .trust.producer_workflow_path==".github/workflows/acr-publish.yml" and (.trust.keys[.key_id]|test("^[0-9a-f]{64}$")) and (.builder_image|test("@sha256:[0-9a-f]{64}$")) and (.image_repositories|length)>0 and (.oss.bucket|length)>0 and (.oss.role_arn|length)>0 and (.oss.oidc_provider_arn|length)>0' "$work/policy.json" >/dev/null
 context="$RUNNER_TEMP/research-release-context.json"

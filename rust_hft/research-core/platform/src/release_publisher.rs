@@ -28,6 +28,8 @@ const MAX_JSON: u64 = 1024 * 1024;
 pub struct PublisherPolicy {
     #[serde(default)]
     pub oss: Option<crate::release_oss::OssConfig>,
+    #[serde(default)]
+    pub import_admission_keys: BTreeMap<String, String>,
     pub trust: BuildReleaseTrust,
     pub key_id: String,
     pub builder_image: String,
@@ -924,35 +926,12 @@ pub async fn publish(
         let proof_blob = gateway
             .publish_json(format!("{proof_prefix}/release-proof.json"), &proof)
             .await?;
-        // Re-read mutable authority just before signing, after all byte readbacks.
-        ensure!(
-            authenticate(root, request, policy)? == check_ids,
-            "release CI changed during publication"
-        );
-        validate_run(
-            &api(
-                root,
-                repository,
-                &format!("actions/runs/{}", request.software_run_id),
-                false,
-            )?,
-            repository,
-            sha,
-            request.software_run_id,
-            manifest.workflow_run_attempt,
-            software_workflow,
-        )?;
-        validate_job(
-            &api(
-                root,
-                repository,
-                &format!("actions/jobs/{}", manifest.workflow_job_id),
-                false,
-            )?,
-            request.software_run_id,
-            manifest.workflow_run_attempt,
-            sha,
-            false,
+        recheck_publication_authority(
+            |path, pages| api(root, repository, path, pages),
+            request,
+            policy,
+            &software_producer,
+            &check_ids,
         )?;
         let mut signed = SignedBuildRelease {
             schema: 1,
@@ -989,6 +968,14 @@ pub async fn publish(
         gateway
             .publish_json(format!("{proof_prefix}/build-artifact.json"), &artifact)
             .await?;
+        // Signed objects cannot be recalled. Failure blocks success and ACK import.
+        recheck_publication_authority(
+            |path, pages| api(root, repository, path, pages),
+            request,
+            policy,
+            &software_producer,
+            &check_ids,
+        )?;
         artifacts.push(PublishedBuild {
             build_sha256: artifact.build.id()?,
             image_sha256: request
@@ -1003,6 +990,80 @@ pub async fn publish(
     }
     Ok(artifacts)
 }
+fn recheck_publication_authority(
+    mut read: impl FnMut(&str, bool) -> Result<Value>,
+    request: &PublicationRequest,
+    policy: &PublisherPolicy,
+    software: &ReleaseProducer,
+    expected_checks: &[u64],
+) -> Result<()> {
+    let repo = &policy.trust.repository;
+    ensure!(
+        read("git/ref/heads/main", false)?["object"]["sha"] == request.source_sha,
+        "publication source drifted from main"
+    );
+    validate_run(
+        &read(&format!("actions/runs/{}", request.publisher_run_id), false)?,
+        repo,
+        &request.source_sha,
+        request.publisher_run_id,
+        request.publisher_run_attempt,
+        &policy.trust.producer_workflow_path,
+    )?;
+    let job = read(&format!("actions/jobs/{}", request.publisher_job_id), false)?;
+    validate_job(
+        &job,
+        request.publisher_run_id,
+        request.publisher_run_attempt,
+        &request.source_sha,
+        true,
+    )?;
+    ensure!(
+        job["name"]
+            == format!(
+                "Publish {}",
+                request
+                    .image
+                    .rsplit_once("@sha256:")
+                    .context("pinned image required")?
+                    .0
+                    .rsplit('/')
+                    .next()
+                    .context("image name")?
+            ),
+        "publisher job does not own the release"
+    );
+    validate_run(
+        &read(&format!("actions/runs/{}", software.run_id), false)?,
+        repo,
+        &request.source_sha,
+        software.run_id,
+        software.run_attempt,
+        &software.workflow_path,
+    )?;
+    validate_job(
+        &read(&format!("actions/jobs/{}", software.job_id), false)?,
+        software.run_id,
+        software.run_attempt,
+        &request.source_sha,
+        false,
+    )?;
+    ensure!(
+        required_checks(
+            &read(
+                &format!(
+                    "commits/{}/check-runs?filter=latest&per_page=100",
+                    request.source_sha
+                ),
+                true
+            )?,
+            &request.source_sha
+        )? == expected_checks,
+        "publication required checks changed"
+    );
+    Ok(())
+}
+
 pub fn check_source_authority(root: &Path, repository: &str, source: &str) -> Result<()> {
     ensure!(
         sha_is_valid(source)
@@ -1279,7 +1340,7 @@ pub async fn import_build(
 }
 
 /// Host-owned ACK approval. Updating this file never changes scientific grants.
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportAdmission {
     pub schema: u32,
@@ -1306,6 +1367,65 @@ impl ImportAdmission {
         Ok(())
     }
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedImportAdmission {
+    pub schema: u32,
+    pub key_id: String,
+    pub admission: ImportAdmission,
+    pub signature_hex: String,
+}
+impl SignedImportAdmission {
+    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = b"monday.ack-build-import-admission.v1\0".to_vec();
+        bytes.extend(serde_json::to_vec(&(
+            self.schema,
+            &self.key_id,
+            &self.admission,
+        ))?);
+        Ok(bytes)
+    }
+    pub fn verify(&self, policy: &PublisherPolicy) -> Result<&ImportAdmission> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        let public = policy
+            .import_admission_keys
+            .get(&self.key_id)
+            .context("unknown independent ACK admission key")?;
+        ensure!(
+            self.schema == 1
+                && valid_digest(public)
+                && !policy.trust.keys.values().any(|key| key == public)
+                && self.signature_hex.len() == 128
+                && self
+                    .signature_hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "ACK admission requires a distinct operator key and canonical signature"
+        );
+        let decode = |hex: &str| -> Result<Vec<u8>> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| Ok(u8::from_str_radix(&hex[i..i + 2], 16)?))
+                .collect()
+        };
+        let key = VerifyingKey::from_bytes(
+            &decode(public)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid ACK public key"))?,
+        )?;
+        ensure!(!key.is_weak(), "weak ACK admission key");
+        let signature = Signature::from_slice(&decode(&self.signature_hex)?)?;
+        key.verify_strict(&self.signing_bytes()?, &signature)
+            .map_err(|_| anyhow::anyhow!("ACK admission signature rejected"))?;
+        Ok(&self.admission)
+    }
+}
+fn read_import_admission(path: &Path, policy: &PublisherPolicy) -> Result<ImportAdmission> {
+    let signed: SignedImportAdmission =
+        serde_json::from_slice(&crate::transport::read_private_file(path)?)?;
+    Ok(signed.verify(policy)?.clone())
+}
+
 fn completed_producer(
     run: &Value,
     job: &Value,
@@ -1368,8 +1488,7 @@ pub async fn import_oss_build(
         .as_ref()
         .context("ACK import requires OSS")?
         .require_reader()?;
-    let admission: ImportAdmission =
-        serde_json::from_slice(&crate::transport::read_private_file(admission_path)?)?;
+    let admission = read_import_admission(admission_path, policy)?;
     admission.validate(
         build,
         image,
@@ -1438,8 +1557,7 @@ pub async fn import_oss_build(
         api(root, repo, "git/ref/heads/main", false)?["object"]["sha"] == proof.source.code_commit,
         "ACK import source changed during readback"
     );
-    let admission: ImportAdmission =
-        serde_json::from_slice(&crate::transport::read_private_file(admission_path)?)?;
+    let admission = read_import_admission(admission_path, policy)?;
     admission.validate(
         build,
         image,
@@ -1505,6 +1623,130 @@ mod tests {
         wrong["name"] = json!("Publish foreign");
         assert!(completed_producer(&run, &wrong, &p, true, &image).is_err());
     }
+    #[test]
+    fn ack_admission_requires_distinct_authority_signature() {
+        let ci = SigningKey::from_bytes(&[17; 32]);
+        let operator = SigningKey::from_bytes(&[18; 32]);
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let mut policy: PublisherPolicy = serde_json::from_value(json!({
+            "trust":{"schema":1,"repository":"owner/repo","producer_workflow_path":".github/workflows/acr-publish.yml","keys":{"ci":hex(&ci.verifying_key().to_bytes())}},
+            "key_id":"ci","builder_image":inputs().builder_image,"image_repositories":{},
+            "import_admission_keys":{"operator":hex(&operator.verifying_key().to_bytes())}
+        })).unwrap();
+        let mut signed = SignedImportAdmission {
+            schema: 1,
+            key_id: "operator".into(),
+            admission: ImportAdmission {
+                schema: 1,
+                expires_ms: 1001,
+                build_sha256: "a".repeat(64),
+                image_sha256: "b".repeat(64),
+                publication_proof_sha256: "c".repeat(64),
+                revoked: false,
+            },
+            signature_hex: String::new(),
+        };
+        signed.signature_hex = hex(&operator.sign(&signed.signing_bytes().unwrap()).to_bytes());
+        assert!(signed.verify(&policy).is_ok());
+        signed.admission.revoked = true;
+        assert!(signed.verify(&policy).is_err());
+        signed.admission.revoked = false;
+        signed.signature_hex = hex(&ci.sign(&signed.signing_bytes().unwrap()).to_bytes());
+        assert!(signed.verify(&policy).is_err());
+        policy
+            .import_admission_keys
+            .insert("operator".into(), hex(&ci.verifying_key().to_bytes()));
+        assert!(signed.verify(&policy).is_err());
+        assert!(serde_json::from_value::<SignedImportAdmission>(
+            serde_json::to_value(&signed.admission).unwrap()
+        )
+        .is_err());
+    }
+    #[test]
+    fn post_signature_recheck_rejects_cancel_drift_attempt_workflow_and_check_replacement() {
+        let sha = "a".repeat(40);
+        let request = PublicationRequest {
+            source_sha: sha.clone(),
+            software_run_id: 20,
+            software_products: "cex-runner".into(),
+            product: "cex-runner".into(),
+            image: format!("registry/runner@sha256:{}", "b".repeat(64)),
+            publisher_run_id: 10,
+            publisher_run_attempt: 2,
+            publisher_job_id: 30,
+        };
+        let policy: PublisherPolicy = serde_json::from_value(json!({"trust":{"schema":1,"repository":"owner/repo","producer_workflow_path":".github/workflows/acr-publish.yml","keys":{}},"key_id":"ci","builder_image":inputs().builder_image,"image_repositories":{}})).unwrap();
+        let software = ReleaseProducer {
+            repository: "owner/repo".into(),
+            workflow_path: ".github/workflows/ci.yml".into(),
+            source_sha: sha.clone(),
+            run_id: 20,
+            run_attempt: 1,
+            job_id: 40,
+        };
+        let run = |id, attempt, path: &str| json!({"id":id,"run_attempt":attempt,"head_sha":sha,"head_branch":"main","head_repository":{"full_name":"owner/repo"},"path":path,"event":"workflow_run","status":"in_progress","conclusion":null});
+        let checks = ["Monorepo CI gate","Prediction Markets CI gate","Security Summary Report"].iter().enumerate().map(|(i,name)| json!({"id":i+1,"name":name,"head_sha":sha,"status":"completed","conclusion":"success","app":{"slug":"github-actions","id":15368}})).collect::<Vec<_>>();
+        let baseline = BTreeMap::from([
+            (
+                "git/ref/heads/main".to_owned(),
+                json!({"object":{"sha":sha}}),
+            ),
+            (
+                "actions/runs/10".into(),
+                run(10, 2, ".github/workflows/acr-publish.yml"),
+            ),
+            (
+                "actions/runs/20".into(),
+                run(20, 1, ".github/workflows/ci.yml"),
+            ),
+            (
+                "actions/jobs/30".into(),
+                json!({"id":30,"run_id":10,"run_attempt":2,"head_sha":sha,"status":"in_progress","name":"Publish runner"}),
+            ),
+            (
+                "actions/jobs/40".into(),
+                json!({"id":40,"run_id":20,"run_attempt":1,"head_sha":sha,"status":"completed","conclusion":"success","name":"Research image binaries"}),
+            ),
+            (
+                format!("commits/{sha}/check-runs?filter=latest&per_page=100"),
+                json!([{"check_runs":checks}]),
+            ),
+        ]);
+        let verify = |data: &BTreeMap<String, Value>| {
+            recheck_publication_authority(
+                |path, _| data.get(path).cloned().context("missing fixture"),
+                &request,
+                &policy,
+                &software,
+                &[1, 2, 3],
+            )
+        };
+        assert!(verify(&baseline).is_ok()); // Before signing.
+        for kind in 0..6 {
+            let mut after = baseline.clone();
+            match kind {
+                0 => {
+                    after.get_mut("git/ref/heads/main").unwrap()["object"]["sha"] =
+                        json!("b".repeat(40))
+                }
+                1 => after.get_mut("actions/runs/10").unwrap()["conclusion"] = json!("cancelled"),
+                2 => after.get_mut("actions/jobs/30").unwrap()["status"] = json!("completed"),
+                3 => after.get_mut("actions/runs/10").unwrap()["run_attempt"] = json!(3),
+                4 => {
+                    after.get_mut("actions/runs/10").unwrap()["path"] =
+                        json!(".github/workflows/foreign.yml")
+                }
+                _ => {
+                    after
+                        .get_mut(&format!(
+                            "commits/{sha}/check-runs?filter=latest&per_page=100"
+                        ))
+                        .unwrap()[0]["check_runs"][0]["id"] = json!(99)
+                }
+            }
+            assert!(verify(&after).is_err()); // After signing/upload readbacks.
+        }
+    }
     fn source() -> SourceArchive {
         SourceArchive {
             schema: 1,
@@ -1562,6 +1804,7 @@ mod tests {
             .collect::<String>();
         let mut policy = PublisherPolicy {
             oss: None,
+            import_admission_keys: BTreeMap::new(),
             trust: BuildReleaseTrust {
                 schema: 1,
                 repository: "owner/repo".into(),

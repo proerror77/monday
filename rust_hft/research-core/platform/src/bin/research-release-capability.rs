@@ -269,6 +269,7 @@ fn oss_identity(
     ensure!(
         c["iss"] == "https://token.actions.githubusercontent.com"
             && c["aud"] == config.audience
+            && c["sub"] == config.subject
             && c["repository"] == r.repository
             && c["repository_id"]
                 .as_str()
@@ -370,6 +371,13 @@ async fn oss_exchange(
         .map_err(|_| anyhow::anyhow!("RAM OIDC exchange unavailable"))?;
     let body: serde_json::Value = serde_json::from_slice(&bounded_body(response).await?)
         .map_err(|_| anyhow::anyhow!("invalid STS response"))?;
+    ensure!(
+        body["OIDCTokenInfo"]["Subject"] == config.subject
+            && body["OIDCTokenInfo"]["Issuer"] == "https://token.actions.githubusercontent.com"
+            && body["OIDCTokenInfo"]["ClientIds"] == config.audience
+            && body["OIDCTokenInfo"]["VerificationInfo"] == "Success",
+        "RAM did not confirm the approved OIDC identity"
+    );
     let c = &body["Credentials"];
     let field = |name: &str| {
         c[name]
@@ -495,6 +503,8 @@ mod tests {
             role_arn: "acs:ram::1:role/test".into(),
             oidc_provider_arn: "acs:ram::1:oidc-provider/test".into(),
             audience: "test".into(),
+            subject: "operator-approved-subject".into(),
+            role_prefixes: vec![format!("research/sources/{}/", "a".repeat(40))],
             repository_id: 1,
             owner_id: 2,
         };
@@ -507,7 +517,7 @@ mod tests {
         )
         .unwrap();
         let c = &request.context;
-        let claims = json!({"iss":"https://token.actions.githubusercontent.com","aud":"test","repository":c.repository,"repository_id":"1","repository_owner_id":"2","sha":c.source_sha,"ref":"refs/heads/main","workflow_ref":format!("{}/.github/workflows/acr-publish.yml@refs/heads/main",c.repository),"run_id":c.publisher_run_id.to_string(),"run_attempt":c.publisher_run_attempt.to_string(),"check_run_id":99,"exp":now_ms().unwrap()/1000+60});
+        let claims = json!({"iss":"https://token.actions.githubusercontent.com","aud":"test","sub":config.subject,"repository":c.repository,"repository_id":"1","repository_owner_id":"2","sha":c.source_sha,"ref":"refs/heads/main","workflow_ref":format!("{}/.github/workflows/acr-publish.yml@refs/heads/main",c.repository),"run_id":c.publisher_run_id.to_string(),"run_attempt":c.publisher_run_attempt.to_string(),"check_run_id":99,"exp":now_ms().unwrap()/1000+60});
         let job = json!({"id":c.publisher_job_id,"run_id":c.publisher_run_id,"run_attempt":c.publisher_run_attempt,"head_sha":c.source_sha,"status":"in_progress","conclusion":null,"name":"Publish controller","check_run_url":format!("https://api.github.com/repos/{}/check-runs/99",c.repository)});
         let token = |v: &serde_json::Value| {
             format!(
@@ -518,7 +528,15 @@ mod tests {
         };
         assert!(oss_identity(&token(&claims), &request, &config, &job).is_ok());
         for (key, value) in [
+            ("iss", json!("https://foreign")),
+            ("aud", json!("foreign")),
+            ("repository", json!("foreign/repo")),
+            ("repository_id", json!("99")),
+            ("run_id", json!("99")),
+            ("ref", json!("refs/heads/foreign")),
             ("workflow_ref", json!("foreign")),
+            ("sub", json!("foreign")),
+            ("sub", json!(null)),
             ("sha", json!("b".repeat(40))),
             ("run_attempt", json!("999")),
             ("repository_owner_id", json!("3")),
