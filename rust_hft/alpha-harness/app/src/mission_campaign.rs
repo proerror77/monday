@@ -1205,15 +1205,38 @@ fn campaign_research_evidence_signature(
         .map(|factor| factor.factor_signature_sha256.as_str())
         .collect::<Vec<_>>();
     factor_signatures.sort_unstable();
+    let rounds = result
+        .rounds
+        .iter()
+        .map(|round| {
+            let mut feedback = serde_json::json!({
+                "round_id": &round.round_id,
+                "termination_reason": &round.termination_reason,
+                "selected_candidate_id": &round.feedback.supervised_selected_candidate_id,
+                "selected": &round.feedback.supervised_selected,
+                "replay": &round.feedback.supervised_replay,
+            });
+            if result.schema_version == CAMPAIGN_RESULT_SCHEMA_V9 {
+                let content_sha256 = match (
+                    &round.feedback.supervised_selected,
+                    &round.feedback.supervised_selected_evaluation_proof,
+                ) {
+                    (Some(summary), Some(proof)) => {
+                        proof.screening_facts(summary)?;
+                        Some(&proof.evaluation_content_sha256)
+                    }
+                    (None, None) => None,
+                    _ => bail!("current result selected evaluation proof is missing or unbound"),
+                };
+                feedback["selected_evaluation_content_sha256"] = serde_json::json!(content_sha256);
+            }
+            // V8 retains its original payload and hash; no new null field is added.
+            Ok(feedback)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let evaluation_feedback_sha256 = canonical_json_hash(&serde_json::json!({
         "termination_reason": &result.termination_reason,
-        "rounds": result.rounds.iter().map(|round| serde_json::json!({
-            "round_id": &round.round_id,
-            "termination_reason": &round.termination_reason,
-            "selected_candidate_id": &round.feedback.supervised_selected_candidate_id,
-            "selected": &round.feedback.supervised_selected,
-            "replay": &round.feedback.supervised_replay,
-        })).collect::<Vec<_>>(),
+        "rounds": rounds,
     }))?;
     CexCampaignResearchEvidenceSignatureV2::new(
         request.campaign_inputs_sha256.clone(),
@@ -5839,6 +5862,13 @@ pub(crate) mod tests {
         let loaded = loaded_request_for_learning();
         let historical = negative_campaign_result(&loaded);
         assert_eq!(historical.schema_version, CAMPAIGN_RESULT_SCHEMA_V8);
+        // Original V8 feedback wire hash, before complete selected proof was added.
+        assert_eq!(
+            campaign_research_evidence_signature(&loaded.request, &historical)
+                .unwrap()
+                .evaluation_feedback_sha256,
+            "fe32f27175060f789f438a8a4feebc3994e53ccfb51c2451416c07b84659d22c",
+        );
         let original = serde_json::to_vec(&historical).unwrap();
         let original_sha = hft_cex_research_input::sha256(&original);
         let mut observed = historical.clone();
@@ -5855,6 +5885,66 @@ pub(crate) mod tests {
             original_sha
         );
         assert!(classify_campaign_failure(&historical).is_err());
+    }
+
+    #[test]
+    fn evidence_signature_distinguishes_complete_evaluation_with_the_same_summary() {
+        let evaluation = actual_diagnosis_evaluation(100.0, 3);
+        let mut changed = evaluation.clone();
+        let mut config = changed.formula_config().unwrap();
+        config.min_time_series_ic = 0.02;
+        changed.evaluator_config = serde_json::to_value(config).unwrap();
+        changed.validate().unwrap();
+        assert_eq!(
+            campaign_evaluation_feedback(&evaluation),
+            campaign_evaluation_feedback(&changed)
+        );
+        for candidate in [&evaluation, &changed] {
+            let facts = candidate.predictive_screening_gate_facts().unwrap();
+            assert!(facts.predictive_passed && facts.coverage_passed);
+        }
+        let loaded = loaded_request_for_learning();
+        let mut original = negative_campaign_result(&loaded);
+        original.schema_version = CAMPAIGN_RESULT_SCHEMA_V9.into();
+        let summary = campaign_evaluation_feedback(&evaluation);
+        for round in &mut original.rounds {
+            round.feedback.supervised_ridge = Some(summary.clone());
+            round.feedback.supervised_cart = Some(summary.clone());
+            round.feedback.supervised_burn = Some(summary.clone());
+            round.feedback.burn = Some(summary.clone());
+            round.feedback.supervised_selected = Some(summary.clone());
+            round.feedback.supervised_selected_evaluation_proof =
+                Some(CampaignSelectedEvaluationProofV1::from_evaluation(&evaluation).unwrap());
+        }
+        let mut changed_result = original.clone();
+        for round in &mut changed_result.rounds {
+            round.feedback.supervised_selected_evaluation_proof =
+                Some(CampaignSelectedEvaluationProofV1::from_evaluation(&changed).unwrap());
+        }
+        for result in [&original, &changed_result] {
+            validate_negative_campaign_result(
+                &loaded,
+                result,
+                &canonical_json_hash(result).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                classify_campaign_failure(result).unwrap(),
+                CexCampaignFailureClassV1::PositiveIcNegativeNet
+            );
+        }
+        let original_signature =
+            campaign_research_evidence_signature(&loaded.request, &original).unwrap();
+        let changed_signature =
+            campaign_research_evidence_signature(&loaded.request, &changed_result).unwrap();
+        let mut request = loaded.request;
+        request.research_plan.parent_evidence_signature = Some(original_signature.clone());
+        assert!(campaign_has_no_improvement(&request, &original_signature));
+        assert_ne!(
+            original_signature.evaluation_feedback_sha256,
+            changed_signature.evaluation_feedback_sha256
+        );
+        assert!(!campaign_has_no_improvement(&request, &changed_signature));
     }
 
     #[test]
