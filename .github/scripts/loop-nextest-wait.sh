@@ -22,8 +22,8 @@ names=(
 
 producer_attempts=()
 while true; do
-  pages=$(gh api --method GET --paginate --slurp "repos/${repo_name}/actions/runs/${run_id}/jobs?filter=all&per_page=100")
-  jobs=$(jq -ce '{total_count: .[0].total_count, jobs: [.[].jobs[]]}' <<<"$pages")
+  pages=$(gh api --method GET --paginate "repos/${repo_name}/actions/runs/${run_id}/jobs?filter=all&per_page=100")
+  jobs=$(jq -sce '{total_count: .[0].total_count, jobs: [.[].jobs[]]}' <<<"$pages")
   total=$(jq -er '.total_count' <<<"$jobs")
   count=$(jq -er '.jobs | length' <<<"$jobs")
   [[ $total == "$count" ]] || {
@@ -86,8 +86,8 @@ artifact_names=(
 artifacts=
 try=1
 while [[ $try -le $artifact_tries ]]; do
-  pages=$(gh api --paginate --slurp "repos/${repo_name}/actions/runs/${run_id}/artifacts?per_page=100")
-  artifacts=$(jq -ce '{total_count: .[0].total_count, artifacts: [.[].artifacts[]]}' <<<"$pages")
+  pages=$(gh api --paginate "repos/${repo_name}/actions/runs/${run_id}/artifacts?per_page=100")
+  artifacts=$(jq -sce '{total_count: .[0].total_count, artifacts: [.[].artifacts[]]}' <<<"$pages")
   total=$(jq -r '.total_count' <<<"$artifacts")
   count=$(jq -r '.artifacts | length' <<<"$artifacts")
   [[ $total == "$count" ]] || {

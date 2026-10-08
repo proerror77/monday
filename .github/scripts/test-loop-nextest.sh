@@ -140,8 +140,8 @@ set -euo pipefail
 url=
 for arg in "$@"; do url=$arg; done
 case $url in
-  *"/jobs?filter=all&per_page=100") jq -s . "$GH_FIXTURE/jobs.json" ;;
-  *"/artifacts?per_page=100") jq -s . "$GH_FIXTURE/artifacts.json" ;;
+  *"/jobs?filter=all&per_page=100") cat "$GH_FIXTURE/jobs.json" ;;
+  *"/artifacts?per_page=100") cat "$GH_FIXTURE/artifacts.json" ;;
   *"/artifacts/"*"/zip")
     id=${url#*"/artifacts/"}
     id=${id%"/zip"}
