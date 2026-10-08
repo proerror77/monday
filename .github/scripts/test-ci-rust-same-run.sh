@@ -24,9 +24,7 @@ export GITHUB_REPOSITORY=proerror77/monday GITHUB_EVENT_NAME=pull_request
 export GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=3 RUST_JOB_RESULT=success
 export GITHUB_EVENT_PATH="$work/event.json"
 jq -n '{repository:{full_name:"proerror77/monday"},pull_request:{head:{sha:("a"*40),repo:{full_name:"fork/monday"}},base:{sha:("b"*40)}}}' >"$GITHUB_EVENT_PATH"
-command_sha=$(cat .github/workflows/ci.yml .github/scripts/write-ci-rust-evidence.sh \
-  .github/scripts/verify-ci-rust-evidence.sh rust_hft/scripts/cargo-scoped.sh \
-  rust_hft/scripts/workspace-metadata.sh rust_hft/workspaces.json | sha256sum | awk '{print $1}')
+command_sha=$(ci_rust_command_sha)
 jq -n --argjson scope "$(ci_expected_scope "$work/scope")" --arg checkout "$(git rev-parse HEAD)" --arg command "$command_sha" \
   '{schema:"monday.ci_rust_evidence.v1",scope:$scope,stages:[{stage:"loop",outcome:"success"},{stage:"clippy_loop",outcome:"success"}],checkout_sha:$checkout,command_sha256:$command,repository:"proerror77/monday",source_repository:"fork/monday",event:"pull_request",head_sha:("a"*40),base_sha:("b"*40),run_id:"123",run_attempt:3,job_id:789}' >"$work/receipt"
 bash .github/scripts/verify-ci-rust-same-run.sh "$work/receipt" "$work/scope"
