@@ -33,19 +33,6 @@ cargo metadata --manifest-path research-core/Cargo.toml --locked --no-deps --for
 missing=$(jq -r --argjson selected "$selected_json" '($selected - [.packages[].name])[]' "$meta")
 [[ -z $missing ]] || { printf 'selected package is outside research-core:\n%s\n' "$missing" >&2; exit 1; }
 
-while IFS= read -r manifest; do
-  [[ -n $manifest ]] || continue
-  dir=${manifest%/Cargo.toml}
-  rel=${dir#"$repo/"}
-  [[ $rel != "$dir" ]] || { printf 'package path is outside the repository: %s\n' "$manifest" >&2; exit 1; }
-  if git -C "$repo" grep -n -E '^[[:space:]]*(///|//!).*```' -- "$rel"; then
-    printf 'loop package %s has a doctest; nextest does not run it\n' "$rel" >&2
-    exit 1
-  fi
-done < <(jq -r --argjson selected "$selected_json" '
-  .packages[] | select(.name as $name | $selected | index($name)) | .manifest_path
-' "$meta")
-
 config=research-core/.config/nextest.toml
 [[ -f $config ]] || { printf 'missing %s\n' "$config" >&2; exit 1; }
 start=$(date +%s)
@@ -64,6 +51,13 @@ cargo nextest list \
   --message-format json >"$work/nextest-list.json"
 loop_nextest_write_expected "$work/nextest-list.json" "$work/expected-counts.json" \
   "$build_seconds" 0 0
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=loop-nextest-doctests.sh
+source "$repo/.github/scripts/loop-nextest-doctests.sh"
+loop_nextest_run_doctests "$work" "$work/nextest-list.json" "${args[@]}"
+jq --argjson listed "$LOOP_DOC_LISTED" --argjson passed "$LOOP_DOC_PASSED" \
+  '.doctests_listed=$listed | .doctests_passed=$passed' "$work/expected-counts.json" >"$work/docs-counts.json"
+mv "$work/docs-counts.json" "$work/expected-counts.json"
 
 # Use nextest's own hash membership. Do not reimplement its hash algorithm.
 for shard in 1 2 3 4; do
@@ -72,3 +66,5 @@ for shard in 1 2 3 4; do
     --user-config-file none --message-format json >"$work/hash-$shard.json"
 done
 ruby "$repo/.github/scripts/loop-nextest-plan.rb" "$work"
+
+if [[ -n ${GITHUB_OUTPUT:-} ]]; then printf 'producer_attempt=%s\n' "${GITHUB_RUN_ATTEMPT:?}" >>"$GITHUB_OUTPUT"; fi

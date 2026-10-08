@@ -17,6 +17,7 @@ work=${LOOP_NEXTEST_WORK:?}
 mkdir -p "$work"
 plan=${LOOP_NEXTEST_PLAN:?}
 filter=$(cat "$plan/filter-$shard.txt")
+mode=$(jq -er .partition "$plan/expected-counts.json")
 config=$repo/rust_hft/research-core/.config/nextest.toml
 [[ -f $config ]]
 
@@ -58,7 +59,7 @@ if loop_nextest_stderr_recompiled "$work/stderr.txt"; then
   recompiled=true
 fi
 loop_nextest_write_shard "$work/events.jsonl" "$work/list.json" "$work/shard-${shard}.json" \
-  "$shard" "$seconds" "$status" "$recompiled"
+  "$shard" "$seconds" "$status" "$recompiled" "$mode"
 if [[ $recompiled == true ]]; then
   printf 'shard %s recompiled from source\n' "$shard" >&2
   exit 1

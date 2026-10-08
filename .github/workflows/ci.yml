@@ -205,6 +205,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Setup Rust for doctest contract fixture
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.98.1
       - name: Verify selection, cancellation and aggregate admission
         run: |
           bash .github/scripts/test-collector-control-scheduling.sh
@@ -218,6 +222,7 @@ jobs:
           bash .github/scripts/test-ack-rust-batch.sh
           bash .github/scripts/test-ci-rust-evidence.sh
           bash .github/scripts/test-loop-nextest.sh
+          bash .github/scripts/test-loop-nextest-doctests.sh
           .github/scripts/test-ci-rust-same-run.sh
           .github/scripts/test-select-rust-ci-scope.sh
           .github/scripts/test-ci-monitor-scope.sh
@@ -242,6 +247,8 @@ jobs:
 
   rust_loop_nextest_archive:
     name: Loop nextest archive
+    outputs:
+      producer_attempt: ${{ steps.archive.outputs.producer_attempt }}
     needs: scope
     if: ${{ !cancelled() && needs.scope.result == 'success' && contains(needs.scope.outputs.jobs, ',ci/rust,') && needs.scope.outputs.loop == 'true' }}
     runs-on: ubuntu-latest
@@ -284,6 +291,7 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/.github/scripts/install-cargo-nextest.sh"
 
       - name: Archive loop tests
+        id: archive
         env:
           LOOP_PARTITION_MODE: ${{ inputs.loop_partition_mode || 'balanced-v1' }}
           LOOP_PACKAGES: ${{ needs.scope.outputs.loop_packages }}
@@ -340,13 +348,13 @@ jobs:
       - name: Download nextest archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: loop-nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          name: loop-nextest-archive-${{ github.run_id }}-${{ needs.rust_loop_nextest_archive.outputs.producer_attempt }}
           path: ${{ runner.temp }}/loop-nextest-archive
 
       - name: Download verified partition plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: loop-nextest-expected-${{ github.run_id }}-${{ github.run_attempt }}
+          name: loop-nextest-expected-${{ github.run_id }}-${{ needs.rust_loop_nextest_archive.outputs.producer_attempt }}
           path: ${{ runner.temp }}/loop-nextest-plan
 
       - name: Run shard

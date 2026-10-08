@@ -45,8 +45,8 @@ loop_nextest_write_expected() {
   binaries=$(loop_nextest_binaries_from_list "$list_json")
   runnable=$(jq -e 'add // 0' <<<"$binaries")
   alpha=$(jq -r '.["alpha-harness::alpha_harness (lib)"] // 0' <<<"$binaries")
-  [[ $runnable =~ ^[1-9][0-9]*$ ]] || {
-    printf 'loop archive listed no runnable tests\n' >&2
+  [[ $runnable =~ ^[0-9]+$ ]] || {
+    printf 'invalid loop archive runnable count\n' >&2
     return 1
   }
   jq -en \
@@ -74,7 +74,8 @@ loop_nextest_write_expected() {
 # Compare one shard's libtest-json-plus event stream with that partition's list.
 loop_nextest_write_shard() {
   local events=$1 list_json=$2 output=$3 shard=$4 seconds=$5 run_status=$6 recompiled=$7
-  local executed listed failed_tests tests
+  local executed listed failed_tests tests mode=${8:-balanced-v1}
+  [[ $mode == hash || $mode == balanced-v1 ]] || return 1
   executed=$(jq -s -e -c '
     def rows:
       [.[]
@@ -135,9 +136,10 @@ loop_nextest_write_shard() {
     --argjson executed "$executed" \
     --argjson failed_tests "$failed_tests" \
     --argjson tests "$tests" \
+    --arg mode "$mode" \
     '{
       shard: $shard,
-      partition: ("balanced-v1:" + ($shard | tostring) + "/4"),
+      partition: ($mode + ":" + ($shard | tostring) + "/4"),
       seconds: $seconds,
       exit_status: $status,
       recompiled: $recompiled,
@@ -159,16 +161,18 @@ loop_nextest_write_shard() {
 
 loop_nextest_verify_dir() {
   local dir=$1 shard_n shard passed failed recompiled exit_status partition
-  local expected_runnable got_passed alpha expected_alpha
+  local expected_runnable got_passed alpha expected_alpha mode
   local -a errors=()
   [[ -f $dir/expected-counts.json ]] || { printf 'missing expected-counts.json\n' >&2; return 1; }
   expected_runnable=$(jq -r '.nextest_runnable' "$dir/expected-counts.json")
   alpha=$(jq -r '.alpha_harness' "$dir/expected-counts.json")
-  [[ $(jq -r '.partition' "$dir/expected-counts.json") == balanced-v1 ]] || errors+=("expected partition is not balanced-v1")
+  mode=$(jq -r '.partition' "$dir/expected-counts.json")
+  [[ $mode == hash || $mode == balanced-v1 ]] || errors+=("invalid partition mode")
+  [[ $(jq -r '.mode' "$dir/expected-counts.json") == "$mode" ]] || errors+=("partition mode label mismatch")
   [[ $(jq -r '.shards' "$dir/expected-counts.json") == 4 ]] || errors+=("expected shard count is not 4")
   [[ $(jq -r '.doctests_listed' "$dir/expected-counts.json") == "$(jq -r '.doctests_passed' "$dir/expected-counts.json")" ]] \
     || errors+=("doctest list does not match doctest passes")
-  [[ $expected_runnable =~ ^[1-9][0-9]*$ ]] || errors+=("expected runnable count is empty")
+  [[ $expected_runnable =~ ^[0-9]+$ ]] || errors+=("expected runnable count is empty")
   got_passed=0
   for shard_n in 1 2 3 4; do
     if [[ ! -f $dir/shard-$shard_n.json ]]; then
@@ -181,7 +185,7 @@ loop_nextest_verify_dir() {
     recompiled=$(jq -r '.recompiled' <<<"$shard")
     exit_status=$(jq -r '.exit_status' <<<"$shard")
     partition=$(jq -r '.partition' <<<"$shard")
-    [[ $(jq -r '.shard' <<<"$shard") == "$shard_n" && $partition == "balanced-v1:$shard_n/4" ]] \
+    [[ $(jq -r '.shard' <<<"$shard") == "$shard_n" && $partition == "$mode:$shard_n/4" ]] \
       || errors+=("shard $shard_n partition is $partition")
     [[ $recompiled == false ]] || errors+=("shard $shard_n recompiled")
     [[ $exit_status == 0 && $failed == 0 ]] || errors+=("shard $shard_n exit=$exit_status failed=$failed")

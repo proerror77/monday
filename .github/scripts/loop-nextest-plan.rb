@@ -50,7 +50,7 @@ shards.each_with_index do |identities, index|
   File.write("#{work}/filter-#{index + 1}.txt", expression)
 end
 expected = JSON.parse(File.read("#{work}/expected-counts.json"))
-expected['partition'] = 'balanced-v1'
+expected['partition'] = mode
 expected['mode'] = mode
 expected['tests'] = full
 expected['shard_tests'] = shards.map(&:sort)

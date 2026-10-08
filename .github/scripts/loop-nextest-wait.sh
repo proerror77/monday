@@ -20,18 +20,21 @@ names=(
   "Loop nextest shard (4)"
 )
 
+producer_attempts=()
 while true; do
-  jobs=$(gh api --method GET "repos/${repo_name}/actions/runs/${run_id}/attempts/${attempt}/jobs?per_page=100")
+  pages=$(gh api --method GET --paginate --slurp "repos/${repo_name}/actions/runs/${run_id}/jobs?filter=all&per_page=100")
+  jobs=$(jq -ce '{total_count: .[0].total_count, jobs: [.[].jobs[]]}' <<<"$pages")
   total=$(jq -er '.total_count' <<<"$jobs")
   count=$(jq -er '.jobs | length' <<<"$jobs")
-  [[ $total == "$count" && $total -le 100 ]] || {
+  [[ $total == "$count" ]] || {
     printf 'jobs page is incomplete: total=%s returned=%s\n' "$total" "$count" >&2
     exit 1
   }
   pending=false
   pending_names=
+  producer_attempts=()
   for name in "${names[@]}"; do
-    row=$(jq -c --arg name "$name" '[.jobs[] | select(.name == $name)]' <<<"$jobs")
+    row=$(jq -c --arg name "$name" --arg attempt "$attempt" '[.jobs[] | select(.name == $name and .run_attempt <= ($attempt|tonumber))] | if length == 0 then [] else (map(.run_attempt)|max) as $latest | map(select(.run_attempt==$latest)) end' <<<"$jobs")
     rows=$(jq -r 'length' <<<"$row")
     if [[ $rows -eq 0 ]]; then
       pending=true
@@ -39,6 +42,7 @@ while true; do
       continue
     fi
     [[ $rows -eq 1 ]] || { printf 'duplicate job named %s\n' "$name" >&2; exit 1; }
+    producer_attempts+=("$(jq -er '.[0].run_attempt | select(type=="number" and .>0 and floor==.)' <<<"$row")")
     status=$(jq -r '.[0].status' <<<"$row")
     conclusion=$(jq -r '.[0].conclusion // "null"' <<<"$row")
     case $conclusion in
@@ -73,19 +77,20 @@ trap 'rm -rf "$work"' EXIT
 artifact_tries=${LOOP_NEXTEST_ARTIFACT_TRIES:-6}
 artifact_wait=${LOOP_NEXTEST_ARTIFACT_WAIT_SECONDS:-5}
 artifact_names=(
-  "loop-nextest-expected-${run_id}-${attempt}"
-  "loop-nextest-shard-1-${run_id}-${attempt}"
-  "loop-nextest-shard-2-${run_id}-${attempt}"
-  "loop-nextest-shard-3-${run_id}-${attempt}"
-  "loop-nextest-shard-4-${run_id}-${attempt}"
+  "loop-nextest-expected-${run_id}-${producer_attempts[0]}"
+  "loop-nextest-shard-1-${run_id}-${producer_attempts[1]}"
+  "loop-nextest-shard-2-${run_id}-${producer_attempts[2]}"
+  "loop-nextest-shard-3-${run_id}-${producer_attempts[3]}"
+  "loop-nextest-shard-4-${run_id}-${producer_attempts[4]}"
 )
 artifacts=
 try=1
 while [[ $try -le $artifact_tries ]]; do
-  artifacts=$(gh api "repos/${repo_name}/actions/runs/${run_id}/artifacts?per_page=100")
+  pages=$(gh api --paginate --slurp "repos/${repo_name}/actions/runs/${run_id}/artifacts?per_page=100")
+  artifacts=$(jq -ce '{total_count: .[0].total_count, artifacts: [.[].artifacts[]]}' <<<"$pages")
   total=$(jq -r '.total_count' <<<"$artifacts")
   count=$(jq -r '.artifacts | length' <<<"$artifacts")
-  [[ $total == "$count" && $total -le 100 ]] || {
+  [[ $total == "$count" ]] || {
     printf 'artifacts page is incomplete: total=%s returned=%s\n' "$total" "$count" >&2
     exit 1
   }
@@ -116,9 +121,9 @@ download_artifact() {
   mkdir -p "$work/$dest"
   unzip -q -o "$work/${dest}.zip" -d "$work/$dest"
 }
-download_artifact "loop-nextest-expected-${run_id}-${attempt}" expected
+download_artifact "loop-nextest-expected-${run_id}-${producer_attempts[0]}" expected
 for shard_n in 1 2 3 4; do
-  download_artifact "loop-nextest-shard-${shard_n}-${run_id}-${attempt}" "shard${shard_n}"
+  download_artifact "loop-nextest-shard-${shard_n}-${run_id}-${producer_attempts[$shard_n]}" "shard${shard_n}"
 done
 mkdir -p "$work/reports"
 cp "$work/expected/expected-counts.json" "$work/reports/expected-counts.json"

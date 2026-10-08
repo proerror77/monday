@@ -44,7 +44,7 @@ shard_json() {
     '{shard:$shard,partition:("balanced-v1:" + ($shard|tostring) + "/4"),seconds:($shard*10),exit_status:0,recompiled:false,passed:$passed,failed:0,binaries:{"alpha-harness::alpha_harness (lib)":$passed},failed_tests:[]}'
 }
 mkdir -p "$work/ok"
-jq -n '{build_seconds:3,nextest_runnable:5,alpha_harness:5,binaries:{"alpha-harness::alpha_harness (lib)":5},doctests_listed:0,doctests_passed:0,partition:"balanced-v1",shards:4}' \
+jq -n '{build_seconds:3,nextest_runnable:5,alpha_harness:5,binaries:{"alpha-harness::alpha_harness (lib)":5},doctests_listed:0,doctests_passed:0,partition:"balanced-v1",mode:"balanced-v1",shards:4}' \
   >"$work/ok/expected-counts.json"
 passed_for=(0 2 1 1 1)
 for shard_n in 1 2 3 4; do
@@ -109,11 +109,11 @@ run_gate 0 LOOP=true SELECTED_JOBS=',ci/ci-contracts,' ARCHIVE_RESULT=skipped SH
 run_gate 1 LOOP=true SELECTED_JOBS=',ci/rust,' ARCHIVE_RESULT=missing SHARD_RESULT=missing
 
 jobs_success=$(jq -n '{total_count:5,jobs:[
-  {name:"Loop nextest archive",status:"completed",conclusion:"success"},
-  {name:"Loop nextest shard (1)",status:"completed",conclusion:"success"},
-  {name:"Loop nextest shard (2)",status:"completed",conclusion:"success"},
-  {name:"Loop nextest shard (3)",status:"completed",conclusion:"success"},
-  {name:"Loop nextest shard (4)",status:"completed",conclusion:"success"}
+  {run_attempt:1,name:"Loop nextest archive",status:"completed",conclusion:"success"},
+  {run_attempt:1,name:"Loop nextest shard (1)",status:"completed",conclusion:"success"},
+  {run_attempt:1,name:"Loop nextest shard (2)",status:"completed",conclusion:"success"},
+  {run_attempt:1,name:"Loop nextest shard (3)",status:"completed",conclusion:"success"},
+  {run_attempt:1,name:"Loop nextest shard (4)",status:"completed",conclusion:"success"}
 ]}')
 
 prepare_zips() {
@@ -140,8 +140,8 @@ set -euo pipefail
 url=
 for arg in "$@"; do url=$arg; done
 case $url in
-  *"/jobs?per_page=100") cat "$GH_FIXTURE/jobs.json" ;;
-  *"/artifacts?per_page=100") cat "$GH_FIXTURE/artifacts.json" ;;
+  *"/jobs?filter=all&per_page=100") jq -s . "$GH_FIXTURE/jobs.json" ;;
+  *"/artifacts?per_page=100") jq -s . "$GH_FIXTURE/artifacts.json" ;;
   *"/artifacts/"*"/zip")
     id=${url#*"/artifacts/"}
     id=${id%"/zip"}
@@ -165,6 +165,22 @@ wait_out=$(
 grep -Fqx 'LOOP_NEXTEST_RUNNABLE=5' <<<"$wait_out" || fail 'waiter did not check the shard sum'
 grep -Fqx 'LOOP_NEXTEST_ALPHA_HARNESS=5' <<<"$wait_out" || fail 'waiter did not report alpha_harness'
 
+# Partial retry: archive and three shards remain successful on attempt 1,
+# while shard 1 is replaced by its successful attempt 2 evidence.
+jq '.jobs += [.jobs[1] | .run_attempt=2] | .total_count=6' <<<"$jobs_success" >"$work/wait/jobs.json"
+jq '(.artifacts[]|select(.id==21)|.name)="loop-nextest-shard-1-99-2"' "$work/wait/artifacts.json" >"$work/retry-artifacts"
+mv "$work/retry-artifacts" "$work/wait/artifacts.json"
+PATH="$work/wait/bin:$PATH" GH_FIXTURE="$work/wait" GITHUB_WORKSPACE="$root" \
+  GITHUB_RUN_ID=99 GITHUB_RUN_ATTEMPT=2 GITHUB_REPOSITORY=proerror77/monday \
+  bash "$root/.github/scripts/loop-nextest-wait.sh" >/dev/null
+jq '.jobs[-1].conclusion="failure"' "$work/wait/jobs.json" >"$work/failed-retry"
+mv "$work/failed-retry" "$work/wait/jobs.json"
+if PATH="$work/wait/bin:$PATH" GH_FIXTURE="$work/wait" GITHUB_WORKSPACE="$root" \
+  GITHUB_RUN_ID=99 GITHUB_RUN_ATTEMPT=2 GITHUB_REPOSITORY=proerror77/monday \
+  bash "$root/.github/scripts/loop-nextest-wait.sh" >/dev/null 2>&1; then
+  fail 'latest failed retry fell back to the earlier successful shard'
+fi
+prepare_zips "$work/wait"
 printf '%s\n' "$jobs_success" | jq '.jobs[1].conclusion = "failure"' >"$work/wait/jobs.json"
 if PATH="$work/wait/bin:$PATH" GH_FIXTURE="$work/wait" GITHUB_WORKSPACE="$root" \
   GITHUB_RUN_ID=99 GITHUB_RUN_ATTEMPT=1 GITHUB_REPOSITORY=proerror77/monday \
@@ -176,8 +192,8 @@ if grep -q 'LOOP_NEXTEST_RUNNABLE=' "$work/wait/failed.out"; then
 fi
 
 jq -n '{total_count:2,jobs:[
-  {name:"Loop nextest archive",status:"completed",conclusion:"success"},
-  {name:"Loop nextest archive",status:"completed",conclusion:"success"}
+  {run_attempt:1,name:"Loop nextest archive",status:"completed",conclusion:"success"},
+  {run_attempt:1,name:"Loop nextest archive",status:"completed",conclusion:"success"}
 ]}' >"$work/wait/jobs.json"
 if PATH="$work/wait/bin:$PATH" GH_FIXTURE="$work/wait" GITHUB_WORKSPACE="$root" \
   GITHUB_RUN_ID=99 GITHUB_RUN_ATTEMPT=1 GITHUB_REPOSITORY=proerror77/monday \
@@ -185,7 +201,7 @@ if PATH="$work/wait/bin:$PATH" GH_FIXTURE="$work/wait" GITHUB_WORKSPACE="$root" 
   fail 'waiter accepted a duplicate job name'
 fi
 
-jq -n '{total_count:101,jobs:[{name:"Loop nextest archive",status:"queued",conclusion:null}]}' >"$work/wait/jobs.json"
+jq -n '{total_count:101,jobs:[{run_attempt:1,name:"Loop nextest archive",status:"queued",conclusion:null}]}' >"$work/wait/jobs.json"
 if PATH="$work/wait/bin:$PATH" GH_FIXTURE="$work/wait" GITHUB_WORKSPACE="$root" \
   GITHUB_RUN_ID=99 GITHUB_RUN_ATTEMPT=1 GITHUB_REPOSITORY=proerror77/monday \
   bash "$root/.github/scripts/loop-nextest-wait.sh" >/dev/null 2>&1; then
@@ -272,6 +288,8 @@ ruby "$root/.github/scripts/loop-nextest-plan.rb" "$work/plan"
 jq -e '.partition == "balanced-v1" and (.tests|length) == 7
   and (.shard_tests|map(length)) == [2,1,2,2]
   and ([.shard_tests[][]]|sort) == (.tests|sort)' "$work/plan/expected-counts.json" >/dev/null
+LOOP_PARTITION_MODE="hash" ruby "$root/.github/scripts/loop-nextest-plan.rb" "$work/plan"
+jq -e '.partition=="hash" and .mode=="hash" and (.shard_tests|map(length))==[1,4,1,1]' "$work/plan/expected-counts.json" >/dev/null
 # A corrupted partition retains its count but repeats another shard's test.
 jq '."rust-suites"["alpha-harness"].testcases.d["filter-match"].status="mismatch"
   | ."rust-suites"["alpha-harness"].testcases.c["filter-match"].status="matches"' \
