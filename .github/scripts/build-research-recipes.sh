@@ -2,8 +2,8 @@
 # Measure the admitted recipes. Keep separate Cargo calls and serial target writes.
 set -euo pipefail
 product=${1:?product required}
-phase=${2:?after-cache-lookup or warm-local required}
-[[ $phase == after-cache-lookup || $phase == warm-local ]] || exit 2
+phase=${2:?after-cache-lookup, warm-local or dependency-warm-local required}
+[[ $phase == after-cache-lookup || $phase == warm-local || $phase == dependency-warm-local ]] || exit 2
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root/rust_hft"
 inputs=${MONDAY_BUILD_INPUTS_FILE:?}
@@ -34,6 +34,7 @@ while IFS= read -r recipe; do
     --arg recipe_target "$recipe_target" --argjson recipe "$recipe" --argjson seconds "$seconds" \
     '{phase:$phase,recipe_target:$recipe_target,cache_exact_match:$cache_match,source_sha:$source,compilation_inputs_sha256:$inputs,recipe:$recipe,seconds:$seconds,
       compiler_artifacts:([.[]|select(.reason=="compiler-artifact")]|length),
+      native_artifacts:[.[]|select(.reason=="compiler-artifact" and (.package_id|contains("libduckdb-sys")))|{package_id,target:.target.name,fresh}],
       fresh:([.[]|select(.reason=="compiler-artifact" and .fresh==true)]|length),
       rebuilt:([.[]|select(.reason=="compiler-artifact" and .fresh==false)]|length)}' \
     "$work/$phase-$package.jsonl" | tee -a "$work/timings.jsonl"

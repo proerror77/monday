@@ -22,6 +22,10 @@ if [[ ${MONDAY_RESEARCH_CACHE_PROBE:-0} == 1 ]]; then
   while IFS= read -r binary; do sha256sum "$(binary_path "$binary")"; done \
     < <(bash ../.github/scripts/research-release-products.sh binaries "$product") >"$after"
   diff -u "$before" "$after"
+  # Exercise dependency-only reuse without persisting a PR cache. Local sources
+  # must compile again; native dependencies should survive the same cleanup.
+  bash ../.github/scripts/research-cache-layout.sh cleanup "$MONDAY_BUILD_INPUTS_FILE"
+  bash ../.github/scripts/build-research-recipes.sh "$product" dependency-warm-local
 fi
 release=${RUNNER_TEMP:?}/research-release
 mkdir -p "$release/research-bin"

@@ -52,7 +52,7 @@ case ${1:?command required} in
       fi
       cargo metadata --manifest-path "$root/rust_hft/$manifest" --locked --format-version 1 "${metadata_args[@]}" >>"$work/local.jsonl"
     done <<<"$recipes"
-    jq -s --arg root "$root/" '[.[].packages[]|select(.manifest_path|startswith($root))|.name, .targets[].name]|unique' "$work/local.jsonl" >"$work/names.json"
+    jq -s --arg root "$root/" '[.[].packages[]|select(.manifest_path|startswith($root))|.name, .targets[].name]|unique|if length>0 then . else error("no local compilation packages") end' "$work/local.jsonl" >"$work/names.json"
     ruby -rjson -rfileutils - "$root" "$work/names.json" "${2:?inputs required}" <<'RUBY'
 root, names_file, inputs_file = ARGV
 names = JSON.parse(File.read(names_file)).flat_map { |n| [n, n.tr('-', '_'), "lib#{n.tr('-', '_')}"] }.uniq
