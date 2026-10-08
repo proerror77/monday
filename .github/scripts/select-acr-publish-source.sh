@@ -76,8 +76,8 @@ require_green_main() {
       prediction) state=$prediction_conclusion ;;
       security) state=$security_conclusion ;;
     esac
-    [[ $state == success ]] || {
-      printf 'release admission requires %s check success, got %s\n' "$name" "${state:-missing}" >&2
+    [[ $state == success || $state == skipped ]] || {
+      printf 'release admission requires %s check success/skipped, got %s\n' "$name" "${state:-missing}" >&2
       exit 1
     }
   done

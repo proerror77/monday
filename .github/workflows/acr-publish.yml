@@ -1,8 +1,9 @@
 name: Publish ACR Images
 
 on:
+  # Keep the native issuer's workflow and OIDC identity stable.
   workflow_run:
-    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]
+    workflows: ["Release"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -46,6 +47,7 @@ permissions:
   actions: read
   checks: read
   contents: read
+  pull-requests: read
 
 concurrency:
   # Retain queued CI wakeups and manual requests while preserving the shared
@@ -56,7 +58,7 @@ concurrency:
 
 jobs:
   selector:
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main')
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'workflow_run' && github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -96,6 +98,7 @@ jobs:
           main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
           echo "main_sha=$main_sha" >> "$GITHUB_OUTPUT"
           if [[ "$PUBLISH_TARGET" != research-source-test && "$CURRENT_SHA" == "$main_sha" ]]; then
+            .github/scripts/wait-release-required-checks.sh "$CURRENT_SHA" current-main
             checks_json="$RUNNER_TEMP/acr-required-checks.json"
             gh api --paginate --slurp \
               "repos/$GITHUB_REPOSITORY/commits/$CURRENT_SHA/check-runs?filter=latest&per_page=100" > "$checks_json"
@@ -110,8 +113,10 @@ jobs:
           BINARIES_CONCLUSION: ${{ steps.source-jobs.outputs.binaries_conclusion }}
           SMOKE_CONCLUSION: ${{ steps.source-jobs.outputs.smoke_conclusion }}
           EVENT_NAME: ${{ github.event_name }}
-          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          # Release may fail in GHCR. ACR derives admission from the exact CI
+          # checks and Prediction artifact readback, independently of GHCR.
+          SOURCE_CONCLUSION: ${{ github.event_name == 'workflow_run' && 'success' || '' }}
+          SOURCE_EVENT: ${{ github.event_name == 'workflow_run' && 'push' || '' }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           SOURCE_RUN_ID: ${{ steps.source-jobs.outputs.artifact_run_id }}
@@ -222,6 +227,7 @@ jobs:
       checks: read
       contents: read
       id-token: write
+      pull-requests: read
     needs: [selector, research-runner-binaries]
     if: always() && needs.selector.result == 'success' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'
     runs-on: ubuntu-latest
@@ -826,6 +832,27 @@ jobs:
             ${{ runner.temp }}/research-release-context.json
           if-no-files-found: error
           retention-days: 7
+
+      - name: Record verified ACR publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
+        run: |
+          docker pull "$IMAGE"
+          base_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE")
+          if [[ '${{ matrix.repository }}' == binance-lob-archiver ]]; then
+            test "$base_digest" = "$(cat "$RUNNER_TEMP/tested-collector/image-id.txt")"
+          fi
+          .github/scripts/write-release-record.sh "$SOURCE_SHA" "$base_digest" "$IMAGE" "$RUNNER_TEMP/acr-release-record.json"
+
+      - name: Retain verified ACR publication record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: acr-release-record-${{ matrix.repository }}-${{ needs.selector.outputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/acr-release-record.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Remove ACR credentials
         if: always()

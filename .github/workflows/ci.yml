@@ -219,6 +219,7 @@ jobs:
           bash .github/scripts/test-ack-preflight-relay.sh
           bash .github/scripts/test-preflight-workflow-gate.sh
           .github/scripts/test-research-image-release-artifact.sh
+          bash .github/scripts/test-release-record.sh
 
   rust_shell_scripts:
     name: Rust shell scripts
