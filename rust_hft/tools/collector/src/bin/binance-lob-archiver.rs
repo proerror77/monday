@@ -14115,7 +14115,7 @@ mod tests {
         assert!(trace.contains("failure_role=\"primary\""), "{trace}");
         assert!(trace.contains("\"missing\":[1]"), "{trace}");
         task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
         drop(held);
     }
 }
