@@ -43,9 +43,15 @@ ci_verify_producer "$work/fork-receipt" "$work/fork-run" "$work/jobs" "$work/for
 # Exercise the actual authenticated-artifact consumer, including an attempt
 # changing between download and final API readback. No network or secret used.
 mkdir -p "$work/repo/.github/scripts" "$work/repo/.github/workflows" "$work/bin"
-cp "$root/.github/scripts/"{wait-ci-rust-evidence,verify-ci-rust-evidence,write-ci-rust-evidence}.sh "$work/repo/.github/scripts/"
-cp "$root/.github/workflows/ci.yml" "$work/repo/.github/workflows/"
-command_sha=$(cat "$work/repo/.github/workflows/ci.yml" "$work/repo/.github/scripts/write-ci-rust-evidence.sh" "$work/repo/.github/scripts/verify-ci-rust-evidence.sh" | sha256sum | awk '{print $1}')
+# Copy the full command-digest surface, including nextest execution helpers.
+while IFS= read -r path; do
+  mkdir -p "$work/repo/$(dirname "$path")"
+  cp "$root/$path" "$work/repo/$path"
+done < <(cd "$root" && printf '%s\n' .github/scripts/*.sh .github/scripts/loop-nextest-plan.rb .github/workflows/ci.yml rust_hft/scripts/cargo-scoped.sh rust_hft/scripts/workspace-metadata.sh rust_hft/workspaces.json rust_hft/research-core/.config/nextest.toml)
+command_sha=$(ci_rust_command_sha "$work/repo")
+printf '\n# digest regression\n' >>"$work/repo/.github/scripts/loop-nextest-plan.rb"
+[[ $(ci_rust_command_sha "$work/repo") != "$command_sha" ]] || exit 1
+cp "$root/.github/scripts/loop-nextest-plan.rb" "$work/repo/.github/scripts/loop-nextest-plan.rb"
 jq --arg sha "$command_sha" '.command_sha256=$sha' "$work/receipt" >"$work/rust-batch.json"
 (cd "$work" && zip -jq evidence.zip rust-batch.json)
 cat >"$work/repo/.github/scripts/select-rust-ci-scope.sh" <<'MOCK'

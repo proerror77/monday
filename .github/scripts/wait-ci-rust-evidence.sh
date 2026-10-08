@@ -60,7 +60,7 @@ while (( $(date +%s)<deadline )); do
         stage=producer-provenance-verification
         ci_verify_producer "$work/receipt" "$work/current" "$work/exact-job" "$GITHUB_EVENT_PATH" "$checkout"
         stage=command-identity-verification
-        command_sha=$(cat .github/workflows/ci.yml .github/scripts/write-ci-rust-evidence.sh .github/scripts/verify-ci-rust-evidence.sh | sha256sum | awk '{print $1}')
+        command_sha=$(ci_rust_command_sha)
         jq -e --arg sha "$command_sha" '.command_sha256==$sha' "$work/receipt" >/dev/null
         if [[ $GITHUB_EVENT_NAME == pull_request ]]; then
           stage=pull-request-readback

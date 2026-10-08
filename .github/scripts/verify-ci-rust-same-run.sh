@@ -5,9 +5,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/verify-ci-rust-evidence.sh"
 receipt=${1:?receipt file required}
 selected=${2:?selected scope required}
 ci_verify_stages "$receipt" "$selected"
-command_sha=$(cat .github/workflows/ci.yml .github/scripts/write-ci-rust-evidence.sh \
-  .github/scripts/verify-ci-rust-evidence.sh rust_hft/scripts/cargo-scoped.sh \
-  rust_hft/scripts/workspace-metadata.sh rust_hft/workspaces.json | sha256sum | awk '{print $1}')
+command_sha=$(ci_rust_command_sha)
 checks=$(jq -c --slurpfile event "$GITHUB_EVENT_PATH" --arg repository "$GITHUB_REPOSITORY" \
   --arg checkout "$(git rev-parse HEAD)" --arg run "$GITHUB_RUN_ID" \
   --argjson attempt "$GITHUB_RUN_ATTEMPT" --arg command "$command_sha" '
