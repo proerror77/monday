@@ -76,10 +76,10 @@ bash .github/scripts/migrate-research-oss-policy.sh \
 ```
 
 This offline command preserves every existing policy field and only adds the
-explicit mapping. It rejects unknown products, shared roles, wildcard prefixes,
-missing fields, duplicate JSON documents and a different already-installed map;
-an identical repeat is idempotent. If a map already exists, reconcile it and
-include all previously approved entries rather than silently replacing them.
+explicit mapping. It rejects unknown products or fields, shared roles, wildcard
+prefixes, missing fields, unbound endpoints and duplicate JSON documents.
+An identical repeat is idempotent. A new product can be added only when every
+previously approved entry is included unchanged. Removal or replacement fails.
 Its structural checks do not prove actual RAM permissions, endpoint trust or
 native signing policy acceptance. It performs no API calls, key creation, role
 creation, IAM writes or repository-variable updates. Review the public JSON diff

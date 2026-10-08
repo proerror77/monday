@@ -13,7 +13,12 @@ jq -ne --slurpfile existing "$1" --slurpfile mapping "$2" '
   def text: type == "string" and length > 0;
   def entry:
     type == "object" and
+    (keys == (["bucket","region","endpoint","role_arn","oidc_provider_arn","audience","subject","role_prefixes","repository_id","owner_id"] | sort)) and
     all([.bucket,.region,.endpoint,.role_arn,.oidc_provider_arn,.audience,.subject][]; text) and
+    (.bucket | test("^[a-z0-9-]{3,63}$")) and
+    (.region | test("^[a-z0-9-]+$")) and
+    (.endpoint == ("https://" + .bucket + ".oss-" + .region + ".aliyuncs.com/") or
+      .endpoint == ("https://" + .bucket + ".oss-" + .region + "-internal.aliyuncs.com/")) and
     (.repository_id | type == "number" and . > 0 and floor == .) and
     (.owner_id | type == "number" and . > 0 and floor == .) and
     (.role_prefixes | type == "array" and length > 0 and . == (sort | unique) and
@@ -23,8 +28,11 @@ jq -ne --slurpfile existing "$1" --slurpfile mapping "$2" '
     error("existing public policy and one reviewed existing-role map object required")
   elif any($mapping[0][]; entry | not) then
     error("role map requires all public OSS/OIDC fields, numeric immutable IDs and sorted exact source/Build prefixes; obtain values from existing configuration, never guess or expand scope")
-  elif ($existing[0].oss_by_product != null and $existing[0].oss_by_product != {} and $existing[0].oss_by_product != $mapping[0]) then
-    error("existing oss_by_product differs; reconcile its reviewed mappings explicitly rather than replacing them")
+  elif ($existing[0].oss_by_product != null and ($existing[0].oss_by_product | type) != "object") then
+    error("existing oss_by_product must be an object")
+  elif any(($existing[0].oss_by_product // {} | to_entries[]);
+      . as $entry | $mapping[0][$entry.key] != $entry.value) then
+    error("existing oss_by_product entries cannot be removed or changed; include every existing reviewed entry unchanged")
   else $existing[0] + {oss_by_product:$mapping[0]} end
 ' "$1" > "$work/candidate.json"
 while IFS= read -r product; do
