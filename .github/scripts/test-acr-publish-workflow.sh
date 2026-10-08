@@ -99,9 +99,26 @@ ruby -ryaml - "$workflow" "$ploy_workflow" <<'RUBY'
 acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
 [[ploy,'research-image-binaries','github.sha'],[acr,'research-runner-binaries','needs.selector.outputs.source_sha']].each do |doc,id,sha|
   steps=doc.fetch('jobs').fetch(id).fetch('steps')
-  upload=steps.find { |s|s.fetch('uses','').include?('actions/upload-artifact@') }
-  abort 'missing immutable software upload' unless upload && upload.fetch('with').fetch('name')=="research-image-release-${{ #{sha} }}-${{ #{id=='research-image-binaries' ? 'needs.image-smoke-scope' : 'needs.selector'}.outputs.research_product }}"
-  abort 'incorrect release boundary' unless upload.fetch('with').fetch('path')=='${{ runner.temp }}/research-image-release.tar' && upload.fetch('with').fetch('if-no-files-found')=='error'
+  expected="research-image-release-${{ #{sha} }}-${{ #{id=='research-image-binaries' ? 'needs.image-smoke-scope' : 'needs.selector'}.outputs.research_product }}"
+  validate = lambda do |entries|
+    uploads=entries.select { |step| step.fetch('uses','').include?('actions/upload-artifact@') && step.fetch('with',{}).fetch('name','')==expected }
+    raise 'missing or duplicate immutable software upload' unless uploads.length==1
+    upload=uploads.fetch(0)
+    raise 'incorrect release boundary' unless upload.fetch('with').fetch('path')=='${{ runner.temp }}/research-image-release.tar' && upload.fetch('with').fetch('if-no-files-found')=='error'
+    upload
+  end
+  upload=validate.call(steps)
+  timing={'uses'=>'actions/upload-artifact@fixture','with'=>{'name'=>'recipe-timing','path'=>'timings.jsonl'}}
+  validate.call([timing,upload])
+  validate.call([upload,timing])
+  wrong_name=Marshal.load(Marshal.dump(upload)); wrong_name['with']['name']='other-release'
+  wrong_path=Marshal.load(Marshal.dump(upload)); wrong_path['with']['path']='timings.jsonl'
+  warning=Marshal.load(Marshal.dump(upload)); warning['with']['if-no-files-found']='warn'
+  [[timing], [timing,wrong_name], [timing,wrong_path], [upload,upload], [warning,timing]].each do |invalid|
+    rejected=false
+    begin; validate.call(invalid); rescue RuntimeError; rejected=true; end
+    abort 'invalid immutable software upload accepted' unless rejected
+  end
 end
 publication=acr.fetch('jobs').fetch('publish')
 abort 'release job cannot obtain its own OIDC identity' unless publication.fetch('permissions')=={'actions'=>'read','checks'=>'read','contents'=>'read','id-token'=>'write','pull-requests'=>'read'}

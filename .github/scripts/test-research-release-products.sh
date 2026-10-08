@@ -83,7 +83,7 @@ bash "$root/.github/scripts/test-research-product-image.sh"
 # binaries. Only the target recorded by compiler inputs may reach the archive.
 fixture="$work/producer"
 mkdir -p "$fixture/.github/scripts" "$fixture/rust_hft" "$fixture/bin" "$fixture/output"
-for script in build-research-release.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
+for script in build-research-release.sh build-research-recipes.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
   cp "$root/.github/scripts/$script" "$fixture/.github/scripts/$script"
 done
 cp "$root/rust_hft/workspaces.json" "$fixture/rust_hft/workspaces.json"
@@ -98,6 +98,7 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\n" 7\n' >"$fixture/bin/gh"
 cat >"$fixture/bin/cargo" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
+[[ ${FAIL_RECIPE:-0} != 1 ]] || exit 37
 target='' binaries=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -110,7 +111,9 @@ test "$target" = "$(jq -r .target "$MONDAY_BUILD_INPUTS_FILE")"
 mkdir -p "$CARGO_TARGET_DIR/$target/release"
 for binary in "${binaries[@]}"; do
   printf 'fresh target executable: %s\n' "$binary" >"$CARGO_TARGET_DIR/$target/release/$binary"
+  printf '%s\n' '{"reason":"compiler-artifact","fresh":true}'
 done
+printf '%s\n' '{"reason":"build-finished","success":true}'
 MOCK
 chmod +x "$fixture/bin/"* "$fixture/.github/scripts/verify-research-runtime-abi.sh"
 mkdir -p "$fixture/rust_hft/target/release"
@@ -118,8 +121,27 @@ while IFS= read -r binary; do
   printf 'stale host executable\n' >"$fixture/rust_hft/target/release/$binary"
 done < <(bash "$products" binaries controller)
 jq --argjson recipes "$(bash "$products" recipes controller | jq -s .)" '.recipes=$recipes' "$MONDAY_BUILD_INPUTS_FILE" >"$fixture/inputs.json"
-PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/output" GITHUB_REPOSITORY=fixture/monday GITHUB_RUN_ID=42 CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu MONDAY_BUILD_INPUTS_FILE="$fixture/inputs.json" bash "$fixture/.github/scripts/build-research-release.sh" controller
+MONDAY_RESEARCH_CACHE_PROBE=1 PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/output" GITHUB_REPOSITORY=fixture/monday GITHUB_RUN_ID=42 CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu MONDAY_BUILD_INPUTS_FILE="$fixture/inputs.json" bash "$fixture/.github/scripts/build-research-release.sh" controller
 while IFS= read -r binary; do
   test "$(cat "$fixture/output/research-release/research-bin/$binary")" = "fresh target executable: $binary"
 done < <(bash "$products" binaries controller)
 printf 'PASS: controller-only release builds five admitted executables including the ACK importer; product, archive and unadmitted control bytes fail closed\n'
+
+# The opt-in probe must run all three controller recipes twice with one input identity.
+jq -es 'length==6 and ([.[].phase]|sort)==["after-cache-lookup","after-cache-lookup","after-cache-lookup","warm-local","warm-local","warm-local"]
+  and ([.[].compilation_inputs_sha256]|unique|length)==1
+  and all(.[]; .source_sha=="1111111111111111111111111111111111111111" and .compiler_artifacts>0)' \
+  "$fixture/output/research-recipe-probe/timings.jsonl" >/dev/null
+# A compiler failure must block the producer before artifact creation.
+mkdir -p "$fixture/failed-output"
+if FAIL_RECIPE=1 PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/failed-output" GITHUB_REPOSITORY=fixture/monday \
+  GITHUB_RUN_ID=42 MONDAY_BUILD_INPUTS_FILE="$fixture/inputs.json" bash "$fixture/.github/scripts/build-research-release.sh" controller; then
+  echo 'compiler failure accepted by the producer' >&2; exit 1
+fi
+[[ ! -e $fixture/failed-output/research-image-release.tar ]]
+jq '.recipes=[]' "$fixture/inputs.json" >"$fixture/wrong-inputs.json"
+if PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/failed-output" MONDAY_SOURCE_REVISION="$sha" \
+  MONDAY_BUILD_INPUTS_FILE="$fixture/wrong-inputs.json" bash "$fixture/.github/scripts/build-research-recipes.sh" controller after-cache-lookup; then
+  echo 'wrong admitted recipes accepted by the probe' >&2; exit 1
+fi
+printf 'PASS: recipe probe preserves exact inputs, compiler failures and all selected recipes\n'

@@ -10,13 +10,19 @@ MONDAY_RELEASE_JOB_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RU
 export MONDAY_SOURCE_REVISION=$source_sha
 export CARGO_TARGET_DIR="$PWD/target"
 target=x86_64-unknown-linux-gnu
-while IFS= read -r recipe; do
-  args=(build --manifest-path "$(jq -r .manifest <<<"$recipe")" --target "$target" --release --locked -p "$(jq -r .package <<<"$recipe")")
-  features=$(jq -r .features <<<"$recipe")
-  [[ -z $features ]] || args+=(--features "$features")
-  while IFS= read -r binary; do args+=(--bin "$binary"); done < <(jq -r '.binaries[]' <<<"$recipe")
-  cargo "${args[@]}"
-done < <(bash ../.github/scripts/research-release-products.sh recipes "$product")
+bash ../.github/scripts/build-research-recipes.sh "$product" after-cache-lookup
+if [[ ${MONDAY_RESEARCH_CACHE_PROBE:-0} == 1 ]]; then
+  # Probe only the current runner's target. Never save a PR cache or change recipes.
+  before=$(mktemp)
+  after=$(mktemp)
+  trap 'rm -f "$before" "$after"' EXIT
+  while IFS= read -r binary; do sha256sum "target/$target/release/$binary"; done \
+    < <(bash ../.github/scripts/research-release-products.sh binaries "$product") >"$before"
+  bash ../.github/scripts/build-research-recipes.sh "$product" warm-local
+  while IFS= read -r binary; do sha256sum "target/$target/release/$binary"; done \
+    < <(bash ../.github/scripts/research-release-products.sh binaries "$product") >"$after"
+  diff -u "$before" "$after"
+fi
 release=${RUNNER_TEMP:?}/research-release
 mkdir -p "$release/research-bin"
 while IFS= read -r binary; do

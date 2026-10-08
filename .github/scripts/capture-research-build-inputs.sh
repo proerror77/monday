@@ -60,6 +60,7 @@ done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
 recipes=$(bash "$root/.github/scripts/research-release-products.sh" recipes "${2:-all}" | jq -s .)
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
 cat "$root/.github/scripts/build-research-release.sh" \
+  "$root/.github/scripts/build-research-recipes.sh" \
   "$root/.github/scripts/research-release-products.sh" \
   "$root/.github/scripts/research-release-products.json" \
   "$root/.github/scripts/research-release-source-sha.sh" \

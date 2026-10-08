@@ -102,4 +102,25 @@ plan
 grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/plan"
 printf '[{}]\n' >"$work/runs"
 if plan >"$work/rejected" 2>&1; then echo 'missing API baseline metadata admitted' >&2; exit 1; fi
+# A helper-only main build fails, then a documentation push must retain its
+# cumulative unpublished impact for every product. A failed run is no baseline.
+publisher "$head"
+helper_base=$head
+printf 'recipe helper change\n' >.github/scripts/build-research-recipes.sh
+git add .github/scripts/build-research-recipes.sh
+git commit -qm 'fixture helper-only main G'
+helper_head=$(git rev-parse HEAD)
+jq --arg sha "$helper_head" '.[0].total_count=2 | .[0].workflow_runs += [.[0].workflow_runs[0] | .id=400 | .head_sha=$sha | .conclusion="failure"]' "$work/runs" >"$work/edit"
+mv "$work/edit" "$work/runs"
+printf 'docs H\n' >>README.md
+git commit -qam 'fixture documentation after failed helper build'
+head=$(git rev-parse HEAD)
+plan
+grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/plan"
+grep -Fq ',ploy/research-image-binaries,ploy/research-image-smoke,' "$work/plan"
+# Only a verified successful publication advances the helper baseline.
+publisher "$head"
+plan
+grep -Fqx research_product=none "$work/plan"
+[[ $helper_base != "$head" ]]
 printf 'PASS: unpublished A survives docs B; separate product readbacks suppress completed work; malformed or ambiguous baselines fail\n'

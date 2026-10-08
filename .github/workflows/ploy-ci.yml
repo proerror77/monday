@@ -6,6 +6,11 @@ on:
   push:
     branches: [main, develop]
   workflow_dispatch:
+    inputs:
+      research_cache_probe:
+        description: Re-run the exact research recipes in the same ephemeral target
+        type: boolean
+        default: false
 
 concurrency:
   group: prediction-markets-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
@@ -229,6 +234,7 @@ jobs:
       image: rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
     timeout-minutes: 90
     env:
+      CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_RELEASE_DEBUG: "0"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -245,7 +251,8 @@ jobs:
         id: build-inputs
         working-directory: .
         run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json" "${{ needs.image-smoke-scope.outputs.research_product }}"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - id: research-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             rust_hft
@@ -256,6 +263,8 @@ jobs:
         working-directory: .
         env:
           GH_TOKEN: ${{ github.token }}
+          MONDAY_CACHE_EXACT_MATCH: ${{ steps.research-cache.outputs.cache-hit || 'unknown' }}
+          MONDAY_RESEARCH_CACHE_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && '1' || '0' }}
           MONDAY_BUILD_INPUTS_FILE: ${{ runner.temp }}/research-build-inputs.json
         run: bash .github/scripts/build-research-release.sh "${{ needs.image-smoke-scope.outputs.research_product }}"
       - name: Upload research image release
@@ -265,6 +274,15 @@ jobs:
           path: ${{ runner.temp }}/research-image-release.tar
           if-no-files-found: error
           retention-days: 7
+      - name: Upload recipe timing evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: research-recipe-timings-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/research-recipe-probe/timings.jsonl
+          if-no-files-found: error
+          retention-days: 7
+
 
   research-image-smoke:
     name: Research image smoke
