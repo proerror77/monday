@@ -9,6 +9,7 @@ pub(crate) mod market_encoder;
 mod platform_output;
 pub(crate) mod preparation;
 pub(crate) mod prepared_inputs;
+pub(crate) mod representation;
 pub(crate) mod sequence;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -79,6 +80,7 @@ const CAMPAIGN_INPUTS_SCHEMA_V1: &str = "monday.cex_campaign_inputs.v1";
 const CAMPAIGN_REQUEST_SCHEMA_V5: &str = "cex-campaign-request-v5";
 const CAMPAIGN_REQUEST_SCHEMA_V6: &str = "cex-campaign-request-v6-prepared";
 const CAMPAIGN_RESULT_SCHEMA_V8: &str = "cex-campaign-result-v8";
+const CAMPAIGN_RESULT_SCHEMA_V9: &str = "cex-campaign-result-v9";
 const CAMPAIGN_IDENTITY_SCHEMA_V5: &str = "cex-campaign-identity-v5";
 const CAMPAIGN_ROUND_IDENTITY_SCHEMA_V1: &str = "cex-campaign-round-identity-v1";
 const CAMPAIGN_DATA_FINGERPRINT_SCHEMA_V1: &str = "cex-campaign-31h-data-fingerprint-v1";
@@ -93,6 +95,21 @@ fn declared_total_trials_for_rounds(
     round_count: usize,
 ) -> anyhow::Result<usize> {
     let gp_trials = research_plan.max_candidates()?;
+    declared_trials_from_candidate_count(research_plan, round_count, gp_trials)
+}
+
+fn declared_total_trials_for_validated_plan(
+    base: &crate::mission_render::ValidatedCexResearchPlanBase<'_>,
+    round_count: usize,
+) -> anyhow::Result<usize> {
+    declared_trials_from_candidate_count(base.plan(), round_count, base.max_candidates()?)
+}
+
+fn declared_trials_from_candidate_count(
+    research_plan: &CexCampaignResearchPlanV1,
+    round_count: usize,
+    gp_trials: usize,
+) -> anyhow::Result<usize> {
     let per_round = if !research_plan.supervised_model_scope.is_default() {
         gp_trials
             .checked_add(research_plan.supervised_model_scope.names().len())
@@ -178,6 +195,59 @@ struct FrozenCampaignPlan {
     campaign_inputs_sha256: String,
     canonical_request: CampaignRequest,
     signing_plan: CampaignSigningPlan,
+}
+
+/// Complete request identity verified against the original producer's ledger
+/// attestation. Caller hashes and JSON cannot construct this process-local value.
+pub(crate) struct VerifiedPlanningRequest<'a> {
+    request: &'a CampaignRequest,
+    request_sha256: String,
+}
+
+impl VerifiedPlanningRequest<'_> {
+    pub(crate) fn request(&self) -> &CampaignRequest {
+        self.request
+    }
+    pub(crate) fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+}
+
+pub(crate) fn verify_planning_request<'a>(
+    ledger: &alpha_store::AlphaStore,
+    freeze_path: Option<&Path>,
+    request: &'a CampaignRequest,
+) -> anyhow::Result<VerifiedPlanningRequest<'a>> {
+    let frozen = load_freeze_plan(
+        freeze_path.context("planning requires an authenticated original freeze")?,
+    )?;
+    preparation::verify_authentication(
+        ledger,
+        &frozen,
+        frozen.preparation_authentication_tag.as_deref(),
+    )?;
+    validate_request_matches_freeze(request, &frozen)?;
+    Ok(VerifiedPlanningRequest {
+        request,
+        request_sha256: hft_cex_research_input::sha256(&serialize_request(request)?),
+    })
+}
+
+fn authenticated_freeze_plan(
+    request: &CampaignRequest,
+    ledger: Option<&alpha_store::AlphaStore>,
+) -> anyhow::Result<FrozenCampaignPlan> {
+    let mut plan = FrozenCampaignPlan {
+        preparation_authentication_tag: None,
+        schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
+        campaign_inputs_sha256: request.campaign_inputs_sha256.clone(),
+        signing_plan: signing_plan(request)?,
+        canonical_request: request.clone(),
+    };
+    if let Some(ledger) = ledger {
+        plan.preparation_authentication_tag = Some(preparation::authenticate(ledger, &plan)?);
+    }
+    Ok(plan)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +344,37 @@ struct CampaignEvaluationFeedbackV1 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+struct CampaignSelectedEvaluationProofV1 {
+    evaluation: CandidateEvaluation,
+    evaluation_content_sha256: String,
+}
+
+impl CampaignSelectedEvaluationProofV1 {
+    fn from_evaluation(evaluation: &CandidateEvaluation) -> anyhow::Result<Self> {
+        evaluation.validate()?;
+        Ok(Self {
+            evaluation: evaluation.clone(),
+            evaluation_content_sha256: canonical_json_hash(evaluation)?,
+        })
+    }
+
+    fn screening_facts(
+        &self,
+        summary: &CampaignEvaluationFeedbackV1,
+    ) -> anyhow::Result<alpha_domain::PredictiveScreeningGateFacts> {
+        if canonical_json_hash(&self.evaluation)? != self.evaluation_content_sha256
+            || campaign_evaluation_feedback(&self.evaluation) != *summary
+        {
+            bail!("selected evaluation proof differs from its complete content hash or summary");
+        }
+        self.evaluation
+            .predictive_screening_gate_facts()
+            .map_err(anyhow::Error::from)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 struct CampaignFactorFeedbackV1 {
     factor_signature_sha256: String,
     source_features: Vec<String>,
@@ -316,6 +417,8 @@ struct CampaignRoundFeedbackV1 {
     supervised_burn: Option<CampaignEvaluationFeedbackV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supervised_selected: Option<CampaignEvaluationFeedbackV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_selected_evaluation_proof: Option<CampaignSelectedEvaluationProofV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supervised_selected_candidate_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -575,18 +678,13 @@ pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
     if args.final_evaluation_control.is_some() {
         return final_evaluation::freeze(args);
     }
-    let (request, campaign_inputs_sha256) = freeze_request(&args)?;
-    let mut plan = FrozenCampaignPlan {
-        preparation_authentication_tag: None,
-        schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.to_string(),
-        campaign_inputs_sha256,
-        signing_plan: signing_plan(&request)?,
-        canonical_request: request.clone(),
-    };
-    if let Some(path) = &args.preparation_ledger {
-        let ledger = alpha_store::AlphaStore::open_read_only(path)?;
-        plan.preparation_authentication_tag = Some(preparation::authenticate(&ledger, &plan)?);
-    }
+    let (request, _) = freeze_request(&args)?;
+    let ledger = args
+        .preparation_ledger
+        .as_ref()
+        .map(alpha_store::AlphaStore::open_read_only)
+        .transpose()?;
+    let plan = authenticated_freeze_plan(&request, ledger.as_ref())?;
     hft_research_artifacts::write_json_atomic(&args.output, &plan)?;
     research_event(
         "alpha-harness",
@@ -612,12 +710,28 @@ pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
 }
 
 pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
+    let source = mission_dispatch::read_authenticated_settled_campaign_source(
+        &args.control,
+        &args.submission,
+        &args.result,
+        &args.settlement,
+        &args.namespace,
+    )?;
+    if !source.is_negative() {
+        bail!("cost learning requires an authenticated negative settled Campaign");
+    }
     let loaded = load_request(&args.request)?;
     validate_request(&loaded.request)?;
-    let result = load_campaign_result(&args.result)?;
-    let result_sha256 = hft_research_artifacts::sha256_file(&args.result)?;
+    let result: CampaignResultV1 = serde_json::from_slice(source.result_bytes())?;
+    let result_sha256 = source.result_sha256().to_string();
     if result_sha256 != normalized_sha256("parent Campaign result", &args.result_sha256)? {
         bail!("parent Campaign result SHA256 mismatch");
+    }
+    if source.request() != &loaded.request
+        || source.request_sha256() != loaded.sha256
+        || source.result_sha256() != result_sha256
+    {
+        bail!("learning request/result differs from the authenticated settled source");
     }
     validate_negative_campaign_result(&loaded, &result, &result_sha256)?;
     let failure_class = classify_campaign_failure(&result)?;
@@ -749,7 +863,7 @@ pub fn propose_next_family(args: CampaignStudyProposeArgs) -> anyhow::Result<()>
         request: authenticated.request,
         sha256: parent.request_sha256.clone(),
     };
-    let result = load_campaign_result(&args.parent_result)?;
+    let result: CampaignResultV1 = serde_json::from_slice(&authenticated.result_bytes)?;
     validate_negative_campaign_result(&loaded, &result, &parent.campaign_result_sha256)?;
 
     let needs_authority = |reason: &str, target_family_id: Option<String>| {
@@ -1037,10 +1151,22 @@ fn campaign_has_no_improvement(
 fn classify_campaign_failure(
     result: &CampaignResultV1,
 ) -> anyhow::Result<CexCampaignFailureClassV1> {
+    if result.schema_version != CAMPAIGN_RESULT_SCHEMA_V9 {
+        bail!("cost learning requires a current result with complete selected evaluation evidence");
+    }
     let mut classified = None;
     for round in &result.rounds {
         let selected = selected_supervised_feedback(&round.feedback)
             .context("Campaign failure has no supervised model evidence")?;
+        let proof = round
+            .feedback
+            .supervised_selected_evaluation_proof
+            .as_ref()
+            .context("cost learning requires complete selected evaluation evidence")?;
+        let facts = proof.screening_facts(selected)?;
+        if !facts.predictive_passed || !facts.coverage_passed {
+            bail!("selected prediction or coverage screening failed; cost attribution is not admitted");
+        }
         let failure_class = if selected.trade_count == 0 {
             CexCampaignFailureClassV1::NoTradesAfterCosts
         } else if selected.capacity_breached {
@@ -1079,15 +1205,38 @@ fn campaign_research_evidence_signature(
         .map(|factor| factor.factor_signature_sha256.as_str())
         .collect::<Vec<_>>();
     factor_signatures.sort_unstable();
+    let rounds = result
+        .rounds
+        .iter()
+        .map(|round| {
+            let mut feedback = serde_json::json!({
+                "round_id": &round.round_id,
+                "termination_reason": &round.termination_reason,
+                "selected_candidate_id": &round.feedback.supervised_selected_candidate_id,
+                "selected": &round.feedback.supervised_selected,
+                "replay": &round.feedback.supervised_replay,
+            });
+            if result.schema_version == CAMPAIGN_RESULT_SCHEMA_V9 {
+                let content_sha256 = match (
+                    &round.feedback.supervised_selected,
+                    &round.feedback.supervised_selected_evaluation_proof,
+                ) {
+                    (Some(summary), Some(proof)) => {
+                        proof.screening_facts(summary)?;
+                        Some(&proof.evaluation_content_sha256)
+                    }
+                    (None, None) => None,
+                    _ => bail!("current result selected evaluation proof is missing or unbound"),
+                };
+                feedback["selected_evaluation_content_sha256"] = serde_json::json!(content_sha256);
+            }
+            // V8 retains its original payload and hash; no new null field is added.
+            Ok(feedback)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let evaluation_feedback_sha256 = canonical_json_hash(&serde_json::json!({
         "termination_reason": &result.termination_reason,
-        "rounds": result.rounds.iter().map(|round| serde_json::json!({
-            "round_id": &round.round_id,
-            "termination_reason": &round.termination_reason,
-            "selected_candidate_id": &round.feedback.supervised_selected_candidate_id,
-            "selected": &round.feedback.supervised_selected,
-            "replay": &round.feedback.supervised_replay,
-        })).collect::<Vec<_>>(),
+        "rounds": rounds,
     }))?;
     CexCampaignResearchEvidenceSignatureV2::new(
         request.campaign_inputs_sha256.clone(),
@@ -1189,6 +1338,14 @@ fn follow_up_plan(
     search_policy_revision: CexCampaignSearchPolicyRevisionV1,
     parent_evidence_signature: CexCampaignResearchEvidenceSignatureV2,
 ) -> anyhow::Result<CexCampaignResearchPlanV1> {
+    if loaded
+        .request
+        .research_plan
+        .representation_binding
+        .is_some()
+    {
+        bail!("representation comparison requires a new validated proposal; automatic follow-up cannot discard its frozen goal");
+    }
     if loaded.request.research_plan.mlp_training.is_some() {
         bail!("paired MLP diagnostics require a new root plan with matched factors and initialization; automatic follow-up is not supported");
     }
@@ -1273,6 +1430,7 @@ fn follow_up_plan(
         }),
         learning_directive: Some(learning_directive),
         llm: None,
+        representation_binding: None,
     };
     plan.validate()?;
     Ok(plan)
@@ -1315,6 +1473,23 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     if final_evaluation::is_final_freeze(&args.freeze)? {
         return final_evaluation::finalize(args);
     }
+    finalize_with_native_readback(args, |request, request_sha256| {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .redirect(Policy::none())
+            .build()?;
+        let readback = tempfile::tempdir().context("native finalized input readback")?;
+        prepared_inputs::acquire_native_prepared(request, request_sha256, &client, readback.path())
+    })
+}
+
+fn finalize_with_native_readback(
+    args: CampaignFinalizeArgs,
+    acquire: impl FnOnce(
+        &CampaignRequest,
+        &str,
+    ) -> anyhow::Result<prepared_inputs::VerifiedNativeCampaignPreparedInputs>,
+) -> anyhow::Result<()> {
     let plan = load_freeze_plan(&args.freeze)?;
     validate_request(&plan.canonical_request)?;
     if expected_campaign_id(&plan.canonical_request)? != plan.canonical_request.campaign_id {
@@ -1324,17 +1499,12 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     let loaded = load_request(&args.signed_request)?;
     validate_request_matches_freeze(&loaded.request, &plan)?;
     if loaded.request.prepared_inputs.is_some() {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .redirect(Policy::none())
-            .build()?;
-        let readback = tempfile::tempdir().context("native finalized input readback")?;
-        let verified = prepared_inputs::acquire_native_prepared(
-            &loaded.request,
-            &loaded.sha256,
-            &client,
-            readback.path(),
-        )?;
+        let verified = acquire(&loaded.request, &loaded.sha256)?;
+        if verified.finalized_request() != &loaded.request
+            || verified.request_sha256() != loaded.sha256
+        {
+            bail!("native finalized readback verified a different request identity");
+        }
         verified.render_inputs();
         research_event(
             "alpha-harness",
@@ -1379,17 +1549,46 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(not(test))]
-pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
+pub(crate) fn validate_request_for_source(request: &CampaignRequest) -> anyhow::Result<()> {
     validate_request(request)
 }
 
 #[cfg(test)]
-pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
+pub(crate) fn validate_request_for_source(request: &CampaignRequest) -> anyhow::Result<()> {
     validate_request(request).or_else(|_| validate_local_test_request(request))
+}
+
+pub(crate) fn validate_execution_readiness(request: &CampaignRequest) -> anyhow::Result<()> {
+    if request.prepared_inputs.is_some() && request.research_plan.calendar.is_some() {
+        bail!("native calendar execution requires an independently admitted calendar validation projection; normalized search preparation alone is not executable");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_request_for_execute(request: &CampaignRequest) -> anyhow::Result<()> {
+    validate_request_for_source(request)?;
+    validate_execution_readiness(request)
+}
+
+pub(crate) fn validate_serialized_execution_readiness(
+    request_json: &str,
+    request_sha256: &str,
+) -> anyhow::Result<()> {
+    let value: serde_json::Value = serde_json::from_str(request_json)?;
+    // Sequence and encoder requests retain their original owning admission.
+    if value["schema_version"] != CAMPAIGN_REQUEST_SCHEMA_V6 {
+        return Ok(());
+    }
+    if hex::encode(Sha256::digest(request_json.as_bytes())) != request_sha256 {
+        bail!("native execution readiness request differs from inspected request identity");
+    }
+    let request: CampaignRequest = serde_json::from_value(value)?;
+    validate_execution_readiness(&request)
 }
 
 #[cfg(feature = "scientific")]
 fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> anyhow::Result<()> {
+    validate_request_for_execute(&loaded.request)?;
     if !args.pre_holdout {
         bail!(
             "campaign-execute cannot open sealed holdout; pass --pre-holdout, or --final-evaluation with an independent grant"
@@ -1634,7 +1833,7 @@ fn execute_loaded_request(args: CampaignExecuteArgs, loaded: LoadedRequest) -> a
     let finalization = None;
 
     let result = CampaignResultV1 {
-        schema_version: CAMPAIGN_RESULT_SCHEMA_V8.to_string(),
+        schema_version: CAMPAIGN_RESULT_SCHEMA_V9.to_string(),
         campaign_id: loaded.request.campaign_id.clone(),
         request_sha256: loaded.sha256.clone(),
         build_source_revision: loaded.request.build_source_revision.clone(),
@@ -1884,6 +2083,7 @@ fn freeze_prepared_request(
     study_proposal: Option<&CampaignNextFamilyProposalV1>,
 ) -> anyhow::Result<(CampaignRequest, String)> {
     research_plan.validate()?;
+    representation::validate_campaign_seeds(research_plan, seeds)?;
     if research_plan.calendar.is_some() && seeds != [7, 11] {
         bail!("calendar H1 requires exactly seeds 7 and 11");
     }
@@ -2546,6 +2746,12 @@ fn collect_round_ledger(
         supervised_selected: supervised
             .as_ref()
             .map(|evidence| campaign_evaluation_feedback(&evidence.selected.evaluation)),
+        supervised_selected_evaluation_proof: supervised
+            .as_ref()
+            .map(|evidence| {
+                CampaignSelectedEvaluationProofV1::from_evaluation(&evidence.selected.evaluation)
+            })
+            .transpose()?,
         supervised_selected_candidate_id: supervised
             .as_ref()
             .map(|evidence| evidence.selected.artifact_id.clone()),
@@ -2716,6 +2922,20 @@ fn collect_round_ledger(
         termination_reason,
         feedback,
     })
+}
+
+fn preserve_result_feedback_shape(
+    observed: &mut CampaignMissionLedgerV1,
+    schema_version: &str,
+) -> anyhow::Result<()> {
+    match schema_version {
+        CAMPAIGN_RESULT_SCHEMA_V8 => {
+            observed.feedback.supervised_selected_evaluation_proof = None;
+            Ok(())
+        }
+        CAMPAIGN_RESULT_SCHEMA_V9 => Ok(()),
+        _ => bail!("unsupported Campaign result feedback version"),
+    }
 }
 
 fn campaign_evaluation_feedback(evaluation: &CandidateEvaluation) -> CampaignEvaluationFeedbackV1 {
@@ -3415,7 +3635,9 @@ fn readback_pre_holdout_terminal_impl(
                 bail!("pre-holdout settlement rejects terminal artifact {artifact}");
             }
         }
-        let observed = collect_round_ledger(&extracted, round, &report)?;
+        let mut observed = collect_round_ledger(&extracted, round, &report)?;
+        // Retain the historical shape without rewriting any original receipt.
+        preserve_result_feedback_shape(&mut observed, &result.schema_version)?;
         if observed != *expected
             || observed.sealed_receipt_id.is_some()
             || observed.sealed_passed.is_some()
@@ -3537,8 +3759,10 @@ fn validate_campaign_result_identity(
     result: &CampaignResultV1,
     result_sha256: &str,
 ) -> anyhow::Result<()> {
-    if result.schema_version != CAMPAIGN_RESULT_SCHEMA_V8
-        || result.campaign_id != loaded.request.campaign_id
+    if !matches!(
+        result.schema_version.as_str(),
+        CAMPAIGN_RESULT_SCHEMA_V8 | CAMPAIGN_RESULT_SCHEMA_V9
+    ) || result.campaign_id != loaded.request.campaign_id
         || result.request_sha256 != loaded.sha256
         || result.build_source_revision != loaded.request.build_source_revision
         || result.image_identity != loaded.request.image_identity
@@ -3551,6 +3775,22 @@ fn validate_campaign_result_identity(
         || result.stop_rule != STOP_RULE_V2
     {
         bail!("Campaign result does not match the parent request identity");
+    }
+    for round in &result.rounds {
+        let proof = round.feedback.supervised_selected_evaluation_proof.as_ref();
+        if result.schema_version == CAMPAIGN_RESULT_SCHEMA_V8 {
+            if proof.is_some() {
+                bail!("historical result cannot acquire new selected evaluation proof");
+            }
+        } else {
+            match (&round.feedback.supervised_selected, proof) {
+                (Some(summary), Some(proof)) => {
+                    proof.screening_facts(summary)?;
+                }
+                (None, None) => {}
+                _ => bail!("current result selected evaluation proof is missing or unbound"),
+            }
+        }
     }
     let expected_directive_sha256 = loaded
         .request
@@ -3850,6 +4090,7 @@ pub(crate) fn validate_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("campaign request schema and prepared input kind disagree");
     }
     request.research_plan.validate()?;
+    representation::validate_campaign_request(request)?;
     if request.research_plan.calendar.is_some() {
         if request
             .rounds
@@ -4655,6 +4896,7 @@ fn validate_local_test_request(request: &CampaignRequest) -> anyhow::Result<()> 
         bail!("local test request input kind is invalid");
     }
     request.research_plan.validate()?;
+    representation::validate_campaign_request(request)?;
     validate_campaign_id(&request.campaign_id)?;
     normalized_sha256("campaign image identity", &request.image_identity)?;
     normalized_sha256(
@@ -4860,13 +5102,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn negative_campaign_creates_one_parent_bound_follow_up_plan() {
+    fn parent_bound_follow_up_plan_composition_preserves_declared_policy() {
         let loaded = loaded_request_for_learning();
         let result_sha256 = "9".repeat(64);
         let result = negative_campaign_result(&loaded);
         validate_negative_campaign_result(&loaded, &result, &result_sha256).unwrap();
-        let failure_class = classify_campaign_failure(&result).unwrap();
-        assert_eq!(failure_class, CexCampaignFailureClassV1::OvertradeCapacity);
+        assert!(classify_campaign_failure(&result).is_err());
+        // Composition is independent from admission of this historical summary.
+        let failure_class = CexCampaignFailureClassV1::OvertradeCapacity;
         let (search_policy_revision, learning_directive) =
             next_campaign_policy_revision(&loaded, &result_sha256, failure_class).unwrap();
 
@@ -4959,16 +5202,17 @@ pub(crate) mod tests {
         std::fs::write(&request_path, serialize_request(&loaded.request).unwrap()).unwrap();
         hft_research_artifacts::write_json_atomic(&result_path, &result).unwrap();
         let args = CampaignLearnArgs {
+            control: root.path().join("missing-control.json"),
+            submission: root.path().join("missing-submission.json"),
+            settlement: root.path().join("missing-settlement.json"),
+            namespace: "monday-research".into(),
             request: request_path,
             result_sha256: hft_research_artifacts::sha256_file(&result_path).unwrap(),
             result: result_path,
             output: root.path().join("learned-plan.json"),
         };
-        learn(args.clone()).unwrap();
-        let first = std::fs::read(&args.output).unwrap();
-        assert!(load_research_plan(&args.output).unwrap().llm.is_none());
-        learn(args.clone()).unwrap();
-        assert_eq!(std::fs::read(&args.output).unwrap(), first);
+        assert!(learn(args.clone()).is_err());
+        assert!(!args.output.exists());
     }
 
     #[test]
@@ -4980,7 +5224,8 @@ pub(crate) mod tests {
         let loaded = loaded_request_for_learning();
         let result = negative_campaign_result(&loaded);
         let result_sha256 = "9".repeat(64);
-        let failure_class = classify_campaign_failure(&result).unwrap();
+        assert!(classify_campaign_failure(&result).is_err());
+        let failure_class = CexCampaignFailureClassV1::OvertradeCapacity;
         let (revision, directive) =
             next_campaign_policy_revision(&loaded, &result_sha256, failure_class).unwrap();
         let mut plan = follow_up_plan(
@@ -5260,14 +5505,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn selected_capacity_breach_is_not_reclassified_by_a_higher_score() {
+    fn historical_capacity_summary_cannot_override_learning_qualification() {
         let loaded = loaded_request_for_learning();
         let result_sha256 = "9".repeat(64);
         let result = negative_campaign_result(&loaded);
         validate_negative_campaign_result(&loaded, &result, &result_sha256).unwrap();
 
-        let failure_class = classify_campaign_failure(&result).unwrap();
-        assert_eq!(failure_class, CexCampaignFailureClassV1::OvertradeCapacity);
+        assert!(classify_campaign_failure(&result).is_err());
+        // Composition is independent from admission of this historical summary.
+        let failure_class = CexCampaignFailureClassV1::OvertradeCapacity;
         let (revision, directive) =
             next_campaign_policy_revision(&loaded, &result_sha256, failure_class).unwrap();
         assert_eq!(
@@ -5341,11 +5587,8 @@ pub(crate) mod tests {
         let result = positive_ic_negative_net_result(&loaded);
         validate_negative_campaign_result(&loaded, &result, &result_sha256).unwrap();
 
-        let failure_class = classify_campaign_failure(&result).unwrap();
-        assert_eq!(
-            failure_class,
-            CexCampaignFailureClassV1::PositiveIcNegativeNet
-        );
+        assert!(classify_campaign_failure(&result).is_err());
+        let failure_class = CexCampaignFailureClassV1::PositiveIcNegativeNet;
         let (revision, directive) =
             next_campaign_policy_revision(&loaded, &result_sha256, failure_class).unwrap();
         assert_eq!(
@@ -5368,6 +5611,340 @@ pub(crate) mod tests {
             plan.search_policy_revision.position_policy,
             CexCampaignPositionPolicyV1::HystereticCostAware
         );
+    }
+
+    fn actual_diagnosis_evaluation(fee_bps: f64, fold_count: usize) -> CandidateEvaluation {
+        use alpha_domain::{
+            CandidateArtifact, EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1,
+            EvaluationWalkForwardV1, FormulaEvaluatorConfig,
+        };
+        use alpha_engine::{CandidateEvaluator, EngineProposal};
+        use std::collections::BTreeMap;
+        let start = chrono::Utc::now();
+        let rows = (0..500)
+            .map(|index| {
+                let signal = if index % 2 == 0 { 1.0 } else { -1.0 };
+                alpha_engine::evaluation::ResearchRow {
+                    series_id: 1,
+                    available_time: start + chrono::Duration::minutes(index),
+                    label_available_time: start + chrono::Duration::minutes(index + 1),
+                    signal,
+                    features: BTreeMap::from([("book_imbalance".into(), signal)]),
+                    label: signal * 0.01,
+                    fee_bps,
+                    funding_bps: 0.0,
+                    pit_funding: false,
+                    latency_bps: 0.0,
+                }
+            })
+            .collect();
+        let protocol = EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: 200,
+                validation_rows: 64,
+                fold_count,
+                purge_rows: 1,
+                embargo_rows: 1,
+                sealed_holdout_rows: 64,
+            },
+            EvaluationCostsV1 {
+                fee_bps,
+                rebate_bps: 0.0,
+                funding_bps: 0.0,
+                latency_bps: 0.0,
+                slippage_bps: 0.0,
+                cross_spread: false,
+                position_notional_usd: 0.0,
+                capacity_depth_levels: 0,
+                max_book_depth_fraction: 0.0,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 1,
+                observation_frequency_millis: 60_000,
+            },
+        )
+        .unwrap();
+        let prepared = alpha_engine::evaluation::prepare_dataset(rows, &protocol).unwrap();
+        let evaluator = alpha_engine::formula_evaluator::FormulaEvaluator::new(
+            FormulaEvaluatorConfig::default(),
+        )
+        .unwrap();
+        let proposal = EngineProposal {
+            candidate_id: "diagnosis-original-evaluator".into(),
+            hypothesis: "original cost fixture".into(),
+            artifact: CandidateArtifact::Formula(hft_factor_dsl::FactorAst::Terminal(
+                hft_factor_dsl::FactorTerminal::Field("book_imbalance".into()),
+            )),
+            expansions: 1,
+            tokens: 0,
+            elapsed_ms: 0,
+        };
+        let evaluation = evaluator
+            .evaluate(&proposal, &prepared.engine_context())
+            .unwrap();
+        evaluation.validate().unwrap();
+        evaluation
+    }
+
+    pub(crate) fn qualified_cost_learning_result_bytes(
+        request: &CampaignRequest,
+        feature: &Path,
+        materialization: &Path,
+    ) -> Vec<u8> {
+        use alpha_engine::{CandidateEvaluator, EngineProposal};
+        let inputs = PreparedCexInputs::load(feature, materialization, true).unwrap();
+        assert_eq!(inputs.feature_sha256(), request.feature_sha256);
+        assert_eq!(
+            inputs.materialization_sha256(),
+            request.materialization_sha256
+        );
+        let protocol = mission_render::approved_evaluation_protocol_for_plan(
+            inputs.materialization(),
+            &request.research_plan,
+        )
+        .unwrap();
+        let prepared = alpha_engine::evaluation::prepare_dataset(
+            inputs.native_source_rows(&protocol).unwrap(),
+            &protocol,
+        )
+        .unwrap();
+        let evaluator = alpha_engine::formula_evaluator::FormulaEvaluator::new(
+            alpha_domain::FormulaEvaluatorConfig {
+                multiple_testing_trials: request
+                    .research_plan
+                    .effective_multiple_testing_trials(request.declared_total_trials)
+                    .unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let proposal = EngineProposal {
+            candidate_id: "original-protocol-cost-interface-fixture".into(),
+            hypothesis: "software composition with original admitted data and protocol".into(),
+            artifact: alpha_domain::CandidateArtifact::Formula(
+                hft_factor_dsl::FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                    "book_imbalance".into(),
+                )),
+            ),
+            expansions: 1,
+            tokens: 0,
+            elapsed_ms: 0,
+        };
+        let evaluation = evaluator
+            .evaluate(&proposal, &prepared.engine_context())
+            .unwrap();
+        assert_eq!(
+            evaluation.evaluation_protocol_hash,
+            Some(protocol.content_hash().unwrap())
+        );
+        let facts = evaluation.predictive_screening_gate_facts().unwrap();
+        assert!(facts.predictive_passed && facts.coverage_passed);
+        assert!(!evaluation.passed && evaluation.metrics.trade_count > 0);
+        assert!(
+            evaluation.metrics.cumulative_net_return < 0.0 && evaluation.metrics.net_sharpe < 0.0
+        );
+        let loaded = LoadedRequest {
+            request: request.clone(),
+            sha256: hex::encode(Sha256::digest(serialize_request(request).unwrap())),
+        };
+        // The surrounding terminal/model layout is a software fixture. Its selected
+        // metrics are from the original evaluator, not a claim of a trained model Run.
+        let mut result = negative_campaign_result(&loaded);
+        result.schema_version = CAMPAIGN_RESULT_SCHEMA_V9.into();
+        let summary = campaign_evaluation_feedback(&evaluation);
+        for round in &mut result.rounds {
+            round.feedback.supervised_ridge = Some(summary.clone());
+            round.feedback.supervised_cart = Some(summary.clone());
+            round.feedback.supervised_burn = Some(summary.clone());
+            round.feedback.burn = Some(summary.clone());
+            round.feedback.supervised_selected = Some(summary.clone());
+            round.feedback.supervised_selected_evaluation_proof =
+                Some(CampaignSelectedEvaluationProofV1::from_evaluation(&evaluation).unwrap());
+            round.supervised_candidate_id = Some(proposal.candidate_id.clone());
+            round.feedback.supervised_selected_candidate_id = Some(proposal.candidate_id.clone());
+        }
+        let bytes = serde_json::to_vec(&result).unwrap();
+        validate_negative_campaign_result(
+            &loaded,
+            &result,
+            &hft_cex_research_input::sha256(&bytes),
+        )
+        .unwrap();
+        assert_eq!(
+            classify_campaign_failure(&result).unwrap(),
+            CexCampaignFailureClassV1::PositiveIcNegativeNet
+        );
+        bytes
+    }
+
+    #[test]
+    fn positive_ic_with_missing_icir_and_negative_net_is_not_a_cost_failure() {
+        let evaluation = actual_diagnosis_evaluation(100.0, 1);
+        assert_eq!(evaluation.metrics.predictive.time_series_ic, Some(1.0));
+        assert_eq!(evaluation.metrics.predictive.time_series_rank_ic, Some(1.0));
+        assert_eq!(evaluation.metrics.predictive.time_series_icir, None);
+        assert_eq!(evaluation.metrics.predictive.time_series_rank_icir, None);
+        assert!(evaluation.metrics.trade_count > 0);
+        assert!(evaluation.metrics.cumulative_net_return < 0.0);
+        assert!(evaluation.metrics.net_sharpe < 0.0);
+        assert!(!evaluation.passed);
+        let loaded = loaded_request_for_learning();
+        let mut result = negative_campaign_result(&loaded);
+        result.schema_version = CAMPAIGN_RESULT_SCHEMA_V9.into();
+        for round in &mut result.rounds {
+            round.feedback.supervised_selected = Some(campaign_evaluation_feedback(&evaluation));
+            round.feedback.supervised_selected_evaluation_proof =
+                Some(CampaignSelectedEvaluationProofV1::from_evaluation(&evaluation).unwrap());
+        }
+        assert!(
+            classify_campaign_failure(&result).is_err(),
+            "predictive rejection was misclassified as a cost-learning failure"
+        );
+    }
+
+    #[test]
+    fn complete_original_prediction_gates_then_transaction_cost_failure_are_distinct() {
+        let evaluation = actual_diagnosis_evaluation(100.0, 3);
+        let config = evaluation.formula_config().unwrap();
+        let predictive = &evaluation.metrics.predictive;
+        assert!(predictive.time_series_ic.unwrap() >= config.min_time_series_ic);
+        assert!(predictive.time_series_rank_ic.unwrap() >= config.min_time_series_rank_ic);
+        assert!(predictive.time_series_icir.unwrap() >= config.min_time_series_icir);
+        assert!(predictive.time_series_rank_icir.unwrap() >= config.min_time_series_rank_icir);
+        assert!(predictive.positive_ic_ratio >= config.min_positive_ic_ratio);
+        assert!(evaluation
+            .metrics
+            .folds
+            .iter()
+            .all(|fold| fold.row_count >= config.min_validation_rows));
+        assert!(!evaluation.passed);
+        assert!(evaluation.metrics.trade_count > 0);
+        assert!(evaluation.metrics.cumulative_net_return < 0.0);
+        assert!(evaluation.metrics.net_sharpe < 0.0);
+        let facts = evaluation.predictive_screening_gate_facts().unwrap();
+        assert!(facts.predictive_passed && facts.coverage_passed);
+        let loaded = loaded_request_for_learning();
+        let mut result = negative_campaign_result(&loaded);
+        result.schema_version = CAMPAIGN_RESULT_SCHEMA_V9.into();
+        for round in &mut result.rounds {
+            round.feedback.supervised_selected = Some(campaign_evaluation_feedback(&evaluation));
+            round.feedback.supervised_selected_evaluation_proof =
+                Some(CampaignSelectedEvaluationProofV1::from_evaluation(&evaluation).unwrap());
+        }
+        assert_eq!(
+            classify_campaign_failure(&result).unwrap(),
+            CexCampaignFailureClassV1::PositiveIcNegativeNet
+        );
+    }
+
+    #[test]
+    fn selected_cost_failure_proof_rejects_content_summary_and_version_drift() {
+        let evaluation = actual_diagnosis_evaluation(100.0, 3);
+        let summary = campaign_evaluation_feedback(&evaluation);
+        let proof = CampaignSelectedEvaluationProofV1::from_evaluation(&evaluation).unwrap();
+        assert!(proof.screening_facts(&summary).unwrap().predictive_passed);
+        let mut changed = proof.clone();
+        changed.evaluation_content_sha256 = "0".repeat(64);
+        assert!(changed.screening_facts(&summary).is_err());
+        let mut changed_summary = summary.clone();
+        changed_summary.trade_count += 1;
+        assert!(proof.screening_facts(&changed_summary).is_err());
+        let mut changed = proof;
+        changed.evaluation.evaluator_version = "unknown-predictive-evaluator".into();
+        changed.evaluation_content_sha256 = canonical_json_hash(&changed.evaluation).unwrap();
+        assert!(changed
+            .screening_facts(&campaign_evaluation_feedback(&changed.evaluation))
+            .is_err());
+    }
+
+    #[test]
+    fn historical_cost_failure_keeps_original_shape_without_learning_qualification() {
+        let loaded = loaded_request_for_learning();
+        let historical = negative_campaign_result(&loaded);
+        assert_eq!(historical.schema_version, CAMPAIGN_RESULT_SCHEMA_V8);
+        // Original V8 feedback wire hash, before complete selected proof was added.
+        assert_eq!(
+            campaign_research_evidence_signature(&loaded.request, &historical)
+                .unwrap()
+                .evaluation_feedback_sha256,
+            "fe32f27175060f789f438a8a4feebc3994e53ccfb51c2451416c07b84659d22c",
+        );
+        let original = serde_json::to_vec(&historical).unwrap();
+        let original_sha = hft_cex_research_input::sha256(&original);
+        let mut observed = historical.clone();
+        let evaluation = actual_diagnosis_evaluation(100.0, 3);
+        for round in &mut observed.rounds {
+            round.feedback.supervised_selected_evaluation_proof =
+                Some(CampaignSelectedEvaluationProofV1::from_evaluation(&evaluation).unwrap());
+            preserve_result_feedback_shape(round, &historical.schema_version).unwrap();
+        }
+        assert_eq!(observed, historical);
+        assert_eq!(serde_json::to_vec(&observed).unwrap(), original);
+        assert_eq!(
+            hft_cex_research_input::sha256(&serde_json::to_vec(&observed).unwrap()),
+            original_sha
+        );
+        assert!(classify_campaign_failure(&historical).is_err());
+    }
+
+    #[test]
+    fn evidence_signature_distinguishes_complete_evaluation_with_the_same_summary() {
+        let evaluation = actual_diagnosis_evaluation(100.0, 3);
+        let mut changed = evaluation.clone();
+        let mut config = changed.formula_config().unwrap();
+        config.min_time_series_ic = 0.02;
+        changed.evaluator_config = serde_json::to_value(config).unwrap();
+        changed.validate().unwrap();
+        assert_eq!(
+            campaign_evaluation_feedback(&evaluation),
+            campaign_evaluation_feedback(&changed)
+        );
+        for candidate in [&evaluation, &changed] {
+            let facts = candidate.predictive_screening_gate_facts().unwrap();
+            assert!(facts.predictive_passed && facts.coverage_passed);
+        }
+        let loaded = loaded_request_for_learning();
+        let mut original = negative_campaign_result(&loaded);
+        original.schema_version = CAMPAIGN_RESULT_SCHEMA_V9.into();
+        let summary = campaign_evaluation_feedback(&evaluation);
+        for round in &mut original.rounds {
+            round.feedback.supervised_ridge = Some(summary.clone());
+            round.feedback.supervised_cart = Some(summary.clone());
+            round.feedback.supervised_burn = Some(summary.clone());
+            round.feedback.burn = Some(summary.clone());
+            round.feedback.supervised_selected = Some(summary.clone());
+            round.feedback.supervised_selected_evaluation_proof =
+                Some(CampaignSelectedEvaluationProofV1::from_evaluation(&evaluation).unwrap());
+        }
+        let mut changed_result = original.clone();
+        for round in &mut changed_result.rounds {
+            round.feedback.supervised_selected_evaluation_proof =
+                Some(CampaignSelectedEvaluationProofV1::from_evaluation(&changed).unwrap());
+        }
+        for result in [&original, &changed_result] {
+            validate_negative_campaign_result(
+                &loaded,
+                result,
+                &canonical_json_hash(result).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                classify_campaign_failure(result).unwrap(),
+                CexCampaignFailureClassV1::PositiveIcNegativeNet
+            );
+        }
+        let original_signature =
+            campaign_research_evidence_signature(&loaded.request, &original).unwrap();
+        let changed_signature =
+            campaign_research_evidence_signature(&loaded.request, &changed_result).unwrap();
+        let mut request = loaded.request;
+        request.research_plan.parent_evidence_signature = Some(original_signature.clone());
+        assert!(campaign_has_no_improvement(&request, &original_signature));
+        assert_ne!(
+            original_signature.evaluation_feedback_sha256,
+            changed_signature.evaluation_feedback_sha256
+        );
+        assert!(!campaign_has_no_improvement(&request, &changed_signature));
     }
 
     #[test]
@@ -5852,6 +6429,56 @@ pub(crate) mod tests {
         pub(crate) fn materialization_path(&self) -> &Path {
             &self._source._render_fixture.materialization_path
         }
+        pub(crate) fn bind_representation_for_tests(
+            &mut self,
+            root: &alpha_domain::campaign_control::VerifiedCampaignRootGrant,
+            store: &alpha_store::AlphaStore,
+            freeze_path: &Path,
+        ) -> anyhow::Result<()> {
+            let original_request_sha = self.inputs.request_sha256().to_owned();
+            let original_inputs_sha = self.request.campaign_inputs_sha256.clone();
+            let original_reference = self.request.prepared_inputs.clone();
+            let objects = published_objects_for_tests(self)?;
+            let request = representation_https_request_for_tests(
+                &self.request,
+                root,
+                store,
+                freeze_path,
+                &objects,
+            )?;
+            if request.campaign_inputs_sha256 != original_inputs_sha
+                || request.campaign_inputs_sha256 != root.grant().execution.campaign_inputs_sha256
+                || request.prepared_inputs != original_reference
+            {
+                bail!("column selection changed the frozen signed DataReady identity");
+            }
+            let reference = request
+                .prepared_inputs
+                .as_ref()
+                .context("missing fixture reference")?;
+            let mut bytes = std::collections::BTreeMap::new();
+            for (sha, url) in &reference.block_urls {
+                bytes.insert(
+                    sha.clone(),
+                    objects.get(url).context("missing frozen block")?.clone(),
+                );
+            }
+            let expected = hft_cex_research_input::sha256(&serialize_request(&request)?);
+            self.inputs = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+                &request,
+                &expected,
+                self.inputs.prepared().manifest().clone(),
+                &mut hft_cex_research_input::prepared::AcquiredBlocks { bytes },
+                1024 * 1024 * 1024,
+            )?;
+            if self.inputs.request_sha256() == original_request_sha {
+                bail!("representation fixture did not bind the new complete request identity");
+            }
+            validate_request_for_execute(&request)?;
+            self.request = request;
+            Ok(())
+        }
+
         pub(crate) fn original_receipt_path(&self) -> PathBuf {
             self._root.path().join("native-source-inputs.json")
         }
@@ -5884,8 +6511,58 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn native_prepared_planning_fixture_for_tests() -> NativePreparedFixture {
+        let source_fixture = campaign_e2e_fixture("native-planning-freeze", false, false, true);
+        let (request, inputs, root) = prepare_native_source_fixture_with_publication(
+            &source_fixture,
+            Some("https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/native-planning-fixture"),
+        ).unwrap();
+        NativePreparedFixture {
+            request,
+            inputs,
+            _source: source_fixture,
+            _root: root,
+        }
+    }
+
+    pub(crate) fn native_prepared_calendar_planning_fixture_for_tests() -> NativePreparedFixture {
+        let source_fixture = calendar_source_fixture(false);
+        let (request, inputs, root) = prepare_native_source_fixture_with_publication(
+            &source_fixture,
+            Some("https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/native-calendar-planning-fixture"),
+        ).unwrap();
+        NativePreparedFixture {
+            request,
+            inputs,
+            _source: source_fixture,
+            _root: root,
+        }
+    }
+
+    pub(crate) fn write_planning_freeze_for_tests(
+        ledger: &alpha_store::AlphaStore,
+        request: &CampaignRequest,
+        path: &Path,
+    ) {
+        validate_request(request).unwrap();
+        assert_eq!(expected_campaign_id(request).unwrap(), request.campaign_id);
+        let plan = authenticated_freeze_plan(request, Some(ledger)).unwrap();
+        hft_research_artifacts::write_json_atomic(path, &plan).unwrap();
+    }
+
     fn prepare_native_source_fixture(
         source_fixture: &CampaignE2eFixture,
+    ) -> anyhow::Result<(
+        CampaignRequest,
+        prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+        tempfile::TempDir,
+    )> {
+        prepare_native_source_fixture_with_publication(source_fixture, None)
+    }
+
+    fn prepare_native_source_fixture_with_publication(
+        source_fixture: &CampaignE2eFixture,
+        publication: Option<&str>,
     ) -> anyhow::Result<(
         CampaignRequest,
         prepared_inputs::VerifiedNativeCampaignPreparedInputs,
@@ -5927,7 +6604,10 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let item = |path: &Path, sha: &str| CampaignInputReceiptItem {
             relative_path: path.file_name().unwrap().into(),
-            object_url: path.to_string_lossy().into_owned(),
+            object_url: publication.map_or_else(
+                || path.to_string_lossy().into_owned(),
+                |base| format!("{base}/{}", path.file_name().unwrap().to_string_lossy()),
+            ),
             sha256: sha.into(),
         };
         let mut receipt = CampaignInputsReceipt {
@@ -5940,7 +6620,8 @@ pub(crate) mod tests {
             market: render.materialization().market.clone(),
             symbol: render.materialization().symbol.clone(),
             output_prefix: "native-source-test".into(),
-            output_object_base_url: root.path().to_string_lossy().into_owned(),
+            output_object_base_url: publication
+                .map_or_else(|| root.path().to_string_lossy().into_owned(), String::from),
             readback_scope: "same-mounted-ossfs-prefix".into(),
             feature: item(
                 &source_fixture._render_fixture.feature_path,
@@ -5989,14 +6670,24 @@ pub(crate) mod tests {
         for (sha, bytes) in &artifacts.blocks {
             let path = root.path().join(format!("{sha}.mondaybin"));
             std::fs::write(&path, bytes).unwrap();
-            block_urls.insert(sha.clone(), path.to_string_lossy().into_owned());
+            block_urls.insert(
+                sha.clone(),
+                publication.map_or_else(
+                    || path.to_string_lossy().into_owned(),
+                    |base| format!("{base}/native-prepared/{sha}.mondaybin"),
+                ),
+            );
         }
         let reference = prepared_inputs::NativePreparedCampaignRefV1 {
-            collection_sha256: artifacts.id,
-            collection_url: collection_path.to_string_lossy().into_owned(),
+            collection_sha256: artifacts.id.clone(),
+            collection_url: publication.map_or_else(
+                || collection_path.to_string_lossy().into_owned(),
+                |base| format!("{base}/native-prepared/{}.json", artifacts.id),
+            ),
             expected_native: artifacts.manifest.expected_native().unwrap(),
             block_urls,
             render_metadata: render.native_metadata().unwrap(),
+            planning_metadata: Some(artifacts.manifest.original.clone()),
         };
         receipt.prepared_inputs = Some(reference.clone());
         let augmented_receipt_bytes = serde_json::to_vec_pretty(&receipt).unwrap();
@@ -6012,6 +6703,33 @@ pub(crate) mod tests {
         request.materialization_url.clear();
         request.replay_artifact_url.clear();
         request.replay_manifest_url.clear();
+        if let Some(base) = publication {
+            request = build_request_from_parts(
+                "",
+                &request.feature_sha256,
+                "",
+                &request.materialization_sha256,
+                "",
+                &request.replay_artifact_sha256,
+                "",
+                &request.replay_manifest_sha256,
+                &request.campaign_inputs_sha256,
+                &request.producer_source_revision,
+                &request.producer_image_identity,
+                request.prepared_inputs.as_ref(),
+                &request.research_plan,
+                &request.build_source_revision,
+                &request.image_identity,
+                base,
+                &request.holdout_id,
+                &request
+                    .rounds
+                    .iter()
+                    .map(|round| round.seed)
+                    .collect::<Vec<_>>(),
+                request.study_proposal.as_ref(),
+            )?;
+        }
         let fingerprint = campaign_data_fingerprint_sha256(
             &request.campaign_inputs_sha256,
             &request.producer_source_revision,
@@ -6024,6 +6742,7 @@ pub(crate) mod tests {
         for round in &mut request.rounds {
             round.identity.data_fingerprint_sha256 = fingerprint.clone();
         }
+        validate_request_for_source(&request)?;
         let expected_request_sha =
             hft_cex_research_input::sha256(&serialize_request(&request).unwrap());
         let inputs = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
@@ -6044,6 +6763,316 @@ pub(crate) mod tests {
         std::fs::write(&fixture.args.request, serialize_request(&request).unwrap()).unwrap();
         fixture.args.request_sha256 = inputs.request_sha256().into();
         fixture._prepared_root = Some(root);
+        Ok(())
+    }
+
+    /// Software publication objects; no network request or cloud readback occurs.
+    const PLANNING_FIXTURE_ORIGIN: &str = "https://monday-lob-apne1-1045353359.oss-ap-northeast-1-internal.aliyuncs.com/research/native-planning-fixture";
+
+    pub(crate) fn published_objects_for_tests(
+        fixture: &NativePreparedFixture,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        let reference = fixture
+            .request
+            .prepared_inputs
+            .as_ref()
+            .context("missing published reference")?;
+        let collection_url = format!(
+            "{PLANNING_FIXTURE_ORIGIN}/native-prepared/{}.json",
+            reference.collection_sha256
+        );
+        if reference.collection_url != collection_url {
+            bail!("fixture is not the original producer's exact publication");
+        }
+        let read_object = |name: String, sha: &str| -> anyhow::Result<Vec<u8>> {
+            let path = fixture._root.path().join(name);
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!("published fixture object is not an original regular file");
+            }
+            let bytes = std::fs::read(path)?;
+            if hft_cex_research_input::sha256(&bytes) != sha {
+                bail!("original published fixture object bytes changed");
+            }
+            Ok(bytes)
+        };
+        let mut objects = std::collections::BTreeMap::from([(
+            collection_url,
+            read_object(
+                format!("{}.json", reference.collection_sha256),
+                &reference.collection_sha256,
+            )?,
+        )]);
+        for (sha, url) in &reference.block_urls {
+            if *url != format!("{PLANNING_FIXTURE_ORIGIN}/native-prepared/{sha}.mondaybin") {
+                bail!("published block URI differs from the original producer identity");
+            }
+            objects.insert(url.clone(), read_object(format!("{sha}.mondaybin"), sha)?);
+        }
+        let receipt = std::fs::read(fixture.augmented_receipt_path())?;
+        if hft_cex_research_input::sha256(&receipt) != fixture.request.campaign_inputs_sha256 {
+            bail!("original published DataReady receipt bytes changed");
+        }
+        objects.insert(
+            format!("{PLANNING_FIXTURE_ORIGIN}/data-ready.json"),
+            receipt,
+        );
+        Ok(objects)
+    }
+
+    pub(crate) fn representation_https_request_for_tests(
+        request: &CampaignRequest,
+        authority: &alpha_domain::campaign_control::VerifiedCampaignRootGrant,
+        store: &alpha_store::AlphaStore,
+        freeze_path: &Path,
+        objects: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> anyhow::Result<CampaignRequest> {
+        let keys_dir = tempfile::tempdir()?;
+        let keys = keys_dir.path().join("planning-current-trust.json");
+        std::fs::write(
+            &keys,
+            serde_json::to_vec(&std::collections::BTreeMap::from([(
+                authority.signed_grant().key_id.clone(),
+                hex::encode(authority.verifying_key().as_bytes()),
+            )]))?,
+        )?;
+        let receipt = objects
+            .get(&format!("{PLANNING_FIXTURE_ORIGIN}/data-ready.json"))
+            .context("missing exact published DataReady fixture")?;
+        let plan = crate::mission_dispatch::admission::planning_view::with_fixture_view(
+            store,
+            authority,
+            &keys,
+            (request, freeze_path),
+            receipt,
+            |expected, guard| {
+                guard()?;
+                let reference = request
+                    .prepared_inputs
+                    .as_ref()
+                    .context("missing collection")?;
+                let collection: hft_cex_research_input::campaign::CampaignPreparedInputsV1 =
+                    serde_json::from_slice(
+                        objects
+                            .get(&reference.collection_url)
+                            .context("missing exact fixture collection")?,
+                    )?;
+                let mut bytes = std::collections::BTreeMap::new();
+                for (sha, url) in &reference.block_urls {
+                    guard()?;
+                    bytes.insert(
+                        sha.clone(),
+                        objects
+                            .get(url)
+                            .context("missing exact fixture block")?
+                            .clone(),
+                    );
+                }
+                let verified = prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+                    request,
+                    expected,
+                    collection,
+                    &mut hft_cex_research_input::prepared::AcquiredBlocks { bytes },
+                    1024 * 1024 * 1024,
+                )?;
+                guard()?;
+                Ok(verified)
+            },
+            |scope| representation::prepared_plan_for_fixture(scope, authority),
+        )?;
+        build_request_from_parts(
+            "",
+            &request.feature_sha256,
+            "",
+            &request.materialization_sha256,
+            "",
+            &request.replay_artifact_sha256,
+            "",
+            &request.replay_manifest_sha256,
+            &request.campaign_inputs_sha256,
+            &request.producer_source_revision,
+            &request.producer_image_identity,
+            request.prepared_inputs.as_ref(),
+            &plan,
+            &request.build_source_revision,
+            &request.image_identity,
+            &campaign_output_root(&canonical_tokyo_oss_internal_object(
+                "HTTPS fixture result",
+                &request.campaign_result_put_url,
+            )?)?,
+            &request.holdout_id,
+            &request
+                .rounds
+                .iter()
+                .map(|round| round.seed)
+                .collect::<Vec<_>>(),
+            None,
+        )
+    }
+
+    pub(crate) fn assert_https_finalize_binding_for_tests(
+        request: &CampaignRequest,
+        objects: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        use hft_cex_research_input::{
+            campaign::CampaignPreparedInputsV1, prepared::AcquiredBlocks,
+        };
+        let root = tempfile::tempdir()?;
+        let canonical = canonicalize_request_transport(request)?;
+        let frozen = FrozenCampaignPlan {
+            preparation_authentication_tag: None,
+            schema_version: CAMPAIGN_FREEZE_SCHEMA_V1.into(),
+            campaign_inputs_sha256: canonical.campaign_inputs_sha256.clone(),
+            signing_plan: signing_plan(&canonical)?,
+            canonical_request: canonical.clone(),
+        };
+        let mut signed = canonical.clone();
+        let prepared = signed
+            .prepared_inputs
+            .as_mut()
+            .context("HTTPS finalize needs actual native collection")?;
+        prepared
+            .collection_url
+            .push_str("?fixture-signature=collection");
+        for url in prepared.block_urls.values_mut() {
+            url.push_str("?fixture-signature=block");
+        }
+        signed
+            .holdout_claim_put_url
+            .push_str("?fixture-signature=put");
+        signed
+            .holdout_claim_readback_url
+            .push_str("?fixture-signature=read");
+        signed
+            .campaign_result_put_url
+            .push_str("?fixture-signature=result-put");
+        signed
+            .campaign_result_readback_url
+            .push_str("?fixture-signature=result-read");
+        for round in &mut signed.rounds {
+            round
+                .mission_put_url
+                .push_str("?fixture-signature=mission-put");
+            round
+                .mission_readback_url
+                .push_str("?fixture-signature=mission-read");
+            round
+                .result_put_url
+                .push_str("?fixture-signature=result-put");
+            round
+                .result_readback_url
+                .push_str("?fixture-signature=result-read");
+        }
+        validate_request(&signed)?;
+        validate_request_matches_freeze(&signed, &frozen)?;
+        for kind in ["data", "plan", "runner", "object"] {
+            let mut changed = signed.clone();
+            match kind {
+                "data" => changed.feature_sha256 = "0".repeat(64),
+                "plan" => {
+                    changed
+                        .research_plan
+                        .representation_binding
+                        .as_mut()
+                        .unwrap()
+                        .goal
+                        .model
+                        .content_sha256 = "0".repeat(64)
+                }
+                "runner" => {
+                    changed.build_source_revision =
+                        "abcdef0123456789abcdef0123456789abcdef01".into()
+                }
+                "object" => {
+                    changed.prepared_inputs.as_mut().unwrap().collection_url =
+                        "https://foreign.oss-ap-northeast-1-internal.aliyuncs.com/other.json".into()
+                }
+                _ => unreachable!(),
+            }
+            if validate_request_matches_freeze(&changed, &frozen).is_ok() {
+                bail!("HTTPS freeze accepted {kind} drift");
+            }
+        }
+        let acquire = |observed: &CampaignRequest,
+                       expected_sha: &str,
+                       source_objects: &std::collections::BTreeMap<String, Vec<u8>>|
+         -> anyhow::Result<_> {
+            let reference = observed
+                .prepared_inputs
+                .as_ref()
+                .context("missing frozen collection")?;
+            let collection_object = canonical_tokyo_oss_internal_object(
+                "fixture collection",
+                &reference.collection_url,
+            )?;
+            let bytes = source_objects
+                .get(&collection_object)
+                .context("unregistered HTTPS collection")?;
+            let collection: CampaignPreparedInputsV1 = serde_json::from_slice(bytes)?;
+            let mut blocks = std::collections::BTreeMap::new();
+            for (sha, url) in &reference.block_urls {
+                let object = canonical_tokyo_oss_internal_object("fixture block", url)?;
+                let bytes = source_objects
+                    .get(&object)
+                    .context("unregistered HTTPS block")?;
+                blocks.insert(sha.clone(), bytes.clone());
+            }
+            prepared_inputs::inspect_finalized_campaign_prepared_inputs(
+                observed,
+                expected_sha,
+                collection,
+                &mut AcquiredBlocks { bytes: blocks },
+                1024 * 1024 * 1024,
+            )
+        };
+        let signed_sha = hft_cex_research_input::sha256(&serialize_request(&signed)?);
+        acquire(&signed, &signed_sha, objects)?;
+        let mut corrupt = objects.clone();
+        let block_uri = canonical
+            .prepared_inputs
+            .as_ref()
+            .unwrap()
+            .block_urls
+            .values()
+            .next()
+            .unwrap();
+        let bytes = corrupt
+            .get_mut(block_uri)
+            .context("missing declared corruption target")?;
+        bytes[0] ^= 1;
+        if acquire(&signed, &signed_sha, &corrupt).is_ok() {
+            bail!("HTTPS native verifier accepted changed acquisition bytes");
+        }
+        let freeze_path = root.path().join("freeze.json");
+        let signed_path = root.path().join("signed.json");
+        let request_out = root.path().join("request.json");
+        let submission_out = root.path().join("submission.json");
+        hft_research_artifacts::write_json_atomic(&freeze_path, &frozen)?;
+        hft_research_artifacts::write_json_atomic(&signed_path, &signed)?;
+        finalize_with_native_readback(
+            CampaignFinalizeArgs {
+                freeze: freeze_path,
+                signed_request: signed_path,
+                attempt_id: "https-represented-fixture".into(),
+                image: format!("registry/worker@sha256:{}", request.image_identity),
+                request_out: request_out.clone(),
+                submission_out: submission_out.clone(),
+            },
+            |observed, sha| acquire(observed, sha, objects),
+        )?;
+        let finalized_bytes = std::fs::read(&request_out)?;
+        let finalized: CampaignRequest = serde_json::from_slice(&finalized_bytes)?;
+        if canonicalize_request_transport(&finalized)? != canonical
+            || finalized.campaign_id != expected_campaign_id(&canonical)?
+            || hft_cex_research_input::sha256(&finalized_bytes) != signed_sha
+        {
+            bail!("finalized HTTPS fixture lost its exact canonical binding");
+        }
+        let submission: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(submission_out)?)?;
+        if submission["request"] != serde_json::to_value(&finalized)? {
+            bail!("HTTPS submission does not retain the full finalized request");
+        }
         Ok(())
     }
 
@@ -7256,7 +8285,7 @@ pub(crate) mod tests {
         let result: serde_json::Value =
             serde_json::from_slice(&std::fs::read(work_dir.join("campaign-result.json")).unwrap())
                 .unwrap();
-        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V8);
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V9);
         assert_eq!(
             result["campaign_inputs_sha256"],
             serde_json::json!(request.campaign_inputs_sha256)
@@ -7348,7 +8377,54 @@ pub(crate) mod tests {
         assert_calendar_h1_readback(false);
     }
 
+    pub(crate) fn native_prepared_calendar_fixture_for_tests(
+        negative: bool,
+    ) -> NativePreparedFixture {
+        let source_fixture = calendar_source_fixture(negative);
+        let (request, inputs, root) = prepare_native_source_fixture(&source_fixture).unwrap();
+        NativePreparedFixture {
+            request,
+            inputs,
+            _source: source_fixture,
+            _root: root,
+        }
+    }
+
     fn assert_calendar_h1_readback(negative: bool) {
+        let fixture = native_prepared_calendar_fixture_for_tests(negative);
+        let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+            fixture.inputs.render_inputs().materialization(),
+            &fixture.request.research_plan,
+        )
+        .unwrap();
+        let parts = protocol
+            .row_partitions(fixture.inputs.prepared().original_metadata().total_rows)
+            .unwrap();
+        assert!(protocol.calendar.as_ref().unwrap().develop_end_row > parts.search.end);
+        assert_eq!(
+            fixture.inputs.prepared().original_metadata().visible_rows,
+            parts.search
+        );
+        assert_eq!(fixture.inputs.prepared().rows().len(), parts.search.len());
+        let dataset = alpha_engine::evaluation::prepare_native_campaign_dataset(
+            fixture.inputs.prepared(),
+            &protocol,
+        )
+        .unwrap();
+        assert_eq!(dataset.proposal_context().row_count(), parts.search.len());
+        assert_eq!(dataset.plan().folds.len(), 3);
+        assert!(dataset.calendar_validation_rows().is_none());
+        prepared_inputs::validate_signed_planning_metadata(&fixture.request).unwrap();
+        prepared_inputs::validate_planning_projection_metadata(
+            fixture.inputs.prepared().manifest(),
+            &fixture.request,
+        )
+        .unwrap();
+        assert!(!fixture._source.work_dir.exists());
+        assert!(!fixture._source.global_claim_path.exists());
+    }
+
+    fn calendar_source_fixture(negative: bool) -> CampaignE2eFixture {
         let render_fixture = mission_render::tests::Fixture::new(28_795);
         let mut rows = mission_render::tests::read_feature_rows(&render_fixture.feature_path);
         for (index, row) in rows.iter_mut().enumerate() {
@@ -7411,20 +8487,7 @@ pub(crate) mod tests {
         std::fs::write(&fixture.args.request, serde_json::to_vec(&request).unwrap()).unwrap();
         fixture.args.request_sha256 =
             hft_research_artifacts::sha256_file(&fixture.args.request).unwrap();
-        let error = prepare_fixture_for_execute(&mut fixture).unwrap_err();
-        assert!(
-            error.to_string().contains("withheld selection or holdout"),
-            "{error:#}"
-        );
-        assert!(!fixture.work_dir.exists());
-        assert!(!fixture.global_claim_path.exists());
-        assert_eq!(
-            load_request(&fixture.args.request)
-                .unwrap()
-                .request
-                .prepared_inputs,
-            None
-        );
+        fixture
     }
 
     fn assert_ridge_holding_campaign(mut fixture: CampaignE2eFixture, negative: bool) {
@@ -7473,15 +8536,33 @@ pub(crate) mod tests {
             .unwrap();
             assert!(result.rounds.iter().all(|r| r.feedback.accepted_factors > 0
                 && r.feedback.supervised_ridge.as_ref().unwrap().trade_count == 0));
+            for round in &result.rounds {
+                let selected = round.feedback.supervised_selected.as_ref().unwrap();
+                let proof = round
+                    .feedback
+                    .supervised_selected_evaluation_proof
+                    .as_ref()
+                    .unwrap();
+                let facts = proof.screening_facts(selected).unwrap();
+                assert!(facts.predictive_passed && facts.coverage_passed);
+                assert_eq!(selected.trade_count, 0);
+            }
+            assert_eq!(
+                classify_campaign_failure(&result).unwrap(),
+                CexCampaignFailureClassV1::NoTradesAfterCosts,
+            );
+            // The qualified diagnosis does not permit a fixed comparison to change policy.
             assert!(next_campaign_policy_revision(
                 &loaded,
                 &hft_research_artifacts::sha256_file(
                     &fixture.work_dir.join("campaign-result.json")
                 )
                 .unwrap(),
-                classify_campaign_failure(&result).unwrap()
+                CexCampaignFailureClassV1::NoTradesAfterCosts,
             )
-            .is_err());
+            .unwrap_err()
+            .to_string()
+            .contains("no automatic follow-up"));
         } else {
             for model in ["cart", "burn_mlp"] {
                 assert_metric_bundle_rejected(
@@ -7552,7 +8633,7 @@ pub(crate) mod tests {
             &std::fs::read(fixture.work_dir.join("campaign-result.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V8);
+        assert_eq!(result["schema_version"], CAMPAIGN_RESULT_SCHEMA_V9);
         assert_eq!(
             result["termination_reason"],
             "campaign_selected_pre_holdout"
@@ -8626,6 +9707,7 @@ pub(crate) mod tests {
                         supervised_cart: Some(no_trades.clone()),
                         supervised_burn: Some(overtrade.clone()),
                         supervised_selected: Some(overtrade.clone()),
+                        supervised_selected_evaluation_proof: None,
                         supervised_selected_candidate_id: Some("selected-burn".to_string()),
                         supervised_replay: None,
                     },
@@ -8853,7 +9935,10 @@ pub(crate) mod tests {
         }
     }
 
-    fn rebind_materialization_feature_artifact(materialization_path: &Path, feature_path: &Path) {
+    pub(crate) fn rebind_materialization_feature_artifact(
+        materialization_path: &Path,
+        feature_path: &Path,
+    ) {
         let feature_sha256 = hft_research_artifacts::sha256_file(feature_path).unwrap();
         let mut materialization: serde_json::Value =
             serde_json::from_slice(&std::fs::read(materialization_path).unwrap()).unwrap();

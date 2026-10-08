@@ -11,7 +11,7 @@ use std::{
     path::Path,
 };
 
-pub(super) fn load(
+pub(in crate::mission_dispatch) fn load(
     path: &Path,
     key_id: &str,
     trust: &NativeAdmissionTrust,
@@ -68,7 +68,7 @@ pub(super) fn load(
 }
 
 /// A restored signature must preserve the signer role without loading a key.
-pub(super) fn check_public_role(
+pub(in crate::mission_dispatch) fn check_public_role(
     key_id: &str,
     trust: &NativeAdmissionTrust,
     authority_public_keys: &[[u8; 32]],

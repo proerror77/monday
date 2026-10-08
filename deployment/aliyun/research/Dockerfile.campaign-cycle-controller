@@ -33,6 +33,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     jq \
+    git \
+    gh \
+    ruby \
+    ruby-rubygems \
+    unzip \
     tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 research \
@@ -41,6 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=controller-tools /usr/local/bin/aliyun /usr/local/bin/aliyun
 COPY --from=controller-tools /usr/local/bin/kubectl /usr/local/bin/kubectl
+COPY --chmod=0755 rust_hft/research-bin/research-release-publisher /usr/local/bin/research-release-publisher
 COPY --chmod=0755 rust_hft/research-bin/alpha-harness /usr/local/bin/alpha-harness
 COPY --chmod=0755 rust_hft/research-bin/binance-market-tape-slicer /usr/local/bin/binance-market-tape-slicer
 COPY --chmod=0755 rust_hft/research-bin/lob-pit-materializer /usr/local/bin/lob-pit-materializer

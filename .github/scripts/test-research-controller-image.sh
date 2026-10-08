@@ -29,6 +29,7 @@ case "$1" in
     # No production verifier options or fake-success branch are introduced.
     script=${script//\/usr\//$MOCK_CONTROLLER_FS/usr/}
     script=${script//\/opt\//$MOCK_CONTROLLER_FS/opt/}
+    script=${script//\/etc\//$MOCK_CONTROLLER_FS/etc/}
     /bin/bash -ceu "$script" "$@" ;;
   create) [[ $2 == fixture-image ]]; printf 'fixture-container\n' ;;
   cp)
@@ -39,9 +40,9 @@ case "$1" in
 esac
 MOCK
 chmod 0755 "$work/bin/docker"
-for binary in alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
-  if [[ $binary == alpha-harness ]]; then
-    printf '#!/usr/bin/env bash\nprintf "alpha-harness %s\\n"\n' "$source_sha" >"$work/release/$binary"
+for binary in research-release-publisher alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
+  if [[ $binary == alpha-harness || $binary == research-release-publisher ]]; then
+    printf '#!/usr/bin/env bash\nprintf "%s %s\\n"\n' "$binary" "$source_sha" >"$work/release/$binary"
   else
     printf '#!/usr/bin/env bash\nexit 0\n' >"$work/release/$binary"
   fi
@@ -49,15 +50,16 @@ for binary in alpha-harness binance-market-tape-slicer lob-pit-materializer bina
 done
 initialize_image() {
   rm -rf "$work/image"
-  mkdir -p "$work/image/usr/bin" "$work/image/usr/local/bin" \
+  mkdir -p "$work/image/etc/ssl/certs" "$work/image/usr/bin" "$work/image/usr/local/bin" \
     "$work/image/opt/monday/deployment/aliyun/research/scripts" \
     "$work/image/opt/monday/deployment/aliyun/research/k8s"
   jq -cn --arg source "$source_sha" \
     '{source:$source,user:"research",workdir:"/work",entrypoint:["/usr/bin/tini","--","/bin/bash","/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh"]}' >"$work/image/config.json"
-  for tool in bash curl jq tini; do
+  for tool in bash curl jq tini git gh ruby unzip; do
     printf '#!/usr/bin/env bash\nexit 0\n' >"$work/image/usr/bin/$tool"
     chmod 0755 "$work/image/usr/bin/$tool"
   done
+  printf '#!/usr/bin/env bash\nprintf -- "--paginate\\n"\n' >"$work/image/usr/bin/gh"
   for tool in aliyun kubectl; do
     printf '#!/usr/bin/env bash\nprintf "offline client version\\n"\n' >"$work/image/usr/local/bin/$tool"
     chmod 0755 "$work/image/usr/local/bin/$tool"
@@ -71,6 +73,7 @@ initialize_image() {
     "$work/image/opt/monday/deployment/aliyun/research/k8s/"
   chmod 0755 "$work/image/usr/local/bin/cex-materialization-entrypoint.sh" \
     "$work/image/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh"
+  printf "fixture CA bundle\n" >"$work/image/etc/ssl/certs/ca-certificates.crt"
   : >"$work/docker.log"
 }
 verify_image() {
@@ -86,7 +89,7 @@ initialize_image
 verify_image
 grep -Fq 'run --rm --network none --entrypoint /bin/bash' "$work/docker.log"
 grep -Fqx 'rm -f fixture-container ' "$work/docker.log"
-for failure in source entrypoint user tool script-missing script-syntax script-bytes template binary; do
+for failure in source entrypoint user tool script-missing script-syntax script-bytes template binary importer importer-version git gh ruby unzip gh-pagination ruby-runtime ruby-tar ca; do
   initialize_image
   case "$failure" in
     source|entrypoint|user)
@@ -102,6 +105,13 @@ for failure in source entrypoint user tool script-missing script-syntax script-b
     script-syntax) printf '\nif then\n' >>"$work/image/opt/monday/deployment/aliyun/research/scripts/campaign-job-watch.sh" ;;
     script-bytes) printf '\n# changed image asset\n' >>"$work/image/usr/local/bin/cex-materialization-entrypoint.sh" ;;
     template) printf '\n# changed Job template\n' >>"$work/image/opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml" ;;
+    importer) rm "$work/image/usr/local/bin/research-release-publisher" ;;
+    importer-version) printf '#!/usr/bin/env bash\nprintf "wrong importer\\n"\n' >"$work/image/usr/local/bin/research-release-publisher" ;;
+    git|gh|ruby|unzip) rm "$work/image/usr/bin/$failure" ;;
+    gh-pagination) printf '#!/usr/bin/env bash\nexit 0\n' >"$work/image/usr/bin/gh" ;;
+    ruby-runtime) printf '#!/usr/bin/env bash\nexit 1\n' >"$work/image/usr/bin/ruby" ;;
+    ruby-tar) printf '#!/usr/bin/env bash\nfor argument in "$@"; do if [[ $argument == -rrubygems/package ]]; then exit 1; fi; done\nexit 0\n' >"$work/image/usr/bin/ruby" ;;
+    ca) rm "$work/image/etc/ssl/certs/ca-certificates.crt" ;;
     binary) printf '\n# changed executable\n' >>"$work/image/usr/local/bin/lob-pit-materializer" ;;
   esac
   reject_image "$failure"

@@ -54,7 +54,8 @@ fn prefix_valid(prefix: &str) -> bool {
             && crate::retirement::source_receipt_key_valid(&format!("{prefix}receipt.json")))
 }
 
-pub(crate) fn read_capabilities(path: &std::path::Path) -> Result<Vec<Capability>> {
+/// Read a private projection using the same invariants as gateway admission.
+pub fn read_capabilities(path: &std::path::Path) -> Result<Vec<Capability>> {
     private_directory(path.parent().context("projection parent absent")?)?;
     // The broker owns this file and its private parent, never the Agent.
     // O_NOFOLLOW excludes a substituted symlink even during atomic reload.
@@ -84,10 +85,7 @@ pub(crate) fn read_capabilities(path: &std::path::Path) -> Result<Vec<Capability
         "broker projection exceeds bound"
     );
     let caps: Vec<Capability> = serde_json::from_slice(&bytes)?;
-    ensure!(
-        !caps.is_empty() && caps.len() <= 1024,
-        "invalid capability count"
-    );
+    ensure!(caps.len() <= 1024, "invalid capability count");
     let mut seen = std::collections::BTreeSet::new();
     for cap in &caps {
         ensure!(
@@ -382,7 +380,7 @@ impl AttemptIdentityIssuer {
     fn replace(&self, caps: &[Capability]) -> Result<()> {
         let bytes = serde_json::to_vec(caps)?;
         ensure!(
-            !caps.is_empty() && caps.len() <= 1024 && bytes.len() <= 1024 * 1024,
+            caps.len() <= 1024 && bytes.len() <= 1024 * 1024,
             "projection exceeds bound"
         );
         // Validate the existing file again before replacing it. All host writers
@@ -950,6 +948,14 @@ mod tests {
         })?;
         Ok((temp, issuer, caps))
     }
+    #[test]
+    fn paused_empty_projection_grants_no_reader_publisher_or_writer() -> Result<()> {
+        let (_temp, issuer, caps) = fixture(Vec::new())?;
+        assert!(caps.is_empty());
+        assert!(read_capabilities(&issuer.config.capabilities_file)?.is_empty());
+        Ok(())
+    }
+
     fn others() -> Vec<Capability> {
         vec![
             Capability {

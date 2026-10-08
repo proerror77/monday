@@ -41,6 +41,7 @@ hft-binance-depth = { path = "../../market-core/binance-depth" }
 data = { package = "hft-data", path = "../../data-pipelines/core" }
 adapter-binance-data = { package = "hft-data-adapter-binance", path = "../../data-pipelines/adapters/adapter-binance" }
 hft-research-manifest = { path = "../../research-core/manifest" }
+hft-prepared-market-io = { path = "../../research-core/prepared-market-io" }
 hft-core = { path = "../../market-core/core" }
 integration = { package = "hft-integration", path = "../../market-core/integration" }
 polymarket-tape-contract = { path = "../../shared/polymarket-tape" }

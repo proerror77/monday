@@ -440,11 +440,7 @@ pub fn prepare_native_campaign_dataset(
         || partitions.selection != metadata.selection.as_ref().map(|p| p.original_rows.clone())
         || partitions.sealed_holdout != metadata.holdout.original_rows
         || input.rows().len() != metadata.visible_rows.end
-        || metadata.visible_rows.start != 0
-        || protocol
-            .calendar
-            .as_ref()
-            .is_some_and(|c| c.develop_end_row > metadata.visible_rows.end)
+        || metadata.visible_rows != partitions.search
     {
         return Err(EvaluationError::InvalidNativePreparedEvidence);
     }

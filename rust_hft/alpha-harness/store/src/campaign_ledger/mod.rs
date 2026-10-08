@@ -11,12 +11,19 @@ pub use final_dispatch::{
     CampaignFinalDispatchClaimV1, CampaignFinalDispatchRecord, CampaignFinalDispatchSettlementV1,
     CampaignFinalOutcomeV1,
 };
+mod planning;
 mod platform_budget;
+mod platform_terminal;
 mod platform_transfer;
 mod state;
+pub use planning::VerifiedCampaignPlanningPermission;
 pub use platform_budget::{
     VerifiedCampaignPlatformBudget, VerifiedCampaignPlatformExport,
     VerifiedCampaignPlatformRevocation,
+};
+pub use platform_terminal::{
+    CampaignPlatformScientificStatusV1, CampaignPlatformTerminalAuditV1,
+    CampaignPlatformTerminalStateV1, VerifiedCampaignPlatformTerminalSource,
 };
 pub use platform_transfer::CampaignPlatformTransferV1;
 
@@ -82,6 +89,9 @@ pub enum CampaignLedgerEventV1 {
     PlatformTransferred {
         transfer: CampaignPlatformTransferV1,
     },
+    PlatformSettled {
+        audit: Box<CampaignPlatformTerminalAuditV1>,
+    },
     DispatchJobBound {
         operation_id: String,
         job_uid: String,
@@ -133,6 +143,9 @@ impl CampaignLedgerEventV1 {
             }
             Self::PlatformTransferred { transfer } => {
                 format!("campaign-platform-transfer:{}", transfer.operation_id)
+            }
+            Self::PlatformSettled { audit } => {
+                format!("campaign-platform-terminal:{}", audit.transfer.operation_id)
             }
             Self::DispatchJobBound { operation_id, .. } => format!("campaign-job:{operation_id}"),
             Self::DispatchCancelled { evidence } => {
@@ -1180,6 +1193,71 @@ mod tests {
         registered_grant(grant("root-1"))
     }
 
+    #[test]
+    fn planning_permission_is_current_readonly_and_allows_zero_llm_budget() {
+        let mut definition = grant("read-only-planning-root");
+        definition.budget.max_llm_tokens = 0;
+        let (store, root) = registered_grant(definition);
+        let before = store.campaign_family_snapshot(FAMILY).unwrap();
+        let usage = store.campaign_family_usage(FAMILY).unwrap();
+        let permission = store
+            .inspect_campaign_planning_permission_at(&root, minutes(1))
+            .unwrap();
+        assert_eq!(permission.root().signed_grant(), root.signed_grant());
+        permission.recheck_at(minutes(2)).unwrap();
+        assert!(permission.recheck_at(root.grant().expires_at).is_err());
+        assert_eq!(store.campaign_family_snapshot(FAMILY).unwrap(), before);
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), usage);
+    }
+
+    #[test]
+    fn planning_rejects_unregistered_revoked_expired_and_exhausted_roots_without_reserving() {
+        let (mut store, root) = registered();
+        let unregistered = verify(grant("unregistered-planning-root"));
+        let before = store.campaign_family_snapshot(FAMILY).unwrap();
+        assert!(store
+            .inspect_campaign_planning_permission_at(&unregistered, minutes(1))
+            .is_err());
+        assert!(store
+            .inspect_campaign_planning_permission_at(&root, root.grant().expires_at)
+            .is_err());
+        assert_eq!(store.campaign_family_snapshot(FAMILY).unwrap(), before);
+        store
+            .revoke_approval(APPROVAL, "operator", "stop planning", minutes(1))
+            .unwrap();
+        let revoked = store.campaign_family_snapshot(FAMILY).unwrap();
+        assert!(store
+            .inspect_campaign_planning_permission_at(&root, minutes(2))
+            .is_err());
+        assert_eq!(store.campaign_family_snapshot(FAMILY).unwrap(), revoked);
+
+        let (mut store, root) = registered();
+        let attempt = reservation(&root, 0, root.grant().budget.max_trials);
+        store
+            .reserve_campaign_attempt(&root, &attempt, minutes(1))
+            .unwrap();
+        let exhausted = store.campaign_family_snapshot(FAMILY).unwrap();
+        let usage = store.campaign_family_usage(FAMILY).unwrap();
+        assert!(store
+            .inspect_campaign_planning_permission_at(&root, minutes(2))
+            .is_err());
+        assert_eq!(store.campaign_family_snapshot(FAMILY).unwrap(), exhausted);
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), usage);
+    }
+
+    #[test]
+    fn planning_cannot_reopen_a_closed_family() {
+        let (store, final_grant) = closed_final_family();
+        let family = &final_grant.grant().family_id;
+        let (state, _) = load(&store.connection, &store.integrity_key, family).unwrap();
+        let root = &state.roots.values().next().unwrap().grant;
+        let before = store.campaign_family_snapshot(family).unwrap();
+        assert!(store
+            .inspect_campaign_planning_permission_at(root, minutes(3))
+            .is_err());
+        assert_eq!(store.campaign_family_snapshot(family).unwrap(), before);
+    }
+
     fn registered_grant(
         definition: CampaignRootGrantV1,
     ) -> (AlphaStore, VerifiedCampaignRootGrant) {
@@ -1220,6 +1298,60 @@ mod tests {
         let mut changed = reservation.clone();
         changed.declared_trials += 1;
         assert!(read(&mut store, &changed).is_err());
+        assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
+    }
+
+    #[test]
+    fn platform_terminal_source_is_historical_and_requires_published_exclusive_transfer() {
+        let (mut store, verified) = registered();
+        let reservation = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &reservation, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let operation = reservation.operation_id().unwrap();
+        assert!(store
+            .campaign_platform_terminal_source(FAMILY, &operation)
+            .is_err());
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: operation.clone(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        let receipt = store
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+            )
+            .unwrap();
+        assert!(store
+            .campaign_platform_terminal_source(FAMILY, &operation)
+            .is_err());
+        acknowledge_all(&mut store);
+        store
+            .revoke_approval(APPROVAL, "operator", "source revoked", minutes(1))
+            .unwrap();
+        let before = store.campaign_family_usage(FAMILY).unwrap();
+        let witness = store
+            .campaign_platform_terminal_source(FAMILY, &operation)
+            .unwrap();
+        assert_eq!(witness.root().signed_grant(), verified.signed_grant());
+        assert_eq!(witness.reservation(), &reservation);
+        assert_eq!(witness.transfer(), &transfer);
+        assert_eq!(witness.transfer_receipt(), &receipt);
+        assert_eq!(
+            witness.operation_sha256().unwrap(),
+            alpha_domain::canonical_json_hash(&operation).unwrap()
+        );
+        assert!(store
+            .campaign_platform_terminal_source("foreign", &operation)
+            .is_err());
+        assert!(store
+            .campaign_platform_terminal_source(FAMILY, "caller-renamed-op")
+            .is_err());
         assert_eq!(store.campaign_family_usage(FAMILY).unwrap(), before);
     }
 
@@ -1641,6 +1773,141 @@ mod tests {
             r.receipt.event,
             CampaignLedgerEventV1::PlatformTransferred { .. }
         )));
+    }
+
+    #[test]
+    fn platform_terminal_audit_keeps_charge_after_revoke_and_expiry() {
+        let (mut store, verified) = registered();
+        let reservation = reservation(&verified, 0, 40);
+        store
+            .reserve_campaign_attempt(&verified, &reservation, t0())
+            .unwrap();
+        acknowledge_all(&mut store);
+        let transfer = CampaignPlatformTransferV1 {
+            operation_id: reservation.operation_id().unwrap(),
+            tenant: "fixture".into(),
+            run_sha256: "a".repeat(64),
+            request_sha256: "b".repeat(64),
+        };
+        store
+            .transfer_campaign_execution_to_platform_with_clock(
+                &verified,
+                &reservation,
+                &transfer,
+                t0,
+            )
+            .unwrap();
+        acknowledge_all(&mut store);
+        let source = store
+            .campaign_platform_terminal_source(FAMILY, &transfer.operation_id)
+            .unwrap();
+        store
+            .revoke_approval(APPROVAL, "operator", "historical stop", minutes(1))
+            .unwrap();
+        let before = store.campaign_family_usage(FAMILY).unwrap();
+        let audit = terminal_audit(&source, minutes(800));
+        for mutate in [
+            |v: &mut CampaignPlatformTerminalAuditV1| v.charging_trials -= 1,
+            |v: &mut CampaignPlatformTerminalAuditV1| v.task_id = "foreign-task".into(),
+            |v: &mut CampaignPlatformTerminalAuditV1| v.attempt = 2,
+            |v: &mut CampaignPlatformTerminalAuditV1| v.fence = 0,
+            |v: &mut CampaignPlatformTerminalAuditV1| v.retained_manifest_sha256.clear(),
+            |v: &mut CampaignPlatformTerminalAuditV1| v.transfer.tenant = "foreign".into(),
+            |v: &mut CampaignPlatformTerminalAuditV1| v.known_scientific_consumption = Some(1),
+            |v: &mut CampaignPlatformTerminalAuditV1| {
+                v.platform_state = CampaignPlatformTerminalStateV1::Succeeded
+            },
+        ] {
+            let mut changed = audit.clone();
+            mutate(&mut changed);
+            assert!(store
+                .record_campaign_platform_terminal_audit_with_clock(&source, &changed, || minutes(
+                    801
+                ))
+                .is_err());
+        }
+        let first = store
+            .record_campaign_platform_terminal_audit_with_clock(&source, &audit, || minutes(801))
+            .unwrap();
+        assert_eq!(
+            first,
+            store
+                .record_campaign_platform_terminal_audit_with_clock(&source, &audit, || minutes(
+                    802
+                ))
+                .unwrap()
+        );
+        assert_eq!(
+            store.campaign_platform_terminal_audit(&source).unwrap(),
+            Some(audit.clone())
+        );
+        let after = store.campaign_family_usage(FAMILY).unwrap();
+        assert_eq!(
+            before.accounted_trials().unwrap(),
+            after.accounted_trials().unwrap()
+        );
+        assert_eq!(
+            after.consumed_trials, 0,
+            "full policy charge is not fabricated scientific consumption"
+        );
+        assert_eq!(after.uncertain_trials, reservation.declared_trials);
+        assert_eq!(after.pending_trials, 0);
+        assert!(store
+            .settle_campaign_attempt(
+                FAMILY,
+                &settlement(&reservation, CampaignAttemptOutcomeV1::Failed, None),
+                minutes(803)
+            )
+            .is_err());
+        assert!(store
+            .claim_campaign_dispatch(&verified, &reservation, &dispatch_target(), minutes(803))
+            .is_err());
+        let mut changed = audit.clone();
+        changed.job_uid = "another-job".into();
+        assert!(store
+            .record_campaign_platform_terminal_audit_with_clock(&source, &changed, || minutes(803))
+            .is_err());
+        let (state, _) = load(&store.connection, &store.integrity_key, FAMILY).unwrap();
+        let attempt = &state.attempts[&transfer.operation_id];
+        assert_eq!(attempt.platform_transfer.as_ref(), Some(&transfer));
+        assert!(attempt.settlement.is_none() && attempt.dispatch.is_none());
+        let snapshot = store.campaign_family_snapshot(FAMILY).unwrap();
+        let mut restored = AlphaStore::open_in_memory().unwrap();
+        restored.integrity_key = store.integrity_key;
+        restored.import_campaign_family_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.campaign_family_usage(FAMILY).unwrap(), after);
+    }
+
+    pub(super) fn terminal_audit(
+        source: &VerifiedCampaignPlatformTerminalSource,
+        observed_at: DateTime<Utc>,
+    ) -> CampaignPlatformTerminalAuditV1 {
+        CampaignPlatformTerminalAuditV1 {
+            schema_version: "monday.campaign_platform_terminal_audit.v1".into(),
+            transfer: source.transfer().clone(),
+            platform_state: CampaignPlatformTerminalStateV1::Failed,
+            scientific_status: CampaignPlatformScientificStatusV1::Unknown,
+            charging_trials: source.reservation().declared_trials,
+            known_scientific_consumption: None,
+            retained_manifest_sha256: "9".repeat(64),
+            platform_snapshot_sha256: "1".repeat(64),
+            observer_release_sha256: "0".repeat(64),
+            native_admission_sha256: "2".repeat(64),
+            native_trust_sha256: "3".repeat(64),
+            collection_sha256: "4".repeat(64),
+            task_id: source.transfer().request_sha256.clone(),
+            attempt: 1,
+            fence: 7,
+            terminal_revision: 7,
+            terminal_event_sha256: "5".repeat(64),
+            execution_event_sha256: "6".repeat(64),
+            job_uid: "fixture-job".into(),
+            pod_uid: "fixture-pod".into(),
+            job_sha256: "7".repeat(64),
+            pod_sha256: "8".repeat(64),
+            native_result_sha256: None,
+            observed_at,
+        }
     }
 
     #[test]
@@ -2645,6 +2912,7 @@ mod tests {
                 CampaignLedgerEventV1::AttemptReserved { .. } => "attempt_reserved",
                 CampaignLedgerEventV1::DispatchClaimed { .. } => "dispatch_claimed",
                 CampaignLedgerEventV1::PlatformTransferred { .. } => "platform_transferred",
+                CampaignLedgerEventV1::PlatformSettled { .. } => "platform_settled",
                 CampaignLedgerEventV1::DispatchJobBound { .. } => "dispatch_job_bound",
                 CampaignLedgerEventV1::AttemptSettled { .. } => "attempt_settled",
                 CampaignLedgerEventV1::DispatchSettled { .. } => "dispatch_settled",

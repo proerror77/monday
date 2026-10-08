@@ -11,6 +11,7 @@ mod evaluation_partition;
 pub mod frozen_model;
 pub mod market_encoder_study;
 pub mod mlp_training;
+pub mod representation;
 pub mod research_accelerator;
 pub mod sec_orderflow;
 pub mod sequence_study;
@@ -1548,7 +1549,43 @@ pub struct CandidateEvaluation {
     pub metrics: EvaluationMetrics,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PredictiveScreeningGateFacts {
+    pub predictive_passed: bool,
+    pub coverage_passed: bool,
+}
+
+fn predictive_icir_required(version: &str) -> Result<bool, &'static str> {
+    match version {
+        WALK_FORWARD_EVALUATOR_VERSION
+        | CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
+        | ONNX_WALK_FORWARD_EVALUATOR_VERSION => Ok(true),
+        SEALED_HOLDOUT_EVALUATOR_VERSION
+        | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
+        | frozen_model::INDEPENDENT_SELECTION_EVALUATOR_VERSION => Ok(false),
+        _ => Err("unsupported predictive evaluator version"),
+    }
+}
+
 impl CandidateEvaluation {
+    /// Readonly screening facts from complete, validated original evidence.
+    /// This does not authorize a Run or change any evaluator threshold.
+    pub fn predictive_screening_gate_facts(
+        &self,
+    ) -> Result<PredictiveScreeningGateFacts, DomainError> {
+        self.validate()?;
+        let require_icir = predictive_icir_required(&self.evaluator_version)
+            .map_err(|_| DomainError::InvalidEvaluationEvidence)?;
+        let config = self.formula_config()?;
+        Ok(PredictiveScreeningGateFacts {
+            predictive_passed: self.metrics.predictive.passes(&config, require_icir),
+            coverage_passed: self
+                .metrics
+                .folds
+                .iter()
+                .all(|fold| fold.row_count >= config.min_validation_rows),
+        })
+    }
     pub fn validate(&self) -> Result<(), DomainError> {
         self.validate_inner(false)
             .map_err(|_| DomainError::InvalidEvaluationEvidence)
@@ -1798,12 +1835,7 @@ impl CandidateEvaluation {
             let config = self
                 .formula_config()
                 .map_err(|_| "evaluator config is invalid")?;
-            let require_icir = matches!(
-                self.evaluator_version.as_str(),
-                WALK_FORWARD_EVALUATOR_VERSION
-                    | CEX_BASELINE_WALK_FORWARD_EVALUATOR_VERSION
-                    | ONNX_WALK_FORWARD_EVALUATOR_VERSION
-            );
+            let require_icir = predictive_icir_required(&self.evaluator_version)?;
             let capacity_passed = protocol.is_none_or(|protocol| {
                 !protocol.costs.capacity_enabled()
                     || self.metrics.folds.iter().all(|fold| {

@@ -31,6 +31,7 @@ impl SystemRuntime {
             ipc_task: None,
             exec_control_tx: self.exec_control_tx.clone(),
             market_plans: self.market_plans.clone(),
+            market_data_planning_error: self.market_data_planning_error.clone(),
             execution_client_venues: self.execution_client_venues.clone(),
             execution_client_accounts: self.execution_client_accounts.clone(),
             execution_client_is_binance_usdm: self.execution_client_is_binance_usdm.clone(),

@@ -64,6 +64,43 @@ Use the owning manifest for feature matrices. `scripts/cargo-scoped.sh` routes
 explicit package lists to their owners. No default command builds all workspaces.
 Cross-domain path dependencies and their contract tests remain explicit.
 
+### Researcher version and evaluation boundaries
+
+`research-core/agent-contracts` declares the shared Cargo owner. It owns immutable
+researcher configuration, bounded ranking proposals, frozen meta-study task and
+resource identities, and signed evaluation/cost receipt wire formats. These are
+data contracts and pure validation, with no database, transport or scientific
+implementation. Receipt JSON carries no authority by itself.
+
+The control platform's `researcher-verification` feature checks independently
+configured evaluator and cost keys, actual receipt bytes, the frozen comparison,
+and a parent/revision condition before changing an in-memory incumbent. Only
+experience ranking may differ in this first implementation. It does not activate
+PG, create a second experiment ledger, authorize a meta run, or prove an executed
+evaluation. Persistent adoption, worker execution and subsequent version
+consumption require their own control/research integration and real evidence.
+The pure verifier accepts only a first Attempt for each frozen Run. Retried or
+uncertain attempts need complete cumulative cost and exposure ledger evidence
+before they can be admitted by a later storage adapter.
+
+`research-core/agent-improvement` belongs to the research owner. Its fixed library
+entry consumes canonical configuration bytes, verifies the complete frozen
+development corpus and query, and applies the selected experience ranking. It
+emits the actual selected context and a configuration-consumption receipt. That
+receipt has no adoption, grant or scientific-result authority. Control imports
+this leaf only in tests; its normal dependency graph excludes the consumer.
+
+Control can prepare those bytes from a verified decision and an actually applied
+in-memory head, then check their full hash against the next Run's configuration
+and query view. This metadata preflight neither reserves nor submits a Run.
+The existing CEX worker configuration whitelist stays closed to this format.
+Active-head storage, qualified corpus export, worker staging and real execution
+still need their own authority adapters and receipts.
+
+Research algorithms remain in the research owner. Control invokes published
+programs through existing Build/Run/Task/Attempt boundaries; it does not import
+`alpha-domain`, `alpha-engine`, fitters or evaluators to make an adoption decision.
+
 ### Market data and execution selection
 
 Venue ownership does not combine quote transport with account mutation.
@@ -89,6 +126,15 @@ this crate directly. SQL plans and HTTPS acquisition remain in the control
 implementation; the input crate has no database or provider dependency.
 Prediction event/settlement inputs remain in their prediction owner. A shared
 Cargo owner does not make CEX time-horizon labels valid for event settlement.
+
+`hft-prepared-market-io` is the shared owner of bounded numerical Parquet IO.
+Its feature/target shard writers and `FeatureParquetReader`/`TargetParquetReader`
+serve the data-service producer and CEX streaming consumers. The original codec
+has one implementation; `hft-research-manifest` retains pure request, receipt,
+coverage, hash and format-limit contracts. Pure manifest, governance and runtime
+consumers do not import Parquet. The `market-parquet` feature explicitly includes
+this IO dependency. Streaming-only GP consumers exclude Parquet and this IO
+dependency.
 
 The build boundary does not grant product or execution authority. Existing
 `ploy-*` names remain compatibility identifiers. New packages use functional
@@ -120,6 +166,13 @@ cluster credentials.
 identity. It imports no venue, scientific model, scheduler, database, risk or
 execution crate. CEX Campaign and holdout object bindings remain CEX-owned.
 The CEX harness contains no Prediction command or Prediction-owned dependency.
+
+`alpha-engine` selects the persistent search kernel and LLM proposals separately.
+The `kernel` feature includes the original budgeted search implementation. The
+`llm` feature includes the original HTTP proposal and failure-critic client.
+The diagnostic CEX harness explicitly enables both; deterministic search callers
+can select `kernel` without including the LLM client in their normal dependency
+graph. Build tools retain their own transport dependencies.
 
 ## Runtime strategy handoff
 

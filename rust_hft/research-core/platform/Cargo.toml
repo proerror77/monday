@@ -9,10 +9,13 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 anyhow = "1"
+hmac = { version = "0.12", optional = true }
+chrono = { version = "0.4", optional = true }
 base64 = { version = "0.22", optional = true }
 zip = { version = "6", optional = true, default-features = false, features = ["deflate"] }
 tempfile = { version = "3", optional = true }
 hft-cex-research-input = { path = "../cex-input" }
+hft-research-agent-contracts = { path = "../agent-contracts" }
 ed25519-dalek = { version = "=2.2.0", optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "process", "io-util", "io-std"] }
 reqwest = { workspace = true, optional = true, features = ["rustls-tls", "json"] }
@@ -21,6 +24,7 @@ rustix = { version = "0.38", features = ["fs"], optional = true }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 futures-util = { version = "0.3", optional = true }
 getrandom = { version = "=0.2.17", optional = true }
+jsonwebtoken = { version = "=9.3.1", optional = true, default-features = false }
 # PG only: the umbrella crate resolves unused MySQL/RSA and SQLite drivers.
 sqlx-core = { version = "=0.8.6", optional = true, default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json"] }
 sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false, features = ["json"] }
@@ -28,10 +32,12 @@ sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false,
 [features]
 default = []
 artifact-io = ["dep:tokio", "dep:reqwest", "dep:rustix", "dep:tokio-util", "dep:base64", "tokio/fs", "reqwest/stream"]
-control = ["artifact-io", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:zip", "dep:tempfile", "dep:getrandom", "native-admission", "release-verification"]
+campaign-result-validation = ["dep:zip"]
+control = ["artifact-io", "campaign-result-validation", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:tempfile", "dep:getrandom", "native-admission", "release-verification", "researcher-verification"]
 native-admission = ["dep:ed25519-dalek"]
 release-verification = ["dep:ed25519-dalek"]
-publisher = ["control", "dep:rustix", "dep:tokio-util", "dep:tempfile", "tokio/fs", "reqwest/stream"]
+researcher-verification = ["release-verification"]
+publisher = ["dep:hmac", "dep:chrono", "control", "dep:rustix", "dep:tokio-util", "dep:tempfile", "dep:jsonwebtoken", "tokio/fs", "reqwest/stream"]
 gateway = ["control", "dep:rustix", "dep:tokio-util", "dep:futures-util", "tokio/fs", "reqwest/stream"]
 
 [[bin]]
@@ -64,8 +70,20 @@ name = "research-release-publisher"
 path = "src/bin/research-release-publisher.rs"
 required-features = ["publisher"]
 
+[[bin]]
+name = "research-release-capability"
+path = "src/bin/research-release-capability.rs"
+required-features = ["publisher"]
+
+[[bin]]
+name = "research-release-capability-broker"
+path = "src/bin/research-release-capability-broker.rs"
+required-features = ["publisher"]
+
 [dev-dependencies]
+hft-research-agent-improvement = { path = "../agent-improvement" }
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
 
 [workspace]
 resolver = "2"

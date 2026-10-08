@@ -82,7 +82,7 @@ binance_repeat_source_test_tag=$(sed -n 's/^source_test_tag=//p' "$tmp_dir/sourc
 test "$binance_source_test_tag" != "$bybit_source_test_tag"
 test "$binance_source_test_tag" = "$binance_repeat_source_test_tag"
 
-for rejected in failed-run pull-request-run branch-run automated-stale-main manual-nonmain manual-stale-main required-missing required-pending required-skipped required-failed implicit-rebuild source-test-missing-sha source-test-nonmain source-test-untrusted-sha source-test-stale-main source-test-rebuild source-test-invalid-profile source-test-on-runtime automated-source-test; do
+for rejected in failed-run pull-request-run branch-run automated-stale-main manual-nonmain manual-stale-main required-missing required-pending required-failed implicit-rebuild source-test-missing-sha source-test-nonmain source-test-untrusted-sha source-test-stale-main source-test-rebuild source-test-invalid-profile source-test-on-runtime automated-source-test; do
   case "$rejected" in
     failed-run) args=(--event workflow_run --conclusion failure --source-event push --head-branch main --head-sha "$main_sha" --run-id 1234) ;;
     pull-request-run) args=(--event workflow_run --conclusion success --source-event pull_request --head-branch main --head-sha "$main_sha" --run-id 1234) ;;
@@ -92,7 +92,6 @@ for rejected in failed-run pull-request-run branch-run automated-stale-main manu
     manual-stale-main) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678 "${green_admission[@]}") ;;
     required-missing) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion missing --prediction-conclusion success --security-conclusion success) ;;
     required-pending) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion success --prediction-conclusion in_progress --security-conclusion success) ;;
-    required-skipped) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion success --prediction-conclusion success --security-conclusion skipped) ;;
     required-failed) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion failure --prediction-conclusion success --security-conclusion success) ;;
     implicit-rebuild) args=(--event workflow_dispatch --target research-runner --rebuild false --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
     source-test-missing-sha) args=(--event workflow_dispatch --target research-source-test --rebuild false --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
@@ -158,7 +157,7 @@ release="$tmp_dir/release"
 mkdir -p "$repo/prediction-markets" "$release/research-bin"
 printf 'root lock\n' >"$repo/Cargo.lock"
 printf 'prediction lock\n' >"$repo/prediction-markets/Cargo.lock"
-for binary in hft-backtest alpha-harness monday-cex-worker lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot monday-prediction-worker monday-prediction-operator; do
+for binary in research-release-publisher hft-backtest alpha-harness monday-cex-worker lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot monday-prediction-worker monday-prediction-operator; do
   printf '%s\n' "$binary" >"$release/research-bin/$binary"
   chmod 0755 "$release/research-bin/$binary"
 done
@@ -314,12 +313,14 @@ for workflow in docker-publish release-rust; do
   grep -Fq '      checks: read' "$path"
 done
 # Check the workflow graph, not just the admission helper: every required
-# workflow completion can wake publication, and only its admitted SHA is built.
-ruby -ryaml - "$script_dir/../workflows/docker-publish.yml" <<'RUBY'
-w = YAML.safe_load(File.read(ARGV[0]))
+# workflow completion can wake the one Release entry, and only its admitted SHA is built.
+ruby -ryaml - "$script_dir/../workflows/release.yml" "$script_dir/../workflows/docker-publish.yml" <<'RUBY'
+release, w = ARGV.map { |path| YAML.safe_load(File.read(path)) }
+release_triggers = release['on'] || release[true]
+raise 'missing completion wakeups' unless release_triggers.fetch('workflow_run').fetch('workflows').sort == ['Monorepo CI', 'Prediction Markets CI', 'Security & Quality (ENABLED)'].sort
 triggers = w['on'] || w[true]
-raise 'missing completion wakeups' unless triggers.fetch('workflow_run').fetch('workflows').sort == ['Monorepo CI', 'Prediction Markets CI', 'Security & Quality (ENABLED)'].sort
-raise 'main publication still races CI on push' if triggers.fetch('push').key?('branches')
+raise 'GHCR still wakes itself from workflow_run' if triggers.key?('workflow_run')
+raise 'main publication still races CI on push' if triggers.key?('push') && triggers.fetch('push').key?('branches')
 jobs = w.fetch('jobs')
 admission_checkout = jobs.fetch('release-admission').fetch('steps').find { |step| step['uses'].to_s.start_with?('actions/checkout@') }
 raise 'admission executes event-selected code before trust validation' unless admission_checkout.fetch('with').fetch('ref') == 'refs/heads/main'
@@ -354,4 +355,5 @@ raise 'rendered SHA tag does not use the source SHA' unless rendered_tags.includ
 raise 'rendered revision label does not use the full source SHA' unless rendered_labels.include?("org.opencontainers.image.revision=#{source_sha}")
 raise 'rendered metadata uses the workflow SHA' if rendered_tags.include?(workflow_sha) || rendered_labels.include?(workflow_sha)
 RUBY
+bash "$script_dir/test-release-once.sh"
 printf 'shared release admission tests passed\n'

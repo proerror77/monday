@@ -2,7 +2,8 @@
 //! rendering neither creates cluster resources nor approves a research attempt.
 
 use super::{
-    admission, load_submission, render_manifest, validate_submission, ValidatedSubmission,
+    admission, load_submission, render_manifest, validate_submission_for_readback,
+    ValidatedSubmission,
 };
 use crate::cli::{print_json, CampaignControllerHandoffArgs, CampaignControllerPrepareArgs};
 use alpha_domain::campaign_control::SignedCampaignRootGrantV1;
@@ -51,7 +52,7 @@ fn check_saved_deadline(work_dir: &Path, deadline: DateTime<Utc>) -> anyhow::Res
 }
 
 pub(crate) fn render(args: CampaignControllerHandoffArgs) -> anyhow::Result<()> {
-    let validated = validate_submission(load_submission(&args.submission)?)?;
+    let validated = validate_submission_for_readback(load_submission(&args.submission)?)?;
     let manifest = render_value(&args, &validated)?;
     let deadline_path = args.work_dir.join("controller-deadline.json");
     if !deadline_path.try_exists()? {
@@ -134,7 +135,8 @@ pub(super) fn render_value(
             bail!("controller handoff requires a finalized and dispatched generation");
         }
     }
-    let checkpoint = validate_submission(load_submission(&generation.join("submission.json"))?)?;
+    let checkpoint =
+        validate_submission_for_readback(load_submission(&generation.join("submission.json"))?)?;
     if checkpoint.request_sha256 != validated.request_sha256
         || checkpoint.submission.image != validated.submission.image
     {

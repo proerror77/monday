@@ -157,6 +157,8 @@ enum MissionDispatchCommand {
     ExportPlatform(mission_dispatch::platform_admission::PlatformExportArgs),
     /// Export authenticated Root/Study constraints for already transferred native operations.
     ExportPlatformRevocations(mission_dispatch::platform_admission::PlatformRevocationsArgs),
+    /// Audit one transferred terminal Attempt using independent stopped/native readback.
+    AuditPlatformTerminal(mission_dispatch::platform_terminal::PlatformTerminalArgs),
     CloseFamily(CampaignCloseFamilyArgs),
     Inspect(MissionDispatchInspectArgs),
     /// Read authenticated historical dispatch identity without submitting or settling.
@@ -449,6 +451,15 @@ pub struct CampaignFreezeArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct CampaignLearnArgs {
+    /// Existing signed dispatch control and authenticated settlement ledger.
+    #[arg(long)]
+    pub control: PathBuf,
+    #[arg(long)]
+    pub submission: PathBuf,
+    #[arg(long)]
+    pub settlement: PathBuf,
+    #[arg(long)]
+    pub namespace: String,
     #[arg(long)]
     pub request: PathBuf,
     #[arg(long)]
@@ -1267,6 +1278,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     .context("native platform revocation export task failed")?
                 }
+                MissionDispatchCommand::AuditPlatformTerminal(args) => {
+                    tokio::task::spawn_blocking(move || {
+                        mission_dispatch::platform_terminal::audit(args)
+                    })
+                    .await
+                    .context("native platform terminal observation failed")?
+                }
                 MissionDispatchCommand::DescribeStudy(args) => {
                     mission_dispatch::sequence_admission::describe(args)
                 }
@@ -1683,11 +1701,19 @@ mod tests {
 
     #[test]
     fn parses_mission_campaign_learn() {
-        let args = "alpha-harness mission campaign-learn --request campaign.json --result campaign-result.json --result-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --output next-plan.json";
+        let args = "alpha-harness mission campaign-learn --control control.json --submission submission.json --settlement settlement.json --namespace monday-research --request campaign.json --result campaign-result.json --result-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --output next-plan.json";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
 
-        let obsolete = "alpha-harness mission campaign-learn --request campaign.json --result campaign-result.json --result-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --max-tokens 300 --output next-plan.json";
+        let obsolete = "alpha-harness mission campaign-learn --control control.json --submission submission.json --settlement settlement.json --namespace monday-research --request campaign.json --result campaign-result.json --result-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --max-tokens 300 --output next-plan.json";
         assert!(Cli::try_parse_from(obsolete.split_whitespace()).is_err());
+        for required in [
+            "--control control.json ",
+            "--submission submission.json ",
+            "--settlement settlement.json ",
+            "--namespace monday-research ",
+        ] {
+            assert!(Cli::try_parse_from(args.replace(required, "").split_whitespace()).is_err());
+        }
     }
 
     #[test]

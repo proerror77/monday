@@ -227,6 +227,7 @@ pub struct SystemBuilder {
     risk_managers: Vec<Box<dyn RiskManager>>,
     // 僅登記市場流規劃，實際橋接在 Runtime::start() 內進行
     market_stream_plans: Vec<(VenueType, String, Vec<InstrumentSpec>)>,
+    market_data_planning_error: Option<String>,
     // 分片配置
     shard_config: Option<ShardConfig>,
     // 🔥 Phase 1: 跟蹤執行客戶端對應的交易所
@@ -252,6 +253,7 @@ impl SystemBuilder {
             strategies: Vec::new(),
             risk_managers: Vec::new(),
             market_stream_plans: Vec::new(),
+            market_data_planning_error: None,
             shard_config: None,
             execution_client_venues: Vec::new(),
             execution_client_accounts: Vec::new(),
@@ -566,6 +568,13 @@ impl SystemBuilder {
         info!("自動註冊適配器...");
 
         self = self.register_market_streams_from_config();
+        if self.market_data_planning_error.is_some() {
+            return self;
+        }
+        if let Err(error) = validate_market_data_plans(&self.market_stream_plans) {
+            self.market_data_planning_error = Some(error.to_string());
+            return self;
+        }
         // Quotes-only 模式：YAML `quotes_only: true` 或環境變量 HFT_QUOTES_ONLY=1
         let quotes_only = quotes_only_enabled(&self.config);
         if quotes_only {
@@ -603,6 +612,10 @@ impl SystemBuilder {
             ));
         }
         self = self.register_market_streams_from_config();
+        if let Some(error) = &self.market_data_planning_error {
+            return Err(HftError::Config(error.clone()));
+        }
+        validate_market_data_plans(&self.market_stream_plans)?;
         let quotes_only = quotes_only_enabled(&self.config);
         if quotes_only {
             info!("quotes-only enabled; execution clients remain disabled");
@@ -780,6 +793,7 @@ impl SystemBuilder {
             ipc_task: None,
             exec_control_tx: None,
             market_plans: self.market_stream_plans,
+            market_data_planning_error: self.market_data_planning_error,
             execution_client_venues: self.execution_client_venues,
             execution_client_accounts: self.execution_client_accounts,
             execution_client_is_binance_usdm: self.execution_client_is_binance_usdm,
@@ -1031,6 +1045,7 @@ pub struct SystemRuntime {
         Option<tokio::sync::mpsc::UnboundedSender<engine::execution_worker::ControlCommand>>,
     // 登記的市場流規劃
     market_plans: Vec<(VenueType, String, Vec<InstrumentSpec>)>,
+    market_data_planning_error: Option<String>,
     // 🔥 Phase 1: 執行客戶端到交易所的映射
     execution_client_venues: Vec<VenueId>,
     // 🔥 Phase 1.x: 執行客戶端到帳戶的映射（可選）
@@ -1062,6 +1077,51 @@ fn requires_authoritative_balance_reconciliation(config: &SystemConfig) -> bool 
         })
 }
 
+fn validate_market_data_plans(plans: &[(VenueType, String, Vec<InstrumentSpec>)]) -> HftResult<()> {
+    for (venue_type, venue_name, instruments) in plans {
+        if instruments.is_empty() {
+            continue;
+        }
+        let (feature, enabled) = match venue_type {
+            VenueType::Bitget => ("adapter-bitget-data", cfg!(feature = "adapter-bitget-data")),
+            VenueType::Binance => (
+                "adapter-binance-data",
+                cfg!(feature = "adapter-binance-data"),
+            ),
+            VenueType::BinancePrediction => (
+                "adapter-binance-prediction-data",
+                cfg!(feature = "adapter-binance-prediction-data"),
+            ),
+            VenueType::Bybit => ("adapter-bybit-data", cfg!(feature = "adapter-bybit-data")),
+            VenueType::Grvt => ("adapter-grvt-data", cfg!(feature = "adapter-grvt-data")),
+            VenueType::Asterdex => (
+                "adapter-asterdex-data",
+                cfg!(feature = "adapter-asterdex-data"),
+            ),
+            VenueType::OndoPerps => (
+                "adapter-ondo-perps-data",
+                cfg!(feature = "adapter-ondo-perps-data"),
+            ),
+            VenueType::Polymarket => (
+                "adapter-polymarket-data",
+                cfg!(feature = "adapter-polymarket-data"),
+            ),
+            VenueType::Mock => ("adapter-mock-data", cfg!(feature = "adapter-mock-data")),
+            VenueType::Okx | VenueType::Hyperliquid | VenueType::Lighter | VenueType::Backpack => {
+                return Err(HftError::Config(format!(
+                    "market data for venue '{venue_name}' ({venue_type:?}) is not implemented"
+                )));
+            }
+        };
+        if !enabled {
+            return Err(HftError::Config(format!(
+                "market data for venue '{venue_name}' ({venue_type:?}) requires feature '{feature}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl SystemRuntime {
     /// 啟動系統
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1075,6 +1135,10 @@ impl SystemRuntime {
         info!("啟動系統運行時...");
         validate_shared_portfolio_market_scope(&self.config)
             .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+        if let Some(error) = &self.market_data_planning_error {
+            return Err(HftError::Config(error.clone()).into());
+        }
+        validate_market_data_plans(&self.market_plans)?;
         #[cfg(feature = "infra-ipc")]
         let prepared_ipc =
             crate::ipc_handler::prepare_ipc_server(ipc_socket_path).map_err(|error| {
@@ -2273,6 +2337,8 @@ mod tests {
         config.engine.ack_timeout_ms = 0;
         config.engine.reconcile_interval_ms = 0;
         config.engine.intent_max_latency_us = 1_000_000;
+        // This rate-limit wiring test tolerates scheduler jitter in the quote age.
+        config.engine.stale_us = 1_000_000;
         config.engine.intent_max_slippage_bps = Some(25);
         config.engine.intent_max_order_notional = Some(Decimal::from(1000));
         config.engine.intent_max_order_quantity = Some(Decimal::from(10));
@@ -3547,5 +3613,528 @@ mod tests {
         assert!(runtime.ipc_task.is_some());
         runtime.stop().await.expect("quotes-only runtime stops");
         assert!(runtime.ipc_task.is_none());
+    }
+
+    #[cfg(not(feature = "adapter-binance-data"))]
+    #[test]
+    fn missing_market_data_feature_rejects_strict_quotes_registration() {
+        let config = SystemConfig {
+            quotes_only: true,
+            venues: vec![live_venue_config()],
+            ..Default::default()
+        };
+        let Err(error) = SystemBuilder::new(config).auto_register_adapters_strict() else {
+            panic!("strict startup accepted a Binance quote plan without its data feature");
+        };
+        assert!(error.to_string().contains("adapter-binance-data"));
+    }
+
+    #[cfg(not(feature = "adapter-binance-data"))]
+    #[tokio::test]
+    #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
+    async fn missing_market_data_feature_rejects_manual_plan_before_start() {
+        let config = SystemConfig {
+            quotes_only: true,
+            ..Default::default()
+        };
+        let mut runtime = SystemBuilder::new(config)
+            .register_market_instrument_plan(
+                VenueType::Binance,
+                "binance-quotes".into(),
+                vec![InstrumentSpec::crypto_spot(
+                    Symbol::new("BTCUSDT"),
+                    VenueId::BINANCE,
+                )],
+            )
+            .build();
+        let result = runtime.start().await;
+        if result.is_ok() {
+            runtime
+                .stop()
+                .await
+                .expect("stop incorrectly started runtime");
+        }
+        let error = result.expect_err("manual quote plan needs a compiled data adapter");
+        assert!(error.to_string().contains("binance-quotes"));
+        assert!(error.to_string().contains("adapter-binance-data"));
+        assert!(runtime.tasks.is_empty());
+        assert!(runtime.adapter_bridge.is_none());
+        assert!(runtime.execution_worker_tasks.is_empty());
+        assert!(runtime.exec_control_tx.is_none());
+        assert!(runtime.ipc_task.is_none());
+    }
+
+    #[test]
+    fn unsupported_market_data_rejects_strict_quotes_registration() {
+        let mut venue = live_venue_config();
+        venue.name = "okx-quotes".into();
+        venue.venue_type = VenueType::Okx;
+        venue.symbol_catalog = vec![InstrumentId::new("BTCUSDT@OKX")];
+        let config = SystemConfig {
+            quotes_only: true,
+            venues: vec![venue],
+            ..Default::default()
+        };
+        let Err(error) = SystemBuilder::new(config).auto_register_adapters_strict() else {
+            panic!("strict startup accepted an unimplemented OKX market stream");
+        };
+        assert!(error.to_string().contains("okx-quotes"));
+        assert!(error.to_string().contains("not implemented"));
+    }
+
+    #[cfg(feature = "adapter-binance-data")]
+    #[test]
+    fn compiled_market_data_quotes_do_not_require_execution() {
+        let config = SystemConfig {
+            quotes_only: true,
+            venues: vec![live_venue_config()],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .auto_register_adapters_strict()
+            .expect("compiled Binance quote plans are available without execution");
+        assert_eq!(builder.market_stream_plans.len(), 1);
+        assert!(builder.execution_clients.is_empty());
+    }
+
+    #[cfg(all(
+        feature = "adapter-binance-execution",
+        not(feature = "adapter-binance-data")
+    ))]
+    #[tokio::test]
+    #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
+    async fn execution_only_account_control_skips_implicit_market_plan() {
+        for catalog in [Vec::new(), vec![InstrumentId::new("BTCUSDT@BINANCE")]] {
+            let mut venue = live_venue_config();
+            venue.execution_mode = Some("Paper".into());
+            venue.simulate_execution = true;
+            venue.symbol_catalog = catalog;
+            let config = SystemConfig {
+                venues: vec![venue],
+                ..Default::default()
+            };
+            let builder = SystemBuilder::new(config)
+                .auto_register_adapters_strict()
+                .expect("account control needs no quote feature or implicit quote plan");
+            assert!(builder.market_stream_plans.is_empty());
+            assert_eq!(builder.execution_clients.len(), 1);
+            let mut runtime = builder.build();
+            runtime.start().await.expect("account control starts");
+            assert!(runtime.exec_control_tx.is_some());
+            runtime.stop().await.expect("account control stops");
+        }
+    }
+
+    struct MarketPlanTestStrategy;
+
+    impl Strategy for MarketPlanTestStrategy {
+        fn on_market_event(&mut self, _: &MarketEvent, _: &AccountView) -> Vec<OrderIntent> {
+            Vec::new()
+        }
+
+        fn on_execution_event(&mut self, _: &ExecutionEvent, _: &AccountView) -> Vec<OrderIntent> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &str {
+            "manual-market-plan"
+        }
+
+        fn id(&self) -> &str {
+            "manual-market-plan:BTCUSDT"
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn market_data_intent_ignores_v2_catalog_endpoints_for_account_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = dir.path().join("venues.yaml");
+        std::fs::write(
+            &catalog,
+            "venues:\n  - venue_id: BINANCE\n    name: Binance\n    ws_public_endpoint: wss://stream.binance.com:9443/ws\n",
+        )
+        .unwrap();
+        let previous = std::env::var_os("HFT_VENUE_CATALOG");
+        std::env::set_var("HFT_VENUE_CATALOG", &catalog);
+        let loaded = super::config_loader::load_config_from_str(
+            "schema_version: v2\nengine:\n  queue_capacity: 1024\n  stale_us: 5000\n  top_n: 10\nvenues:\n  - name: binance\n    venue_type: BINANCE\n    execution_mode: Paper\n    simulate_execution: true\n    symbol_catalog: [BTCUSDT@BINANCE]\nstrategies: []\nrisk:\n  risk_type: Default\n  global_position_limit: 0\n  global_notional_limit: 0\n  max_daily_trades: 0\n  max_orders_per_second: 0\n  staleness_threshold_us: 5000\n",
+        );
+        match previous {
+            Some(value) => std::env::set_var("HFT_VENUE_CATALOG", value),
+            None => std::env::remove_var("HFT_VENUE_CATALOG"),
+        }
+        let config = loaded.expect("actual v2 account config loads");
+        assert!(config.venues[0].ws_public.is_some());
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert!(builder.market_stream_plans.is_empty());
+    }
+
+    #[test]
+    fn market_data_intent_includes_manually_registered_strategy_ids() {
+        let mut venue = live_venue_config();
+        venue.account_id = Some("binance-account".into());
+        let config = SystemConfig {
+            venues: vec![venue],
+            strategy_accounts: HashMap::from([(
+                "manual-market-plan:BTCUSDT".into(),
+                "binance-account".into(),
+            )]),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 1);
+        assert_eq!(builder.market_stream_plans[0].0, VenueType::Binance);
+    }
+
+    #[test]
+    fn market_data_intent_keeps_unrelated_venue_control_only() {
+        let mut binance = live_venue_config();
+        binance.account_id = Some("binance-account".into());
+        let mut okx = live_venue_config();
+        okx.name = "okx-control".into();
+        okx.account_id = Some("okx-account".into());
+        okx.venue_type = VenueType::Okx;
+        okx.symbol_catalog.clear();
+        let strategy = configured_strategy();
+        let config = SystemConfig {
+            venues: vec![binance, okx],
+            strategy_accounts: HashMap::from([(
+                format!("{}:BTCUSDT", strategy.name),
+                "binance-account".into(),
+            )]),
+            strategies: vec![strategy],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 1);
+        assert_eq!(builder.market_stream_plans[0].0, VenueType::Binance);
+    }
+
+    #[tokio::test]
+    async fn market_data_planning_rejection_survives_runtime_and_ipc_clone() {
+        let mut binance = live_venue_config();
+        binance.simulate_execution = true;
+        let mut okx = binance.clone();
+        okx.name = "okx-control".into();
+        okx.venue_type = VenueType::Okx;
+        let config = SystemConfig {
+            venues: vec![binance, okx],
+            router: Some(ports::RouterConfig::SameVenue {
+                default_venue: "unknown-market-data-venue".into(),
+            }),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .auto_register_adapters();
+        assert!(builder.market_data_planning_error.is_some());
+        let mut runtime = builder.build();
+        let mut ipc = runtime.clone_for_ipc();
+        for target in [&mut runtime, &mut ipc] {
+            let error = target
+                .start()
+                .await
+                .expect_err("invalid data route fails closed");
+            assert!(error.to_string().contains("unknown-market-data-venue"));
+            assert!(target.tasks.is_empty());
+            assert!(target.execution_worker_tasks.is_empty());
+            assert!(target.exec_control_tx.is_none());
+            assert!(target.ipc_task.is_none());
+            assert!(target.adapter_bridge.is_none());
+        }
+    }
+
+    #[test]
+    fn market_data_scope_rejects_account_and_actual_instance_route_conflict() {
+        let mut binance = live_venue_config();
+        binance.account_id = Some("binance-account".into());
+        let mut okx = binance.clone();
+        okx.name = "okx-control".into();
+        okx.account_id = Some("okx-account".into());
+        okx.venue_type = VenueType::Okx;
+        let config = SystemConfig {
+            venues: vec![binance, okx],
+            strategy_accounts: HashMap::from([(
+                "manual-market-plan:BTCUSDT".into(),
+                "binance-account".into(),
+            )]),
+            router: Some(ports::RouterConfig::StrategyMap {
+                strategy_venues: HashMap::from([(
+                    "manual-market-plan:BTCUSDT".into(),
+                    "OKX".into(),
+                )]),
+                default_venue: "BINANCE".into(),
+            }),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+    }
+
+    #[test]
+    fn market_data_scope_rejects_unrelated_manual_plan_for_typed_strategy() {
+        let mut first = live_venue_config();
+        first.account_id = Some("binance-first".into());
+        let mut second = first.clone();
+        second.name = "binance-second".into();
+        second.account_id = Some("binance-second".into());
+        let strategy = StrategyConfig {
+            name: "typed-binance".into(),
+            strategy_type: StrategyType::Formula,
+            symbols: vec![Symbol::new("BTCUSDT")],
+            params: StrategyParams::Formula {
+                ast: hft_factor_dsl::FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                    "book_imbalance".into(),
+                )),
+                max_order_notional: Decimal::ONE,
+                signal_threshold: 0.0,
+                target_position: false,
+                evaluation_interval_millis: None,
+                execution_contract: Some(FormulaExecutionContract {
+                    venue: VenueId::BINANCE,
+                    venue_spec: ports::VenueSpec::default(),
+                    cross_spread: false,
+                }),
+            },
+            risk_limits: StrategyRiskLimits::default(),
+        };
+        let config = SystemConfig {
+            venues: vec![first, second],
+            strategies: vec![strategy],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_market_stream_plan(
+                VenueType::Bitget,
+                "unrelated-bitget".into(),
+                vec![Symbol::new("BTCUSDT")],
+            )
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+    }
+
+    #[test]
+    fn subscription_followup_keeps_distinct_instance_catalogs() {
+        let mut btc = live_venue_config();
+        btc.name = "binance-btc".into();
+        btc.symbol_catalog = vec![InstrumentId::new("BTCUSDT@BINANCE")];
+        let mut eth = btc.clone();
+        eth.name = "binance-eth".into();
+        eth.symbol_catalog = vec![InstrumentId::new("ETHUSDT@BINANCE")];
+        let config = SystemConfig {
+            quotes_only: true,
+            venues: vec![btc, eth],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 2);
+        assert_eq!(
+            builder.market_stream_plans[0].2[0].symbol,
+            Symbol::new("BTCUSDT")
+        );
+        assert_eq!(
+            builder.market_stream_plans[1].2[0].symbol,
+            Symbol::new("ETHUSDT")
+        );
+    }
+
+    #[test]
+    fn subscription_followup_rejects_undeclared_account_name() {
+        let mut binance = live_venue_config();
+        binance.name = "name-is-not-an-account".into();
+        binance.account_id = None;
+        let config = SystemConfig {
+            venues: vec![binance],
+            strategy_accounts: HashMap::from([(
+                "manual-market-plan:BTCUSDT".into(),
+                "name-is-not-an-account".into(),
+            )]),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+    }
+
+    #[test]
+    fn subscription_followup_plans_every_explicit_round_robin_target() {
+        let mut binance = live_venue_config();
+        binance.name = "binance".into();
+        let mut bitget = binance.clone();
+        bitget.name = "bitget".into();
+        bitget.venue_type = VenueType::Bitget;
+        bitget.symbol_catalog = vec![InstrumentId::new("BTCUSDT@BITGET")];
+        let config = SystemConfig {
+            venues: vec![binance, bitget],
+            router: Some(ports::RouterConfig::RoundRobin {
+                venues: vec!["BINANCE".into(), "BITGET".into()],
+            }),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 2);
+        assert!(builder
+            .market_stream_plans
+            .iter()
+            .any(|p| p.0 == VenueType::Binance));
+        assert!(builder
+            .market_stream_plans
+            .iter()
+            .any(|p| p.0 == VenueType::Bitget));
+    }
+
+    #[test]
+    fn subscription_followup_clears_error_after_manual_plan_repairs_scope() {
+        let mut binance = live_venue_config();
+        binance.name = "binance".into();
+        let mut bitget = binance.clone();
+        bitget.name = "bitget-control".into();
+        bitget.venue_type = VenueType::Bitget;
+        let config = SystemConfig {
+            venues: vec![binance, bitget],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+        let builder = builder
+            .register_market_stream_plan(
+                VenueType::Binance,
+                "binance".into(),
+                vec![Symbol::new("BTCUSDT")],
+            )
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_none());
+        assert_eq!(builder.market_stream_plans.len(), 1);
+    }
+
+    #[test]
+    fn subscription_followup_rejects_requested_prediction_target_without_quote_inputs() {
+        let mut binance = live_venue_config();
+        binance.name = "binance".into();
+        let mut prediction = binance.clone();
+        prediction.name = "prediction".into();
+        prediction.venue_type = VenueType::BinancePrediction;
+        prediction.symbol_catalog.clear();
+        prediction.data_config = None;
+        let config = SystemConfig {
+            venues: vec![binance, prediction],
+            router: Some(ports::RouterConfig::RoundRobin {
+                venues: vec!["BINANCE".into(), "BINANCE_PREDICTION".into()],
+            }),
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .register_strategy(MarketPlanTestStrategy)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+    }
+
+    #[test]
+    fn requested_target_catalog_must_cover_each_strategy_before_sharding() {
+        for account_bound in [false, true] {
+            let mut binance = live_venue_config();
+            binance.name = "binance".into();
+            binance.symbol_catalog = vec![InstrumentId::new("BTCUSDT@BINANCE")];
+            let mut bitget = binance.clone();
+            bitget.name = "bitget".into();
+            bitget.venue_type = VenueType::Bitget;
+            bitget.account_id = Some("bitget-account".into());
+            bitget.symbol_catalog = vec![InstrumentId::new("ETHUSDT@BITGET")];
+            let strategy = configured_strategy();
+            let mut config = SystemConfig {
+                venues: vec![binance, bitget],
+                strategies: vec![strategy.clone()],
+                router: Some(ports::RouterConfig::RoundRobin {
+                    venues: vec!["BINANCE".into(), "BITGET".into()],
+                }),
+                ..Default::default()
+            };
+            if account_bound {
+                config
+                    .strategy_accounts
+                    .insert(strategy.name.clone(), "bitget-account".into());
+            }
+            let builder = SystemBuilder::new(config)
+                .register_market_stream_plan(
+                    VenueType::Binance,
+                    "binance".into(),
+                    vec![Symbol::new("BTCUSDT")],
+                )
+                .with_sharding(crate::ShardConfig::new(
+                    0,
+                    2,
+                    crate::ShardStrategy::SymbolHash,
+                ))
+                .register_market_streams_from_config();
+            assert!(
+                builder.market_data_planning_error.is_some(),
+                "account_bound={account_bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_quote_validation_rejects_foreign_catalog_before_empty_shard() {
+        let mut venue = live_venue_config();
+        venue.name = "prediction".into();
+        venue.venue_type = VenueType::BinancePrediction;
+        venue.symbol_catalog = vec![InstrumentId::new("112233@BINANCE")];
+        venue.data_config = Some(
+            serde_yaml::from_str("outcomes:\n  - token_id: '112233'\n    market_id: 1\n").unwrap(),
+        );
+        let shard = (0..2)
+            .map(|i| crate::ShardConfig::new(i, 2, crate::ShardStrategy::SymbolHash))
+            .find(|s| !s.should_handle(&BaseSymbol::from("112233"), &VenueId::BINANCE))
+            .unwrap();
+        let config = SystemConfig {
+            quotes_only: true,
+            venues: vec![venue],
+            ..Default::default()
+        };
+        let builder = SystemBuilder::new(config)
+            .with_sharding(shard)
+            .register_market_streams_from_config();
+        assert!(builder.market_data_planning_error.is_some());
+    }
+
+    #[test]
+    fn requested_quote_validation_checks_outcome_coverage_before_empty_shard() {
+        for yaml in ["{}", "outcomes:\n  - token_id: 'other'\n    market_id: 1\n"] {
+            let mut venue = live_venue_config();
+            venue.name = "prediction".into();
+            venue.venue_type = VenueType::BinancePrediction;
+            venue.symbol_catalog = vec![InstrumentId::new("112233@BINANCE_PREDICTION")];
+            venue.data_config = Some(serde_yaml::from_str(yaml).unwrap());
+            let shard = (0..2)
+                .map(|i| crate::ShardConfig::new(i, 2, crate::ShardStrategy::SymbolHash))
+                .find(|s| {
+                    !s.should_handle(&BaseSymbol::from("112233"), &VenueId::BINANCE_PREDICTION)
+                })
+                .unwrap();
+            let config = SystemConfig {
+                quotes_only: true,
+                venues: vec![venue],
+                ..Default::default()
+            };
+            let builder = SystemBuilder::new(config)
+                .with_sharding(shard)
+                .register_market_streams_from_config();
+            assert!(builder.market_data_planning_error.is_some());
+        }
     }
 }

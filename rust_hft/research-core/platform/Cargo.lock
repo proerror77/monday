@@ -656,16 +656,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-research-agent-contracts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "hft-research-agent-improvement"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hft-research-agent-contracts",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "hft-research-platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "chrono",
  "ed25519-dalek",
  "futures-util",
  "getrandom 0.2.17",
  "hft-cex-research-input",
+ "hft-research-agent-contracts",
+ "hft-research-agent-improvement",
+ "hmac",
+ "jsonwebtoken",
  "reqwest",
  "rustix 0.38.44",
  "serde",
@@ -988,6 +1013,19 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64",
+ "js-sys",
+ "ring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

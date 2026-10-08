@@ -13,8 +13,8 @@ test "$(docker image inspect --format '{{.Config.WorkingDir}}' "$image")" = /wor
 # Run only local packaging probes. Never invoke the Campaign entrypoint or
 # forward host credentials; even the client version probes have no network.
 docker run --rm --network none --entrypoint /bin/bash "$image" -ceu '
-  for tool in bash curl jq tini; do test -x "/usr/bin/$tool"; done
-  for tool in aliyun kubectl alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
+  for tool in bash curl jq tini git gh ruby unzip; do test -x "/usr/bin/$tool"; done
+  for tool in aliyun kubectl research-release-publisher alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
     test -x "/usr/local/bin/$tool"
   done
   test -x /usr/local/bin/cex-materialization-entrypoint.sh
@@ -25,6 +25,13 @@ docker run --rm --network none --entrypoint /bin/bash "$image" -ceu '
   bash -n /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
   bash -n /opt/monday/deployment/aliyun/research/scripts/campaign-job-watch.sh
   test "$(/usr/local/bin/alpha-harness --version)" = "alpha-harness $1"
+  test "$(/usr/local/bin/research-release-publisher --version)" = "research-release-publisher $1"
+  git --version
+  gh --version
+  /usr/bin/gh api --help | grep -Fq -- "--paginate"
+  /usr/bin/ruby -rjson -rdigest -rzlib -rfileutils -rpathname -rrubygems/package -e "abort unless defined?(Gem::Package::TarReader) && defined?(Gem::Package::TarWriter)"
+  /usr/bin/unzip -v >/dev/null
+  test -s /etc/ssl/certs/ca-certificates.crt
   /usr/local/bin/aliyun version
   /usr/local/bin/kubectl version --client=true
 ' -- "$source"
@@ -37,7 +44,7 @@ cleanup() {
 }
 trap cleanup EXIT
 container_id=$(docker create "$image")
-for binary in alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
+for binary in research-release-publisher alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
   docker cp "$container_id:/usr/local/bin/$binary" "$readback/$binary"
   cmp "$readback/$binary" "$binaries/$binary"
 done

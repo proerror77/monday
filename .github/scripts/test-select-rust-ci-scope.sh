@@ -198,10 +198,18 @@ release_metadata_paths=(
   .github/scripts/research-image-release-artifact.sh
   .github/scripts/test-research-image-release-artifact.sh
   .github/scripts/publish-research-build-release.sh
+  .github/scripts/select-research-oss-policy.jq
+  .github/scripts/migrate-research-oss-policy.sh
+  .github/scripts/test-migrate-research-oss-policy.sh
   .github/scripts/verify-research-runner-binaries.sh
   .github/scripts/read-acr-publish-source.sh
   .github/scripts/select-acr-publish-source.sh
   .github/scripts/test-acr-publish-source-readback.sh
+  .github/workflows/release.yml
+  .github/scripts/decide-release-once.sh
+  .github/scripts/read-release-published.sh
+  .github/scripts/release-orchestrator-admit.sh
+  .github/scripts/test-release-once.sh
 )
 for kind in ack release; do
   if [[ $kind == ack ]]; then infrastructure_paths=("${ack_metadata_paths[@]}"); else infrastructure_paths=("${release_metadata_paths[@]}"); fi
@@ -462,6 +470,11 @@ for event in pull_request push; do
   printf '%s\n' rust_hft/research-core/platform/src/build.rs >"$tmp_dir/control-owner.txt"
   control_owner=$(run_case "control-owner-$event" "$event" control-owner.txt "$owners_metadata")
   assert_owning_packages "$control_owner" hft-research-platform
+  grep -Eq '^research_product=(cex-runner,)?controller(,prediction-runner)?$' "$control_owner"
+  if [[ $event == push ]]; then
+    grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$control_owner"
+    grep -Eq '^jobs=.*,(ploy/research-image-smoke),' "$control_owner"
+  fi
   grep -Fqx 'loop_packages=,alpha-harness,hft-cex-research-worker,' "$control_owner"
   grep -Eq '^jobs=.*,(ci/research-foundation),' "$control_owner"
   grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$control_owner"
@@ -471,6 +484,18 @@ for event in pull_request push; do
   if grep -Eq '^jobs=.*,(ci/rust|ci/research-foundation|ploy/research-image-binaries|ploy/research-image-smoke),' "$owner_docs"; then
     echo 'docs-only owner graph selected compilation' >&2; exit 1
   fi
+done
+
+# A future platform-only change must rebuild its direct controller product even
+# when no Alpha/CEX package depends on that workspace.
+jq '.packages |= map(.dependencies |= map(select(.name != "hft-research-platform")))' "$owners_metadata" >"$tmp_dir/isolated-platform.metadata"
+for event in pull_request push; do
+  isolated_platform=$(run_case "isolated-platform-$event" "$event" control-owner.txt "$tmp_dir/isolated-platform.metadata")
+  assert_owning_packages "$isolated_platform" hft-research-platform
+  grep -Fqx 'loop_packages=,,' "$isolated_platform"
+  grep -Fqx 'research_product=controller' "$isolated_platform"
+  grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$isolated_platform"
+  grep -Eq '^jobs=.*,(ploy/research-image-smoke),' "$isolated_platform"
 done
 
 same_suite=$(run_case same-suite pull_request same-suite.txt)
@@ -567,9 +592,21 @@ grep -Fqx '      CARGO_PROFILE_DEV_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '  rust_fast_gates:' "$ci_workflow"
 grep -Fqx '      - rust_fast_gates' "$ci_workflow"
-grep -Fqx '      RUSTC_WRAPPER: sccache' "$ci_workflow"
-grep -Fqx '      SCCACHE_GHA_ENABLED: "false"' "$ci_workflow"
-grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' "$ci_workflow"
+# Compilation cache is Swatinem/rust-cache only. sccache must not wrap rustc or
+# write a GHA backend; pull requests restore main's cache and do not save.
+for workflow in \
+  "$ci_workflow" \
+  "$script_dir/../workflows/ploy-ci.yml" \
+  "$script_dir/../workflows/release-rust.yml" \
+  "$script_dir/../workflows/security-enabled.yml" \
+  "$script_dir/../workflows/acr-publish.yml" \
+  "$script_dir/../workflows/docker-publish.yml" \
+  "$script_dir/../workflows/docker-smoke.yml"; do
+  if grep -Fq 'sccache' "$workflow" || grep -Fq 'RUSTC_WRAPPER' "$workflow" || grep -Fq 'mode=max' "$workflow"; then
+    echo "sccache or gha mode=max must stay out of $workflow" >&2
+    exit 1
+  fi
+done
 
 # Job-block extraction: lines from '^  <name>:' up to (excluding) the next
 # two-space top-level job key.
@@ -597,15 +634,12 @@ grep -Fq "find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \\;" <<<"$
 grep -Fq 'Enforce Rust-only research and runtime source' <<<"$fast_gates_block"
 grep -Fq 'Python runtime or package-manager command' <<<"$fast_gates_block"
 
-# sccache must be wired into EACH of the two heavy jobs (per-job presence,
-# not a file-wide count).
-grep -Fqx '      RUSTC_WRAPPER: sccache' <<<"$rust_job_block"
-grep -Fqx '      SCCACHE_GHA_ENABLED: "false"' <<<"$rust_job_block"
-grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$rust_job_block"
+# Each heavy Rust job saves Swatinem/rust-cache only from main.
+grep -Fq 'uses: Swatinem/rust-cache@' <<<"$rust_job_block"
+grep -Fq "save-if: \${{ github.ref == 'refs/heads/main' }}" <<<"$rust_job_block"
 fast_lane_block=$(job_block rust_hft_engine_fast_lane)
-grep -Fqx '      RUSTC_WRAPPER: sccache' <<<"$fast_lane_block"
-grep -Fqx '      SCCACHE_GHA_ENABLED: "false"' <<<"$fast_lane_block"
-grep -Fq 'uses: mozilla-actions/sccache-action@v0.0.10' <<<"$fast_lane_block"
+grep -Fq 'uses: Swatinem/rust-cache@' <<<"$fast_lane_block"
+grep -Fq "save-if: \${{ github.ref == 'refs/heads/main' }}" <<<"$fast_lane_block"
 
 # Suite placement is pinned both ways: fast-only work stays out of the heavy
 # job, and each suite's required home is asserted positively.
@@ -636,7 +670,7 @@ recorder_block=$(job_block market_recorder_contract)
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fq "if: \${{ (always() && needs.scope.outputs.toolchain == 'true') }}" <<<"$rust_job_block"
+grep -Fq 'key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}' <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
@@ -691,13 +725,9 @@ metadata_case field-type example Audit '' 'interface: {display_name: 42}' fail
 metadata_case short-description example Audit '' 'interface: {short_description: tiny}' fail
 metadata_case prompt example Audit '' 'interface: {default_prompt: Audit this}' fail
 metadata_case color example Audit '' 'interface: {brand_color: red}' fail
-# sccache must use the #559/#566 pattern (sccache-action + per-job local
-# cache, rustc/sccache-versioned rust-cache keys, continue-on-error fallback) in
-# EVERY ploy-ci job that compiles Rust on the runner, and the homegrown
-# actions/cache sccache block must stay removed.
-if grep -Fq 'sccache --zero-stats' "$ploy_workflow"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-if grep -Fq 'cargo install sccache' "$ploy_workflow"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-if grep -Fq 'path: ~/.cache/sccache' "$ploy_workflow"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+# Prediction-market Rust jobs keep a shared rust-cache key and save only on main.
+# The removed per-job sccache directory cache must not come back.
+if grep -Fq 'path: ~/.cache/sccache' "$ploy_workflow"; then echo "unexpected sccache directory cache" >&2; exit 1; fi
 ploy_job_block() {
   awk -v job="^  $1:" '$0 ~ job {found=1; next} /^  [a-z0-9-]+:/ {found=0} found' "$ploy_workflow"
 }
@@ -709,14 +739,23 @@ for ploy_rust_job in \
   integration-regressions; do
   ploy_block=$(ploy_job_block "$ploy_rust_job")
   [ -n "$ploy_block" ]
-  grep -Fqx '      RUSTC_WRAPPER: sccache' <<<"$ploy_block"
-  grep -Fqx '      SCCACHE_GHA_ENABLED: "false"' <<<"$ploy_block"
-  grep -Fqx '        uses: mozilla-actions/sccache-action@v0.0.10' <<<"$ploy_block"
-  grep -Fqx '        continue-on-error: true' <<<"$ploy_block"
-  grep -Fq "if: steps.sccache.outcome == 'failure'" <<<"$ploy_block"
+  grep -Fq 'uses: Swatinem/rust-cache@' <<<"$ploy_block"
+  grep -Fq "save-if: \${{ github.ref == 'refs/heads/main' }}" <<<"$ploy_block"
   grep -Fq 'steps.cache-info.outputs.rust' <<<"$ploy_block"
-  grep -Fq 'steps.cache-info.outputs.sccache' <<<"$ploy_block"
+  if grep -Fq 'steps.cache-info.outputs.sccache' <<<"$ploy_block"; then echo "unexpected sccache cache key" >&2; exit 1; fi
   if grep -Fq -- '}}-${{ github.sha }}' <<<"$ploy_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
+done
+# Docker GHA cache exports final layers only, and only from main. Pull requests
+# keep cache-from so they can read that cache.
+for workflow in \
+  "$ci_workflow" \
+  "$script_dir/../workflows/security-enabled.yml" \
+  "$script_dir/../workflows/docker-smoke.yml" \
+  "$script_dir/../workflows/docker-publish.yml" \
+  "$script_dir/../workflows/acr-publish.yml"; do
+  grep -Fq 'cache-from: type=gha' "$workflow"
+  grep -Fq "github.ref == 'refs/heads/main'" "$workflow"
+  grep -Fq 'mode=min' "$workflow"
 done
 # Native test/build jobs preserve domain coverage and have no resource relay.
 ruby -ryaml - "$ci_workflow" "$script_dir/../workflows/security-enabled.yml" "$ploy_workflow" <<'RUBY'
@@ -857,32 +896,9 @@ summary_upload_line=$(grep -nF '      - name: Upload summary' "$security_workflo
 security_gate_line=$(grep -nF '      - name: Require selected security jobs to pass' "$security_workflow" | cut -d: -f1)
 ((security_gate_line > summary_upload_line))
 
-docker_publish_workflow="$script_dir/../workflows/docker-publish.yml"
-expected_docker_publish_triggers=$(printf '%s\n' \
-  '  workflow_run:' \
-  '    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]' \
-  '    types: [completed]' \
-  '    branches: [main]' \
-  '  push:' \
-  '    tags:' \
-  "      - 'v*'" \
-  '  workflow_dispatch:')
-assert_docker_publish_triggers() {
-  local trigger_block
-  trigger_block=$(sed -n '/^  workflow_run:$/,/^  workflow_dispatch:$/p' "$1")
-  [[ $trigger_block == "$expected_docker_publish_triggers" ]] || return 1
-  grep -Fq 'bash .github/scripts/select-main-image-scope.sh "$SOURCE_SHA" "$plan"' "$1" &&
-    grep -Fq 'any(.include[]; .name=="hft-core")' "$1"
-}
-assert_docker_publish_triggers "$docker_publish_workflow"
-
-docker_publish_counterexample="$tmp_dir/docker-publish-extra-path.yml"
-sed 's@.name=="hft-core"@.name=="research-runner"@' \
-  "$docker_publish_workflow" >"$docker_publish_counterexample"
-if assert_docker_publish_triggers "$docker_publish_counterexample"; then
-  echo 'Docker Publish trigger contract accepted an unrelated path' >&2
-  exit 1
-fi
+# Release wakeups, the single reusable entry, and the hft-core guard live in
+# test-release-once.sh. This scope test still runs that contract.
+bash "$script_dir/test-release-once.sh"
 
 listing_monitor_workflow="$script_dir/../workflows/deploy-listing-monitor.yml"
 expected_listing_monitor_triggers=$(printf '%s\n' 'on:' '  workflow_dispatch:')

@@ -84,6 +84,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     sqlx_core::raw_sql::raw_sql(BUILD_RELEASE_MIGRATION)
         .execute(&pool)
         .await?;
+    sqlx_core::raw_sql::raw_sql(hft_research_platform::postgres::BUILD_IMPORT_ADMISSION_MIGRATION)
+        .execute(&pool)
+        .await?;
     sqlx_core::raw_sql::raw_sql(SESSION_DELIVERY_MIGRATION)
         .execute(&pool)
         .await?;
@@ -267,6 +270,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     assert!(package.import(&ledger).await.is_err());
     assert!(ledger.build_artifact(&artifact.id()?).await.is_err());
     std::fs::write(source_path, b"source fixture")?;
+    ledger
+        .set_build_import_admission(&package.admission)
+        .await?;
     let artifact_id = package.import(&ledger).await?;
     assert_eq!(package.import(&ledger).await?, artifact_id);
     assert_eq!(ledger.build_artifact(&artifact_id).await?, artifact);

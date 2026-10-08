@@ -26,8 +26,12 @@ pub mod preparation;
 #[cfg(any(feature = "control", feature = "release-verification"))]
 pub mod release;
 #[cfg(feature = "publisher")]
+pub mod release_oss;
+#[cfg(feature = "publisher")]
 pub mod release_publisher;
 pub mod research;
+#[cfg(feature = "researcher-verification")]
+pub mod researcher;
 #[cfg(feature = "control")]
 pub mod retirement;
 #[cfg(feature = "native-admission")]
@@ -64,3 +68,6 @@ pub mod worker;
 
 #[cfg(feature = "artifact-io")]
 pub mod transport;
+
+#[cfg(feature = "control")]
+pub mod foundation;

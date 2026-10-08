@@ -6,6 +6,13 @@ use crate::{
         MAX_MATERIALIZATION_BYTES,
     },
 };
+use alpha_domain::representation::{
+    campaign_minimum_rows, CAMPAIGN_DEFAULT_EMBARGO_ROWS as EMBARGO_ROWS,
+    CAMPAIGN_DEFAULT_MIN_ROWS as MIN_ROWS, CAMPAIGN_DEFAULT_PURGE_ROWS as PURGE_ROWS,
+    CAMPAIGN_FOLD_COUNT as FOLD_COUNT, CAMPAIGN_HOLDOUT_ROWS as HOLDOUT_ROWS,
+    CAMPAIGN_INITIAL_TRAIN_ROWS as INITIAL_TRAIN_ROWS, CAMPAIGN_SELECTION_ROWS as SELECTION_ROWS,
+    CAMPAIGN_VALIDATION_ROWS as VALIDATION_ROWS,
+};
 use alpha_domain::{
     campaign_horizon::CampaignLabelHorizonV1, canonical_json_hash, CexBaselinePolicyV1,
     CexEqualAbsoluteWeightPolicyV1, CexEventReplayPolicyV1, CexGpPolicyV1, CexResearchContentRefV1,
@@ -39,22 +46,6 @@ const SEARCH_POLICY_REVISION_SCHEMA_V2: &str = "cex-campaign-search-policy-revis
 const LEARNING_DIRECTIVE_SCHEMA_V1: &str = "cex-campaign-learning-directive-v1";
 const RESEARCH_EVIDENCE_SIGNATURE_SCHEMA_V2: &str = "cex-campaign-research-evidence-signature-v2";
 pub(crate) const MAX_RESEARCH_PLAN_GENERATION: u8 = 3;
-const INITIAL_TRAIN_ROWS: usize = 7_200;
-const VALIDATION_ROWS: usize = 3_600;
-const FOLD_COUNT: usize = 3;
-// Labels mature five seconds after observation. Leave another full horizon
-// before validation so the bound trainer's purge/embargo contract is real.
-const PURGE_ROWS: usize = 10;
-// Keep the last validation label strictly before the sealed holdout.
-const EMBARGO_ROWS: usize = 5;
-const HOLDOUT_ROWS: usize = 3_600;
-const SELECTION_ROWS: usize = 3_600;
-const MIN_ROWS: usize = INITIAL_TRAIN_ROWS
-    + FOLD_COUNT * (VALIDATION_ROWS + EMBARGO_ROWS)
-    + PURGE_ROWS
-    + SELECTION_ROWS
-    + 2 * PURGE_ROWS
-    + HOLDOUT_ROWS;
 const MAX_EXPANSIONS: u64 = 256;
 const GP_POLICY_ID: &str = "binance-cex-1s-top5-factor-plan-v5-gp-policy";
 const BASELINE_POLICY_ID: &str = "binance-cex-1s-top5-baseline-policy";
@@ -424,6 +415,9 @@ impl CexCampaignLearningDirectiveV1 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CexCampaignResearchPlanV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) representation_binding:
+        Option<alpha_domain::representation::RepresentationCampaignBindingV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) calendar: Option<alpha_domain::EvaluationCalendarV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) development_precheck: Option<crate::mission_calendar::DevelopmentPrecheckReceiptV1>,
@@ -585,10 +579,10 @@ impl CexCampaignResearchPlanV1 {
             parent: None,
             learning_directive: None,
             llm: None,
+            representation_binding: None,
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn h2() -> Self {
         let mut plan = Self::canonical();
         plan.objective = "Generate and screen continuous L2 microstructure factors, including lagged sixty-second Cont best-quote order-flow imbalance, inverse spread, cross-depth pressure consensus, top-five depth concentration, and VWAP-center displacement, then evaluate Ridge and shallow CART with purged walk-forward OOS predictions on the bound Binance instrument and prediction horizon under governed dynamic-v4 GP"
@@ -851,6 +845,9 @@ impl CexCampaignResearchPlanV1 {
             }
             _ => bail!("CEX Campaign follow-up requires parent and learning directive"),
         }
+        crate::mission_campaign::representation::validate_research_plan_binding(
+            &ValidatedCexResearchPlanBase { plan: self },
+        )?;
         Ok(())
     }
 
@@ -861,6 +858,10 @@ impl CexCampaignResearchPlanV1 {
 
     pub(crate) fn max_candidates(&self) -> anyhow::Result<usize> {
         self.validate()?;
+        self.candidate_count_from_validated_base()
+    }
+
+    fn candidate_count_from_validated_base(&self) -> anyhow::Result<usize> {
         self.search_policy_revision
             .research_delta
             .as_ref()
@@ -884,6 +885,20 @@ impl CexCampaignResearchPlanV1 {
                     .gp_template_count()
                 },
             )
+    }
+}
+
+/// Only the completed base validation above can construct this borrow.
+/// The representation check uses it to count candidates without entering validation again.
+pub(crate) struct ValidatedCexResearchPlanBase<'a> {
+    plan: &'a CexCampaignResearchPlanV1,
+}
+impl ValidatedCexResearchPlanBase<'_> {
+    pub(crate) fn plan(&self) -> &CexCampaignResearchPlanV1 {
+        self.plan
+    }
+    pub(crate) fn max_candidates(&self) -> anyhow::Result<usize> {
+        self.plan.candidate_count_from_validated_base()
     }
 }
 
@@ -1506,6 +1521,12 @@ pub(crate) fn render_prepared_cex_bundle(
         operational: CexResearchOperationalMetadataV1::default(),
     };
     mission.validate()?;
+    crate::mission_campaign::representation::validate_rendered_binding(
+        research_plan,
+        &mission,
+        materialization,
+        multiple_testing_trials,
+    )?;
     let mission_id = mission.semantic_id()?;
     Ok(RenderedCexMission {
         mission,
@@ -1707,17 +1728,7 @@ fn rendered_research_market(
 }
 
 fn minimum_rows_for_horizon(horizon: &CampaignLabelHorizonV1) -> anyhow::Result<usize> {
-    let fold_rows = VALIDATION_ROWS
-        .checked_add(horizon.embargo_rows)
-        .and_then(|rows| FOLD_COUNT.checked_mul(rows))
-        .context("typed Campaign horizon row budget overflowed")?;
-    INITIAL_TRAIN_ROWS
-        .checked_add(fold_rows)
-        .and_then(|rows| rows.checked_add(horizon.purge_rows))
-        .and_then(|rows| rows.checked_add(SELECTION_ROWS))
-        .and_then(|rows| rows.checked_add(horizon.purge_rows.checked_mul(2)?))
-        .and_then(|rows| rows.checked_add(HOLDOUT_ROWS))
-        .context("typed Campaign horizon row budget overflowed")
+    campaign_minimum_rows(horizon.purge_rows, horizon.embargo_rows).map_err(anyhow::Error::msg)
 }
 
 fn ensure_materialization_scope(
@@ -2550,6 +2561,7 @@ pub(crate) mod tests {
             ),
             parent: Some(parent),
             learning_directive: Some(learning_directive),
+            representation_binding: None,
             llm: Some(CexCampaignLlmProvenanceV1 {
                 provider: "test".to_string(),
                 model: "test".to_string(),
@@ -2753,6 +2765,7 @@ pub(crate) mod tests {
             parent: Some(parent),
             learning_directive: Some(directive),
             llm: None,
+            representation_binding: None,
         };
         plan.validate().unwrap();
         let rendered = render_cex_bundle(

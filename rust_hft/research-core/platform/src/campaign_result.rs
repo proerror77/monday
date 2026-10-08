@@ -150,7 +150,7 @@ impl CexCampaignResultReceipt {
 
 /// Transport-level archive verification, independent of the worker's entry
 /// claims. This does not evaluate a model or permit scientific promotion.
-#[cfg(feature = "control")]
+#[cfg(feature = "campaign-result-validation")]
 pub fn verify_archive_entries(
     source: impl std::io::Read + std::io::Seek,
     expected: &[ArchiveEntry],
@@ -227,7 +227,7 @@ pub fn verify_archive_entries(
     Ok(())
 }
 
-#[cfg(all(test, feature = "control"))]
+#[cfg(all(test, feature = "campaign-result-validation"))]
 mod tests {
     use super::*;
     #[test]
