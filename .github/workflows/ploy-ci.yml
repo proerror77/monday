@@ -848,6 +848,44 @@ jobs:
           echo "### Frontend lane" >> "$GITHUB_STEP_SUMMARY"
           echo "TypeScript is limited to the operator UI; the agent sidecar runs in the Rust control-plane lane." >> "$GITHUB_STEP_SUMMARY"
 
+  strategy-config-contracts:
+    name: Prediction strategy configuration contracts
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/strategy-config-contracts,') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+
+      - name: Install build dependencies
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev clang lld
+
+      - name: Cache configuration test dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rust_hft/prediction-markets
+          shared-key: prediction-strategy-config-1.98.1
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Validate changed configuration files and parser contracts
+        working-directory: .
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          bash .github/scripts/run-strategy-config-contracts.sh
+          --event "${GITHUB_EVENT_NAME}"
+          --base "${BASE_SHA}"
+          --head "${HEAD_SHA}"
+
   architecture-contracts:
     name: Prediction architecture contracts
     needs: image-smoke-scope
@@ -960,6 +998,7 @@ jobs:
       - rust-research-heavy
       - frontend
       - integration-regressions
+      - strategy-config-contracts
       - architecture-contracts
     if: ${{ always() }}
     runs-on: ubuntu-latest

@@ -245,7 +245,7 @@ if [[ -n $changed_files ]]; then
 else
   [[ -n $base ]] || { printf '%s\n' '--base is required when changed files are not provided' >&2; exit 2; }
   while IFS= read -r -d '' path; do paths+=("$path"); done \
-    < <(git diff --no-renames --name-only --diff-filter=ACMRD -z "$base...$head")
+    < <(git diff --no-renames --name-only --diff-filter=ACMRDT -z "$base...$head")
 fi
 
 needs_metadata=false
@@ -338,6 +338,13 @@ for path in "${paths[@]}"; do
       select_job ploy/frontend
       continue
       ;;
+    rust_hft/prediction-markets/config/strategies/*.toml|rust_hft/prediction-markets/config/default.toml)
+      # These files configure a Run. Their parser and architecture contracts
+      # validate them without rebuilding research release products.
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      select_job ploy/strategy-config-contracts
+      continue
+      ;;
     rust_hft/prediction-markets/*.md)
       continue
       ;;
@@ -407,6 +414,13 @@ for path in "${paths[@]}"; do
     .github/scripts/run-prediction-research-contracts.sh)
       select_job ploy/rust-research-heavy
       select_job ploy/workflow-lint
+      continue
+      ;;
+    .github/scripts/run-strategy-config-contracts.sh|.github/scripts/test-strategy-config-contracts.sh)
+      select_job ploy/strategy-config-contracts
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
     .github/scripts/write-ci-rust-evidence.sh|.github/scripts/verify-ci-rust-evidence.sh|.github/scripts/wait-ci-rust-evidence.sh|.github/scripts/test-ci-rust-evidence.sh|.github/scripts/check-collector-test-presence.sh)
@@ -655,6 +669,7 @@ for path in "${paths[@]}"; do
     rust_hft/deployment/docker/*|rust_hft/deployment/k8s/*|rust_hft/.dockerignore|\
     rust_hft/Cargo.toml|rust_hft/Cargo.lock|rust_hft/prediction-markets/Cargo.toml|\
     rust_hft/prediction-markets/Cargo.lock|rust_hft/prediction-markets/ploy-frontend/*|\
+    rust_hft/prediction-markets/config/strategies/*.toml|rust_hft/prediction-markets/config/default.toml|\
     rust_hft/prediction-markets/*.md|rust_hft/rust-toolchain*|rust_hft/.cargo/*|\
     rust_hft/AGENTS.md|rust_hft/*/AGENTS.md|rust_hft/CLAUDE.md|rust_hft/*/CLAUDE.md)
       continue

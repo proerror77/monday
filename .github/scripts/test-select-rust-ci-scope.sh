@@ -2,6 +2,11 @@
 # shellcheck disable=SC2016
 set -euo pipefail
 
+case ${1:-} in
+  ''|--strategy-config) ;;
+  *) printf 'unknown test scope: %s\n' "$1" >&2; exit 2 ;;
+esac
+
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 selector="$script_dir/select-rust-ci-scope.sh"
 fixtures="$script_dir/fixtures/rust-ci-scope"
@@ -166,6 +171,42 @@ for job_case in "${job_cases[@]}"; do
   assert_owning_packages "$output" "${expected_owning:-}"
   assert_flag "$output" selection_complete true
 done
+
+# Parameter edits keep parsing and authority checks, without release products.
+for event in pull_request push; do
+  for path in \
+    rust_hft/prediction-markets/config/strategies/02-pm5d-threelayer.live.toml \
+    rust_hft/prediction-markets/config/strategies/new-parameters.toml \
+    rust_hft/prediction-markets/config/default.toml; do
+    printf '%s\n' "$path" >"$tmp_dir/strategy-config.txt"
+    output=$(run_case "strategy-config-$event" "$event" strategy-config.txt)
+    expected='ploy/strategy-config-contracts,ploy/architecture-contracts'
+    [[ $event != pull_request ]] || expected="ploy/commit-hygiene,$expected"
+    assert_jobs "$output" "$expected"
+    assert_owning_packages "$output" ''
+    assert_flag "$output" research_product none
+    assert_flag "$output" toolchain false
+    assert_flag "$output" selection_complete true
+  done
+done
+
+# A parameter file must not acquire the root ploy owner during metadata lookup.
+printf '%s\n' rust_hft/prediction-markets/crates/ploy-strategy-bundles/src/lib.rs >"$tmp_dir/strategy-source.txt"
+source_scope=$(run_case strategy-source pull_request strategy-source.txt)
+assert_jobs "$source_scope" 'ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/architecture-contracts'
+source_jobs=$(sed -n 's/^jobs=,\(.*\),$/\1/p' "$source_scope")
+cat "$tmp_dir/strategy-source.txt" >"$tmp_dir/strategy-mixed.txt"
+printf '%s\n' rust_hft/prediction-markets/config/strategies/new-parameters.toml \
+  rust_hft/prediction-markets/config/default.toml >>"$tmp_dir/strategy-mixed.txt"
+mixed_scope=$(run_case strategy-mixed pull_request strategy-mixed.txt)
+assert_jobs "$mixed_scope" "$source_jobs,ploy/strategy-config-contracts"
+assert_flag "$mixed_scope" research_product "$(sed -n 's/^research_product=//p' "$source_scope")"
+
+bash "$script_dir/test-strategy-config-contracts.sh"
+if [[ ${1:-} == --strategy-config ]]; then
+  printf 'strategy configuration selector contracts passed\n'
+  exit 0
+fi
 
 # The fixed probability inference is a runtime owner with a real live-intake consumer.
 printf '%s\n' rust_hft/strategy-framework/strategies/probability_reversal/src/lib.rs >"$tmp_dir/probability-strategy.txt"
@@ -769,6 +810,11 @@ abort 'Security duplicates Clippy on PR/push' unless security.fetch('clippy-stri
 abort 'Clippy lacks same-run dependency' unless ci.fetch('clippy_strict').fetch('needs').include?('rust') && ci.fetch('clippy_strict').to_s.include?('verify-ci-rust-same-run.sh')
 abort 'Security still polls native Clippy' if security.fetch('clippy-strict').to_s.include?('wait-ci-rust-evidence.sh')
 abort 'smoke does not reuse binary job' unless ploy.fetch('research-image-smoke').fetch('needs').include?('research-image-binaries')
+config_job = ploy.fetch('strategy-config-contracts')
+abort 'configuration checks must not start services' if config_job.key?('services')
+abort 'configuration failures must fail their lane' if config_job['continue-on-error']
+abort 'configuration parser is not selected' unless config_job.fetch('steps').any? { |step| step.fetch('run', '').include?('run-strategy-config-contracts.sh') && !step['continue-on-error'] }
+abort 'configuration lane missing from required gate' unless ploy.fetch('prediction-markets-gate').fetch('needs').include?('strategy-config-contracts')
 %w[research-image-binaries rust-format rust-research-heavy].each do |id|
   abort "native compiler absent #{id}" unless ploy.fetch(id).to_s.include?('dtolnay/rust-toolchain@')
 end
@@ -813,7 +859,7 @@ if printf '%s' '{"selector":{"result":"success"},"rust":{"result":"skipped"}}' |
 fi
 printf '%s' '{"selector":{"result":"success"},"rust":{"result":"success"}}' | \
   bash "$gate" --expected-jobs ',ci/rust,'
-for selected in ploy/architecture-contracts ci/rust-hft-engine-fast-lane ci/research-foundation; do
+for selected in ploy/architecture-contracts ploy/strategy-config-contracts ci/rust-hft-engine-fast-lane ci/research-foundation; do
   job=${selected#*/}
   [[ $selected == ci/* ]] && job=${job//-/_}
   for state in missing skipped failure cancelled; do
