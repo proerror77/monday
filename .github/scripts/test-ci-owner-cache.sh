@@ -18,12 +18,16 @@ native_before=$(PATH="$work/native-bin:$PATH" bash "$root/.github/scripts/ci-own
 native_after=$(PATH="$work/native-bin:$PATH" CXXFLAGS=-DFIXTURE_NATIVE_INPUT_CHANGED bash "$root/.github/scripts/ci-owner-cache.sh" native-input)
 [[ $native_before != "$native_after" ]]
 # A narrow first save must not become an exact hit for wider coverage.
-plan=$(jq -cn '{handoff:"false",json:"false",ondo:"false",collector:"false",control:"false",focused:"true",loop:"false",focused_packages:",hft-live,",loop_packages:""}')
+plan=$(jq -cn '{handoff:"false",json:"false",ondo:"false",collector:"false",control:"false",focused:"true",loop:"false",owning_packages:",,",focused_packages:",hft-live,",loop_packages:""}')
 coverage() { MONDAY_CI_CACHE_PLAN="$1" bash "$root/.github/scripts/ci-owner-cache.sh" coverage-input; }
 narrow=$(coverage "$plan")
 wide=$(coverage "$(jq -c '.handoff="true" | .focused_packages=",hft-live,hft-cex-research-worker,"' <<<"$plan")")
 [[ $narrow != "$wide" ]]
 [[ $(coverage "$(jq -c '.focused_packages=",hft-live,hft-cex-research-worker,"' <<<"$plan")") != "$narrow" ]]
+owning=$(jq -c '.owning_packages=",hft-live,"' <<<"$plan")
+[[ $(coverage "$owning") != "$narrow" ]]
+[[ $(coverage "$(jq -c '.owning_packages=",hft-paper,"' <<<"$owning")") != "$(coverage "$owning")" ]]
+[[ $(coverage "$(jq -c '.loop_packages="hft-live"' <<<"$owning")") != "$(coverage "$owning")" ]]
 for flag in handoff json ondo collector control focused loop; do
   changed=$(jq -c --arg flag "$flag" '.[$flag]=(if .[$flag]=="true" then "false" else "true" end) | .loop_packages="alpha-harness"' <<<"$plan")
   [[ $(coverage "$changed") != "$narrow" ]]
@@ -31,7 +35,7 @@ done
 [[ $(coverage "$(jq -c '.focused_packages="hft-live,hft-live" | .source_sha="other-source" | .event="pull_request"' <<<"$plan")") == "$narrow" ]]
 [[ $(coverage "$(jq -c '.focused="false" | .focused_packages=""' <<<"$plan")") == \
    "$(coverage "$(jq -c '.focused="false" | .focused_packages="ignored-package"' <<<"$plan")")" ]]
-for invalid in 'del(.handoff)' '.focused="yes"' '.focused_packages=""' '.focused_packages="hft-live --features unexpected"'; do
+for invalid in 'del(.handoff)' 'del(.owning_packages)' '.focused="yes"' '.focused_packages=""' '.focused_packages="hft-live --features unexpected"'; do
   if coverage "$(jq -c "$invalid" <<<"$plan")"; then
     echo 'invalid cache coverage accepted' >&2; exit 1
   fi
@@ -133,7 +137,7 @@ fi
 [[ $(<"$work/outside/marker") == untouched ]]
 
 # The workflow uses the same disjoint paths and saves only after cleanup.
-ruby -ryaml -rpathname -rjson -rdigest -rtmpdir -rfileutils - "$root" <<'RUBY'
+ruby -ryaml -rpathname -rjson -rdigest -rtmpdir -rfileutils -ropen3 - "$root" <<'RUBY'
 root = ARGV.fetch(0)
 job = YAML.safe_load(File.read("#{root}/.github/workflows/ci.yml")).fetch('jobs').fetch('rust')
 abort 'owner layout missing' unless job.fetch('env')['MONDAY_CARGO_TARGET_LAYOUT'] == 'owning-workspace-v1'
@@ -155,6 +159,35 @@ abort 'cache coverage output is never computed' unless dimensions.fetch('run').i
 # Keep compiler/native/manifest dimensions fixed in these coverage fixtures.
 key_inputs = restore.dig('with', 'key').scan(/hashFiles\((.*?)\)/).flat_map { |group| group.first.scan(/'([^']+)'/).flatten }
 abort 'cache key has no compilation inputs' if key_inputs.empty?
+# Audit actual workflow Cargo callers and every selector input they consume.
+compile_steps = steps.select do |step|
+  run = step['run'].to_s
+  helpers = run.scan(%r{((?:rust_hft|\.github|deployment)/[a-zA-Z0-9_./-]+\.sh)}).flatten.uniq
+  callers = helpers.select do |path|
+    File.read("#{root}/#{path}").match?(/\bcargo[ \t]+(?:build|test|check|clippy)\b/) || path.end_with?('/cargo-scoped.sh')
+  end
+  abort 'direct Cargo helper is absent from cache inputs' unless (callers - key_inputs).empty?
+  !callers.empty? || run.match?(/\bcargo[ \t]+(?:build|test|check|clippy)\b/)
+end
+fields = compile_steps.flat_map do |step|
+  [step['if'], step['run'], *step.fetch('env', {}).values].join.scan(/needs\.scope\.outputs\.([a-z_]+)/).flatten
+end.uniq
+plan = %w[handoff json ondo collector control focused loop].to_h { |name| [name, 'true'] }
+plan.merge!('owning_packages' => 'hft-paper', 'focused_packages' => 'hft-live', 'loop_packages' => 'alpha-harness')
+fields.each { |name| plan[name] ||= 'false' }
+coverage_digest = lambda do |selected|
+  output, _, status = Open3.capture3({'MONDAY_CI_CACHE_PLAN' => JSON.generate(selected)},
+    'bash', "#{root}/.github/scripts/ci-owner-cache.sh", 'coverage-input')
+  abort 'valid workflow coverage could not be hashed' unless status.success?
+  output
+end
+baseline_coverage = coverage_digest.call(plan)
+fields.each do |name|
+  changed = plan.dup
+  changed[name] = name.end_with?('_packages') ? "#{plan.fetch(name)},hft-cex-research-worker" : 'false'
+  changed[name] = 'true' if plan.fetch(name) == 'false'
+  abort "compiled workflow input #{name} is absent from coverage digest" if coverage_digest.call(changed) == baseline_coverage
+end
 dimension = lambda do |directory|
   Digest::SHA256.hexdigest(key_inputs.sort.map { |path| Digest::SHA256.file("#{directory}/#{path}").digest }.join)
 end

@@ -448,7 +448,7 @@ jobs:
             rust_hft/research-core/platform -> target
             rust_hft/runtime -> target
             rust_hft/prediction-markets -> target
-          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
+          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/scripts/check-collector-test-presence.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
           cache-all-crates: false
           save-if: false
 
@@ -612,7 +612,7 @@ jobs:
             rust_hft/research-core/platform -> target
             rust_hft/runtime -> target
             rust_hft/prediction-markets -> target
-          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
+          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/scripts/check-collector-test-presence.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
           cache-all-crates: false
           save-if: true
 
