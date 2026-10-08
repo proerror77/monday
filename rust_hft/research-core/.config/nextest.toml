@@ -1,0 +1,10 @@
+# Loop-engineer CI runs each test in its own process. Retries stay off so a
+# failure caused by that isolation is reported instead of hidden.
+nextest-version = "0.9.146"
+
+[profile.default]
+retries = 0
+fail-fast = false
+# mission_campaign tests exceed nextest's 60s default slow period. Warn only
+# after 15 minutes, and do not terminate them.
+slow-timeout = { period = "900s" }

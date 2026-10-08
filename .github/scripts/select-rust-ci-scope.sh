@@ -447,6 +447,14 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
+    .github/scripts/loop-nextest-archive.sh|.github/scripts/loop-nextest-shard.sh|.github/scripts/loop-nextest-counts.sh|\
+    .github/scripts/loop-nextest-wait.sh|.github/scripts/loop-nextest-gate.sh|.github/scripts/loop-nextest-plan.rb|\
+    .github/scripts/install-cargo-nextest.sh|.github/scripts/test-loop-nextest.sh)
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
     .github/workflows/market-tape-seal-benchmark.yml|.github/workflows/release-rust.yml|\
     .github/workflows/ci.yml|.github/workflows/ploy-ci.yml|.github/workflows/security-enabled.yml|\
     .github/scripts/select-rust-ci-scope.sh|.github/scripts/research-workspace-locks.sh|.github/scripts/check-rust-workspace-reports.sh|.github/scripts/verify-ci-rust-same-run.sh|.github/scripts/test-ci-rust-same-run.sh|\
