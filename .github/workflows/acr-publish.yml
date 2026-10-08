@@ -7,6 +7,13 @@ on:
         description: Exact main commit to publish
         required: true
         type: string
+    secrets:
+      ACR_PASSWORD:
+        description: Registry credential for admitted ACR publication
+        required: true
+      MONDAY_RESEARCH_RELEASE_SIGNING_KEY:
+        description: Key used only by the existing independent Build issuer
+        required: true
   workflow_dispatch:
     inputs:
       target:

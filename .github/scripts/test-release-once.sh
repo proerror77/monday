@@ -118,6 +118,13 @@ abort 'release concurrency is not one queued group per SHA' unless release.fetch
 }
 ghcr = release.fetch('jobs').fetch('publish-ghcr')
 acr_job = release.fetch('jobs').fetch('publish-acr')
+abort 'GHCR inherits unrelated secrets' if ghcr.key?('secrets')
+expected_secrets = {
+  'ACR_PASSWORD' => '${{ secrets.ACR_PASSWORD }}',
+  'MONDAY_RESEARCH_RELEASE_SIGNING_KEY' => '${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY }}'
+}
+abort 'ACR receives unrelated secrets' unless acr_job.fetch('secrets') == expected_secrets
+abort 'ACR reusable secrets differ from its admitted credentials' unless (acr['on'] || acr[true]).dig('workflow_call','secrets').keys.sort == expected_secrets.keys.sort
 abort 'GHCR is not the reusable publisher' unless ghcr.fetch('uses') == './.github/workflows/docker-publish.yml'
 abort 'ACR is not the reusable publisher' unless acr_job.fetch('uses') == './.github/workflows/acr-publish.yml'
 abort 'GHCR call is not gated on one admission output' unless ghcr.fetch('if').include?("outputs.publish_ghcr == 'true'")
