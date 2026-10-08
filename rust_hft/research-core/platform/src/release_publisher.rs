@@ -26,6 +26,10 @@ const MAX_JSON: u64 = 1024 * 1024;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublisherPolicy {
+    #[serde(default)]
+    pub oss: Option<crate::release_oss::OssConfig>,
+    #[serde(default)]
+    pub import_admission_keys: BTreeMap<String, String>,
     pub trust: BuildReleaseTrust,
     pub key_id: String,
     pub builder_image: String,
@@ -482,14 +486,41 @@ impl Scratch {
     }
 }
 
-/// HTTPS capability transport; exact object prefixes are issued by the broker.
+/// Release transport for direct OSS or the retained HTTPS capability gateway.
 /// Upload and independent GET readback are distinct checks, including retries.
 pub struct ReleaseGateway {
+    oss: Option<crate::release_oss::Oss>,
     client: reqwest::Client,
     base: reqwest::Url,
     token: String,
 }
 impl ReleaseGateway {
+    pub fn oss(config: &crate::release_oss::OssConfig, session: &Path) -> Result<Self> {
+        let mut transport = Self::new(&config.endpoint, "unused".into())?;
+        transport.oss = Some(crate::release_oss::Oss::from_file(config, session)?);
+        Ok(transport)
+    }
+    pub async fn check_oss(&self, source: &str) -> Result<()> {
+        self.oss
+            .as_ref()
+            .context("OSS backend required")?
+            .check(source)
+            .await
+    }
+    async fn get(&self, key: &str) -> Result<reqwest::Response> {
+        if let Some(oss) = &self.oss {
+            return oss.get(key, None).await;
+        }
+        self.client
+            .get(self.url(key)?)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("release read unavailable"))?
+            .error_for_status()
+            .map_err(|_| anyhow::anyhow!("release evidence missing"))
+    }
+
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
         let base = reqwest::Url::parse(endpoint)?;
         ensure!(
@@ -505,6 +536,7 @@ impl ReleaseGateway {
             "publisher requires scoped HTTPS gateway"
         );
         Ok(Self {
+            oss: None,
             client: crate::transport::TlsConfig::default()
                 .client(std::time::Duration::from_secs(120), true)?,
             base,
@@ -547,15 +579,7 @@ impl ReleaseGateway {
         Ok(self.base.join(key)?)
     }
     async fn get_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<T> {
-        let mut response = self
-            .client
-            .get(self.url(key)?)
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("release gateway unavailable"))?
-            .error_for_status()
-            .map_err(|_| anyhow::anyhow!("release proof missing"))?;
+        let mut response = self.get(key).await?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -571,15 +595,7 @@ impl ReleaseGateway {
         Ok(serde_json::from_slice(&bytes)?)
     }
     async fn verify(&self, artifact: &Artifact) -> Result<()> {
-        let mut response = self
-            .client
-            .get(self.url(&artifact.key)?)
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("release readback unavailable"))?
-            .error_for_status()
-            .map_err(|_| anyhow::anyhow!("release readback rejected"))?;
+        let mut response = self.get(&artifact.key).await?;
         let mut digest = Sha256::new();
         let mut size = 0;
         while let Some(chunk) = response
@@ -599,10 +615,20 @@ impl ReleaseGateway {
     }
     async fn publish_file(&self, path: &Path, artifact: &Artifact) -> Result<()> {
         let file = tokio::fs::File::open(path).await?;
+        if let Some(oss) = &self.oss {
+            oss.put(
+                &artifact.key,
+                reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file)),
+                artifact.bytes,
+            )
+            .await?;
+            return self.verify(artifact).await;
+        }
         let response = self
             .client
             .put(self.url(&artifact.key)?)
             .bearer_auth(&self.token)
+            .header("If-None-Match", "*")
             .header(reqwest::header::CONTENT_LENGTH, artifact.bytes)
             .body(reqwest::Body::wrap_stream(
                 tokio_util::io::ReaderStream::new(file),
@@ -611,7 +637,9 @@ impl ReleaseGateway {
             .await
             .map_err(|_| anyhow::anyhow!("release upload unavailable"))?;
         ensure!(
-            response.status().is_success() || response.status() == reqwest::StatusCode::CONFLICT,
+            response.status().is_success()
+                || response.status() == reqwest::StatusCode::CONFLICT
+                || response.status() == reqwest::StatusCode::PRECONDITION_FAILED,
             "release upload rejected"
         );
         self.verify(artifact).await
@@ -627,16 +655,24 @@ impl ReleaseGateway {
             sha256: sha256(&bytes),
             bytes: bytes.len() as u64,
         };
+        if let Some(oss) = &self.oss {
+            oss.put(&artifact.key, bytes.into(), artifact.bytes).await?;
+            self.verify(&artifact).await?;
+            return Ok(artifact);
+        }
         let response = self
             .client
             .put(self.url(&artifact.key)?)
             .bearer_auth(&self.token)
+            .header("If-None-Match", "*")
             .body(bytes)
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("release proof upload unavailable"))?;
         ensure!(
-            response.status().is_success() || response.status() == reqwest::StatusCode::CONFLICT,
+            response.status().is_success()
+                || response.status() == reqwest::StatusCode::CONFLICT
+                || response.status() == reqwest::StatusCode::PRECONDITION_FAILED,
             "release proof upload rejected"
         );
         self.verify(&artifact).await?;
@@ -890,35 +926,12 @@ pub async fn publish(
         let proof_blob = gateway
             .publish_json(format!("{proof_prefix}/release-proof.json"), &proof)
             .await?;
-        // Re-read mutable authority just before signing, after all byte readbacks.
-        ensure!(
-            authenticate(root, request, policy)? == check_ids,
-            "release CI changed during publication"
-        );
-        validate_run(
-            &api(
-                root,
-                repository,
-                &format!("actions/runs/{}", request.software_run_id),
-                false,
-            )?,
-            repository,
-            sha,
-            request.software_run_id,
-            manifest.workflow_run_attempt,
-            software_workflow,
-        )?;
-        validate_job(
-            &api(
-                root,
-                repository,
-                &format!("actions/jobs/{}", manifest.workflow_job_id),
-                false,
-            )?,
-            request.software_run_id,
-            manifest.workflow_run_attempt,
-            sha,
-            false,
+        recheck_publication_authority(
+            |path, pages| api(root, repository, path, pages),
+            request,
+            policy,
+            &software_producer,
+            &check_ids,
         )?;
         let mut signed = SignedBuildRelease {
             schema: 1,
@@ -955,6 +968,14 @@ pub async fn publish(
         gateway
             .publish_json(format!("{proof_prefix}/build-artifact.json"), &artifact)
             .await?;
+        // Signed objects cannot be recalled. Failure blocks success and ACK import.
+        recheck_publication_authority(
+            |path, pages| api(root, repository, path, pages),
+            request,
+            policy,
+            &software_producer,
+            &check_ids,
+        )?;
         artifacts.push(PublishedBuild {
             build_sha256: artifact.build.id()?,
             image_sha256: request
@@ -968,6 +989,97 @@ pub async fn publish(
         });
     }
     Ok(artifacts)
+}
+fn recheck_publication_authority(
+    mut read: impl FnMut(&str, bool) -> Result<Value>,
+    request: &PublicationRequest,
+    policy: &PublisherPolicy,
+    software: &ReleaseProducer,
+    expected_checks: &[u64],
+) -> Result<()> {
+    let repo = &policy.trust.repository;
+    ensure!(
+        read("git/ref/heads/main", false)?["object"]["sha"] == request.source_sha,
+        "publication source drifted from main"
+    );
+    validate_run(
+        &read(&format!("actions/runs/{}", request.publisher_run_id), false)?,
+        repo,
+        &request.source_sha,
+        request.publisher_run_id,
+        request.publisher_run_attempt,
+        &policy.trust.producer_workflow_path,
+    )?;
+    let job = read(&format!("actions/jobs/{}", request.publisher_job_id), false)?;
+    validate_job(
+        &job,
+        request.publisher_run_id,
+        request.publisher_run_attempt,
+        &request.source_sha,
+        true,
+    )?;
+    ensure!(
+        job["name"]
+            == format!(
+                "Publish {}",
+                request
+                    .image
+                    .rsplit_once("@sha256:")
+                    .context("pinned image required")?
+                    .0
+                    .rsplit('/')
+                    .next()
+                    .context("image name")?
+            ),
+        "publisher job does not own the release"
+    );
+    validate_run(
+        &read(&format!("actions/runs/{}", software.run_id), false)?,
+        repo,
+        &request.source_sha,
+        software.run_id,
+        software.run_attempt,
+        &software.workflow_path,
+    )?;
+    validate_job(
+        &read(&format!("actions/jobs/{}", software.job_id), false)?,
+        software.run_id,
+        software.run_attempt,
+        &request.source_sha,
+        false,
+    )?;
+    ensure!(
+        required_checks(
+            &read(
+                &format!(
+                    "commits/{}/check-runs?filter=latest&per_page=100",
+                    request.source_sha
+                ),
+                true
+            )?,
+            &request.source_sha
+        )? == expected_checks,
+        "publication required checks changed"
+    );
+    Ok(())
+}
+
+pub fn check_source_authority(root: &Path, repository: &str, source: &str) -> Result<()> {
+    ensure!(
+        sha_is_valid(source)
+            && api(root, repository, "git/ref/heads/main", false)?["object"]["sha"] == source,
+        "OSS preflight source is not current main"
+    );
+    required_checks(
+        &api(
+            root,
+            repository,
+            &format!("commits/{source}/check-runs?filter=latest&per_page=100"),
+            true,
+        )?,
+        source,
+    )?;
+    Ok(())
 }
 fn authenticate(root: &Path, r: &PublicationRequest, p: &PublisherPolicy) -> Result<Vec<u64>> {
     let repository = &p.trust.repository;
@@ -1227,10 +1339,618 @@ pub async fn import_build(
     Ok(id)
 }
 
+/// Host-owned ACK approval. Updating this file never changes scientific grants.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportAdmission {
+    pub schema: u32,
+    pub expires_ms: i64,
+    pub build_sha256: String,
+    pub image_sha256: String,
+    pub publication_proof_sha256: String,
+    pub revoked: bool,
+}
+impl ImportAdmission {
+    pub fn validate(&self, build: &str, image: &str, proof: &str, now: i64) -> Result<()> {
+        ensure!(
+            self.schema == 1
+                && !self.revoked
+                && self.expires_ms > now
+                && valid_digest(build)
+                && valid_digest(image)
+                && valid_digest(proof)
+                && self.build_sha256 == build
+                && self.image_sha256 == image
+                && self.publication_proof_sha256 == proof,
+            "ACK import admission expired, revoked or foreign"
+        );
+        Ok(())
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedImportAdmission {
+    pub schema: u32,
+    pub key_id: String,
+    pub admission: ImportAdmission,
+    pub signature_hex: String,
+}
+impl SignedImportAdmission {
+    /// Operator-only utility: consume an existing approved key, never generate one.
+    pub fn sign(
+        admission: ImportAdmission,
+        key_id: String,
+        key: &SigningKey,
+        policy: &PublisherPolicy,
+        now: i64,
+    ) -> Result<Self> {
+        ensure!(
+            admission.schema == 1
+                && admission.expires_ms > now
+                && valid_digest(&admission.build_sha256)
+                && valid_digest(&admission.image_sha256)
+                && valid_digest(&admission.publication_proof_sha256),
+            "operator admission requires exact selectors and future expiry"
+        );
+        let mut signed = Self {
+            schema: 1,
+            key_id,
+            admission,
+            signature_hex: String::new(),
+        };
+        signed.signature_hex = key
+            .sign(&signed.signing_bytes()?)
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // Includes independent pinned-key enforcement, not merely a valid signature.
+        signed.verify(policy)?;
+        Ok(signed)
+    }
+    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = b"monday.ack-build-import-admission.v1\0".to_vec();
+        bytes.extend(serde_json::to_vec(&(
+            self.schema,
+            &self.key_id,
+            &self.admission,
+        ))?);
+        Ok(bytes)
+    }
+    pub fn verify(&self, policy: &PublisherPolicy) -> Result<&ImportAdmission> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        let public = policy
+            .import_admission_keys
+            .get(&self.key_id)
+            .context("unknown independent ACK admission key")?;
+        ensure!(
+            self.schema == 1
+                && valid_digest(public)
+                && !policy.trust.keys.values().any(|key| key == public)
+                && self.signature_hex.len() == 128
+                && self
+                    .signature_hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "ACK admission requires a distinct operator key and canonical signature"
+        );
+        let decode = |hex: &str| -> Result<Vec<u8>> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| Ok(u8::from_str_radix(&hex[i..i + 2], 16)?))
+                .collect()
+        };
+        let key = VerifyingKey::from_bytes(
+            &decode(public)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid ACK public key"))?,
+        )?;
+        ensure!(!key.is_weak(), "weak ACK admission key");
+        let signature = Signature::from_slice(&decode(&self.signature_hex)?)?;
+        key.verify_strict(&self.signing_bytes()?, &signature)
+            .map_err(|_| anyhow::anyhow!("ACK admission signature rejected"))?;
+        Ok(&self.admission)
+    }
+}
+fn read_import_admission(path: &Path, policy: &PublisherPolicy) -> Result<ImportAdmission> {
+    let signed: SignedImportAdmission =
+        serde_json::from_slice(&crate::transport::read_private_file(path)?)?;
+    Ok(signed.verify(policy)?.clone())
+}
+
+fn completed_producer(
+    run: &Value,
+    job: &Value,
+    p: &ReleaseProducer,
+    publisher: bool,
+    image: &str,
+) -> Result<()> {
+    validate_run(
+        run,
+        &p.repository,
+        &p.source_sha,
+        p.run_id,
+        p.run_attempt,
+        &p.workflow_path,
+    )?;
+    ensure!(
+        run["status"] == "completed"
+            && run["conclusion"] == "success"
+            && job["id"] == p.job_id
+            && job["run_id"] == p.run_id
+            && job["run_attempt"] == p.run_attempt
+            && job["head_sha"] == p.source_sha
+            && job["status"] == "completed"
+            && job["conclusion"] == "success",
+        "ACK import requires completed successful exact producers"
+    );
+    if publisher {
+        ensure!(
+            job["name"]
+                == format!(
+                    "Publish {}",
+                    image
+                        .rsplit_once("@sha256:")
+                        .context("pinned image required")?
+                        .0
+                        .rsplit('/')
+                        .next()
+                        .context("image name")?
+                ),
+            "wrong publication job"
+        );
+    } else {
+        validate_job(job, p.run_id, p.run_attempt, &p.source_sha, false)?;
+    }
+    Ok(())
+}
+// Issuance binds current main. Later import binds the signed original identities.
+fn recheck_import_authority(
+    mut read: impl FnMut(&str) -> Result<Value>,
+    proof: &PublicationProof,
+) -> Result<()> {
+    for (producer, publisher) in [(&proof.software_producer, false), (&proof.producer, true)] {
+        let run = read(&format!(
+            "actions/runs/{}/attempts/{}",
+            producer.run_id, producer.run_attempt
+        ))?;
+        let job = read(&format!("actions/jobs/{}", producer.job_id))?;
+        completed_producer(&run, &job, producer, publisher, &proof.image)?;
+    }
+    let names = [
+        "Monorepo CI gate",
+        "Prediction Markets CI gate",
+        "Security Summary Report",
+    ];
+    ensure!(
+        proof.required_check_ids.len() == names.len()
+            && proof
+                .required_check_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                == names.len(),
+        "original required check identities missing or duplicated"
+    );
+    for (id, name) in proof.required_check_ids.iter().zip(names) {
+        let check = read(&format!("check-runs/{id}"))?;
+        ensure!(
+            *id > 0
+                && check["id"] == *id
+                && check["name"] == name
+                && check["head_sha"] == proof.source.code_commit
+                && check["app"]["slug"] == "github-actions"
+                && check["app"]["id"] == 15368
+                && check["status"] == "completed"
+                && check["conclusion"] == "success",
+            "original authenticated release check rejected"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn import_oss_build(
+    root: &Path,
+    build: &str,
+    image: &str,
+    proof_id: &str,
+    policy: &PublisherPolicy,
+    store: &ReleaseGateway,
+    ledger: &crate::postgres::Ledger,
+    admission_path: &Path,
+) -> Result<String> {
+    store
+        .oss
+        .as_ref()
+        .context("ACK import requires OSS")?
+        .require_reader()?;
+    let admission = read_import_admission(admission_path, policy)?;
+    admission.validate(
+        build,
+        image,
+        proof_id,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+    let published = read_build_release(build, image, proof_id, &policy.trust, store).await?;
+    let prefix = format!("research/builds/{build}/releases/{image}/{proof_id}");
+    let proof: PublicationProof = store
+        .get_json(&format!("{prefix}/release-proof.json"))
+        .await?;
+    ensure!(
+        identity(&proof)? == proof_id
+            && proof.producer.repository == policy.trust.repository
+            && proof.producer.workflow_path == policy.trust.producer_workflow_path
+            && proof.software_producer.repository == policy.trust.repository
+            && matches!(
+                proof.software_producer.workflow_path.as_str(),
+                ".github/workflows/ploy-ci.yml" | ".github/workflows/acr-publish.yml"
+            )
+            && proof.software_producer.source_sha == proof.source.code_commit
+            && proof.producer.source_sha == proof.source.code_commit
+            && policy.image_repositories.values().any(|repo| proof
+                .image
+                .rsplit_once("@sha256:")
+                .map(|(r, _)| r)
+                == Some(repo.as_str())),
+        "foreign import producer/workflow/image"
+    );
+    recheck_import_authority(
+        |path| api(root, &policy.trust.repository, path, false),
+        &proof,
+    )?;
+    let admission = read_import_admission(admission_path, policy)?;
+    admission.validate(
+        build,
+        image,
+        proof_id,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+    let id = ledger.register_build(&published).await?;
+    ensure!(
+        ledger.build_artifact(&id).await? == *published.artifact(),
+        "ACK PG Build readback mismatch"
+    );
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn ack_import_rejects_expired_revoked_replayed_selectors_and_cancelled_producers() {
+        let build = "a".repeat(64);
+        let image = "b".repeat(64);
+        let proof = "c".repeat(64);
+        let mut admission = ImportAdmission {
+            schema: 1,
+            expires_ms: 1001,
+            build_sha256: build.clone(),
+            image_sha256: image.clone(),
+            publication_proof_sha256: proof.clone(),
+            revoked: false,
+        };
+        assert!(admission.validate(&build, &image, &proof, 1000).is_ok());
+        assert!(admission.validate(&build, &image, &proof, 1001).is_err());
+        assert!(admission
+            .validate(&build, &image, &"d".repeat(64), 1000)
+            .is_err());
+        admission.revoked = true;
+        assert!(admission.validate(&build, &image, &proof, 1000).is_err());
+        let p = ReleaseProducer {
+            repository: "owner/repo".into(),
+            workflow_path: ".github/workflows/acr-publish.yml".into(),
+            source_sha: "a".repeat(40),
+            run_id: 10,
+            run_attempt: 2,
+            job_id: 30,
+        };
+        let run = json!({"id":10,"run_attempt":2,"head_sha":p.source_sha,"head_branch":"main","head_repository":{"full_name":"owner/repo"},"path":p.workflow_path,"event":"workflow_run","status":"completed","conclusion":"success"});
+        let job = json!({"id":30,"run_id":10,"run_attempt":2,"head_sha":p.source_sha,"status":"completed","conclusion":"success","name":"Publish runner"});
+        let image = format!("registry/runner@sha256:{}", "b".repeat(64));
+        assert!(completed_producer(&run, &job, &p, true, &image).is_ok());
+        for (key, value) in [
+            ("conclusion", json!("cancelled")),
+            ("status", json!("in_progress")),
+            ("path", json!(".github/workflows/foreign.yml")),
+            ("run_attempt", json!(3)),
+            ("head_sha", json!("b".repeat(40))),
+        ] {
+            let mut bad = run.clone();
+            bad[key] = value;
+            assert!(completed_producer(&bad, &job, &p, true, &image).is_err());
+        }
+        let mut wrong = job.clone();
+        wrong["name"] = json!("Publish foreign");
+        assert!(completed_producer(&run, &wrong, &p, true, &image).is_err());
+    }
+    #[test]
+    fn ack_admission_requires_distinct_authority_signature() {
+        let ci = SigningKey::from_bytes(&[17; 32]);
+        let operator = SigningKey::from_bytes(&[18; 32]);
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let mut policy: PublisherPolicy = serde_json::from_value(json!({
+            "trust":{"schema":1,"repository":"owner/repo","producer_workflow_path":".github/workflows/acr-publish.yml","keys":{"ci":hex(&ci.verifying_key().to_bytes())}},
+            "key_id":"ci","builder_image":inputs().builder_image,"image_repositories":{},
+            "import_admission_keys":{"operator":hex(&operator.verifying_key().to_bytes())}
+        })).unwrap();
+        let mut signed = SignedImportAdmission {
+            schema: 1,
+            key_id: "operator".into(),
+            admission: ImportAdmission {
+                schema: 1,
+                expires_ms: 1001,
+                build_sha256: "a".repeat(64),
+                image_sha256: "b".repeat(64),
+                publication_proof_sha256: "c".repeat(64),
+                revoked: false,
+            },
+            signature_hex: String::new(),
+        };
+        let admission = signed.admission.clone();
+        let generated = SignedImportAdmission::sign(
+            admission.clone(),
+            "operator".into(),
+            &operator,
+            &policy,
+            1000,
+        )
+        .unwrap();
+        assert!(generated.verify(&policy).is_ok());
+        generated
+            .admission
+            .validate(&"a".repeat(64), &"b".repeat(64), &"c".repeat(64), 1000)
+            .unwrap();
+        assert!(SignedImportAdmission::sign(
+            admission.clone(),
+            "operator".into(),
+            &ci,
+            &policy,
+            1000
+        )
+        .is_err());
+        assert!(SignedImportAdmission::sign(
+            admission.clone(),
+            "unknown".into(),
+            &operator,
+            &policy,
+            1000
+        )
+        .is_err());
+        assert!(SignedImportAdmission::sign(
+            admission.clone(),
+            "operator".into(),
+            &operator,
+            &policy,
+            1001
+        )
+        .is_err());
+        let mut malformed = admission.clone();
+        malformed.build_sha256 = "*".into();
+        assert!(SignedImportAdmission::sign(
+            malformed,
+            "operator".into(),
+            &operator,
+            &policy,
+            1000
+        )
+        .is_err());
+        let mut revoked = admission;
+        revoked.revoked = true;
+        let revoked =
+            SignedImportAdmission::sign(revoked, "operator".into(), &operator, &policy, 1000)
+                .unwrap();
+        assert!(revoked.verify(&policy).is_ok());
+        assert!(revoked
+            .admission
+            .validate(&"a".repeat(64), &"b".repeat(64), &"c".repeat(64), 1000)
+            .is_err());
+        signed.signature_hex = hex(&operator.sign(&signed.signing_bytes().unwrap()).to_bytes());
+        assert!(signed.verify(&policy).is_ok());
+        signed.admission.revoked = true;
+        assert!(signed.verify(&policy).is_err());
+        signed.admission.revoked = false;
+        signed.signature_hex = hex(&ci.sign(&signed.signing_bytes().unwrap()).to_bytes());
+        assert!(signed.verify(&policy).is_err());
+        policy
+            .import_admission_keys
+            .insert("operator".into(), hex(&ci.verifying_key().to_bytes()));
+        assert!(signed.verify(&policy).is_err());
+        assert!(serde_json::from_value::<SignedImportAdmission>(
+            serde_json::to_value(&signed.admission).unwrap()
+        )
+        .is_err());
+    }
+    #[test]
+    fn post_signature_recheck_rejects_cancel_drift_attempt_workflow_and_check_replacement() {
+        let sha = "a".repeat(40);
+        let request = PublicationRequest {
+            source_sha: sha.clone(),
+            software_run_id: 20,
+            software_products: "cex-runner".into(),
+            product: "cex-runner".into(),
+            image: format!("registry/runner@sha256:{}", "b".repeat(64)),
+            publisher_run_id: 10,
+            publisher_run_attempt: 2,
+            publisher_job_id: 30,
+        };
+        let policy: PublisherPolicy = serde_json::from_value(json!({"trust":{"schema":1,"repository":"owner/repo","producer_workflow_path":".github/workflows/acr-publish.yml","keys":{}},"key_id":"ci","builder_image":inputs().builder_image,"image_repositories":{}})).unwrap();
+        let software = ReleaseProducer {
+            repository: "owner/repo".into(),
+            workflow_path: ".github/workflows/ci.yml".into(),
+            source_sha: sha.clone(),
+            run_id: 20,
+            run_attempt: 1,
+            job_id: 40,
+        };
+        let run = |id, attempt, path: &str| json!({"id":id,"run_attempt":attempt,"head_sha":sha,"head_branch":"main","head_repository":{"full_name":"owner/repo"},"path":path,"event":"workflow_run","status":"in_progress","conclusion":null});
+        let checks = ["Monorepo CI gate","Prediction Markets CI gate","Security Summary Report"].iter().enumerate().map(|(i,name)| json!({"id":i+1,"name":name,"head_sha":sha,"status":"completed","conclusion":"success","app":{"slug":"github-actions","id":15368}})).collect::<Vec<_>>();
+        let baseline = BTreeMap::from([
+            (
+                "git/ref/heads/main".to_owned(),
+                json!({"object":{"sha":sha}}),
+            ),
+            (
+                "actions/runs/10".into(),
+                run(10, 2, ".github/workflows/acr-publish.yml"),
+            ),
+            (
+                "actions/runs/20".into(),
+                run(20, 1, ".github/workflows/ci.yml"),
+            ),
+            (
+                "actions/jobs/30".into(),
+                json!({"id":30,"run_id":10,"run_attempt":2,"head_sha":sha,"status":"in_progress","name":"Publish runner"}),
+            ),
+            (
+                "actions/jobs/40".into(),
+                json!({"id":40,"run_id":20,"run_attempt":1,"head_sha":sha,"status":"completed","conclusion":"success","name":"Research image binaries"}),
+            ),
+            (
+                format!("commits/{sha}/check-runs?filter=latest&per_page=100"),
+                json!([{"check_runs":checks}]),
+            ),
+        ]);
+        let verify = |data: &BTreeMap<String, Value>| {
+            recheck_publication_authority(
+                |path, _| data.get(path).cloned().context("missing fixture"),
+                &request,
+                &policy,
+                &software,
+                &[1, 2, 3],
+            )
+        };
+        assert!(verify(&baseline).is_ok()); // Before signing.
+        for kind in 0..6 {
+            let mut after = baseline.clone();
+            match kind {
+                0 => {
+                    after.get_mut("git/ref/heads/main").unwrap()["object"]["sha"] =
+                        json!("b".repeat(40))
+                }
+                1 => after.get_mut("actions/runs/10").unwrap()["conclusion"] = json!("cancelled"),
+                2 => after.get_mut("actions/jobs/30").unwrap()["status"] = json!("completed"),
+                3 => after.get_mut("actions/runs/10").unwrap()["run_attempt"] = json!(3),
+                4 => {
+                    after.get_mut("actions/runs/10").unwrap()["path"] =
+                        json!(".github/workflows/foreign.yml")
+                }
+                _ => {
+                    after
+                        .get_mut(&format!(
+                            "commits/{sha}/check-runs?filter=latest&per_page=100"
+                        ))
+                        .unwrap()[0]["check_runs"][0]["id"] = json!(99)
+                }
+            }
+            assert!(verify(&after).is_err()); // After signing/upload readbacks.
+        }
+    }
+    #[test]
+    fn historical_import_binds_original_attempts_and_checks_after_main_or_latest_drift() {
+        let source = source();
+        let sha = &source.code_commit;
+        let producer = ReleaseProducer {
+            repository: "owner/repo".into(),
+            workflow_path: ".github/workflows/acr-publish.yml".into(),
+            source_sha: sha.clone(),
+            run_id: 10,
+            run_attempt: 2,
+            job_id: 30,
+        };
+        let software = ReleaseProducer {
+            workflow_path: ".github/workflows/ploy-ci.yml".into(),
+            run_id: 20,
+            run_attempt: 1,
+            job_id: 40,
+            ..producer.clone()
+        };
+        let mut proof = PublicationProof {
+            schema: 1,
+            source: source.clone(),
+            image: format!("registry/runner@sha256:{}", "b".repeat(64)),
+            producer,
+            software_producer: software,
+            required_check_ids: vec![1, 2, 3],
+            compilation_inputs: inputs(),
+            executables: vec![],
+            build_sha256: "a".repeat(64),
+        };
+        let run = |id, attempt, path: &str| json!({"id":id,"run_attempt":attempt,"head_sha":sha,"head_branch":"main","head_repository":{"full_name":"owner/repo"},"path":path,"event":"workflow_run","status":"completed","conclusion":"success"});
+        let mut original = BTreeMap::from([
+            (
+                "actions/runs/10/attempts/2".to_owned(),
+                run(10, 2, ".github/workflows/acr-publish.yml"),
+            ),
+            (
+                "actions/runs/20/attempts/1".into(),
+                run(20, 1, ".github/workflows/ploy-ci.yml"),
+            ),
+            (
+                "actions/jobs/30".into(),
+                json!({"id":30,"run_id":10,"run_attempt":2,"head_sha":sha,"status":"completed","conclusion":"success","name":"Publish runner"}),
+            ),
+            (
+                "actions/jobs/40".into(),
+                json!({"id":40,"run_id":20,"run_attempt":1,"head_sha":sha,"status":"completed","conclusion":"success","name":"Research image binaries"}),
+            ),
+            // Current main and latest attempts/checks have changed. They are not imported identities.
+            (
+                "git/ref/heads/main".into(),
+                json!({"object":{"sha":"f".repeat(40)}}),
+            ),
+            (
+                "actions/runs/10".into(),
+                run(10, 3, ".github/workflows/acr-publish.yml"),
+            ),
+            (
+                format!("commits/{sha}/check-runs?filter=latest&per_page=100"),
+                json!([{"check_runs":[]}]),
+            ),
+        ]);
+        for (i, name) in [
+            "Monorepo CI gate",
+            "Prediction Markets CI gate",
+            "Security Summary Report",
+        ]
+        .iter()
+        .enumerate()
+        {
+            original.insert(format!("check-runs/{}",i+1),json!({"id":i+1,"name":name,"head_sha":sha,"status":"completed","conclusion":"success","app":{"slug":"github-actions","id":15368}}));
+        }
+        let verify = |data: &BTreeMap<String, Value>, proof: &PublicationProof| {
+            recheck_import_authority(
+                |path| data.get(path).cloned().context("missing original identity"),
+                proof,
+            )
+        };
+        assert!(verify(&original, &proof).is_ok());
+        for (path, key, value) in [
+            (
+                "actions/runs/10/attempts/2",
+                "conclusion",
+                json!("cancelled"),
+            ),
+            ("actions/runs/10/attempts/2", "run_attempt", json!(3)),
+            ("actions/jobs/30", "status", json!("in_progress")),
+            ("check-runs/1", "head_sha", json!("f".repeat(40))),
+            ("check-runs/1", "id", json!(99)),
+            ("check-runs/1", "conclusion", json!("failure")),
+            ("check-runs/1", "name", json!("foreign gate")),
+            ("check-runs/1", "app", json!({"slug":"foreign","id":15368})),
+        ] {
+            let mut bad = original.clone();
+            bad.get_mut(path).unwrap()[key] = value;
+            assert!(verify(&bad, &proof).is_err());
+        }
+        let mut missing = original.clone();
+        missing.remove("check-runs/1");
+        assert!(verify(&missing, &proof).is_err());
+        proof.required_check_ids = vec![1, 1, 3];
+        assert!(verify(&original, &proof).is_err());
+    }
     fn source() -> SourceArchive {
         SourceArchive {
             schema: 1,
@@ -1287,6 +2007,8 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         let mut policy = PublisherPolicy {
+            oss: None,
+            import_admission_keys: BTreeMap::new(),
             trust: BuildReleaseTrust {
                 schema: 1,
                 repository: "owner/repo".into(),

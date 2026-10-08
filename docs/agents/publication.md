@@ -81,12 +81,13 @@ mixed runner markers do not prove publication of the split images. The v6
 migration bootstraps each product until its own readback succeeds.
 
 The separate native issuer signs each Build only after authenticated CI,
-original software producer, immutable OCI programs and gateway bytes agree.
+original software producer, immutable OCI programs and OSS bytes agree.
 Preflight binds operator policy and TLS to the selected publication before
 registry writes. Keys remain outside research services and the PG ledger.
 Signed proofs use `research/builds/{build}/releases/{oci}/{proof}/`; shared
-executable blobs keep their Build prefix. PG projection requires explicit
-import enablement and the dedicated importer role.
+executable blobs keep their Build prefix. ACK PG projection requires separate read-only OSS credentials, completed producer
+verification, current host approval and the dedicated importer role. Ordinary CI
+never gets that PG identity. See the [OSS migration contract](../../deployment/aliyun/research/foundation/RELEASE_OSS.md).
 
 Collector publication loads the successful Monorepo CI image. It checks the
 producer, platform, archive hash, image ID and source before promotion. The

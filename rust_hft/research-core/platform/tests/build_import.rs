@@ -161,3 +161,45 @@ async fn signed_release_requires_actual_blob_and_only_strong_import_reaches_pg()
     println!("same valid signed fixture: legacy CLI rejected; missing source rejected without PG rows; complete actual TLS package imported idempotently");
     Ok(())
 }
+
+#[tokio::test]
+async fn independent_readback_rejects_missing_tampered_and_replayed_evidence() -> Result<()> {
+    let package = common::published::Package::new(artifact_fixture()?).await?;
+    // Keep selector strings alive across each asynchronous read.
+    let build = package.artifact.build.id()?;
+    let image = h('2');
+    let verify = || {
+        hft_research_platform::release_publisher::read_build_release(
+            &build,
+            &image,
+            &package.proof_sha,
+            &package.trust,
+            &package.gateway,
+        )
+    };
+    verify().await?;
+    let path = package.root.join(&package.artifact.executables[0].blob.key);
+    let original = std::fs::read(&path)?;
+    std::fs::write(&path, b"tampered")?;
+    ensure!(verify().await.is_err(), "tampered program admitted");
+    std::fs::write(&path, original)?;
+    std::fs::remove_file(
+        package
+            .root
+            .join(&package.signed.receipt.source.archive.key),
+    )?;
+    ensure!(verify().await.is_err(), "missing source admitted");
+    ensure!(
+        hft_research_platform::release_publisher::read_build_release(
+            &build,
+            &image,
+            &h('f'),
+            &package.trust,
+            &package.gateway
+        )
+        .await
+        .is_err(),
+        "foreign proof selector replay admitted"
+    );
+    Ok(())
+}

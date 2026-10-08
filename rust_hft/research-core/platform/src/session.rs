@@ -52,6 +52,15 @@ fn private_directory(path: &Path) -> Result<()> {
 }
 
 fn file_digest(path: &Path) -> Result<(String, u64)> {
+    bounded_digest(path, FILE_LIMIT)
+}
+
+// Native executables have a separate bound; session state stays at FILE_LIMIT.
+fn executable_digest(path: &Path) -> Result<(String, u64)> {
+    bounded_digest(path, 512 * 1024 * 1024)
+}
+
+fn bounded_digest(path: &Path, limit: u64) -> Result<(String, u64)> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -67,7 +76,7 @@ fn file_digest(path: &Path) -> Result<(String, u64)> {
     let mut file = options.open(path)?;
     let meta = file.metadata()?;
     ensure!(
-        meta.is_file() && meta.len() <= FILE_LIMIT,
+        meta.is_file() && meta.len() <= limit,
         "unbounded or aliased session file"
     );
     let mut hasher = Sha256::new();
@@ -79,7 +88,7 @@ fn file_digest(path: &Path) -> Result<(String, u64)> {
             break;
         }
         total += n as u64;
-        ensure!(total <= FILE_LIMIT, "session file grew beyond bound");
+        ensure!(total <= limit, "file grew beyond digest bound");
         hasher.update(&buffer[..n]);
     }
     ensure!(total == meta.len(), "session file changed during readback");
@@ -196,7 +205,7 @@ mod tests {
             "fixture Git commit failed"
         );
         let config = SessionConfig {
-            executable_sha256: file_digest(&executable)?.0,
+            executable_sha256: executable_digest(&executable)?.0,
             executable,
             workspace,
             native_home: root.join("native"),
@@ -602,7 +611,7 @@ mod tests {
         let workspace = root.join("workspace");
         std::fs::create_dir(&workspace)?;
         let server = AppServer::start(SessionConfig {
-            executable_sha256: file_digest(&executable)?.0,
+            executable_sha256: executable_digest(&executable)?.0,
             executable,
             workspace,
             native_home: root.join("native"),
@@ -1134,7 +1143,7 @@ impl AppServer {
     async fn launch(config: SessionConfig, native: Option<&NativeState>) -> Result<Self> {
         ensure!(
             config.executable.is_absolute()
-                && file_digest(&config.executable)?.0 == config.executable_sha256,
+                && executable_digest(&config.executable)?.0 == config.executable_sha256,
             "untrusted app-server executable"
         );
         let mut header = [0u8; 4];

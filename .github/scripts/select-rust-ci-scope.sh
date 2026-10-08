@@ -274,7 +274,7 @@ for path in "${paths[@]}"; do
     .github/workflows/acr-publish.yml|.github/scripts/test-acr-publish-workflow.sh|\
     .github/scripts/read-release-required-checks.sh|.github/scripts/wait-release-required-checks.sh|\
     .github/scripts/research-image-release-artifact.sh|.github/scripts/test-research-image-release-artifact.sh|\
-    .github/scripts/publish-research-build-release.sh|\
+    .github/scripts/publish-research-build-release.sh|.github/scripts/select-research-oss-policy.jq|\
     .github/scripts/verify-research-runner-binaries.sh|\
     .github/scripts/read-acr-publish-source.sh|.github/scripts/select-acr-publish-source.sh|\
     .github/scripts/test-acr-publish-source-readback.sh)
@@ -793,6 +793,10 @@ if is_affected hft-collector || is_affected alpha-harness || is_affected hft-cex
 fi
 if is_affected hft-collector || is_affected alpha-harness; then
   research_product=$(bash "$products" merge "$research_product" controller)
+fi
+# The controller now directly owns the platform release importer.
+if is_affected hft-research-platform; then
+  select_research_image_jobs controller
 fi
 if [[ $event == pull_request ]] && is_affected hft-backtest; then
   select_job ploy/research-image-binaries
