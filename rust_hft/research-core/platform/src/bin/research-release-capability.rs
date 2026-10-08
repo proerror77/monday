@@ -302,12 +302,15 @@ fn oss_identity(
                     "Publish {}",
                     r.image_repository.rsplit('/').next().unwrap_or_default()
                 )
-            && c["check_run_id"].as_u64().is_some_and(|id| id > 0
-                && job["check_run_url"]
-                    == format!(
-                        "https://api.github.com/repos/{}/check-runs/{id}",
-                        r.repository
-                    ))
+            && c["check_run_id"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some_and(|id| id > 0
+                    && job["check_run_url"]
+                        == format!(
+                            "https://api.github.com/repos/{}/check-runs/{id}",
+                            r.repository
+                        ))
             && c["exp"]
                 .as_u64()
                 .is_some_and(|exp| exp > now_ms().unwrap_or(u64::MAX) / 1000),
@@ -517,7 +520,7 @@ mod tests {
         )
         .unwrap();
         let c = &request.context;
-        let claims = json!({"iss":"https://token.actions.githubusercontent.com","aud":"test","sub":config.subject,"repository":c.repository,"repository_id":"1","repository_owner_id":"2","sha":c.source_sha,"ref":"refs/heads/main","workflow_ref":format!("{}/.github/workflows/acr-publish.yml@refs/heads/main",c.repository),"run_id":c.publisher_run_id.to_string(),"run_attempt":c.publisher_run_attempt.to_string(),"check_run_id":99,"exp":now_ms().unwrap()/1000+60});
+        let claims = json!({"iss":"https://token.actions.githubusercontent.com","aud":"test","sub":config.subject,"repository":c.repository,"repository_id":"1","repository_owner_id":"2","sha":c.source_sha,"ref":"refs/heads/main","workflow_ref":format!("{}/.github/workflows/acr-publish.yml@refs/heads/main",c.repository),"run_id":c.publisher_run_id.to_string(),"run_attempt":c.publisher_run_attempt.to_string(),"check_run_id":"99","exp":now_ms().unwrap()/1000+60});
         let job = json!({"id":c.publisher_job_id,"run_id":c.publisher_run_id,"run_attempt":c.publisher_run_attempt,"head_sha":c.source_sha,"status":"in_progress","conclusion":null,"name":"Publish controller","check_run_url":format!("https://api.github.com/repos/{}/check-runs/99",c.repository)});
         let token = |v: &serde_json::Value| {
             format!(
@@ -541,7 +544,11 @@ mod tests {
             ("run_attempt", json!("999")),
             ("repository_owner_id", json!("3")),
             ("exp", json!(0)),
-            ("check_run_id", json!(98)),
+            ("check_run_id", json!("98")),
+            ("check_run_id", json!(99)),
+            ("check_run_id", json!(null)),
+            ("check_run_id", json!("0")),
+            ("check_run_id", json!("malformed")),
         ] {
             let mut bad = claims.clone();
             bad[key] = value;

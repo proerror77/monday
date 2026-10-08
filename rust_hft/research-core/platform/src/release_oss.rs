@@ -84,14 +84,18 @@ impl Session {
             "OSS session expired or exceeds fifteen minutes"
         );
         ensure!(
-            [
-                &self.access_key_id,
-                &self.access_key_secret,
-                &self.security_token
-            ]
-            .iter()
-            .all(|s| !s.is_empty() && s.len() <= 16_384 && s.bytes().all(|b| b.is_ascii_graphic())),
+            [&self.access_key_id, &self.access_key_secret]
+                .iter()
+                .all(|s| !s.is_empty()
+                    && s.len() <= 16_384
+                    && s.bytes().all(|b| b.is_ascii_graphic())),
             "invalid OSS session"
+        );
+        // STS token length is variable. Transport and private-file bounds still apply.
+        ensure!(
+            !self.security_token.is_empty()
+                && self.security_token.bytes().all(|b| b.is_ascii_graphic()),
+            "invalid OSS security token"
         );
         ensure!(
             !self.prefixes.is_empty()
@@ -406,6 +410,11 @@ mod tests {
             prefixes: vec![format!("research/builds/{}/", "a".repeat(64))],
         };
         assert!(session.validate(1000).is_ok());
+        session.security_token = "x".repeat(20_000);
+        assert!(session.validate(1000).is_ok());
+        session.security_token.push('\n');
+        assert!(session.validate(1000).is_err());
+        session.security_token = "test".into();
         assert!(session.validate(1001).is_err());
         session.expires_ms = 901001;
         assert!(session.validate(1000).is_err());
