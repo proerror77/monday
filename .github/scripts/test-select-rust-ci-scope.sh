@@ -32,6 +32,8 @@ printf '%s\n' package-lock.json >"$tmp_dir/root-node.txt"
 printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
 printf '%s\n' .github/scripts/run-collector-control-contracts.sh >"$tmp_dir/control-scheduling.txt"
+printf '%s\n' .github/scripts/ci-owner-cache.sh >"$tmp_dir/ci-owner-cache.txt"
+printf '%s\n' .github/scripts/test-ci-owner-cache.sh >"$tmp_dir/ci-owner-cache-test.txt"
 printf '%s\n' .github/scripts/test-collector-control-scheduling.sh >"$tmp_dir/control-scheduling-test.txt"
 printf '%s\n' .github/scripts/run-collector-control-contracts.py .github/scripts/test-collector-control-scheduling.py >"$tmp_dir/control-scheduling-deletions.txt"
 printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
@@ -230,6 +232,8 @@ job_cases=(
   'security-workflow|pull_request|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'security-workflow-push|push|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
   'control-scheduling|pull_request|control-scheduling.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
+  'ci-owner-cache|pull_request|ci-owner-cache.txt|ci/rust,ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans,ci/deployment-artifacts'
+  'ci-owner-cache-test|pull_request|ci-owner-cache-test.txt|ci/ci-contracts,ploy/workflow-lint'
   'control-scheduling-test|pull_request|control-scheduling-test.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'control-scheduling-deletions|pull_request|control-scheduling-deletions.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'

@@ -425,7 +425,19 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
-    .github/scripts/write-ci-rust-evidence.sh|.github/scripts/verify-ci-rust-evidence.sh|.github/scripts/wait-ci-rust-evidence.sh|.github/scripts/test-ci-rust-evidence.sh|.github/scripts/check-collector-test-presence.sh)
+    .github/scripts/ci-owner-cache.sh)
+      loop=true
+      loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-cex-research-worker,hft-harnessctl,hft-research-ml
+      handoff=true; json=true; ondo=true; collector=true; control=true
+      focused=true; toolchain=true; clippy_loop=true; clippy_handoff=true
+      focused_packages=hft-live,hft-paper,hft-all-in-one,alpha-harness,hft-harnessctl
+      select_job ci/rust
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
+    .github/scripts/test-ci-owner-cache.sh|.github/scripts/write-ci-rust-evidence.sh|.github/scripts/verify-ci-rust-evidence.sh|.github/scripts/wait-ci-rust-evidence.sh|.github/scripts/test-ci-rust-evidence.sh|.github/scripts/check-collector-test-presence.sh)
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
       continue
