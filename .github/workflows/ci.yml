@@ -224,6 +224,7 @@ jobs:
           bash .github/scripts/test-rerun-loop-nextest.sh
           bash .github/scripts/test-loop-nextest.sh
           bash .github/scripts/test-loop-nextest-doctests.sh
+          bash .github/scripts/test-ci-owner-cache.sh
           .github/scripts/test-ci-rust-same-run.sh
           .github/scripts/test-select-rust-ci-scope.sh
           .github/scripts/test-ci-monitor-scope.sh
@@ -400,6 +401,7 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_TARGET_DIR: ${{ github.workspace }}/rust_hft/target
       CARGO_INCREMENTAL: "0"
+      MONDAY_CARGO_TARGET_LAYOUT: owning-workspace-v1
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     defaults:
@@ -426,17 +428,24 @@ jobs:
         if: ${{ (needs.scope.outputs.toolchain == 'true') }}
         id: cache-info
         shell: bash
-        run: echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" native-input >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
         if: ${{ (needs.scope.outputs.toolchain == 'true') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
-            rust_hft
-          key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}
+            rust_hft/shared -> target
+            rust_hft/data-pipelines -> ../target
+            rust_hft/research-core -> target
+            rust_hft/research-core/platform -> target
+            rust_hft/runtime -> target
+            rust_hft/prediction-markets -> target
+          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', '.github/scripts/ci-owner-cache.sh') }}
           cache-all-crates: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false
 
       - name: Test directly changed Rust packages
         id: owning
@@ -524,7 +533,9 @@ jobs:
         run: |
           mkdir -p dist
           for bin in hft-live hft-paper hft-all-in-one hft-replay; do
-            if [ -f target/debug/$bin ]; then
+            if [ -f runtime/target/debug/$bin ]; then
+              cp runtime/target/debug/$bin dist/
+            elif [ -f target/debug/$bin ]; then
               cp target/debug/$bin dist/
             fi
           done
@@ -580,6 +591,25 @@ jobs:
           path: ${{ runner.temp }}/rust-batch.json
           if-no-files-found: error
           retention-days: 7
+
+      - name: Retain only external dependencies for trusted workspace cache saves
+        if: ${{ github.ref == 'refs/heads/main' && success() && needs.scope.outputs.toolchain == 'true' }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" cleanup
+
+      - name: Save trusted workspace dependency cache
+        if: ${{ github.ref == 'refs/heads/main' && success() && needs.scope.outputs.toolchain == 'true' }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            rust_hft/shared -> target
+            rust_hft/data-pipelines -> ../target
+            rust_hft/research-core -> target
+            rust_hft/research-core/platform -> target
+            rust_hft/runtime -> target
+            rust_hft/prediction-markets -> target
+          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', '.github/scripts/ci-owner-cache.sh') }}
+          cache-all-crates: false
+          save-if: true
 
   clippy_strict:
     name: Code Quality - Clippy (STRICT)

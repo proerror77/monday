@@ -792,7 +792,10 @@ grep -Fq 'Python runtime or package-manager command' <<<"$fast_gates_block"
 
 # Each heavy Rust job saves Swatinem/rust-cache only from main.
 grep -Fq 'uses: Swatinem/rust-cache@' <<<"$rust_job_block"
-grep -Fq "save-if: \${{ github.ref == 'refs/heads/main' }}" <<<"$rust_job_block"
+grep -Fq 'save-if: false' <<<"$rust_job_block"
+grep -Fq "if: \${{ github.ref == 'refs/heads/main' && success() && needs.scope.outputs.toolchain == 'true' }}" <<<"$rust_job_block"
+grep -Fq 'Save trusted workspace dependency cache' <<<"$rust_job_block"
+grep -Fq 'save-if: true' <<<"$rust_job_block"
 fast_lane_block=$(job_block rust_hft_engine_fast_lane)
 grep -Fq 'uses: Swatinem/rust-cache@' <<<"$fast_lane_block"
 grep -Fq "save-if: \${{ github.ref == 'refs/heads/main' }}" <<<"$fast_lane_block"
@@ -826,7 +829,7 @@ recorder_block=$(job_block market_recorder_contract)
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fq 'key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}' <<<"$rust_job_block"
+grep -Fq 'key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}' <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
