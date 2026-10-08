@@ -19,6 +19,15 @@ The existing control Pod retains its runtime Gateway and AttemptWriter.
 | Scientific task lease/fence/cancel | Existing PG admission, Gateway and AttemptWriter remain | Existing runtime acceptance; no change here |
 | Promotion, holdout and trading | Existing separate governance/runtime rules | Build publication/import grants none of these |
 
+The shared Release orchestration accepts required-check conclusions of `success`
+or `skipped`. Research issuance and ACK import independently require all three
+authenticated checks to be `success` (latest exact-source checks for issuance,
+signed original check IDs for ACK); a skipped check therefore blocks
+research release acceptance even when the shared orchestration succeeds. Keep
+the independent `acr-publish.yml` publisher workflow/run/attempt/job identity;
+the Release orchestrator is not its issuer. Do not relax native checks to make
+the shared orchestration's broader admission imply research acceptance.
+
 ## Public publisher configuration
 
 Keep `MONDAY_RESEARCH_RELEASE_POLICY` and `MONDAY_RESEARCH_RELEASE_SIGNING_KEY`.
