@@ -1152,28 +1152,127 @@ pub struct ReleasePlan {
     pub builds: Vec<BuildSpec>,
     pub publisher_prefixes: Vec<String>,
 }
-/// Exact broker scopes computed from authenticated software and committed source.
-/// This prepares selectors only; it never uploads, signs, imports, or grants a Run.
-pub fn plan(
-    root: &Path,
-    request: &PublicationRequest,
+/// Public approval material, without a future publisher identity or OCI digest.
+#[derive(Serialize)]
+pub struct ReleaseScopePlan {
+    pub schema: u32,
+    pub source: SourceArchive,
+    pub builds: Vec<BuildSpec>,
+    pub publisher_prefixes: Vec<String>,
+}
+#[allow(clippy::too_many_arguments)]
+fn validate_scope_software(
+    manifest: &SoftwareRelease,
+    source: &str,
+    software_run: u64,
+    software_products: &str,
+    product: &str,
     policy: &PublisherPolicy,
-) -> Result<ReleasePlan> {
+    run: &Value,
+    job: &Value,
+    completed_run: bool,
+) -> Result<()> {
+    let selected: BTreeSet<_> = software_products.split(',').collect();
+    let produced: BTreeSet<_> = manifest.products.iter().map(String::as_str).collect();
+    ensure!(
+        manifest.schema == "monday.research-image-release.v6"
+            && manifest.source_sha == source
+            && manifest.workflow_run_id == software_run.to_string()
+            && manifest.target == manifest.build_inputs.target
+            && manifest.cargo_locks == manifest.build_inputs.locks
+            && manifest.build_inputs.builder_image == policy.builder_image
+            && pinned_image(&policy.builder_image)
+            && policy.trust.schema == 1
+            && policy.trust.producer_workflow_path == ".github/workflows/acr-publish.yml"
+            && policy
+                .image_repositories
+                .get(product)
+                .is_some_and(|r| !r.is_empty())
+            && selected == produced
+            && !selected.contains("")
+            && selected.len() == software_products.split(',').count()
+            && produced.len() == manifest.products.len()
+            && selected.contains(product),
+        "scope compiler/product provenance mismatch"
+    );
+    let workflow = run["path"].as_str().context("software workflow missing")?;
+    ensure!(
+        matches!(
+            workflow,
+            ".github/workflows/ploy-ci.yml" | ".github/workflows/acr-publish.yml"
+        ),
+        "untrusted scope software workflow"
+    );
+    let producer = ReleaseProducer {
+        repository: policy.trust.repository.clone(),
+        workflow_path: workflow.into(),
+        source_sha: source.into(),
+        run_id: software_run,
+        run_attempt: manifest.workflow_run_attempt,
+        job_id: manifest.workflow_job_id,
+    };
+    if completed_run {
+        completed_producer(run, job, &producer, false, "")
+    } else {
+        validate_run(
+            run,
+            &producer.repository,
+            source,
+            software_run,
+            producer.run_attempt,
+            workflow,
+        )?;
+        validate_job(job, software_run, producer.run_attempt, source, false)?;
+        ensure!(
+            job["id"] == producer.job_id,
+            "scope software job identity mismatch"
+        );
+        Ok(())
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn materialize_scope_plan(
+    root: &Path,
+    source_sha: &str,
+    software_run: u64,
+    software_products: &str,
+    product: &str,
+    policy: &PublisherPolicy,
+    completed_run: bool,
+) -> Result<ReleaseScopePlan> {
     let repository = &policy.trust.repository;
     ensure!(
-        sha_is_valid(&request.source_sha)
+        sha_is_valid(source_sha)
+            && software_run > 0
             && repository.split('/').count() == 2
             && repository
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_/".contains(&b)),
-        "invalid plan source/repository"
+        "invalid scope source/repository"
     );
     ensure!(
         command(root, "git", &["rev-parse", "HEAD"], repository)?
-            == format!("{}\n", request.source_sha).as_bytes(),
-        "plan source checkout mismatch"
+            == format!("{source_sha}\n").as_bytes()
+            && command(
+                root,
+                "git",
+                &["status", "--porcelain", "--untracked-files=no"],
+                repository
+            )?
+            .is_empty(),
+        "scope plan requires clean exact source checkout"
     );
-    authenticate(root, request, policy)?;
+    let normalized = command(
+        root,
+        "bash",
+        &[
+            ".github/scripts/research-release-products.sh",
+            "normalize",
+            software_products,
+        ],
+        repository,
+    )?;
+    let normalized = std::str::from_utf8(&normalized)?.trim();
     let scratch = Scratch::new()?;
     let software = scratch.join("software");
     command(
@@ -1181,29 +1280,47 @@ pub fn plan(
         "bash",
         &[
             ".github/scripts/download-research-release.sh",
-            &request.software_run_id.to_string(),
-            &request.source_sha,
+            &software_run.to_string(),
+            source_sha,
             software.to_str().context("software path")?,
-            &request.software_products,
+            normalized,
         ],
         repository,
     )?;
     let manifest: SoftwareRelease = read_json(&software.join("research-image-release.json"))?;
-    ensure!(
-        manifest.schema == "monday.research-image-release.v6"
-            && manifest.source_sha == request.source_sha
-            && manifest.workflow_run_id == request.software_run_id.to_string()
-            && manifest.build_inputs.builder_image == policy.builder_image
-            && manifest.products.contains(&request.product),
-        "plan compiler provenance mismatch"
-    );
+    let run = api(
+        root,
+        repository,
+        &format!(
+            "actions/runs/{software_run}/attempts/{}",
+            manifest.workflow_run_attempt
+        ),
+        false,
+    )?;
+    let job = api(
+        root,
+        repository,
+        &format!("actions/jobs/{}", manifest.workflow_job_id),
+        false,
+    )?;
+    validate_scope_software(
+        &manifest,
+        source_sha,
+        software_run,
+        normalized,
+        product,
+        policy,
+        &run,
+        &job,
+        completed_run,
+    )?;
     let names = command(
         root,
         "bash",
         &[
             ".github/scripts/research-release-products.sh",
             "binaries",
-            &request.product,
+            product,
         ],
         repository,
     )?;
@@ -1220,29 +1337,82 @@ pub fn plan(
             "--format=tar",
             "--output",
             archive.to_str().context("archive path")?,
-            &request.source_sha,
+            source_sha,
         ],
         repository,
     )?;
     let source = SourceArchive {
         schema: 1,
-        code_commit: request.source_sha.clone(),
+        code_commit: source_sha.into(),
         archive: measure(
             &archive,
-            format!("research/sources/{}/source.tar", request.source_sha),
+            format!("research/sources/{source_sha}/source.tar"),
         )?,
     };
-    let builds = project_builds(&source, &manifest.build_inputs, &names)?;
-    let mut publisher_prefixes = vec![format!("research/sources/{}/", request.source_sha)];
+    project_scope_plan(source, &manifest.build_inputs, &names)
+}
+fn project_scope_plan(
+    source: SourceArchive,
+    inputs: &CompilationInputs,
+    names: &BTreeSet<String>,
+) -> Result<ReleaseScopePlan> {
+    let builds = project_builds(&source, inputs, names)?;
+    let mut publisher_prefixes = vec![format!("research/sources/{}/", source.code_commit)];
     for build in &builds {
         publisher_prefixes.push(format!("research/builds/{}/", build.id()?));
     }
-    Ok(ReleasePlan {
+    publisher_prefixes.sort();
+    Ok(ReleaseScopePlan {
         schema: 1,
-        image: request.image.clone(),
         source,
         builds,
         publisher_prefixes,
+    })
+}
+/// Read-only pre-approval planning: no storage session, signing key or publisher.
+pub fn scope_plan(
+    root: &Path,
+    source: &str,
+    software_run: u64,
+    software_products: &str,
+    product: &str,
+    policy: &PublisherPolicy,
+) -> Result<ReleaseScopePlan> {
+    check_source_authority(root, &policy.trust.repository, source)?;
+    let scope = materialize_scope_plan(
+        root,
+        source,
+        software_run,
+        software_products,
+        product,
+        policy,
+        true,
+    )?;
+    check_source_authority(root, &policy.trust.repository, source)?;
+    Ok(scope)
+}
+/// Issuance still requires active authenticated publisher authority.
+pub fn plan(
+    root: &Path,
+    request: &PublicationRequest,
+    policy: &PublisherPolicy,
+) -> Result<ReleasePlan> {
+    authenticate(root, request, policy)?;
+    let scope = materialize_scope_plan(
+        root,
+        &request.source_sha,
+        request.software_run_id,
+        &request.software_products,
+        &request.product,
+        policy,
+        false,
+    )?;
+    Ok(ReleasePlan {
+        schema: 1,
+        image: request.image.clone(),
+        source: scope.source,
+        builds: scope.builds,
+        publisher_prefixes: scope.publisher_prefixes,
     })
 }
 
@@ -1315,35 +1485,12 @@ pub async fn read_build_release(
     Ok(VerifiedPublishedBuildRelease { verified })
 }
 
-pub async fn import_build(
-    build_id: &str,
-    oci_sha256: &str,
-    publication_proof_sha256: &str,
-    trust: &BuildReleaseTrust,
-    gateway: &ReleaseGateway,
-    ledger: &crate::postgres::Ledger,
-) -> Result<String> {
-    let published = read_build_release(
-        build_id,
-        oci_sha256,
-        publication_proof_sha256,
-        trust,
-        gateway,
-    )
-    .await?;
-    let id = ledger.register_build(&published).await?;
-    ensure!(
-        ledger.build_artifact(&id).await? == *published.artifact(),
-        "PG Build projection readback mismatch"
-    );
-    Ok(id)
-}
-
 /// Host-owned ACK approval. Updating this file never changes scientific grants.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportAdmission {
     pub schema: u32,
+    pub revision: i64,
     pub expires_ms: i64,
     pub build_sha256: String,
     pub image_sha256: String,
@@ -1353,7 +1500,8 @@ pub struct ImportAdmission {
 impl ImportAdmission {
     pub fn validate(&self, build: &str, image: &str, proof: &str, now: i64) -> Result<()> {
         ensure!(
-            self.schema == 1
+            self.schema == 2
+                && self.revision > 0
                 && !self.revoked
                 && self.expires_ms > now
                 && valid_digest(build)
@@ -1385,7 +1533,8 @@ impl SignedImportAdmission {
         now: i64,
     ) -> Result<Self> {
         ensure!(
-            admission.schema == 1
+            admission.schema == 2
+                && admission.revision > 0
                 && admission.expires_ms > now
                 && valid_digest(&admission.build_sha256)
                 && valid_digest(&admission.image_sha256)
@@ -1393,7 +1542,7 @@ impl SignedImportAdmission {
             "operator admission requires exact selectors and future expiry"
         );
         let mut signed = Self {
-            schema: 1,
+            schema: 2,
             key_id,
             admission,
             signature_hex: String::new(),
@@ -1409,7 +1558,7 @@ impl SignedImportAdmission {
         Ok(signed)
     }
     pub fn signing_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes = b"monday.ack-build-import-admission.v1\0".to_vec();
+        let mut bytes = b"monday.ack-build-import-admission.v2\0".to_vec();
         bytes.extend(serde_json::to_vec(&(
             self.schema,
             &self.key_id,
@@ -1424,7 +1573,7 @@ impl SignedImportAdmission {
             .get(&self.key_id)
             .context("unknown independent ACK admission key")?;
         ensure!(
-            self.schema == 1
+            self.schema == 2
                 && valid_digest(public)
                 && !policy.trust.keys.values().any(|key| key == public)
                 && self.signature_hex.len() == 128
@@ -1452,10 +1601,63 @@ impl SignedImportAdmission {
         Ok(&self.admission)
     }
 }
-fn read_import_admission(path: &Path, policy: &PublisherPolicy) -> Result<ImportAdmission> {
+/// Signature-verified independent approval; only its owner may project it to PG.
+pub struct VerifiedImportAdmission {
+    signed: SignedImportAdmission,
+    envelope_sha256: String,
+}
+impl VerifiedImportAdmission {
+    pub fn from_signed(signed: SignedImportAdmission, policy: &PublisherPolicy) -> Result<Self> {
+        signed.verify(policy)?;
+        let a = &signed.admission;
+        ensure!(
+            a.schema == 2
+                && a.revision > 0
+                && valid_digest(&a.build_sha256)
+                && valid_digest(&a.image_sha256)
+                && valid_digest(&a.publication_proof_sha256),
+            "exact independent admission selectors required"
+        );
+        let envelope_sha256 = identity(&signed)?;
+        Ok(Self {
+            signed,
+            envelope_sha256,
+        })
+    }
+    pub fn admission(&self) -> &ImportAdmission {
+        &self.signed.admission
+    }
+    pub(crate) fn envelope_sha256(&self) -> &str {
+        &self.envelope_sha256
+    }
+    pub(crate) fn document(&self) -> Result<Value> {
+        Ok(serde_json::to_value(&self.signed)?)
+    }
+    pub(crate) fn validate_release(
+        &self,
+        published: &VerifiedPublishedBuildRelease,
+        now: i64,
+    ) -> Result<()> {
+        let receipt = &published.verified().signed().receipt;
+        self.admission().validate(
+            &receipt.build_sha256,
+            receipt
+                .image
+                .rsplit_once("@sha256:")
+                .context("pinned import image")?
+                .1,
+            &receipt.publication_readback_sha256,
+            now,
+        )
+    }
+}
+pub fn read_import_admission(
+    path: &Path,
+    policy: &PublisherPolicy,
+) -> Result<VerifiedImportAdmission> {
     let signed: SignedImportAdmission =
         serde_json::from_slice(&crate::transport::read_private_file(path)?)?;
-    Ok(signed.verify(policy)?.clone())
+    VerifiedImportAdmission::from_signed(signed, policy)
 }
 
 fn completed_producer(
@@ -1567,7 +1769,7 @@ pub async fn import_oss_build(
         .context("ACK import requires OSS")?
         .require_reader()?;
     let admission = read_import_admission(admission_path, policy)?;
-    admission.validate(
+    admission.admission().validate(
         build,
         image,
         proof_id,
@@ -1601,13 +1803,13 @@ pub async fn import_oss_build(
         &proof,
     )?;
     let admission = read_import_admission(admission_path, policy)?;
-    admission.validate(
+    admission.admission().validate(
         build,
         image,
         proof_id,
         chrono::Utc::now().timestamp_millis(),
     )?;
-    let id = ledger.register_build(&published).await?;
+    let id = ledger.register_build(&published, &admission).await?;
     ensure!(
         ledger.build_artifact(&id).await? == *published.artifact(),
         "ACK PG Build readback mismatch"
@@ -1625,7 +1827,8 @@ mod tests {
         let image = "b".repeat(64);
         let proof = "c".repeat(64);
         let mut admission = ImportAdmission {
-            schema: 1,
+            schema: 2,
+            revision: 1,
             expires_ms: 1001,
             build_sha256: build.clone(),
             image_sha256: image.clone(),
@@ -1677,10 +1880,11 @@ mod tests {
             "import_admission_keys":{"operator":hex(&operator.verifying_key().to_bytes())}
         })).unwrap();
         let mut signed = SignedImportAdmission {
-            schema: 1,
+            schema: 2,
             key_id: "operator".into(),
             admission: ImportAdmission {
-                schema: 1,
+                schema: 2,
+                revision: 1,
                 expires_ms: 1001,
                 build_sha256: "a".repeat(64),
                 image_sha256: "b".repeat(64),
@@ -1731,6 +1935,16 @@ mod tests {
         malformed.build_sha256 = "*".into();
         assert!(SignedImportAdmission::sign(
             malformed,
+            "operator".into(),
+            &operator,
+            &policy,
+            1000
+        )
+        .is_err());
+        let mut zero_revision = admission.clone();
+        zero_revision.revision = 0;
+        assert!(SignedImportAdmission::sign(
+            zero_revision,
             "operator".into(),
             &operator,
             &policy,
@@ -1950,6 +2164,169 @@ mod tests {
         assert!(verify(&missing, &proof).is_err());
         proof.required_check_ids = vec![1, 1, 3];
         assert!(verify(&original, &proof).is_err());
+    }
+    #[test]
+    fn readonly_scope_binds_completed_software_and_exact_compiler_products_without_publisher() {
+        let sha = "a".repeat(40);
+        let policy: PublisherPolicy=serde_json::from_value(json!({
+            "trust":{"schema":1,"repository":"owner/repo","producer_workflow_path":".github/workflows/acr-publish.yml","keys":{}},
+            "key_id":"ci","builder_image":inputs().builder_image,"image_repositories":{"cex-runner":"registry/runner"}
+        })).unwrap();
+        let manifest = json!({"schema":"monday.research-image-release.v6","products":["cex-runner"],
+            "source_sha":sha,"workflow_run_id":"20","workflow_run_attempt":1,"workflow_job_id":30,
+            "target":inputs().target,"build_inputs":inputs(),"cargo_locks":inputs().locks,"binaries":[]});
+        let run = json!({"id":20,"run_attempt":1,"head_sha":sha,"head_branch":"main","head_repository":{"full_name":"owner/repo"},
+            "path":".github/workflows/ploy-ci.yml","event":"push","status":"completed","conclusion":"success"});
+        let job = json!({"id":30,"run_id":20,"run_attempt":1,"head_sha":sha,"name":"Research image binaries","status":"completed","conclusion":"success"});
+        let verify = |m: Value, r: &Value, j: &Value, products: &str| {
+            validate_scope_software(
+                &serde_json::from_value(m).unwrap(),
+                &sha,
+                20,
+                products,
+                "cex-runner",
+                &policy,
+                r,
+                j,
+                true,
+            )
+        };
+        assert!(verify(manifest.clone(), &run, &job, "cex-runner").is_ok());
+        for (path, value) in [
+            ("/source_sha", json!("b".repeat(40))),
+            ("/workflow_run_id", json!("21")),
+            ("/workflow_run_attempt", json!(2)),
+            ("/workflow_job_id", json!(31)),
+            ("/target", json!("aarch64-unknown-linux-gnu")),
+            ("/cargo_locks", json!({})),
+            (
+                "/build_inputs/builder_image",
+                json!(format!("foreign@sha256:{}", "b".repeat(64))),
+            ),
+            ("/products", json!(["cex-runner", "cex-runner"])),
+            ("/products", json!(["controller"])),
+        ] {
+            let mut bad = manifest.clone();
+            *bad.pointer_mut(path).unwrap() = value;
+            assert!(
+                verify(bad, &run, &job, "cex-runner").is_err(),
+                "accepted manifest mutation {path}"
+            );
+        }
+        for (key, value) in [
+            ("conclusion", json!("cancelled")),
+            ("status", json!("in_progress")),
+            ("path", json!(".github/workflows/foreign.yml")),
+            ("head_sha", json!("b".repeat(40))),
+            ("run_attempt", json!(2)),
+            ("head_branch", json!("foreign")),
+            ("head_repository", json!({"full_name":"foreign/repo"})),
+        ] {
+            let mut bad = run.clone();
+            bad[key] = value;
+            assert!(verify(manifest.clone(), &bad, &job, "cex-runner").is_err());
+        }
+        for (key, value) in [
+            ("id", json!(31)),
+            ("conclusion", json!("failure")),
+            ("status", json!("in_progress")),
+            ("run_attempt", json!(2)),
+            ("name", json!("foreign")),
+        ] {
+            let mut bad = job.clone();
+            bad[key] = value;
+            assert!(verify(manifest.clone(), &run, &bad, "cex-runner").is_err());
+        }
+        for products in [
+            "cex-runner,cex-runner",
+            "cex-runner,controller",
+            "controller",
+            "",
+        ] {
+            assert!(verify(manifest.clone(), &run, &job, products).is_err());
+        }
+        // Rebuild within an active publication workflow remains supported for
+        // issuance, but cannot be used as an independently completed scope plan.
+        let mut active = run;
+        active["path"] = json!(".github/workflows/acr-publish.yml");
+        active["event"] = json!("workflow_dispatch");
+        active["status"] = json!("in_progress");
+        active["conclusion"] = Value::Null;
+        let manifest: SoftwareRelease = serde_json::from_value(manifest).unwrap();
+        assert!(validate_scope_software(
+            &manifest,
+            &sha,
+            20,
+            "cex-runner",
+            "cex-runner",
+            &policy,
+            &active,
+            &job,
+            false
+        )
+        .is_ok());
+        assert!(validate_scope_software(
+            &manifest,
+            &sha,
+            20,
+            "cex-runner",
+            "cex-runner",
+            &policy,
+            &active,
+            &job,
+            true
+        )
+        .is_err());
+        let names = inputs().recipes[0].binaries.iter().cloned().collect();
+        let scope = project_scope_plan(source(), &inputs(), &names).unwrap();
+        let expected = project_builds(&source(), &inputs(), &names).unwrap();
+        assert_eq!(
+            serde_json::to_value(&scope.builds).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        for build in &scope.builds {
+            assert!(scope
+                .publisher_prefixes
+                .contains(&format!("research/builds/{}/", build.id().unwrap())));
+        }
+        let value = serde_json::to_value(scope).unwrap();
+        assert!(value.get("image").is_none() && value.get("publisher_run_id").is_none());
+    }
+    #[test]
+    fn scope_plan_rejects_dirty_tracked_scripts_before_any_software_or_cloud_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            out.stdout
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "Fixture"]);
+        std::fs::write(root.join("guard.sh"), "committed").unwrap();
+        git(&["add", "guard.sh"]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        let sha = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
+        std::fs::write(root.join("guard.sh"), "changed").unwrap();
+        let policy:PublisherPolicy=serde_json::from_value(json!({"trust":{"schema":1,"repository":"owner/repo","producer_workflow_path":".github/workflows/acr-publish.yml","keys":{}},"key_id":"ci","builder_image":inputs().builder_image,"image_repositories":{}})).unwrap();
+        let error = materialize_scope_plan(
+            root,
+            sha.trim(),
+            20,
+            "cex-runner",
+            "cex-runner",
+            &policy,
+            true,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(error, "scope plan requires clean exact source checkout");
     }
     fn source() -> SourceArchive {
         SourceArchive {

@@ -6,9 +6,9 @@ use anyhow::{ensure, Result};
 #[ignore = "requires disposable MONDAY_TEST_DATABASE_URL ending /monday_foundation_roles_test"]
 async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> Result<()> {
     use hft_research_platform::postgres::{
-        BUILD_RELEASE_MIGRATION, MIGRATION, NATIVE_ADMISSION_MIGRATION,
-        NATIVE_CAMPAIGN_INPUTS_MIGRATION, NATIVE_REQUEST_REVOCATION_MIGRATION,
-        SESSION_DELIVERY_MIGRATION,
+        BUILD_IMPORT_ADMISSION_MIGRATION, BUILD_RELEASE_MIGRATION, MIGRATION,
+        NATIVE_ADMISSION_MIGRATION, NATIVE_CAMPAIGN_INPUTS_MIGRATION,
+        NATIVE_REQUEST_REVOCATION_MIGRATION, SESSION_DELIVERY_MIGRATION,
     };
     let url = std::env::var("MONDAY_TEST_DATABASE_URL")?;
     ensure!(
@@ -19,6 +19,7 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
     for migration in [
         MIGRATION,
         BUILD_RELEASE_MIGRATION,
+        BUILD_IMPORT_ADMISSION_MIGRATION,
         SESSION_DELIVERY_MIGRATION,
         include_str!("../sql/artifact_gateway.sql"),
         NATIVE_ADMISSION_MIGRATION,
@@ -237,6 +238,33 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
         .to_string()
         .contains("artifact authority is paused"));
     tx.rollback().await?;
+    // The independent approval owner is not a scientific or release writer.
+    for role in [
+        "monday_research_submitter",
+        "monday_research_reconciler",
+        "monday_research_session_host",
+        "monday_research_artifact_gateway",
+        "monday_research_prepare_worker",
+        "monday_research_definition_writer",
+        "monday_research_release_importer",
+        "monday_research_native_admission",
+        "monday_research_terminal_retirement",
+    ] {
+        let writes:bool=sqlx_core::query_scalar::query_scalar("SELECT has_table_privilege($1,'research.build_import_admissions','INSERT') OR has_table_privilege($1,'research.build_import_admissions','UPDATE') OR has_table_privilege($1,'research.build_import_admissions','DELETE') OR pg_has_role($1,'monday_research_build_import_owner','MEMBER')")
+            .bind(role).fetch_one(&pool).await?;
+        ensure!(!writes, "ordinary role can approve its own Build: {role}");
+    }
+    let owner_correct:bool=sqlx_core::query_scalar::query_scalar("SELECT has_table_privilege('monday_research_build_import_owner','research.build_import_admissions','SELECT,INSERT,UPDATE') AND NOT has_table_privilege('monday_research_build_import_owner','research.build_import_admissions','DELETE') AND NOT has_table_privilege('monday_research_build_import_owner','research.build_releases','INSERT') AND NOT has_table_privilege('monday_research_build_import_owner','research.runs','INSERT') AND NOT has_table_privilege('monday_research_build_import_owner','research.admissions','INSERT') AND NOT has_table_privilege('monday_research_build_import_owner','research.backends','UPDATE')")
+        .fetch_one(&pool).await?;
+    ensure!(
+        owner_correct,
+        "independent owner acquired release/Run/runtime authority"
+    );
+    let flags:bool=sqlx_core::query_scalar::query_scalar("SELECT NOT rolcanlogin AND NOT rolsuper AND NOT rolcreaterole FROM pg_roles WHERE rolname='monday_research_build_import_owner'").fetch_one(&pool).await?;
+    ensure!(
+        flags,
+        "independent approval owner role must not provision login/admin authority"
+    );
     pool.close().await;
     Ok(())
 }

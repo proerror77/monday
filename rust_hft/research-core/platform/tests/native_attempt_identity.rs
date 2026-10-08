@@ -8,8 +8,8 @@ use hft_research_platform::{
     identity,
     orchestrator::{Admission, Artifact, State, Task, TaskKind, TaskSpec},
     postgres::{
-        Ledger, BUILD_RELEASE_MIGRATION, MIGRATION, NATIVE_ADMISSION_MIGRATION,
-        NATIVE_REQUEST_REVOCATION_MIGRATION,
+        Ledger, BUILD_IMPORT_ADMISSION_MIGRATION, BUILD_RELEASE_MIGRATION, MIGRATION,
+        NATIVE_ADMISSION_MIGRATION, NATIVE_REQUEST_REVOCATION_MIGRATION,
     },
     research::{Experiment, Run},
     revocation::{sign_revocation, NativeRequestRevocation, NATIVE_REQUEST_REVOCATION_SCHEMA},
@@ -40,6 +40,7 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
         for migration in [
             MIGRATION,
             BUILD_RELEASE_MIGRATION,
+            BUILD_IMPORT_ADMISSION_MIGRATION,
             NATIVE_ADMISSION_MIGRATION,
             NATIVE_REQUEST_REVOCATION_MIGRATION,
         ] {
@@ -95,6 +96,9 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
     };
     let package = common::published::Package::new(artifact).await?;
     let artifact = package.artifact.clone();
+    ledger
+        .set_build_import_admission(&package.admission)
+        .await?;
     let artifact_id = package.import(&ledger).await?;
     let run = Run {
         schema: 1,
