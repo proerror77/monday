@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../../rust_hft/prediction-markets"
 cargo test --locked -p ploy-feed-loaders --lib
 cargo test --locked -p ploy-research --lib
+cargo test --locked -p ploy-research --no-default-features --features rl --lib model::rl
 cargo test --locked -p ploy-research --features ml --lib
 cargo clippy --locked -p ploy-research --features ml --all-targets --no-deps -- -D warnings
 cargo check --locked -p ploy-research --bin monday-prediction-research
