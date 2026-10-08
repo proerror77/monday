@@ -264,6 +264,13 @@ jobs:
           MONDAY_RESEARCH_CACHE_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && '1' || '0' }}
           MONDAY_BUILD_INPUTS_FILE: ${{ runner.temp }}/research-build-inputs.json
         run: bash .github/scripts/build-research-release.sh "${{ needs.image-smoke-scope.outputs.research_product }}"
+      - name: Upload research image release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: research-image-release-${{ github.sha }}-${{ needs.image-smoke-scope.outputs.research_product }}
+          path: ${{ runner.temp }}/research-image-release.tar
+          if-no-files-found: error
+          retention-days: 7
       - name: Upload recipe timing evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -272,13 +279,7 @@ jobs:
           path: ${{ runner.temp }}/research-recipe-probe/timings.jsonl
           if-no-files-found: error
           retention-days: 7
-      - name: Upload research image release
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: research-image-release-${{ github.sha }}-${{ needs.image-smoke-scope.outputs.research_product }}
-          path: ${{ runner.temp }}/research-image-release.tar
-          if-no-files-found: error
-          retention-days: 7
+
 
   research-image-smoke:
     name: Research image smoke
