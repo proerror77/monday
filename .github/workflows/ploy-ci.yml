@@ -40,6 +40,8 @@ jobs:
       jobs: ${{ steps.cumulative.outputs.jobs || steps.scope.outputs.jobs }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
       research_product: ${{ steps.cumulative.outputs.research_product || steps.scope.outputs.research_product }}
+      research_pending_product: ${{ steps.cumulative.outputs.research_pending_product }}
+      research_deferred_product: ${{ steps.cumulative.outputs.research_deferred_product }}
     steps:
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -66,6 +68,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
           SELECTED_RESEARCH_PRODUCT: ${{ steps.scope.outputs.research_product }}
+          RESEARCH_CARRY_MODE: defer-unconfigured
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
         run: bash .github/scripts/select-main-research-scope.sh "$GITHUB_SHA" "$GITHUB_OUTPUT"
 
   image-smoke-scope:

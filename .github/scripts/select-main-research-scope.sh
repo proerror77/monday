@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 head=${1:?source required} output=${2:?plan output required} metadata=${3:-}
+carry_mode=${RESEARCH_CARRY_MODE:-always}
+[[ $carry_mode == always || $carry_mode == defer-unconfigured ]] || exit 2
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -36,7 +38,31 @@ for target in cex-runner controller prediction-runner; do
     accumulated=$(bash "$script_dir/research-release-products.sh" merge "$accumulated" "$target")
   fi
 done
+policy_state=unchecked
+if [[ $carry_mode == defer-unconfigured ]]; then
+  if [[ -z ${MONDAY_RELEASE_POLICY_JSON:-} ]]; then policy_state=unconfigured
+  else
+    # Only confirmed absent configuration defers work. Invalid policy retains
+    # the existing carry plan and still requires native publication validation.
+    policy_state=$(printf '%s' "$MONDAY_RELEASE_POLICY_JSON" | jq -esr '
+      if length != 1 or (.[0] | type) != "object" then "invalid"
+      elif .[0].oss_by_product == null or .[0].oss_by_product == {} then "unconfigured"
+      elif (.[0].oss_by_product | type) == "object" then "configured"
+      else "invalid" end' 2>/dev/null) || policy_state=invalid
+  fi
+fi
+deferred=none
 product=$(bash "$script_dir/research-release-products.sh" merge "$current" "$accumulated")
+if [[ $policy_state == unconfigured ]]; then
+  # Keep every direct-source product and job. The baseline remains unchanged.
+  product=$current
+  deferred=$(jq -nr --arg pending "$accumulated" --arg current "$current" '
+    def products: if . == "none" then [] else split(",") end;
+    (($pending | products) - ($current | products)) | join(",") | if . == "" then "none" else . end')
+  printf 'Research carry deferred: %s; direct-source products retained: %s; publication baseline unchanged.\n' "$deferred" "$current" >&2
+elif [[ $policy_state == invalid ]]; then
+  printf 'Invalid public research policy; retaining cumulative builds for native publication validation.\n' >&2
+fi
 if [[ $product != none ]]; then
   for job in ploy/research-image-binaries ploy/research-image-smoke; do
     if [[ $jobs != *,$job,* ]]; then
@@ -44,4 +70,5 @@ if [[ $product != none ]]; then
     fi
   done
 fi
-printf 'research_base_sha=%s\nresearch_product=%s\njobs=%s\n' "$(jq -c . "$work/base")" "$product" "$jobs" >>"$output"
+printf 'research_base_sha=%s\nresearch_product=%s\nresearch_pending_product=%s\nresearch_deferred_product=%s\nresearch_carry_policy=%s\njobs=%s\n' \
+  "$(jq -c . "$work/base")" "$product" "$accumulated" "$deferred" "$policy_state" "$jobs" >>"$output"
