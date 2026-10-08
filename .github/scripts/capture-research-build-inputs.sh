@@ -52,6 +52,9 @@ while IFS= read -r manifest; do
   printf '%s\n' "$manifest" >>"$work/profiles"
   cat "$root/rust_hft/$manifest" >>"$work/profiles"
 done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
+# Native/dependency feature resolution can change via an excluded local
+# package manifest without any lockfile change. Bind those manifests too.
+bash "$root/.github/scripts/research-cache-layout.sh" manifest-inputs >>"$work/profiles"
 workspace_profiles='{}'
 while IFS= read -r manifest; do
   digest=$(sha256sum "$root/rust_hft/$manifest" | awk '{print $1}')
@@ -61,6 +64,7 @@ recipes=$(bash "$root/.github/scripts/research-release-products.sh" recipes "${2
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
 cat "$root/.github/scripts/build-research-release.sh" \
   "$root/.github/scripts/build-research-recipes.sh" \
+  "$root/.github/scripts/research-cache-layout.sh" \
   "$root/.github/scripts/research-release-products.sh" \
   "$root/.github/scripts/research-release-products.json" \
   "$root/.github/scripts/research-release-source-sha.sh" \

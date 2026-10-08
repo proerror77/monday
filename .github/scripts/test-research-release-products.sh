@@ -83,7 +83,7 @@ bash "$root/.github/scripts/test-research-product-image.sh"
 # binaries. Only the target recorded by compiler inputs may reach the archive.
 fixture="$work/producer"
 mkdir -p "$fixture/.github/scripts" "$fixture/rust_hft" "$fixture/bin" "$fixture/output"
-for script in build-research-release.sh build-research-recipes.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
+for script in research-cache-layout.sh build-research-release.sh build-research-recipes.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
   cp "$root/.github/scripts/$script" "$fixture/.github/scripts/$script"
 done
 cp "$root/rust_hft/workspaces.json" "$fixture/rust_hft/workspaces.json"
@@ -98,6 +98,10 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\n" 7\n' >"$fixture/bin/gh"
 cat >"$fixture/bin/cargo" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ $1 == metadata ]]; then
+  jq -n --arg root "$PWD" '{packages:[{name:"alpha-harness",manifest_path:($root+"/alpha-harness/Cargo.toml"),targets:[{name:"alpha_harness"}]}]}'
+  exit
+fi
 [[ ${FAIL_RECIPE:-0} != 1 ]] || exit 37
 target='' binaries=()
 while [[ $# -gt 0 ]]; do
@@ -111,7 +115,7 @@ test "$target" = "$(jq -r .target "$MONDAY_BUILD_INPUTS_FILE")"
 mkdir -p "$CARGO_TARGET_DIR/$target/release"
 for binary in "${binaries[@]}"; do
   printf 'fresh target executable: %s\n' "$binary" >"$CARGO_TARGET_DIR/$target/release/$binary"
-  printf '%s\n' '{"reason":"compiler-artifact","fresh":true}'
+  printf '%s\n' '{"reason":"compiler-artifact","package_id":"path+file:///fixture#local-recipe@0.1.0","target":{"name":"mock-binary"},"fresh":true}'
 done
 printf '%s\n' '{"reason":"build-finished","success":true}'
 MOCK
@@ -127,8 +131,8 @@ while IFS= read -r binary; do
 done < <(bash "$products" binaries controller)
 printf 'PASS: controller-only release builds five admitted executables including the ACK importer; product, archive and unadmitted control bytes fail closed\n'
 
-# The opt-in probe must run all three controller recipes twice with one input identity.
-jq -es 'length==6 and ([.[].phase]|sort)==["after-cache-lookup","after-cache-lookup","after-cache-lookup","warm-local","warm-local","warm-local"]
+# The opt-in probe must run all three controller recipes through three exact-input phases with one input identity.
+jq -es 'length==9 and ([.[].phase]|sort)==["after-cache-lookup","after-cache-lookup","after-cache-lookup","dependency-warm-local","dependency-warm-local","dependency-warm-local","warm-local","warm-local","warm-local"]
   and ([.[].compilation_inputs_sha256]|unique|length)==1
   and all(.[]; .source_sha=="1111111111111111111111111111111111111111" and .compiler_artifacts>0)' \
   "$fixture/output/research-recipe-probe/timings.jsonl" >/dev/null

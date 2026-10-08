@@ -9,24 +9,28 @@ export MONDAY_RELEASE_JOB_ID
 MONDAY_RELEASE_JOB_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '.jobs|map(select(.name=="Research image binaries" or .name=="Research release binaries"))|if length==1 then .[0].id else error("ambiguous release producer") end')
 export MONDAY_SOURCE_REVISION=$source_sha
 export CARGO_TARGET_DIR="$PWD/target"
-target=x86_64-unknown-linux-gnu
+binary_path() { bash ../.github/scripts/research-cache-layout.sh binary-path "$product" "$1"; }
 bash ../.github/scripts/build-research-recipes.sh "$product" after-cache-lookup
 if [[ ${MONDAY_RESEARCH_CACHE_PROBE:-0} == 1 ]]; then
   # Probe only the current runner's target. Never save a PR cache or change recipes.
   before=$(mktemp)
   after=$(mktemp)
   trap 'rm -f "$before" "$after"' EXIT
-  while IFS= read -r binary; do sha256sum "target/$target/release/$binary"; done \
+  while IFS= read -r binary; do sha256sum "$(binary_path "$binary")"; done \
     < <(bash ../.github/scripts/research-release-products.sh binaries "$product") >"$before"
   bash ../.github/scripts/build-research-recipes.sh "$product" warm-local
-  while IFS= read -r binary; do sha256sum "target/$target/release/$binary"; done \
+  while IFS= read -r binary; do sha256sum "$(binary_path "$binary")"; done \
     < <(bash ../.github/scripts/research-release-products.sh binaries "$product") >"$after"
   diff -u "$before" "$after"
+  # Exercise dependency-only reuse without persisting a PR cache. Local sources
+  # must compile again; native dependencies should survive the same cleanup.
+  bash ../.github/scripts/research-cache-layout.sh cleanup "$MONDAY_BUILD_INPUTS_FILE"
+  bash ../.github/scripts/build-research-recipes.sh "$product" dependency-warm-local
 fi
 release=${RUNNER_TEMP:?}/research-release
 mkdir -p "$release/research-bin"
 while IFS= read -r binary; do
-  install -m 0755 "target/$target/release/$binary" "$release/research-bin/$binary"
+  install -m 0755 "$(binary_path "$binary")" "$release/research-bin/$binary"
 done < <(bash ../.github/scripts/research-release-products.sh binaries "$product")
 ../.github/scripts/verify-research-runtime-abi.sh "$release/research-bin" "$product"
 ../.github/scripts/research-image-release-artifact.sh create "$release" "$source_sha" "$GITHUB_RUN_ID" . "$GITHUB_RUN_ATTEMPT" "$MONDAY_RELEASE_JOB_ID" "$product"

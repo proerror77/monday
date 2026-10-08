@@ -219,6 +219,10 @@ jobs:
         working-directory: .
         run: .github/scripts/test-market-tape-seal-benchmark.sh
 
+      - name: Test research dependency cache boundaries
+        working-directory: .
+        run: bash .github/scripts/test-research-cache-layout.sh
+
       - name: Test ACR publish workflow contract
         run: ../../.github/scripts/test-acr-publish-workflow.sh
 
@@ -251,12 +255,14 @@ jobs:
         id: build-inputs
         working-directory: .
         run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json" "${{ needs.image-smoke-scope.outputs.research_product }}"
+      - name: Select owning-workspace cache targets
+        id: research-cache-layout
+        working-directory: .
+        run: bash .github/scripts/research-cache-layout.sh workspaces "${RUNNER_TEMP}/research-build-inputs.json" >> "$GITHUB_OUTPUT"
       - id: research-cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          workspaces: |
-            rust_hft
-            rust_hft/prediction-markets
+          workspaces: ${{ steps.research-cache-layout.outputs.workspaces }}
           key: research-release-linux-amd64-${{ steps.build-inputs.outputs.cache_sha256 }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build immutable research release
@@ -283,6 +289,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+
+      - name: Retain only dependency compilation bytes for trusted cache saves
+        if: ${{ github.ref == 'refs/heads/main' && success() }}
+        working-directory: .
+        run: bash .github/scripts/research-cache-layout.sh cleanup "${RUNNER_TEMP}/research-build-inputs.json"
 
   research-image-smoke:
     name: Research image smoke
