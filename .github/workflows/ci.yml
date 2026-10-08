@@ -282,9 +282,11 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # The archive builds research-core. Cleanup must use that owner's
+          # dependency graph, including native DuckDB compilation outputs.
           workspaces: |
-            rust_hft
-          key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}
+            rust_hft/research-core -> ../target
+          key: loop-nextest-research-owner-v2-${{ steps.cache-info.outputs.rust }}
           cache-all-crates: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
