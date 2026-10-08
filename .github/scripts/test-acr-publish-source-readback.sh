@@ -83,7 +83,10 @@ done
 reset_fixtures
 edit_fixture checks '.[0].check_runs[0].app.id=1'
 read_state deferred
-for failure in failure skipped cancelled timed_out; do
+reset_fixtures
+edit_fixture checks '.[0].check_runs[0].conclusion="skipped"'
+read_state ready
+for failure in failure cancelled timed_out; do
   reset_fixtures
   edit_fixture checks ".[0].check_runs[0].conclusion=\"$failure\""
   reject "required-$failure"

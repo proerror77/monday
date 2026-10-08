@@ -30,7 +30,7 @@ fi
 all_green=true
 for check in monorepo prediction security; do
   state=$(sed -n "s/^${check}_conclusion=//p" "$work/states")
-  [[ $state == success ]] || all_green=false
+  [[ $state == success || $state == skipped ]] || all_green=false
 done
 if [[ $all_green == true ]]; then
   "$script_dir/read-release-published.sh" "$source_sha" "$work/published"

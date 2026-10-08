@@ -82,7 +82,7 @@ binance_repeat_source_test_tag=$(sed -n 's/^source_test_tag=//p' "$tmp_dir/sourc
 test "$binance_source_test_tag" != "$bybit_source_test_tag"
 test "$binance_source_test_tag" = "$binance_repeat_source_test_tag"
 
-for rejected in failed-run pull-request-run branch-run automated-stale-main manual-nonmain manual-stale-main required-missing required-pending required-skipped required-failed implicit-rebuild source-test-missing-sha source-test-nonmain source-test-untrusted-sha source-test-stale-main source-test-rebuild source-test-invalid-profile source-test-on-runtime automated-source-test; do
+for rejected in failed-run pull-request-run branch-run automated-stale-main manual-nonmain manual-stale-main required-missing required-pending required-failed implicit-rebuild source-test-missing-sha source-test-nonmain source-test-untrusted-sha source-test-stale-main source-test-rebuild source-test-invalid-profile source-test-on-runtime automated-source-test; do
   case "$rejected" in
     failed-run) args=(--event workflow_run --conclusion failure --source-event push --head-branch main --head-sha "$main_sha" --run-id 1234) ;;
     pull-request-run) args=(--event workflow_run --conclusion success --source-event pull_request --head-branch main --head-sha "$main_sha" --run-id 1234) ;;
@@ -92,7 +92,6 @@ for rejected in failed-run pull-request-run branch-run automated-stale-main manu
     manual-stale-main) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678 "${green_admission[@]}") ;;
     required-missing) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion missing --prediction-conclusion success --security-conclusion success) ;;
     required-pending) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion success --prediction-conclusion in_progress --security-conclusion success) ;;
-    required-skipped) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion success --prediction-conclusion success --security-conclusion skipped) ;;
     required-failed) args=(--event workflow_dispatch --target hft-trading --rebuild false --current-ref refs/heads/main --current-sha "$main_sha" --current-run-id 5678 --main-sha "$main_sha" --monorepo-conclusion failure --prediction-conclusion success --security-conclusion success) ;;
     implicit-rebuild) args=(--event workflow_dispatch --target research-runner --rebuild false --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;
     source-test-missing-sha) args=(--event workflow_dispatch --target research-source-test --rebuild false --current-ref refs/heads/main --current-sha "$other_sha" --current-run-id 5678) ;;

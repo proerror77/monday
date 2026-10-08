@@ -21,9 +21,9 @@ else
   for check in monorepo prediction security; do
     state=$(sed -n "s/^${check}_conclusion=//p" "$states")
     case "$state" in
-      success) ;;
+      success|skipped) ;;
       missing|queued|in_progress|waiting|pending|requested) pending=true ;;
-      failure|neutral|cancelled|skipped|timed_out|action_required|stale|startup_failure) rejected=true ;;
+      failure|neutral|cancelled|timed_out|action_required|stale|startup_failure) rejected=true ;;
       *) printf 'invalid check state for %s: %s\n' "$check" "${state:-empty}" >&2; exit 1 ;;
     esac
   done

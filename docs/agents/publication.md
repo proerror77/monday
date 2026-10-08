@@ -14,8 +14,9 @@ sealed holdout, trading, risk changes, or resuming a paused runtime.
 ## Admission
 
 All production artifact paths require the same three authenticated GitHub Actions
-checks for the exact source SHA, read by read-release-required-checks.sh. Do not
-accept similarly named checks from another app, skipped checks, or another SHA.
+checks for the exact source SHA, read by read-release-required-checks.sh.
+Accept success or skipped for these three checks. Reject similarly named checks
+from another app or another SHA.
 These checks aggregate the selected validation plan; they do not require every
 product to build for each release. Monitoring and CI-policy changes select their
 own contracts. The current-source aggregate must reject a missing, failed,
@@ -29,11 +30,12 @@ non-production diagnostic exception with its existing identity restrictions.
 Automatic GHCR and ACR publication share one Release workflow. Completion of
 any required CI workflow wakes it. Pull requests do not. The workflow reads the
 three required checks for that head SHA and calls the GHCR and ACR workflows
-only when every check is success and the SHA is still current main. Pending or
-unsuccessful evidence exits without publishing; a later completion checks the
+only when every check is success or skipped and the SHA is still current main.
+Pending or unsuccessful evidence exits without publishing; a later completion checks the
 SHA again, so long-running valid CI does not exhaust a publisher's wait window.
-A SHA that already has its image tag or a successful Release publish job is not
-published again. The admitted SHA binds the build checkout and OCI revision.
+GHCR skips a full-SHA image tag or a successful nested publication job.
+ACR requires the successful product publication marker; raw manifests do not
+prove signed release completion. Retried runs also read earlier attempts. The admitted SHA binds the build checkout and OCI revision.
 Manual and tag publication stay on their existing entries and may wait a
 bounded time; failure, cancellation, missing evidence at its deadline, or
 source drift fails closed. Reconcile those
@@ -98,3 +100,12 @@ Collector publication loads the successful Monorepo CI image. It checks the
 producer, platform, archive hash, image ID and source before promotion. The
 publisher does not compile that product. Immutable registry readback must
 match the saved image ID. Missing or expired evidence blocks publication.
+
+## Publication records
+
+Each publisher retains a JSON record after immutable image readback. It includes
+merged PR numbers and their head commits and trees, the main commit and tree,
+the source image config digest, the published manifest digest, and the run attempt.
+`base_image_digest_kind=oci-config` identifies the tested image before promotion.
+It is not the Dockerfile FROM image. Promotion keeps that config digest and does
+not issue a new signature. The existing research Build issuer remains separate.

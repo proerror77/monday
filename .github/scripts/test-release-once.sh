@@ -63,6 +63,17 @@ simulate later-green-wakeup success success success
 [[ $decisions == 1 ]]
 printf 'publish_decisions=%s\n' "$decisions"
 
+for state in missing queued in_progress waiting pending requested; do
+  write_states success "$state" skipped
+  write_published false false
+  decide
+  [[ $(field reason) == checks-pending && $(field publish_ghcr) == false ]]
+done
+write_states skipped skipped skipped
+write_published false false
+decide
+[[ $(field reason) == publish ]]
+
 printf '%s\n' '--- failed check stays quiet ---'
 sim_gh=false
 sim_ac=false
@@ -97,6 +108,7 @@ ruby -ryaml - "$root/.github/workflows/release.yml" \
 release, docker, acr = ARGV.map { |path| YAML.safe_load(File.read(path)) }
 on = release['on'] || release[true]
 expected = ['Monorepo CI', 'Prediction Markets CI', 'Security & Quality (ENABLED)']
+abort 'release ignores the last failed/skipped upstream completion' if release.dig('jobs','admit','if').include?('conclusion')
 abort 'release is not main-only' unless on.keys == ['workflow_run']
 wakeup = on.fetch('workflow_run')
 abort 'release wakeup changed' unless wakeup.fetch('workflows').sort == expected && wakeup.fetch('types') == ['completed'] && wakeup.fetch('branches') == ['main']
@@ -115,6 +127,7 @@ abort 'ACR call is not gated on one admission output' unless acr_job.fetch('if')
   abort 'publisher still starts from workflow_run' if triggers.key?('workflow_run') || triggers.key?('pull_request')
   abort 'manual workflow_dispatch was removed' unless triggers.key?('workflow_dispatch')
   abort 'publisher is not reusable' unless triggers.dig('workflow_call', 'inputs', 'source_sha', 'required') == true
+  abort 'reusable publisher confuses caller event with workflow_call' if doc.to_s.include?("github.event_name == 'workflow_call'")
 end
 abort 'GHCR lost tag publication' unless (docker['on'] || docker[true]).dig('push', 'tags') == ['v*']
 abort 'GHCR lost the hft-core scope guard' unless File.read(ARGV[1]).include?('any(.include[]; .name=="hft-core")')
@@ -139,7 +152,7 @@ if ruby -ryaml -e 'on=(YAML.safe_load(File.read(ARGV[0]))["on"]||YAML.safe_load(
   exit 1
 fi
 
-export GITHUB_REPOSITORY=owner/repo GITHUB_RUN_ID=99
+export GITHUB_REPOSITORY=owner/repo GITHUB_RUN_ID=99 GITHUB_RUN_ATTEMPT=1
 mkdir -p "$work/bin"
 cat >"$work/bin/gh" <<'MOCK'
 #!/usr/bin/env bash
@@ -158,32 +171,7 @@ case "$endpoint" in
   *) printf 'unexpected endpoint %s\n' "$endpoint" >&2; exit 1 ;;
 esac
 MOCK
-cat >"$work/bin/curl" <<'MOCK'
-#!/usr/bin/env bash
-set -euo pipefail
-headerfile= bodyfile= url=
-args=("$@")
-i=0
-while [[ $i -lt ${#args[@]} ]]; do
-  case "${args[$i]}" in
-    -D) i=$((i + 1)); headerfile=${args[$i]} ;;
-    -o) i=$((i + 1)); bodyfile=${args[$i]} ;;
-    https:*) url=${args[$i]} ;;
-  esac
-  i=$((i + 1))
-done
-repo=${url#*wildcard0923/}
-repo=${repo%%/*}
-code=$(cat "$FAKE_RELEASE_STATE/acr-$repo")
-if [[ $code == 200 ]]; then
-  printf 'HTTP/1.1 200 OK\r\nDocker-Content-Digest: sha256:%s\r\n' "$(cat "$FAKE_RELEASE_STATE/digest")" >"$headerfile"
-else
-  printf 'HTTP/1.1 %s\r\n' "$code" >"$headerfile"
-fi
-printf '%s' "$code" >"$bodyfile"
-printf '%s' "$code"
-MOCK
-chmod 0755 "$work/bin/gh" "$work/bin/curl"
+chmod 0755 "$work/bin/gh"
 export PATH="$work/bin:$PATH" FAKE_RELEASE_STATE=$work
 reset_api() {
   : >"$work/calls"
@@ -195,12 +183,9 @@ reset_api() {
     {id:3,name:"Security Summary Report",status:"completed",conclusion:"success",app:{id:15368,slug:"github-actions"}}
   ]}]' >"$work/checks"
   jq -n '[{total_count:0,workflow_runs:[]}]' >"$work/runs"
-  jq -n '[{jobs:[]}]' >"$work/jobs"
+  jq -n --arg sha "$sha" '[{jobs:[]}]' >"$work/jobs"
   jq -n '[[]]' >"$work/user-versions"
   jq -n '[[]]' >"$work/org-versions"
-  printf '%s\n' 404 >"$work/acr-research-runner"
-  printf '%s\n' 404 >"$work/acr-prediction-research-runner"
-  printf '%s\n' 404 >"$work/acr-campaign-cycle-controller"
   printf '%s\n' "$digest" >"$work/digest"
 }
 admit() {
@@ -210,7 +195,8 @@ admit() {
 }
 
 reset_api
-jq -n --argjson run "$(jq '.[0]' "$work/checks")" '[$run | .check_runs[1].status="in_progress" | .check_runs[1].conclusion=null]' >"$work/checks"
+jq '.[0].check_runs[1].status="in_progress" | .[0].check_runs[1].conclusion=null' "$work/checks" >"$work/edit"
+mv "$work/edit" "$work/checks"
 admit "$sha"
 [[ $(field reason) == checks-pending ]]
 if grep -Eq 'packages/container|workflows/release.yml/runs' "$work/calls"; then
@@ -229,7 +215,7 @@ fi
 
 reset_api
 # user package 404 falls through to the org package, where the sha tag exists.
-jq -n --arg tag "sha-${sha:0:7}" --arg digest "sha256:$digest" \
+jq -n --arg tag "sha-$sha" --arg digest "sha256:$digest" \
   '[[{name:$digest,metadata:{container:{tags:[$tag,"main"]}}}]]' >"$work/org-versions"
 printf 'gh: Not Found (HTTP 404)\n' >"$work/user-versions"
 # Make the user endpoint fail as 404 by exiting after printing the message.
@@ -253,33 +239,46 @@ case "$endpoint" in
 esac
 MOCK
 chmod 0755 "$work/bin/gh"
-export ACR_REGISTRY=registry.example ACR_USERNAME=user ACR_PASSWORD=secret
 admit "$sha"
 [[ $(field reason) == publish && $(field publish_ghcr) == false && $(field publish_acr) == true ]]
-for repository in research-runner prediction-research-runner campaign-cycle-controller; do
-  printf '%s\n' 200 >"$work/acr-$repository"
-done
-admit "$sha"
-[[ $(field reason) == already-published && $(field publish_ghcr) == false && $(field publish_acr) == false ]]
 
 reset_api
 jq -n --arg sha "$sha" '[{total_count:1,workflow_runs:[{id:50,run_attempt:1,head_sha:$sha,head_branch:"main",event:"workflow_run",path:".github/workflows/release.yml",head_repository:{full_name:"owner/repo"},status:"completed",conclusion:"success"}]}]' >"$work/runs"
-jq -n '[{jobs:[
-  {run_id:50,run_attempt:1,name:"Publish GHCR",status:"completed",conclusion:"success"},
-  {run_id:50,run_attempt:1,name:"Publish ACR",status:"completed",conclusion:"success"},
+jq -n --arg sha "$sha" '[{jobs:[
+  {run_id:50,run_attempt:1,name:"Publish GHCR / build-and-push",status:"completed",conclusion:"success"},
+  {run_id:50,run_attempt:1,name:("Publish ACR / Research products published [cex-runner,controller,prediction-runner] ("+$sha+")"),status:"completed",conclusion:"success"},
   {run_id:50,run_attempt:1,name:"Admit release",status:"completed",conclusion:"success"}
 ]}]' >"$work/jobs"
-unset ACR_REGISTRY ACR_USERNAME ACR_PASSWORD
 admit "$sha"
 [[ $(field reason) == already-published ]]
 
 reset_api
 jq -n --arg sha "$sha" '[{total_count:1,workflow_runs:[{id:50,run_attempt:1,head_sha:$sha,head_branch:"main",event:"workflow_run",path:".github/workflows/release.yml",head_repository:{full_name:"owner/repo"},status:"completed",conclusion:"success"}]}]' >"$work/runs"
-jq -n '[{jobs:[
-  {run_id:50,run_attempt:1,name:"Publish GHCR",status:"completed",conclusion:"skipped"},
-  {run_id:50,run_attempt:1,name:"Publish ACR",status:"completed",conclusion:"failure"}
+jq -n --arg sha "$sha" '[{jobs:[
+  {run_id:50,run_attempt:1,name:"Publish GHCR / build-and-push",status:"completed",conclusion:"skipped"},
+  {run_id:50,run_attempt:1,name:("Publish ACR / Research products published [cex-runner,controller,prediction-runner] ("+$sha+")"),status:"completed",conclusion:"failure"}
 ]}]' >"$work/jobs"
 admit "$sha"
 [[ $(field reason) == publish && $(field publish_ghcr) == true && $(field publish_acr) == true ]]
 
+reset_api
+jq '.[0].check_runs[2].conclusion="skipped"' "$work/checks" >"$work/edit"
+mv "$work/edit" "$work/checks"
+admit "$sha"
+[[ $(field reason) == publish && $(field publish_ghcr) == true && $(field publish_acr) == true ]]
+# A partial retry reads successful nested jobs from its own previous attempt.
+reset_api
+export GITHUB_RUN_ATTEMPT=2
+jq -n --arg sha "$sha" '[{workflow_runs:[{id:99,run_attempt:2,head_sha:$sha,event:"workflow_run",path:".github/workflows/release.yml",head_repository:{full_name:"owner/repo"},status:"in_progress"}]}]' >"$work/runs"
+jq -n '[{jobs:[{run_id:99,run_attempt:1,name:"Publish GHCR / build-and-push",status:"completed",conclusion:"success"}]}]' >"$work/jobs"
+admit "$sha"
+[[ $(field publish_ghcr) == false && $(field publish_acr) == true ]]
+export GITHUB_RUN_ATTEMPT=1
+# A short SHA tag can collide and cannot prove publication of the full SHA.
+reset_api
+jq -n --arg tag "sha-${sha:0:7}" '[[{metadata:{container:{tags:[$tag]}}}]]' >"$work/org-versions"
+admit "$sha"
+[[ $(field publish_ghcr) == true ]]
+touch "$work/api-failure"
+if admit "$sha" >"$work/error" 2>&1; then echo 'API failure admitted publication' >&2; exit 1; fi
 printf 'release once contract passed\n'

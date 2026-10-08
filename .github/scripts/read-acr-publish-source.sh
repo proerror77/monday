@@ -33,7 +33,7 @@ gh api --paginate --slurp \
 pending=false
 while IFS='=' read -r check state; do
   case "$state" in
-    success) ;;
+    success|skipped) ;;
     missing|queued|in_progress|waiting|pending|requested) pending=true ;;
     *) printf 'ACR release rejected: %s=%s\n' "$check" "$state" >&2; exit 1 ;;
   esac

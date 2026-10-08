@@ -104,7 +104,7 @@ acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
   abort 'incorrect release boundary' unless upload.fetch('with').fetch('path')=='${{ runner.temp }}/research-image-release.tar' && upload.fetch('with').fetch('if-no-files-found')=='error'
 end
 publication=acr.fetch('jobs').fetch('publish')
-abort 'release job cannot obtain its own OIDC identity' unless publication.fetch('permissions')=={'actions'=>'read','checks'=>'read','contents'=>'read','id-token'=>'write'}
+abort 'release job cannot obtain its own OIDC identity' unless publication.fetch('permissions')=={'actions'=>'read','checks'=>'read','contents'=>'read','id-token'=>'write','pull-requests'=>'read'}
 abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']
 steps=publication.fetch('steps')
 presence=steps.index { |s|s.fetch('name','')=='Require research publication settings before preparation' }
