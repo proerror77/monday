@@ -50,8 +50,8 @@ run_public_policy() {
   local policy=$1 product=$2 mode=${3:-check-public-policy}
   PATH="$policy_tools" TMPDIR="$policy_state" RUNNER_TEMP="$policy_state" \
     MONDAY_RELEASE_POLICY_JSON="$(<"$policy")" PRODUCT="$product" \
-    MONDAY_RELEASE_SIGNING_KEY=private-key-must-not-appear \
-    MONDAY_RELEASE_GATEWAY_TOKEN=private-token-must-not-appear \
+    MONDAY_RELEASE_SIGNING_KEY=EXAMPLE_private-key-must-not-appear \
+    MONDAY_RELEASE_GATEWAY_TOKEN=EXAMPLE_private-token-must-not-appear \
     "$bash_command" "$script_dir/publish-research-build-release.sh" "$mode" \
       >"$tmp_dir/public-policy.out" 2>"$tmp_dir/public-policy.err"
 }
