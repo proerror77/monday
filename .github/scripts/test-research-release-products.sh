@@ -128,7 +128,7 @@ done < <(bash "$products" binaries controller)
 printf 'PASS: controller-only release builds five admitted executables including the ACK importer; product, archive and unadmitted control bytes fail closed\n'
 
 # The opt-in probe must run all three controller recipes twice with one input identity.
-jq -es 'length==6 and ([.[].phase]|sort)==["restored","restored","restored","warm-local","warm-local","warm-local"]
+jq -es 'length==6 and ([.[].phase]|sort)==["after-cache-lookup","after-cache-lookup","after-cache-lookup","warm-local","warm-local","warm-local"]
   and ([.[].compilation_inputs_sha256]|unique|length)==1
   and all(.[]; .source_sha=="1111111111111111111111111111111111111111" and .compiler_artifacts>0)' \
   "$fixture/output/research-recipe-probe/timings.jsonl" >/dev/null
@@ -141,7 +141,7 @@ fi
 [[ ! -e $fixture/failed-output/research-image-release.tar ]]
 jq '.recipes=[]' "$fixture/inputs.json" >"$fixture/wrong-inputs.json"
 if PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/failed-output" MONDAY_SOURCE_REVISION="$sha" \
-  MONDAY_BUILD_INPUTS_FILE="$fixture/wrong-inputs.json" bash "$fixture/.github/scripts/build-research-recipes.sh" controller restored; then
+  MONDAY_BUILD_INPUTS_FILE="$fixture/wrong-inputs.json" bash "$fixture/.github/scripts/build-research-recipes.sh" controller after-cache-lookup; then
   echo 'wrong admitted recipes accepted by the probe' >&2; exit 1
 fi
 printf 'PASS: recipe probe preserves exact inputs, compiler failures and all selected recipes\n'

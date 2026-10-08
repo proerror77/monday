@@ -10,7 +10,7 @@ MONDAY_RELEASE_JOB_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RU
 export MONDAY_SOURCE_REVISION=$source_sha
 export CARGO_TARGET_DIR="$PWD/target"
 target=x86_64-unknown-linux-gnu
-bash ../.github/scripts/build-research-recipes.sh "$product" restored
+bash ../.github/scripts/build-research-recipes.sh "$product" after-cache-lookup
 if [[ ${MONDAY_RESEARCH_CACHE_PROBE:-0} == 1 ]]; then
   # Probe only the current runner's target. Never save a PR cache or change recipes.
   before=$(mktemp)
