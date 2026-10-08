@@ -75,6 +75,8 @@ pub struct ExecutionWorkerConfig {
     pub ack_timeout_ms: u64,
     /// 對帳間隔（毫秒），0 表示不啟用
     pub reconcile_interval_ms: u64,
+    /// Maximum age of a proven private-stream heartbeat. Zero fails closed.
+    pub private_stream_stale_us: u64,
 }
 
 impl Default for ExecutionWorkerConfig {
@@ -87,6 +89,7 @@ impl Default for ExecutionWorkerConfig {
             latency_monitor: LatencyMonitorConfig::default(),
             ack_timeout_ms: 3000,
             reconcile_interval_ms: 5000,
+            private_stream_stale_us: 30_000_000,
         }
     }
 }
@@ -262,6 +265,7 @@ pub struct ExecutionWorker {
     operator_intake_enabled: bool,
     emergency_latched: bool,
     stream_recovery_pending: bool,
+    stream_cancellations_pending: bool,
     client_connected: Vec<bool>,
     /// Per-client stream attach generation that must reach its matching tail marker before the
     /// client can be considered connected again. This prevents stale ready events already in the
@@ -564,6 +568,7 @@ impl ExecutionWorker {
             operator_intake_enabled: true,
             emergency_latched: false,
             stream_recovery_pending: false,
+            stream_cancellations_pending: false,
             client_connected: vec![true; client_count],
             client_stream_barriers: vec![None; client_count],
             client_latest_stream_id: vec![0; client_count],
@@ -615,6 +620,7 @@ impl ExecutionWorker {
             operator_intake_enabled: true,
             emergency_latched: false,
             stream_recovery_pending: false,
+            stream_cancellations_pending: false,
             client_connected: vec![true; client_count],
             client_stream_barriers: vec![None; client_count],
             client_latest_stream_id: vec![0; client_count],
@@ -708,6 +714,7 @@ impl ExecutionWorker {
             if applied_streams > 0 {
                 had_activity = true;
             }
+            self.enforce_private_stream_truth().await;
             if self.retry_stream_recovery_if_due().await {
                 had_activity = true;
             }
@@ -1074,6 +1081,20 @@ impl ExecutionWorker {
                 now_micros(),
                 self.execution_clients[client_idx].price_protection(),
             ) {
+                if matches!(
+                    reason,
+                    ports::OrderIntentRejectReason::SourceBookUnavailable
+                        | ports::OrderIntentRejectReason::SourceBookStale { .. }
+                        | ports::OrderIntentRejectReason::MissingSlippageReference
+                        | ports::OrderIntentRejectReason::MissingSlippageReferenceLifetime
+                        | ports::OrderIntentRejectReason::SlippageReferenceExpired { .. }
+                ) {
+                    // Stream reconciliation proves account/order truth only. A market-truth
+                    // failure must not be re-armed by that order-only readback.
+                    self.emergency_latched = true;
+                    self.latch_stream_recovery();
+                    self.cancel_for_stream_uncertainty().await;
+                }
                 self.reject_intent(
                     &envelope.client_order_id,
                     format!("final market price protection rejected intent: {reason:?}"),
@@ -1206,6 +1227,7 @@ impl ExecutionWorker {
                     if outcome_unknown {
                         self.accepting_intents = false;
                         self.emergency_latched = true;
+                        self.latch_stream_recovery();
 
                         // The venue may already own this order. Keep a provisional local record
                         // under the stable client id so private reports, reconciliation, and
@@ -1255,6 +1277,7 @@ impl ExecutionWorker {
                                 strategy_id: intent.strategy_id.clone(),
                             })
                             .await;
+                        self.cancel_for_stream_uncertainty().await;
                     }
                     warn!(
                         client_order_id = %envelope.client_order_id,
@@ -1289,6 +1312,52 @@ impl ExecutionWorker {
             if received < self.execution_event_batch_limit() {
                 break;
             }
+        }
+        self.enforce_private_stream_truth().await;
+    }
+
+    fn private_stream_health_is_fresh(&self, health: &ports::ConnectionHealth, now: u64) -> bool {
+        health.connected
+            && health.last_heartbeat != 0
+            && self.config.private_stream_stale_us != 0
+            && now
+                .checked_sub(health.last_heartbeat)
+                .is_some_and(|age| age <= self.config.private_stream_stale_us)
+    }
+
+    /// A connected bit is insufficient evidence. Missing, future, or stale private-stream
+    /// heartbeats use the same recovery latch as disconnects and lost execution reports.
+    async fn enforce_private_stream_truth(&mut self) {
+        for client_idx in 0..self.execution_clients.len() {
+            if self.execution_clients[client_idx].is_simulated_execution() {
+                continue;
+            }
+            let health = self.execution_clients[client_idx].health().await;
+            if !self.private_stream_health_is_fresh(&health, now_micros()) {
+                if !self.stream_recovery_pending || self.client_connected[client_idx] {
+                    warn!(
+                        client_idx,
+                        "private-stream freshness is unproven; execution intake closed"
+                    );
+                    self.latch_on_execution_stream_failure(client_idx).await;
+                }
+            }
+        }
+        self.cancel_for_stream_uncertainty().await;
+    }
+
+    async fn cancel_for_stream_uncertainty(&mut self) {
+        if !self.stream_cancellations_pending {
+            return;
+        }
+        self.stream_cancellations_pending = false;
+        let targets = self.include_worker_tracked_orders(Vec::new(), &CancelScope::All);
+        let report = self.dispatch_cancellations(targets).await;
+        if !report.is_complete() {
+            warn!(
+                ?report,
+                "stream-uncertainty cancellation requires authoritative reconciliation"
+            );
         }
     }
 
@@ -1733,6 +1802,9 @@ impl ExecutionWorker {
     }
 
     fn latch_stream_recovery(&mut self) {
+        if !self.stream_recovery_pending {
+            self.stream_cancellations_pending = true;
+        }
         self.accepting_intents = false;
         self.stream_recovery_pending = true;
         self.recovery_intent_drain_required = true;
@@ -1791,6 +1863,7 @@ impl ExecutionWorker {
     }
 
     async fn attempt_stream_recovery(&mut self) -> bool {
+        self.cancel_for_stream_uncertainty().await;
         if !self.stream_recovery_ready_for_reconcile() {
             return false;
         }
@@ -2676,6 +2749,7 @@ impl ExecutionWorker {
     /// Periodic worker-side capability check. OMS comparison is performed by
     /// `ExecutionControlHandle`, which owns access to the engine's local truth.
     async fn reconcile_open_orders(&mut self) -> bool {
+        self.cancel_for_stream_uncertainty().await;
         let snapshot = self.collect_reconcile_snapshot(false, false, false).await;
         let complete = snapshot.is_complete();
         self.update_reconciled_open_orders(&snapshot);
@@ -2741,7 +2815,11 @@ impl ExecutionWorker {
 
     async fn execution_clients_currently_healthy(&mut self) -> bool {
         for client in &self.execution_clients {
-            if !client.health().await.connected {
+            if client.is_simulated_execution() {
+                continue;
+            }
+            let health = client.health().await;
+            if !self.private_stream_health_is_fresh(&health, now_micros()) {
                 return false;
             }
         }
@@ -3021,6 +3099,8 @@ mod tests {
         balance_reads: usize,
         spot_inventory: bool,
         healthy: Option<bool>,
+        last_heartbeat: Option<u64>,
+        heartbeat_after_first_place: Option<u64>,
         finite_stream: bool,
         disconnect_on_first_place: Option<mpsc::UnboundedSender<ExecutionEvent>>,
         modify_error: bool,
@@ -3041,6 +3121,11 @@ mod tests {
             let disconnect = {
                 let mut state = self.state.lock().unwrap();
                 state.placed.push(intent.symbol);
+                if state.placed.len() == 1 {
+                    if let Some(heartbeat) = state.heartbeat_after_first_place {
+                        state.last_heartbeat = Some(heartbeat);
+                    }
+                }
                 (state.placed.len() == 1)
                     .then(|| state.disconnect_on_first_place.clone())
                     .flatten()
@@ -3142,11 +3227,255 @@ mod tests {
         }
 
         async fn health(&self) -> ConnectionHealth {
+            let state = self.state.lock().unwrap();
             ConnectionHealth {
-                connected: self.state.lock().unwrap().healthy.unwrap_or(true),
+                connected: state.healthy.unwrap_or(true),
                 latency_ms: None,
-                last_heartbeat: now_micros(),
+                last_heartbeat: state.last_heartbeat.unwrap_or_else(now_micros),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_uncertainty_stale_private_state_rejects_action_until_reconciled() {
+        let now = now_micros();
+        let max_age = ExecutionWorkerConfig::default().private_stream_stale_us;
+        for (heartbeat, connected) in [
+            (0, true),
+            (now - max_age - 1, true),
+            (u64::MAX, true),
+            (now, false),
+        ] {
+            let known_ids = [
+                OrderId("venue-known".to_string()),
+                OrderId("client-provisional".to_string()),
+            ];
+            let state = Arc::new(StdMutex::new(MockExecutionState {
+                last_heartbeat: Some(heartbeat),
+                healthy: Some(connected),
+                open_orders: known_ids
+                    .iter()
+                    .map(|id| OpenOrder {
+                        order_id: OrderId(format!("exchange-{}", id.0)),
+                        client_order_id: Some(id.0.clone()),
+                        symbol: Symbol::new("BTCUSDT"),
+                        side: Side::Buy,
+                        order_type: OrderType::Limit,
+                        original_quantity: Quantity::from_f64(1.0).unwrap(),
+                        remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                        filled_quantity: Quantity::zero(),
+                        price: Some(Price::from_f64(100.0).unwrap()),
+                        status: ports::OrderStatus::Acknowledged,
+                        created_at: now,
+                        updated_at: now,
+                    })
+                    .collect(),
+                ..Default::default()
+            }));
+            let client = MockExecutionClient {
+                state: Arc::clone(&state),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            };
+            let (mut engine_queues, worker_queues) =
+                crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+            let account = AccountId("stream-freshness-test".to_string());
+            for symbol in ["BTCUSDT", "ETHUSDT"] {
+                engine_queues
+                    .send_intent(account.clone(), create_test_intent(symbol))
+                    .expect("queue qualified intent");
+            }
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let mut worker = ExecutionWorker::new(
+                ExecutionWorkerConfig::default(),
+                worker_queues,
+                vec![Box::new(client)],
+                rx,
+            );
+            bind_ready_spot_admission(&mut worker, account.clone(), 0, VenueId::BYBIT);
+            for id in &known_ids {
+                worker.order_to_client.insert(id.clone(), 0);
+                worker.tracked_orders.insert(
+                    id.clone(),
+                    TrackedOrder {
+                        symbol: Symbol::new("BTCUSDT"),
+                        strategy_id: "test".to_string(),
+                        venue: Some(VenueId::BYBIT),
+                        account_id: Some(account.clone()),
+                        side: Side::Buy,
+                        limit_price: Some(Price::from_f64(100.0).unwrap()),
+                        remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                        processed_fill_ids: HashSet::new(),
+                    },
+                );
+            }
+            let mut queued = worker.queues.receive_envelopes();
+            let rejected_ids: HashSet<_> = queued
+                .iter()
+                .map(|envelope| OrderId(envelope.client_order_id.clone()))
+                .collect();
+            worker.process_order_intents(&mut queued).await;
+
+            assert!(state.lock().unwrap().placed.is_empty());
+            assert_eq!(worker.stats.orders_failed, 2);
+            assert!(!worker.accepting_intents);
+            assert!(worker.stream_recovery_pending);
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .canceled
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>(),
+                known_ids.iter().cloned().collect::<HashSet<_>>()
+            );
+            assert!(known_ids
+                .iter()
+                .all(|id| worker.tracked_orders.contains_key(id)));
+            let mut events = Vec::new();
+            engine_queues.receive_events_into(&mut events);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        ExecutionEvent::OrderReject { order_id, .. } => Some(order_id.clone()),
+                        _ => None,
+                    })
+                    .collect::<HashSet<_>>(),
+                rejected_ids
+            );
+
+            // Even a complete REST order snapshot cannot override stale private-stream truth.
+            worker.update_connection_tracking(
+                0,
+                &ExecutionEvent::ConnectionStatus {
+                    connected: true,
+                    timestamp: now_micros(),
+                },
+            );
+            assert!(worker.reconcile_open_orders().await);
+            assert!(!worker.accepting_intents);
+            {
+                let mut state = state.lock().unwrap();
+                state.last_heartbeat = None;
+                state.healthy = Some(true);
+            }
+            worker.enforce_private_stream_truth().await;
+            assert!(
+                !worker.accepting_intents,
+                "fresh heartbeat alone cannot re-arm intake"
+            );
+            let (reply, result) = oneshot::channel();
+            worker
+                .handle_control_command(ControlCommand::SetIntake {
+                    enabled: true,
+                    reply,
+                })
+                .await;
+            assert!(result.await.unwrap().is_err());
+            assert!(worker.reconcile_open_orders().await);
+            assert!(worker.accepting_intents);
+            assert!(!worker.stream_recovery_pending);
+            assert_eq!(state.lock().unwrap().canceled.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_uncertainty_mid_batch_staleness_rejects_next_action_and_cancels_first() {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            heartbeat_after_first_place: Some(0),
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let account = AccountId("mid-batch-staleness".to_string());
+        for symbol in ["BTCUSDT", "ETHUSDT"] {
+            engine_queues
+                .send_intent(account.clone(), create_test_intent(symbol))
+                .unwrap();
+        }
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            rx,
+        );
+        bind_ready_spot_admission(&mut worker, account, 0, VenueId::BYBIT);
+        let mut queued = worker.queues.receive_envelopes();
+        worker.process_order_intents(&mut queued).await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.placed, vec![Symbol::new("BTCUSDT")]);
+        assert_eq!(state.canceled, vec![OrderId("placed".to_string())]);
+        assert_eq!(worker.stats.orders_failed, 1);
+        assert!(!worker.accepting_intents);
+        assert!(worker.stream_recovery_pending);
+        assert!(worker
+            .tracked_orders
+            .contains_key(&OrderId("placed".to_string())));
+    }
+
+    #[tokio::test]
+    async fn stream_uncertainty_stale_or_missing_market_truth_closes_the_same_gate() {
+        let now = now_micros();
+        for received_at in [0, now - 2_000_000] {
+            let state = Arc::new(StdMutex::new(MockExecutionState {
+                simulated: true,
+                ..Default::default()
+            }));
+            let client = MockExecutionClient {
+                state: Arc::clone(&state),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            };
+            let (_engine_queues, mut queues) =
+                crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+            let snapshots = snapshot::SnapshotContainer::new(crate::tests::execution_test_market(
+                received_at,
+                100.0,
+            ));
+            queues.set_market_reader(snapshots.reader());
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let mut worker = ExecutionWorker::new(
+                ExecutionWorkerConfig::default(),
+                queues,
+                vec![Box::new(client)],
+                rx,
+            );
+            worker.venue_to_client.insert(VenueId::MOCK, 0);
+            let mut intent = create_test_intent("BTCUSDT");
+            intent.target_venue = Some(VenueId::MOCK);
+            intent.order_type = OrderType::Limit;
+            let mut lifecycle = ports::OrderIntentLifecycle::new(now, now + 1_000_000);
+            lifecycle.max_slippage_bps = Some(25);
+            let mut envelope = OrderIntentEnvelope::new(intent, lifecycle);
+            envelope.price_reference = snapshots.load().execution_price_reference(&envelope.intent);
+            let followup = OrderIntentEnvelope::new(envelope.intent.clone(), Default::default());
+            worker
+                .process_order_intents(&mut vec![envelope, followup])
+                .await;
+
+            assert!(state.lock().unwrap().placed.is_empty());
+            assert_eq!(worker.stats.orders_failed, 2);
+            assert!(worker.stream_recovery_pending);
+            assert!(!worker.accepting_intents);
+            snapshots.store(Arc::new(crate::tests::execution_test_market(now, 100.0)));
+            assert!(worker.reconcile_open_orders().await);
+            assert!(
+                !worker.accepting_intents,
+                "order-only reconciliation cannot clear market uncertainty"
+            );
+            assert!(worker.emergency_latched);
         }
     }
 
@@ -4307,7 +4636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_during_first_submission_rejects_the_rest_of_the_batch() {
+    async fn stream_uncertainty_disconnect_during_first_submission_rejects_the_rest_of_the_batch() {
         let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel();
         let state = Arc::new(StdMutex::new(MockExecutionState {
             disconnect_on_first_place: Some(disconnect_tx),
