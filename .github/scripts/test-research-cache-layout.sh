@@ -54,6 +54,18 @@ printf 'default=["native-feature"]\n' >"$work/repo/rust_hft/shared/cex-input/Car
 after=$(bash "$work/repo/.github/scripts/research-cache-layout.sh" manifest-inputs)
 [[ $before != "$after" ]]
 jq -e 'has("rust_hft/shared/cex-input/Cargo.toml") and has("vendor/local/Cargo.toml")' <<<"$after" >/dev/null
+# Match the container checkout ownership boundary without changing host owners.
+foreign=$(GIT_TEST_ASSUME_DIFFERENT_OWNER=1 bash "$work/repo/.github/scripts/research-cache-layout.sh" manifest-inputs)
+[[ $foreign == "$after" ]]
+cat >"$work/bin/git" <<'MOCK'
+#!/usr/bin/env bash
+exit 73
+MOCK
+chmod +x "$work/bin/git"
+if PATH="$work/bin:$PATH" bash "$work/repo/.github/scripts/research-cache-layout.sh" manifest-inputs >"$work/rejected-inputs"; then
+  echo 'Git failure was silently accepted' >&2; exit 1
+fi
+[[ ! -s $work/rejected-inputs ]]
 # Refuse to traverse a cached symlink into another target or filesystem path.
 profile="$work/repo/rust_hft/target/research-core/x86_64-unknown-linux-gnu/release"
 rm -rf "$profile/deps"

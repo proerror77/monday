@@ -12,11 +12,16 @@ manifest_dir() {
 case ${1:?command required} in
   manifest-inputs)
     # Include local path/patch/default-feature manifests beyond recipe roots.
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    # Container checkouts may belong to the host runner user. Scope trust to
+    # this invocation, and propagate Git failure before processing its output.
+    git -c safe.directory="$root" -C "$root" ls-files -z -- ':(glob)**/Cargo.toml' Cargo.toml >"$work/manifests"
     result='{}'
     while IFS= read -r -d '' manifest; do
       digest=$(sha256sum "$root/$manifest" | awk '{print $1}')
       result=$(jq -c --arg manifest "$manifest" --arg digest "$digest" '. + {($manifest):$digest}' <<<"$result")
-    done < <(git -C "$root" ls-files -z -- ':(glob)**/Cargo.toml' Cargo.toml)
+    done <"$work/manifests"
     jq -Se 'if length>0 then . else error("no tracked local manifests") end' <<<"$result"
     ;;
   target-dir)
