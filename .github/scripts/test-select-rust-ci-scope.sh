@@ -203,6 +203,11 @@ release_metadata_paths=(
   .github/scripts/read-acr-publish-source.sh
   .github/scripts/select-acr-publish-source.sh
   .github/scripts/test-acr-publish-source-readback.sh
+  .github/workflows/release.yml
+  .github/scripts/decide-release-once.sh
+  .github/scripts/read-release-published.sh
+  .github/scripts/release-orchestrator-admit.sh
+  .github/scripts/test-release-once.sh
 )
 for kind in ack release; do
   if [[ $kind == ack ]]; then infrastructure_paths=("${ack_metadata_paths[@]}"); else infrastructure_paths=("${release_metadata_paths[@]}"); fi
@@ -875,32 +880,9 @@ summary_upload_line=$(grep -nF '      - name: Upload summary' "$security_workflo
 security_gate_line=$(grep -nF '      - name: Require selected security jobs to pass' "$security_workflow" | cut -d: -f1)
 ((security_gate_line > summary_upload_line))
 
-docker_publish_workflow="$script_dir/../workflows/docker-publish.yml"
-expected_docker_publish_triggers=$(printf '%s\n' \
-  '  workflow_run:' \
-  '    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]' \
-  '    types: [completed]' \
-  '    branches: [main]' \
-  '  push:' \
-  '    tags:' \
-  "      - 'v*'" \
-  '  workflow_dispatch:')
-assert_docker_publish_triggers() {
-  local trigger_block
-  trigger_block=$(sed -n '/^  workflow_run:$/,/^  workflow_dispatch:$/p' "$1")
-  [[ $trigger_block == "$expected_docker_publish_triggers" ]] || return 1
-  grep -Fq 'bash .github/scripts/select-main-image-scope.sh "$SOURCE_SHA" "$plan"' "$1" &&
-    grep -Fq 'any(.include[]; .name=="hft-core")' "$1"
-}
-assert_docker_publish_triggers "$docker_publish_workflow"
-
-docker_publish_counterexample="$tmp_dir/docker-publish-extra-path.yml"
-sed 's@.name=="hft-core"@.name=="research-runner"@' \
-  "$docker_publish_workflow" >"$docker_publish_counterexample"
-if assert_docker_publish_triggers "$docker_publish_counterexample"; then
-  echo 'Docker Publish trigger contract accepted an unrelated path' >&2
-  exit 1
-fi
+# Release wakeups, the single reusable entry, and the hft-core guard live in
+# test-release-once.sh. This scope test still runs that contract.
+bash "$script_dir/test-release-once.sh"
 
 listing_monitor_workflow="$script_dir/../workflows/deploy-listing-monitor.yml"
 expected_listing_monitor_triggers=$(printf '%s\n' 'on:' '  workflow_dispatch:')

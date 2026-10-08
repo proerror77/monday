@@ -314,12 +314,14 @@ for workflow in docker-publish release-rust; do
   grep -Fq '      checks: read' "$path"
 done
 # Check the workflow graph, not just the admission helper: every required
-# workflow completion can wake publication, and only its admitted SHA is built.
-ruby -ryaml - "$script_dir/../workflows/docker-publish.yml" <<'RUBY'
-w = YAML.safe_load(File.read(ARGV[0]))
+# workflow completion can wake the one Release entry, and only its admitted SHA is built.
+ruby -ryaml - "$script_dir/../workflows/release.yml" "$script_dir/../workflows/docker-publish.yml" <<'RUBY'
+release, w = ARGV.map { |path| YAML.safe_load(File.read(path)) }
+release_triggers = release['on'] || release[true]
+raise 'missing completion wakeups' unless release_triggers.fetch('workflow_run').fetch('workflows').sort == ['Monorepo CI', 'Prediction Markets CI', 'Security & Quality (ENABLED)'].sort
 triggers = w['on'] || w[true]
-raise 'missing completion wakeups' unless triggers.fetch('workflow_run').fetch('workflows').sort == ['Monorepo CI', 'Prediction Markets CI', 'Security & Quality (ENABLED)'].sort
-raise 'main publication still races CI on push' if triggers.fetch('push').key?('branches')
+raise 'GHCR still wakes itself from workflow_run' if triggers.key?('workflow_run')
+raise 'main publication still races CI on push' if triggers.key?('push') && triggers.fetch('push').key?('branches')
 jobs = w.fetch('jobs')
 admission_checkout = jobs.fetch('release-admission').fetch('steps').find { |step| step['uses'].to_s.start_with?('actions/checkout@') }
 raise 'admission executes event-selected code before trust validation' unless admission_checkout.fetch('with').fetch('ref') == 'refs/heads/main'
@@ -354,4 +356,5 @@ raise 'rendered SHA tag does not use the source SHA' unless rendered_tags.includ
 raise 'rendered revision label does not use the full source SHA' unless rendered_labels.include?("org.opencontainers.image.revision=#{source_sha}")
 raise 'rendered metadata uses the workflow SHA' if rendered_tags.include?(workflow_sha) || rendered_labels.include?(workflow_sha)
 RUBY
+bash "$script_dir/test-release-once.sh"
 printf 'shared release admission tests passed\n'

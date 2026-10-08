@@ -1,17 +1,19 @@
 name: Docker Publish (GHCR)
 
 on:
-  workflow_run:
-    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]
-    types: [completed]
-    branches: [main]
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact main commit to publish
+        required: true
+        type: string
   push:
     tags:
       - 'v*'
   workflow_dispatch:
 
 concurrency:
-  group: ghcr-${{ github.event.workflow_run.head_sha || github.sha }}
+  group: ghcr-${{ github.event_name == 'workflow_call' && inputs.source_sha || github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -44,9 +46,9 @@ jobs:
         id: admission
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
-          SOURCE_REF: ${{ github.event_name == 'workflow_run' && 'refs/heads/main' || github.ref }}
-          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_SHA: ${{ github.event_name == 'workflow_call' && inputs.source_sha || github.sha }}
+          SOURCE_REF: ${{ github.event_name == 'workflow_call' && 'refs/heads/main' || github.ref }}
+          EVENT_NAME: ${{ github.event_name == 'workflow_call' && 'workflow_run' || github.event_name }}
         run: |
           if [[ ! "$SOURCE_SHA" =~ ^[[:xdigit:]]{40}$ ]]; then
             echo 'release source SHA must be a 40-character hexadecimal object ID' >&2
@@ -110,7 +112,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ needs.release-admission.outputs.source_sha }}
-          EVENT_NAME: ${{ github.event_name }}
+          EVENT_NAME: ${{ github.event_name == 'workflow_call' && 'workflow_run' || github.event_name }}
         run: |
           mode=required
           [[ "$EVENT_NAME" == workflow_run ]] || mode=optional
@@ -168,7 +170,7 @@ jobs:
           images: |
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/hft
           tags: |
-            type=raw,value=main,enable=${{ github.event_name == 'workflow_run' || github.ref == 'refs/heads/main' }}
+            type=raw,value=main,enable=${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_run' || github.ref == 'refs/heads/main' }}
             type=ref,event=tag
             type=raw,value=sha-${{ needs.release-admission.outputs.source_sha_short }}
           labels: |
@@ -178,7 +180,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ needs.release-admission.outputs.source_sha }}
-          SOURCE_REF: ${{ github.event_name == 'workflow_run' && 'refs/heads/main' || github.ref }}
+          SOURCE_REF: ${{ github.event_name == 'workflow_call' && 'refs/heads/main' || github.ref }}
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           policy=current-main

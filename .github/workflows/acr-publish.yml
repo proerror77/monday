@@ -1,10 +1,12 @@
 name: Publish ACR Images
 
 on:
-  workflow_run:
-    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]
-    types: [completed]
-    branches: [main]
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact main commit to publish
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       target:
@@ -56,7 +58,7 @@ concurrency:
 
 jobs:
   selector:
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main')
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -76,10 +78,10 @@ jobs:
 
       - name: Read authenticated reusable research source
         id: source-jobs
-        if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && (inputs.target == 'research-runner' || inputs.target == 'prediction-research-runner' || inputs.target == 'campaign-cycle-controller' || inputs.target == 'all') && inputs.rebuild_research_runner != true)
+        if: github.event_name == 'workflow_call' || (github.event_name == 'workflow_dispatch' && (inputs.target == 'research-runner' || inputs.target == 'prediction-research-runner' || inputs.target == 'campaign-cycle-controller' || inputs.target == 'all') && inputs.rebuild_research_runner != true)
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          SOURCE_SHA: ${{ github.event_name == 'workflow_call' && inputs.source_sha || github.sha }}
           SOURCE_MODE: ${{ github.event_name == 'workflow_dispatch' && 'reuse' || 'automatic' }}
         run: |
           .github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID" "$GITHUB_OUTPUT" "$SOURCE_MODE"
@@ -109,11 +111,11 @@ jobs:
         env:
           BINARIES_CONCLUSION: ${{ steps.source-jobs.outputs.binaries_conclusion }}
           SMOKE_CONCLUSION: ${{ steps.source-jobs.outputs.smoke_conclusion }}
-          EVENT_NAME: ${{ github.event_name }}
-          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_NAME: ${{ github.event_name == 'workflow_call' && 'workflow_run' || github.event_name }}
+          SOURCE_CONCLUSION: ${{ github.event_name == 'workflow_call' && 'success' || github.event.workflow_run.conclusion }}
+          SOURCE_EVENT: ${{ github.event_name == 'workflow_call' && 'push' || github.event.workflow_run.event }}
+          HEAD_BRANCH: ${{ github.event_name == 'workflow_call' && 'main' || github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event_name == 'workflow_call' && inputs.source_sha || github.event.workflow_run.head_sha }}
           SOURCE_RUN_ID: ${{ steps.source-jobs.outputs.artifact_run_id }}
           AUTOMATION_STATE: ${{ steps.source-jobs.outputs.automation_state }}
           RESEARCH_PRODUCT: ${{ steps.source-jobs.outputs.research_product || 'all' }}

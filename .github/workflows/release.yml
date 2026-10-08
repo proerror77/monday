@@ -1,0 +1,79 @@
+name: Release
+
+# workflow_run fires once per upstream workflow. Publish only after every
+# required check for that same head SHA is success, and only once.
+on:
+  workflow_run:
+    workflows: ["Monorepo CI", "Prediction Markets CI", "Security & Quality (ENABLED)"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+  id-token: write
+  packages: write
+
+jobs:
+  admit:
+    name: Admit release
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    outputs:
+      publish_ghcr: ${{ steps.gate.outputs.publish_ghcr }}
+      publish_acr: ${{ steps.gate.outputs.publish_acr }}
+      source_sha: ${{ steps.gate.outputs.source_sha }}
+      reason: ${{ steps.gate.outputs.reason }}
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout release admission
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 1
+      - name: Publish only once all required checks are green
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+          ACR_USERNAME: ${{ vars.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: .github/scripts/release-orchestrator-admit.sh "$SOURCE_SHA"
+
+  publish-ghcr:
+    name: Publish GHCR
+    needs: admit
+    if: needs.admit.result == 'success' && needs.admit.outputs.publish_ghcr == 'true'
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      source_sha: ${{ needs.admit.outputs.source_sha }}
+    secrets: inherit
+
+  publish-acr:
+    name: Publish ACR
+    needs: admit
+    if: needs.admit.result == 'success' && needs.admit.outputs.publish_acr == 'true'
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/acr-publish.yml
+    with:
+      source_sha: ${{ needs.admit.outputs.source_sha }}
+    secrets: inherit

@@ -17,7 +17,7 @@ gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/workflows/acr-publis
 jq -e 'length>0 and all(.[]; (.workflow_runs|type=="array") and (.total_count|type=="number" and .>=0))' "$work/runs.json" >/dev/null
 jq -r --arg repo "$GITHUB_REPOSITORY" '
   [.[].workflow_runs[]? | select(.head_branch=="main" and .head_repository.full_name==$repo and
-    .path==".github/workflows/acr-publish.yml" and (.event=="workflow_run" or .event=="workflow_dispatch") and
+    .path==".github/workflows/acr-publish.yml" and (.event=="workflow_run" or .event=="workflow_dispatch" or .event=="workflow_call") and
     .status=="completed" and .conclusion=="success")] | sort_by(.id) | reverse |
   .[] | [.id,.run_attempt,.head_sha] | @tsv' "$work/runs.json" >"$work/runs.tsv"
 baseline='{"cex-runner":"BOOTSTRAP","controller":"BOOTSTRAP","prediction-runner":"BOOTSTRAP"}'

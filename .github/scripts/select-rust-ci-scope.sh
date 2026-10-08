@@ -277,7 +277,10 @@ for path in "${paths[@]}"; do
     .github/scripts/publish-research-build-release.sh|.github/scripts/select-research-oss-policy.jq|\
     .github/scripts/verify-research-runner-binaries.sh|\
     .github/scripts/read-acr-publish-source.sh|.github/scripts/select-acr-publish-source.sh|\
-    .github/scripts/test-acr-publish-source-readback.sh)
+    .github/scripts/test-acr-publish-source-readback.sh|\
+    .github/workflows/release.yml|.github/scripts/decide-release-once.sh|\
+    .github/scripts/read-release-published.sh|.github/scripts/release-orchestrator-admit.sh|\
+    .github/scripts/test-release-once.sh)
       # Release policy changes run source/signature/manifest contracts on both
       # PR and main push. Only actual image/source/dependency inputs rebuild.
       select_job ci/ci-contracts
