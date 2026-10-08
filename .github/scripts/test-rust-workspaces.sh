@@ -13,28 +13,60 @@ if (($#)); then
   mode=cex-products
 fi
 
+cex_graph_failure() {
+  local assertion=$1 graph=$2
+  printf 'CEX dependency assertion failed: %s\n' "$assertion" >&2
+  printf 'Actual related package features from %s:\n' "${graph##*/}" >&2
+  awk -F'|' '
+    $1 ~ /^(alpha-(harness|engine|onnx-evaluator)|hft-(cex-research-worker|research-ml|infer-onnx)|burn[^ ]*|ort) / {
+      print; found=1
+    }
+    END {if (!found) print "<no related package rows>"}
+  ' "$graph" | LC_ALL=C sort -u >&2
+  exit 1
+}
+
+check_cex_feature() {
+  local product=$1 graph=$2 package=$3 feature=$4 state=$5
+  # The final delimiter keeps Cargo's duplicate marker outside the feature list.
+  if ! awk -F'|' -v package="$package" -v feature="$feature" -v state="$state" '
+    $1 ~ ("^" package " ") {
+      found=1
+      enabled=index("," $2 ",", "," feature ",") > 0
+      if (NF != 3 || enabled != (state == "enabled")) invalid=1
+    }
+    END {exit (!found || invalid)}
+  ' "$graph"; then
+    cex_graph_failure "$product $package/$feature must be $state" "$graph"
+  fi
+}
+
 check_cex_products() {
+  # {f} includes active package features forwarded by the selected product.
+  # Separate roots preserve the actual operator and worker feature selections.
   cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
-    -p alpha-harness --locked --edges normal --prefix none >"$work/cex-operator.tree"
-  if grep -E '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-operator.tree"; then
-    echo 'CEX operator pulls a training or ONNX implementation' >&2; exit 1
+    -p alpha-harness --locked --edges normal --prefix none --color never \
+    --format '{p}|{f}|' >"$work/cex-operator.tree"
+  if grep -Eq '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-operator.tree"; then
+    cex_graph_failure 'operator must exclude training and ONNX implementations' "$work/cex-operator.tree"
   fi
+  check_cex_feature operator "$work/cex-operator.tree" alpha-engine llm enabled
+
   cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
-    -p hft-cex-research-worker --locked --edges normal --prefix none >"$work/cex-worker.tree"
-  grep -q '^hft-research-ml ' "$work/cex-worker.tree"
-  grep -q '^burn ' "$work/cex-worker.tree"
-  # Inspect each product separately. A combined selection unifies their features.
-  cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
-    -p alpha-harness --locked --edges normal,features --prefix none >"$work/cex-operator.features"
-  grep -Fq 'alpha-engine feature "llm"' "$work/cex-operator.features"
-  cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
-    -p hft-cex-research-worker --locked --edges normal,features --prefix none >"$work/cex-worker.features"
-  grep -Fq 'alpha-harness feature "scientific"' "$work/cex-worker.features"
-  grep -Fq 'alpha-engine feature "kernel"' "$work/cex-worker.features"
-  grep -Fq 'alpha-engine feature "fitting"' "$work/cex-worker.features"
-  if grep -E '^alpha-harness feature "(default|operator)"|^alpha-engine feature "llm"' "$work/cex-worker.features"; then
-    echo 'CEX worker enables operator commands or diagnostic LLM proposals' >&2; exit 1
+    -p hft-cex-research-worker --locked --edges normal --prefix none --color never \
+    --format '{p}|{f}|' >"$work/cex-worker.tree"
+  if ! grep -q '^hft-research-ml ' "$work/cex-worker.tree"; then
+    cex_graph_failure 'worker must include hft-research-ml' "$work/cex-worker.tree"
   fi
+  if ! grep -q '^burn ' "$work/cex-worker.tree"; then
+    cex_graph_failure 'worker must include Burn' "$work/cex-worker.tree"
+  fi
+  check_cex_feature worker "$work/cex-worker.tree" alpha-harness scientific enabled
+  check_cex_feature worker "$work/cex-worker.tree" alpha-engine kernel enabled
+  check_cex_feature worker "$work/cex-worker.tree" alpha-engine fitting enabled
+  check_cex_feature worker "$work/cex-worker.tree" alpha-harness default disabled
+  check_cex_feature worker "$work/cex-worker.tree" alpha-harness operator disabled
+  check_cex_feature worker "$work/cex-worker.tree" alpha-engine llm disabled
   printf 'CEX operator and scientific worker dependency contracts passed\n'
 }
 
