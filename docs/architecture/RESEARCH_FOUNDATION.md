@@ -50,7 +50,9 @@ CEX 与 Prediction Markets 保留不同的科学输入和 evaluator。`hft-cex-r
 
 CI selector 汇总真实 metadata，包括跨域 path dependencies 和 integration/dev edges。`cargo-scoped.sh` 把显式包集合分到各 owner；跨 workspace features 或命名 target 组合拒绝模糊执行。CI 单 runner 可复用自己的 target cache；多个 Cargo invocation 仍各自解析所属 workspace 的 features。共享可写多租户 cache 不属于此合同。
 
-保留的耦合仍有 collector 的 `BookSync`/engine、Alpha Data Mission 和 ONNX/formula 跨域兼容测试。本轮没有改成远端 RPC，也未宣称整个研究图已解耦。发布按已有真实镜像选择程序：runner 九项，Campaign controller 四项。两者共享的程序只编译一次。功能拆分本身不提供编译耗时或加速倍数证据。
+collector 的 `BookSync` 已由纯 `hft-binance-depth` 提供，不再依赖订单循环 `hft-engine`。Alpha Data Mission 对采集实现的依赖，以及 ONNX/formula 跨域兼容测试仍然保留。功能拆分本身不提供编译耗时或加速倍数证据。
+
+[发布产品清单](../../.github/scripts/research-release-products.json) 分别选择 CEX runner 七个程序、Prediction runner 五个程序、Campaign controller 五个程序。同一次产品选择按清单合并所需程序；镜像分别消费自己的子集，共用程序不重复构建。
 
 ## Build → Run → Attempt，不在训练 Pod cold build
 
@@ -73,7 +75,7 @@ Run 是固定科学调用：Experiment、BuildArtifact、配置摘要、命令�
 
 `.github/scripts/build-research-release.sh` 使用精确 `-p` / `--bin` / `--features`，没有默认 `--workspace` / `--all-features`。一份产品清单绑定已有 runner 与 Campaign controller。controller 资产单改时构建所需程序，包括 owning platform 的 `research-release-publisher`，并验证其 source、依赖和 OCI 可执行字节。不同科学变异的 BuildSpec 可以缩小到实际科学 crate/binary。Cargo 依赖图重建受影响 crate，链接仍有成本。本分支没有编译耗时基准，不承诺加速倍数。
 
-发布保留原 `release` profile（opt-level 3、thin LTO、codegen-units 1）。另提供显式 `research` profile（opt-level 2、无 LTO、16 codegen units）；它的身份与 release 分开，不能把不同优化产物当同一科学执行。`researchctl plan-build BUILD` 仅输出经过校验的 scoped Cargo 参数，不执行编译或配置云端 builder。
+发布使用各 owner 的 `release` profile。shared、data、research、control 和 runtime 为 opt-level 3，Prediction 为 opt-level 2；六者均使用 thin LTO、codegen-units 1。前五个 owner 另有显式 `research` profile（opt-level 2、无 LTO、16 codegen units）。Prediction 的 `fast` profile 继承 release，并使用无 LTO、8 codegen units 和 incremental。快速 profile 的产物身份与 release 分开，不能把不同优化产物当同一科学执行。`researchctl plan-build BUILD` 仅输出经过校验的 scoped Cargo 参数，不执行编译或配置云端 builder。
 
 CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生软件版本、编译环境、profile、lock 和 scoped 配方指纹纳入缓存键，并将这些输入保存在 release manifest。Cargo cache 与可执行产物分开：缓存只影响后续编译效率，命中缓存仍必须执行 build、二进制摘要验证和 image smoke。每个 runner 有自己的可写 target，禁止多租户共享可写 target；readonly prepared-data mount 不能被当作 compiler cache。
 

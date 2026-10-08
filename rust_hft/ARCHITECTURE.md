@@ -202,4 +202,20 @@ Runtime accounting uses exact decimals and covers long/short increases, partial 
 
 ## Build Discipline
 
-Use package-scoped development checks. The default workspace members remain execution-oriented; alpha crates are explicit members but are not default members. Run release feature graphs, production image builds, and Kubernetes validation only at release gates.
+Use the six owning manifests in `workspaces.json` for package-scoped checks.
+The root package belongs to `runtime/Cargo.toml`; Alpha packages belong to
+`research-core/Cargo.toml`, and collector belongs to `data-pipelines/Cargo.toml`.
+
+Default members differ by owner. Research defaults to `hft-search-kernel`;
+runtime and Prediction have separate application selections. A default Cargo
+command does not validate every package or workspace.
+
+Use `scripts/cargo-scoped.sh` for explicit package sets across owners. Select an
+owning manifest for feature matrices and named tests. From the repository root,
+run `bash .github/scripts/test-rust-workspaces.sh` after ownership or dependency
+boundary changes. It checks registered owners and normal dependency closures,
+including Prediction's default, db, and full feature selections.
+
+Reuse existing build caches. Release feature graphs, production image builds,
+and Kubernetes validation follow the selected CI jobs and applicable release
+or production gates. A parameter-only research Run reuses its verified Build.
