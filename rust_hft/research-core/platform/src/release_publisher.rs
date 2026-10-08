@@ -257,13 +257,26 @@ fn command(root: &Path, program: &str, args: &[&str], repository: &str) -> Resul
 fn api(root: &Path, repository: &str, endpoint: &str, pages: bool) -> Result<Value> {
     let endpoint = format!("repos/{repository}/{endpoint}");
     let args = if pages {
-        vec!["api", "--paginate", "--slurp", &endpoint]
+        vec!["api", "--paginate", &endpoint]
     } else {
         vec!["api", &endpoint]
     };
-    Ok(serde_json::from_slice(&command(
-        root, "gh", &args, repository,
-    )?)?)
+    decode_api_output(&command(root, "gh", &args, repository)?, pages)
+}
+fn decode_api_output(output: &[u8], pages: bool) -> Result<Value> {
+    if !pages {
+        return Ok(serde_json::from_slice(output)?);
+    }
+    // Older distro gh supports --paginate but not --slurp. Preserve the same
+    // page array using the authenticated JSON stream, without dropping pages.
+    let pages = serde_json::Deserializer::from_slice(output)
+        .into_iter::<Value>()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(
+        !pages.is_empty(),
+        "GitHub pagination returned no JSON pages"
+    );
+    Ok(Value::Array(pages))
 }
 fn sha_is_valid(s: &str) -> bool {
     s.len() == 40
@@ -1821,6 +1834,22 @@ pub async fn import_oss_build(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn github_pagination_preserves_all_streamed_pages_and_rejects_bad_output() {
+        let output = b"{\"jobs\":[]}\n{\"jobs\":[{\"id\":567}]}\n";
+        assert_eq!(
+            decode_api_output(output, true).unwrap(),
+            json!([{"jobs":[]},{"jobs":[{"id":567}]}])
+        );
+        assert!(decode_api_output(output, false).is_err());
+        assert!(decode_api_output(b"", true).is_err());
+        assert!(decode_api_output(b"{}\n{malformed}", true).is_err());
+        assert!(decode_api_output(b"{}\nunauthenticated error", true).is_err());
+        assert_eq!(
+            decode_api_output(b"{\"id\":567}", false).unwrap(),
+            json!({"id":567})
+        );
+    }
     #[test]
     fn ack_import_rejects_expired_revoked_replayed_selectors_and_cancelled_producers() {
         let build = "a".repeat(64);

@@ -160,10 +160,10 @@ References: [OSS V4 signing](https://www.alibabacloud.com/help/en/oss/developer-
 
 ## ACK execution using existing capacity
 
-The `controller` product now builds `research-release-publisher` with its owning platform workspace, locked release profile and `publisher` feature. The existing compiler-input manifest records that recipe, lock/profile bytes and compiler environment; producer artifacts and controller OCI verification include its executable digest and exact readback. The controller image installs git, gh and CA certificates and verifies these dependencies plus the source-bound importer CLI offline. Neither probe invokes the campaign entrypoint or supplies credentials.
+The `controller` product now builds `research-release-publisher` with its owning platform workspace, locked release profile and `publisher` feature. The existing compiler-input manifest records that recipe, lock/profile bytes and compiler environment; producer artifacts and controller OCI verification include its executable digest and exact readback. The controller image installs git, gh, Ruby, unzip and CA certificates and verifies these dependencies plus the source-bound importer CLI offline. Neither probe invokes the campaign entrypoint or supplies credentials.
 
 Use that authenticated release binary for the existing controlled ACK execution image; never install the separate temporary CI debug issuer. The actual existing control capacity and its operator execution surface must still be read back before deployment. The controller artifact is a packaging source, not permission to replace a different control service or start a Campaign.
-The foundation Dockerfile requires that verified binary in `research-control-bin`; stage it only from the authenticated controller artifact after checking the exact source/compiler/producer/digest. Its reviewed runtime base must independently supply git, gh and CA. Merely building that Dockerfile or copying a host binary does not establish those prerequisites.
+The foundation Dockerfile requires that verified binary in `research-control-bin`; stage it only from the authenticated controller artifact after checking the exact source/compiler/producer/digest. Its reviewed runtime base must independently supply git, gh, Ruby, unzip and CA. Merely building that Dockerfile or copying a host binary does not establish those prerequisites.
 Run the importer through the existing operator execution surface in that Pod or host.
 Do not add a release Gateway/Broker Pod, service, ingress or PVC.
 Do not mount signing keys or collector credentials there.
@@ -171,6 +171,12 @@ The current foundation NetworkPolicy does not allow GitHub or OSS egress.
 An operator must review exact existing egress destinations and TLS trust before this command can work.
 This branch does not open network access or change that policy.
 This command does not start a research provider, migrate PG or enable an authority.
+
+The importer uses `gh api --paginate` and parses every authenticated JSON page
+locally, including downloads through `jq -s`. It does not require the newer
+`gh --slurp` flag: the existing distro CLI can be reused. Malformed/truncated
+pages, API failure and missing/ambiguous original identities still fail closed;
+this compatibility change does not weaken producer or signature verification.
 
 The host must supply these separate inputs:
 

@@ -55,10 +55,11 @@ initialize_image() {
     "$work/image/opt/monday/deployment/aliyun/research/k8s"
   jq -cn --arg source "$source_sha" \
     '{source:$source,user:"research",workdir:"/work",entrypoint:["/usr/bin/tini","--","/bin/bash","/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh"]}' >"$work/image/config.json"
-  for tool in bash curl jq tini git gh; do
+  for tool in bash curl jq tini git gh ruby unzip; do
     printf '#!/usr/bin/env bash\nexit 0\n' >"$work/image/usr/bin/$tool"
     chmod 0755 "$work/image/usr/bin/$tool"
   done
+  printf '#!/usr/bin/env bash\nprintf -- "--paginate\\n"\n' >"$work/image/usr/bin/gh"
   for tool in aliyun kubectl; do
     printf '#!/usr/bin/env bash\nprintf "offline client version\\n"\n' >"$work/image/usr/local/bin/$tool"
     chmod 0755 "$work/image/usr/local/bin/$tool"
@@ -88,7 +89,7 @@ initialize_image
 verify_image
 grep -Fq 'run --rm --network none --entrypoint /bin/bash' "$work/docker.log"
 grep -Fqx 'rm -f fixture-container ' "$work/docker.log"
-for failure in source entrypoint user tool script-missing script-syntax script-bytes template binary importer importer-version git gh ca; do
+for failure in source entrypoint user tool script-missing script-syntax script-bytes template binary importer importer-version git gh ruby unzip gh-pagination ruby-runtime ruby-tar ca; do
   initialize_image
   case "$failure" in
     source|entrypoint|user)
@@ -106,7 +107,10 @@ for failure in source entrypoint user tool script-missing script-syntax script-b
     template) printf '\n# changed Job template\n' >>"$work/image/opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml" ;;
     importer) rm "$work/image/usr/local/bin/research-release-publisher" ;;
     importer-version) printf '#!/usr/bin/env bash\nprintf "wrong importer\\n"\n' >"$work/image/usr/local/bin/research-release-publisher" ;;
-    git|gh) rm "$work/image/usr/bin/$failure" ;;
+    git|gh|ruby|unzip) rm "$work/image/usr/bin/$failure" ;;
+    gh-pagination) printf '#!/usr/bin/env bash\nexit 0\n' >"$work/image/usr/bin/gh" ;;
+    ruby-runtime) printf '#!/usr/bin/env bash\nexit 1\n' >"$work/image/usr/bin/ruby" ;;
+    ruby-tar) printf '#!/usr/bin/env bash\nfor argument in "$@"; do if [[ $argument == -rrubygems/package ]]; then exit 1; fi; done\nexit 0\n' >"$work/image/usr/bin/ruby" ;;
     ca) rm "$work/image/etc/ssl/certs/ca-certificates.crt" ;;
     binary) printf '\n# changed executable\n' >>"$work/image/usr/local/bin/lob-pit-materializer" ;;
   esac

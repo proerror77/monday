@@ -20,12 +20,12 @@ attempt=$(jq -er '.run_attempt' "$work/run.json")
 [[ $attempt =~ ^[1-9][0-9]*$ ]]
 path=$(jq -er '.path' "$work/run.json")
 if [[ $path == .github/workflows/ploy-ci.yml ]]; then name='Research image binaries'; else name='Research release binaries'; fi
-gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$run/attempts/$attempt/jobs?per_page=100" >"$work/jobs.json"
+gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run/attempts/$attempt/jobs?per_page=100" | jq -s . >"$work/jobs.json"
 job=$(jq -er --arg name "$name" --argjson run "$run" --argjson attempt "$attempt" '
   [.[].jobs[]?|select(.name==$name and .run_id==$run and .run_attempt==$attempt and .status=="completed" and .conclusion=="success")]
   | if length==1 then .[0].id else error("missing/ambiguous successful software producer") end' "$work/jobs.json")
 [[ $job =~ ^[1-9][0-9]*$ ]]
-gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?per_page=100" >"$work/artifacts.json"
+gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?per_page=100" | jq -s . >"$work/artifacts.json"
 artifact=$(jq -er --arg name "research-image-release-$source_sha-$product" --arg sha "$source_sha" --argjson run "$run" '
   [.[].artifacts[]?|select(.name==$name)] | if length==1 and (.[0]|.expired==false and .workflow_run.id==$run and .workflow_run.head_sha==$sha and .size_in_bytes>0 and .size_in_bytes<=1073741824)
   then .[0].id else error("missing/expired/ambiguous release artifact") end' "$work/artifacts.json")
