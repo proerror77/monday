@@ -48,15 +48,29 @@ while IFS=$'\t' read -r prior_id prior_attempt; do
   ' "$work/jobs.json" >/dev/null; then
     ghcr=true
   fi
+done <"$work/prior.tsv"
+
+# ACR retains its native workflow identity for the existing Build issuer.
+gh api --paginate --slurp \
+  "repos/$GITHUB_REPOSITORY/actions/workflows/acr-publish.yml/runs?head_sha=$source_sha&branch=main&status=success&per_page=100" >"$work/acr-runs.json"
+jq -r --arg sha "$source_sha" --arg repo "$GITHUB_REPOSITORY" '
+  [.[].workflow_runs[]? | select(.head_sha==$sha and .head_branch=="main"
+    and .head_repository.full_name==$repo and .path==".github/workflows/acr-publish.yml"
+    and (.event=="workflow_run" or .event=="workflow_dispatch")
+    and .status=="completed" and .conclusion=="success")]
+  | .[] | [.id,.run_attempt] | @tsv
+' "$work/acr-runs.json" >"$work/acr-prior.tsv"
+while IFS=$'\t' read -r prior_id prior_attempt; do
+  [[ -n $prior_id ]] || continue
+  [[ $prior_id =~ ^[1-9][0-9]*$ && $prior_attempt =~ ^[1-9][0-9]*$ ]] || exit 1
+  gh api --paginate --slurp \
+    "repos/$GITHUB_REPOSITORY/actions/runs/$prior_id/attempts/$prior_attempt/jobs?per_page=100" >"$work/acr-jobs.json"
   if jq -e --arg sha "$source_sha" --argjson run "$prior_id" --argjson attempt "$prior_attempt" '
     [.[].jobs[]? | select(.run_id==$run and .run_attempt==$attempt and .status=="completed"
-      and .conclusion=="success"
-      and (.name | startswith("Publish ACR / Research products published ["))
+      and .conclusion=="success" and (.name | startswith("Research products published ["))
       and (.name | endswith("] ("+$sha+")")))] | length>0
-  ' "$work/jobs.json" >/dev/null; then
-    acr=true
-  fi
-done <"$work/prior.tsv"
+  ' "$work/acr-jobs.json" >/dev/null; then acr=true; fi
+done <"$work/acr-prior.tsv"
 
 lookup_ghcr() {
   local url=$1 status=0

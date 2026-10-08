@@ -94,7 +94,7 @@ gh api --paginate --slurp \
 jq -r --arg source "$source_sha" --arg repo "$GITHUB_REPOSITORY" --argjson current "$current_run_id" '
   [.[].workflow_runs[]? | select(.head_sha == $source and .head_branch == "main"
     and .path == ".github/workflows/acr-publish.yml" and .head_repository.full_name == $repo
-    and (.event == "workflow_run" or .event == "workflow_dispatch" or .event == "workflow_call")
+    and (.event == "workflow_run" or .event == "workflow_dispatch")
     and .status == "completed" and .conclusion == "success" and .id != $current)]
   | sort_by(.id) | reverse | .[] | [.id,.run_attempt] | @tsv' "$work/publishers.json" > "$work/prior.tsv"
 while IFS=$'\t' read -r prior_id prior_attempt; do

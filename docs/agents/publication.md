@@ -27,19 +27,23 @@ Version-tag publication requires the tagged commit to belong to main history and
 the same exact-source checks. The explicit ACR source-test target remains a
 non-production diagnostic exception with its existing identity restrictions.
 
-Automatic GHCR and ACR publication share one Release workflow. Completion of
-any required CI workflow wakes it. Pull requests do not. The workflow reads the
-three required checks for that head SHA and calls the GHCR and ACR workflows
-only when every check is success or skipped and the SHA is still current main.
-Pending or unsuccessful evidence exits without publishing; a later completion checks the
-SHA again, so long-running valid CI does not exhaust a publisher's wait window.
-GHCR skips a full-SHA image tag or a successful nested publication job.
-ACR requires the successful product publication marker; raw manifests do not
-prove signed release completion. Retried runs also read earlier attempts. The admitted SHA binds the build checkout and OCI revision.
-Manual and tag publication stay on their existing entries and may wait a
-bounded time; failure, cancellation, missing evidence at its deadline, or
-source drift fails closed. Reconcile those
-conditions before an authorized retry. CI and publication remain separate labels.
+Automatic publication starts with Release. Completion of any required main-push
+CI workflow wakes it. Pull requests do not. Release reads the three required
+checks for that head SHA and calls GHCR only when each is success or skipped.
+ACR wakes after Release completes and independently reads the same exact-source
+checks and Prediction artifacts. It retains its native workflow, job names and
+OIDC identity, which the existing Build issuer requires. GHCR failure does not
+replace ACR's CI admission decision.
+
+Pending evidence exits without publishing. The final upstream completion causes
+another evaluation. GHCR skips a full-SHA image tag or a successful nested
+publication job, including earlier attempts. ACR requires its own successful
+product publication marker; raw manifests do not prove signed release completion.
+No-op runs are not publication evidence. Existing concurrency serializes each
+publisher. The admitted SHA binds its checkout and OCI revision.
+Manual and tag publication retain their entries and may wait a bounded time.
+Failure, cancellation, missing evidence at the deadline, or source drift fails
+closed. CI and publication remain separate labels.
 
 ## Rule ownership
 

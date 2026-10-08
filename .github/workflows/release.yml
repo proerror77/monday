@@ -16,7 +16,6 @@ permissions:
   actions: read
   checks: read
   contents: read
-  id-token: write
   packages: write
 
 jobs:
@@ -26,7 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       publish_ghcr: ${{ steps.gate.outputs.publish_ghcr }}
-      publish_acr: ${{ steps.gate.outputs.publish_acr }}
       source_sha: ${{ steps.gate.outputs.source_sha }}
       reason: ${{ steps.gate.outputs.reason }}
     permissions:
@@ -60,20 +58,3 @@ jobs:
     uses: ./.github/workflows/docker-publish.yml
     with:
       source_sha: ${{ needs.admit.outputs.source_sha }}
-
-  publish-acr:
-    name: Publish ACR
-    needs: admit
-    if: needs.admit.result == 'success' && needs.admit.outputs.publish_acr == 'true'
-    permissions:
-      actions: read
-      checks: read
-      contents: read
-      id-token: write
-      pull-requests: read
-    uses: ./.github/workflows/acr-publish.yml
-    with:
-      source_sha: ${{ needs.admit.outputs.source_sha }}
-    secrets:
-      ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
-      MONDAY_RESEARCH_RELEASE_SIGNING_KEY: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY }}

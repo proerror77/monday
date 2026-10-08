@@ -117,25 +117,23 @@ abort 'release concurrency is not one queued group per SHA' unless release.fetch
   'cancel-in-progress' => false
 }
 ghcr = release.fetch('jobs').fetch('publish-ghcr')
-acr_job = release.fetch('jobs').fetch('publish-acr')
 abort 'GHCR inherits unrelated secrets' if ghcr.key?('secrets')
-expected_secrets = {
-  'ACR_PASSWORD' => '${{ secrets.ACR_PASSWORD }}',
-  'MONDAY_RESEARCH_RELEASE_SIGNING_KEY' => '${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY }}'
-}
-abort 'ACR receives unrelated secrets' unless acr_job.fetch('secrets') == expected_secrets
-abort 'ACR reusable secrets differ from its admitted credentials' unless (acr['on'] || acr[true]).dig('workflow_call','secrets').keys.sort == expected_secrets.keys.sort
 abort 'GHCR is not the reusable publisher' unless ghcr.fetch('uses') == './.github/workflows/docker-publish.yml'
-abort 'ACR is not the reusable publisher' unless acr_job.fetch('uses') == './.github/workflows/acr-publish.yml'
 abort 'GHCR call is not gated on one admission output' unless ghcr.fetch('if').include?("outputs.publish_ghcr == 'true'")
-abort 'ACR call is not gated on one admission output' unless acr_job.fetch('if').include?("outputs.publish_acr == 'true'")
+abort 'ACR issuer lost its native workflow identity' if release.fetch('jobs').key?('publish-acr')
+acr_on = acr['on'] || acr[true]
+abort 'ACR must wake only from Release completion' unless acr_on.fetch('workflow_run') == {
+  'workflows'=>['Release'], 'types'=>['completed'], 'branches'=>['main']
+}
+abort 'ACR must keep its native issuer context' if acr_on.key?('workflow_call')
 [docker, acr].each do |doc|
   triggers = doc['on'] || doc[true]
-  abort 'publisher still starts from workflow_run' if triggers.key?('workflow_run') || triggers.key?('pull_request')
+  abort 'publisher starts from a pull request' if triggers.key?('pull_request')
   abort 'manual workflow_dispatch was removed' unless triggers.key?('workflow_dispatch')
-  abort 'publisher is not reusable' unless triggers.dig('workflow_call', 'inputs', 'source_sha', 'required') == true
-  abort 'reusable publisher confuses caller event with workflow_call' if doc.to_s.include?("github.event_name == 'workflow_call'")
+  abort 'publisher confuses caller event with workflow_call' if doc.to_s.include?("github.event_name == 'workflow_call'")
 end
+abort 'GHCR still wakes from upstream CI directly' if (docker['on'] || docker[true]).key?('workflow_run')
+abort 'GHCR is not reusable' unless (docker['on'] || docker[true]).dig('workflow_call','inputs','source_sha','required')==true
 abort 'GHCR lost tag publication' unless (docker['on'] || docker[true]).dig('push', 'tags') == ['v*']
 abort 'GHCR lost the hft-core scope guard' unless File.read(ARGV[1]).include?('any(.include[]; .name=="hft-core")')
 RUBY
@@ -172,6 +170,8 @@ case "$endpoint" in
   */git/ref/heads/main) cat "$FAKE_RELEASE_STATE/main" ;;
   */check-runs\?*) cat "$FAKE_RELEASE_STATE/checks" ;;
   */workflows/release.yml/runs\?*) cat "$FAKE_RELEASE_STATE/runs" ;;
+  */workflows/acr-publish.yml/runs\?*) cat "$FAKE_RELEASE_STATE/acr-runs" ;;
+  */runs/80/attempts/1/jobs\?*) cat "$FAKE_RELEASE_STATE/acr-jobs" ;;
   */runs/*/attempts/*/jobs\?*) cat "$FAKE_RELEASE_STATE/jobs" ;;
   */users/*/packages/container/hft/versions\?*) cat "$FAKE_RELEASE_STATE/user-versions" ;;
   */orgs/*/packages/container/hft/versions\?*) cat "$FAKE_RELEASE_STATE/org-versions" ;;
@@ -191,6 +191,8 @@ reset_api() {
   ]}]' >"$work/checks"
   jq -n '[{total_count:0,workflow_runs:[]}]' >"$work/runs"
   jq -n --arg sha "$sha" '[{jobs:[]}]' >"$work/jobs"
+  jq -n '[{total_count:0,workflow_runs:[]}]' >"$work/acr-runs"
+  jq -n '[{jobs:[]}]' >"$work/acr-jobs"
   jq -n '[[]]' >"$work/user-versions"
   jq -n '[[]]' >"$work/org-versions"
   printf '%s\n' "$digest" >"$work/digest"
@@ -237,6 +239,8 @@ case "$endpoint" in
   */git/ref/heads/main) cat "$FAKE_RELEASE_STATE/main" ;;
   */check-runs\?*) cat "$FAKE_RELEASE_STATE/checks" ;;
   */workflows/release.yml/runs\?*) cat "$FAKE_RELEASE_STATE/runs" ;;
+  */workflows/acr-publish.yml/runs\?*) cat "$FAKE_RELEASE_STATE/acr-runs" ;;
+  */runs/80/attempts/1/jobs\?*) cat "$FAKE_RELEASE_STATE/acr-jobs" ;;
   */runs/*/attempts/*/jobs\?*) cat "$FAKE_RELEASE_STATE/jobs" ;;
   */users/*/packages/container/hft/versions\?*)
     printf 'gh: Not Found (HTTP 404)\n' >&2
@@ -253,9 +257,10 @@ reset_api
 jq -n --arg sha "$sha" '[{total_count:1,workflow_runs:[{id:50,run_attempt:1,head_sha:$sha,head_branch:"main",event:"workflow_run",path:".github/workflows/release.yml",head_repository:{full_name:"owner/repo"},status:"completed",conclusion:"success"}]}]' >"$work/runs"
 jq -n --arg sha "$sha" '[{jobs:[
   {run_id:50,run_attempt:1,name:"Publish GHCR / build-and-push",status:"completed",conclusion:"success"},
-  {run_id:50,run_attempt:1,name:("Publish ACR / Research products published [cex-runner,controller,prediction-runner] ("+$sha+")"),status:"completed",conclusion:"success"},
   {run_id:50,run_attempt:1,name:"Admit release",status:"completed",conclusion:"success"}
 ]}]' >"$work/jobs"
+jq -n --arg sha "$sha" '[{total_count:1,workflow_runs:[{id:80,run_attempt:1,head_sha:$sha,head_branch:"main",event:"workflow_run",path:".github/workflows/acr-publish.yml",head_repository:{full_name:"owner/repo"},status:"completed",conclusion:"success"}]}]' >"$work/acr-runs"
+jq -n --arg sha "$sha" '[{jobs:[{run_id:80,run_attempt:1,name:("Research products published [cex-runner,controller,prediction-runner] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/acr-jobs"
 admit "$sha"
 [[ $(field reason) == already-published ]]
 

@@ -134,9 +134,6 @@ read_state ready
 cp "$work/marker-base" "$work/prior-jobs"
 rm "$work/out"
 read_state already_published
-edit_fixture publishers '.[0].workflow_runs[0].event="workflow_call"'
-rm -f "$work/out"
-read_state already_published
 if ! grep -Fq /artifacts "$work/calls"; then
   echo 'product coverage was not checked against the producer artifact metadata' >&2; exit 1
 fi

@@ -14,25 +14,11 @@ migration=$(git log -1 --format=%H -G 'monday.research-products.v2' -- .github/s
 since=$(git show -s --format=%ct "$migration")
 since=$(ruby -e 'puts Time.at(Integer(ARGV[0])).utc.strftime("%Y-%m-%dT%H:%M:%SZ")' "$since")
 gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/workflows/acr-publish.yml/runs?branch=main&status=success&created=%3E%3D$since&per_page=100" >"$work/runs.json"
-# Reusable publishers create jobs in Release, not separate ACR workflow runs.
-# The workflow can be absent before its first default-branch registration.
-if ! gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?branch=main&created=%3E%3D$since&per_page=100" >"$work/releases.json" 2>"$work/release-error"; then
-  if grep -Eq 'HTTP 404|Not Found' "$work/release-error"; then
-    printf '[{"total_count":0,"workflow_runs":[]}]\n' >"$work/releases.json"
-  else
-    cat "$work/release-error" >&2
-    exit 1
-  fi
-fi
-jq -e 'length>0 and all(.[]; (.workflow_runs|type=="array") and (.total_count|type=="number" and .>=0))' "$work/releases.json" >/dev/null
-jq -s 'add' "$work/runs.json" "$work/releases.json" >"$work/combined.json"
-mv "$work/combined.json" "$work/runs.json"
 jq -e 'length>0 and all(.[]; (.workflow_runs|type=="array") and (.total_count|type=="number" and .>=0))' "$work/runs.json" >/dev/null
 jq -r --arg repo "$GITHUB_REPOSITORY" '
   [.[].workflow_runs[]? | select(.head_branch=="main" and .head_repository.full_name==$repo and
-    ((.path==".github/workflows/acr-publish.yml" and (.event=="workflow_run" or .event=="workflow_dispatch")) or
-      (.path==".github/workflows/release.yml" and .event=="workflow_run")) and
-    .status=="completed" and (.path==".github/workflows/release.yml" or .conclusion=="success"))] | sort_by(.id) | reverse |
+    .path==".github/workflows/acr-publish.yml" and (.event=="workflow_run" or .event=="workflow_dispatch") and
+    .status=="completed" and .conclusion=="success")] | sort_by(.id) | reverse |
   .[] | [.id,.run_attempt,.head_sha] | @tsv' "$work/runs.json" >"$work/runs.tsv"
 baseline='{"cex-runner":"BOOTSTRAP","controller":"BOOTSTRAP","prediction-runner":"BOOTSTRAP"}'
 while IFS=$'\t' read -r run attempt source; do
@@ -41,8 +27,8 @@ while IFS=$'\t' read -r run attempt source; do
   gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$run/attempts/$attempt/jobs?per_page=100" >"$work/jobs.json"
   marker=$(jq -er --argjson run "$run" --argjson attempt "$attempt" --arg source "$source" '
     [.[].jobs[]? | select(.run_id==$run and .run_attempt==$attempt and .status=="completed" and .conclusion=="success" and
-      (.name | sub("^Publish ACR / "; "") | startswith("Research products published")))] |
-    if length==0 then "none" elif length!=1 then error("ambiguous publication marker") else .[0].name | sub("^Publish ACR / "; "") |
+      (.name | startswith("Research products published")))] |
+    if length==0 then "none" elif length!=1 then error("ambiguous publication marker") else .[0].name |
       capture("^Research products published \\[(?<products>[a-z,-]+)\\] \\((?<source>[0-9a-f]{40})\\)$") |
       if .source == $source then .products else error("publication marker source mismatch") end end' "$work/jobs.json")
   if [[ $marker != none ]]; then
