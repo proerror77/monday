@@ -1,17 +1,21 @@
 mod cli;
 mod data_mission;
+#[cfg(any(feature = "operator", test))]
 mod governance;
+#[cfg(feature = "operator")]
 mod loop_control;
 mod mission;
 mod mission_calendar;
 mod mission_campaign;
 mod mission_dispatch;
+#[cfg(feature = "operator")]
 mod mission_fresh_inputs;
 mod mission_metrics;
 mod mission_objects;
 mod mission_render;
 mod mission_runner;
 pub mod representation_plan;
+#[cfg(feature = "operator")]
 mod sec_orderflow;
 pub use mission_campaign::representation::{
     bind_signed_prepared_representation_campaign, preview_representation_campaign_contracts,
@@ -19,6 +23,7 @@ pub use mission_campaign::representation::{
 
 use clap::Parser;
 
+#[cfg(feature = "operator")]
 pub async fn operator_main() -> anyhow::Result<()> {
     let result = cli::run(cli::Cli::parse()).await;
     if result.is_err() {
@@ -58,6 +63,7 @@ pub async fn worker_main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod worker_boundary_tests {
     use super::*;
+    #[cfg(feature = "operator")]
     #[test]
     fn operator_cannot_execute_a_scientific_campaign() {
         assert!(cli::Cli::try_parse_from([
@@ -98,10 +104,19 @@ mod worker_boundary_tests {
             "/work",
         ])
         .unwrap();
-        for command in ["dispatch", "run", "campaign-freeze", "campaign-finalize"] {
+        for command in [
+            "dispatch",
+            "run",
+            "learn",
+            "campaign-freeze",
+            "campaign-finalize",
+        ] {
             assert!(
                 cli::WorkerCli::try_parse_from(["monday-cex-worker", "mission", command]).is_err()
             );
+        }
+        for command in ["data", "loop", "approval", "deployment", "research"] {
+            assert!(cli::WorkerCli::try_parse_from(["monday-cex-worker", command]).is_err());
         }
     }
 }

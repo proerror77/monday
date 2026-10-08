@@ -6,9 +6,10 @@ edition = "2021"
 publish = false
 
 [features]
-default = []
+default = ["operator"]
+operator = ["alpha-engine/llm"]
 scientific = ["alpha-engine/fitting", "hft-research-platform/artifact-io", "dep:hft-cex-search-driver"]
-onnx-compatibility = ["dep:alpha-onnx-evaluator"]
+onnx-compatibility = ["operator", "dep:alpha-onnx-evaluator"]
 
 [dependencies]
 hft-cex-search-driver = { path = "../search-driver", optional = true }
@@ -17,7 +18,7 @@ hft-cex-research-input = { path = "../../research-core/cex-input", features = ["
 hft-research-artifacts = { path = "../../research-core/artifacts" }
 hft-research-dispatch-io = { path = "../../research-core/dispatch-io" }
 alpha-domain = { path = "../domain" }
-alpha-engine = { path = "../engine", default-features = false, features = ["kernel", "llm"] }
+alpha-engine = { path = "../engine", default-features = false, features = ["kernel"] }
 alpha-onnx-evaluator = { path = "../onnx-evaluator", optional = true }
 alpha-store = { path = "../store" }
 anyhow = "1"
@@ -43,6 +44,7 @@ zip = { version = "6", default-features = false, features = ["deflate"] }
 [[bin]]
 name = "alpha-harness"
 path = "src/main.rs"
+required-features = ["operator"]
 
 [dev-dependencies]
 hft-prepared-market-io = { path = "../../research-core/prepared-market-io" }

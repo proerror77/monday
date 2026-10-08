@@ -174,6 +174,17 @@ The diagnostic CEX harness explicitly enables both; deterministic search callers
 can select `kernel` without including the LLM client in their normal dependency
 graph. Build tools retain their own transport dependencies.
 
+The harness's default `operator` feature includes that LLM client and the
+operator CLI, legacy loop controller, data preparation and approval commands.
+`hft-cex-research-worker` disables defaults and selects only `scientific`.
+It retains `kernel` and `fitting`, frozen input checks, native Campaign execution,
+independent final evaluation and result readback. Governance handoff helpers
+remain available to scientific tests, without entering the worker's normal graph.
+The worker still consumes shared application, collector, store and control code;
+this feature boundary is one step toward separating the scientific application.
+The published operator and worker use separate build recipes. A combined Cargo
+package selection unifies their features and does not verify this boundary.
+
 ## Runtime strategy handoff
 
 `rust_hft/governance-contracts` owns the fixed `monday.runtime_bundle.v1`
