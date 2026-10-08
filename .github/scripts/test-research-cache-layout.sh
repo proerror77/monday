@@ -20,7 +20,8 @@ cp "$root/rust_hft/workspaces.json" "$work/repo/rust_hft/"
 cat >"$work/bin/cargo" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
-jq -n --arg root "$FIXTURE/repo" '{packages:[{name:"local-code",manifest_path:($root+"/rust_hft/member/Cargo.toml"),targets:[{name:"local_code"}]}]}'
+if [[ " $* " == *" --no-deps "* ]]; then extra=false; else extra=true; fi
+jq -n --arg root "$FIXTURE/repo" --argjson extra "$extra" '{packages:([{name:"local-code",manifest_path:($root+"/rust_hft/member/Cargo.toml"),targets:[{name:"local_code"}]}] + if $extra then [{name:"hidden-local",manifest_path:($root+"/vendor/hidden-local/Cargo.toml"),targets:[{name:"hidden_local"}]}] else [] end)}'
 MOCK
 chmod +x "$work/bin/cargo"
 for id in data-pipelines prediction-markets research-core research-core--platform; do
@@ -30,6 +31,7 @@ for id in data-pipelines prediction-markets research-core research-core--platfor
   printf 'native object\n' >"$profile/build/libduckdb-sys-native/out/native.o"
   printf 'local object\n' >"$profile/build/local-code-hash/out/local.o"
   printf 'local\n' >"$profile/deps/liblocal_code-hash.rlib"
+  printf 'hidden local\n' >"$profile/deps/libhidden_local-hash.rlib"
   printf 'local fingerprint\n' >"$profile/.fingerprint/local-code-hash"
   printf 'native\n' >"$profile/deps/liblibduckdb_sys-hash.rlib"
   printf 'local executable\n' >"$profile/local-code"
@@ -38,7 +40,7 @@ FIXTURE="$work" PATH="$work/bin:$PATH" bash "$work/repo/.github/scripts/research
 for id in data-pipelines prediction-markets research-core research-core--platform; do
   profile="$work/repo/rust_hft/target/$id/x86_64-unknown-linux-gnu/release"
   [[ -f $profile/build/libduckdb-sys-native/out/native.o && -f $profile/deps/liblibduckdb_sys-hash.rlib ]]
-  [[ ! -e $profile/build/local-code-hash && ! -e $profile/deps/liblocal_code-hash.rlib && ! -e $profile/.fingerprint/local-code-hash && ! -e $profile/local-code ]]
+  [[ ! -e $profile/deps/libhidden_local-hash.rlib && ! -e $profile/build/local-code-hash && ! -e $profile/deps/liblocal_code-hash.rlib && ! -e $profile/.fingerprint/local-code-hash && ! -e $profile/local-code ]]
 done
 # Refuse to traverse a cached symlink into another target or filesystem path.
 profile="$work/repo/rust_hft/target/research-core/x86_64-unknown-linux-gnu/release"

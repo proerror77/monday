@@ -37,6 +37,21 @@ case ${1:?command required} in
     while IFS= read -r manifest; do
       cargo metadata --manifest-path "$root/rust_hft/$manifest" --locked --no-deps --format-version 1 >>"$work/local.jsonl"
     done < <(jq -er '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
+    # Include any local path/patch dependencies outside workspace membership.
+    # Metadata uses each recipe's exact features; this never compiles a union.
+    recipes=$(jq -ec '.recipes[]' "${2:?inputs required}")
+    while IFS= read -r recipe; do
+      manifest=$(jq -er .manifest <<<"$recipe")
+      manifest_dir "$manifest" >/dev/null
+      features=$(jq -r .features <<<"$recipe")
+      package=$(jq -er .package <<<"$recipe")
+      metadata_args=()
+      if [[ -n $features ]]; then
+        scoped_features=$(jq -nr --arg package "$package" --arg features "$features" '$features|split(",")|map($package+"/"+.)|join(",")')
+        metadata_args+=(--features "$scoped_features")
+      fi
+      cargo metadata --manifest-path "$root/rust_hft/$manifest" --locked --format-version 1 "${metadata_args[@]}" >>"$work/local.jsonl"
+    done <<<"$recipes"
     jq -s --arg root "$root/" '[.[].packages[]|select(.manifest_path|startswith($root))|.name, .targets[].name]|unique' "$work/local.jsonl" >"$work/names.json"
     ruby -rjson -rfileutils - "$root" "$work/names.json" "${2:?inputs required}" <<'RUBY'
 root, names_file, inputs_file = ARGV
