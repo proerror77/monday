@@ -16,7 +16,7 @@ full = ["db", "polars-export", "ml", "rl", "strategy-runtime"]
 db = ["dep:sqlx", "dep:ploy-feed-loaders"]
 polars-export = ["dep:polars"]
 ml = ["dep:burn", "dep:burn-ndarray", "dep:burn-store", "dep:ciborium"]
-rl = ["dep:burn", "dep:burn-ndarray"]
+rl = []
 strategy-runtime = []
 
 [dependencies]

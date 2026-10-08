@@ -214,7 +214,7 @@ pub use factors_v2::{
     TradeFormationReviewReport, TradeFormationRuleRow,
 };
 #[cfg(feature = "rl")]
-pub use model::rl::{BinaryEventEnv, DqnAgent, Environment, ReplayBuffer};
+pub use model::rl::{BinaryEventEnv, Environment, ReplayBuffer};
 #[cfg(feature = "ml")]
 pub use model::supervised::BinaryTimeBoundary;
 #[cfg(feature = "ml")]
