@@ -13,7 +13,7 @@ test "$(docker image inspect --format '{{.Config.WorkingDir}}' "$image")" = /wor
 # Run only local packaging probes. Never invoke the Campaign entrypoint or
 # forward host credentials; even the client version probes have no network.
 docker run --rm --network none --entrypoint /bin/bash "$image" -ceu '
-  for tool in bash curl jq tini git gh; do test -x "/usr/bin/$tool"; done
+  for tool in bash curl jq tini git gh ruby unzip; do test -x "/usr/bin/$tool"; done
   for tool in aliyun kubectl research-release-publisher alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
     test -x "/usr/local/bin/$tool"
   done
@@ -28,6 +28,9 @@ docker run --rm --network none --entrypoint /bin/bash "$image" -ceu '
   test "$(/usr/local/bin/research-release-publisher --version)" = "research-release-publisher $1"
   git --version
   gh --version
+  /usr/bin/gh api --help | grep -Fq -- "--paginate"
+  /usr/bin/ruby -rjson -rdigest -rzlib -rfileutils -rpathname -rrubygems/package -e "abort unless defined?(Gem::Package::TarReader) && defined?(Gem::Package::TarWriter)"
+  /usr/bin/unzip -v >/dev/null
   test -s /etc/ssl/certs/ca-certificates.crt
   /usr/local/bin/aliyun version
   /usr/local/bin/kubectl version --client=true
