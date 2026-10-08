@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+[[ $# == 0 || ( $# == 1 && $1 == --deferred-carry ) ]] || exit 2
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -44,6 +45,84 @@ plan() {
   SELECTED_JOBS=,, SELECTED_RESEARCH_PRODUCT=none bash "$root/.github/scripts/select-main-research-scope.sh" "$head" "$work/plan" \
     "$root/.github/scripts/fixtures/rust-ci-scope/metadata.fixture"
 }
+# This focused fixture isolates scheduling from the authenticated baseline
+# reader. The complete tests below still exercise that reader through gh.
+isolated="$work/isolated/.github/scripts"
+mkdir -p "$isolated"
+for script in select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json; do
+  cp "$root/.github/scripts/$script" "$isolated/$script"
+done
+cat >"$isolated/read-research-publish-baseline.sh" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ! -f $RESEARCH_SCOPE_FIXTURE/baseline-failure ]] || exit 42
+cp "$RESEARCH_SCOPE_FIXTURE/baselines" "$2"
+MOCK
+printf '%s\n' '{"cex-runner":"BOOTSTRAP","controller":"BOOTSTRAP","prediction-runner":"BOOTSTRAP"}' >"$work/baselines"
+cp "$work/baselines" "$work/baselines-before"
+direct_jobs=,ploy/rust-runner-lean,ploy/architecture-contracts,ploy/research-image-binaries,ploy/research-image-smoke,
+focused_plan() {
+  : >"$work/focused-plan"
+  RESEARCH_CARRY_MODE=$1 MONDAY_RELEASE_POLICY_JSON=$2 SELECTED_RESEARCH_PRODUCT=${3:-none} SELECTED_JOBS=${4:-,,} \
+    bash "$isolated/select-main-research-scope.sh" "$head" "$work/focused-plan" \
+      "$root/.github/scripts/fixtures/rust-ci-scope/metadata.fixture" 2>"$work/focused-log"
+}
+for policy in '' '{}' '{"oss_by_product":null}' '{"oss_by_product":{}}'; do
+  focused_plan defer-unconfigured "$policy"
+  grep -Fqx research_product=none "$work/focused-plan"
+  grep -Fqx jobs=,, "$work/focused-plan"
+  grep -Fqx research_pending_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+  grep -Fqx research_deferred_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+  grep -Fqx research_carry_policy=unconfigured "$work/focused-plan"
+  focused_plan defer-unconfigured "$policy" prediction-runner "$direct_jobs"
+  grep -Fqx research_product=prediction-runner "$work/focused-plan"
+  grep -Fqx "jobs=$direct_jobs" "$work/focused-plan"
+  grep -Fqx research_deferred_product=cex-runner,controller "$work/focused-plan"
+done
+config_jobs=,ploy/strategy-config-contracts,ploy/architecture-contracts,
+focused_plan defer-unconfigured '{}' none "$config_jobs"
+grep -Fqx research_product=none "$work/focused-plan"
+grep -Fqx "jobs=$config_jobs" "$work/focused-plan"
+focused_plan defer-unconfigured '{}' all "$direct_jobs"
+grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+grep -Fqx research_deferred_product=none "$work/focused-plan"
+# Any nonempty map restores the whole pending selection. It grants no product
+# permission, including when only one product or an unknown product is present.
+for policy in '{"oss_by_product":{"controller":{}}}' '{"oss_by_product":{"unknown":false}}'; do
+  focused_plan defer-unconfigured "$policy"
+  grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+  grep -Fqx research_deferred_product=none "$work/focused-plan"
+  grep -Fqx research_carry_policy=configured "$work/focused-plan"
+done
+for policy in 'broken json' '{} {}' 'null' '[]' ' ' '{"oss_by_product":false}' '{"oss_by_product":[]}' '{"oss_by_product":""}'; do
+  focused_plan defer-unconfigured "$policy"
+  grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+  grep -Fqx research_carry_policy=invalid "$work/focused-plan"
+done
+focused_plan always 'broken json'
+grep -Fqx research_carry_policy=unchecked "$work/focused-plan"
+grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+: >"$work/default-plan"
+env -u RESEARCH_CARRY_MODE MONDAY_RELEASE_POLICY_JSON='broken json' SELECTED_RESEARCH_PRODUCT=none SELECTED_JOBS=,, \
+  bash "$isolated/select-main-research-scope.sh" "$head" "$work/default-plan"
+grep -Fqx research_carry_policy=unchecked "$work/default-plan"
+grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/default-plan"
+cmp "$work/baselines-before" "$work/baselines"
+# A real unpublished source change remains pending while a later docs change
+# defers its build; repairing configuration restores it from the same baseline.
+jq -n --arg base "$base" '{"cex-runner":$base,"controller":$base,"prediction-runner":$base}' >"$work/baselines"
+focused_plan defer-unconfigured '{}'
+grep -Fqx research_pending_product=cex-runner "$work/focused-plan"
+grep -Fqx research_deferred_product=cex-runner "$work/focused-plan"
+focused_plan defer-unconfigured '{"oss_by_product":{"cex-runner":{}}}'
+grep -Fqx research_product=cex-runner "$work/focused-plan"
+touch "$work/baseline-failure"
+if focused_plan defer-unconfigured '{}'; then echo 'baseline failure hidden by deferral' >&2; exit 1; fi
+rm "$work/baseline-failure"
+printf '{}\n' >"$work/baselines"
+if focused_plan defer-unconfigured '{}'; then echo 'missing baseline hidden by deferral' >&2; exit 1; fi
+printf 'PASS: carry deferral preserves direct products/jobs, original baselines and conservative policy classification\n'
+[[ ${1:-} != --deferred-carry ]] || exit 0
 publisher "$base"
 plan
 grep -Fqx research_product=cex-runner "$work/plan"

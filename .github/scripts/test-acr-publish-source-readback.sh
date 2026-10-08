@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+[[ $# == 0 || ( $# == 1 && $1 == --deferred-carry ) ]] || exit 2
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -18,7 +19,7 @@ case "$endpoint" in
   */git/ref/heads/main) cat "$FAKE_ACR_STATE/main" ;;
   */check-runs\?*) cat "$FAKE_ACR_STATE/checks" ;;
   */workflows/ploy-ci.yml/runs\?*) cat "$FAKE_ACR_STATE/prediction" ;;
-  */runs/100/attempts/2/jobs\?*) cat "$FAKE_ACR_STATE/jobs" ;;
+  */runs/100/attempts/2/jobs\?*|*/runs/100/attempts/3/jobs\?*) cat "$FAKE_ACR_STATE/jobs" ;;
   */workflows/acr-publish.yml/runs\?*) cat "$FAKE_ACR_STATE/publishers" ;;
   */runs/80/attempts/3/jobs\?*|*/runs/300/attempts/3/jobs\?*) cat "$FAKE_ACR_STATE/prior-jobs" ;;
   */runs/100/artifacts\?*) cat "$FAKE_ACR_STATE/artifacts" ;;
@@ -58,6 +59,73 @@ reject() {
     printf 'unexpected admission: %s\n' "$1" >&2; exit 1
   fi
 }
+# Use the real reader and cumulative planner with a baseline fixture. Native
+# baseline authentication remains covered by test-main-research-scope.sh.
+scope_repo="$work/scope-repo"
+mkdir -p "$scope_repo/.github/scripts"
+for script in read-acr-publish-source.sh read-release-required-checks.sh select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json; do
+  cp "$script_dir/$script" "$scope_repo/.github/scripts/$script"
+done
+cat >"$scope_repo/.github/scripts/read-research-publish-baseline.sh" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ! -f $FAKE_ACR_STATE/baseline-failure ]] || exit 42
+cp "$FAKE_ACR_STATE/pending-base" "$2"
+MOCK
+git -C "$scope_repo" init -q
+git -C "$scope_repo" add .
+git -C "$scope_repo" -c user.name='CI contract' -c user.email=ci@example.invalid commit -qm 'scope fixture'
+original_source=$source_sha
+source_sha=$(git -C "$scope_repo" rev-parse HEAD)
+scope_reader="$scope_repo/.github/scripts/read-acr-publish-source.sh"
+printf '%s\n' '{"cex-runner":"BOOTSTRAP","controller":"BOOTSTRAP","prediction-runner":"BOOTSTRAP"}' >"$work/pending-base"
+cp "$work/pending-base" "$work/pending-before"
+for policy in '' '{"oss_by_product":{"controller":{}}}'; do
+  reset_fixtures
+  edit_fixture jobs '.[0].jobs |= map(.conclusion="skipped")'
+  printf '[{"artifacts":[]}]\n' >"$work/artifacts"
+  if (cd "$scope_repo" && RESEARCH_CARRY_MODE=defer-unconfigured MONDAY_RELEASE_POLICY_JSON="$policy" \
+      SELECTED_RESEARCH_PRODUCT=prediction-runner SELECTED_JOBS=,ploy/rust-runner-lean, \
+      bash "$scope_reader" "$source_sha" 200 "$work/out") >"$work/deferred-log" 2>&1; then
+    echo 'pending publication became a successful out-of-scope run' >&2; exit 1
+  fi
+  grep -Fq 'pending research products cex-runner,controller,prediction-runner' "$work/deferred-log"
+  if grep -Fq '/artifacts' "$work/calls"; then echo 'skipped producer attempted artifact reuse' >&2; exit 1; fi
+done
+cmp "$work/pending-before" "$work/pending-base"
+touch "$work/baseline-failure"
+if (cd "$scope_repo" && bash "$scope_reader" "$source_sha" 200 "$work/out") >"$work/rejected-baseline" 2>&1; then
+  echo 'pending baseline failure became out of scope' >&2; exit 1
+fi
+rm "$work/baseline-failure"
+printf '{}\n' >"$work/pending-base"
+if (cd "$scope_repo" && bash "$scope_reader" "$source_sha" 200 "$work/out") >"$work/rejected-baseline" 2>&1; then
+  echo 'missing pending baseline became out of scope' >&2; exit 1
+fi
+# A fully published source remains a genuine no-op.
+jq -n --arg source "$source_sha" '{"cex-runner":$source,"controller":$source,"prediction-runner":$source}' >"$work/pending-base"
+(cd "$scope_repo" && bash "$scope_reader" "$source_sha" 200 "$work/out")
+grep -Fqx automation_state=out_of_scope "$work/out"
+# Recovery can rerun all jobs of the same current-main push when its previous
+# attempt had no artifact. Authenticate the new attempt, never an old job.
+reset_fixtures
+edit_fixture prediction '.[0].workflow_runs[0].run_attempt=3'
+edit_fixture jobs '.[0].jobs |= map(.run_attempt=3)'
+(cd "$scope_repo" && bash "$scope_reader" "$source_sha" 200 "$work/out")
+grep -Fqx automation_state=ready "$work/out"
+grep -Fqx artifact_run_id=100 "$work/out"
+grep -Fq '/runs/100/attempts/3/jobs?' "$work/calls"
+# An explicit manual rebuild uses the publisher's own authenticated producer.
+"$script_dir/select-acr-publish-source.sh" --event workflow_dispatch --target prediction-research-runner \
+  --rebuild true --current-ref refs/heads/main --current-sha "$source_sha" --current-run-id 200 \
+  --main-sha "$source_sha" --monorepo-conclusion success --prediction-conclusion success \
+  --security-conclusion success --output "$work/manual-rebuild"
+grep -Fqx research_mode=rebuild "$work/manual-rebuild"
+grep -Fqx artifact_run_id=200 "$work/manual-rebuild"
+grep -Fqx published_products=prediction-runner "$work/manual-rebuild"
+source_sha=$original_source
+printf 'PASS: skipped research work retains pending publication failure and exact-source recovery paths\n'
+[[ ${1:-} != --deferred-carry ]] || exit 0
 reset_fixtures
 read_state ready
 grep -Fqx artifact_run_id=100 "$work/out"
@@ -104,9 +172,6 @@ reject latest-producer-failed
 reset_fixtures
 edit_fixture prediction '.[0].workflow_runs |= map(.head_repository.full_name="foreign/repo")'
 reject foreign-producer
-reset_fixtures
-edit_fixture jobs '.[0].jobs |= map(.conclusion="skipped")'
-read_state out_of_scope
 reset_fixtures
 edit_fixture jobs '.[0].jobs[1].conclusion="skipped"'
 reject partial-smoke

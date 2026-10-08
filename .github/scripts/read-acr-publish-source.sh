@@ -70,7 +70,20 @@ job_state() {
 binaries_conclusion=$(job_state 'Research image binaries')
 smoke_conclusion=$(job_state 'Research image smoke')
 case "$binaries_conclusion/$smoke_conclusion" in
-  skipped/skipped) finish out_of_scope ;;
+  skipped/skipped)
+    # CI may defer historical carry while public publisher settings are absent.
+    # Recompute real pending products, independent of that CI scheduling choice.
+    RESEARCH_CARRY_MODE=always SELECTED_JOBS=,, SELECTED_RESEARCH_PRODUCT=none \
+      bash "$script_dir/select-main-research-scope.sh" "$source_sha" "$work/pending"
+    pending_products=$(sed -n 's/^research_pending_product=//p' "$work/pending")
+    if [[ $pending_products != none ]]; then
+      pending_products=$(bash "$script_dir/research-release-products.sh" normalize "$pending_products")
+      printf 'ACR publication blocked: pending research products %s have no current-source binaries and smoke.\n' "$pending_products" >&2
+      printf 'After configuration is ready, use the next main push or an explicit research-target ACR rebuild. A current-main push run with no research artifact can rerun all CI jobs.\n' >&2
+      exit 1
+    fi
+    finish out_of_scope
+    ;;
   success/success) ;;
   *) echo 'exact-source research binaries and smoke must both succeed' >&2; exit 1 ;;
 esac
