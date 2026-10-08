@@ -202,6 +202,19 @@ mixed_scope=$(run_case strategy-mixed pull_request strategy-mixed.txt)
 assert_jobs "$mixed_scope" "$source_jobs,ploy/strategy-config-contracts"
 assert_flag "$mixed_scope" research_product "$(sed -n 's/^research_product=//p' "$source_scope")"
 
+# The installer contract is CI policy code and must have an executable owner.
+printf '%s\n' .github/workflows/test-install-ubuntu-packages.sh >"$tmp_dir/installer-contract.txt"
+for event in pull_request push; do
+  output=$(run_case "installer-contract-$event" "$event" installer-contract.txt)
+  expected='ci/ci-contracts,ploy/workflow-lint'
+  [[ $event != pull_request ]] || expected="$expected,ploy/commit-hygiene"
+  assert_jobs "$output" "$expected"
+  assert_owning_packages "$output" ''
+  assert_flag "$output" research_product none
+  assert_flag "$output" toolchain false
+  assert_flag "$output" selection_complete true
+done
+bash "$script_dir/../workflows/test-install-ubuntu-packages.sh"
 bash "$script_dir/test-strategy-config-contracts.sh"
 if [[ ${1:-} == --strategy-config ]]; then
   printf 'strategy configuration selector contracts passed\n'
