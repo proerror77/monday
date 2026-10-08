@@ -42,6 +42,18 @@ for id in data-pipelines prediction-markets research-core research-core--platfor
   [[ -f $profile/build/libduckdb-sys-native/out/native.o && -f $profile/deps/liblibduckdb_sys-hash.rlib ]]
   [[ ! -e $profile/deps/libhidden_local-hash.rlib && ! -e $profile/build/local-code-hash && ! -e $profile/deps/liblocal_code-hash.rlib && ! -e $profile/.fingerprint/local-code-hash && ! -e $profile/local-code ]]
 done
+# A local shared/vendor manifest outside the recipe roots changes cache identity
+# even when every owning Cargo.lock and recipe remains unchanged.
+mkdir -p "$work/repo/rust_hft/shared/cex-input" "$work/repo/vendor/local"
+printf 'default=[]\n' >"$work/repo/rust_hft/shared/cex-input/Cargo.toml"
+printf 'default=[]\n' >"$work/repo/vendor/local/Cargo.toml"
+git -C "$work/repo" init -q
+git -C "$work/repo" add rust_hft/shared/cex-input/Cargo.toml vendor/local/Cargo.toml
+before=$(bash "$work/repo/.github/scripts/research-cache-layout.sh" manifest-inputs)
+printf 'default=["native-feature"]\n' >"$work/repo/rust_hft/shared/cex-input/Cargo.toml"
+after=$(bash "$work/repo/.github/scripts/research-cache-layout.sh" manifest-inputs)
+[[ $before != "$after" ]]
+jq -e 'has("rust_hft/shared/cex-input/Cargo.toml") and has("vendor/local/Cargo.toml")' <<<"$after" >/dev/null
 # Refuse to traverse a cached symlink into another target or filesystem path.
 profile="$work/repo/rust_hft/target/research-core/x86_64-unknown-linux-gnu/release"
 rm -rf "$profile/deps"

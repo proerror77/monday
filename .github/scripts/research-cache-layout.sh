@@ -10,6 +10,15 @@ manifest_dir() {
   printf '%s\n' "${manifest%/Cargo.toml}"
 }
 case ${1:?command required} in
+  manifest-inputs)
+    # Include local path/patch/default-feature manifests beyond recipe roots.
+    result='{}'
+    while IFS= read -r -d '' manifest; do
+      digest=$(sha256sum "$root/$manifest" | awk '{print $1}')
+      result=$(jq -c --arg manifest "$manifest" --arg digest "$digest" '. + {($manifest):$digest}' <<<"$result")
+    done < <(git -C "$root" ls-files -z -- ':(glob)**/Cargo.toml' Cargo.toml)
+    jq -Se 'if length>0 then . else error("no tracked local manifests") end' <<<"$result"
+    ;;
   target-dir)
     directory=$(manifest_dir "${2:?manifest required}")
     printf '%s/rust_hft/target/%s\n' "$root" "${directory//\//--}"

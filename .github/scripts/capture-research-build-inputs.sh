@@ -52,6 +52,9 @@ while IFS= read -r manifest; do
   printf '%s\n' "$manifest" >>"$work/profiles"
   cat "$root/rust_hft/$manifest" >>"$work/profiles"
 done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
+# Native/dependency feature resolution can change via an excluded local
+# package manifest without any lockfile change. Bind those manifests too.
+bash "$root/.github/scripts/research-cache-layout.sh" manifest-inputs >>"$work/profiles"
 workspace_profiles='{}'
 while IFS= read -r manifest; do
   digest=$(sha256sum "$root/rust_hft/$manifest" | awk '{print $1}')
