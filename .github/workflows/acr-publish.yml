@@ -203,6 +203,7 @@ jobs:
             rust_hft
             rust_hft/prediction-markets
           key: research-release-linux-amd64-${{ steps.build-inputs.outputs.cache_sha256 }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build immutable research release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -355,7 +356,7 @@ jobs:
             ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ needs.selector.outputs.source_sha }}
             ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:run-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=acr-${{ matrix.repository }}
-          cache-to: type=gha,mode=max,scope=acr-${{ matrix.repository }}
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=min,scope=acr-{0}', matrix.repository) || '' }}
           # Alibaba ACR rejects BuildKit's OCI attestation referrer/config media
           # type; source/artifact identity remains bound by labels and outputs.
           provenance: false

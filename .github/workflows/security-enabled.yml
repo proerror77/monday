@@ -140,6 +140,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit
@@ -172,6 +173,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rust_hft
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check tracked secrets
         run: cargo test --manifest-path rust_hft/Cargo.toml -p hft-infra-secrets --test tracked_secrets_contract --locked -- --nocapture
@@ -249,6 +251,7 @@ jobs:
         with:
           workspaces: rust_hft
           shared-key: strict-alpha-research-ml-v1
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run research Clippy (strict)
         if: ${{ (needs.security-scope.outputs.clippy_loop == 'true') && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
@@ -349,7 +352,7 @@ jobs:
           labels: org.opencontainers.image.revision=${{ github.sha }}
           build-args: ${{ matrix.build_args }}
           cache-from: type=gha,scope=image-${{ matrix.name }}
-          cache-to: type=gha,scope=image-${{ matrix.name }},mode=max
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,scope=image-{0},mode=min', matrix.name) || '' }}
 
       - name: Scan with Trivy
         uses: aquasecurity/trivy-action@d2a0b60797ff03db6132bd4e2b293f9b37081297 # master resolved 2026-10-01

@@ -139,7 +139,7 @@ jobs:
           tags: monday-tested:hft-core-${{ needs.release-admission.outputs.source_sha }}
           labels: org.opencontainers.image.revision=${{ needs.release-admission.outputs.source_sha }}
           cache-from: type=gha,scope=image-hft-core
-          cache-to: type=gha,scope=image-hft-core,mode=max
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=image-hft-core,mode=min' || '' }}
 
       - name: Scan explicitly built release image
         if: steps.tested.outputs.build == 'true'
