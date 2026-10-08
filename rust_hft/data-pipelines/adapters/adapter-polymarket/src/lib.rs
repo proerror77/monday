@@ -486,6 +486,38 @@ impl PolymarketBook {
         asks.sort_by_key(|level| level.price);
         (bids, asks)
     }
+
+    // A newer snapshot can already include a queued older price change. Only
+    // discard that replay when its level and complete BBA exactly match the
+    // current healthy depth. Do not reconcile/prune the book to make it match.
+    fn repeats_current_level_and_bba(&self, entry: &PriceChangeBatchEntry) -> bool {
+        if !self.ready || self.dirty {
+            return false;
+        }
+        let Some(size) = entry.size else {
+            return false;
+        };
+        // Empty-side sentinels cannot prove a healthy replay. Require actual
+        // depth on both sides before comparing the provider's complete BBA.
+        let Some(((best_bid, _), (best_ask, _))) =
+            self.bids.last_key_value().zip(self.asks.first_key_value())
+        else {
+            return false;
+        };
+        if entry.best_bid != Some(*best_bid) || entry.best_ask != Some(*best_ask) {
+            return false;
+        }
+        let levels = match entry.side {
+            PolymarketSide::Buy => &self.bids,
+            PolymarketSide::Sell => &self.asks,
+            _ => return false,
+        };
+        levels
+            .get(&entry.price)
+            .copied()
+            .unwrap_or(rust_decimal::Decimal::ZERO)
+            == size
+    }
 }
 
 fn market_ws_url(endpoint: &str) -> HftResult<String> {
@@ -867,6 +899,11 @@ fn convert_message(
                     .get(&token)
                     .is_some_and(|last| timestamp_ms < *last)
                 {
+                    if book.repeats_current_level_and_bba(&entry) {
+                        // Preserve the snapshot watermark, sequence and hash;
+                        // emitting an update here would publish stale time.
+                        continue;
+                    }
                     return Err(HftError::Parse(format!(
                         "Polymarket price-change source time moved backwards for {token}"
                     )));
@@ -1680,6 +1717,239 @@ mod tests {
         assert!(!state.books["123"].is_dirty());
         assert!(state.books["123"].bids.is_empty());
         assert!(state.books["123"].asks.is_empty());
+    }
+
+    #[test]
+    fn captured_stale_replays_preserve_depth_watermark_sequence_and_seed_identity() {
+        let tokens = [
+            "19863482706273727548071429905247814367237447889397299454551225184125433521261",
+            "80039802053468158107683194369775138479717908465274509278065745327631424956954",
+        ];
+        let symbols = tokens
+            .iter()
+            .map(|token| (token.to_string(), Symbol::new(*token)))
+            .collect::<HashMap<_, _>>();
+        let mut state = BookState::default();
+        let snapshots = parse_messages(include_str!(
+            "../tests/fixtures/source-clock/snapshot.frame"
+        ))
+        .unwrap();
+        for snapshot in snapshots {
+            convert_message(snapshot, &symbols, &mut state).unwrap();
+        }
+        let before = state.books.clone();
+        let fixtures = [
+            include_str!("../tests/fixtures/source-clock/delta-106ms.frame"),
+            include_str!("../tests/fixtures/source-clock/delta-1ms-1.frame"),
+            include_str!("../tests/fixtures/source-clock/delta-1ms-2.frame"),
+            include_str!("../tests/fixtures/source-clock/delta-1ms-3.frame"),
+        ];
+        for wire in fixtures {
+            for message in parse_messages(wire).unwrap() {
+                assert!(convert_message(message, &symbols, &mut state)
+                    .unwrap()
+                    .is_empty());
+            }
+            for token in tokens {
+                let current = &state.books[token];
+                let seed = &before[token];
+                assert_eq!(state.timestamps[token], 1_790_779_051_836);
+                assert_eq!(state.sequences[token], 1);
+                assert_eq!(current.sequence, seed.sequence);
+                assert_eq!(current.bids, seed.bids);
+                assert_eq!(current.asks, seed.asks);
+                assert!(current.is_ready() && !current.is_dirty());
+                let identity = current.provider_identity.as_ref().unwrap();
+                let original = seed.provider_identity.as_ref().unwrap();
+                assert_eq!(identity.market, original.market);
+                assert_eq!(identity.book_hash, original.book_hash);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_replay_requires_every_level_and_complete_bba_to_match() {
+        let symbols = symbols();
+        let mut state = BookState::default();
+        let snapshot = parse_one(
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","hash":"seed","timestamp":"2000","bids":[{"price":"0.4","size":"2"}],"asks":[{"price":"0.6","size":"3"}]}"#,
+        );
+        convert_message(snapshot, &symbols, &mut state).unwrap();
+        let base = serde_json::json!({
+            "event_type": "price_change", "market": polymarket_client_sdk::types::B256::ZERO.to_string(),
+            "timestamp": "1000", "price_changes": [{"asset_id":"123", "price":"0.4",
+                "size":"2", "side":"BUY", "best_bid":"0.4", "best_ask":"0.6"}]
+        });
+        for variant in 0..8 {
+            let mut frame = base.clone();
+            match variant {
+                0 => frame["price_changes"][0]["size"] = serde_json::json!("3"),
+                1 => frame["price_changes"][0]["size"] = serde_json::json!("0"),
+                2 => frame["price_changes"][0]["best_bid"] = serde_json::json!("0.5"),
+                3 => {
+                    frame["price_changes"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("best_ask");
+                }
+                4 => frame["price_changes"][0]["best_ask"] = serde_json::json!("0.8"),
+                5 => frame["market"] = serde_json::json!(format!("0x{}", "1".repeat(64))),
+                6 => frame["price_changes"][0]["size"] = serde_json::json!("-1"),
+                _ => {
+                    let mut changed = frame["price_changes"][0].clone();
+                    changed["size"] = serde_json::json!("1");
+                    frame["price_changes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .insert(0, changed);
+                }
+            }
+            assert!(convert_message(parse_one(&frame.to_string()), &symbols, &mut state).is_err());
+            assert_eq!(state.timestamps["123"], 2_000);
+            assert_eq!(state.sequences["123"], 1);
+            assert_eq!(
+                state.books["123"].bids[&Decimal::new(4, 1)],
+                Decimal::new(2, 0)
+            );
+            assert!(state.books["123"].is_ready());
+            assert_eq!(
+                state.books["123"]
+                    .provider_identity
+                    .as_ref()
+                    .unwrap()
+                    .book_hash
+                    .as_deref(),
+                Some("seed")
+            );
+        }
+    }
+
+    #[test]
+    fn stale_replay_does_not_seed_dirty_or_new_generation_books() {
+        let symbols = symbols();
+        let mut state = BookState::default();
+        convert_message(parse_one(
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","timestamp":"2000","bids":[{"price":"0.4","size":"2"}],"asks":[{"price":"0.6","size":"3"}]}"#,
+        ), &symbols, &mut state).unwrap();
+        let wire = r#"{"event_type":"price_change","market":"$MARKET","timestamp":"1000","price_changes":[{"asset_id":"123","price":"0.4","size":"2","side":"BUY","best_bid":"0.4","best_ask":"0.6"}]}"#;
+        state.books.get_mut("123").unwrap().invalidate();
+        assert!(convert_message(parse_one(wire), &symbols, &mut state).is_err());
+        assert_eq!(state.timestamps["123"], 2_000);
+        assert!(state.books["123"].is_dirty());
+        state.reset();
+        assert!(matches!(
+            convert_message(parse_one(wire), &symbols, &mut state)
+                .unwrap()
+                .as_slice(),
+            [MarketEvent::Disconnect { .. }]
+        ));
+        assert!(state.books.is_empty());
+    }
+
+    #[test]
+    fn redundant_stale_token_does_not_block_a_fresh_token_in_the_same_frame() {
+        let symbols = multiple_symbols();
+        let mut state = BookState::default();
+        for (token, timestamp) in [("123", "2000"), ("456", "1000")] {
+            let wire = format!(
+                r#"{{"event_type":"book","asset_id":"{token}","market":"$MARKET","timestamp":"{timestamp}","bids":[{{"price":"0.4","size":"2"}}],"asks":[{{"price":"0.6","size":"3"}}]}}"#
+            );
+            convert_message(parse_one(&wire), &symbols, &mut state).unwrap();
+        }
+        let wire = r#"{"event_type":"price_change","market":"$MARKET","timestamp":"1500","price_changes":[{"asset_id":"123","price":"0.4","size":"2","side":"BUY","best_bid":"0.4","best_ask":"0.6"},{"asset_id":"456","price":"0.4","size":"4","side":"BUY","best_bid":"0.4","best_ask":"0.6"}]}"#;
+        let events = convert_message(parse_one(wire), &symbols, &mut state).unwrap();
+        assert!(
+            matches!(events.as_slice(), [MarketEvent::Update(update)] if update.symbol == Symbol::new("456"))
+        );
+        assert_eq!(state.timestamps["123"], 2_000);
+        assert_eq!(state.sequences["123"], 1);
+        assert_eq!(state.timestamps["456"], 1_500);
+        assert_eq!(state.sequences["456"], 2);
+    }
+
+    #[test]
+    fn unsafe_stale_token_keeps_the_whole_frame_unapplied() {
+        let symbols = multiple_symbols();
+        let mut state = BookState::default();
+        for (token, timestamp) in [("123", "2000"), ("456", "1000")] {
+            let wire = format!(
+                r#"{{"event_type":"book","asset_id":"{token}","market":"$MARKET","timestamp":"{timestamp}","bids":[{{"price":"0.4","size":"2"}}],"asks":[{{"price":"0.6","size":"3"}}]}}"#
+            );
+            convert_message(parse_one(&wire), &symbols, &mut state).unwrap();
+        }
+        let wire = r#"{"event_type":"price_change","market":"$MARKET","timestamp":"1500","price_changes":[{"asset_id":"456","price":"0.4","size":"4","side":"BUY","best_bid":"0.4","best_ask":"0.6"},{"asset_id":"123","price":"0.4","size":"4","side":"BUY","best_bid":"0.4","best_ask":"0.6"}]}"#;
+        assert!(convert_message(parse_one(wire), &symbols, &mut state).is_err());
+        assert_eq!(state.timestamps["456"], 1_000);
+        assert_eq!(state.sequences["456"], 1);
+        assert_eq!(
+            state.books["456"].bids[&Decimal::new(4, 1)],
+            Decimal::new(2, 0)
+        );
+        assert_eq!(state.timestamps["123"], 2_000);
+        assert_eq!(state.sequences["123"], 1);
+    }
+
+    #[test]
+    fn stale_replay_rejects_empty_book_sentinel_rollback() {
+        let symbols = symbols();
+        for (bids, asks, best_bid, best_ask) in [
+            ("[]", "[]", "0", "1"),
+            ("[]", r#"[{"price":"0.6","size":"3"}]"#, "0", "0.6"),
+            (r#"[{"price":"0.4","size":"2"}]"#, "[]", "0.4", "1"),
+        ] {
+            let mut state = BookState::default();
+            let snapshot = format!(
+                r#"{{"event_type":"book","asset_id":"123","market":"$MARKET","hash":"seed","timestamp":"2000","bids":{bids},"asks":{asks}}}"#
+            );
+            convert_message(parse_one(&snapshot), &symbols, &mut state).unwrap();
+            let before = state.books["123"].clone();
+            for side in ["BUY", "SELL"] {
+                let wire = format!(
+                    r#"{{"event_type":"price_change","market":"$MARKET","timestamp":"1000","price_changes":[{{"asset_id":"123","price":"0.5","size":"0","side":"{side}","best_bid":"{best_bid}","best_ask":"{best_ask}"}}]}}"#
+                );
+                let error = convert_message(parse_one(&wire), &symbols, &mut state)
+                    .expect_err("empty-side sentinels must not mask a source-clock rollback");
+                assert!(
+                    matches!(error, HftError::Parse(reason) if reason.contains("source time moved backwards"))
+                );
+                assert_eq!(state.timestamps["123"], 2_000);
+                assert_eq!(state.sequences["123"], 1);
+                let current = &state.books["123"];
+                assert_eq!(current.sequence, before.sequence);
+                assert_eq!(current.bids, before.bids);
+                assert_eq!(current.asks, before.asks);
+                assert_eq!(current.is_ready(), before.is_ready());
+                assert_eq!(current.is_dirty(), before.is_dirty());
+                assert_eq!(
+                    current.provider_identity.as_ref().unwrap().book_hash,
+                    before.provider_identity.as_ref().unwrap().book_hash
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_timestamp_redundant_delta_retains_normal_update_semantics() {
+        let symbols = symbols();
+        let mut state = BookState::default();
+        convert_message(parse_one(
+            r#"{"event_type":"book","asset_id":"123","market":"$MARKET","hash":"seed","timestamp":"2000","bids":[{"price":"0.4","size":"2"}],"asks":[{"price":"0.6","size":"3"}]}"#,
+        ), &symbols, &mut state).unwrap();
+        let wire = r#"{"event_type":"price_change","market":"$MARKET","timestamp":"2000","price_changes":[{"asset_id":"123","price":"0.4","size":"2","side":"BUY","best_bid":"0.4","best_ask":"0.6"}]}"#;
+        assert!(matches!(
+            convert_message(parse_one(wire), &symbols, &mut state)
+                .unwrap()
+                .as_slice(),
+            [MarketEvent::Update(_)]
+        ));
+        assert_eq!(state.timestamps["123"], 2_000);
+        assert_eq!(state.sequences["123"], 2);
+        assert!(state.books["123"]
+            .provider_identity
+            .as_ref()
+            .unwrap()
+            .book_hash
+            .is_none());
     }
 
     #[test]
