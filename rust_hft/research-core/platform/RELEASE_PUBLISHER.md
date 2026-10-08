@@ -82,7 +82,7 @@ The capability executable exchanges GitHub OIDC directly with RAM STS.
 It requests only exact source/Build prefixes from the authenticated native plan.
 CI no longer imports PG or requires a release Gateway/Broker endpoint.
 ACK uses separate read-only OSS credentials, pinned public trust and an independently signed host admission envelope. Its operator key must differ from every CI release key.
-It independently verifies completed GitHub producers and object bytes before immutable PG import.
+It independently verifies the signed original completed GitHub run/attempt/job and check IDs, plus object bytes, before immutable PG import. Historical releases need current separate signed admission; later main commits do not replace their original identities.
 
 The cheap `check-presence` receives only booleans. Native signer, policy,
 OIDC, exact-scope and authenticated OSS preflight remain mandatory before ACR login.

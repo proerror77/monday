@@ -70,7 +70,7 @@ This code does not claim single-use OIDC, immediate IAM revocation or immutable 
 The replacement boundary is complete release acceptance, rather than every storage write.
 The issuer rechecks current main, original required-check IDs and the active exact publisher before signing and after both signed objects have been uploaded and independently read back. A failed final check leaves evidence objects but fails publication; it cannot recall a signature already written.
 ACK requires that the complete publisher run and exact job finished successfully before importing.
-Cancelled, incomplete, failed, wrong-workflow or superseded attempts cannot import through this path.
+Cancelled, incomplete, failed or wrong-workflow original attempts cannot import through this path. A later successful rerun does not substitute for the signed original attempt.
 A residual object write provides no PG, scientific Run, promotion or trading authority.
 Reimport of the same exact valid release is idempotent in PG; a foreign proof/OCI/Build is rejected.
 This does not consume a scientific admission nonce or create another Run.
@@ -81,7 +81,7 @@ Actual IAM remains an independently approved deployment prerequisite:
 2. Bind immutable IDs where the available RAM conditions support them.
 3. Verify the actual subject customization and supported claims before enabling publication.
 4. The base CI role itself must restrict read/create to the exact preapproved native source/Build prefixes in the existing bucket. A broad `research/sources/*` or `research/builds/*` role with only caller-supplied inline Policy is insufficient.
-5. The public `role_prefixes` list must match those trusted base-role resources. Updating that per-release scope is a separately approved IAM operation, not performed by CI or this branch. The caller-supplied session Policy adds restriction; it is not the trusted scope boundary.
+5. The public `role_prefixes` list must match those trusted base-role resources. Updating that per-release scope is a separately approved IAM operation, not performed by CI or this branch. This initial model does not supply a low-interaction RSI publication loop: every new release needs independently approved scope or a separately reviewed trusted updater. An isolated fixed release namespace would be a different authorization model, requiring explicit parent approval and real overwrite/delete/negative tests; it is not implemented or treated as equivalent here. The caller-supplied session Policy adds restriction; it is not the trusted scope boundary.
 6. Deny delete, ACL changes, bucket mutations and overwrite-header bypass through the reviewed bucket/role policy.
 7. ACK gets separate read-only OSS permissions and the dedicated PG importer role.
 8. Promotion signing and scientific AttemptWriter credentials remain separate.
@@ -103,7 +103,7 @@ OSS ignores overwrite refusal when versioning is Enabled or Suspended.
 The adapter reads bucket versioning before each PUT and refuses those states.
 It also checks this before ACR publication. Do not suspend versioning as a workaround.
 If the existing bucket is versioned, this initial publisher remains blocked. This is a constraint of this adapter, not a claim that OSS cannot safely publish versioned evidence.
-Choosing another existing compliant bucket or a version-preserving backend needs a separate reviewed decision.
+Choosing another existing compliant bucket or a version-preserving backend needs a separate reviewed decision. A future version-preserving publisher must capture the exact PUT version ID, bind it to signed evidence and independently GET that version with digest/size verification. That backend is not implemented in this PR; never disable or suspend existing versioning to enable this adapter.
 A configuration change between versioning GET and PUT remains an IAM-controlled race.
 Bucket mutation must be unavailable to CI and controlled through independent operator policy.
 
@@ -141,8 +141,7 @@ The host must supply these separate inputs:
 The envelope has `schema:1`, `key_id`, `admission` and canonical lowercase `signature_hex`. Admission fields are `schema:1`, `expires_ms`, `build_sha256`, `image_sha256`, `publication_proof_sha256`, and `revoked`. Sign `SignedImportAdmission::signing_bytes()` using the separately controlled operator Ed25519 key; the importer has only its public key. A private 0600 file alone is not authority. Unsigned files, CI-key signatures, key reuse and tampering are rejected. This branch does not create or copy that operator private key.
 No wildcard or omitted selector is accepted. Expired or revoked approval fails before readback.
 The importer rereads and verifies this envelope after object/GitHub checks, immediately before PG registration. An attacker able to replace the trusted policy or restore an older signed, unexpired approval could still authorize replay: read-only independently owned mounts and approval lifecycle are mandatory deployment prerequisites, not proven here.
-It requires current main and the original authenticated required-check IDs.
-Later main commits require a new publication; historical exceptions are not implicit.
+Issuance requires current main before signing and after signed-object readback. Import instead reads the signed original successful run/attempt/job and each original authenticated check ID directly. Later main commits, newer checks or later attempts do not invalidate those immutable release identities. Historical import or rollback still needs a current independent signed admission for the exact Build/OCI/proof, a matching separately approved read-only OSS scope, valid public trust and complete readback. Missing/deleted/failed original GitHub records fail closed; no latest-check or unsigned fallback is accepted.
 Revocation that races after the final file read does not atomically revoke PG registration.
 For that stronger boundary, use the separate PG scientific admission/revocation transaction before any Run.
 Revoking storage publication does not remove previously imported Builds or invalidate existing Run grants automatically.

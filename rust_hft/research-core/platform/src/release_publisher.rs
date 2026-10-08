@@ -1472,6 +1472,52 @@ fn completed_producer(
     }
     Ok(())
 }
+// Issuance binds current main. Later import binds the signed original identities.
+fn recheck_import_authority(
+    mut read: impl FnMut(&str) -> Result<Value>,
+    proof: &PublicationProof,
+) -> Result<()> {
+    for (producer, publisher) in [(&proof.software_producer, false), (&proof.producer, true)] {
+        let run = read(&format!(
+            "actions/runs/{}/attempts/{}",
+            producer.run_id, producer.run_attempt
+        ))?;
+        let job = read(&format!("actions/jobs/{}", producer.job_id))?;
+        completed_producer(&run, &job, producer, publisher, &proof.image)?;
+    }
+    let names = [
+        "Monorepo CI gate",
+        "Prediction Markets CI gate",
+        "Security Summary Report",
+    ];
+    ensure!(
+        proof.required_check_ids.len() == names.len()
+            && proof
+                .required_check_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                == names.len(),
+        "original required check identities missing or duplicated"
+    );
+    for (id, name) in proof.required_check_ids.iter().zip(names) {
+        let check = read(&format!("check-runs/{id}"))?;
+        ensure!(
+            *id > 0
+                && check["id"] == *id
+                && check["name"] == name
+                && check["head_sha"] == proof.source.code_commit
+                && check["app"]["slug"] == "github-actions"
+                && check["app"]["id"] == 15368
+                && check["status"] == "completed"
+                && check["conclusion"] == "success",
+            "original authenticated release check rejected"
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn import_oss_build(
     root: &Path,
@@ -1518,45 +1564,10 @@ pub async fn import_oss_build(
                 == Some(repo.as_str())),
         "foreign import producer/workflow/image"
     );
-    let repo = &policy.trust.repository;
-    ensure!(
-        api(root, repo, "git/ref/heads/main", false)?["object"]["sha"] == proof.source.code_commit,
-        "ACK import source drifted from main"
-    );
-    for (producer, publisher) in [(&proof.software_producer, false), (&proof.producer, true)] {
-        let run = api(
-            root,
-            repo,
-            &format!("actions/runs/{}", producer.run_id),
-            false,
-        )?;
-        let job = api(
-            root,
-            repo,
-            &format!("actions/jobs/{}", producer.job_id),
-            false,
-        )?;
-        completed_producer(&run, &job, producer, publisher, &proof.image)?;
-    }
-    ensure!(
-        required_checks(
-            &api(
-                root,
-                repo,
-                &format!(
-                    "commits/{}/check-runs?filter=latest&per_page=100",
-                    proof.source.code_commit
-                ),
-                true
-            )?,
-            &proof.source.code_commit
-        )? == proof.required_check_ids,
-        "ACK import required checks changed"
-    );
-    ensure!(
-        api(root, repo, "git/ref/heads/main", false)?["object"]["sha"] == proof.source.code_commit,
-        "ACK import source changed during readback"
-    );
+    recheck_import_authority(
+        |path| api(root, &policy.trust.repository, path, false),
+        &proof,
+    )?;
     let admission = read_import_admission(admission_path, policy)?;
     admission.validate(
         build,
@@ -1746,6 +1757,109 @@ mod tests {
             }
             assert!(verify(&after).is_err()); // After signing/upload readbacks.
         }
+    }
+    #[test]
+    fn historical_import_binds_original_attempts_and_checks_after_main_or_latest_drift() {
+        let source = source();
+        let sha = &source.code_commit;
+        let producer = ReleaseProducer {
+            repository: "owner/repo".into(),
+            workflow_path: ".github/workflows/acr-publish.yml".into(),
+            source_sha: sha.clone(),
+            run_id: 10,
+            run_attempt: 2,
+            job_id: 30,
+        };
+        let software = ReleaseProducer {
+            workflow_path: ".github/workflows/ploy-ci.yml".into(),
+            run_id: 20,
+            run_attempt: 1,
+            job_id: 40,
+            ..producer.clone()
+        };
+        let mut proof = PublicationProof {
+            schema: 1,
+            source: source.clone(),
+            image: format!("registry/runner@sha256:{}", "b".repeat(64)),
+            producer,
+            software_producer: software,
+            required_check_ids: vec![1, 2, 3],
+            compilation_inputs: inputs(),
+            executables: vec![],
+            build_sha256: "a".repeat(64),
+        };
+        let run = |id, attempt, path: &str| json!({"id":id,"run_attempt":attempt,"head_sha":sha,"head_branch":"main","head_repository":{"full_name":"owner/repo"},"path":path,"event":"workflow_run","status":"completed","conclusion":"success"});
+        let mut original = BTreeMap::from([
+            (
+                "actions/runs/10/attempts/2".to_owned(),
+                run(10, 2, ".github/workflows/acr-publish.yml"),
+            ),
+            (
+                "actions/runs/20/attempts/1".into(),
+                run(20, 1, ".github/workflows/ploy-ci.yml"),
+            ),
+            (
+                "actions/jobs/30".into(),
+                json!({"id":30,"run_id":10,"run_attempt":2,"head_sha":sha,"status":"completed","conclusion":"success","name":"Publish runner"}),
+            ),
+            (
+                "actions/jobs/40".into(),
+                json!({"id":40,"run_id":20,"run_attempt":1,"head_sha":sha,"status":"completed","conclusion":"success","name":"Research image binaries"}),
+            ),
+            // Current main and latest attempts/checks have changed. They are not imported identities.
+            (
+                "git/ref/heads/main".into(),
+                json!({"object":{"sha":"f".repeat(40)}}),
+            ),
+            (
+                "actions/runs/10".into(),
+                run(10, 3, ".github/workflows/acr-publish.yml"),
+            ),
+            (
+                format!("commits/{sha}/check-runs?filter=latest&per_page=100"),
+                json!([{"check_runs":[]}]),
+            ),
+        ]);
+        for (i, name) in [
+            "Monorepo CI gate",
+            "Prediction Markets CI gate",
+            "Security Summary Report",
+        ]
+        .iter()
+        .enumerate()
+        {
+            original.insert(format!("check-runs/{}",i+1),json!({"id":i+1,"name":name,"head_sha":sha,"status":"completed","conclusion":"success","app":{"slug":"github-actions","id":15368}}));
+        }
+        let verify = |data: &BTreeMap<String, Value>, proof: &PublicationProof| {
+            recheck_import_authority(
+                |path| data.get(path).cloned().context("missing original identity"),
+                proof,
+            )
+        };
+        assert!(verify(&original, &proof).is_ok());
+        for (path, key, value) in [
+            (
+                "actions/runs/10/attempts/2",
+                "conclusion",
+                json!("cancelled"),
+            ),
+            ("actions/runs/10/attempts/2", "run_attempt", json!(3)),
+            ("actions/jobs/30", "status", json!("in_progress")),
+            ("check-runs/1", "head_sha", json!("f".repeat(40))),
+            ("check-runs/1", "id", json!(99)),
+            ("check-runs/1", "conclusion", json!("failure")),
+            ("check-runs/1", "name", json!("foreign gate")),
+            ("check-runs/1", "app", json!({"slug":"foreign","id":15368})),
+        ] {
+            let mut bad = original.clone();
+            bad.get_mut(path).unwrap()[key] = value;
+            assert!(verify(&bad, &proof).is_err());
+        }
+        let mut missing = original.clone();
+        missing.remove("check-runs/1");
+        assert!(verify(&missing, &proof).is_err());
+        proof.required_check_ids = vec![1, 1, 3];
+        assert!(verify(&original, &proof).is_err());
     }
     fn source() -> SourceArchive {
         SourceArchive {
