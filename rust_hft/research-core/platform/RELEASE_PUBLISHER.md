@@ -69,25 +69,22 @@ CI compiles the native issuer in a separate step before injecting release
 credentials. The wrapper only invokes that built binary. It does not expose
 private key/token files to Cargo or dependency build scripts.
 
-`import BUILD_SHA256 OCI_SHA256 PROOF_SHA256 PUBLIC_TRUST_FILE HTTPS_GATEWAY TOKEN_FILE` accepts no
-signing key. It reads the signed proof and artifact from the gateway, verifies
-operator trust and proof binding, and independently checks source/program bytes.
-It registers through the existing immutable PG transaction and reads back the
-resulting BuildArtifact. `MONDAY_RESEARCH_DATABASE_URL` must refer to the dedicated
-Build importer role; installing schema/roles remains an independent operation.
+ACK's sole registration CLI is `oss-import`; it requires a current independently signed approval and matching stable PG approval state in the immutable registration transaction. The obsolete Gateway release `import` command was removed because it did not independently check the original completed producers. Runtime Gateway/AttemptWriter remains. The dedicated importer PG role cannot write approvals; an independent operator projects signed approvals/revocations using `set-import-admission POLICY SIGNED_ADMISSION` and its separate existing PG identity. Installing the additive migration/roles remains a separately approved deployment operation.
 
 ACR research publication uses `MONDAY_RESEARCH_RELEASE_POLICY`, including its
 per-product `oss_by_product` configuration (projected to native `oss`), and the dedicated `MONDAY_RESEARCH_RELEASE_SIGNING_KEY`.
 The capability executable exchanges GitHub OIDC directly with RAM STS.
 It requests only exact source/Build prefixes from the authenticated native plan.
 CI no longer imports PG or requires a release Gateway/Broker endpoint.
-ACK uses separate read-only OSS credentials, pinned public trust and an independently signed host admission envelope. Its operator key must differ from every CI release key.
+ACK uses separate read-only OSS credentials, pinned public trust, an independently signed host admission envelope and its matching current PG state. The schema 2 independent approval signs a positive monotonic revision. PG rejects rollback or same-revision changes, including owner replay of older signed approvals; native registration explicitly calls the mandatory PG lock function so a missing migration fails closed. The stable selector row is locked through registration; restoring an old file cannot undo a completed revocation. Its operator key must differ from every CI release key.
 It independently verifies the signed original completed GitHub run/attempt/job and check IDs, plus object bytes, before immutable PG import. Historical releases need current separate signed admission; later main commits do not replace their original identities.
 
 The cheap `check-presence` receives only booleans. Native signer, policy,
 OIDC, exact-scope and authenticated OSS preflight remain mandatory before ACR login.
 Publication keys and STS files stay outside Cargo and retained Actions artifacts.
 No production credentials, permissions or services are created by this code.
+
+`scope-plan ROOT SOURCE SOFTWARE_RUN SOFTWARE_PRODUCTS PRODUCT POLICY` produces exact approval prefixes from the completed authenticated software and clean current-main source before a publisher or STS session exists. It grants nothing and needs no OCI digest; it shares the actual Build projection with issuance `plan`, whose active-publisher authentication remains mandatory.
 
 The OSS commands are `oss-check-config`, `oss-publish` and `oss-import`.
 Their actual argument forms are documented in the ACK/OSS contract above.

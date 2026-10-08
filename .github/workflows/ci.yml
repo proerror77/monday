@@ -531,6 +531,9 @@ jobs:
           docker exec "${{ job.services.postgres.id }}" psql -U fixture -d monday_foundation_test -v ON_ERROR_STOP=1 -c 'CREATE DATABASE monday_foundation_build_import_test'
           MONDAY_TEST_DATABASE_URL="${MONDAY_TEST_DATABASE_URL%/monday_foundation_test}/monday_foundation_build_import_test" \
             "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --test build_import signed_release_requires_actual_blob_and_only_strong_import_reaches_pg --locked -- --ignored
+          docker exec "${{ job.services.postgres.id }}" psql -U fixture -d monday_foundation_test -v ON_ERROR_STOP=1 -c 'CREATE DATABASE monday_foundation_build_admission_test'
+          MONDAY_TEST_DATABASE_URL="${MONDAY_TEST_DATABASE_URL%/monday_foundation_test}/monday_foundation_build_admission_test" \
+            "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-research-platform --features control,gateway,publisher --test build_import independent_pg_admission_orders_revocation_and_rejects_replay_and_sql_bypass --locked -- --ignored
       - name: Validate packaged CH SQL against the fixture server
         run: bash .github/scripts/test-clickhouse-preparation.sh
       - name: Validate raw protocol, standard Parquet and durable CH/PG import
