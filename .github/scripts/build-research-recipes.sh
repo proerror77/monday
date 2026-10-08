@@ -25,13 +25,14 @@ while IFS= read -r recipe; do
   [[ -z $features ]] || args+=(--features "$features")
   while IFS= read -r binary; do args+=(--bin "$binary"); done < <(jq -r '.binaries[]' <<<"$recipe")
   start=$(date +%s)
-  cargo "${args[@]}" --message-format json-render-diagnostics >"$work/$phase-$package.jsonl"
+  recipe_target=$(bash "$root/.github/scripts/research-cache-layout.sh" target-dir "$(jq -r .manifest <<<"$recipe")")
+  CARGO_TARGET_DIR="$recipe_target" cargo "${args[@]}" --message-format json-render-diagnostics >"$work/$phase-$package.jsonl"
   jq -es 'any(.[]; .reason=="compiler-artifact") and any(.[]; .reason=="build-finished" and .success==true)' \
     "$work/$phase-$package.jsonl" >/dev/null
   seconds=$(( $(date +%s) - start ))
   jq -s -c --arg cache_match "$cache_match" --arg phase "$phase" --arg source "$source_sha" --arg inputs "$inputs_sha" \
-    --argjson recipe "$recipe" --argjson seconds "$seconds" \
-    '{phase:$phase,cache_exact_match:$cache_match,source_sha:$source,compilation_inputs_sha256:$inputs,recipe:$recipe,seconds:$seconds,
+    --arg recipe_target "$recipe_target" --argjson recipe "$recipe" --argjson seconds "$seconds" \
+    '{phase:$phase,recipe_target:$recipe_target,cache_exact_match:$cache_match,source_sha:$source,compilation_inputs_sha256:$inputs,recipe:$recipe,seconds:$seconds,
       compiler_artifacts:([.[]|select(.reason=="compiler-artifact")]|length),
       fresh:([.[]|select(.reason=="compiler-artifact" and .fresh==true)]|length),
       rebuilt:([.[]|select(.reason=="compiler-artifact" and .fresh==false)]|length)}' \

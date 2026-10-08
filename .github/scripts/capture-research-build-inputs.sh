@@ -61,6 +61,7 @@ recipes=$(bash "$root/.github/scripts/research-release-products.sh" recipes "${2
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
 cat "$root/.github/scripts/build-research-release.sh" \
   "$root/.github/scripts/build-research-recipes.sh" \
+  "$root/.github/scripts/research-cache-layout.sh" \
   "$root/.github/scripts/research-release-products.sh" \
   "$root/.github/scripts/research-release-products.json" \
   "$root/.github/scripts/research-release-source-sha.sh" \

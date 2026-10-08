@@ -83,7 +83,7 @@ bash "$root/.github/scripts/test-research-product-image.sh"
 # binaries. Only the target recorded by compiler inputs may reach the archive.
 fixture="$work/producer"
 mkdir -p "$fixture/.github/scripts" "$fixture/rust_hft" "$fixture/bin" "$fixture/output"
-for script in build-research-release.sh build-research-recipes.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
+for script in research-cache-layout.sh build-research-release.sh build-research-recipes.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
   cp "$root/.github/scripts/$script" "$fixture/.github/scripts/$script"
 done
 cp "$root/rust_hft/workspaces.json" "$fixture/rust_hft/workspaces.json"
