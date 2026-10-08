@@ -3,7 +3,7 @@
 set -euo pipefail
 
 case ${1:-} in
-  ''|--strategy-config) ;;
+  ''|--strategy-config|--production-scope) ;;
   *) printf 'unknown test scope: %s\n' "$1" >&2; exit 2 ;;
 esac
 
@@ -115,6 +115,99 @@ assert_security_jobs() {
     exit 1
   }
 }
+
+# Keep test consumers while separating their release impact. The fixture includes
+# formula's real dev edge and synthetic dev consumers for every image selector.
+production_metadata="$fixtures/production-dependencies.fixture"
+printf '%s\n' rust_hft/selector-fixtures/test-input/src/lib.rs >"$tmp_dir/dev-input.txt"
+printf '%s\n' rust_hft/strategy-framework/strategies/formula/src/lib.rs >"$tmp_dir/formula-input.txt"
+printf '%s\n' rust_hft/alpha-harness/engine/src/lib.rs >"$tmp_dir/engine-input.txt"
+for event in pull_request push; do
+  dev_scope=$(run_case "dev-only-$event" "$event" dev-input.txt "$production_metadata")
+  for flag in loop handoff collector control toolchain; do assert_flag "$dev_scope" "$flag" true; done
+  assert_owning_packages "$dev_scope" hft-ci-test-input
+  assert_flag "$dev_scope" research_product none
+  assert_flag "$dev_scope" production_trading_image false
+  assert_flag "$dev_scope" production_collector_image false
+  grep -Fqx 'loop_packages=,alpha-engine,alpha-harness,hft-cex-research-worker,' "$dev_scope"
+  grep -Eq '^jobs=.*,(ci/rust),' "$dev_scope"
+  grep -Eq '^jobs=.*,(ci/control-contracts),' "$dev_scope"
+  grep -Eq '^jobs=.*,(ci/deployment-artifacts),' "$dev_scope"
+  grep -Eq '^jobs=.*,(ploy/rust-research-heavy),' "$dev_scope"
+  sed -n 's/^image_matrix=//p' "$dev_scope" | jq -e '.include == []' >/dev/null
+  if grep -Eq '^jobs=.*,(ploy/research-image-(binaries|smoke)|ci/polymarket-evidence-compiler-image),' "$dev_scope"; then
+    echo 'test-only consumers selected release compilation' >&2; exit 1
+  fi
+
+  formula_scope=$(run_case "formula-$event" "$event" formula-input.txt "$production_metadata")
+  assert_owning_packages "$formula_scope" hft-strategy-formula
+  assert_flag "$formula_scope" loop true
+  assert_flag "$formula_scope" research_product none
+  assert_flag "$formula_scope" production_trading_image true
+  grep -Fqx 'loop_packages=,alpha-engine,alpha-harness,hft-cex-research-worker,' "$formula_scope"
+  sed -n 's/^image_matrix=//p' "$formula_scope" | jq -e 'any(.include[]; .name == "deploy-paper")' >/dev/null
+
+  # Normal, build, omitted and unfamiliar kinds cannot suppress releases.
+  # Optional and target-specific edges also remain conservative.
+  for kind in normal build missing opaque parallel optional-target; do
+    jq --arg kind "$kind" '
+      .packages[].dependencies |= if $kind == "parallel" then
+        . + [.[] | select(.name == "hft-ci-test-input") | .kind = null]
+      else map(if .name != "hft-ci-test-input" then .
+        elif $kind == "missing" then del(.kind)
+        elif $kind == "normal" then .kind = null
+        elif $kind == "optional-target" then .kind = null | .optional = true | .target = "cfg(windows)"
+        else .kind = $kind end)
+      end' "$production_metadata" >"$tmp_dir/$kind.metadata"
+    release_scope=$(run_case "release-$kind-$event" "$event" dev-input.txt "$tmp_dir/$kind.metadata")
+    assert_flag "$release_scope" research_product cex-runner,controller,prediction-runner
+    assert_flag "$release_scope" production_trading_image true
+    assert_flag "$release_scope" production_collector_image true
+    grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$release_scope"
+    grep -Eq '^jobs=.*,(ci/polymarket-evidence-compiler-image),' "$release_scope"
+    sed -n 's/^image_matrix=//p' "$release_scope" | jq -e 'any(.include[]; .name == "deploy-collector")' >/dev/null
+  done
+
+  engine_scope=$(run_case "engine-$event" "$event" engine-input.txt "$production_metadata")
+  assert_flag "$engine_scope" research_product cex-runner,controller
+  cat "$tmp_dir/engine-input.txt" >"$tmp_dir/engine-config.txt"
+  printf '%s\n' rust_hft/prediction-markets/config/strategies/new-parameters.toml >>"$tmp_dir/engine-config.txt"
+  mixed_scope=$(run_case "engine-config-$event" "$event" engine-config.txt "$production_metadata")
+  assert_flag "$mixed_scope" research_product cex-runner,controller
+  assert_flag "$mixed_scope" loop true
+  grep -Eq '^jobs=.*,(ploy/strategy-config-contracts),' "$mixed_scope"
+  if [[ $event == push ]]; then
+    grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$mixed_scope"
+    grep -Eq '^jobs=.*,(ploy/research-image-smoke),' "$mixed_scope"
+  fi
+
+  # Explicit source, image and host-control rules still override graph narrowing.
+  for path in rust_hft/docker/Dockerfile rust_hft/deployment/docker/Dockerfile.trading \
+    rust_hft/deployment/docker/Dockerfile.research rust_hft/.dockerignore \
+    rust_hft/scripts/deploy-ecs-tools-collector.sh Makefile; do
+    cat "$tmp_dir/dev-input.txt" >"$tmp_dir/explicit-image.txt"
+    printf '%s\n' "$path" >>"$tmp_dir/explicit-image.txt"
+    explicit_scope=$(run_case "explicit-$event" "$event" explicit-image.txt "$production_metadata")
+    case "$path" in
+      rust_hft/docker/Dockerfile)
+        sed -n 's/^image_matrix=//p' "$explicit_scope" | jq -e 'any(.include[]; .name == "hft-core")' >/dev/null ;;
+      rust_hft/deployment/docker/Dockerfile.trading)
+        assert_flag "$explicit_scope" production_trading_image true ;;
+      rust_hft/deployment/docker/Dockerfile.research)
+        assert_flag "$explicit_scope" research_product cex-runner
+        grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$explicit_scope" ;;
+      *) assert_flag "$explicit_scope" production_collector_image true ;;
+    esac
+  done
+done
+manual_scope=$(run_case production-manual workflow_dispatch dev-input.txt "$production_metadata")
+assert_flag "$manual_scope" research_product cex-runner,controller,prediction-runner
+assert_flag "$manual_scope" production_trading_image true
+assert_flag "$manual_scope" production_collector_image true
+if [[ ${1:-} == --production-scope ]]; then
+  printf 'production dependency scope contracts passed\n'
+  exit 0
+fi
 
 job_cases=(
   'collector|pull_request|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
@@ -368,6 +461,15 @@ grep -Fqx research_product=cex-runner,prediction-runner "$domain_scope"
 # The separate Prediction operator publishes its own domain. Shared cluster IO
 # reaches both the operator and CEX consumers through their real dependencies.
 "$script_dir/../../rust_hft/scripts/workspace-metadata.sh" >"$tmp_dir/operator-metadata.fixture"
+jq -e '.packages[] | select(.name == "alpha-engine") | any(.dependencies[]; .name == "hft-strategy-formula" and .kind == "dev")' "$tmp_dir/operator-metadata.fixture" >/dev/null
+for event in pull_request push; do
+  native_formula=$(run_case "native-formula-$event" "$event" formula-input.txt "$tmp_dir/operator-metadata.fixture")
+  assert_flag "$native_formula" research_product none
+  assert_flag "$native_formula" loop true
+  assert_flag "$native_formula" production_trading_image true
+  grep -Eq '^loop_packages=.*[,](alpha-engine),' "$native_formula"
+  assert_owning_packages "$native_formula" hft-strategy-formula
+done
 printf '%s\n' rust_hft/prediction-markets/crates/research-operator/src/dispatch.rs >"$tmp_dir/operator-image.txt"
 operator_scope=$(run_case prediction-operator push operator-image.txt "$tmp_dir/operator-metadata.fixture")
 grep -Fqx research_product=prediction-runner "$operator_scope"
