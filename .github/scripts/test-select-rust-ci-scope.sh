@@ -32,6 +32,8 @@ printf '%s\n' package-lock.json >"$tmp_dir/root-node.txt"
 printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
 printf '%s\n' .github/scripts/run-collector-control-contracts.sh >"$tmp_dir/control-scheduling.txt"
+printf '%s\n' .github/scripts/ci-owner-cache.sh >"$tmp_dir/ci-owner-cache.txt"
+printf '%s\n' .github/scripts/test-ci-owner-cache.sh >"$tmp_dir/ci-owner-cache-test.txt"
 printf '%s\n' .github/scripts/test-collector-control-scheduling.sh >"$tmp_dir/control-scheduling-test.txt"
 printf '%s\n' .github/scripts/run-collector-control-contracts.py .github/scripts/test-collector-control-scheduling.py >"$tmp_dir/control-scheduling-deletions.txt"
 printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
@@ -230,6 +232,8 @@ job_cases=(
   'security-workflow|pull_request|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'security-workflow-push|push|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
   'control-scheduling|pull_request|control-scheduling.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
+  'ci-owner-cache|pull_request|ci-owner-cache.txt|ci/rust,ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans,ci/deployment-artifacts'
+  'ci-owner-cache-test|pull_request|ci-owner-cache-test.txt|ci/ci-contracts,ploy/workflow-lint'
   'control-scheduling-test|pull_request|control-scheduling-test.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'control-scheduling-deletions|pull_request|control-scheduling-deletions.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'
@@ -792,7 +796,10 @@ grep -Fq 'Python runtime or package-manager command' <<<"$fast_gates_block"
 
 # Each heavy Rust job saves Swatinem/rust-cache only from main.
 grep -Fq 'uses: Swatinem/rust-cache@' <<<"$rust_job_block"
-grep -Fq "save-if: \${{ github.ref == 'refs/heads/main' }}" <<<"$rust_job_block"
+grep -Fq 'save-if: false' <<<"$rust_job_block"
+grep -Fq "if: \${{ github.ref == 'refs/heads/main' && success() && needs.scope.outputs.toolchain == 'true' }}" <<<"$rust_job_block"
+grep -Fq 'Save trusted workspace dependency cache' <<<"$rust_job_block"
+grep -Fq 'save-if: true' <<<"$rust_job_block"
 fast_lane_block=$(job_block rust_hft_engine_fast_lane)
 grep -Fq 'uses: Swatinem/rust-cache@' <<<"$fast_lane_block"
 grep -Fq "save-if: \${{ github.ref == 'refs/heads/main' }}" <<<"$fast_lane_block"
@@ -826,7 +833,7 @@ recorder_block=$(job_block market_recorder_contract)
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fq 'key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}' <<<"$rust_job_block"
+grep -Fq 'key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}' <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"

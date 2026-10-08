@@ -3,6 +3,10 @@
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 command=${1:?Cargo subcommand required}; shift
+layout=${MONDAY_CARGO_TARGET_LAYOUT:-default}
+[[ $layout == default || $layout == owning-workspace-v1 ]] || {
+  echo 'unsupported scoped Cargo target layout' >&2; exit 2;
+}
 case "$command" in build|check|test|clippy|fmt) ;; *) echo 'unsupported scoped Cargo subcommand' >&2; exit 2 ;; esac
 packages=() args=() features=false targets=false
 while (($#)); do
@@ -40,6 +44,14 @@ while IFS= read -r plan; do
   if [[ ${MONDAY_CARGO_DRY_RUN:-0} == 1 ]]; then
     jq -cn --args '$ARGS.positional' -- cargo "$command" --manifest-path "$root/$manifest" "${owned[@]}" "${args[@]}"
   else
-    cargo "$command" --manifest-path "$root/$manifest" "${owned[@]}" "${args[@]}"
+    if [[ $layout == owning-workspace-v1 ]]; then
+      # The collector contract also builds directly into the root target.
+      # Other owners use disjoint directories, with one cache cleaner each.
+      target="$root/${manifest%/Cargo.toml}/target"
+      [[ $manifest != data-pipelines/Cargo.toml ]] || target="$root/target"
+      CARGO_TARGET_DIR="$target" cargo "$command" --manifest-path "$root/$manifest" "${owned[@]}" "${args[@]}"
+    else
+      cargo "$command" --manifest-path "$root/$manifest" "${owned[@]}" "${args[@]}"
+    fi
   fi
 done < <(jq -c '.[]' <<<"$plans")
