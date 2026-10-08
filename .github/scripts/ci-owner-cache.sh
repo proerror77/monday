@@ -55,13 +55,13 @@ targets.each do |target|
   end
   Dir.children(profile).each do |name|
     path = "#{profile}/#{name}"
-    FileUtils.rm_rf(path) unless %w[build .fingerprint deps].include?(name)
+    FileUtils.rm_r(path) unless %w[build .fingerprint deps].include?(name)
   end
   %w[build .fingerprint deps].each do |kind|
     path = "#{profile}/#{kind}"
     next unless File.directory?(path)
     Dir.children(path).each do |name|
-      FileUtils.rm_rf("#{path}/#{name}") if names.any? { |local| name.start_with?("#{local}-") }
+      FileUtils.rm_r("#{path}/#{name}") if names.any? { |local| name.start_with?("#{local}-") }
     end
   end
 end
