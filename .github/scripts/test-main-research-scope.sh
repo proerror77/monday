@@ -11,6 +11,9 @@ cat >"$work/bin/gh" <<'MOCK'
 set -euo pipefail
 case "${!#}" in
   */workflows/acr-publish.yml/runs\?*) cat "$RESEARCH_SCOPE_FIXTURE/runs" ;;
+  */workflows/release.yml/runs\?*)
+    if [[ -f $RESEARCH_SCOPE_FIXTURE/releases ]]; then cat "$RESEARCH_SCOPE_FIXTURE/releases";
+    else printf '[{"total_count":0,"workflow_runs":[]}]\n'; fi ;;
   */runs/100/attempts/2/jobs\?*) cat "$RESEARCH_SCOPE_FIXTURE/pair" ;;
   */runs/200/attempts/2/jobs\?*) cat "$RESEARCH_SCOPE_FIXTURE/controller" ;;
   */runs/300/attempts/2/jobs\?*) cat "$RESEARCH_SCOPE_FIXTURE/cex" ;;
@@ -51,6 +54,15 @@ grep -Fq ',ploy/research-image-binaries,ploy/research-image-smoke,' "$work/plan"
 publisher "$head"
 plan
 grep -Fqx research_product=none "$work/plan"
+# An automatic reusable ACR publication advances the same product baselines.
+jq '.[0].workflow_runs[0].path=".github/workflows/release.yml" | .[0].workflow_runs[0].conclusion="failure"' "$work/runs" >"$work/releases"
+printf '[{"total_count":0,"workflow_runs":[]}]\n' >"$work/runs"
+jq '.[0].jobs[0].name="Publish ACR / "+.[0].jobs[0].name' "$work/pair" >"$work/edit"
+mv "$work/edit" "$work/pair"
+plan
+grep -Fqx research_product=none "$work/plan"
+rm "$work/releases"
+publisher "$head"
 # A controller publication advances its own baseline, without losing runner
 # changes or rebuilding that controller forever on later documentation commits.
 pair_head=$head
