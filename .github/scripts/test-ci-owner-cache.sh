@@ -125,6 +125,7 @@ save_index = steps.index { |s| s['name'] == 'Save trusted workspace dependency c
 save = steps.fetch(save_index)
 abort 'early action can save local bytes' unless restore.dig('with', 'save-if') == false
 abort 'cache save precedes cleanup' unless cleanup_index < save_index
+abort 'real cleanup is not validated on PRs' unless steps.fetch(cleanup_index).fetch('if') == "${{ success() && needs.scope.outputs.toolchain == 'true' }}"
 abort 'save is not success/main bound' unless save.fetch('if').include?("github.ref == 'refs/heads/main' && success()")
 abort 'restore/save key or owner drift' unless %w[key workspaces].all? { |k| restore.dig('with', k) == save.dig('with', k) }
 pairs = restore.dig('with', 'workspaces').lines.map { |line| line.strip.split(' -> ') }

@@ -593,7 +593,7 @@ jobs:
           retention-days: 7
 
       - name: Retain only external dependencies for trusted workspace cache saves
-        if: ${{ github.ref == 'refs/heads/main' && success() && needs.scope.outputs.toolchain == 'true' }}
+        if: ${{ success() && needs.scope.outputs.toolchain == 'true' }}
         run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" cleanup
 
       - name: Save trusted workspace dependency cache
