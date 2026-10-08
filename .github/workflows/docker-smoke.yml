@@ -53,4 +53,4 @@ jobs:
           sbom: false
           build-args: ${{ matrix.build_args }}
           cache-from: type=gha,scope=image-${{ matrix.name }}
-          cache-to: type=gha,scope=image-${{ matrix.name }},mode=max
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,scope=image-{0},mode=min', matrix.name) || '' }}

@@ -22,6 +22,9 @@ cat >"$work/bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 endpoint=${!#}
+for argument in "$@"; do
+  if [[ $argument == --slurp ]]; then echo 'old gh rejects unsupported --slurp' >&2; exit 1; fi
+done
 mode=${MOCK_MODE:-ok}
 sha=1111111111111111111111111111111111111111
 case "$endpoint" in
@@ -33,11 +36,13 @@ case "$endpoint" in
     if [[ $mode == wrong-source ]]; then sha=2222222222222222222222222222222222222222; fi
     jq -n --arg sha "$sha" --arg path "$path" --argjson attempt "$attempt" '{id:1234,head_sha:$sha,head_branch:"main",head_repository:{full_name:"fixture/monday"},path:$path,event:"push",status:"completed",conclusion:"success",run_attempt:$attempt}' ;;
   */attempts/2/jobs\?*)
+    if [[ $mode == malformed-pages ]]; then printf '%s\n' '{"jobs":[]}' '{bad-json}'; exit 0; fi
+    if [[ $mode == failed-pages ]]; then printf '%s\n' '{"jobs":[]}'; exit 1; fi
     conclusion=success; if [[ $mode == failed-job ]]; then conclusion=failure; fi
-    jq -n --arg conclusion "$conclusion" '[{jobs:[{id:567,name:"Research image binaries",run_id:1234,run_attempt:2,status:"completed",conclusion:$conclusion}]}]' ;;
+    jq -n --arg conclusion "$conclusion" '{jobs:[]},{jobs:[{id:567,name:"Research image binaries",run_id:1234,run_attempt:2,status:"completed",conclusion:$conclusion}]}' ;;
   */runs/1234/artifacts\?*)
     expired=false; if [[ $mode == expired ]]; then expired=true; fi
-    jq -n --arg sha "$sha" --argjson expired "$expired" '[{artifacts:[{id:987,name:("research-image-release-"+$sha+"-cex-runner,controller,prediction-runner"),expired:$expired,workflow_run:{id:1234,head_sha:$sha},size_in_bytes:4096}]}]' ;;
+    jq -n --arg sha "$sha" --argjson expired "$expired" '{artifacts:[]},{artifacts:[{id:987,name:("research-image-release-"+$sha+"-cex-runner,controller,prediction-runner"),expired:$expired,workflow_run:{id:1234,head_sha:$sha},size_in_bytes:4096}]}' ;;
   */artifacts/987/zip) cat "$MOCK_WORK/release.zip" ;;
   */jobs/567) printf '%s\n' '{run_id:1234,run_attempt:2,status:"completed",conclusion:"success"}' | jq -R 'fromjson' ;;
   *) echo 'unexpected mock API endpoint' >&2; exit 1 ;;
@@ -49,7 +54,7 @@ chmod 0755 "$work/bin/gh"
 export PATH="$work/bin:$PATH"
 "$root/.github/scripts/download-research-release.sh" 1234 "$source_sha" "$work/verified"
 cmp "$work/release/research-bin/hft-backtest" "$work/verified/research-bin/hft-backtest"
-for mode in wrong-workflow wrong-source failed-job expired rerun extra digest attempt; do
+for mode in wrong-workflow wrong-source failed-job expired rerun extra digest attempt malformed-pages failed-pages; do
   export MOCK_MODE=$mode
   rm -f "$work/count"
   cp "$work/clean.zip" "$work/release.zip"

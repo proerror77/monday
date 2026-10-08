@@ -1,5 +1,10 @@
 # Per-job release capabilities
 
+Ordinary CI now uses `oss-source` and `oss-publish` through RAM OIDC/STS.
+See [the OSS authorization contract](../../../deployment/aliyun/research/foundation/RELEASE_OSS.md).
+The remainder describes the retained legacy release Broker integration.
+It is not an ordinary CI deployment prerequisite.
+
 The CI publisher exchanges GitHub job identity through a trusted operator broker.
 It never creates a token or expands gateway authority itself.
 No broker is provisioned by this change. An absent broker blocks publication.

@@ -13,7 +13,8 @@ use data::binance_market_tape_artifact::{
 };
 use futures::{SinkExt, StreamExt};
 use hft_collector::lob_archiver::{
-    checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
+    bounded_log_error, checkpoint_event, command_status_with_timeout, files_with_suffix,
+    read_upload_status,
     recover_parts_from_paths, segment_partition, send_or_shutdown, sha256_file, write_health,
     write_success_marker, write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget,
     QueueHealth, Segment, SegmentArtifacts, SegmentConfig, SendOutcome, SequenceGap, UploadStatus,
@@ -1262,12 +1263,16 @@ fn publish_global_shutdown(shutdown: &watch::Sender<bool>, watchdog: &ProcessWat
     true
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    init_tracing();
     let args = Args::parse();
     if let Some(path) = &args.audit_archive_index {
         let report = hft_collector::archive_continuity::audit_archive_index(path)?;
@@ -1317,7 +1322,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(None) => backoff = 1,
             Err(error) => {
-                error!(error = %error, backoff, "session failed; reconnecting");
+                error!(error = %bounded_log_error(&error), backoff, "session failed; reconnecting");
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(30);
             }
@@ -2306,7 +2311,10 @@ async fn run_session(
             }
             changed = catalog_updates.changed(), if config.dynamic_symbols => {
                 if changed.is_err() {
-                    failure = Some(anyhow::anyhow!("catalog refresh worker stopped"));
+                    failure = Some(SessionFailure::new(
+                        anyhow::anyhow!("catalog refresh worker stopped"),
+                        "catalog_refresh",
+                    ));
                     break;
                 }
                 if let Some(catalog) = catalog_updates.borrow_and_update().clone() {
@@ -2327,7 +2335,7 @@ async fn run_session(
                         ) {
                             Ok(action) => pending_action = action,
                             Err(error) => {
-                                failure = Some(error);
+                                failure = Some(SessionFailure::new(error, "process_event"));
                                 break;
                             }
                         }
@@ -2336,15 +2344,18 @@ async fn run_session(
                     }
                     Some(Ok(Ok(TaskExit::Stopped(None)))) if *session_stop_rx.borrow() => {},
                     Some(Ok(Ok(TaskExit::Stopped(None)))) => {
-                        failure = Some(anyhow::anyhow!("producer stopped unexpectedly"));
+                        failure = Some(SessionFailure::new(
+                            anyhow::anyhow!("producer stopped unexpectedly"),
+                            "producer_exit",
+                        ));
                         break;
                     }
                     Some(Ok(Err(error))) => {
-                        failure = Some(error);
+                        failure = Some(SessionFailure::new(error, "producer_task"));
                         break;
                     }
                     Some(Err(error)) => {
-                        failure = Some(error.into());
+                        failure = Some(SessionFailure::new(error.into(), "producer_join"));
                         break;
                     }
                     None => break,
@@ -2359,7 +2370,7 @@ async fn run_session(
                         ) {
                             Ok(action) => pending_action = action,
                             Err(error) => {
-                                failure = Some(error);
+                                failure = Some(SessionFailure::new(error, "process_event"));
                                 break;
                             }
                         }
@@ -2367,7 +2378,10 @@ async fn run_session(
                         watchdog.record_queue_health(QueueHealth::from_sender(&sender));
                     }
                     None => {
-                        failure = Some(anyhow::anyhow!("archive queue closed"));
+                        failure = Some(SessionFailure::new(
+                            anyhow::anyhow!("archive queue closed"),
+                            "archive_queue",
+                        ));
                         break;
                     }
                 }
@@ -2389,7 +2403,7 @@ async fn run_session(
                 if let Err(error) =
                     queue_snapshot_resyncs(&config, &snapshot_resync_queues, requests)
                 {
-                    failure = Some(error);
+                    failure = Some(SessionFailure::new(error, "snapshot_resync"));
                     break;
                 }
                 if snapshot_initialization_complete(snapshot_completions, snapshot_producers) {
@@ -2399,7 +2413,7 @@ async fn run_session(
         }
 
         if let Err(error) = poll_finished_segment_finalizer(&mut pending_segment_finalizer).await {
-            failure = Some(error);
+            failure = Some(SessionFailure::new(error, "scheduled_segment_finalizer"));
             break;
         }
 
@@ -2408,7 +2422,7 @@ async fn run_session(
         let segment_is_due = match segment_due(&segment, config.segment_seconds) {
             Ok(is_due) => is_due,
             Err(error) => {
-                failure = Some(error);
+                failure = Some(SessionFailure::new(error, "segment_rotation_schedule"));
                 break;
             }
         };
@@ -2420,7 +2434,7 @@ async fn run_session(
             if let Err(error) =
                 collect_pending_segment_finalizer(&mut pending_segment_finalizer).await
             {
-                failure = Some(error);
+                failure = Some(SessionFailure::new(error, "scheduled_segment_finalizer"));
                 break;
             }
             // Each producer emits its barrier after every event whose receive
@@ -2428,14 +2442,17 @@ async fn run_session(
             rotation_epoch = match rotation_epoch.checked_add(1) {
                 Some(epoch) => epoch,
                 None => {
-                    failure = Some(anyhow::anyhow!("segment rotation epoch overflow"));
+                    failure = Some(SessionFailure::new(
+                        anyhow::anyhow!("segment rotation epoch overflow"),
+                        "segment_rotation_epoch",
+                    ));
                     break;
                 }
             };
             if rotation_pause_tx.send(rotation_epoch).is_err() {
-                failure = Some(anyhow::anyhow!(
+                failure = Some(SessionFailure::new(anyhow::anyhow!(
                     "collector producers stopped before segment rotation"
-                ));
+                ), "rotation_pause"));
                 break;
             }
             let barriers = match await_rotation_barriers(
@@ -2457,7 +2474,7 @@ async fn run_session(
                 Ok(result) => result,
                 Err(error) => {
                     let _ = rotation_resume_tx.send(rotation_epoch);
-                    failure = Some(error);
+                    failure = Some(SessionFailure::new(error, "rotation_barrier"));
                     break;
                 }
             };
@@ -2482,7 +2499,7 @@ async fn run_session(
                 Ok(next_segment) => next_segment,
                 Err(error) => {
                     let _ = rotation_resume_tx.send(rotation_epoch);
-                    failure = Some(error);
+                    failure = Some(SessionFailure::new(error, "segment_rotation_open"));
                     break;
                 }
             };
@@ -2502,7 +2519,10 @@ async fn run_session(
                 .filter(|(_, state)| !state.synced)
                 .map(|(symbol, _)| symbol.as_str())
                 .collect::<Vec<_>>();
-            failure = Some(anyhow::anyhow!("snapshot sync timed out: {missing:?}"));
+            failure = Some(SessionFailure::new(
+                anyhow::anyhow!("snapshot sync timed out: {missing:?}"),
+                "snapshot_sync",
+            ));
             break;
         }
 
@@ -2518,7 +2538,7 @@ async fn run_session(
             let manifest_count = match files_with_suffix(&config.spool_dir, ".manifest.json") {
                 Ok(manifests) => manifests.len(),
                 Err(error) => {
-                    failure = Some(error);
+                    failure = Some(SessionFailure::new(error, "health_manifest_scan"));
                     break;
                 }
             };
@@ -2534,22 +2554,17 @@ async fn run_session(
                 QueueHealth::from_sender(&sender),
                 &states,
             ) {
-                failure = Some(error);
+                failure = Some(SessionFailure::new(error, "health_write"));
                 break;
             }
             last_health = Instant::now();
         }
     }
 
-    let _ = session_stop_tx.send(true);
-    let final_queue_health = QueueHealth::from_sender(&sender);
-    drop(sender);
+    let final_queue_health =
+        begin_session_teardown(&session_id, failure.as_ref(), &session_stop_tx, sender);
     if let Err(error) = collect_pending_segment_finalizer(&mut pending_segment_finalizer).await {
-        if failure.is_none() {
-            failure = Some(error);
-        } else {
-            error!(error = %error, "scheduled segment finalizer failed during shutdown");
-        }
+        retain_finalizer_failure(&session_id, &mut failure, error);
     }
     while let Some(joined) = tasks.join_next().await {
         if let Ok(Ok(TaskExit::Stopped(Some(event)))) = joined {
@@ -2587,9 +2602,60 @@ async fn run_session(
         &states,
     )?;
     if let Some(error) = failure {
-        Err(error)
+        Err(error.error)
     } else {
         Ok(next_catalog)
+    }
+}
+
+struct SessionFailure {
+    error: anyhow::Error,
+    phase: &'static str,
+}
+
+impl SessionFailure {
+    fn new(error: anyhow::Error, phase: &'static str) -> Self {
+        Self { error, phase }
+    }
+
+    fn report(&self, session_id: &str, failure_role: &str) {
+        error!(
+            session_id,
+            phase = self.phase,
+            failure_role,
+            error = %bounded_log_error(&self.error),
+            "capture session failure"
+        );
+    }
+}
+
+fn begin_session_teardown(
+    session_id: &str,
+    failure: Option<&SessionFailure>,
+    session_stop_tx: &watch::Sender<bool>,
+    sender: mpsc::Sender<Event>,
+) -> QueueHealth {
+    // Flush the first cause before stopping producers or awaiting any cleanup.
+    if let Some(failure) = failure {
+        failure.report(session_id, "primary");
+    }
+    let _ = session_stop_tx.send(true);
+    let queue_health = QueueHealth::from_sender(&sender);
+    drop(sender);
+    queue_health
+}
+
+fn retain_finalizer_failure(
+    session_id: &str,
+    failure: &mut Option<SessionFailure>,
+    error: anyhow::Error,
+) {
+    let finalizer_failure = SessionFailure::new(error, "scheduled_segment_finalizer");
+    if failure.is_some() {
+        finalizer_failure.report(session_id, "secondary");
+    } else {
+        finalizer_failure.report(session_id, "primary");
+        *failure = Some(finalizer_failure);
     }
 }
 
@@ -13251,6 +13317,125 @@ mod tests {
 
         segment.mark_replay_unsafe();
         assert!(segment.close().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn first_failure_survives_watchdog_exit_during_blocked_finalizer() {
+        const CHILD_ROOT: &str = "MONDAY_TEST_BLOCKED_TEARDOWN_ROOT";
+        const TEST: &str = "tests::first_failure_survives_watchdog_exit_during_blocked_finalizer";
+        const SOURCE: &[u8] =
+            b"{\"session_id\":\"blocked-session\",\"type\":\"agg_trade\",\"a\":12}\n";
+        if let Some(root) = env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            std::fs::write(root.join("part-1.jsonl.part"), SOURCE).unwrap();
+            init_tracing();
+            let (_release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let mut pending = Some(spawn_segment_finalizer(move || {
+                std::fs::write(root.join("finalizer-entered"), b"blocked").unwrap();
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                std::fs::write(root.join("finalizer-completed"), b"finished").unwrap();
+                Ok(None)
+            }));
+            ready_rx.await.unwrap();
+            let watchdog = ProcessWatchdog::start(
+                Duration::from_millis(500),
+                Arc::new(ProducerDiagnostics::new(&[])),
+            )
+            .unwrap();
+            let failure = SessionFailure::new(
+                anyhow::anyhow!(
+                    "aggregate_trade_sequence_gap symbol=BTCUSDT expected=10 received=12"
+                ),
+                "process_event",
+            );
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let (sender, _receiver) = mpsc::channel(1);
+            begin_session_teardown("blocked-session", Some(&failure), &stop_tx, sender);
+            assert!(*stop_rx.borrow());
+            assert_eq!(watchdog.state(), ProcessWatchdogState::Armed);
+            collect_pending_segment_finalizer(&mut pending)
+                .await
+                .unwrap();
+            panic!("watchdog must exit before the blocked finalizer completes");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let mut child = tokio::process::Command::new(env::current_exe().unwrap());
+        child
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env(CHILD_ROOT, root.path())
+            .env("RUST_LOG", "info")
+            .env("NO_COLOR", "1")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(8), child.output())
+            .await
+            .expect("watchdog child did not terminate")
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(75), "{stdout}");
+        let first = stdout
+            .find("capture session failure")
+            .expect("first cause was lost");
+        let exit = stdout
+            .find("process watchdog exiting")
+            .expect("watchdog did not fire");
+        assert!(first < exit, "{stdout}");
+        assert!(
+            stdout.contains("session_id=\"blocked-session\""),
+            "{stdout}"
+        );
+        assert!(stdout.contains("phase=\"process_event\""), "{stdout}");
+        assert!(stdout.contains("failure_role=\"primary\""), "{stdout}");
+        assert!(
+            stdout.contains("aggregate_trade_sequence_gap symbol=BTCUSDT expected=10 received=12")
+        );
+        assert!(!stdout.contains("session failed; reconnecting"));
+        assert!(root.path().join("finalizer-entered").is_file());
+        assert!(!root.path().join("finalizer-completed").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("part-1.jsonl.part")).unwrap(),
+            SOURCE
+        );
+        eprintln!("{stdout}");
+    }
+
+    #[test]
+    fn finalizer_failure_preserves_primary_cause_and_reports_its_role() {
+        let root = tempfile::tempdir().unwrap();
+        let trace = root.path().join("trace.log");
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(std::fs::File::create(&trace).unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut failure = Some(SessionFailure::new(
+                anyhow::anyhow!("first cause"),
+                "process_event",
+            ));
+            retain_finalizer_failure(
+                "session-1",
+                &mut failure,
+                anyhow::anyhow!("compression timed out"),
+            );
+            let primary = failure.unwrap();
+            assert_eq!(primary.error.to_string(), "first cause");
+            assert_eq!(primary.phase, "process_event");
+
+            let mut failure = None;
+            retain_finalizer_failure(
+                "session-2",
+                &mut failure,
+                anyhow::anyhow!("first finalizer failure"),
+            );
+            assert_eq!(failure.unwrap().phase, "scheduled_segment_finalizer");
+        });
+        let logs = std::fs::read_to_string(trace).unwrap();
+        assert!(logs.contains("session_id=\"session-1\" phase=\"scheduled_segment_finalizer\" failure_role=\"secondary\""), "{logs}");
+        assert!(logs.contains("session_id=\"session-2\" phase=\"scheduled_segment_finalizer\" failure_role=\"primary\""), "{logs}");
+        assert!(!logs.contains("error=first cause"));
     }
 
     #[tokio::test]

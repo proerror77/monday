@@ -71,15 +71,17 @@ Run 是固定科学调用：Experiment、BuildArtifact、配置摘要、命令�
 
 计算 Pod 直接调用 `/usr/local/bin/<已发布二进制>`；PG Run admission 拒绝 `cargo` 或任意 shell 作为直接入口。reconciler 每次 launch（包括 retry）读取已注册 Build，并从受控 artifact gateway 流式核验二进制大小/摘要，再检查租期、截止时间和撤销状态。缺失或错误产物不能触发 launch。OCI digest 与内含二进制的绑定来自独立的 trusted release verifier；通用 Agent API 无权出具这个证明。
 
-`.github/scripts/build-research-release.sh` 使用精确 `-p` / `--bin` / `--features`，没有默认 `--workspace` / `--all-features`。一份产品清单绑定已有 runner 与 Campaign controller。controller 资产单改时只构建所需四项。新平台控制程序仍由 owning CI 验证；它们没有生产发布合同，不进入这两个镜像。不同科学变异的 BuildSpec 可以缩小到实际科学 crate/binary。Cargo 依赖图重建受影响 crate，链接仍有成本。本分支没有编译耗时基准，不承诺加速倍数。
+`.github/scripts/build-research-release.sh` 使用精确 `-p` / `--bin` / `--features`，没有默认 `--workspace` / `--all-features`。一份产品清单绑定已有 runner 与 Campaign controller。controller 资产单改时构建所需程序，包括 owning platform 的 `research-release-publisher`，并验证其 source、依赖和 OCI 可执行字节。不同科学变异的 BuildSpec 可以缩小到实际科学 crate/binary。Cargo 依赖图重建受影响 crate，链接仍有成本。本分支没有编译耗时基准，不承诺加速倍数。
 
 发布保留原 `release` profile（opt-level 3、thin LTO、codegen-units 1）。另提供显式 `research` profile（opt-level 2、无 LTO、16 codegen units）；它的身份与 release 分开，不能把不同优化产物当同一科学执行。`researchctl plan-build BUILD` 仅输出经过校验的 scoped Cargo 参数，不执行编译或配置云端 builder。
 
 CI 的 `capture-research-build-inputs.sh` 将实际编译器/标准库、原生软件版本、编译环境、profile、lock 和 scoped 配方指纹纳入缓存键，并将这些输入保存在 release manifest。Cargo cache 与可执行产物分开：缓存只影响后续编译效率，命中缓存仍必须执行 build、二进制摘要验证和 image smoke。每个 runner 有自己的可写 target，禁止多租户共享可写 target；readonly prepared-data mount 不能被当作 compiler cache。
 
-Build 的生产写入只走 `research-release-publisher import BUILD_SHA256 OCI_SHA256 PROOF_SHA256 PUBLIC_TRUST_FILE HTTPS_GATEWAY TOKEN_FILE`。旧 `researchctl register-build` shortcut 已删除。pure `VerifiedBuildRelease` 仍仅证明 Ed25519 签名与绑定，不能写 PG；完成 package、signed proof、实际 source archive 和全部程序对象的独立 GET/大小/SHA 核验后，强 importer 才创建不可从 JSON 构造的 `VerifiedPublishedBuildRelease`。PG `register_build` 只接收该值，写入口仅编入 `publisher` feature。公开信任配置由 operator 管理，绑定 repository、producer workflow 和公钥；输入 envelope 不能自带受信公钥。Blob 缺失或字节变化时不产生新的 Build 行；完整回读与相同身份重试保持幂等，authority 仍可 paused。
+Build 的生产写入只走 `research-release-publisher oss-import SOURCE_ROOT BUILD_SHA256 OCI_SHA256 PROOF_SHA256 POLICY_FILE READONLY_SESSION_FILE PRIVATE_ADMISSION_FILE`。旧 `researchctl register-build` 和 Gateway release `import` shortcut 已删除；运行时 Gateway/AttemptWriter 保留。ACK 独立检查发行 Ed25519、原始成功 software/publisher run-attempt-job/check、实际 source archive 与全部程序对象的 GET/大小/SHA；签名或 JSON 本身不能写 PG。独立 owner 的 schema 2 审批签名覆盖正数单调 revision、精确 Build/OCI/proof、expiry 和 revoked，公钥与 CI 发行密钥分离；公开信任由 operator 控制，输入 envelope 不能自带受信公钥。
 
-先离线应用 `platform/sql/verified_build_release.sql`。该迁移保留原 Build 行作为审计记录，不自动为旧行补信任。只有附有签名证明的 Build 才能进入新 Run。导入事务写入不可变 release 和信任配置摘要；重复导入复用原记录。Build 可在 authority 为 paused 时预先登记；导入不启用 backend，也不授予科学预算或运行权。Run 启动与基础设施 retry 仍独立回读二进制字节。
+以可信 schema owner 在单一事务中安装 `platform/sql/verified_build_release.sql`（若未安装），然后安装 `build_import_admission.sql` 与独立 owner/importer 最小 grants。旧 Build 和审批审计保留，不自动补信任。PG `register_build` 必须在同事务显式调用 `lock_build_import_admission`，再写 immutable artifact/release；漏装新 migration/function 会 fail closed，不依赖旧表上恰好存在 trigger。稳定 selector 行保存当前 envelope hash 和单调 revision；旧批准回放、同 revision 改写、已撤销/过期/缺审批均拒绝。owner 更新与 Build 注册通过行锁串行化，已导入历史 Build 不因撤销删除。事务准入时检查 expiry，native 默认 deferred 检查是额外保障，不能声称所有 SQL 都强制 wall-clock COMMIT 时未过期。Build 登记可以在 authority paused 时进行，不授予 Run、backend、科学预算或交易权限。
+
+只读 `scope-plan ROOT SOURCE SOFTWARE_RUN SOFTWARE_PRODUCTS PRODUCT POLICY` 在 publisher/STSes 存在前从已完成的真实 compiler producer 计算精确 source/Build prefixes，作为独立 RAM 审批材料。实际 CI issuance 仍验证当前 main/三 gate/active publisher、实际 OCI 字节，签名前后独立读回。IAM、PG 安装和 ACK 可信挂载仍需具体部署批准及真实负测；没有自动新 Build 的 RSI 授权更新者。
 
 生产构建调度、变异 workspace 的源码归档上传、原生发布 verifier 出具此签名，以及 release 向 PG 的自动投影仍待接入。现有 CI bundle 能构建一次并被 smoke/发布复用；新 PG 合同能让多个 Run/Attempt 复用已导入的同一产物。不能据此声称已有自动 Agent 变异 → Build → 科学执行闭环。
 

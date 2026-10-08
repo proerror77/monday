@@ -1,5 +1,10 @@
 # 受控产物网关
 
+普通 CI 发行改用 OSS，不依赖此网关或发行 Broker。
+运行时 AttemptWriter 的 PG fence、lease、取消与准入职责保留。
+本改动不新增网关 Pod，也不迁移科学输出写入路径。
+见 [OSS 发行与 ACK 独立导入合同](../../../deployment/aliyun/research/foundation/RELEASE_OSS.md)。
+
 `research-artifact-gateway` 提供已有 `ArtifactGateway` 和 `Writer` 的持久存储出口。
 它不创建云资源，不签发 capability，不启用 PG authority，也不改变科学任务。
 

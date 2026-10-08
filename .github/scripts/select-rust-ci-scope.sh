@@ -274,10 +274,15 @@ for path in "${paths[@]}"; do
     .github/workflows/acr-publish.yml|.github/scripts/test-acr-publish-workflow.sh|\
     .github/scripts/read-release-required-checks.sh|.github/scripts/wait-release-required-checks.sh|\
     .github/scripts/research-image-release-artifact.sh|.github/scripts/test-research-image-release-artifact.sh|\
-    .github/scripts/publish-research-build-release.sh|\
+    .github/scripts/publish-research-build-release.sh|.github/scripts/select-research-oss-policy.jq|\
+    .github/scripts/migrate-research-oss-policy.sh|.github/scripts/test-migrate-research-oss-policy.sh|\
     .github/scripts/verify-research-runner-binaries.sh|\
     .github/scripts/read-acr-publish-source.sh|.github/scripts/select-acr-publish-source.sh|\
-    .github/scripts/test-acr-publish-source-readback.sh)
+    .github/scripts/test-acr-publish-source-readback.sh|\
+    .github/workflows/release.yml|.github/scripts/decide-release-once.sh|\
+    .github/scripts/read-release-published.sh|.github/scripts/release-orchestrator-admit.sh|\
+    .github/scripts/test-release-once.sh|.github/scripts/write-release-record.sh|\
+    .github/scripts/test-release-record.sh)
       # Release policy changes run source/signature/manifest contracts on both
       # PR and main push. Only actual image/source/dependency inputs rebuild.
       select_job ci/ci-contracts
@@ -793,6 +798,10 @@ if is_affected hft-collector || is_affected alpha-harness || is_affected hft-cex
 fi
 if is_affected hft-collector || is_affected alpha-harness; then
   research_product=$(bash "$products" merge "$research_product" controller)
+fi
+# The controller now directly owns the platform release importer.
+if is_affected hft-research-platform; then
+  select_research_image_jobs controller
 fi
 if [[ $event == pull_request ]] && is_affected hft-backtest; then
   select_job ploy/research-image-binaries

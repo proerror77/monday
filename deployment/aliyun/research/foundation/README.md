@@ -1,5 +1,9 @@
 # Paused persistent research foundation assets
 
+研究发行改用 [GitHub/ACR/OSS 与 ACK 独立导入](RELEASE_OSS.md)。
+该入口复用既有 ACK 容量，不新增 Gateway/Broker Pod。
+下面的 runtime Gateway 与 AttemptWriter 模板继续保留。
+
 这些资产补齐持久 PG、CH、artifact gateway 和 Session 的部署包装。它们是
 离线代码与模板。仓库没有应用生产迁移、创建资源、修改 IAM/network、启动模型、
 运行科学任务或启用 backend。参考 [research foundation](../../../../docs/architecture/RESEARCH_FOUNDATION.md)。
@@ -24,7 +28,7 @@ PVC 在缩容和 StatefulSet 删除后保留。PG/CH/objects/native-state/delive
 
 ## PG 与 CH 的离线安装
 
-用独立 schema owner 按顺序安装 platform `sql/postgres.sql`、`verified_build_release.sql`、
+用独立 schema owner 按顺序安装 platform `sql/postgres.sql`、`verified_build_release.sql`、`build_import_admission.sql`、
 `session_deliveries.sql`、`artifact_gateway.sql`、`native_admission.sql`、
 `native_request_revocation.sql`、`native_campaign_inputs.sql`、`native_terminal_retirement.sql`，最后安装 `postgres/roles.sql`。
 Native admission 迁移最后替换 artifact permit，保留 fence、lease、deadline、撤销与暂停检查，并加原生有效期和租户检查。
@@ -140,7 +144,7 @@ cluster-wide 权限。Kubernetes token 仍由受控 operator 投影并核对主�
 不会创建 token、IAM、云资源或 Role。namespace_prefix 是 Artifact `research/` 前缀，
 不是另一个 Kubernetes 命名空间授权。
 
-离线安装顺序为 postgres、verified_build_release、session_deliveries、artifact_gateway、
+离线安装顺序为 postgres、verified_build_release、build_import_admission、session_deliveries、artifact_gateway、
 native_admission、native_request_revocation、native_campaign_inputs、native_terminal_retirement，最后安装 roles.sql。
 应用身份不写 native admission/revocation；Session 仅 UPDATE(session_sha256) 用于行锁。
 immutable_sessions trigger 继续拒绝实际文档修改，DELETE 没有授权。

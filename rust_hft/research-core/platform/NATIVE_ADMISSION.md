@@ -18,7 +18,7 @@ permit also checks tenant and expiry under its original authority/task/admission
 locks, lease/fence/deadline and cancellation guards.
 
 Install additive migrations in this order: `postgres.sql`,
-`verified_build_release.sql`, `session_deliveries.sql`, `artifact_gateway.sql`,
+`verified_build_release.sql`, `build_import_admission.sql`, `session_deliveries.sql`, `artifact_gateway.sql`,
 `native_admission.sql`, then `native_request_revocation.sql`. The latter migration
 adds scheduled source history. See [native request revocation](NATIVE_REVOCATION.md).
 The native admission migration replaces the original permit's exact
