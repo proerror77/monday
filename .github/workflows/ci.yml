@@ -276,7 +276,7 @@ jobs:
             rust_hft
           key: loop-nextest-archive-${{ steps.cache-info.outputs.rust }}
           cache-all-crates: false
-          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest 0.9.146
         run: |
