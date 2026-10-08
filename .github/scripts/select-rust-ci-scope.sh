@@ -44,6 +44,7 @@ image_paper=false
 image_collector=false
 production_collector_image=false
 declare -a paths=()
+declare -A ignored_documentation=()
 
 select_job() {
   local job=$1
@@ -348,6 +349,7 @@ for path in "${paths[@]}"; do
       continue
       ;;
     rust_hft/prediction-markets/*.md)
+      ignored_documentation["$path"]=true
       continue
       ;;
     rust_hft/Cargo.lock|rust_hft/runtime/Cargo.lock|rust_hft/shared/Cargo.lock|rust_hft/data-pipelines/Cargo.lock|rust_hft/research-core/Cargo.lock|rust_hft/research-core/platform/Cargo.lock|rust_hft/prediction-markets/Cargo.lock)
@@ -575,6 +577,7 @@ for path in "${paths[@]}"; do
       continue
       ;;
     deployment/aliyun/*.md)
+      ignored_documentation["$path"]=true
       continue
       ;;
     deployment/aliyun/*)
@@ -582,9 +585,11 @@ for path in "${paths[@]}"; do
       [[ $path == deployment/aliyun/research/* ]] && research_image_relevant=true
       ;;
     docs/*|*.md|LICENSE*)
+      ignored_documentation["$path"]=true
       continue
       ;;
     rust_hft/docs/*|rust_hft/README*|rust_hft/*/README*)
+      ignored_documentation["$path"]=true
       continue
       ;;
     rust_hft/scripts/deploy-ecs-tools-collector.sh)
@@ -689,6 +694,8 @@ mark_checked_direct_package() {
 
 for path in "${paths[@]}"; do
   [[ $path == rust_hft/* ]] || continue
+  # Preserve the first pass decision when code also requires ownership metadata.
+  [[ ${ignored_documentation[$path]:-} == true ]] && continue
   case "$path" in
     rust_hft/deployment/docker/*|rust_hft/deployment/k8s/*|rust_hft/.dockerignore|\
     rust_hft/Cargo.toml|rust_hft/Cargo.lock|rust_hft/prediction-markets/Cargo.toml|\
