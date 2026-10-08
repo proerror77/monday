@@ -20,7 +20,8 @@
       "alpha-harness",
       "lob-pit-materializer",
       "binance-market-tape-slicer",
-      "binance-replay-parquet-materializer"
+      "binance-replay-parquet-materializer",
+      "research-release-publisher"
     ]
   },
   "recipes": [
@@ -83,6 +84,14 @@
       "features": "",
       "binaries": [
         "monday-prediction-operator"
+      ]
+    },
+    {
+      "manifest": "research-core/platform/Cargo.toml",
+      "package": "hft-research-platform",
+      "features": "publisher",
+      "binaries": [
+        "research-release-publisher"
       ]
     }
   ],

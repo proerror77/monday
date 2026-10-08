@@ -118,8 +118,10 @@ References: [OSS V4 signing](https://www.alibabacloud.com/help/en/oss/developer-
 
 ## ACK execution using existing capacity
 
-Install the verified `research-release-publisher` binary into the existing controlled ACK execution image.
-The foundation Dockerfile now requires that prebuilt binary in `research-control-bin`.
+The `controller` product now builds `research-release-publisher` with its owning platform workspace, locked release profile and `publisher` feature. The existing compiler-input manifest records that recipe, lock/profile bytes and compiler environment; producer artifacts and controller OCI verification include its executable digest and exact readback. The controller image installs git, gh and CA certificates and verifies these dependencies plus the source-bound importer CLI offline. Neither probe invokes the campaign entrypoint or supplies credentials.
+
+Use that authenticated release binary for the existing controlled ACK execution image; never install the separate temporary CI debug issuer. The actual existing control capacity and its operator execution surface must still be read back before deployment. The controller artifact is a packaging source, not permission to replace a different control service or start a Campaign.
+The foundation Dockerfile requires that verified binary in `research-control-bin`; stage it only from the authenticated controller artifact after checking the exact source/compiler/producer/digest. Its reviewed runtime base must independently supply git, gh and CA. Merely building that Dockerfile or copying a host binary does not establish those prerequisites.
 Run the importer through the existing operator execution surface in that Pod or host.
 Do not add a release Gateway/Broker Pod, service, ingress or PVC.
 Do not mount signing keys or collector credentials there.
@@ -139,6 +141,15 @@ The host must supply these separate inputs:
 - Operator-pinned `import_admission_keys` public keys in a read-only host policy mount. These keys must differ from all CI release keys; the publisher and importer must have no write access to the policy or admission mount.
 
 The envelope has `schema:1`, `key_id`, `admission` and canonical lowercase `signature_hex`. Admission fields are `schema:1`, `expires_ms`, `build_sha256`, `image_sha256`, `publication_proof_sha256`, and `revoked`. Sign `SignedImportAdmission::signing_bytes()` using the separately controlled operator Ed25519 key; the importer has only its public key. A private 0600 file alone is not authority. Unsigned files, CI-key signatures, key reuse and tampering are rejected. This branch does not create or copy that operator private key.
+On the separately controlled operator host, use the verified binary and **existing approved** private key. Prepare an unsigned admission JSON with the six exact fields listed above, then execute:
+
+```bash
+umask 077
+research-release-publisher sign-import-admission POLICY_FILE ADMISSION_JSON OPERATOR_KEY_ID EXISTING_PRIVATE_KEY_FILE > SIGNED_ADMISSION_NEW
+```
+
+The command checks the pinned independent public key, rejects CI-key reuse or a foreign key, and emits only the signed envelope; it never creates keys or grants cloud/Run authority. It can sign `revoked:true` updates for the same exact selectors. The operator atomically installs that envelope at the independently owned read-only ACK mount through the already approved control surface. Do not mount this private key into CI, the importer or research jobs. Key provisioning, policy/mount writes and approval lifecycle remain separate action-time approvals; producing an envelope does not authorize their installation.
+
 No wildcard or omitted selector is accepted. Expired or revoked approval fails before readback.
 The importer rereads and verifies this envelope after object/GitHub checks, immediately before PG registration. An attacker able to replace the trusted policy or restore an older signed, unexpired approval could still authorize replay: read-only independently owned mounts and approval lifecycle are mandatory deployment prerequisites, not proven here.
 Issuance requires current main before signing and after signed-object readback. Import instead reads the signed original successful run/attempt/job and each original authenticated check ID directly. Later main commits, newer checks or later attempts do not invalidate those immutable release identities. Historical import or rollback still needs a current independent signed admission for the exact Build/OCI/proof, a matching separately approved read-only OSS scope, valid public trust and complete readback. Missing/deleted/failed original GitHub records fail closed; no latest-check or unsigned fallback is accepted.

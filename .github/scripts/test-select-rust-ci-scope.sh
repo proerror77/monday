@@ -463,6 +463,11 @@ for event in pull_request push; do
   printf '%s\n' rust_hft/research-core/platform/src/build.rs >"$tmp_dir/control-owner.txt"
   control_owner=$(run_case "control-owner-$event" "$event" control-owner.txt "$owners_metadata")
   assert_owning_packages "$control_owner" hft-research-platform
+  grep -Eq '^research_product=(cex-runner,)?controller(,prediction-runner)?$' "$control_owner"
+  if [[ $event == push ]]; then
+    grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$control_owner"
+    grep -Eq '^jobs=.*,(ploy/research-image-smoke),' "$control_owner"
+  fi
   grep -Fqx 'loop_packages=,alpha-harness,hft-cex-research-worker,' "$control_owner"
   grep -Eq '^jobs=.*,(ci/research-foundation),' "$control_owner"
   grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$control_owner"
@@ -472,6 +477,18 @@ for event in pull_request push; do
   if grep -Eq '^jobs=.*,(ci/rust|ci/research-foundation|ploy/research-image-binaries|ploy/research-image-smoke),' "$owner_docs"; then
     echo 'docs-only owner graph selected compilation' >&2; exit 1
   fi
+done
+
+# A future platform-only change must rebuild its direct controller product even
+# when no Alpha/CEX package depends on that workspace.
+jq '.packages |= map(.dependencies |= map(select(.name != "hft-research-platform")))' "$owners_metadata" >"$tmp_dir/isolated-platform.metadata"
+for event in pull_request push; do
+  isolated_platform=$(run_case "isolated-platform-$event" "$event" control-owner.txt "$tmp_dir/isolated-platform.metadata")
+  assert_owning_packages "$isolated_platform" hft-research-platform
+  grep -Fqx 'loop_packages=,,' "$isolated_platform"
+  grep -Fqx 'research_product=controller' "$isolated_platform"
+  grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$isolated_platform"
+  grep -Eq '^jobs=.*,(ploy/research-image-smoke),' "$isolated_platform"
 done
 
 same_suite=$(run_case same-suite pull_request same-suite.txt)

@@ -1376,6 +1376,38 @@ pub struct SignedImportAdmission {
     pub signature_hex: String,
 }
 impl SignedImportAdmission {
+    /// Operator-only utility: consume an existing approved key, never generate one.
+    pub fn sign(
+        admission: ImportAdmission,
+        key_id: String,
+        key: &SigningKey,
+        policy: &PublisherPolicy,
+        now: i64,
+    ) -> Result<Self> {
+        ensure!(
+            admission.schema == 1
+                && admission.expires_ms > now
+                && valid_digest(&admission.build_sha256)
+                && valid_digest(&admission.image_sha256)
+                && valid_digest(&admission.publication_proof_sha256),
+            "operator admission requires exact selectors and future expiry"
+        );
+        let mut signed = Self {
+            schema: 1,
+            key_id,
+            admission,
+            signature_hex: String::new(),
+        };
+        signed.signature_hex = key
+            .sign(&signed.signing_bytes()?)
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // Includes independent pinned-key enforcement, not merely a valid signature.
+        signed.verify(policy)?;
+        Ok(signed)
+    }
     pub fn signing_bytes(&self) -> Result<Vec<u8>> {
         let mut bytes = b"monday.ack-build-import-admission.v1\0".to_vec();
         bytes.extend(serde_json::to_vec(&(
@@ -1657,6 +1689,64 @@ mod tests {
             },
             signature_hex: String::new(),
         };
+        let admission = signed.admission.clone();
+        let generated = SignedImportAdmission::sign(
+            admission.clone(),
+            "operator".into(),
+            &operator,
+            &policy,
+            1000,
+        )
+        .unwrap();
+        assert!(generated.verify(&policy).is_ok());
+        generated
+            .admission
+            .validate(&"a".repeat(64), &"b".repeat(64), &"c".repeat(64), 1000)
+            .unwrap();
+        assert!(SignedImportAdmission::sign(
+            admission.clone(),
+            "operator".into(),
+            &ci,
+            &policy,
+            1000
+        )
+        .is_err());
+        assert!(SignedImportAdmission::sign(
+            admission.clone(),
+            "unknown".into(),
+            &operator,
+            &policy,
+            1000
+        )
+        .is_err());
+        assert!(SignedImportAdmission::sign(
+            admission.clone(),
+            "operator".into(),
+            &operator,
+            &policy,
+            1001
+        )
+        .is_err());
+        let mut malformed = admission.clone();
+        malformed.build_sha256 = "*".into();
+        assert!(SignedImportAdmission::sign(
+            malformed,
+            "operator".into(),
+            &operator,
+            &policy,
+            1000
+        )
+        .is_err());
+        let mut revoked = admission;
+        revoked.revoked = true;
+        let revoked =
+            SignedImportAdmission::sign(revoked, "operator".into(), &operator, &policy, 1000)
+                .unwrap();
+        assert!(revoked.verify(&policy).is_ok());
+        assert!(revoked
+            .admission
+            .validate(&"a".repeat(64), &"b".repeat(64), &"c".repeat(64), 1000)
+            .is_err());
         signed.signature_hex = hex(&operator.sign(&signed.signing_bytes().unwrap()).to_bytes());
         assert!(signed.verify(&policy).is_ok());
         signed.admission.revoked = true;

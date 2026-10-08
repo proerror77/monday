@@ -13,8 +13,8 @@ jq -s -e 'length==3 and all(.[]; .manifest=="prediction-markets/Cargo.toml") and
 bash "$products" recipes cex-runner >"$work/cex-recipes"
 jq -s -e 'length==4 and any(.[]; .package=="hft-cex-research-worker" and .binaries==["monday-cex-worker"]) and all(.[]; .package!="ploy-research" and .manifest!="prediction-markets/Cargo.toml")' "$work/cex-recipes" >/dev/null
 [[ $(bash "$products" binaries cex-runner | wc -l) -eq 7 ]]
-[[ $(bash "$products" binaries all | wc -l) -eq 12 ]]
-[[ $(bash "$products" binaries cex-runner,controller | wc -l) -eq 7 ]]
+[[ $(bash "$products" binaries all | wc -l) -eq 13 ]]
+[[ $(bash "$products" binaries cex-runner,controller | wc -l) -eq 8 ]]
 [[ $(bash "$products" merge controller prediction-runner) == controller,prediction-runner ]]
 for invalid in runner paired '' 'cex-runner,cex-runner' 'prediction-runner,unknown' 'all,controller'; do
   if bash "$products" normalize "$invalid" >"$work/rejection" 2>&1; then
@@ -36,14 +36,14 @@ end
 RUBY
 mkdir -p "$work/controller/research-bin"
 bash "$root/.github/scripts/research-release-products.sh" binaries controller >"$work/binaries"
-[[ $(wc -l <"$work/binaries") -eq 4 ]]
+[[ $(wc -l <"$work/binaries") -eq 5 ]]
 while IFS= read -r binary; do
   printf 'mock executable: %s\n' "$binary" >"$work/controller/research-bin/$binary"
   chmod 0755 "$work/controller/research-bin/$binary"
 done <"$work/binaries"
 bash "$root/.github/scripts/research-release-products.sh" recipes controller >"$work/recipes"
-jq -s -e 'length==2 and any(.[]; .package=="alpha-harness") and any(.[]; .package=="hft-collector") and
-  all(.[]; .package!="hft-backtest" and .package!="ploy-research" and .package!="hft-research-platform")' "$work/recipes" >/dev/null
+jq -s -e 'length==3 and any(.[]; .package=="hft-research-platform" and .manifest=="research-core/platform/Cargo.toml" and .features=="publisher" and .binaries==["research-release-publisher"]) and any(.[]; .package=="alpha-harness") and any(.[]; .package=="hft-collector") and
+  all(.[]; .package!="hft-backtest" and .package!="ploy-research")' "$work/recipes" >/dev/null
 locks=$(bash "$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
 workspace_profiles=$(ruby -rjson -rdigest -e 'root=ARGV[0]; puts JSON.generate(JSON.parse(File.read("#{root}/workspaces.json")).fetch("workspaces").to_h{|owner| manifest=owner.fetch("manifest"); [manifest,Digest::SHA256.file("#{root}/#{manifest}").hexdigest]})' "$root/rust_hft")
 jq -n --arg h "$(printf a%.0s {1..64})" --argjson locks "$locks" --argjson workspace_profiles "$workspace_profiles" --argjson recipes "$(jq -s . "$work/recipes")" \
@@ -122,4 +122,4 @@ PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/output" GITHUB_REPOSITORY=fixtur
 while IFS= read -r binary; do
   test "$(cat "$fixture/output/research-release/research-bin/$binary")" = "fresh target executable: $binary"
 done < <(bash "$products" binaries controller)
-printf 'PASS: controller-only release builds four actual executables; product, archive and unadmitted control bytes fail closed\n'
+printf 'PASS: controller-only release builds five admitted executables including the ACK importer; product, archive and unadmitted control bytes fail closed\n'

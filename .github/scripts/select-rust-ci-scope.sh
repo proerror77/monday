@@ -794,6 +794,10 @@ fi
 if is_affected hft-collector || is_affected alpha-harness; then
   research_product=$(bash "$products" merge "$research_product" controller)
 fi
+# The controller now directly owns the platform release importer.
+if is_affected hft-research-platform; then
+  select_research_image_jobs controller
+fi
 if [[ $event == pull_request ]] && is_affected hft-backtest; then
   select_job ploy/research-image-binaries
 fi
