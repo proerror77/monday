@@ -41,6 +41,7 @@ clippy_loop=false
 clippy_handoff=false
 image_live=false
 image_paper=false
+image_collector=false
 production_collector_image=false
 declare -a paths=()
 
@@ -167,6 +168,7 @@ select_main_research_image_jobs() {
 select_all() {
   image_live=true
   image_paper=true
+  image_collector=true
   loop=true
   loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-cex-research-worker,hft-harnessctl,hft-research-ml
   handoff=true
@@ -185,11 +187,11 @@ emit() {
   [[ ,$owning_packages, != *",hft-research-platform,"* ]] || select_job ci/research-foundation
   [[ $architecture == true ]] && select_job ploy/architecture-contracts
   [[ $control == true ]] && select_job ci/control-contracts
-  # Every path that selects collector verification must exercise its production image.
+  # Collector tests retain deployment contracts even when their image is unchanged.
   if [[ $collector == true ]]; then select_job ci/deployment-artifacts; fi
-  image_matrix=$(printf '%s\n' "${paths[@]}" | bash "$(dirname "${BASH_SOURCE[0]}")/image-build-plan.sh" "$image_live" "$image_paper" "$collector" "$event")
+  image_matrix=$(printf '%s\n' "${paths[@]}" | bash "$(dirname "${BASH_SOURCE[0]}")/image-build-plan.sh" "$image_live" "$image_paper" "$image_collector" "$event")
   production_trading_image=$(jq -r 'any(.include[]; .name=="hft-trading")' <<<"$image_matrix")
-  [[ $collector != true ]] || production_collector_image=true
+  [[ $image_collector != true ]] || production_collector_image=true
   select_security_scope
   if [[ $event != schedule && ( $clippy_loop == true || $clippy_handoff == true ) ]]; then select_job ci/clippy-strict; fi
   for value in "$loop" "$handoff" "$json" "$ondo" "$collector" "$control" "$focused" "$toolchain"; do
@@ -575,6 +577,7 @@ for path in "${paths[@]}"; do
       ;;
     rust_hft/scripts/deploy-ecs-tools-collector.sh)
       collector=true
+      image_collector=true
       control=true
       toolchain=true
       select_job ci/rust-shell-scripts
@@ -643,19 +646,27 @@ while IFS=$'\t' read -r lock_package lock_workspace; do
   fi
 done < <(jq -r '.[] | [.name,.workspace] | @tsv' <<<"$lock_packages")
 
-declare -a package_names=() package_dirs=() package_dependencies=()
-while IFS=$'\t' read -r name manifest dependencies; do
+declare -a package_names=() package_dirs=() package_dependencies=() package_production_dependencies=()
+while IFS=$'\t' read -r name manifest dependencies production_dependencies; do
   if [[ $manifest == "$repo_root/"* ]]; then manifest=${manifest#"$repo_root/"}; fi
   package_names+=("$name")
   package_dirs+=("${manifest%/Cargo.toml}")
   package_dependencies+=("$dependencies")
-done < <(jq -r '.packages[] | [.name, .manifest_path, ([.dependencies[] | select(.path != null) | .name] | join(","))] | @tsv' "$metadata")
+  package_production_dependencies+=("$production_dependencies")
+done < <(jq -r '.packages[] | [
+  .name, .manifest_path,
+  ([.dependencies[] | select(.path != null) | .name] | join(",")),
+  ([.dependencies[] | select(.path != null and .kind != "dev") | .name] | join(","))
+] | @tsv' "$metadata")
 
 affected=$'\n'
+production_affected=$'\n'
 direct_root_packages=$'\n'
 checked_direct_packages=$'\n'
 is_affected() { [[ $affected == *$'\n'"$1"$'\n'* ]]; }
 mark_affected() { is_affected "$1" || affected+="$1"$'\n'; }
+is_production_affected() { [[ $production_affected == *$'\n'"$1"$'\n'* ]]; }
+mark_production_affected() { is_production_affected "$1" || production_affected+="$1"$'\n'; }
 is_direct_root_package() { [[ $direct_root_packages == *$'\n'"$1"$'\n'* ]]; }
 mark_direct_root_package() { is_direct_root_package "$1" || direct_root_packages+="$1"$'\n'; }
 is_checked_direct_package() { [[ $checked_direct_packages == *$'\n'"$1"$'\n'* ]]; }
@@ -703,6 +714,7 @@ for path in "${paths[@]}"; do
   fi
   [[ $owner_directory == rust_hft/prediction-markets* ]] || mark_direct_root_package "$owner"
   mark_affected "$owner"
+  mark_production_affected "$owner"
 done
 
 # Cargo.toml remains the source of truth for downstream package impact.
@@ -718,6 +730,27 @@ while [[ $changed == true ]]; do
     for dependency in "${dependencies[@]}"; do
       if [[ -n $dependency ]] && is_affected "$dependency"; then
         mark_affected "$name"
+        changed=true
+        break
+      fi
+    done
+  done
+done
+
+# Release impact starts from changed owners, never from test-only consumers.
+# Only an explicit dev edge is excluded. Other kinds, features and targets stay conservative.
+changed=true
+while [[ $changed == true ]]; do
+  changed=false
+  for ((index = 0; index < ${#package_names[@]}; index++)); do
+    name=${package_names[$index]}
+    is_production_affected "$name" && continue
+    dependency_list=${package_production_dependencies[$index]}
+    [[ -n $dependency_list ]] || continue
+    IFS=',' read -ra dependencies <<<"$dependency_list"
+    for dependency in "${dependencies[@]}"; do
+      if [[ -n $dependency ]] && is_production_affected "$dependency"; then
+        mark_production_affected "$name"
         changed=true
         break
       fi
@@ -777,14 +810,15 @@ if [[ $focused == true && -z $focused_packages ]]; then
   done
 fi
 
-is_affected hft-live && image_live=true
-is_affected hft-paper && image_paper=true
+is_production_affected hft-live && image_live=true
+is_production_affected hft-paper && image_paper=true
+is_production_affected hft-collector && image_collector=true
 
 # Collector source and its host controls are one release boundary.
 if [[ $collector == true ]]; then control=true; fi
 
 if [[ $toolchain == true ]]; then select_job ci/rust; fi
-if [[ $collector == true ]]; then select_job ci/polymarket-evidence-compiler-image; fi
+if [[ $image_collector == true ]]; then select_job ci/polymarket-evidence-compiler-image; fi
 select_job_if_affected ci/deployment-artifacts hft-live
 select_job_if_affected ci/rust-hft-engine-fast-lane hft-engine hft-binance-depth
 
@@ -812,22 +846,22 @@ select_job_if_affected ploy/rust-research-heavy ploy-feed-loaders ploy-research 
 select_job_if_affected ploy/frontend ploy-operator-contracts
 select_job_if_affected ploy/integration-regressions ploy
 
-if is_affected ploy-research || is_affected hft-prediction-research-worker || is_affected hft-prediction-research-operator; then
+if is_production_affected ploy-research || is_production_affected hft-prediction-research-worker || is_production_affected hft-prediction-research-operator; then
   research_product=$(bash "$products" merge "$research_product" prediction-runner)
   research_image_relevant=true
 fi
-if is_affected hft-collector || is_affected alpha-harness || is_affected hft-cex-research-worker || is_affected hft-backtest; then
+if is_production_affected hft-collector || is_production_affected alpha-harness || is_production_affected hft-cex-research-worker || is_production_affected hft-backtest; then
   research_product=$(bash "$products" merge "$research_product" cex-runner)
   research_image_relevant=true
 fi
-if is_affected hft-collector || is_affected alpha-harness; then
+if is_production_affected hft-collector || is_production_affected alpha-harness; then
   research_product=$(bash "$products" merge "$research_product" controller)
 fi
 # The controller now directly owns the platform release importer.
-if is_affected hft-research-platform; then
+if is_production_affected hft-research-platform; then
   select_research_image_jobs controller
 fi
-if [[ $event == pull_request ]] && is_affected hft-backtest; then
+if [[ $event == pull_request ]] && is_production_affected hft-backtest; then
   select_job ploy/research-image-binaries
 fi
 select_job_if_affected ci/research-foundation hft-market-pipeline

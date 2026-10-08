@@ -1,0 +1,89 @@
+{
+  "packages": [
+    {
+      "name": "hft-ci-test-input",
+      "manifest_path": "rust_hft/selector-fixtures/test-input/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-strategy-formula",
+      "manifest_path": "rust_hft/strategy-framework/strategies/formula/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "alpha-engine",
+      "manifest_path": "rust_hft/alpha-harness/engine/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-strategy-formula", "path": "rust_hft/strategy-framework/strategies/formula", "kind": "dev"},
+        {"name": "hft-ci-test-input", "path": "rust_hft/selector-fixtures/test-input", "kind": "dev"}
+      ]
+    },
+    {
+      "name": "alpha-harness",
+      "manifest_path": "rust_hft/alpha-harness/app/Cargo.toml",
+      "dependencies": [
+        {"name": "alpha-engine", "path": "rust_hft/alpha-harness/engine", "kind": null},
+        {"name": "hft-backtest", "path": "rust_hft/apps/backtest", "kind": null},
+        {"name": "hft-collector", "path": "rust_hft/tools/collector", "kind": null}
+      ]
+    },
+    {
+      "name": "hft-cex-research-worker",
+      "manifest_path": "rust_hft/alpha-harness/worker/Cargo.toml",
+      "dependencies": [
+        {"name": "alpha-harness", "path": "rust_hft/alpha-harness/app", "kind": null}
+      ]
+    },
+    {
+      "name": "hft-runtime",
+      "manifest_path": "rust_hft/market-core/runtime/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-strategy-formula", "path": "rust_hft/strategy-framework/strategies/formula", "kind": null, "optional": true}
+      ]
+    },
+    {
+      "name": "hft-live",
+      "manifest_path": "rust_hft/apps/live/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-runtime", "path": "rust_hft/market-core/runtime", "kind": null},
+        {"name": "hft-ci-test-input", "path": "rust_hft/selector-fixtures/test-input", "kind": "dev"}
+      ]
+    },
+    {
+      "name": "hft-paper",
+      "manifest_path": "rust_hft/apps/paper/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-runtime", "path": "rust_hft/market-core/runtime", "kind": null},
+        {"name": "hft-ci-test-input", "path": "rust_hft/selector-fixtures/test-input", "kind": "dev"}
+      ]
+    },
+    {
+      "name": "hft-collector",
+      "manifest_path": "rust_hft/tools/collector/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-ci-test-input", "path": "rust_hft/selector-fixtures/test-input", "kind": "dev"}
+      ]
+    },
+    {
+      "name": "hft-backtest",
+      "manifest_path": "rust_hft/apps/backtest/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-ci-test-input", "path": "rust_hft/selector-fixtures/test-input", "kind": "dev"}
+      ]
+    },
+    {
+      "name": "hft-research-platform",
+      "manifest_path": "rust_hft/research-core/platform/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-ci-test-input", "path": "rust_hft/selector-fixtures/test-input", "kind": "dev"}
+      ]
+    },
+    {
+      "name": "ploy-research",
+      "manifest_path": "rust_hft/prediction-markets/crates/ploy-research/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-ci-test-input", "path": "rust_hft/selector-fixtures/test-input", "kind": "dev"}
+      ]
+    }
+  ]
+}
