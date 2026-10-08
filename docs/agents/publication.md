@@ -91,6 +91,28 @@ survives later main commits and another product's successful publication. Old
 mixed runner markers do not prove publication of the split images. The v6
 migration bootstraps each product until its own readback succeeds.
 
+Main CI keeps every product and test selected by the current source change.
+When public OSS product configuration is absent, CI defers only additional builds
+carried from unpublished history. An absent public policy or a missing, null or
+`{}` value for `oss_by_product` confirms this condition. Invalid JSON or another
+field type retains the existing carry plan.
+Any nonempty product map also retains that plan, including an incomplete map.
+Native publication still validates each selected product. The selector reports
+pending and deferred products without advancing any publication baseline.
+
+ACR independently recalculates pending products when binary and smoke jobs were
+skipped. Pending work fails publication; it cannot become a successful no-op.
+After configuration is repaired, the next main push rebuilds pending products
+from their original publication baselines. A variable update alone starts no job.
+If the current main push produced no research artifact, rerun all its Prediction
+CI jobs to recalculate the plan. Do not use a new Prediction manual dispatch for
+artifact reuse. If an earlier attempt already produced research artifacts, retain
+the existing artifact admission checks and use the next main push instead.
+An explicit ACR research target with `rebuild_research_runner=true` can also
+recover that product. Select its research target; `all` includes unrelated images.
+Every recovery keeps current-main checks, original attempt identity, native
+signing, OSS admission and image readback requirements.
+
 The separate native issuer signs each Build only after authenticated CI,
 original software producer, immutable OCI programs and OSS bytes agree.
 Preflight binds operator policy and TLS to the selected publication before

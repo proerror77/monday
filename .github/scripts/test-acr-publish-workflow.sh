@@ -106,6 +106,24 @@ if [[ ${1:-} == --public-policy ]]; then exit 0; fi
 ruby -ryaml - "$workflow" "$ploy_workflow" "$ci_workflow" "$script_dir/../workflows/security-enabled.yml" <<'RUBY'
 acr, ploy, ci, security = ARGV.map { |path| YAML.safe_load(File.read(path)) }
 abort 'ACR queue changed' unless acr.fetch('concurrency') == {'group'=>'acr-publish-${{ github.ref }}','queue'=>'max','cancel-in-progress'=>false}
+selector = ploy.fetch('jobs').fetch('image-smoke-selector')
+carry = selector.fetch('steps').find { |step| step['id']=='cumulative' }
+abort 'carry deferral escaped main pushes' unless carry.fetch('if') == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+expected_carry = {
+  'GH_TOKEN'=>'${{ github.token }}',
+  'SELECTED_JOBS'=>'${{ steps.scope.outputs.jobs }}',
+  'SELECTED_RESEARCH_PRODUCT'=>'${{ steps.scope.outputs.research_product }}',
+  'RESEARCH_CARRY_MODE'=>'defer-unconfigured',
+  'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}'
+}
+abort 'carry deferral lost direct scope or public-only policy input' unless carry.fetch('env') == expected_carry
+%w[research_pending_product research_deferred_product].each do |name|
+  abort 'carry scheduling evidence is missing' unless selector.fetch('outputs').fetch(name) == "${{ steps.cumulative.outputs.#{name} }}"
+end
+acr_selector = acr.fetch('jobs').fetch('selector')
+checkout = acr_selector.fetch('steps').find { |step| step.fetch('uses','').start_with?('actions/checkout@') }
+abort 'pending publication needs complete main history' unless checkout.fetch('with') == {'ref'=>'refs/heads/main','fetch-depth'=>0}
+abort 'ACR source planning compiles software' if acr_selector.to_s.match?(/\bcargo\s+(build|test|check|clippy|run)\b/)
 [acr,ploy,ci,security].each do |doc|
   doc.fetch('jobs').each do |id,job|
     abort "public ACK runner exposure: #{id}" if job.fetch('runs-on','').to_s.match?(/self-hosted|monday-ack-research/)
