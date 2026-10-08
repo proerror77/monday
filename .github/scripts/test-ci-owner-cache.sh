@@ -17,6 +17,25 @@ done
 native_before=$(PATH="$work/native-bin:$PATH" bash "$root/.github/scripts/ci-owner-cache.sh" native-input)
 native_after=$(PATH="$work/native-bin:$PATH" CXXFLAGS=-DFIXTURE_NATIVE_INPUT_CHANGED bash "$root/.github/scripts/ci-owner-cache.sh" native-input)
 [[ $native_before != "$native_after" ]]
+# A narrow first save must not become an exact hit for wider coverage.
+plan=$(jq -cn '{handoff:"false",json:"false",ondo:"false",collector:"false",control:"false",focused:"true",loop:"false",focused_packages:",hft-live,",loop_packages:""}')
+coverage() { MONDAY_CI_CACHE_PLAN="$1" bash "$root/.github/scripts/ci-owner-cache.sh" coverage-input; }
+narrow=$(coverage "$plan")
+wide=$(coverage "$(jq -c '.handoff="true" | .focused_packages=",hft-live,hft-cex-research-worker,"' <<<"$plan")")
+[[ $narrow != "$wide" ]]
+[[ $(coverage "$(jq -c '.focused_packages=",hft-live,hft-cex-research-worker,"' <<<"$plan")") != "$narrow" ]]
+for flag in handoff json ondo collector control focused loop; do
+  changed=$(jq -c --arg flag "$flag" '.[$flag]=(if .[$flag]=="true" then "false" else "true" end) | .loop_packages="alpha-harness"' <<<"$plan")
+  [[ $(coverage "$changed") != "$narrow" ]]
+done
+[[ $(coverage "$(jq -c '.focused_packages="hft-live,hft-live" | .source_sha="other-source" | .event="pull_request"' <<<"$plan")") == "$narrow" ]]
+[[ $(coverage "$(jq -c '.focused="false" | .focused_packages=""' <<<"$plan")") == \
+   "$(coverage "$(jq -c '.focused="false" | .focused_packages="ignored-package"' <<<"$plan")")" ]]
+for invalid in 'del(.handoff)' '.focused="yes"' '.focused_packages=""' '.focused_packages="hft-live --features unexpected"'; do
+  if coverage "$(jq -c "$invalid" <<<"$plan")"; then
+    echo 'invalid cache coverage accepted' >&2; exit 1
+  fi
+done
 cat >"$work/bin/cargo" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -128,6 +147,10 @@ abort 'cache save precedes cleanup' unless cleanup_index < save_index
 abort 'real cleanup is not validated on PRs' unless steps.fetch(cleanup_index).fetch('if') == "${{ success() && needs.scope.outputs.toolchain == 'true' }}"
 abort 'save is not success/main bound' unless save.fetch('if').include?("github.ref == 'refs/heads/main' && success()")
 abort 'restore/save key or owner drift' unless %w[key workspaces].all? { |k| restore.dig('with', k) == save.dig('with', k) }
+abort 'cache omits the selected compilation scope' unless restore.dig('with', 'key').include?('steps.cache-info.outputs.coverage')
+dimensions = steps.find { |step| step['name'] == 'Record cache dimensions' }
+abort 'cache coverage plan is not wired from the selector' unless dimensions.dig('env', 'MONDAY_CI_CACHE_PLAN') == '${{ toJSON(needs.scope.outputs) }}'
+abort 'cache coverage output is never computed' unless dimensions.fetch('run').include?('ci-owner-cache.sh" coverage-input')
 # A changed admitted feature or package must permit a new dependency cache save.
 # Keep compiler/native/manifest dimensions fixed in these coverage fixtures.
 key_inputs = restore.dig('with', 'key').scan(/hashFiles\((.*?)\)/).flat_map { |group| group.first.scan(/'([^']+)'/).flatten }
@@ -136,7 +159,7 @@ dimension = lambda do |directory|
   Digest::SHA256.hexdigest(key_inputs.sort.map { |path| Digest::SHA256.file("#{directory}/#{path}").digest }.join)
 end
 Dir.mktmpdir('ci-cache-coverage') do |fixture|
-  coverage_paths = %w[.github/workflows/ci.yml .github/scripts/select-rust-ci-scope.sh]
+  coverage_paths = %w[.github/workflows/ci.yml .github/scripts/select-rust-ci-scope.sh rust_hft/scripts/workspace-metadata.sh]
   (key_inputs + coverage_paths).uniq.each do |path|
     FileUtils.mkdir_p(File.dirname("#{fixture}/#{path}"))
     FileUtils.cp("#{root}/#{path}", "#{fixture}/#{path}")
@@ -157,6 +180,13 @@ Dir.mktmpdir('ci-cache-coverage') do |fixture|
   File.write(scope_path, changed)
   abort 'changed package coverage reuses the immutable cache key' if dimension.call(fixture) == baseline
   File.write(scope_path, scope)
+  metadata_path = "#{fixture}/rust_hft/scripts/workspace-metadata.sh"
+  metadata = File.read(metadata_path)
+  changed = metadata.sub('.workspace_members | index($id)', '(.workspace_members + ["cache-fixture-member"]) | index($id)')
+  abort 'metadata coverage fixture did not change member selection' if changed == metadata
+  File.write(metadata_path, changed)
+  abort 'changed metadata coverage reuses the immutable cache key' if dimension.call(fixture) == baseline
+  File.write(metadata_path, metadata)
   FileUtils.mkdir_p("#{fixture}/rust_hft/src")
   File.write("#{fixture}/rust_hft/src/cache-fixture.rs", 'changed local source')
   abort 'local source changes invalidate dependency reuse' unless dimension.call(fixture) == baseline

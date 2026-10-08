@@ -2,9 +2,29 @@
 # Keep external dependencies in disjoint CI targets. Rebuild local code.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
-mode=${1:?expected native-input or cleanup}
+mode=${1:?expected native-input, coverage-input or cleanup}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+if [[ $mode == coverage-input ]]; then
+  # Bind only the commands this Rust job executes, excluding source/event IDs.
+  ruby -rjson -rdigest <<'RUBY'
+plan = JSON.parse(ENV.fetch('MONDAY_CI_CACHE_PLAN'))
+flags = %w[handoff json ondo collector control focused loop]
+coverage = flags.to_h do |name|
+  value = plan.fetch(name)
+  abort 'invalid Rust cache coverage flag' unless %w[true false].include?(value)
+  [name, value]
+end
+%w[focused loop].each do |name|
+  packages = plan.fetch("#{name}_packages").split(',').reject(&:empty?)
+  abort 'invalid Rust cache coverage package' unless packages.all? { |p| p.match?(/\A[a-zA-Z0-9_-]+\z/) }
+  abort 'active Rust cache coverage has no packages' if coverage.fetch(name) == 'true' && packages.empty?
+  coverage["#{name}_packages"] = coverage.fetch(name) == 'true' ? packages.uniq.sort : []
+end
+puts "coverage=#{Digest::SHA256.hexdigest(JSON.generate(coverage))}"
+RUBY
+  exit 0
+fi
 if [[ $mode == native-input ]]; then
   [[ $(uname -s) == Linux ]]
   {
