@@ -18,7 +18,8 @@ for target in cex-runner controller prediction-runner; do
     # Only deployed image inputs belong here. Governance/history remain in their
     # per-change contract jobs and are not permanent rebuild inputs.
     git diff --no-renames --name-only "$base" "$head" -- rust_hft/ deployment/aliyun/research/ \
-      .github/scripts/build-research-release.sh .github/scripts/research-release-products.sh \
+      .github/scripts/build-research-release.sh .github/scripts/build-research-recipes.sh \
+      .github/scripts/research-release-products.sh \
       .github/scripts/research-release-products.json .github/scripts/capture-research-build-inputs.sh \
       .github/scripts/research-image-smoke.sh .github/scripts/research-release-bundle.rb \
       .github/scripts/verify-research-product-image.sh .cargo/ >"$work/paths"
