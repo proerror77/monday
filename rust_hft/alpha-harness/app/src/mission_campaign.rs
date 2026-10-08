@@ -22,7 +22,6 @@ use crate::cli::CampaignLearnArgs;
 use crate::cli::CampaignStudyProposeArgs;
 use crate::cli::BUILD_SOURCE_REVISION;
 use crate::mission_dispatch;
-use crate::mission_render::allowed_research_feature_fields;
 use crate::mission_render::render_cex_bundle;
 use crate::mission_render::render_prepared_cex_bundle;
 use crate::mission_render::validate_render_instrument_scope;
@@ -3862,6 +3861,7 @@ fn validate_negative_campaign_result(
             &round.feedback,
             loaded.request.research_plan.max_candidates()?,
             loaded.request.research_plan.supervised_model_scope,
+            &loaded.request.research_plan.feature_fields,
         )?;
     }
     Ok(())
@@ -3871,8 +3871,8 @@ fn validate_campaign_round_feedback(
     feedback: &CampaignRoundFeedbackV1,
     max_factors: usize,
     scope: alpha_domain::CexSupervisedModelScopeV1,
+    allowed_fields: &[String],
 ) -> anyhow::Result<()> {
-    let allowed_fields = allowed_research_feature_fields();
     if feedback.factor_attempts != feedback.factors.len()
         || feedback.factor_attempts > max_factors
         || feedback.accepted_factors
@@ -6106,11 +6106,13 @@ pub(crate) mod tests {
             cart: Some(failed_trading_evaluation),
             ..CampaignRoundFeedbackV1::default()
         };
+        let allowed_fields = CexCampaignResearchPlanV1::canonical().feature_fields;
 
         validate_campaign_round_feedback(
             &feedback,
             1,
             alpha_domain::CexSupervisedModelScopeV1::default(),
+            &allowed_fields,
         )
         .unwrap();
         // Fixed-notional additive accounting can lose more than the initial
@@ -6124,6 +6126,7 @@ pub(crate) mod tests {
             &feedback,
             1,
             alpha_domain::CexSupervisedModelScopeV1::default(),
+            &allowed_fields,
         )
         .unwrap();
         assert!(!feedback.factors[0].evaluation.as_ref().unwrap().passed);
@@ -6132,7 +6135,8 @@ pub(crate) mod tests {
         assert!(validate_campaign_round_feedback(
             &invalid,
             1,
-            alpha_domain::CexSupervisedModelScopeV1::default()
+            alpha_domain::CexSupervisedModelScopeV1::default(),
+            &allowed_fields,
         )
         .is_err());
         for drawdown in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -6141,7 +6145,8 @@ pub(crate) mod tests {
             assert!(validate_campaign_round_feedback(
                 &invalid,
                 1,
-                alpha_domain::CexSupervisedModelScopeV1::default()
+                alpha_domain::CexSupervisedModelScopeV1::default(),
+                &allowed_fields,
             )
             .is_err());
         }
@@ -6149,7 +6154,75 @@ pub(crate) mod tests {
         assert!(validate_campaign_round_feedback(
             &feedback,
             1,
-            alpha_domain::CexSupervisedModelScopeV1::default()
+            alpha_domain::CexSupervisedModelScopeV1::default(),
+            &allowed_fields,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn campaign_feedback_rejects_features_outside_the_active_plan_family() {
+        let failed_trading_evaluation = CampaignEvaluationFeedbackV1 {
+            passed: false,
+            score: 0.1,
+            time_series_ic: Some(0.05),
+            time_series_rank_ic: Some(0.04),
+            cumulative_net_return: -0.01,
+            max_drawdown: 0.02,
+            net_sharpe: -0.2,
+            trade_count: 10,
+            total_turnover: 1.0,
+            max_book_depth_fraction: None,
+            max_book_depth_fraction_limit: None,
+            capacity_breached: false,
+        };
+        let feedback_for = |source_feature: &str| CampaignRoundFeedbackV1 {
+            factor_attempts: 1,
+            accepted_factors: 1,
+            factors: vec![CampaignFactorFeedbackV1 {
+                factor_signature_sha256: "7".repeat(64),
+                source_features: vec![source_feature.to_string()],
+                rejection_codes: Vec::new(),
+                evaluation: Some(failed_trading_evaluation.clone()),
+            }],
+            baseline_gate_passed: false,
+            baseline_failure_codes: vec![CexBaselineFailureCodeV1::InsufficientEvidence],
+            ridge: Some(failed_trading_evaluation.clone()),
+            cart: Some(failed_trading_evaluation.clone()),
+            ..CampaignRoundFeedbackV1::default()
+        };
+        let h1 = CexCampaignResearchPlanV1::canonical().feature_fields;
+        let h2 = CexCampaignResearchPlanV1::h2().feature_fields;
+        let scope = alpha_domain::CexSupervisedModelScopeV1::default();
+
+        validate_campaign_round_feedback(&feedback_for("book_imbalance"), 1, scope, &h1).unwrap();
+        validate_campaign_round_feedback(&feedback_for("book_imbalance"), 1, scope, &h2).unwrap();
+        validate_campaign_round_feedback(
+            &feedback_for(alpha_domain::CEX_RESEARCH_CONT_OFI_LAG60S_FIELD),
+            1,
+            scope,
+            &h2,
+        )
+        .unwrap();
+        validate_campaign_round_feedback(
+            &feedback_for(alpha_domain::CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD),
+            1,
+            scope,
+            &h1,
+        )
+        .unwrap();
+        assert!(validate_campaign_round_feedback(
+            &feedback_for(alpha_domain::CEX_RESEARCH_CONT_OFI_LAG60S_FIELD),
+            1,
+            scope,
+            &h1,
+        )
+        .is_err());
+        assert!(validate_campaign_round_feedback(
+            &feedback_for(alpha_domain::CEX_RESEARCH_AGGREGATE_TRADE_FLOW_IMBALANCE_FIELD),
+            1,
+            scope,
+            &h2,
         )
         .is_err());
     }
