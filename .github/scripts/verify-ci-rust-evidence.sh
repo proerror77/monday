@@ -67,6 +67,7 @@ ci_rust_command_sha() {
       .github/scripts/write-ci-rust-evidence.sh .github/scripts/verify-ci-rust-evidence.sh \
       .github/scripts/verify-ci-rust-same-run.sh .github/scripts/wait-ci-rust-evidence.sh \
       rust_hft/scripts/cargo-scoped.sh rust_hft/scripts/workspace-metadata.sh rust_hft/workspaces.json \
+      .github/scripts/test-rust-workspaces.sh \
       .github/scripts/install-cargo-nextest.sh .github/scripts/loop-nextest-archive.sh \
       .github/scripts/loop-nextest-doctests.sh .github/scripts/loop-nextest-plan.rb \
       .github/scripts/loop-nextest-shard.sh .github/scripts/loop-nextest-counts.sh \

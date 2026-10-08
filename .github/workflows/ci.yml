@@ -448,7 +448,7 @@ jobs:
             rust_hft/research-core/platform -> target
             rust_hft/runtime -> target
             rust_hft/prediction-markets -> target
-          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/scripts/check-collector-test-presence.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
+          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/scripts/test-rust-workspaces.sh', '.github/scripts/check-collector-test-presence.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
           cache-all-crates: false
           save-if: false
 
@@ -554,6 +554,18 @@ jobs:
           path: rust_hft/dist/*
           if-no-files-found: ignore
 
+      - name: Check CEX worker without operator features
+        if: >-
+          ${{ contains(needs.scope.outputs.owning_packages, ',alpha-harness,') ||
+              contains(needs.scope.outputs.owning_packages, ',hft-cex-research-worker,') ||
+              contains(needs.scope.outputs.loop_packages, ',alpha-harness,') ||
+              contains(needs.scope.outputs.loop_packages, ',hft-cex-research-worker,') ||
+              contains(needs.scope.outputs.focused_packages, ',alpha-harness,') ||
+              contains(needs.scope.outputs.focused_packages, ',hft-cex-research-worker,') }}
+        run: |
+          bash "$GITHUB_WORKSPACE/.github/scripts/test-rust-workspaces.sh" --cex-products
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" check -p hft-cex-research-worker --bin monday-cex-worker --locked
+
       - name: Strict research Clippy
         id: clippy_loop
         if: needs.scope.outputs.loop == 'true'
@@ -612,7 +624,7 @@ jobs:
             rust_hft/research-core/platform -> target
             rust_hft/runtime -> target
             rust_hft/prediction-markets -> target
-          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/scripts/check-collector-test-presence.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
+          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/scripts/test-rust-workspaces.sh', '.github/scripts/check-collector-test-presence.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
           cache-all-crates: false
           save-if: true
 

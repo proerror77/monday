@@ -1,5 +1,7 @@
+#[cfg(feature = "operator")]
+use crate::cli::{print_json, LearnMissionArgs, MissionStatusArgs};
 use crate::{
-    cli::{print_json, EngineChoice, LearnMissionArgs, MissionStatusArgs, RunMissionArgs},
+    cli::{EngineChoice, RunMissionArgs},
     data_mission,
 };
 use alpha_domain::{
@@ -12,11 +14,16 @@ use alpha_engine::{
     engines::{GeneticProgrammingEngine, OfflineRlEngine, OfflineTrace},
     evaluation::{prepare_dataset, EngineContext},
     formula_evaluator::FormulaEvaluator,
-    learning::{close_learning_loop, FailureCritic, LearningConfig},
-    llm::{LlmConfig, LlmProposalEngine, OpenAiCompatibleClient},
     AutoResearchKernel, ProposalEngine, RunControl,
 };
-use alpha_store::{AlphaStore, StoreError};
+#[cfg(feature = "operator")]
+use alpha_engine::{
+    learning::{close_learning_loop, FailureCritic, LearningConfig},
+    llm::{LlmConfig, LlmProposalEngine, OpenAiCompatibleClient},
+};
+use alpha_store::AlphaStore;
+#[cfg(feature = "operator")]
+use alpha_store::StoreError;
 use anyhow::{bail, Context};
 use hft_factor_dsl::{validate_live_formula, FactorAst, FactorTerminal, LiveEventDomain};
 
@@ -53,10 +60,12 @@ pub struct MissionRunReport {
     pub walk_forward_partition: CexResearchContentRefV1,
 }
 
+#[cfg(feature = "operator")]
 pub fn run_mission(args: RunMissionArgs, resume: bool) -> anyhow::Result<()> {
     print_json(&execute_mission(&args, resume)?)
 }
 
+#[cfg(any(feature = "operator", test))]
 pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<MissionRunReport> {
     execute_mission_inner(args, resume, None)
 }
@@ -339,6 +348,7 @@ fn read_mcts_baseline_artifact(
     Ok(artifact)
 }
 
+#[cfg(feature = "operator")]
 pub fn mission_status(args: MissionStatusArgs) -> anyhow::Result<()> {
     let store = AlphaStore::open(&args.db)?;
     let lineage = store.mission_lineage(&args.mission_id)?;
@@ -356,10 +366,12 @@ pub fn mission_status(args: MissionStatusArgs) -> anyhow::Result<()> {
     }))
 }
 
+#[cfg(feature = "operator")]
 pub fn learn_mission(args: LearnMissionArgs) -> anyhow::Result<()> {
     print_json(&execute_learning(&args)?)
 }
 
+#[cfg(feature = "operator")]
 pub fn execute_learning(
     args: &LearnMissionArgs,
 ) -> anyhow::Result<alpha_engine::learning::LearningOutcome> {
@@ -449,12 +461,15 @@ fn build_engine(
                     .map_err(anyhow::Error::msg)?,
             )
         }
+        #[cfg(feature = "operator")]
         EngineChoice::Llm => {
             let client =
                 OpenAiCompatibleClient::new(LlmConfig::from_env().map_err(anyhow::Error::msg)?)
                     .map_err(anyhow::Error::msg)?;
             Box::new(LlmProposalEngine::new(client, fields).map_err(anyhow::Error::msg)?)
         }
+        #[cfg(not(feature = "operator"))]
+        EngineChoice::Llm => bail!("LLM proposals require the diagnostic operator build"),
     };
     Ok(engine)
 }

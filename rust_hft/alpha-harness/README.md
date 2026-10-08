@@ -25,6 +25,27 @@ settlement readback. The generated Job invokes `monday-cex-worker mission
 campaign-execute` with the existing admitted arguments. The worker owns the
 scientific feature and accepts only that execution command.
 
+The default `operator` feature compiles the operator CLI, data preparation,
+legacy LoopRun orchestration, approval/signing commands and diagnostic LLM client.
+The worker disables the harness defaults and enables only `scientific`.
+Its normal graph keeps the search kernel and fitting implementation, without
+the operator command router or `alpha-engine/llm`. The shared Campaign input,
+admission, independent final-evaluation and settlement code stays unchanged.
+Scientific tests still exercise governance handoff through test-only helpers.
+
+This is a feature boundary inside the existing harness. The worker still
+depends on the shared app library, collector, store and control contracts.
+Build the operator and worker with separate Cargo invocations. Selecting both
+packages together enables the union of their features and cannot prove the
+production worker boundary.
+
+```bash
+bash .github/scripts/test-rust-workspaces.sh --cex-products
+cargo check --manifest-path rust_hft/research-core/Cargo.toml --locked -p alpha-harness --bin alpha-harness
+cargo check --manifest-path rust_hft/research-core/Cargo.toml --locked -p hft-cex-research-worker --bin monday-cex-worker
+cargo test --manifest-path rust_hft/research-core/Cargo.toml --locked -p alpha-harness --features scientific --lib
+```
+
 Frozen sequence and market models export explicit f32 parameters. Their pure
 manifest evaluators preserve causal padding, scaling, fitted-value identities,
 parent inheritance and reconstruction receipts. Independent prediction and

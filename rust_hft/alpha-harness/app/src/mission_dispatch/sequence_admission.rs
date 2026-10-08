@@ -1976,6 +1976,7 @@ mod tests {
         crate::mission_campaign::market_encoder::request_tests::rebind(&mut changed);
         assert_ne!(execution_binding(&changed, &controller).unwrap(), binding);
     }
+    #[cfg(feature = "operator")]
     #[test]
     fn stage_operator_cli_parses_without_render_registration_cycle() {
         use clap::Parser;
@@ -1987,6 +1988,10 @@ mod tests {
             "alpha-harness mission dispatch register-study --ledger /root/ledger.duckdb --signed-study /root/signed-study.json --trusted-keys /root/keys.json --study-approval-id original-approval --roots /root/roots.json --output /root/registered.json",
             "alpha-harness mission dispatch inspect-study --ledger /root/ledger.duckdb --study-id original-study --output /root/study-inspection.json",
         ] {assert!(crate::cli::Cli::try_parse_from(command.split_whitespace()).is_ok(),"{command}");}
+    }
+
+    #[test]
+    fn describe_study_does_not_require_render_registration() {
         let root = tempfile::tempdir().unwrap();
         let request = crate::mission_campaign::market_encoder::request_tests::request();
         let path = root.path().join("submission.json");

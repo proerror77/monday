@@ -3,6 +3,46 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# This mode validates only the two independently built CEX products.
+mode=all
+if (($#)); then
+  if [[ $# != 1 || $1 != --cex-products ]]; then
+    echo 'usage: test-rust-workspaces.sh [--cex-products]' >&2
+    exit 2
+  fi
+  mode=cex-products
+fi
+
+check_cex_products() {
+  cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
+    -p alpha-harness --locked --edges normal --prefix none >"$work/cex-operator.tree"
+  if grep -E '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-operator.tree"; then
+    echo 'CEX operator pulls a training or ONNX implementation' >&2; exit 1
+  fi
+  cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
+    -p hft-cex-research-worker --locked --edges normal --prefix none >"$work/cex-worker.tree"
+  grep -q '^hft-research-ml ' "$work/cex-worker.tree"
+  grep -q '^burn ' "$work/cex-worker.tree"
+  # Inspect each product separately. A combined selection unifies their features.
+  cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
+    -p alpha-harness --locked --edges normal,features --prefix none >"$work/cex-operator.features"
+  grep -Fq 'alpha-engine feature "llm"' "$work/cex-operator.features"
+  cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
+    -p hft-cex-research-worker --locked --edges normal,features --prefix none >"$work/cex-worker.features"
+  grep -Fq 'alpha-harness feature "scientific"' "$work/cex-worker.features"
+  grep -Fq 'alpha-engine feature "kernel"' "$work/cex-worker.features"
+  grep -Fq 'alpha-engine feature "fitting"' "$work/cex-worker.features"
+  if grep -E '^alpha-harness feature "(default|operator)"|^alpha-engine feature "llm"' "$work/cex-worker.features"; then
+    echo 'CEX worker enables operator commands or diagnostic LLM proposals' >&2; exit 1
+  fi
+  printf 'CEX operator and scientific worker dependency contracts passed\n'
+}
+
+if [[ $mode == cex-products ]]; then
+  check_cex_products
+  exit 0
+fi
+
 "$root/rust_hft/scripts/workspace-metadata.sh" >"$work/metadata.json"
 jq -e '[.packages[].name] | length == (unique | length)' "$work/metadata.json" >/dev/null
 MONDAY_CARGO_DRY_RUN=1 "$root/rust_hft/scripts/cargo-scoped.sh" check \
@@ -36,15 +76,7 @@ cargo tree --manifest-path "$root/rust_hft/shared/Cargo.toml" \
 if grep -E '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-input.tree"; then
   echo 'Immutable CEX input readers pull a scientific implementation' >&2; exit 1
 fi
-cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
-  -p alpha-harness --locked --edges normal --prefix none >"$work/cex-operator.tree"
-if grep -E '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-operator.tree"; then
-  echo 'CEX operator pulls a training or ONNX implementation' >&2; exit 1
-fi
-cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
-  -p hft-cex-research-worker --locked --edges normal --prefix none >"$work/cex-worker.tree"
-grep -q '^hft-research-ml ' "$work/cex-worker.tree"
-grep -q '^burn ' "$work/cex-worker.tree"
+check_cex_products
 for profile in default db full; do
   options=()
   [[ $profile == default ]] || options=(--features "$profile")
