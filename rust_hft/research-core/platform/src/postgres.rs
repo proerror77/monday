@@ -14,6 +14,8 @@ use crate::{
 
 pub const MIGRATION: &str = include_str!("../sql/postgres.sql");
 pub const BUILD_RELEASE_MIGRATION: &str = include_str!("../sql/verified_build_release.sql");
+pub const BUILD_IMPORT_ADMISSION_MIGRATION: &str =
+    include_str!("../sql/build_import_admission.sql");
 pub const NATIVE_ADMISSION_MIGRATION: &str = include_str!("../sql/native_admission.sql");
 pub const NATIVE_CAMPAIGN_INPUTS_MIGRATION: &str =
     include_str!("../sql/native_campaign_inputs.sql");
@@ -543,11 +545,34 @@ impl Ledger {
     pub async fn register_build(
         &self,
         published: &crate::release_publisher::VerifiedPublishedBuildRelease,
+        admission: &crate::release_publisher::VerifiedImportAdmission,
     ) -> Result<String> {
         let verified = published.verified();
         let artifact = verified.artifact();
         let id = artifact.id()?;
+        admission.validate_release(published, chrono::Utc::now().timestamp_millis())?;
         let mut tx = self.pool.begin().await?;
+        // All registration paths use the same independent PG admission gate.
+        query("SELECT set_config('monday.build_import_admission_sha256',$1,true)")
+            .bind(admission.envelope_sha256())
+            .execute(&mut *tx)
+            .await?;
+        let receipt = &verified.signed().receipt;
+        // Missing migration/function fails closed even on a pre-existing schema
+        // whose old release table lacks the new trigger.
+        query("SELECT research.lock_build_import_admission($1,$2,$3,$4)")
+            .bind(&receipt.build_sha256)
+            .bind(
+                receipt
+                    .image
+                    .rsplit_once("@sha256:")
+                    .context("pinned import image")?
+                    .1,
+            )
+            .bind(&receipt.publication_readback_sha256)
+            .bind(admission.envelope_sha256())
+            .execute(&mut *tx)
+            .await?;
         query("SELECT mode FROM research.authority WHERE singleton FOR SHARE")
             .fetch_one(&mut *tx)
             .await?;
@@ -557,6 +582,31 @@ impl Ledger {
             .bind(serde_json::to_value(verified.signed())?).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(id)
+    }
+    /// Independent operator only. The importer has no writes to this table.
+    #[cfg(feature = "publisher")]
+    pub async fn set_build_import_admission(
+        &self,
+        admission: &crate::release_publisher::VerifiedImportAdmission,
+    ) -> Result<()> {
+        let a = admission.admission();
+        anyhow::ensure!(
+            a.expires_ms > chrono::Utc::now().timestamp_millis(),
+            "expired operator admission"
+        );
+        query("INSERT INTO research.build_import_admissions(build_sha256,image_sha256,publication_proof_sha256,envelope_sha256,revision,expires_ms,revoked,document) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (build_sha256,image_sha256,publication_proof_sha256) DO UPDATE SET envelope_sha256=EXCLUDED.envelope_sha256,revision=EXCLUDED.revision,expires_ms=EXCLUDED.expires_ms,revoked=EXCLUDED.revoked,document=EXCLUDED.document")
+            .bind(&a.build_sha256).bind(&a.image_sha256).bind(&a.publication_proof_sha256)
+            .bind(admission.envelope_sha256()).bind(a.revision).bind(a.expires_ms).bind(a.revoked)
+            .bind(admission.document()?).execute(&self.pool).await?;
+        let row = query("SELECT envelope_sha256,document FROM research.build_import_admissions WHERE build_sha256=$1 AND image_sha256=$2 AND publication_proof_sha256=$3")
+            .bind(&a.build_sha256).bind(&a.image_sha256).bind(&a.publication_proof_sha256)
+            .fetch_one(&self.pool).await?;
+        ensure!(
+            row.get::<String, _>("envelope_sha256") == admission.envelope_sha256()
+                && row.get::<Value, _>("document") == admission.document()?,
+            "independent approval PG readback changed"
+        );
+        Ok(())
     }
     pub async fn build_artifact(&self, id: &str) -> Result<crate::build::BuildArtifact> {
         let row = query("SELECT a.document AS artifact,r.document AS release,r.receipt_sha256 FROM research.build_artifacts a JOIN research.build_releases r USING(artifact_sha256) WHERE artifact_sha256=$1")

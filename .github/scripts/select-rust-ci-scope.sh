@@ -275,6 +275,7 @@ for path in "${paths[@]}"; do
     .github/scripts/read-release-required-checks.sh|.github/scripts/wait-release-required-checks.sh|\
     .github/scripts/research-image-release-artifact.sh|.github/scripts/test-research-image-release-artifact.sh|\
     .github/scripts/publish-research-build-release.sh|.github/scripts/select-research-oss-policy.jq|\
+    .github/scripts/migrate-research-oss-policy.sh|.github/scripts/test-migrate-research-oss-policy.sh|\
     .github/scripts/verify-research-runner-binaries.sh|\
     .github/scripts/read-acr-publish-source.sh|.github/scripts/select-acr-publish-source.sh|\
     .github/scripts/test-acr-publish-source-readback.sh)
