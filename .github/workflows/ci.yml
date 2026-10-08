@@ -221,6 +221,7 @@ jobs:
           node .github/scripts/test-local-lock-impact.mjs
           bash .github/scripts/test-ack-rust-batch.sh
           bash .github/scripts/test-ci-rust-evidence.sh
+          bash .github/scripts/test-rerun-loop-nextest.sh
           bash .github/scripts/test-loop-nextest.sh
           bash .github/scripts/test-loop-nextest-doctests.sh
           .github/scripts/test-ci-rust-same-run.sh
@@ -346,16 +347,24 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/.github/scripts/install-cargo-nextest.sh"
 
       - name: Download nextest archive
+        id: archive_download
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: loop-nextest-archive-${{ github.run_id }}-${{ needs.rust_loop_nextest_archive.outputs.producer_attempt }}
           path: ${{ runner.temp }}/loop-nextest-archive
 
       - name: Download verified partition plan
+        id: plan_download
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: loop-nextest-expected-${{ github.run_id }}-${{ needs.rust_loop_nextest_archive.outputs.producer_attempt }}
           path: ${{ runner.temp }}/loop-nextest-plan
+
+      - name: Explain recovery when retained producer artifacts are unavailable
+        if: ${{ failure() && (steps.archive_download.conclusion == 'failure' || steps.plan_download.conclusion == 'failure') }}
+        run: |
+          echo "Producer artifact unavailable. After the run finishes, use GITHUB_REPOSITORY=$GITHUB_REPOSITORY bash .github/scripts/rerun-loop-nextest.sh $GITHUB_RUN_ID; expired archive/plan causes a complete producer rerun." >&2
+          exit 1
 
       - name: Run shard
         env:

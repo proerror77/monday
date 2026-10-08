@@ -449,7 +449,7 @@ for path in "${paths[@]}"; do
       ;;
     .github/scripts/loop-nextest-archive.sh|.github/scripts/loop-nextest-shard.sh|.github/scripts/loop-nextest-counts.sh|\
     .github/scripts/loop-nextest-doctests.sh|.github/scripts/loop-nextest-wait.sh|.github/scripts/loop-nextest-gate.sh|.github/scripts/loop-nextest-plan.rb|\
-    .github/scripts/install-cargo-nextest.sh|.github/scripts/test-loop-nextest.sh|.github/scripts/test-loop-nextest-doctests.sh)
+    .github/scripts/rerun-loop-nextest.sh|.github/scripts/test-rerun-loop-nextest.sh|.github/scripts/install-cargo-nextest.sh|.github/scripts/test-loop-nextest.sh|.github/scripts/test-loop-nextest-doctests.sh)
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
