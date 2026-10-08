@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
-use hft_research_platform::{
-    release::BuildReleaseTrust,
-    release_publisher::{self, PublicationRequest, PublisherPolicy, ReleaseGateway},
+use hft_research_platform::release_publisher::{
+    self, PublicationRequest, PublisherPolicy, ReleaseGateway,
 };
 use std::path::Path;
 #[tokio::main]
@@ -15,6 +14,13 @@ async fn main() -> Result<()> {
             let key=release_publisher::read_signing_key(Path::new(key))?;
             let signed=release_publisher::SignedImportAdmission::sign(admission,(*key_id).to_owned(),&key,&policy,chrono::Utc::now().timestamp_millis())?;
             println!("{}",serde_json::to_string(&signed)?);
+        }
+        ["set-import-admission",policy,admission]=>{
+            let policy:PublisherPolicy=release_publisher::read_json(Path::new(policy))?;
+            let admission=release_publisher::read_import_admission(Path::new(admission),&policy)?;
+            let ledger=hft_research_platform::postgres::Ledger::connect(&std::env::var("MONDAY_RESEARCH_DATABASE_URL").context("independent admission owner PG URL required")?).await.map_err(|_|anyhow::anyhow!("admission owner PG unavailable"))?;
+            ledger.set_build_import_admission(&admission).await?;
+            println!("independent Build import admission projected");
         }
         ["oss-check-config",policy,key,manifest,repository,product,image_repository,source,session]=>{
             let policy:PublisherPolicy=release_publisher::read_json(Path::new(policy))?;
@@ -57,14 +63,7 @@ async fn main() -> Result<()> {
             let gateway=ReleaseGateway::with_tls(endpoint,token,&policy.tls)?;
             println!("{}",serde_json::to_string(&release_publisher::publish(Path::new(root),&request,&policy,&key,&gateway).await?)?);
         }
-        ["import",build,oci,proof,trust,endpoint,token]=>{
-            let trust:BuildReleaseTrust=release_publisher::read_json(Path::new(trust))?;
-            let tls=match std::env::var("MONDAY_RESEARCH_RELEASE_TLS_FILE") {Ok(path)=>release_publisher::read_json(Path::new(&path))?,Err(_)=>hft_research_platform::transport::TlsConfig::default()};
-            let gateway=ReleaseGateway::with_tls(endpoint,hft_research_platform::service::read_secret(token)?,&tls)?;
-            let ledger=hft_research_platform::postgres::Ledger::connect(&std::env::var("MONDAY_RESEARCH_DATABASE_URL").context("release importer PG URL required")?).await.map_err(|_|anyhow::anyhow!("release importer PG unavailable"))?;
-            println!("{}",release_publisher::import_build(build,oci,proof,&trust,&gateway,&ledger).await?);
-        }
-        _=>bail!("usage: research-release-publisher --version | sign-import-admission POLICY ADMISSION KEY_ID EXISTING_PRIVATE_KEY_FILE | oss-check-config POLICY KEY SOFTWARE_MANIFEST REPOSITORY PRODUCT IMAGE_REPOSITORY SOURCE SESSION | oss-publish ROOT REQUEST POLICY KEY SESSION | oss-import ROOT BUILD OCI PROOF POLICY READER_SESSION ADMISSION | check-config POLICY PRIVATE_KEY_FILE SOFTWARE_MANIFEST REPOSITORY PRODUCT IMAGE_REPOSITORY HTTPS_GATEWAY TOKEN_FILE | plan SOURCE_ROOT REQUEST POLICY | publish SOURCE_ROOT REQUEST POLICY PRIVATE_KEY_FILE HTTPS_GATEWAY TOKEN_FILE | import BUILD_SHA256 OCI_SHA256 PROOF_SHA256 PUBLIC_TRUST_FILE HTTPS_GATEWAY TOKEN_FILE"),
+        _=>bail!("usage: research-release-publisher --version | sign-import-admission POLICY ADMISSION KEY_ID EXISTING_PRIVATE_KEY_FILE | set-import-admission POLICY SIGNED_ADMISSION | oss-check-config POLICY KEY SOFTWARE_MANIFEST REPOSITORY PRODUCT IMAGE_REPOSITORY SOURCE SESSION | oss-publish ROOT REQUEST POLICY KEY SESSION | oss-import ROOT BUILD OCI PROOF POLICY READER_SESSION ADMISSION | check-config POLICY PRIVATE_KEY_FILE SOFTWARE_MANIFEST REPOSITORY PRODUCT IMAGE_REPOSITORY HTTPS_GATEWAY TOKEN_FILE | plan SOURCE_ROOT REQUEST POLICY | publish SOURCE_ROOT REQUEST POLICY PRIVATE_KEY_FILE HTTPS_GATEWAY TOKEN_FILE"),
     }
     Ok(())
 }

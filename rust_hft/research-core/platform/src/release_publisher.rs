@@ -1315,30 +1315,6 @@ pub async fn read_build_release(
     Ok(VerifiedPublishedBuildRelease { verified })
 }
 
-pub async fn import_build(
-    build_id: &str,
-    oci_sha256: &str,
-    publication_proof_sha256: &str,
-    trust: &BuildReleaseTrust,
-    gateway: &ReleaseGateway,
-    ledger: &crate::postgres::Ledger,
-) -> Result<String> {
-    let published = read_build_release(
-        build_id,
-        oci_sha256,
-        publication_proof_sha256,
-        trust,
-        gateway,
-    )
-    .await?;
-    let id = ledger.register_build(&published).await?;
-    ensure!(
-        ledger.build_artifact(&id).await? == *published.artifact(),
-        "PG Build projection readback mismatch"
-    );
-    Ok(id)
-}
-
 /// Host-owned ACK approval. Updating this file never changes scientific grants.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1452,10 +1428,62 @@ impl SignedImportAdmission {
         Ok(&self.admission)
     }
 }
-fn read_import_admission(path: &Path, policy: &PublisherPolicy) -> Result<ImportAdmission> {
+/// Signature-verified independent approval; only its owner may project it to PG.
+pub struct VerifiedImportAdmission {
+    signed: SignedImportAdmission,
+    envelope_sha256: String,
+}
+impl VerifiedImportAdmission {
+    pub fn from_signed(signed: SignedImportAdmission, policy: &PublisherPolicy) -> Result<Self> {
+        signed.verify(policy)?;
+        let a = &signed.admission;
+        ensure!(
+            a.schema == 1
+                && valid_digest(&a.build_sha256)
+                && valid_digest(&a.image_sha256)
+                && valid_digest(&a.publication_proof_sha256),
+            "exact independent admission selectors required"
+        );
+        let envelope_sha256 = identity(&signed)?;
+        Ok(Self {
+            signed,
+            envelope_sha256,
+        })
+    }
+    pub fn admission(&self) -> &ImportAdmission {
+        &self.signed.admission
+    }
+    pub(crate) fn envelope_sha256(&self) -> &str {
+        &self.envelope_sha256
+    }
+    pub(crate) fn document(&self) -> Result<Value> {
+        Ok(serde_json::to_value(&self.signed)?)
+    }
+    pub(crate) fn validate_release(
+        &self,
+        published: &VerifiedPublishedBuildRelease,
+        now: i64,
+    ) -> Result<()> {
+        let receipt = &published.verified().signed().receipt;
+        self.admission().validate(
+            &receipt.build_sha256,
+            receipt
+                .image
+                .rsplit_once("@sha256:")
+                .context("pinned import image")?
+                .1,
+            &receipt.publication_readback_sha256,
+            now,
+        )
+    }
+}
+pub fn read_import_admission(
+    path: &Path,
+    policy: &PublisherPolicy,
+) -> Result<VerifiedImportAdmission> {
     let signed: SignedImportAdmission =
         serde_json::from_slice(&crate::transport::read_private_file(path)?)?;
-    Ok(signed.verify(policy)?.clone())
+    VerifiedImportAdmission::from_signed(signed, policy)
 }
 
 fn completed_producer(
@@ -1567,7 +1595,7 @@ pub async fn import_oss_build(
         .context("ACK import requires OSS")?
         .require_reader()?;
     let admission = read_import_admission(admission_path, policy)?;
-    admission.validate(
+    admission.admission().validate(
         build,
         image,
         proof_id,
@@ -1601,13 +1629,13 @@ pub async fn import_oss_build(
         &proof,
     )?;
     let admission = read_import_admission(admission_path, policy)?;
-    admission.validate(
+    admission.admission().validate(
         build,
         image,
         proof_id,
         chrono::Utc::now().timestamp_millis(),
     )?;
-    let id = ledger.register_build(&published).await?;
+    let id = ledger.register_build(&published, &admission).await?;
     ensure!(
         ledger.build_artifact(&id).await? == *published.artifact(),
         "ACK PG Build readback mismatch"

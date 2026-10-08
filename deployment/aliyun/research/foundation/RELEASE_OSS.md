@@ -15,7 +15,7 @@ The existing control Pod retains its runtime Gateway and AttemptWriter.
 | No same-key replacement | OSS V4 PUT with signed `x-oss-forbid-overwrite:true`; check bucket versioning before each PUT | Existing never-versioned bucket; approved policy must deny bypass writes/deletes |
 | Independent bytes | Separate bounded OSS GET after PUT; ACK repeats source/program/proof checks | Separate ACK read-only identity |
 | Build projection | ACK importer verifies signature, exact selectors and completed producers; immutable PG transaction and readback | Existing dedicated Build importer role |
-| Expiry and revocation | Every OSS request checks session expiry; ACK rereads host admission before registration | Host-owned admission updater; separate scientific revocation contract |
+| Expiry and revocation | OSS checks expiry per request; PG locks current exact independent approval through Build registration | Independent approval PG owner; native Run revocation remains separate |
 | Scientific task lease/fence/cancel | Existing PG admission, Gateway and AttemptWriter remain | Existing runtime acceptance; no change here |
 | Promotion, holdout and trading | Existing separate governance/runtime rules | Build publication/import grants none of these |
 
@@ -137,7 +137,7 @@ The host must supply these separate inputs:
 - A short-lived read-only OSS session in a private 0600 regular file.
 - A short-lived read-only private-repository GitHub token, available as `GH_TOKEN` to `gh`.
 - `MONDAY_RESEARCH_DATABASE_URL` for the existing dedicated Build importer with verified PG TLS.
-- A private signed admission envelope, atomically replaced by a separate approved authority owner.
+- A private signed admission envelope, atomically replaced by a separate approved authority owner, and its independently installed current PG state.
 - Operator-pinned `import_admission_keys` public keys in a read-only host policy mount. These keys must differ from all CI release keys; the publisher and importer must have no write access to the policy or admission mount.
 
 The envelope has `schema:1`, `key_id`, `admission` and canonical lowercase `signature_hex`. Admission fields are `schema:1`, `expires_ms`, `build_sha256`, `image_sha256`, `publication_proof_sha256`, and `revoked`. Sign `SignedImportAdmission::signing_bytes()` using the separately controlled operator Ed25519 key; the importer has only its public key. A private 0600 file alone is not authority. Unsigned files, CI-key signatures, key reuse and tampering are rejected. This branch does not create or copy that operator private key.
@@ -150,11 +150,21 @@ research-release-publisher sign-import-admission POLICY_FILE ADMISSION_JSON OPER
 
 The command checks the pinned independent public key, rejects CI-key reuse or a foreign key, and emits only the signed envelope; it never creates keys or grants cloud/Run authority. It can sign `revoked:true` updates for the same exact selectors. The operator atomically installs that envelope at the independently owned read-only ACK mount through the already approved control surface. Do not mount this private key into CI, the importer or research jobs. Key provisioning, policy/mount writes and approval lifecycle remain separate action-time approvals; producing an envelope does not authorize their installation.
 
+After separately approving the schema/role change, the independent owner uses its existing PG login (membership only in `monday_research_build_import_owner`) to install or revoke the signed envelope:
+
+```bash
+research-release-publisher set-import-admission POLICY_FILE SIGNED_ADMISSION_NEW
+```
+
+This command verifies the independent signature and exact selectors before PG UPSERT and independently reads back the installed document/hash. UPSERT commits before the independent readback; a later readback error does not prove rollback. On error, the owner must inspect current state and immutable audit, reconcile concurrent owner actions, and never blindly retry an older approval over a later revocation. A signed `revoked:true` update targets the same selector row. Reapproval is an explicit independently owned state change, not restoring a host file. No owner PG credential is mounted in the importer.
+For fresh schema installation, apply `sql/build_import_admission.sql` after `verified_build_release.sql`, before foundation `postgres/roles.sql`. For an already installed schema, the action-time reviewed additive diff is that migration, a new NOLOGIN `monday_research_build_import_owner`, schema USAGE plus SELECT/INSERT/UPDATE on `build_import_admissions` and SELECT-only on its audit for that owner; the existing importer gets SELECT-only on approval state and never owner membership. The trigger is SECURITY DEFINER, pinned to `pg_catalog`, owned by the trusted schema owner; PUBLIC has no table/function permissions. Owner/importer receive no DELETE, schema ownership or trigger alteration. Do not re-run the fresh-install roles file against existing roles. No migration or grants have been applied to real PG.
+
 No wildcard or omitted selector is accepted. Expired or revoked approval fails before readback.
-The importer rereads and verifies this envelope after object/GitHub checks, immediately before PG registration. An attacker able to replace the trusted policy or restore an older signed, unexpired approval could still authorize replay: read-only independently owned mounts and approval lifecycle are mandatory deployment prerequisites, not proven here.
+The importer rereads and verifies this envelope after object/GitHub checks, immediately before PG registration. The signed file is necessary but insufficient. `build_import_admissions` stores the current envelope hash, expiry and revocation under the stable `(Build, OCI, proof)` key. Restoring an older valid signed file cannot replace this independent PG state. Read-only independently owned policy mounts remain mandatory; replacing public trust or obtaining the independent PG owner identity is outside the importer authority boundary.
 Issuance requires current main before signing and after signed-object readback. Import instead reads the signed original successful run/attempt/job and each original authenticated check ID directly. Later main commits, newer checks or later attempts do not invalidate those immutable release identities. Historical import or rollback still needs a current independent signed admission for the exact Build/OCI/proof, a matching separately approved read-only OSS scope, valid public trust and complete readback. Missing/deleted/failed original GitHub records fail closed; no latest-check or unsigned fallback is accepted.
-Revocation that races after the final file read does not atomically revoke PG registration.
-For that stronger boundary, use the separate PG scientific admission/revocation transaction before any Run.
+The registration transaction's database trigger takes `FOR SHARE` on the current approval and requires its exact envelope hash, selectors, future expiry and unrevoked state. This lock lives through commit; the independent owner's approval/revocation `UPDATE` conflicts with it. Revocation-first rejects import; import-first makes revocation wait. When revocation returns successfully, a later registration (including idempotent retry) cannot use the old approval. Already imported immutable Builds remain readable and no Run is created. Every owner update appends immutable audit history.
+Expiry's mandatory boundary is the serialized insertion check, not an impossible wall-clock guarantee after COMMIT. The native default transaction also has a deferred expiry recheck; SQL clients can move that constraint's timing with `SET CONSTRAINTS IMMEDIATE`, so this is additional protection, not an unchangeable SQL commit-time expiry contract. Constraint timing cannot bypass the mandatory BEFORE trigger or its revocation lock. Existing grants for running science still have their independent native deadline/fence/revocation checks.
+All CLI registration goes through `oss-import` and the original GitHub producer/check verification. The obsolete Gateway release `import` CLI and public shortcut helper were removed because they lacked that original completion check. Runtime Gateway/AttemptWriter and HTTPS readback fixtures remain. The PG trigger rejects direct SQL without current exact independent approval; it does not verify executable bytes or Ed25519 in SQL. The importer login and verified executable therefore remain entrusted only to the controlled host, never arbitrary Agent tools. Original source/compiler/OCI/readback checks remain native and mandatory.
 Revoking storage publication does not remove previously imported Builds or invalidate existing Run grants automatically.
 
 Execute within the existing controlled host:
@@ -171,13 +181,18 @@ The existing native research admission and task checks remain mandatory.
 
 1. Review this branch and offline tests. Keep the collector production task untouched.
 2. Independently approve and verify existing bucket state, RAM OIDC trust, scoped permissions and ACK identities.
-3. Verify the complete real negative IAM list above, independently owned admission/policy mounts, cancellation/expiry and signature checks. Keep deployment blocked without this evidence.
+3. Independently approve/install the additive PG admission migration/roles; verify real grant isolation, stable approval replay rejection and both revocation lock orders. Verify the complete real negative IAM list above, independently owned admission/policy mounts, cancellation/expiry and signature checks. Keep deployment blocked without this evidence.
 4. Publish one exact test release through GitHub/ACR/OSS; retain run/attempt/job and all digests.
 5. Independently import it from existing ACK capacity; verify real OSS bytes, signature and PG projection.
 6. Keep research paused until its separate runtime admission/readback succeeds.
 
 On failure, stop research publication/import and retain all evidence.
-Restore the prior workflow commit if its already-approved Gateway/Broker exists; otherwise keep publication blocked.
+Restore prior publication workflow only if its already-approved Gateway/Broker exists; otherwise keep publication blocked. Retain the additive approval migration and audit history. An older importer cannot supply the new mandatory approval context, so it fails closed; never remove the approval trigger or grant broad rights as rollback.
 Do not delete objects, reverse migrations, reset immutable PG records or restart collectors.
 No new persistent infrastructure needs removal.
 Real GitHub/RAM/OSS/ACR/ACK acceptance has not been performed by offline tests.
+
+## Controlled issuance and RSI boundary
+
+The executable first-release sequence is: consume the final-main authenticated compiler artifact; invoke the native `plan` with its real request/policy to obtain exact source/Build prefixes; present the base-role resources and unchanged trust/actions as a concrete IAM diff to the independent owner; approve and verify that diff before CI OIDC exchange; publish one controller release; sign and install its independent PG approval; import with separate read-only ACK identity and read back the immutable Build. These commands exist; unknown native plan/digest/role values must be filled from actual final-main artifacts rather than PR fixtures. No IAM write is performed by these tools.
+A scientific loop can reuse an already verified Build under distinct native task grants, leases, budgets and AttemptWriter scopes; it does not require new release IAM scope for each candidate. A loop that edits software and creates a new Build needs a new independently approved exact prefix. Automatic new-Build RSI publication is therefore not implemented or accepted as complete. Its supported next implementation must put a trusted updater on an existing approved operator execution surface, verify final-main/native plan independently, obtain an explicit bounded release grant, apply only that exact role-policy delta and journal/read back it. The updater must not share CI/Agent authority, cannot mint grants, and must prove expiry/cancel/replay/negative IAM behavior before enablement. This requires a separately reviewed authorization contract and concrete credential/policy approval; neither a broad wildcard base role nor CI-authored session Policy can substitute.

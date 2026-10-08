@@ -4,7 +4,7 @@ use anyhow::{ensure, Result};
 use hft_research_platform::{
     build::{BuildArtifact, BuildSpec, BuiltExecutable},
     orchestrator::Artifact,
-    postgres::{Ledger, BUILD_RELEASE_MIGRATION, MIGRATION},
+    postgres::{Ledger, BUILD_IMPORT_ADMISSION_MIGRATION, BUILD_RELEASE_MIGRATION, MIGRATION},
 };
 use std::process::Command;
 fn h(c: char) -> String {
@@ -54,7 +54,11 @@ async fn signed_release_requires_actual_blob_and_only_strong_import_reaches_pg()
         "disposable loopback database required"
     );
     let pool = sqlx_postgres::PgPool::connect(&url).await?;
-    for migration in [MIGRATION, BUILD_RELEASE_MIGRATION] {
+    for migration in [
+        MIGRATION,
+        BUILD_RELEASE_MIGRATION,
+        BUILD_IMPORT_ADMISSION_MIGRATION,
+    ] {
         sqlx_core::raw_sql::raw_sql(migration)
             .execute(&pool)
             .await?;
@@ -109,6 +113,24 @@ async fn signed_release_requires_actual_blob_and_only_strong_import_reaches_pg()
             .is_err(),
         "missing-source fixture reached PG"
     );
+    let obsolete = Command::new(env!("CARGO_BIN_EXE_research-release-publisher"))
+        .args([
+            "import",
+            "build",
+            "image",
+            "proof",
+            "policy",
+            "https://localhost",
+            "token",
+            "admission",
+        ])
+        .output()?;
+    ensure!(
+        !obsolete.status.success()
+            && String::from_utf8_lossy(&obsolete.stderr)
+                .contains("usage: research-release-publisher"),
+        "obsolete Gateway CLI bypass is still callable"
+    );
     let missing = package
         .import(&ledger)
         .await
@@ -136,6 +158,13 @@ async fn signed_release_requires_actual_blob_and_only_strong_import_reaches_pg()
             .join(&package.signed.receipt.source.archive.key),
         b"source fixture",
     )?;
+    ensure!(
+        package.import(&ledger).await.is_err(),
+        "unprojected signed approval admitted"
+    );
+    ledger
+        .set_build_import_admission(&package.admission)
+        .await?;
     let id = package.import(&ledger).await?;
     ensure!(
         package.import(&ledger).await? == id,
@@ -202,4 +231,233 @@ async fn independent_readback_rejects_missing_tampered_and_replayed_evidence() -
         "foreign proof selector replay admitted"
     );
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable loopback MONDAY_TEST_DATABASE_URL ending /monday_foundation_build_admission_test"]
+async fn independent_pg_admission_orders_revocation_and_rejects_replay_and_sql_bypass() -> Result<()>
+{
+    use sqlx_core::row::Row;
+    let url = std::env::var("MONDAY_TEST_DATABASE_URL")?;
+    ensure!(
+        url.ends_with("/monday_foundation_build_admission_test") && url.contains("@127.0.0.1:"),
+        "disposable loopback database required"
+    );
+    let pool = sqlx_postgres::PgPool::connect(&url).await?;
+    for migration in [
+        MIGRATION,
+        BUILD_RELEASE_MIGRATION,
+        BUILD_IMPORT_ADMISSION_MIGRATION,
+    ] {
+        sqlx_core::raw_sql::raw_sql(migration)
+            .execute(&pool)
+            .await?;
+    }
+    let package = common::published::Package::new(artifact_fixture()?).await?;
+    let ledger = Ledger::connect(&url).await?;
+    let published = std::sync::Arc::new(
+        hft_research_platform::release_publisher::read_build_release(
+            &package.artifact.build.id()?,
+            &h('2'),
+            &package.proof_sha,
+            &package.trust,
+            &package.gateway,
+        )
+        .await?,
+    );
+    let admission = std::sync::Arc::new(common::published::admission_fixture(
+        &package.artifact,
+        &package.proof_sha,
+        &package.trust,
+        false,
+        chrono::Utc::now().timestamp_millis() + 60_000,
+    )?);
+    let count = || async {
+        let n: i64 =
+            sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.build_releases")
+                .fetch_one(&pool)
+                .await?;
+        anyhow::Ok(n)
+    };
+    ensure!(
+        ledger.register_build(&published, &admission).await.is_err(),
+        "missing PG approval admitted"
+    );
+    ensure!(count().await? == 0, "missing approval left a release");
+    ledger.set_build_import_admission(&admission).await?;
+    // A newer independent approval replaces the stable selector row. Old signed
+    // files remain cryptographically valid but are no longer active authority.
+    let replacement = common::published::admission_fixture(
+        &package.artifact,
+        &package.proof_sha,
+        &package.trust,
+        false,
+        chrono::Utc::now().timestamp_millis() + 120_000,
+    )?;
+    ledger.set_build_import_admission(&replacement).await?;
+    ensure!(
+        ledger.register_build(&published, &admission).await.is_err(),
+        "older signed file replay admitted"
+    );
+    let revoked = common::published::admission_fixture(
+        &package.artifact,
+        &package.proof_sha,
+        &package.trust,
+        true,
+        chrono::Utc::now().timestamp_millis() + 120_000,
+    )?;
+    ledger.set_build_import_admission(&revoked).await?;
+    ensure!(
+        ledger.register_build(&published, &admission).await.is_err(),
+        "completed revocation admitted first import"
+    );
+    ensure!(count().await? == 0, "revoked approval left a release");
+
+    ensure!(sqlx_core::query::query("INSERT INTO research.build_import_admissions(build_sha256,image_sha256,publication_proof_sha256,envelope_sha256,expires_ms,revoked,document) VALUES($1,$2,$3,$4,123,false,'{}')")
+        .bind(h('d')).bind(h('e')).bind(h('f')).bind(h('a')).execute(&pool).await.is_err(), "NULL document selectors bypassed CHECK");
+    // Real role separation and direct SQL insert: no native-only gate.
+    sqlx_core::raw_sql::raw_sql("CREATE ROLE fixture_build_importer NOLOGIN; GRANT USAGE ON SCHEMA research TO fixture_build_importer; GRANT SELECT ON research.build_import_admissions,research.build_artifacts,research.build_releases TO fixture_build_importer; GRANT INSERT ON research.build_artifacts,research.build_releases TO fixture_build_importer;").execute(&pool).await?;
+    let mut restricted = pool.acquire().await?;
+    sqlx_core::query::query("SET ROLE fixture_build_importer")
+        .execute(&mut *restricted)
+        .await?;
+    ensure!(
+        sqlx_core::query::query("UPDATE research.build_import_admissions SET revoked=false")
+            .execute(&mut *restricted)
+            .await
+            .is_err(),
+        "importer rewrote approval"
+    );
+    let id = package.artifact.id()?;
+    sqlx_core::query::query("INSERT INTO research.build_artifacts(artifact_sha256,build_sha256,document) VALUES($1,$2,$3)").bind(&id).bind(package.artifact.build.id()?).bind(serde_json::to_value(&package.artifact)?).execute(&mut *restricted).await?;
+    ensure!(sqlx_core::query::query("INSERT INTO research.build_releases(artifact_sha256,receipt_sha256,trust_sha256,document) VALUES($1,$2,$3,$4)").bind(&id).bind(&package.artifact.release_receipt_sha256).bind(h('a')).bind(serde_json::to_value(&package.signed)?).execute(&mut *restricted).await.is_err(), "direct INSERT bypassed revoked approval");
+    sqlx_core::query::query("RESET ROLE")
+        .execute(&mut *restricted)
+        .await?;
+    drop(restricted);
+    // Advancing constraint timing cannot bypass the mandatory BEFORE gate.
+    let mut immediate = pool.begin().await?;
+    sqlx_core::query::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *immediate)
+        .await?;
+    ensure!(sqlx_core::query::query("INSERT INTO research.build_releases(artifact_sha256,receipt_sha256,trust_sha256,document) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+        .bind(&id).bind(&package.artifact.release_receipt_sha256).bind(h('a')).bind(serde_json::to_value(&package.signed)?)
+        .execute(&mut *immediate).await.is_err(), "immediate constraints bypassed revoked gate");
+    immediate.rollback().await?;
+
+    // Revocation owns the row first: the native import waits, then rejects.
+    ledger.set_build_import_admission(&admission).await?;
+    let mut revoke_tx = pool.begin().await?;
+    sqlx_core::query::query("UPDATE research.build_import_admissions SET revoked=true,document=jsonb_set(document,'{admission,revoked}','true')").execute(&mut *revoke_tx).await?;
+    let import_task = {
+        let ledger = ledger.clone();
+        let published = published.clone();
+        let admission = admission.clone();
+        tokio::spawn(async move { ledger.register_build(&published, &admission).await })
+    };
+    wait_for_pg_wait(&pool, "transactionid").await?;
+    revoke_tx.commit().await?;
+    ensure!(import_task.await?.is_err(), "revoke-first import succeeded");
+    ensure!(count().await? == 0, "revoke-first wrote a release");
+
+    // Fixture-only barrier runs AFTER the real BEFORE trigger (alphabetical
+    // order). It pauses native registration while its real approval lock lives.
+    sqlx_core::raw_sql::raw_sql("CREATE FUNCTION research.fixture_import_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(13640001); RETURN NEW; END $$; CREATE TRIGGER zzz_fixture_import_barrier BEFORE INSERT ON research.build_releases FOR EACH ROW EXECUTE FUNCTION research.fixture_import_barrier();").execute(&pool).await?;
+    let mut barrier = pool.acquire().await?;
+    sqlx_core::query::query("SELECT pg_advisory_lock(13640001)")
+        .execute(&mut *barrier)
+        .await?;
+    let expires = chrono::Utc::now().timestamp_millis() + 1_500;
+    let expiring = std::sync::Arc::new(common::published::admission_fixture(
+        &package.artifact,
+        &package.proof_sha,
+        &package.trust,
+        false,
+        expires,
+    )?);
+    ledger.set_build_import_admission(&expiring).await?;
+    let expiring_task = {
+        let ledger = ledger.clone();
+        let published = published.clone();
+        let expiring = expiring.clone();
+        tokio::spawn(async move { ledger.register_build(&published, &expiring).await })
+    };
+    wait_for_pg_wait(&pool, "advisory").await?;
+    while chrono::Utc::now().timestamp_millis() <= expires {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    sqlx_core::query::query("SELECT pg_advisory_unlock(13640001)")
+        .execute(&mut *barrier)
+        .await?;
+    ensure!(
+        expiring_task.await?.is_err(),
+        "expiry before deferred commit check admitted"
+    );
+    ensure!(count().await? == 0, "expired transaction wrote a release");
+
+    // Import owns the row first: revocation cannot complete until import commits.
+    ledger.set_build_import_admission(&admission).await?;
+    sqlx_core::query::query("SELECT pg_advisory_lock(13640001)")
+        .execute(&mut *barrier)
+        .await?;
+    let import_task = {
+        let ledger = ledger.clone();
+        let published = published.clone();
+        let admission = admission.clone();
+        tokio::spawn(async move { ledger.register_build(&published, &admission).await })
+    };
+    wait_for_pg_wait(&pool, "advisory").await?;
+    let revoke_task = {
+        let ledger = ledger.clone();
+        tokio::spawn(async move { ledger.set_build_import_admission(&revoked).await })
+    };
+    wait_for_pg_wait(&pool, "transactionid").await?;
+    ensure!(
+        !revoke_task.is_finished(),
+        "revocation completed inside admitted import"
+    );
+    sqlx_core::query::query("SELECT pg_advisory_unlock(13640001)")
+        .execute(&mut *barrier)
+        .await?;
+    ensure!(import_task.await?? == id, "import-first identity changed");
+    revoke_task.await??;
+    ensure!(
+        ledger.register_build(&published, &admission).await.is_err(),
+        "old file retry bypassed completed revocation"
+    );
+    ensure!(
+        ledger.build_artifact(&id).await? == package.artifact,
+        "revocation deleted historical immutable Build"
+    );
+    ensure!(count().await? == 1, "import/revoke produced extra Builds");
+    let row = sqlx_core::query::query("SELECT revoked FROM research.build_import_admissions")
+        .fetch_one(&pool)
+        .await?;
+    ensure!(row.get::<bool, _>("revoked"), "revocation not persisted");
+    let audit_count: i64 = sqlx_core::query_scalar::query_scalar(
+        "SELECT count(*) FROM research.build_import_admission_audits",
+    )
+    .fetch_one(&pool)
+    .await?;
+    ensure!(audit_count >= 7, "approval/revocation history lost");
+    ensure!(
+        sqlx_core::query::query("DELETE FROM research.build_import_admission_audits")
+            .execute(&pool)
+            .await
+            .is_err(),
+        "admission audit was mutable"
+    );
+    sqlx_core::raw_sql::raw_sql("DROP TRIGGER zzz_fixture_import_barrier ON research.build_releases; DROP FUNCTION research.fixture_import_barrier();").execute(&pool).await?;
+    println!("real PG: missing/replaced/revoked approvals and direct SQL bypass rejected; revoke-first blocks import; import-first blocks revoke; expiry at commit rejected; historical Build retained without Run authority");
+    Ok(())
+}
+async fn wait_for_pg_wait(pool: &sqlx_postgres::PgPool, event: &str) -> Result<()> {
+    for _ in 0..150 {
+        let waiting: bool=sqlx_core::query_scalar::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event=$1)").bind(event).fetch_one(pool).await?;
+        if waiting {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    anyhow::bail!("expected real PG lock wait did not occur: {event}")
 }

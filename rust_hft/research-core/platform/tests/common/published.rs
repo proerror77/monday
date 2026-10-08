@@ -5,7 +5,10 @@ use hft_research_platform::{
     identity,
     postgres::Ledger,
     release::{BuildReleaseTrust, SignedBuildRelease},
-    release_publisher::{import_build, CompilationInputs, PublicationProof, ReleaseGateway},
+    release_publisher::{
+        CompilationInputs, ImportAdmission, PublicationProof, PublisherPolicy, ReleaseGateway,
+        SignedImportAdmission, VerifiedImportAdmission,
+    },
     sha256,
     transport::TlsConfig,
 };
@@ -40,6 +43,7 @@ pub struct Package {
     pub signed: SignedBuildRelease,
     pub trust: BuildReleaseTrust,
     pub proof_sha: String,
+    pub admission: VerifiedImportAdmission,
 }
 impl Drop for Package {
     fn drop(&mut self) {
@@ -220,7 +224,15 @@ impl Package {
                 identity_file: None,
             },
         )?;
+        let admission = admission_fixture(
+            &artifact,
+            &proof_sha,
+            &trust,
+            false,
+            chrono::Utc::now().timestamp_millis() + 60_000,
+        )?;
         Ok(Self {
+            admission,
             _directory: directory,
             root,
             server,
@@ -234,14 +246,54 @@ impl Package {
 }
 impl Package {
     pub async fn import(&self, ledger: &Ledger) -> Result<String> {
-        import_build(
+        let published = hft_research_platform::release_publisher::read_build_release(
             &self.artifact.build.id()?,
             self.artifact.image.rsplit_once("@sha256:").unwrap().1,
             &self.proof_sha,
             &self.trust,
             &self.gateway,
-            ledger,
         )
-        .await
+        .await?;
+        let id = ledger.register_build(&published, &self.admission).await?;
+        ensure!(
+            ledger.build_artifact(&id).await? == self.artifact,
+            "fixture projection differs"
+        );
+        Ok(id)
     }
+}
+
+pub fn admission_fixture(
+    artifact: &BuildArtifact,
+    proof: &str,
+    trust: &BuildReleaseTrust,
+    revoked: bool,
+    expires_ms: i64,
+) -> Result<VerifiedImportAdmission> {
+    let operator = SigningKey::from_bytes(&[18; 32]);
+    let key_hex = operator
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let policy: PublisherPolicy = serde_json::from_value(serde_json::json!({
+        "trust":trust, "key_id":"fixture", "builder_image":artifact.build.builder_image,
+        "image_repositories":{}, "import_admission_keys":{"operator":key_hex}
+    }))?;
+    let signed = SignedImportAdmission::sign(
+        ImportAdmission {
+            schema: 1,
+            expires_ms,
+            build_sha256: artifact.build.id()?,
+            image_sha256: artifact.image.rsplit_once("@sha256:").unwrap().1.into(),
+            publication_proof_sha256: proof.into(),
+            revoked,
+        },
+        "operator".into(),
+        &operator,
+        &policy,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+    VerifiedImportAdmission::from_signed(signed, &policy)
 }

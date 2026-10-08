@@ -8,13 +8,15 @@ CREATE ROLE monday_research_artifact_gateway NOLOGIN;
 CREATE ROLE monday_research_prepare_worker NOLOGIN;
 CREATE ROLE monday_research_definition_writer NOLOGIN;
 CREATE ROLE monday_research_release_importer NOLOGIN;
+CREATE ROLE monday_research_build_import_owner NOLOGIN;
 CREATE ROLE monday_research_native_admission NOLOGIN;
 CREATE ROLE monday_research_terminal_retirement NOLOGIN;
 GRANT USAGE ON SCHEMA research TO monday_research_submitter,
   monday_research_reconciler, monday_research_session_host,
   monday_research_artifact_gateway, monday_research_prepare_worker,
   monday_research_definition_writer, monday_research_release_importer,
-  monday_research_native_admission, monday_research_terminal_retirement;
+  monday_research_native_admission, monday_research_terminal_retirement,
+  monday_research_build_import_owner;
 GRANT SELECT ON research.authority, research.inputs, research.backends,
   research.build_artifacts, research.build_releases, research.runs,
   research.admissions, research.revocations, research.tasks
@@ -60,6 +62,11 @@ GRANT SELECT ON research.authority, research.build_artifacts, research.build_rel
   TO monday_research_release_importer;
 GRANT INSERT ON research.build_artifacts, research.build_releases TO monday_research_release_importer;
 GRANT UPDATE(singleton) ON research.authority TO monday_research_release_importer;
+-- The importer cannot install, revoke or restore its own independent approval.
+GRANT SELECT ON research.build_import_admissions TO monday_research_release_importer;
+GRANT SELECT, INSERT, UPDATE ON research.build_import_admissions TO monday_research_build_import_owner;
+GRANT SELECT ON research.build_import_admission_audits TO monday_research_build_import_owner;
+-- Never give importer membership in this owner role; no DELETE or schema ownership.
 -- Only independently verified native grants can be projected by this identity.
 -- Neither Agent tools, workers, Session nor reconciler inherit this role.
 GRANT SELECT, INSERT ON research.admissions, research.revocations
