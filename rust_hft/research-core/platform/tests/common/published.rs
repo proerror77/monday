@@ -230,6 +230,7 @@ impl Package {
             &trust,
             false,
             chrono::Utc::now().timestamp_millis() + 60_000,
+            1,
         )?;
         Ok(Self {
             admission,
@@ -269,6 +270,7 @@ pub fn admission_fixture(
     trust: &BuildReleaseTrust,
     revoked: bool,
     expires_ms: i64,
+    revision: i64,
 ) -> Result<VerifiedImportAdmission> {
     let operator = SigningKey::from_bytes(&[18; 32]);
     let key_hex = operator
@@ -283,7 +285,8 @@ pub fn admission_fixture(
     }))?;
     let signed = SignedImportAdmission::sign(
         ImportAdmission {
-            schema: 1,
+            schema: 2,
+            revision,
             expires_ms,
             build_sha256: artifact.build.id()?,
             image_sha256: artifact.image.rsplit_once("@sha256:").unwrap().1.into(),

@@ -64,6 +64,7 @@ GRANT INSERT ON research.build_artifacts, research.build_releases TO monday_rese
 GRANT UPDATE(singleton) ON research.authority TO monday_research_release_importer;
 -- The importer cannot install, revoke or restore its own independent approval.
 GRANT SELECT ON research.build_import_admissions TO monday_research_release_importer;
+GRANT EXECUTE ON FUNCTION research.lock_build_import_admission(text,text,text,text) TO monday_research_release_importer;
 GRANT SELECT, INSERT, UPDATE ON research.build_import_admissions TO monday_research_build_import_owner;
 GRANT SELECT ON research.build_import_admission_audits TO monday_research_build_import_owner;
 -- Never give importer membership in this owner role; no DELETE or schema ownership.

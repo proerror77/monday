@@ -76,13 +76,15 @@ per-product `oss_by_product` configuration (projected to native `oss`), and the 
 The capability executable exchanges GitHub OIDC directly with RAM STS.
 It requests only exact source/Build prefixes from the authenticated native plan.
 CI no longer imports PG or requires a release Gateway/Broker endpoint.
-ACK uses separate read-only OSS credentials, pinned public trust, an independently signed host admission envelope and its matching current PG state. The stable selector row is locked through registration; restoring an old file cannot undo a completed revocation. Its operator key must differ from every CI release key.
+ACK uses separate read-only OSS credentials, pinned public trust, an independently signed host admission envelope and its matching current PG state. The schema 2 independent approval signs a positive monotonic revision. PG rejects rollback or same-revision changes, including owner replay of older signed approvals; native registration explicitly calls the mandatory PG lock function so a missing migration fails closed. The stable selector row is locked through registration; restoring an old file cannot undo a completed revocation. Its operator key must differ from every CI release key.
 It independently verifies the signed original completed GitHub run/attempt/job and check IDs, plus object bytes, before immutable PG import. Historical releases need current separate signed admission; later main commits do not replace their original identities.
 
 The cheap `check-presence` receives only booleans. Native signer, policy,
 OIDC, exact-scope and authenticated OSS preflight remain mandatory before ACR login.
 Publication keys and STS files stay outside Cargo and retained Actions artifacts.
 No production credentials, permissions or services are created by this code.
+
+`scope-plan ROOT SOURCE SOFTWARE_RUN SOFTWARE_PRODUCTS PRODUCT POLICY` produces exact approval prefixes from the completed authenticated software and clean current-main source before a publisher or STS session exists. It grants nothing and needs no OCI digest; it shares the actual Build projection with issuance `plan`, whose active-publisher authentication remains mandatory.
 
 The OSS commands are `oss-check-config`, `oss-publish` and `oss-import`.
 Their actual argument forms are documented in the ACK/OSS contract above.

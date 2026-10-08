@@ -557,6 +557,22 @@ impl Ledger {
             .bind(admission.envelope_sha256())
             .execute(&mut *tx)
             .await?;
+        let receipt = &verified.signed().receipt;
+        // Missing migration/function fails closed even on a pre-existing schema
+        // whose old release table lacks the new trigger.
+        query("SELECT research.lock_build_import_admission($1,$2,$3,$4)")
+            .bind(&receipt.build_sha256)
+            .bind(
+                receipt
+                    .image
+                    .rsplit_once("@sha256:")
+                    .context("pinned import image")?
+                    .1,
+            )
+            .bind(&receipt.publication_readback_sha256)
+            .bind(admission.envelope_sha256())
+            .execute(&mut *tx)
+            .await?;
         query("SELECT mode FROM research.authority WHERE singleton FOR SHARE")
             .fetch_one(&mut *tx)
             .await?;
@@ -578,9 +594,9 @@ impl Ledger {
             a.expires_ms > chrono::Utc::now().timestamp_millis(),
             "expired operator admission"
         );
-        query("INSERT INTO research.build_import_admissions(build_sha256,image_sha256,publication_proof_sha256,envelope_sha256,expires_ms,revoked,document) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (build_sha256,image_sha256,publication_proof_sha256) DO UPDATE SET envelope_sha256=EXCLUDED.envelope_sha256,expires_ms=EXCLUDED.expires_ms,revoked=EXCLUDED.revoked,document=EXCLUDED.document")
+        query("INSERT INTO research.build_import_admissions(build_sha256,image_sha256,publication_proof_sha256,envelope_sha256,revision,expires_ms,revoked,document) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (build_sha256,image_sha256,publication_proof_sha256) DO UPDATE SET envelope_sha256=EXCLUDED.envelope_sha256,revision=EXCLUDED.revision,expires_ms=EXCLUDED.expires_ms,revoked=EXCLUDED.revoked,document=EXCLUDED.document")
             .bind(&a.build_sha256).bind(&a.image_sha256).bind(&a.publication_proof_sha256)
-            .bind(admission.envelope_sha256()).bind(a.expires_ms).bind(a.revoked)
+            .bind(admission.envelope_sha256()).bind(a.revision).bind(a.expires_ms).bind(a.revoked)
             .bind(admission.document()?).execute(&self.pool).await?;
         let row = query("SELECT envelope_sha256,document FROM research.build_import_admissions WHERE build_sha256=$1 AND image_sha256=$2 AND publication_proof_sha256=$3")
             .bind(&a.build_sha256).bind(&a.image_sha256).bind(&a.publication_proof_sha256)

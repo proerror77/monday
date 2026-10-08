@@ -50,6 +50,10 @@ async fn main() -> Result<()> {
             ReleaseGateway::with_tls(endpoint,hft_research_platform::service::read_secret(token)?,&policy.tls)?.check_transport().await?;
             println!("release issuer configuration verified");
         }
+        ["scope-plan",root,source,software_run,software_products,product,policy]=>{
+            let policy:PublisherPolicy=release_publisher::read_json(Path::new(policy))?;
+            println!("{}",serde_json::to_string(&release_publisher::scope_plan(Path::new(root),source,software_run.parse()?,software_products,product,&policy)?)?);
+        }
         ["plan",root,request,policy]=>{
             let request:PublicationRequest=release_publisher::read_json(Path::new(request))?;
             let policy:PublisherPolicy=release_publisher::read_json(Path::new(policy))?;
@@ -63,7 +67,7 @@ async fn main() -> Result<()> {
             let gateway=ReleaseGateway::with_tls(endpoint,token,&policy.tls)?;
             println!("{}",serde_json::to_string(&release_publisher::publish(Path::new(root),&request,&policy,&key,&gateway).await?)?);
         }
-        _=>bail!("usage: research-release-publisher --version | sign-import-admission POLICY ADMISSION KEY_ID EXISTING_PRIVATE_KEY_FILE | set-import-admission POLICY SIGNED_ADMISSION | oss-check-config POLICY KEY SOFTWARE_MANIFEST REPOSITORY PRODUCT IMAGE_REPOSITORY SOURCE SESSION | oss-publish ROOT REQUEST POLICY KEY SESSION | oss-import ROOT BUILD OCI PROOF POLICY READER_SESSION ADMISSION | check-config POLICY PRIVATE_KEY_FILE SOFTWARE_MANIFEST REPOSITORY PRODUCT IMAGE_REPOSITORY HTTPS_GATEWAY TOKEN_FILE | plan SOURCE_ROOT REQUEST POLICY | publish SOURCE_ROOT REQUEST POLICY PRIVATE_KEY_FILE HTTPS_GATEWAY TOKEN_FILE"),
+        _=>bail!("usage: research-release-publisher --version | sign-import-admission POLICY ADMISSION KEY_ID EXISTING_PRIVATE_KEY_FILE | set-import-admission POLICY SIGNED_ADMISSION | oss-check-config POLICY KEY SOFTWARE_MANIFEST REPOSITORY PRODUCT IMAGE_REPOSITORY SOURCE SESSION | oss-publish ROOT REQUEST POLICY KEY SESSION | oss-import ROOT BUILD OCI PROOF POLICY READER_SESSION ADMISSION | check-config POLICY PRIVATE_KEY_FILE SOFTWARE_MANIFEST REPOSITORY PRODUCT IMAGE_REPOSITORY HTTPS_GATEWAY TOKEN_FILE | scope-plan ROOT SOURCE SOFTWARE_RUN SOFTWARE_PRODUCTS PRODUCT POLICY | plan SOURCE_ROOT REQUEST POLICY | publish SOURCE_ROOT REQUEST POLICY PRIVATE_KEY_FILE HTTPS_GATEWAY TOKEN_FILE"),
     }
     Ok(())
 }
