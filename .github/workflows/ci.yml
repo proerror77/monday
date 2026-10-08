@@ -431,9 +431,11 @@ jobs:
         env:
           MONDAY_CI_CACHE_PLAN: ${{ toJSON(needs.scope.outputs) }}
         run: |
-          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
-          bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" native-input >> "$GITHUB_OUTPUT"
-          bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" coverage-input >> "$GITHUB_OUTPUT"
+          {
+            echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')"
+            bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" native-input
+            bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" coverage-input
+          } >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
         if: ${{ (needs.scope.outputs.toolchain == 'true') }}
