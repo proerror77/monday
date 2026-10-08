@@ -271,6 +271,13 @@ jobs:
           MONDAY_RELEASE_OSS_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
         run: .github/scripts/publish-research-build-release.sh check-presence
 
+      - name: Validate public research publication policy before preparation
+        if: matrix.research_artifact
+        env:
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          PRODUCT: ${{ matrix.product }}
+        run: .github/scripts/publish-research-build-release.sh check-public-policy
+
       - name: Download authenticated research release
         if: matrix.research_artifact
         env:

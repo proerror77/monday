@@ -2,6 +2,11 @@
 # shellcheck disable=SC1003,SC2016
 set -euo pipefail
 
+case ${1:-} in
+  ''|--public-policy) ;;
+  *) printf 'unknown test scope: %s\n' "$1" >&2; exit 2 ;;
+esac
+
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 workflow="$script_dir/../workflows/acr-publish.yml"
 dockerignore="$script_dir/../../.dockerignore"
@@ -21,6 +26,83 @@ emergency_collector="$script_dir/../../rust_hft/tools/collector/local-emergency-
 tmp_dir=$(mktemp -d)
 source_test_tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir" "$source_test_tmp_dir"' EXIT
+
+# Public policy validation must work before tools, artifacts or credentials exist.
+policy_tools="$tmp_dir/policy-tools"
+policy_state="$tmp_dir/policy-state"
+mkdir "$policy_tools" "$policy_state"
+ln -s "$(command -v jq)" "$policy_tools/jq"
+ln -s "$(command -v dirname)" "$policy_tools/dirname"
+bash_command=$(command -v bash)
+jq -n '
+  def oss($product): {
+    bucket:"fixture-bucket", region:"fixture-region", endpoint:"https://fixture.invalid/",
+    role_arn:("fixture-role/" + $product), oidc_provider_arn:"fixture-provider",
+    audience:"fixture-audience", subject:"fixture-subject", repository_id:1, owner_id:2,
+    role_prefixes:[("research/builds/" + ("b" * 64) + "/"), ("research/sources/" + ("a" * 40) + "/")]
+  };
+  {trust:{schema:1,repository:"fixture/repo",producer_workflow_path:".github/workflows/acr-publish.yml",keys:{fixture:("a" * 64)}},
+   key_id:"fixture",builder_image:("fixture/builder@sha256:" + ("b" * 64)),
+   image_repositories:{"cex-runner":"fixture/cex","prediction-runner":"fixture/prediction",controller:"fixture/controller"},
+   oss_by_product:{"cex-runner":oss("cex"),"prediction-runner":oss("prediction"),controller:oss("controller")}}
+' >"$tmp_dir/public-policy.json"
+run_public_policy() {
+  local policy=$1 product=$2 mode=${3:-check-public-policy}
+  PATH="$policy_tools" TMPDIR="$policy_state" RUNNER_TEMP="$policy_state" \
+    MONDAY_RELEASE_POLICY_JSON="$(<"$policy")" PRODUCT="$product" \
+    MONDAY_RELEASE_SIGNING_KEY=private-key-must-not-appear \
+    MONDAY_RELEASE_GATEWAY_TOKEN=private-token-must-not-appear \
+    "$bash_command" "$script_dir/publish-research-build-release.sh" "$mode" \
+      >"$tmp_dir/public-policy.out" 2>"$tmp_dir/public-policy.err"
+}
+assert_public_policy_is_offline() {
+  local files=()
+  shopt -s nullglob dotglob
+  files=("$policy_state"/*)
+  shopt -u nullglob dotglob
+  ((${#files[@]} == 0)) || { echo 'public policy check wrote preparation files' >&2; exit 1; }
+  if grep -Eq 'private-(key|token)-must-not-appear' "$tmp_dir/public-policy.out" "$tmp_dir/public-policy.err"; then
+    echo 'public policy diagnostic exposed a credential' >&2; exit 1
+  fi
+}
+reject_public_policy() {
+  if run_public_policy "$1" "${2:-controller}"; then
+    echo 'invalid public policy was admitted' >&2; exit 1
+  fi
+  test ! -s "$tmp_dir/public-policy.out"
+  assert_public_policy_is_offline
+}
+for product in cex-runner prediction-runner controller; do
+  run_public_policy "$tmp_dir/public-policy.json" "$product"
+  grep -Fq 'native signing, OIDC and TLS validation remain required' "$tmp_dir/public-policy.out"
+  assert_public_policy_is_offline
+done
+for expression in \
+  'null' '[]' \
+  'del(.oss_by_product)' '.oss_by_product={}' 'del(.oss_by_product.controller)' \
+  '.oss_by_product.foreign=.oss_by_product.controller' \
+  '.oss_by_product.controller.role_arn=.oss_by_product["cex-runner"].role_arn' \
+  '.trust.schema=2' '.trust.keys.fixture="invalid-public-key"' \
+  '.builder_image="fixture/builder:latest"' '.image_repositories=[]' \
+  'del(.image_repositories.controller)' '.oss_by_product.controller.bucket=1' \
+  '.oss_by_product.controller.role_arn=""' '.oss_by_product.controller.oidc_provider_arn=""'; do
+  jq "$expression" "$tmp_dir/public-policy.json" >"$tmp_dir/invalid-public-policy.json"
+  reject_public_policy "$tmp_dir/invalid-public-policy.json"
+done
+printf '{invalid JSON\n' >"$tmp_dir/invalid-public-policy.json"
+reject_public_policy "$tmp_dir/invalid-public-policy.json"
+cat "$tmp_dir/public-policy.json" "$tmp_dir/public-policy.json" >"$tmp_dir/invalid-public-policy.json"
+reject_public_policy "$tmp_dir/invalid-public-policy.json"
+reject_public_policy "$tmp_dir/public-policy.json" foreign
+for mode in check-config publish; do
+  if run_public_policy "$tmp_dir/public-policy.json" controller "$mode"; then
+    echo 'public policy bypassed the native issuer gate' >&2; exit 1
+  fi
+  assert_public_policy_is_offline
+done
+printf 'Public policy structure, product mapping and pre-issuer failure contracts passed\n'
+if [[ ${1:-} == --public-policy ]]; then exit 0; fi
+
 ruby -ryaml - "$workflow" "$ploy_workflow" "$ci_workflow" "$script_dir/../workflows/security-enabled.yml" <<'RUBY'
 acr, ploy, ci, security = ARGV.map { |path| YAML.safe_load(File.read(path)) }
 abort 'ACR queue changed' unless acr.fetch('concurrency') == {'group'=>'acr-publish-${{ github.ref }}','queue'=>'max','cancel-in-progress'=>false}
@@ -125,6 +207,7 @@ abort 'release job cannot obtain its own OIDC identity' unless publication.fetch
 abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']
 steps=publication.fetch('steps')
 presence=steps.index { |s|s.fetch('name','')=='Require research publication settings before preparation' }
+public_policy=steps.index { |s|s.fetch('name','')=='Validate public research publication policy before preparation' }
 download=steps.index { |s|s.fetch('name','')=='Download authenticated research release' }
 preflight=steps.index { |s|s.fetch('name','')=='Require independent Build signer configuration' }
 compile=steps.index { |s|s.fetch('name','')=='Compile independent release issuer before secret injection' }
@@ -141,6 +224,12 @@ expected_presence={
   'MONDAY_RELEASE_OSS_PRESENT'=>"${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}"
 }
 abort 'cheap configuration check receives credentials or loses OSS binding' unless presence_env==expected_presence
+abort 'invalid public policy can reach expensive preparation' unless public_policy && presence<public_policy && public_policy<download && public_policy<compile
+policy_step=steps.fetch(public_policy)
+abort 'public policy check receives private credentials or loses product binding' unless policy_step.fetch('if')=='matrix.research_artifact' && policy_step.fetch('env')=={
+  'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}',
+  'PRODUCT'=>'${{ matrix.product }}'
+} && policy_step.fetch('run')=='.github/scripts/publish-research-build-release.sh check-public-policy'
 wrapper=File.read(File.join(File.dirname(ARGV[0]),'../scripts/publish-research-build-release.sh'))
 abort 'issuer wrapper compiles while holding release credentials' if wrapper.match?(/\bcargo\s+(?:build|run)\b/)
 abort 'static gateway credential still authorizes publication' if steps.any? { |s| s.fetch('env',{}).values.any? { |v| v.to_s.include?('secrets.MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN') } }

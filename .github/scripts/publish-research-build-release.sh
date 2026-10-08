@@ -2,7 +2,7 @@
 # Dedicated CI issuer. ACK owns independent import. No science or provisioning.
 set +x
 set -euo pipefail
-mode=${1:?expected check-presence, check-config or publish}
+mode=${1:?expected check-presence, check-public-policy, check-config or publish}
 if [[ $mode == check-presence ]]; then
   # This cheap check receives only GitHub presence booleans, never credentials.
   # The native signer/policy/TLS check below remains the publication authority.
@@ -20,6 +20,30 @@ if [[ $mode == check-presence ]]; then
 fi
 : "${MONDAY_RELEASE_POLICY_JSON:?operator public publisher policy required}"
 root=$(cd "$(dirname "$0")/../.." && pwd)
+: "${PRODUCT:?image product required}"
+select_public_policy() {
+  printf '%s' "$MONDAY_RELEASE_POLICY_JSON" |
+    jq -es 'if length == 1 and (.[0] | type) == "object" then .[0] else error("one public research publisher policy object required") end' |
+    jq -e --arg product "$PRODUCT" -f "$root/.github/scripts/select-research-oss-policy.jq" |
+    jq -e --arg product "$PRODUCT" '
+      def text: type == "string" and length > 0;
+      if .trust.schema == 1 and
+         .trust.producer_workflow_path == ".github/workflows/acr-publish.yml" and
+         (.key_id | text) and (.trust.keys | type) == "object" and
+         (.trust.keys[.key_id] | type == "string" and test("^[0-9a-f]{64}$")) and
+         (.builder_image | type == "string" and test("@sha256:[0-9a-f]{64}$")) and
+         (.image_repositories | type == "object" and length > 0) and
+         (.image_repositories[$product] | text) and
+         all([.oss.bucket, .oss.role_arn, .oss.oidc_provider_arn][]; text)
+      then . else error("invalid public research publisher policy structure for selected product") end
+    '
+}
+if [[ $mode == check-public-policy ]]; then
+  # Public structure only. No issuer, private key, OIDC exchange or network call.
+  select_public_policy >/dev/null
+  printf 'Public research publication policy structure is valid for %s; native signing, OIDC and TLS validation remain required.\n' "$PRODUCT"
+  exit 0
+fi
 issuer=${RUNNER_TEMP:?prebuilt native issuer directory required}/research-release-issuer-target/debug/research-release-publisher
 capability=${RUNNER_TEMP}/research-release-issuer-target/debug/research-release-capability
 test -x "$issuer"
@@ -27,10 +51,8 @@ test -x "$capability"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 umask 077
-: "${PRODUCT:?image product required}"
-printf '%s' "$MONDAY_RELEASE_POLICY_JSON" | jq -e --arg product "$PRODUCT" -f "$root/.github/scripts/select-research-oss-policy.jq" >"$work/policy.json"
+select_public_policy >"$work/policy.json"
 unset MONDAY_RELEASE_GATEWAY_TOKEN
-jq -e '.trust.schema==1 and .trust.producer_workflow_path==".github/workflows/acr-publish.yml" and (.trust.keys[.key_id]|test("^[0-9a-f]{64}$")) and (.builder_image|test("@sha256:[0-9a-f]{64}$")) and (.image_repositories|length)>0 and (.oss.bucket|length)>0 and (.oss.role_arn|length)>0 and (.oss.oidc_provider_arn|length)>0' "$work/policy.json" >/dev/null
 context="$RUNNER_TEMP/research-release-context.json"
 make_context() {
   : "${SOURCE_REVISION:?source required}" "${PRODUCER_RUN:?software producer required}"
