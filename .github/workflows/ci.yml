@@ -428,9 +428,14 @@ jobs:
         if: ${{ (needs.scope.outputs.toolchain == 'true') }}
         id: cache-info
         shell: bash
+        env:
+          MONDAY_CI_CACHE_PLAN: ${{ toJSON(needs.scope.outputs) }}
         run: |
-          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
-          bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" native-input >> "$GITHUB_OUTPUT"
+          {
+            echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')"
+            bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" native-input
+            bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" coverage-input
+          } >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
         if: ${{ (needs.scope.outputs.toolchain == 'true') }}
@@ -443,7 +448,7 @@ jobs:
             rust_hft/research-core/platform -> target
             rust_hft/runtime -> target
             rust_hft/prediction-markets -> target
-          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', '.github/scripts/ci-owner-cache.sh') }}
+          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/scripts/check-collector-test-presence.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
           cache-all-crates: false
           save-if: false
 
@@ -607,7 +612,7 @@ jobs:
             rust_hft/research-core/platform -> target
             rust_hft/runtime -> target
             rust_hft/prediction-markets -> target
-          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', '.github/scripts/ci-owner-cache.sh') }}
+          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/scripts/check-collector-test-presence.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
           cache-all-crates: false
           save-if: true
 

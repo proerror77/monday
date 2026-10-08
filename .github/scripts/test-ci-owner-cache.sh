@@ -17,6 +17,29 @@ done
 native_before=$(PATH="$work/native-bin:$PATH" bash "$root/.github/scripts/ci-owner-cache.sh" native-input)
 native_after=$(PATH="$work/native-bin:$PATH" CXXFLAGS=-DFIXTURE_NATIVE_INPUT_CHANGED bash "$root/.github/scripts/ci-owner-cache.sh" native-input)
 [[ $native_before != "$native_after" ]]
+# A narrow first save must not become an exact hit for wider coverage.
+plan=$(jq -cn '{handoff:"false",json:"false",ondo:"false",collector:"false",control:"false",focused:"true",loop:"false",owning_packages:",,",focused_packages:",hft-live,",loop_packages:""}')
+coverage() { MONDAY_CI_CACHE_PLAN="$1" bash "$root/.github/scripts/ci-owner-cache.sh" coverage-input; }
+narrow=$(coverage "$plan")
+wide=$(coverage "$(jq -c '.handoff="true" | .focused_packages=",hft-live,hft-cex-research-worker,"' <<<"$plan")")
+[[ $narrow != "$wide" ]]
+[[ $(coverage "$(jq -c '.focused_packages=",hft-live,hft-cex-research-worker,"' <<<"$plan")") != "$narrow" ]]
+owning=$(jq -c '.owning_packages=",hft-live,"' <<<"$plan")
+[[ $(coverage "$owning") != "$narrow" ]]
+[[ $(coverage "$(jq -c '.owning_packages=",hft-paper,"' <<<"$owning")") != "$(coverage "$owning")" ]]
+[[ $(coverage "$(jq -c '.loop_packages="hft-live"' <<<"$owning")") != "$(coverage "$owning")" ]]
+for flag in handoff json ondo collector control focused loop; do
+  changed=$(jq -c --arg flag "$flag" '.[$flag]=(if .[$flag]=="true" then "false" else "true" end) | .loop_packages="alpha-harness"' <<<"$plan")
+  [[ $(coverage "$changed") != "$narrow" ]]
+done
+[[ $(coverage "$(jq -c '.focused_packages="hft-live,hft-live" | .source_sha="other-source" | .event="pull_request"' <<<"$plan")") == "$narrow" ]]
+[[ $(coverage "$(jq -c '.focused="false" | .focused_packages=""' <<<"$plan")") == \
+   "$(coverage "$(jq -c '.focused="false" | .focused_packages="ignored-package"' <<<"$plan")")" ]]
+for invalid in 'del(.handoff)' 'del(.owning_packages)' '.focused="yes"' '.focused_packages=""' '.focused_packages="hft-live --features unexpected"'; do
+  if coverage "$(jq -c "$invalid" <<<"$plan")"; then
+    echo 'invalid cache coverage accepted' >&2; exit 1
+  fi
+done
 cat >"$work/bin/cargo" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -114,7 +137,7 @@ fi
 [[ $(<"$work/outside/marker") == untouched ]]
 
 # The workflow uses the same disjoint paths and saves only after cleanup.
-ruby -ryaml -rpathname -rjson - "$root" <<'RUBY'
+ruby -ryaml -rpathname -rjson -rdigest -rtmpdir -rfileutils -ropen3 - "$root" <<'RUBY'
 root = ARGV.fetch(0)
 job = YAML.safe_load(File.read("#{root}/.github/workflows/ci.yml")).fetch('jobs').fetch('rust')
 abort 'owner layout missing' unless job.fetch('env')['MONDAY_CARGO_TARGET_LAYOUT'] == 'owning-workspace-v1'
@@ -128,6 +151,79 @@ abort 'cache save precedes cleanup' unless cleanup_index < save_index
 abort 'real cleanup is not validated on PRs' unless steps.fetch(cleanup_index).fetch('if') == "${{ success() && needs.scope.outputs.toolchain == 'true' }}"
 abort 'save is not success/main bound' unless save.fetch('if').include?("github.ref == 'refs/heads/main' && success()")
 abort 'restore/save key or owner drift' unless %w[key workspaces].all? { |k| restore.dig('with', k) == save.dig('with', k) }
+abort 'cache omits the selected compilation scope' unless restore.dig('with', 'key').include?('steps.cache-info.outputs.coverage')
+dimensions = steps.find { |step| step['name'] == 'Record cache dimensions' }
+abort 'cache coverage plan is not wired from the selector' unless dimensions.dig('env', 'MONDAY_CI_CACHE_PLAN') == '${{ toJSON(needs.scope.outputs) }}'
+abort 'cache coverage output is never computed' unless dimensions.fetch('run').include?('ci-owner-cache.sh" coverage-input')
+# A changed admitted feature or package must permit a new dependency cache save.
+# Keep compiler/native/manifest dimensions fixed in these coverage fixtures.
+key_inputs = restore.dig('with', 'key').scan(/hashFiles\((.*?)\)/).flat_map { |group| group.first.scan(/'([^']+)'/).flatten }
+abort 'cache key has no compilation inputs' if key_inputs.empty?
+# Audit actual workflow Cargo callers and every selector input they consume.
+compile_steps = steps.select do |step|
+  run = step['run'].to_s
+  helpers = run.scan(%r{((?:rust_hft|\.github|deployment)/[a-zA-Z0-9_./-]+\.sh)}).flatten.uniq
+  callers = helpers.select do |path|
+    File.read("#{root}/#{path}").match?(/\bcargo[ \t]+(?:build|test|check|clippy)\b/) || path.end_with?('/cargo-scoped.sh')
+  end
+  abort 'direct Cargo helper is absent from cache inputs' unless (callers - key_inputs).empty?
+  !callers.empty? || run.match?(/\bcargo[ \t]+(?:build|test|check|clippy)\b/)
+end
+fields = compile_steps.flat_map do |step|
+  [step['if'], step['run'], *step.fetch('env', {}).values].join.scan(/needs\.scope\.outputs\.([a-z_]+)/).flatten
+end.uniq
+plan = %w[handoff json ondo collector control focused loop].to_h { |name| [name, 'true'] }
+plan.merge!('owning_packages' => 'hft-paper', 'focused_packages' => 'hft-live', 'loop_packages' => 'alpha-harness')
+fields.each { |name| plan[name] ||= 'false' }
+coverage_digest = lambda do |selected|
+  output, _, status = Open3.capture3({'MONDAY_CI_CACHE_PLAN' => JSON.generate(selected)},
+    'bash', "#{root}/.github/scripts/ci-owner-cache.sh", 'coverage-input')
+  abort 'valid workflow coverage could not be hashed' unless status.success?
+  output
+end
+baseline_coverage = coverage_digest.call(plan)
+fields.each do |name|
+  changed = plan.dup
+  changed[name] = name.end_with?('_packages') ? "#{plan.fetch(name)},hft-cex-research-worker" : 'false'
+  changed[name] = 'true' if plan.fetch(name) == 'false'
+  abort "compiled workflow input #{name} is absent from coverage digest" if coverage_digest.call(changed) == baseline_coverage
+end
+dimension = lambda do |directory|
+  Digest::SHA256.hexdigest(key_inputs.sort.map { |path| Digest::SHA256.file("#{directory}/#{path}").digest }.join)
+end
+Dir.mktmpdir('ci-cache-coverage') do |fixture|
+  coverage_paths = %w[.github/workflows/ci.yml .github/scripts/select-rust-ci-scope.sh rust_hft/scripts/workspace-metadata.sh]
+  (key_inputs + coverage_paths).uniq.each do |path|
+    FileUtils.mkdir_p(File.dirname("#{fixture}/#{path}"))
+    FileUtils.cp("#{root}/#{path}", "#{fixture}/#{path}")
+  end
+  baseline = dimension.call(fixture)
+  workflow_path = "#{fixture}/.github/workflows/ci.yml"
+  workflow = File.read(workflow_path)
+  changed = workflow.sub('--features formula-strategy,binance ', '--features formula-strategy,binance,cache-fixture-feature ')
+  abort 'feature coverage fixture did not change a Cargo recipe' if changed == workflow
+  File.write(workflow_path, changed)
+  abort 'changed feature coverage reuses the immutable cache key' if dimension.call(fixture) == baseline
+  File.write(workflow_path, workflow)
+  scope_path = "#{fixture}/.github/scripts/select-rust-ci-scope.sh"
+  scope = File.read(scope_path)
+  changed = scope.sub('focused_packages=hft-live,hft-paper,hft-all-in-one,alpha-harness,hft-harnessctl',
+                      'focused_packages=hft-live,hft-paper,hft-all-in-one,alpha-harness,hft-harnessctl,hft-cex-research-worker')
+  abort 'package coverage fixture did not change the selected set' if changed == scope
+  File.write(scope_path, changed)
+  abort 'changed package coverage reuses the immutable cache key' if dimension.call(fixture) == baseline
+  File.write(scope_path, scope)
+  metadata_path = "#{fixture}/rust_hft/scripts/workspace-metadata.sh"
+  metadata = File.read(metadata_path)
+  changed = metadata.sub('.workspace_members | index($id)', '(.workspace_members + ["cache-fixture-member"]) | index($id)')
+  abort 'metadata coverage fixture did not change member selection' if changed == metadata
+  File.write(metadata_path, changed)
+  abort 'changed metadata coverage reuses the immutable cache key' if dimension.call(fixture) == baseline
+  File.write(metadata_path, metadata)
+  FileUtils.mkdir_p("#{fixture}/rust_hft/src")
+  File.write("#{fixture}/rust_hft/src/cache-fixture.rs", 'changed local source')
+  abort 'local source changes invalidate dependency reuse' unless dimension.call(fixture) == baseline
+end
 pairs = restore.dig('with', 'workspaces').lines.map { |line| line.strip.split(' -> ') }
 paths = pairs.map { |source, target| Pathname.new("#{root}/#{source}/#{target}").cleanpath.to_s }
 manifests = JSON.parse(File.read("#{root}/rust_hft/workspaces.json")).fetch('workspaces').map { |w| w.fetch('manifest') }
