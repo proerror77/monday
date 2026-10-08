@@ -390,12 +390,9 @@ fi
 line=$(awk -F'\t' -v u="$unit" '$1 == u { print; exit }' "$SCENARIO" 2>/dev/null || true)
 active="inactive"; enabled="disabled"; result="success"; nrestarts="0"; substate=""; next_elapse=""
 if [ -n "$line" ]; then
-  active=$(printf '%s\n' "$line" | awk -F'\t' '{print $2}')
-  enabled=$(printf '%s\n' "$line" | awk -F'\t' '{print $3}')
-  result=$(printf '%s\n' "$line" | awk -F'\t' '{print $4}')
-  nrestarts=$(printf '%s\n' "$line" | awk -F'\t' '{print $5}')
-  substate=$(printf '%s\n' "$line" | awk -F'\t' '{print $6}')
-  next_elapse=$(printf '%s\n' "$line" | awk -F'\t' '{print $7}')
+  IFS='	' read -r scenario_unit active enabled result nrestarts substate next_elapse <<FIELDS
+$line
+FIELDS
 fi
 [ "$active" != "-" ] || active="inactive"
 [ "$enabled" != "-" ] || enabled="disabled"

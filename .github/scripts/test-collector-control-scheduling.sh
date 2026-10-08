@@ -53,11 +53,13 @@ cmp "$root/expected" "$root/actual"
 awk '
   $1=="start" {
     active++; if (active>peak) peak=active;
-    if ($2=="test-rust-lob-recovery-queue.sh") {if (ended!=13 || active!=1) exit 1; recovery=1}
-    else if (recovery) exit 1
+    slow=($2=="test-rust-lob-recovery-queue.sh" ||
+          $2=="test-rust-lob-control-plane.sh" || $2=="test-monday-collector-health.sh");
+    if (slow) {if (ended!=13) exit 1; parallel++}
+    else if (active!=1 || parallel) exit 1
   }
-  $1=="end" {active--; ended++; if ($2=="test-rust-lob-recovery-queue.sh") recovery=0}
-  END {if (peak!=2 || active!=0 || ended!=16) exit 1}
+  $1=="end" {active--; ended++}
+  END {if (peak!=3 || parallel!=3 || active!=0 || ended!=16) exit 1}
 ' "$root/events"
 [[ $(grep -c '^contract_result script=' "$root/output") == 16 ]]
 grep -q elapsed_seconds= "$root/output"
@@ -67,10 +69,13 @@ if FAIL=test-trading-ecs-host-contract.sh bash "$runner" --root "$root" >"$root/
 [[ $(grep -c '^start ' "$root/events") == 3 ]]
 grep -q 'exit=37' "$root/output"
 
-fixture slow-failure
-if FAIL=test-rust-lob-recovery-queue.sh bash "$runner" --root "$root" >"$root/output"; then exit 1; fi
-[[ $(grep -c '^end ' "$root/events") == 16 ]]
-grep -q 'exit=37' "$root/output"
+for failed_script in test-rust-lob-recovery-queue.sh test-rust-lob-control-plane.sh test-monday-collector-health.sh; do
+  fixture "slow-failure-$failed_script"
+  if FAIL=$failed_script bash "$runner" --root "$root" >"$root/output"; then exit 1; fi
+  [[ $(grep -c '^end ' "$root/events") == 16 ]]
+  grep -q "contract_result script=$failed_script exit=37 " "$root/output"
+  [[ $(grep -c ' exit=0 ' "$root/output") == 15 ]]
+done
 
 fixture cancellation
 HOLD=1 bash "$runner" --root "$root" >"$root/output" 2>&1 &
@@ -109,4 +114,4 @@ grep -q 'register the fee cutover contract' "$root/error"
 sed 's/^  test-binance-fee-cutover.sh$/  # test-binance-fee-cutover.sh/' "$runner" >"$root/.github/scripts/run-collector-control-contracts.sh"
 if check_fee 2>"$root/error"; then exit 1; fi
 grep -q 'register the fee cutover contract' "$root/error"
-printf 'collector scheduling: coverage, isolation, failures, cancellation and fee admission passed\n'
+printf 'collector scheduling: coverage, parallel scheduling, failures, cancellation and fee admission passed\n'

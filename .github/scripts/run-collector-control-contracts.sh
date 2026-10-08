@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux CI: fast contracts first, isolated recovery, then two independent suites.
+# Linux CI: fast contracts first, then three independent suites in parallel.
 set -Eeuo pipefail
 
 FAST=(
@@ -17,8 +17,7 @@ FAST=(
   test-bybit-options-shadow-gate.sh
   test-upload-cpu-limits.sh
 )
-ISOLATED=(test-rust-lob-recovery-queue.sh)
-SLOW=(test-rust-lob-control-plane.sh test-monday-collector-health.sh)
+SLOW=(test-rust-lob-recovery-queue.sh test-rust-lob-control-plane.sh test-monday-collector-health.sh)
 
 root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 if [[ ${1:-} == --root && $# == 2 ]]; then
@@ -55,14 +54,22 @@ trap 'exit 143' TERM
 
 start() {
   local name=$1
-  setsid bash "$root/deployment/aliyun/$name" >"$logs/$name" 2>&1 &
+  # shellcheck disable=SC2016 # The child records its own duration and exit status.
+  setsid bash -c '
+    began=$SECONDS
+    status=0
+    bash "$1" || status=$?
+    printf "%s\n" "$((SECONDS - began))" >"$2"
+    exit "$status"
+  ' _ "$root/deployment/aliyun/$name" "$logs/$name.elapsed" >"$logs/$name" 2>&1 &
   started_pid=$!
   active+=("$started_pid")
   printf 'contract_start script=%s\n' "$name"
 }
 finish() {
-  local pid=$1 name=$2 began_at=$3 status=0 item remaining=()
+  local pid=$1 name=$2 status=0 elapsed=unknown item remaining=()
   wait "$pid" || status=$?
+  if [[ -f $logs/$name.elapsed ]]; then read -r elapsed <"$logs/$name.elapsed"; fi
   for item in "${active[@]}"; do
     [[ $item == "$pid" ]] || remaining+=("$item")
   done
@@ -70,29 +77,21 @@ finish() {
   printf '::group::%s\n' "$name"
   cat -- "$logs/$name"
   printf '::endgroup::\ncontract_result script=%s exit=%s elapsed_seconds=%s\n' \
-    "$name" "$status" "$((SECONDS - began_at))"
+    "$name" "$status" "$elapsed"
   if (( status != 0 )); then failed=1; fi
 }
 
 cd -- "$root/rust_hft"
 for name in "${FAST[@]}"; do
-  began_at=$SECONDS
   start "$name"
-  finish "$started_pid" "$name" "$began_at"
+  finish "$started_pid" "$name"
   if (( failed )); then exit 1; fi
 done
-printf 'contract_phase name=recovery_isolated\n'
-for name in "${ISOLATED[@]}"; do
-  began_at=$SECONDS
-  start "$name"
-  finish "$started_pid" "$name" "$began_at"
-done
-printf 'contract_phase name=parallel_health_control\n'
-pids=() starts=()
+printf 'contract_phase name=parallel_recovery_health_control\n'
+pids=()
 for name in "${SLOW[@]}"; do
-  starts+=("$SECONDS")
   start "$name"
   pids+=("$started_pid")
 done
-for i in "${!SLOW[@]}"; do finish "${pids[i]}" "${SLOW[i]}" "${starts[i]}"; done
+for i in "${!SLOW[@]}"; do finish "${pids[i]}" "${SLOW[i]}"; done
 exit "$failed"
