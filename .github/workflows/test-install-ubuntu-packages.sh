@@ -112,8 +112,8 @@ grep -F 'rm -rf -- ' "$test_root/install-failing-calls" >/dev/null
 
 ci_workflow="$repo_root/.github/workflows/ci.yml"
 ploy_workflow="$repo_root/.github/workflows/ploy-ci.yml"
-[[ "$(grep -cF 'install-ubuntu-packages.sh' "$ci_workflow")" == 3 ]]
-[[ "$(grep -cF 'install-ubuntu-packages.sh' "$ploy_workflow")" == 6 ]]
+[[ "$(grep -cF 'install-ubuntu-packages.sh' "$ci_workflow")" == 6 ]]
+[[ "$(grep -cF 'install-ubuntu-packages.sh' "$ploy_workflow")" == 7 ]]
 if grep -nF 'sudo apt-get update' "$ci_workflow" "$ploy_workflow"; then
   echo "host workflow still uses the ambient apt source list" >&2
   exit 1

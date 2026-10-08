@@ -1409,6 +1409,136 @@ taker_fee_rate = 0.07
         assert!(!config.sim_executor_config().fee_schedule.is_configured());
     }
 
+    fn configuration_is_syntax_only(relative: &str) -> bool {
+        matches!(
+            relative,
+            "config/default.toml" | "config/strategies/07-liquidity-vacuum.template.toml"
+        )
+    }
+
+    fn validate_ci_configuration(path: &Path, syntax_only: bool) -> Result<(), String> {
+        let body = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let value: toml::Value = toml::from_str(&body).map_err(|error| error.to_string())?;
+        // The default schema and the unwired liquidity-vacuum template are not
+        // FullConfig runtime inputs. The architecture contract still checks them.
+        if syntax_only {
+            return Ok(());
+        }
+        for section in value
+            .as_table()
+            .ok_or("expected a configuration table")?
+            .keys()
+        {
+            if !matches!(
+                section.as_str(),
+                "runtime"
+                    | "strategy"
+                    | "reference_data"
+                    | "backtest_data"
+                    | "execution"
+                    | "live_execution"
+            ) {
+                return Err(format!("unknown strategy configuration section: {section}"));
+            }
+        }
+        let config = FullConfig::from_file(path.to_str().ok_or("non-UTF-8 config path")?)
+            .map_err(|error| error.to_string())?;
+        if !matches!(
+            config.runtime.mode.as_str(),
+            "backtest" | "replay" | "dryrun" | "live"
+        ) {
+            return Err(format!("unknown runtime mode: {}", config.runtime.mode));
+        }
+        if matches!(
+            config.strategy_kind(),
+            crate::strategies::registry::StrategyKind::Unknown(_)
+        ) {
+            return Err(format!(
+                "unknown strategy variant: {}",
+                config.runtime.strategy_variant
+            ));
+        }
+        if config.strategy.symbols.is_empty() {
+            return Err("strategy configuration must define at least one symbol".to_string());
+        }
+        config.validated_feed_broadcast_capacity()?;
+        Ok(())
+    }
+
+    #[test]
+    fn changed_configuration_files_parse() {
+        let Ok(selected) = std::env::var("MONDAY_STRATEGY_CONFIG_FILES_JSON") else {
+            return;
+        };
+        let paths: Vec<String> = serde_json::from_str(&selected).expect("valid config path plan");
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for relative in paths {
+            let is_default = relative == "config/default.toml";
+            let path = Path::new(&relative);
+            assert!(
+                is_default
+                    || (path.parent() == Some(Path::new("config/strategies"))
+                        && path.extension().and_then(|value| value.to_str()) == Some("toml")),
+                "unsupported configuration path: {relative}"
+            );
+            validate_ci_configuration(
+                &workspace.join(path),
+                configuration_is_syntax_only(&relative),
+            )
+            .unwrap_or_else(|error| panic!("{relative}: {error}"));
+        }
+    }
+
+    #[test]
+    fn configuration_contract_rejects_invalid_strategy_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("parameters.toml");
+        let valid = r#"
+[runtime]
+mode = "dryrun"
+strategy_variant = "directional"
+[strategy]
+symbols = ["BTCUSDT"]
+"#;
+        std::fs::write(&path, valid).unwrap();
+        validate_ci_configuration(&path, false).unwrap();
+        for invalid in [
+            "not valid TOML = [".to_string(),
+            valid.replace("dryrun", "unknown-mode"),
+            valid.replace("directional", "unknown-strategy"),
+            valid.replace("[\"BTCUSDT\"]", "[]"),
+            format!("{valid}\n[unrecognized]\nvalue = 1\n"),
+            "[strategy]\nsymbols = [\"BTCUSDT\"]\n[timing]\nwindow = 10\n".to_string(),
+        ] {
+            std::fs::write(&path, &invalid).unwrap();
+            assert!(
+                validate_ci_configuration(&path, false).is_err(),
+                "accepted invalid strategy configuration: {invalid}"
+            );
+        }
+        std::fs::write(&path, "[dry_run]\nenabled = true\n").unwrap();
+        validate_ci_configuration(&path, true).unwrap();
+        std::fs::write(&path, "[dry_run\nenabled = true\n").unwrap();
+        assert!(validate_ci_configuration(&path, true).is_err());
+    }
+
+    #[test]
+    fn configuration_contract_preserves_only_the_known_unwired_template() {
+        let relative = "config/strategies/07-liquidity-vacuum.template.toml";
+        assert!(configuration_is_syntax_only(relative));
+        assert!(configuration_is_syntax_only("config/default.toml"));
+        for runtime_input in [
+            "config/strategies/new.template.toml",
+            "config/strategies/01-momentum.default.toml",
+            "config/strategies/02-pm5d-threelayer.live.toml",
+        ] {
+            assert!(!configuration_is_syntax_only(runtime_input));
+        }
+        let path = strategy_config_dir().join("07-liquidity-vacuum.template.toml");
+        validate_ci_configuration(&path, true).unwrap();
+        assert!(validate_ci_configuration(&path, false).is_err());
+    }
+
     #[test]
     fn roadmap_config_family_parses() {
         let config_dir = strategy_config_dir();
