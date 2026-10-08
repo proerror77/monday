@@ -2137,4 +2137,5 @@ if [ "$fail_count" -gt 0 ]; then
   printf '%s\n' "$ERR" | sed 's/^/  stderr: /' | head -n 40
   exit 1
 fi
-exit 0
+# CI acceptance probe: restore after the red step confirms failure propagation.
+exit 1
