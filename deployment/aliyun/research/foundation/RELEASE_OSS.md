@@ -43,6 +43,48 @@ repository_id: verified immutable GitHub repository ID
 owner_id: verified immutable GitHub owner ID
 ```
 
+### Migrate existing configuration without recreating resources
+
+Keep three facts separate: an existing Alibaba bucket/repository/role, a missing
+GitHub public policy mapping, and actual role permissions not yet independently
+verified. `MONDAY_RESEARCH_RELEASE_POLICY lacks oss_by_product mapping` is a
+local configuration error before RAM/OSS/ACR calls. It does not establish missing
+cloud resources. The prior Gateway publisher policy had signing trust, builder
+and image repositories but no per-product OSS identity mapping; those existing
+settings and resources remain reusable. Do not rebuild them to fix this error.
+
+Read the existing public policy through the approved operator surface and ask
+the read-only inventory owner to compare existing role trust/actions/resources
+with the exact native scope plan. Prepare a public role-map JSON object keyed by
+the selected products, with the complete fields above, using only verified
+existing values. Each product must retain its independently reviewed distinct
+role and exact sorted prefixes. Whether existing roles qualify, or any specific
+IAM delta is needed, is an inventory result, not inferred from this error.
+
+```bash
+bash .github/scripts/migrate-research-oss-policy.sh \
+  EXISTING_PUBLIC_POLICY_JSON REVIEWED_EXISTING_ROLE_MAP_JSON > CANDIDATE_POLICY_JSON
+```
+
+This offline command preserves every existing policy field and only adds the
+explicit mapping. It rejects unknown products, shared roles, wildcard prefixes,
+missing fields, duplicate JSON documents and a different already-installed map;
+an identical repeat is idempotent. If a map already exists, reconcile it and
+include all previously approved entries rather than silently replacing them.
+Its structural checks do not prove actual RAM permissions, endpoint trust or
+native signing policy acceptance. It performs no API calls, key creation, role
+creation, IAM writes or repository-variable updates. Review the public JSON diff
+before the separately authorized variable update; review only demonstrated IAM
+differences before any permission write. Never obtain values from collector
+credentials or fill unknown role/provider/audience/subject values by guessing.
+
+For example, a controller-only migration supplies `{ "controller": OSS_ENTRY }`;
+publishing all three products needs all three independently reviewed entries.
+A single legacy role cannot be silently copied into all products. The selected
+product projection still goes through the same native validation and real IAM
+negative acceptance required below. A presence check only confirms the variable
+and signing secret are set; it cannot establish that this migration is complete.
+
 Resolve IDs through authenticated GitHub reads. Do not guess IDs or create credentials.
 The ACK policy can use the same bucket with its internal HTTPS endpoint.
 The code accepts only bucket/region-bound Alibaba endpoints, without redirects or ambient proxies.
