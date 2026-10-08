@@ -47,11 +47,16 @@ grep -q '^hft-research-ml ' "$work/cex-worker.tree"
 grep -q '^burn ' "$work/cex-worker.tree"
 for profile in default db full; do
   options=()
-  [[ $profile == default ]] || options=(--features db)
+  [[ $profile == default ]] || options=(--features "$profile")
   cargo tree --manifest-path "$root/rust_hft/prediction-markets/Cargo.toml" \
     -p ploy-research "${options[@]}" --locked --edges normal --prefix none >"$work/prediction.tree"
   if grep -E '^(alpha-(domain|engine|harness|onnx-evaluator) |hft-(cex-research-input|collector|backtest|research-platform) )' "$work/prediction.tree"; then
     echo 'prediction research pulls the CEX input, evaluator or control chain' >&2; exit 1
+  fi
+  # Prove the full graph includes science and export, beyond the db-only graph.
+  if [[ $profile == full ]] &&
+    { ! grep -q '^burn ' "$work/prediction.tree" || ! grep -q '^polars ' "$work/prediction.tree"; }; then
+    echo 'prediction full graph is missing training or columnar export dependencies' >&2; exit 1
   fi
 done
 for profile in default researcher-verification control,gateway,publisher,researcher-verification; do
