@@ -88,29 +88,35 @@ The research plane exposes no order or trade command and has no execution-adapte
 
 ## Focused Validation
 
-Run from `rust_hft/` unless noted:
+Run the affected checks from the repository root. Each example names the
+package's owning workspace; the list is not a required suite for every change.
 
 ```bash
-cargo test --locked -p hft-collector -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness
-cargo test --locked -p hft-research-ml
-cargo clippy --locked -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness --all-targets --no-deps -- -D warnings
-cargo clippy --locked -p hft-collector --all-targets --features collector-binance --no-deps -- -D warnings
-cargo test --locked -p hft-live --features dl-strategy
-cargo test --locked -p hft-live --no-default-features --features formula-strategy,binance --test deployment_envelope
-cargo test --locked -p hft-execution-adapter-binance-prediction
-cargo test --locked -p hft-runtime --features binance-prediction
-cargo test --locked -p hft-live --no-default-features --features formula-strategy,bitget --test deployment_artifacts
-cargo audit --no-fetch
+cargo test --manifest-path rust_hft/data-pipelines/Cargo.toml --locked -p hft-collector
+cargo test --manifest-path rust_hft/research-core/Cargo.toml --locked -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness
+cargo test --manifest-path rust_hft/research-core/Cargo.toml --locked -p hft-research-ml
+cargo clippy --manifest-path rust_hft/research-core/Cargo.toml --locked -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness --all-targets --no-deps -- -D warnings
+cargo clippy --manifest-path rust_hft/data-pipelines/Cargo.toml --locked -p hft-collector --all-targets --features collector-binance --no-deps -- -D warnings
+cargo test --manifest-path rust_hft/runtime/Cargo.toml --locked -p hft-live --features dl-strategy
+cargo test --manifest-path rust_hft/runtime/Cargo.toml --locked -p hft-live --no-default-features --features formula-strategy,binance --test deployment_envelope
+cargo test --manifest-path rust_hft/runtime/Cargo.toml --locked -p hft-execution-adapter-binance-prediction
+cargo test --manifest-path rust_hft/runtime/Cargo.toml --locked -p hft-runtime --features binance-prediction
+cargo test --manifest-path rust_hft/runtime/Cargo.toml --locked -p hft-live --no-default-features --features formula-strategy,bitget --test deployment_artifacts
+cargo test --manifest-path rust_hft/runtime/Cargo.toml --locked -p hft-infra-secrets --test tracked_secrets_contract -- --nocapture
+cargo test --manifest-path rust_hft/runtime/Cargo.toml --locked -p hft-live --no-default-features --test deployment_artifacts
 ```
 
-From the repository root:
+Audit the changed owner's lockfile from that workspace, for example:
 
 ```bash
-cargo test --manifest-path rust_hft/Cargo.toml -p hft-infra-secrets --test tracked_secrets_contract --locked -- --nocapture
-cargo test --manifest-path rust_hft/Cargo.toml -p hft-live --no-default-features --test deployment_artifacts --locked
+(cd rust_hft/research-core && cargo audit --no-fetch)
 ```
 
-Ordinary changes should use package-scoped checks. Run a release graph, container build, and Kubernetes dry-run once at a production gate, not after every edit.
+Use `rust_hft/scripts/cargo-scoped.sh` for explicit package sets across owners.
+Feature matrices and named tests use an owning manifest. For workspace ownership
+or dependency-boundary changes, run `bash .github/scripts/test-rust-workspaces.sh`.
+Release graphs, container builds, and Kubernetes validation follow the selected
+CI jobs and the applicable production gate.
 
 ## Entry Points
 
