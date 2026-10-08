@@ -314,3 +314,4 @@ done
 if jq -e --arg product foreign -f "$selector" "$tmp_dir/oss-products.json" >/dev/null 2>&1; then exit 1; fi
 jq '.oss_by_product.controller.role_arn=.oss_by_product["cex-runner"].role_arn' "$tmp_dir/oss-products.json" >"$tmp_dir/oss-shared-role.json"
 if jq -e --arg product controller -f "$selector" "$tmp_dir/oss-shared-role.json" >/dev/null 2>&1; then exit 1; fi
+bash "$script_dir/test-migrate-research-oss-policy.sh"
