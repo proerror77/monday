@@ -228,7 +228,7 @@ if grep -q ',ci/rust,' "$work/scope"; then
   fail 'script edit selected the rust workspace'
 fi
 
-ruby -ryaml - "$root/.github/workflows/ci.yml" <<'RUBY'
+ruby -ryaml -rpathname - "$root/.github/workflows/ci.yml" <<'RUBY'
 workflow = ARGV.fetch(0)
 text = File.read(workflow)
 token = ['py', 'thon3'].join
@@ -248,7 +248,14 @@ abort 'loop step does not wait for shards' unless loop.fetch('run').include?('lo
 archive = jobs.fetch('rust_loop_nextest_archive')
 abort 'archive must depend only on scope' unless archive.fetch('needs') == 'scope'
 cache = archive.fetch('steps').find { |step| step['uses'].to_s.include?('Swatinem/rust-cache@') }
-abort 'archive cache key drifted' unless cache && cache.dig('with', 'key') == 'rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}'
+abort 'archive cache key drifted' unless cache && cache.dig('with', 'key') == 'loop-nextest-research-owner-v2-${{ steps.cache-info.outputs.rust }}'
+cache_pairs = cache.dig('with', 'workspaces').lines.map(&:strip).reject(&:empty?).map { |line| line.split(/\s*->\s*/) }
+abort 'archive cleanup must use only the research owner' unless cache_pairs.length == 1 && cache_pairs[0][0] == 'rust_hft/research-core'
+cache_source, cache_target = cache_pairs.fetch(0)
+abort 'archive cache target is missing' unless cache_target
+target = Pathname.new(cache_source).join(cache_target).cleanpath.to_s
+build_target = archive.fetch('env').fetch('CARGO_TARGET_DIR').delete_prefix('${{ github.workspace }}/')
+abort 'archive cache does not cover its Cargo target' unless target == build_target
 abort 'archive cache save drifted' unless cache.dig('with', 'save-if') == "${{ github.ref == 'refs/heads/main' }}"
 shard = jobs.fetch('rust_loop_nextest_shard')
 abort 'shard must depend only on the archive' unless shard.fetch('needs') == 'rust_loop_nextest_archive'
