@@ -118,7 +118,6 @@ struct Config {
     max_pending_diffs: usize,
     stall_timeout: Duration,
     sync_timeout: Duration,
-    process_watchdog_timeout: Duration,
     snapshot_retry_attempts: usize,
     rest_base: String,
     oss_bucket: String,
@@ -433,10 +432,6 @@ impl Config {
             max_pending_diffs: env_parse("MAX_PENDING_DIFFS_TOTAL", 250_000_usize)?.max(1),
             stall_timeout: Duration::from_secs(env_parse("STALL_TIMEOUT_SECONDS", 60_u64)?),
             sync_timeout: Duration::from_secs(env_parse("SYNC_TIMEOUT_SECONDS", 120_u64)?),
-            process_watchdog_timeout: Duration::from_secs(env_parse(
-                "PROCESS_WATCHDOG_SECONDS",
-                180_u64,
-            )?),
             snapshot_retry_attempts: env_parse("SNAPSHOT_RETRY_ATTEMPTS", 6_usize)?.max(1),
             rest_base,
             oss_bucket: env_string("OSS_BUCKET", "monday-lob-apne1-1045353359"),
@@ -1017,6 +1012,7 @@ struct ProcessWatchdogInner {
     started: Instant,
     last_data_ms: AtomicU64,
     last_processed_ms: AtomicU64,
+    consumer_started_ms: AtomicU64,
     queue_capacity: AtomicU64,
     queue_remaining_capacity: AtomicU64,
     queue_saturated: AtomicU8,
@@ -1045,6 +1041,7 @@ impl ProcessWatchdog {
                 started: Instant::now(),
                 last_data_ms: AtomicU64::new(0),
                 last_processed_ms: AtomicU64::new(UNKNOWN_ELAPSED_MS),
+                consumer_started_ms: AtomicU64::new(UNKNOWN_ELAPSED_MS),
                 queue_capacity: AtomicU64::new(0),
                 queue_remaining_capacity: AtomicU64::new(0),
                 queue_saturated: AtomicU8::new(0),
@@ -1100,6 +1097,10 @@ impl ProcessWatchdog {
                                 "process watchdog producer diagnostic"
                             );
                         }
+                        // process::exit skips destructors. Flush the synchronous
+                        // tracing output before the service restarts this process.
+                        let _ = std::io::stdout().flush();
+                        let _ = std::io::stderr().flush();
                         std::process::exit(75);
                     }
                 }
@@ -1149,6 +1150,9 @@ impl ProcessWatchdog {
 
     fn reset_session_diagnostics(&self, stream_shards: &[StreamShard]) {
         self.inner.producer_diagnostics.reset(stream_shards);
+        self.inner
+            .consumer_started_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
         self.inner
             .last_processed_ms
             .store(UNKNOWN_ELAPSED_MS, Ordering::Relaxed);
@@ -1215,11 +1219,23 @@ impl ProcessWatchdog {
     }
 
     fn try_begin_exit_at(&self, now_ms: u64, timeout: Duration) -> bool {
-        if !process_watchdog_expired(
-            self.inner.last_data_ms.load(Ordering::Relaxed),
-            now_ms,
-            timeout,
-        ) {
+        let last_processed_ms = self.inner.last_processed_ms.load(Ordering::Relaxed);
+        // An unstarted consumer has no deadline during recovery. Once a
+        // session starts, even its first event must be consumed on time.
+        let consumer_progress_ms = if last_processed_ms == UNKNOWN_ELAPSED_MS {
+            self.inner.consumer_started_ms.load(Ordering::Relaxed)
+        } else {
+            last_processed_ms
+        };
+        let consumer_expired = elapsed_age(consumer_progress_ms, now_ms)
+            .is_some_and(|age_ms| age_ms > timeout.as_millis() as u64);
+        if !consumer_expired
+            && !process_watchdog_expired(
+                self.inner.last_data_ms.load(Ordering::Relaxed),
+                now_ms,
+                timeout,
+            )
+        {
             return false;
         }
         self.inner
@@ -1250,6 +1266,23 @@ impl ProcessWatchdog {
 
 fn process_watchdog_expired(last_data_ms: u64, now_ms: u64, timeout: Duration) -> bool {
     now_ms.saturating_sub(last_data_ms) > timeout.as_millis() as u64
+}
+
+fn process_watchdog_timeout() -> anyhow::Result<Duration> {
+    Ok(Duration::from_secs(env_parse(
+        "PROCESS_WATCHDOG_SECONDS",
+        180_u64,
+    )?))
+}
+
+fn with_recovery_watchdog<T>(
+    timeout: Duration,
+    recover: impl FnOnce(&ProcessWatchdog) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let watchdog = ProcessWatchdog::start(timeout, Arc::new(ProducerDiagnostics::default()))?;
+    let result = recover(&watchdog);
+    watchdog.stop();
+    result
 }
 
 fn publish_global_shutdown(shutdown: &watch::Sender<bool>, watchdog: &ProcessWatchdog) -> bool {
@@ -1299,10 +1332,21 @@ async fn main() -> anyhow::Result<()> {
     let spool_dir = PathBuf::from(env_string("SPOOL_DIR", "/data/monday/spool/binance-lob"));
     std::fs::create_dir_all(&spool_dir)?;
     let _spool_lock = SpoolLock::acquire(&spool_dir)?;
-    ensure_startup_spool_ready(&spool_dir)?;
-    let mut config = Arc::new(Config::from_env().await?);
     let producer_diagnostics = Arc::new(ProducerDiagnostics::default());
-    let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout, producer_diagnostics)?;
+    let watchdog = ProcessWatchdog::start(process_watchdog_timeout()?, producer_diagnostics)?;
+    let startup = async {
+        ensure_startup_spool_ready(&spool_dir)?;
+        Config::from_env().await
+    }
+    .await;
+    let mut config = match startup {
+        Ok(config) => Arc::new(config),
+        Err(error) => {
+            watchdog.stop();
+            return Err(error);
+        }
+    };
+    watchdog.mark_data();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let upload_task = tokio::spawn(upload_loop(config.clone(), shutdown_rx.clone()));
     let shutdown_signal = tokio::spawn(wait_for_signal(shutdown_tx.clone(), watchdog.clone()));
@@ -1477,9 +1521,12 @@ fn recover_parts_only() -> anyhow::Result<()> {
         zstd_timeout: Duration::from_secs(required_env_parse("ZSTD_TIMEOUT_SECONDS")?),
         stream_types: expected_stream_types,
     };
-    let recovery_batches = prepare_recovery_batches(&base_config, &parts, &nonempty_parts)?;
-    remove_recovery_temporaries(&temporaries)?;
-    let recovered = recover_recovery_batches(recovery_batches)?;
+    let recovered = with_recovery_watchdog(process_watchdog_timeout()?, |watchdog| {
+        let recovery_batches = prepare_recovery_batches(&base_config, &parts, &nonempty_parts)?;
+        remove_recovery_temporaries(&temporaries)?;
+        watchdog.mark_data();
+        recover_recovery_batches(recovery_batches, || watchdog.mark_data())
+    })?;
     anyhow::ensure!(
         recovered.len() == nonempty_parts.len()
             && files_with_suffix(&spool_dir, ".jsonl.part")?.is_empty()
@@ -1524,10 +1571,12 @@ fn prepare_recovery_batches(
 
 fn recover_recovery_batches(
     batches: Vec<(SegmentConfig, Vec<PathBuf>)>,
+    mut progress: impl FnMut(),
 ) -> anyhow::Result<Vec<SegmentArtifacts>> {
     let mut recovered = Vec::new();
     for (config, parts) in batches {
         recovered.extend(recover_parts_from_paths(&config, &parts)?);
+        progress();
     }
     Ok(recovered)
 }
@@ -6033,7 +6082,9 @@ mod tests {
         .unwrap();
         assert!(recovery_session_groups(&[parts[0].clone(), parts[1].clone(), repeated]).is_err());
         let batches = prepare_recovery_batches(&base_config, &parts, &parts).unwrap();
-        let artifacts = recover_recovery_batches(batches).unwrap();
+        let mut progress_count = 0;
+        let artifacts = recover_recovery_batches(batches, || progress_count += 1).unwrap();
+        assert_eq!(progress_count, 3);
         assert_eq!(artifacts.len(), parts.len());
         let recovered_sessions = artifacts
             .iter()
@@ -7333,7 +7384,6 @@ mod tests {
             max_pending_diffs: 100,
             stall_timeout: Duration::from_secs(60),
             sync_timeout: Duration::from_secs(120),
-            process_watchdog_timeout: Duration::from_secs(180),
             snapshot_retry_attempts: 3,
             rest_base,
             oss_bucket: "bucket".into(),
@@ -11841,6 +11891,231 @@ mod tests {
     }
 
     #[test]
+    fn process_watchdog_trips_stalled_consumer_with_fresh_arrivals() {
+        let watchdog = armed_watchdog();
+        watchdog
+            .inner
+            .last_processed_ms
+            .store(1_000, Ordering::Relaxed);
+        watchdog
+            .inner
+            .last_data_ms
+            .store(181_000, Ordering::Relaxed);
+        assert!(!watchdog.try_begin_exit_at(181_000, Duration::from_secs(180)));
+        assert!(watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
+        assert_eq!(watchdog.state(), ProcessWatchdogState::Firing);
+    }
+
+    #[test]
+    fn process_watchdog_trips_before_first_event_is_consumed() {
+        let watchdog = armed_watchdog();
+        watchdog.reset_session_diagnostics(&[]);
+        watchdog
+            .inner
+            .consumer_started_ms
+            .store(1_000, Ordering::Relaxed);
+        watchdog
+            .inner
+            .last_data_ms
+            .store(181_000, Ordering::Relaxed);
+        assert_eq!(
+            watchdog.inner.last_processed_ms.load(Ordering::Relaxed),
+            UNKNOWN_ELAPSED_MS
+        );
+        assert!(!watchdog.try_begin_exit_at(181_000, Duration::from_secs(180)));
+        assert!(watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
+    }
+
+    #[test]
+    fn process_watchdog_accepts_progress_but_still_trips_arrival_silence() {
+        let watchdog = armed_watchdog();
+        watchdog
+            .inner
+            .last_data_ms
+            .store(181_000, Ordering::Relaxed);
+        watchdog
+            .inner
+            .last_processed_ms
+            .store(181_000, Ordering::Relaxed);
+        assert!(!watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
+        watchdog.inner.last_data_ms.store(1_000, Ordering::Relaxed);
+        assert!(watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
+    }
+
+    #[test]
+    fn process_watchdog_shutdown_disarms_the_consumer_deadline() {
+        let watchdog = armed_watchdog();
+        watchdog
+            .inner
+            .last_processed_ms
+            .store(1_000, Ordering::Relaxed);
+        watchdog
+            .inner
+            .last_data_ms
+            .store(181_000, Ordering::Relaxed);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        assert!(publish_global_shutdown(&shutdown_tx, &watchdog));
+        assert!(*shutdown_rx.borrow());
+        assert!(!watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
+    }
+
+    #[test]
+    fn process_watchdog_recovery_stops_after_success_and_failure() {
+        for fail in [false, true] {
+            let mut observed = None;
+            let result = with_recovery_watchdog(Duration::from_secs(180), |watchdog| {
+                observed = Some(watchdog.clone());
+                assert_eq!(watchdog.state(), ProcessWatchdogState::Armed);
+                assert_eq!(
+                    watchdog.inner.consumer_started_ms.load(Ordering::Relaxed),
+                    UNKNOWN_ELAPSED_MS
+                );
+                if fail {
+                    anyhow::bail!("recovery failed closed");
+                }
+                Ok(17)
+            });
+            assert_eq!(observed.unwrap().state(), ProcessWatchdogState::Stopped);
+            if fail {
+                assert_eq!(result.unwrap_err().to_string(), "recovery failed closed");
+            } else {
+                assert_eq!(result.unwrap(), 17);
+            }
+        }
+    }
+
+    #[test]
+    fn process_watchdog_recovery_progress_does_not_require_a_consumer() {
+        let watchdog = armed_watchdog();
+        watchdog
+            .inner
+            .last_data_ms
+            .store(181_000, Ordering::Relaxed);
+        assert!(!watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
+        assert!(watchdog.try_begin_exit_at(361_001, Duration::from_secs(180)));
+    }
+
+    // Run the exit path in a child so exit(75) cannot terminate the test runner.
+    #[test]
+    fn process_watchdog_exit_child() {
+        let Ok(mode) = env::var("MONDAY_WATCHDOG_TEST_CHILD") else {
+            return;
+        };
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .without_time()
+            .init();
+        if mode == "recovery" {
+            let _: anyhow::Result<()> = with_recovery_watchdog(Duration::from_millis(40), |_| {
+                // Recovery has not returned and cannot refresh progress.
+                let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+                receiver.recv().unwrap();
+                Ok(())
+            });
+        } else {
+            let shards = vec![
+                StreamShard {
+                    url: "wss://first".into(),
+                    streams: BTreeSet::from(["btcusdt@trade".into()]),
+                },
+                StreamShard {
+                    url: "wss://second".into(),
+                    streams: BTreeSet::from(["ethusdt@trade".into()]),
+                },
+            ];
+            let watchdog = ProcessWatchdog::start(
+                Duration::from_millis(40),
+                Arc::new(ProducerDiagnostics::new(&shards)),
+            )
+            .unwrap();
+            watchdog.reset_session_diagnostics(&shards);
+            if mode == "consumer" {
+                watchdog.mark_processed();
+            }
+            loop {
+                for producer_id in 0..shards.len() {
+                    watchdog.mark_data_for(producer_id);
+                    watchdog.mark_enqueued_for(producer_id);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        panic!("watchdog did not terminate the stalled process");
+    }
+
+    fn watchdog_child_output(mode: &str) -> std::process::Output {
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::process_watchdog_exit_child",
+                "--nocapture",
+            ])
+            .env("MONDAY_WATCHDOG_TEST_CHILD", mode)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("watchdog child {mode} exceeded its deadline: {output:?}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn process_watchdog_exits_75_while_recovery_is_blocked() {
+        let output = watchdog_child_output("recovery");
+        assert_eq!(output.status.code(), Some(75));
+        assert!(String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("process watchdog exiting after market-data stall"));
+    }
+
+    #[test]
+    fn process_watchdog_flushes_all_producer_diagnostics_before_exit_75() {
+        for mode in ["consumer", "first-event"] {
+            let output = watchdog_child_output(mode);
+            assert_eq!(output.status.code(), Some(75));
+            let logs = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                logs.contains("process watchdog exiting after market-data stall"),
+                "{logs}"
+            );
+            assert_eq!(
+                logs.matches("process watchdog producer diagnostic").count(),
+                2,
+                "{logs}"
+            );
+            for expected in [
+                "producer_id=0",
+                "producer_id=1",
+                "wss://first",
+                "wss://second",
+                "btcusdt@trade",
+                "ethusdt@trade",
+            ] {
+                assert!(logs.contains(expected), "missing {expected}: {logs}");
+            }
+            assert!(
+                logs.contains(if mode == "consumer" {
+                    "processed_age_ms=Some("
+                } else {
+                    "processed_age_ms=None"
+                }),
+                "{logs}"
+            );
+        }
+    }
+
+    #[test]
     fn producer_watchdog_diagnostics_identify_stale_producer() {
         let shards = vec![
             StreamShard {
@@ -12428,6 +12703,7 @@ mod tests {
         assert_eq!(parts.len(), 1);
         let recovered = recover_recovery_batches(
             prepare_recovery_batches(&config.segment_config(), &parts, &parts).unwrap(),
+            || {},
         )
         .unwrap();
         assert_eq!(recovered.len(), 1);
