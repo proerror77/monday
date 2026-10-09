@@ -711,6 +711,18 @@ jobs:
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/rust-market-data,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 18
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: ploy
+          POSTGRES_PASSWORD: ${{ github.run_id }}
+          POSTGRES_DB: ploy_test
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
+      PLOY_TEST_DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
     steps:
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -735,14 +747,9 @@ jobs:
           shared-key: rust-market-data-${{ steps.cache-info.outputs.rust }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Check market-data ops lane
-        run: |
-          set -euo pipefail
-          SECONDS=0
-          cargo check --locked -p ploy-market-data --features live --lib
-          cargo test --locked -p ploy-market-data --features live --lib
-          echo "### Rust market-data ops lane" >> "$GITHUB_STEP_SUMMARY"
-          echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify market-data and ephemeral database contracts
+        working-directory: .
+        run: bash .github/scripts/run-prediction-market-data-contracts.sh
 
 
   rust-research-heavy:
