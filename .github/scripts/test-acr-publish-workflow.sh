@@ -34,6 +34,7 @@ mkdir "$policy_tools" "$policy_state"
 ln -s "$(command -v jq)" "$policy_tools/jq"
 ln -s "$(command -v dirname)" "$policy_tools/dirname"
 bash_command=$(command -v bash)
+ln -s "$bash_command" "$policy_tools/bash"
 jq -n '
   def oss($product): {
     bucket:"fixture-bucket", region:"fixture-region", endpoint:"https://fixture.invalid/",
@@ -101,6 +102,61 @@ for mode in check-config publish; do
   assert_public_policy_is_offline
 done
 printf 'Public policy structure, product mapping and pre-issuer failure contracts passed\n'
+
+# Execute the workflow's pre-build check with no compiler, network tool or issuer.
+awk '
+  /^      - name: Validate research publication settings before rebuild$/ { in_step=1; next }
+  in_step && /^      - / { exit }
+  in_step && /^        run: \|$/ { in_run=1; next }
+  in_run { sub(/^          /, ""); print }
+' "$workflow" >"$tmp_dir/pre-rebuild.sh"
+test -s "$tmp_dir/pre-rebuild.sh"
+run_rebuild_preflight() {
+  (
+    cd "$script_dir/../.."
+    PATH="$policy_tools" TMPDIR="$policy_state" RUNNER_TEMP="$policy_state" \
+      RESEARCH_PRODUCTS="$2" MONDAY_RELEASE_POLICY_JSON="$(<"$1")" \
+      MONDAY_RELEASE_POLICY_PRESENT="${3:-true}" \
+      MONDAY_RELEASE_SIGNING_KEY_PRESENT="${4:-true}" \
+      MONDAY_RELEASE_OSS_PRESENT="${5:-true}" \
+      MONDAY_RELEASE_SIGNING_KEY=EXAMPLE_private-key-must-not-appear \
+      MONDAY_RELEASE_GATEWAY_TOKEN=EXAMPLE_private-token-must-not-appear \
+      "$bash_command" "$tmp_dir/pre-rebuild.sh" \
+        >"$tmp_dir/public-policy.out" 2>"$tmp_dir/public-policy.err"
+  )
+}
+all_products=cex-runner,controller,prediction-runner
+run_rebuild_preflight "$tmp_dir/public-policy.json" "$all_products"
+[[ $(grep -Fc 'Public research publication policy structure is valid for' "$tmp_dir/public-policy.out") == 3 ]]
+assert_public_policy_is_offline
+for presence in 'false true true' 'true false true' 'true true false'; do
+  read -r policy_present key_present oss_present <<< "$presence"
+  if run_rebuild_preflight "$tmp_dir/public-policy.json" "$all_products" "$policy_present" "$key_present" "$oss_present"; then
+    echo 'missing configuration reached the manual producer' >&2; exit 1
+  fi
+  test ! -s "$tmp_dir/public-policy.out"
+  assert_public_policy_is_offline
+done
+for expression in 'del(.oss_by_product)' \
+  'del(.oss_by_product["cex-runner"])' 'del(.oss_by_product.controller)' \
+  'del(.oss_by_product["prediction-runner"])' \
+  '.oss_by_product.controller.role_arn=.oss_by_product["cex-runner"].role_arn'; do
+  jq "$expression" "$tmp_dir/public-policy.json" >"$tmp_dir/invalid-public-policy.json"
+  if run_rebuild_preflight "$tmp_dir/invalid-public-policy.json" "$all_products"; then
+    echo 'invalid selected product policy reached the manual producer' >&2; exit 1
+  fi
+  assert_public_policy_is_offline
+done
+printf '{invalid JSON\n' >"$tmp_dir/invalid-public-policy.json"
+if run_rebuild_preflight "$tmp_dir/invalid-public-policy.json" "$all_products"; then exit 1; fi
+assert_public_policy_is_offline
+# A single-product rebuild requires only its own publication mapping.
+jq 'del(.oss_by_product.controller, .oss_by_product["prediction-runner"])' \
+  "$tmp_dir/public-policy.json" >"$tmp_dir/cex-public-policy.json"
+run_rebuild_preflight "$tmp_dir/cex-public-policy.json" cex-runner
+[[ $(grep -Fc 'Public research publication policy structure is valid for' "$tmp_dir/public-policy.out") == 1 ]]
+assert_public_policy_is_offline
+printf 'Manual rebuild checks all selected products before any compilation or preparation\n'
 if [[ ${1:-} == --public-policy ]]; then exit 0; fi
 
 ruby -ryaml - "$workflow" "$ploy_workflow" "$ci_workflow" "$script_dir/../workflows/security-enabled.yml" <<'RUBY'
@@ -124,6 +180,22 @@ acr_selector = acr.fetch('jobs').fetch('selector')
 checkout = acr_selector.fetch('steps').find { |step| step.fetch('uses','').start_with?('actions/checkout@') }
 abort 'pending publication needs complete main history' unless checkout.fetch('with') == {'ref'=>'refs/heads/main','fetch-depth'=>0}
 abort 'ACR source planning compiles software' if acr_selector.to_s.match?(/\bcargo\s+(build|test|check|clippy|run)\b/)
+dispatch = (acr['on'] || acr[true]).fetch('workflow_dispatch').fetch('inputs')
+abort 'manual union target is unavailable' unless dispatch.fetch('target').fetch('options').include?('research-products')
+selector_steps = acr_selector.fetch('steps')
+source_index = selector_steps.index { |step| step['id']=='source' }
+prebuild_index = selector_steps.index { |step| step['name']=='Validate research publication settings before rebuild' }
+matrix_index = selector_steps.index { |step| step['id']=='select' }
+abort 'manual compilation can start before source/configuration validation' unless source_index && prebuild_index && matrix_index && source_index<prebuild_index && prebuild_index<matrix_index && acr.fetch('jobs').fetch('research-runner-binaries').fetch('needs')=='selector'
+prebuild = selector_steps.fetch(prebuild_index)
+abort 'configuration preflight is not scoped to explicit rebuilds' unless prebuild.fetch('if')=="steps.source.outputs.research_mode == 'rebuild'"
+abort 'prebuild check receives credentials or loses selected products' unless prebuild.fetch('env')=={
+  'RESEARCH_PRODUCTS'=>'${{ steps.source.outputs.published_products }}',
+  'MONDAY_RELEASE_POLICY_PRESENT'=>"${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}",
+  'MONDAY_RELEASE_SIGNING_KEY_PRESENT'=>"${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}",
+  'MONDAY_RELEASE_OSS_PRESENT'=>"${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}",
+  'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}'
+}
 [acr,ploy,ci,security].each do |doc|
   doc.fetch('jobs').each do |id,job|
     abort "public ACK runner exposure: #{id}" if job.fetch('runs-on','').to_s.match?(/self-hosted|monday-ack-research/)
@@ -152,6 +224,40 @@ repo_root = File.expand_path('../..', File.dirname(ARGV[0]))
     end
   end
 end
+prediction_builder = ploy.fetch('jobs').fetch('research-image-binaries')
+manual_builder = acr.fetch('jobs').fetch('research-runner-binaries')
+find_step = lambda { |job, name| job.fetch('steps').find { |step| step['name']==name } }
+cache_environment = lambda do |doc, job|
+  doc.fetch('env',{}).merge(job.fetch('env',{})).select { |name,_| name.match?(/\A(CARGO|CC|CFLAGS|CXX|CMAKE|RUST)/) }
+end
+abort 'manual dependency restore uses a different compiler environment' unless cache_environment.call(acr,manual_builder)==cache_environment.call(ploy,prediction_builder)
+abort 'manual dependency restore uses different native packages' unless find_step.call(manual_builder,'Install build dependencies').fetch('run')==find_step.call(prediction_builder,'Install build dependencies').fetch('run')
+toolchain = lambda { |job| job.fetch('steps').find { |step| step.fetch('uses','').start_with?('dtolnay/rust-toolchain@') } }
+abort 'manual dependency restore uses a different Rust toolchain' unless toolchain.call(manual_builder)==toolchain.call(prediction_builder)
+%w[research-cache-layout build-inputs].each do |id|
+  abort "manual build lost #{id}" unless manual_builder.fetch('steps').any? { |step| step['id']==id }
+end
+# Pinned rust-cache uses shared-key instead of key plus the default job suffix.
+effective_prefix = lambda do |job, id|
+  step = job.fetch('steps').find { |entry| entry['id']=='research-cache' }
+  abort 'cache action changed' unless step.fetch('uses')=='Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6'
+  settings = step.fetch('with')
+  abort 'dependency cache lost environment or target validation' unless settings.keys.sort == (id=='research-image-binaries' ? %w[key save-if workspaces] : %w[save-if shared-key workspaces])
+  abort 'dependency cache escaped owner paths' unless settings.fetch('workspaces')=='${{ steps.research-cache-layout.outputs.workspaces }}'
+  abort 'untrusted dependency cache save' unless settings.fetch('save-if')=="${{ github.ref == 'refs/heads/main' }}"
+  settings['shared-key'] || "#{settings.fetch('key')}-#{id}"
+end
+expected_prefix = 'research-dependencies-v1-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}-research-image-binaries'
+abort 'manual producer cannot restore the existing Prediction dependency cache' unless [effective_prefix.call(prediction_builder,'research-image-binaries'),effective_prefix.call(manual_builder,'research-runner-binaries')].all? { |prefix| prefix==expected_prefix }
+abort 'manual producer changes trusted cache cleanup' unless find_step.call(manual_builder,'Retain only dependency compilation bytes for trusted cache saves')==find_step.call(prediction_builder,'Retain only dependency compilation bytes for trusted cache saves')
+manual_build = find_step.call(manual_builder,'Build immutable research release')
+abort 'manual timing evidence omits actual cache restore status' unless manual_build.fetch('env').fetch('MONDAY_CACHE_EXACT_MATCH')=="${{ steps.research-cache.outputs.cache-hit || 'unknown' }}"
+timings = find_step.call(manual_builder,'Upload recipe timing evidence')
+abort 'manual timing evidence lost source, attempt or recipe measurements' unless timings.fetch('with')=={
+  'name'=>'research-recipe-timings-${{ needs.selector.outputs.source_sha }}-${{ github.run_attempt }}',
+  'path'=>'${{ runner.temp }}/research-recipe-probe/timings.jsonl',
+  'if-no-files-found'=>'error', 'retention-days'=>7
+}
 abort 'cross-run source readback missing' unless acr.fetch('jobs').fetch('publish').fetch('steps').any? { |s|s.fetch('run','').include?('download-research-release.sh') }
 abort 'release relationship changed' unless acr.fetch('jobs').fetch('research-release-complete').fetch('needs') == ['selector','publish']
 RUBY
@@ -332,6 +438,21 @@ rows.each do |row|
 end
 RUBY
 done
+# The manual union source must drive exactly three images from one producer.
+fixture_sha=$(printf 'a%.0s' {1..40})
+"$script_dir/select-acr-publish-source.sh" --event workflow_dispatch --target research-products \
+  --rebuild true --current-ref refs/heads/main --current-sha "$fixture_sha" --current-run-id 200 \
+  --main-sha "$fixture_sha" --monorepo-conclusion success --prediction-conclusion success \
+  --security-conclusion success --output "$tmp_dir/union-source"
+: >"$tmp_dir/matrix-output"
+TARGET=$(sed -n 's/^publish_target=//p' "$tmp_dir/union-source") \
+  PUBLISHED_PRODUCTS=$(sed -n 's/^published_products=//p' "$tmp_dir/union-source") \
+  GITHUB_OUTPUT="$tmp_dir/matrix-output" bash "$tmp_dir/select-matrix.sh"
+sed 's/^matrix=//' "$tmp_dir/matrix-output" | jq -e '
+  (.include | map(.repository) | sort)==["campaign-cycle-controller","prediction-research-runner","research-runner"]
+  and (.include | map(.product) | sort)==["cex-runner","controller","prediction-runner"]
+  and all(.include[]; .research_artifact==true)
+' >/dev/null
 # Selector still owns approved source-test SHA/profile/tag; no public job may
 # accept a free-form compiler command or recreate a hosted source-test build.
 grep -Fqx '      source_test_profile: ${{ steps.source.outputs.source_test_profile }}' "$workflow"

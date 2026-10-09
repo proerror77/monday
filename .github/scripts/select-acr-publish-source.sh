@@ -125,7 +125,7 @@ case "$event" in
     }
     case "$target" in
       polymarket-raw-ops) target=binance-lob-archiver ;;
-      all|research-runner|prediction-research-runner|campaign-cycle-controller|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder|research-source-test) ;;
+      all|research-products|research-runner|prediction-research-runner|campaign-cycle-controller|hft-trading|binance-lob-archiver|polymarket-evidence-compiler|polymarket-market-recorder|research-source-test) ;;
       *) printf 'unsupported publish target: %s\n' "$target" >&2; exit 1 ;;
     esac
     if [[ $target == research-source-test ]]; then
@@ -154,9 +154,9 @@ case "$event" in
         printf 'source-test SHA is only valid for research-source-test\n' >&2
         exit 1
       }
-      if [[ $target == all || $target == research-runner || $target == prediction-research-runner || $target == campaign-cycle-controller ]]; then
+      if [[ $target == all || $target == research-products || $target == research-runner || $target == prediction-research-runner || $target == campaign-cycle-controller ]]; then
         case "$target" in
-          all) published_products=$(bash "$script_dir/research-release-products.sh" normalize all) ;;
+          all|research-products) published_products=$(bash "$script_dir/research-release-products.sh" normalize all) ;;
           research-runner) published_products=cex-runner ;;
           prediction-research-runner) published_products=prediction-runner ;;
           campaign-cycle-controller) published_products=controller ;;

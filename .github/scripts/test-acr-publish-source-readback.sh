@@ -123,6 +123,16 @@ grep -Fq '/runs/100/attempts/3/jobs?' "$work/calls"
 grep -Fqx research_mode=rebuild "$work/manual-rebuild"
 grep -Fqx artifact_run_id=200 "$work/manual-rebuild"
 grep -Fqx published_products=prediction-runner "$work/manual-rebuild"
+"$script_dir/select-acr-publish-source.sh" --event workflow_dispatch --target research-products \
+  --rebuild true --current-ref refs/heads/main --current-sha "$source_sha" --current-run-id 200 \
+  --main-sha "$source_sha" --monorepo-conclusion success --prediction-conclusion success \
+  --security-conclusion success --output "$work/union-rebuild"
+grep -Fqx publish_target=research-products "$work/union-rebuild"
+grep -Fqx research_mode=rebuild "$work/union-rebuild"
+grep -Fqx artifact_run_id=200 "$work/union-rebuild"
+grep -Fqx "source_sha=$source_sha" "$work/union-rebuild"
+grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/union-rebuild"
+grep -Fqx published_products=cex-runner,controller,prediction-runner "$work/union-rebuild"
 source_sha=$original_source
 printf 'PASS: skipped research work retains pending publication failure and exact-source recovery paths\n'
 [[ ${1:-} != --deferred-carry ]] || exit 0
@@ -260,7 +270,7 @@ grep -Fqx automation_state=ready "$work/reusable"
 grep -Fqx artifact_run_id=100 "$work/reusable"
 if grep -Fq '/workflows/acr-publish.yml/runs' "$work/calls"; then exit 1; fi
 manual_reuse() {
-  "$script_dir/select-acr-publish-source.sh" --event workflow_dispatch --target research-runner \
+  "$script_dir/select-acr-publish-source.sh" --event workflow_dispatch --target "${3:-research-runner}" \
     --rebuild false --current-ref refs/heads/main --current-sha "$source_sha" --current-run-id 200 \
     --main-sha "$source_sha" --monorepo-conclusion success --prediction-conclusion success \
     --security-conclusion success --run-id 100 --automation-state "$1" \
@@ -270,6 +280,12 @@ manual_reuse ready success
 grep -Fqx research_mode=artifact "$work/manual-reuse"
 grep -Fqx artifact_run_id=100 "$work/manual-reuse"
 grep -Fqx published_products=cex-runner "$work/manual-reuse"
+manual_reuse ready success research-products
+grep -Fqx research_mode=artifact "$work/manual-reuse"
+grep -Fqx artifact_run_id=100 "$work/manual-reuse"
+grep -Fqx "source_sha=$source_sha" "$work/manual-reuse"
+grep -Fqx publish_target=research-products "$work/manual-reuse"
+grep -Fqx published_products=cex-runner,controller,prediction-runner "$work/manual-reuse"
 # The same verified union may publish only Prediction. A CEX-only producer
 # cannot be reused for that target or for an all-products publication.
 "$script_dir/select-acr-publish-source.sh" --event workflow_dispatch --target prediction-research-runner \
@@ -277,7 +293,7 @@ grep -Fqx published_products=cex-runner "$work/manual-reuse"
   --main-sha "$source_sha" --monorepo-conclusion success --prediction-conclusion success --security-conclusion success \
   --run-id 100 --automation-state ready --binaries-conclusion success --smoke-conclusion success --output "$work/prediction-reuse"
 grep -Fqx published_products=prediction-runner "$work/prediction-reuse"
-for target in prediction-research-runner all; do
+for target in prediction-research-runner research-products all; do
   if "$script_dir/select-acr-publish-source.sh" --event workflow_dispatch --target "$target" \
     --product cex-runner --rebuild false --current-ref refs/heads/main --current-sha "$source_sha" --current-run-id 200 \
     --main-sha "$source_sha" --monorepo-conclusion success --prediction-conclusion success --security-conclusion success \
@@ -285,10 +301,12 @@ for target in prediction-research-runner all; do
     echo 'foreign product reuse accepted' >&2; exit 1
   fi
 done
-for state in deferred stale out_of_scope; do
-  if manual_reuse "$state" success; then exit 1; fi
+for target in research-runner research-products; do
+  for state in deferred stale out_of_scope; do
+    if manual_reuse "$state" success "$target"; then exit 1; fi
+  done
+  if manual_reuse ready failure "$target"; then exit 1; fi
 done
-if manual_reuse ready failure; then exit 1; fi
 reset_fixtures
 edit_fixture artifacts '.[0].artifacts[0].expired=true'
 if "$script_dir/read-acr-publish-source.sh" "$source_sha" 200 "$work/expired-reuse" reuse; then exit 1; fi
@@ -296,6 +314,7 @@ ruby -ryaml - "$script_dir/../workflows/acr-publish.yml" "$script_dir/../workflo
 acr,ploy=ARGV.map { |p| YAML.load_file(p) }
 reader=acr['jobs']['selector']['steps'].find { |s| s['id']=='source-jobs' }
 abort 'manual reuse skips authenticated readback' unless reader['if'].include?("github.event_name == 'workflow_dispatch'") && reader['if'].include?("inputs.rebuild_research_runner != true")
+abort 'union reuse skips authenticated readback' unless reader['if'].include?("inputs.target == 'research-products'")
 [[acr,'research-runner-binaries'],[ploy,'research-image-binaries']].each do |doc,id|
   upload=doc['jobs'][id]['steps'].find { |s| s.fetch('uses','').include?('actions/upload-artifact@') }
   abort 'software retention is shorter than the release window' unless upload['with']['retention-days']==7

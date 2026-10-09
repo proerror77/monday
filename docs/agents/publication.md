@@ -117,7 +117,15 @@ CI jobs to recalculate the plan. Do not use a new Prediction manual dispatch for
 artifact reuse. If an earlier attempt already produced research artifacts, retain
 the existing artifact admission checks and use the next main push instead.
 An explicit ACR research target with `rebuild_research_runner=true` can also
-recover that product. Select its research target; `all` includes unrelated images.
+recover that product. Use `research-products` to recover all three research images
+from one union build. The `all` target also includes four other images.
+Before a manual rebuild, the selector checks configuration presence and every
+selected product's public policy. Missing settings stop before compilation.
+Native signing, OIDC and TLS checks still run in each publisher.
+Compatible manual builds share Prediction's dependency cache and owning-workspace
+targets. Compiler, native packages, profile, flags and recipes remain cache inputs.
+The manual run remains its own producer and uploads its own artifact and timings.
+Dependency reuse does not admit software artifacts from another source or producer.
 Every recovery keeps current-main checks, original attempt identity, native
 signing, OSS admission and image readback requirements.
 
