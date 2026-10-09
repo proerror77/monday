@@ -3,7 +3,7 @@
 set -euo pipefail
 
 case ${1:-} in
-  ''|--strategy-config|--production-scope) ;;
+  ''|--strategy-config|--production-scope|--documentation-scope) ;;
   *) printf 'unknown test scope: %s\n' "$1" >&2; exit 2 ;;
 esac
 
@@ -117,6 +117,76 @@ assert_security_jobs() {
     exit 1
   }
 }
+
+check_documentation_scope() {
+  local event package source_only mixed unknown expected_loop input
+  local metadata="$fixtures/workspace-owners.fixture"
+  for event in pull_request push; do
+    for package in app worker; do
+      printf '%s\n' "rust_hft/alpha-harness/$package/src/main.rs" >"$tmp_dir/docs-source.txt"
+      source_only=$(run_case "docs-$package-$event-source" "$event" docs-source.txt "$metadata")
+      cat "$tmp_dir/docs-source.txt" >"$tmp_dir/docs-mixed.txt"
+      printf '%s\n' \
+        rust_hft/alpha-harness/README.md \
+        "rust_hft/alpha-harness/$package/README.md" \
+        rust_hft/tools/collector/README.md \
+        rust_hft/docs/architecture.md \
+        rust_hft/research-core/README \
+        docs/architecture/REPOSITORY_LAYOUT.md >>"$tmp_dir/docs-mixed.txt"
+      mixed=$(run_case "docs-$package-$event-mixed" "$event" docs-mixed.txt "$metadata")
+      # Compare every field, including security and publication scope.
+      if ! diff -u "$source_only" "$mixed"; then
+        printf 'ignored documentation changed %s %s scope\n' "$package" "$event" >&2
+        exit 1
+      fi
+      expected_loop=',hft-cex-research-worker,'
+      [[ $package != app ]] || expected_loop=',alpha-harness,hft-cex-research-worker,'
+      assert_flag "$mixed" loop_packages "$expected_loop"
+      for flag in handoff json ondo collector control focused production_trading_image production_collector_image; do
+        assert_flag "$mixed" "$flag" false
+      done
+    done
+
+    # Unknown Rust input still selects the broad safety coverage beside docs.
+    for input in src/lib.rs research-schema.json; do
+      printf '%s\n' "rust_hft/unknown-input/$input" rust_hft/alpha-harness/README.md \
+        >"$tmp_dir/docs-unknown-rust.txt"
+      unknown=$(run_case "docs-unknown-rust-$event" "$event" docs-unknown-rust.txt "$metadata")
+      for flag in loop handoff json ondo collector control focused production_trading_image production_collector_image; do
+        assert_flag "$unknown" "$flag" true
+      done
+    done
+
+    # Non-Rust compile inputs keep their owning package and downstream scope.
+    printf '%s\n' rust_hft/alpha-harness/domain/src/lib.rs >"$tmp_dir/docs-domain-source.txt"
+    printf '%s\n' rust_hft/alpha-harness/domain/tests/fixtures/campaign-checkpoints/learning-follow-up.json \
+      rust_hft/alpha-harness/README.md >"$tmp_dir/docs-domain-input.txt"
+    source_only=$(run_case "docs-domain-source-$event" "$event" docs-domain-source.txt "$metadata")
+    mixed=$(run_case "docs-domain-input-$event" "$event" docs-domain-input.txt "$metadata")
+    diff -u "$source_only" "$mixed"
+
+    # Prediction docs retain their explicit architecture contract before skipping ownership.
+    printf '%s\n' rust_hft/alpha-harness/worker/src/main.rs rust_hft/prediction-markets/README.md \
+      >"$tmp_dir/docs-prediction.txt"
+    mixed=$(run_case "docs-prediction-$event" "$event" docs-prediction.txt "$metadata")
+    assert_flag "$mixed" loop_packages ',hft-cex-research-worker,'
+    assert_flag "$mixed" handoff false
+    grep -Eq '^jobs=.*,(ploy/architecture-contracts),' "$mixed"
+  done
+
+  printf '%s\n' .github/scripts/unknown-ci-input.sh rust_hft/alpha-harness/README.md \
+    >"$tmp_dir/docs-unknown-ci.txt"
+  local status=0
+  "$selector" --event pull_request --changed-files "$tmp_dir/docs-unknown-ci.txt" \
+    --metadata "$metadata" --output "$tmp_dir/docs-unknown-ci.out" \
+    >"$tmp_dir/docs-unknown-ci.log" 2>&1 || status=$?
+  [[ $status == 2 ]] || { printf 'unknown CI input did not block selection\n' >&2; exit 1; }
+  grep -Fq 'unmapped CI path: .github/scripts/unknown-ci-input.sh' "$tmp_dir/docs-unknown-ci.log"
+  printf 'documentation CI scope selector tests passed\n'
+}
+
+check_documentation_scope
+[[ ${1:-} != --documentation-scope ]] || exit 0
 
 # Keep test consumers while separating their release impact. The fixture includes
 # formula's real dev edge and synthetic dev consumers for every image selector.
