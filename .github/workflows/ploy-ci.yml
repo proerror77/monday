@@ -922,20 +922,6 @@ jobs:
     if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/integration-regressions,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: ploy
-          POSTGRES_PASSWORD: ${{ github.run_id }}
-          POSTGRES_DB: ploy_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -946,7 +932,7 @@ jobs:
           toolchain: 1.98.1
 
       - name: Install build dependencies
-        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev libpq-dev clang lld
+        run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" pkg-config libssl-dev clang lld
 
       - name: Record cache dimensions
         id: cache-info
@@ -960,28 +946,9 @@ jobs:
           shared-key: rust-integration-${{ steps.cache-info.outputs.rust }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install SQLx CLI
-        run: |
-          cargo install sqlx-cli \
-            --locked \
-            --version "${SQLX_CLI_VERSION}" \
-            --no-default-features \
-            --features rustls,postgres
-
-      - name: Prepare database schema
-        env:
-          DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
-        run: sqlx migrate run
-
       - name: Run integration regressions
-        env:
-          DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
-        run: |
-          set -euo pipefail
-          SECONDS=0
-          cargo test --locked -p ploy --test platform_smoke
-          echo "### Rust integration regressions lane" >> "$GITHUB_STEP_SUMMARY"
-          echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+        working-directory: .
+        run: bash .github/scripts/run-prediction-platform-smoke.sh
 
 
   prediction-markets-gate:

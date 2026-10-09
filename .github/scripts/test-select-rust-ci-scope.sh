@@ -31,6 +31,7 @@ run_case() {
 printf '%s\n' package-lock.json >"$tmp_dir/root-node.txt"
 printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
+printf '%s\n' .github/scripts/run-prediction-platform-smoke.sh >"$tmp_dir/platform-smoke-runner.txt"
 printf '%s\n' .github/scripts/run-collector-control-contracts.sh >"$tmp_dir/control-scheduling.txt"
 printf '%s\n' .github/scripts/ci-owner-cache.sh >"$tmp_dir/ci-owner-cache.txt"
 printf '%s\n' .github/scripts/test-ci-owner-cache.sh >"$tmp_dir/ci-owner-cache-test.txt"
@@ -367,6 +368,8 @@ job_cases=(
   'campaign-controller-dockerfile|pull_request|campaign-controller-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
   'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/research-foundation,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts|hft-prediction-research-worker,hft-prediction-research-operator'
   'prediction-workflow|pull_request|prediction-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
+  'platform-smoke-runner|pull_request|platform-smoke-runner.txt|ploy/integration-regressions,ploy/workflow-lint'
+  'platform-smoke-runner-push|push|platform-smoke-runner.txt|ploy/integration-regressions,ploy/workflow-lint'
   'root-node|pull_request|root-node.txt|ci/node-install'
   'security-workflow|pull_request|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'security-workflow-push|push|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
