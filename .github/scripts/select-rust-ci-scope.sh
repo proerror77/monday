@@ -421,6 +421,11 @@ for path in "${paths[@]}"; do
       select_job ploy/workflow-lint
       continue
       ;;
+    .github/scripts/run-prediction-platform-smoke.sh)
+      select_job ploy/integration-regressions
+      select_job ploy/workflow-lint
+      continue
+      ;;
     .github/scripts/run-strategy-config-contracts.sh|.github/scripts/test-strategy-config-contracts.sh)
       select_job ploy/strategy-config-contracts
       select_job ci/ci-contracts
