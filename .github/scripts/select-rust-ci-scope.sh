@@ -51,6 +51,16 @@ select_job() {
   [[ ,$jobs, == *,$job,* ]] || jobs=${jobs:+$jobs,}$job
 }
 
+select_owning_package() {
+  local package=$1
+  [[ ,$owning_packages, == *,$package,* ]] || owning_packages=${owning_packages:+$owning_packages,}$package
+}
+
+select_prediction_tools() {
+  select_owning_package hft-prediction-research-worker
+  select_owning_package hft-prediction-research-operator
+}
+
 select_security_job() {
   local job=$1
   [[ ,$security_jobs, == *,$job,* ]] || security_jobs=${security_jobs:+$security_jobs,}$job
@@ -131,6 +141,7 @@ select_all_rust_ci_jobs() {
 }
 
 select_all_ploy_jobs() {
+  select_prediction_tools
   research_product=$(bash "$products" merge "$research_product" "${1:-all}")
   architecture=true
   research_image_relevant=true
@@ -167,6 +178,7 @@ select_main_research_image_jobs() {
 }
 
 select_all() {
+  select_prediction_tools
   image_live=true
   image_paper=true
   image_collector=true
@@ -184,6 +196,10 @@ select_all() {
 
 emit() {
   local value
+  if [[ -n $owning_packages ]]; then
+    toolchain=true
+    select_job ci/rust
+  fi
   if [[ ,$jobs, == *,ploy/research-image-binaries,* && $research_product == none ]]; then research_product=$(bash "$products" normalize all); fi
   [[ ,$owning_packages, != *",hft-research-platform,"* ]] || select_job ci/research-foundation
   [[ $architecture == true ]] && select_job ploy/architecture-contracts
@@ -896,12 +912,14 @@ select_main_research_image_jobs
 while IFS= read -r package; do
   [[ -n $package ]] || continue
   if ! is_checked_direct_package "$package"; then
-    [[ ,$owning_packages, == *,$package,* ]] || owning_packages=${owning_packages:+$owning_packages,}$package
+    select_owning_package "$package"
   fi
 done <<<"$direct_root_packages"
-if [[ -n $owning_packages ]]; then
-  toolchain=true
-  select_job ci/rust
-fi
+# These thin Prediction tools have no package tests in the existing PLOY lanes.
+# Include affected consumers of shared artifacts/dispatch IO, not only files
+# directly owned by the tools. cargo-scoped resolves each selected workspace.
+for package in hft-prediction-research-worker hft-prediction-research-operator; do
+  if is_affected "$package"; then select_owning_package "$package"; fi
+done
 
 emit

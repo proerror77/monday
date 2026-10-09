@@ -3,7 +3,7 @@
 set -euo pipefail
 
 case ${1:-} in
-  ''|--strategy-config|--production-scope|--documentation-scope) ;;
+  ''|--strategy-config|--production-scope|--documentation-scope|--prediction-tools) ;;
   *) printf 'unknown test scope: %s\n' "$1" >&2; exit 2 ;;
 esac
 
@@ -118,6 +118,75 @@ assert_security_jobs() {
     exit 1
   }
 }
+
+check_prediction_tool_scope() {
+  local event entry label path expected_owning expected_loop expected_product scope expected_jobs
+  local worker=hft-prediction-research-worker operator=hft-prediction-research-operator
+  local metadata="$fixtures/prediction-tools.fixture"
+  local cases=(
+    "worker|rust_hft/prediction-markets/crates/research-worker/src/prediction_runner.rs|$worker|false|prediction-runner"
+    "operator|rust_hft/prediction-markets/crates/research-operator/src/dispatch.rs|$operator|false|prediction-runner"
+    "artifacts|rust_hft/research-core/artifacts/src/lib.rs|hft-research-artifacts,$worker,$operator|true|cex-runner,controller,prediction-runner"
+    "dispatch|rust_hft/research-core/dispatch-io/src/lib.rs|hft-research-dispatch-io,$operator|true|cex-runner,controller,prediction-runner"
+  )
+  for event in pull_request push; do
+    for entry in "${cases[@]}"; do
+      IFS='|' read -r label path expected_owning expected_loop expected_product <<<"$entry"
+      printf '%s\n' "$path" >"$tmp_dir/prediction-tool.txt"
+      scope=$(run_case "prediction-tool-$label-$event" "$event" prediction-tool.txt "$metadata")
+      assert_owning_packages "$scope" "$expected_owning"
+      assert_flag "$scope" loop "$expected_loop"
+      assert_flag "$scope" toolchain true
+      assert_flag "$scope" research_product "$expected_product"
+      assert_flag "$scope" production_trading_image false
+      assert_flag "$scope" production_collector_image false
+      expected_jobs='ci/rust,ploy/rust-format,ploy/safety-scans'
+      [[ $path != rust_hft/prediction-markets/* ]] || expected_jobs+=',ploy/architecture-contracts'
+      if [[ $event == pull_request ]]; then
+        expected_jobs+=',ploy/commit-hygiene'
+      else
+        expected_jobs+=',ploy/research-image-binaries,ploy/research-image-smoke'
+      fi
+      assert_jobs "$scope" "$expected_jobs"
+      if [[ $expected_loop == true ]]; then
+        assert_flag "$scope" loop_packages ',alpha-harness,hft-cex-research-worker,'
+      fi
+    done
+
+    # Shared and consumer edits must not test the consumer twice. Documentation
+    # still keeps its architecture checks without broadening package ownership.
+    printf '%s\n' rust_hft/research-core/artifacts/src/lib.rs \
+      rust_hft/prediction-markets/crates/research-operator/src/dispatch.rs \
+      rust_hft/prediction-markets/README.md >"$tmp_dir/prediction-tool-mixed.txt"
+    scope=$(run_case "prediction-tool-mixed-$event" "$event" prediction-tool-mixed.txt "$metadata")
+    assert_owning_packages "$scope" "hft-research-artifacts,$worker,$operator"
+
+    # A CEX worker change and Prediction documentation do not affect these tools.
+    for path in rust_hft/alpha-harness/worker/src/main.rs rust_hft/prediction-markets/README.md; do
+      printf '%s\n' "$path" >"$tmp_dir/prediction-tool-unrelated.txt"
+      scope=$(run_case "prediction-tool-unrelated-$event" "$event" prediction-tool-unrelated.txt "$metadata")
+      assert_owning_packages "$scope" ''
+    done
+
+    # Broad manifest, external lock and unknown-input fallbacks must retain the
+    # tools even when selection finishes before dependency metadata is loaded.
+    for path in rust_hft/prediction-markets/Cargo.toml rust_hft/prediction-markets/Cargo.lock \
+      rust_hft/shared/Cargo.lock rust_hft/prediction-markets/new-safety-input.txt; do
+      printf '%s\n' "$path" >"$tmp_dir/prediction-tool-broad.txt"
+      scope=$(run_case "prediction-tool-broad-$event" "$event" prediction-tool-broad.txt "$metadata")
+      assert_owning_packages "$scope" "$worker,$operator"
+      assert_flag "$scope" toolchain true
+      grep -Eq '^jobs=.*,(ci/rust),' "$scope"
+    done
+  done
+  scope=$(run_case prediction-tool-manual workflow_dispatch prediction-tool.txt "$metadata")
+  assert_owning_packages "$scope" "$worker,$operator"
+  grep -Eq '^jobs=.*,(ci/rust),' "$scope"
+  printf 'Prediction tool and cross-workspace consumer scope tests passed\n'
+}
+
+check_prediction_tool_scope
+[[ ${1:-} != --prediction-tools ]] || exit 0
 
 check_documentation_scope() {
   local event package source_only mixed unknown expected_loop input
@@ -294,10 +363,10 @@ job_cases=(
   'unowned-unit|pull_request|unowned-unit.txt|ploy/safety-scans'
   'evaluator|pull_request|evaluator.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-research-heavy,ploy/architecture-contracts'
   'shared-prediction|pull_request|shared-prediction.txt|ploy/commit-hygiene,ploy/rust-format,ploy/safety-scans,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
-  'prediction-lock|pull_request|prediction-lock.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
+  'prediction-lock|pull_request|prediction-lock.txt|ci/rust,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts|hft-prediction-research-worker,hft-prediction-research-operator'
   'research-dockerfile|pull_request|research-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
   'campaign-controller-dockerfile|pull_request|campaign-controller-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
-  'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/research-foundation,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
+  'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/research-foundation,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts|hft-prediction-research-worker,hft-prediction-research-operator'
   'prediction-workflow|pull_request|prediction-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'platform-smoke-runner|pull_request|platform-smoke-runner.txt|ploy/integration-regressions,ploy/workflow-lint'
   'platform-smoke-runner-push|push|platform-smoke-runner.txt|ploy/integration-regressions,ploy/workflow-lint'
@@ -317,14 +386,14 @@ job_cases=(
   'agent-instructions|pull_request|agent-instructions.txt|ploy/commit-hygiene'
   'agent-instructions-with-code|pull_request|agent-instructions-with-code.txt|ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
   'preflight-only|pull_request|preflight-only.txt|ploy/commit-hygiene'
-  'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/research-foundation,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
+  'unknown-root|pull_request|unknown-root.txt|ci/rust-shell-scripts,ci/rust,ci/research-foundation,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts|hft-prediction-research-worker,hft-prediction-research-operator'
   'unknown-nested|pull_request|unknown-nested.txt|'
   'rust-docs|pull_request|rust-docs.txt|'
   'package-readme|pull_request|package-readme.txt|'
   'rust-shell-script|pull_request|rust-shell-script.txt|ci/rust-shell-scripts'
   'rust-deploy-collector|pull_request|rust-deploy-collector.txt|ci/rust-shell-scripts,ci/rust,ci/polymarket-evidence-compiler-image,ploy/safety-scans,ci/deployment-artifacts'
   'docs|pull_request|docs.txt|ploy/architecture-contracts'
-  'unknown-prediction|pull_request|unknown-prediction.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts'
+  'unknown-prediction|pull_request|unknown-prediction.txt|ci/rust,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts|hft-prediction-research-worker,hft-prediction-research-operator'
   'mixed-prediction|pull_request|mixed-prediction.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans,ploy/rust-format,ploy/rust-research-heavy,ploy/architecture-contracts'
   'frontend|pull_request|frontend.txt|ploy/commit-hygiene,ploy/safety-scans,ploy/frontend,ploy/architecture-contracts'
   'backtest|pull_request|backtest.txt|ploy/research-image-binaries,ci/rust|hft-backtest'

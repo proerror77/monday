@@ -1,0 +1,44 @@
+{
+  "packages": [
+    {
+      "name": "hft-research-artifacts",
+      "manifest_path": "rust_hft/research-core/artifacts/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-research-dispatch-io",
+      "manifest_path": "rust_hft/research-core/dispatch-io/Cargo.toml",
+      "dependencies": []
+    },
+    {
+      "name": "hft-prediction-research-worker",
+      "manifest_path": "rust_hft/prediction-markets/crates/research-worker/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-research-artifacts", "path": "rust_hft/research-core/artifacts", "kind": null, "optional": false}
+      ]
+    },
+    {
+      "name": "hft-prediction-research-operator",
+      "manifest_path": "rust_hft/prediction-markets/crates/research-operator/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-research-artifacts", "path": "rust_hft/research-core/artifacts", "kind": null, "optional": false},
+        {"name": "hft-research-dispatch-io", "path": "rust_hft/research-core/dispatch-io", "kind": null, "optional": false}
+      ]
+    },
+    {
+      "name": "alpha-harness",
+      "manifest_path": "rust_hft/alpha-harness/app/Cargo.toml",
+      "dependencies": [
+        {"name": "hft-research-artifacts", "path": "rust_hft/research-core/artifacts", "kind": null, "optional": false},
+        {"name": "hft-research-dispatch-io", "path": "rust_hft/research-core/dispatch-io", "kind": null, "optional": false}
+      ]
+    },
+    {
+      "name": "hft-cex-research-worker",
+      "manifest_path": "rust_hft/alpha-harness/worker/Cargo.toml",
+      "dependencies": [
+        {"name": "alpha-harness", "path": "rust_hft/alpha-harness/app", "kind": null, "optional": false}
+      ]
+    }
+  ]
+}
