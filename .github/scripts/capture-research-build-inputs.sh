@@ -82,3 +82,8 @@ jq -S -n --arg compiler "$(sha256sum "$work/compiler" | awk '{print $1}')" \
   --argjson locks "$locks" \
   '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",compiler:$compiler,native:$native,flags:$flags,profiles:$profiles,recipe:$recipe,locks:$locks,builder_image:$builder_image,recipes:$recipes,workspace_profiles:$workspace_profiles}'  >"$output"
 if [[ -n ${GITHUB_OUTPUT:-} ]]; then printf 'cache_sha256=%s\n' "$(sha256sum "$output" | awk '{print $1}')" >>"$GITHUB_OUTPUT"; fi
+# This separate restore identity does not replace the complete v3 provenance.
+bash "$root/.github/scripts/research-cache-layout.sh" compatibility-inputs "$output" >"$work/dependency-cache-inputs.json"
+if [[ -n ${GITHUB_OUTPUT:-} ]]; then
+  printf 'dependency_cache_sha256=%s\n' "$(sha256sum "$work/dependency-cache-inputs.json" | awk '{print $1}')" >>"$GITHUB_OUTPUT"
+fi

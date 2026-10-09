@@ -4,6 +4,108 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 helper=$root/.github/scripts/research-cache-layout.sh
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+case ${1:-} in
+  ''|--compatibility-key) ;;
+  *) printf 'unknown cache test scope: %s\n' "$1" >&2; exit 2 ;;
+esac
+
+# These are cache identity fixtures, not native Cargo build evidence.
+compat_repo="$work/compat-repo"
+mkdir -p "$compat_repo/.github/scripts" "$compat_repo/rust_hft/alpha-harness/app"
+cp "$helper" "$compat_repo/.github/scripts/"
+cp "$root/rust_hft/"{Cargo.toml,workspaces.json} "$compat_repo/rust_hft/"
+while IFS= read -r manifest; do
+  mkdir -p "$compat_repo/rust_hft/${manifest%/Cargo.toml}"
+  cp "$root/rust_hft/$manifest" "$compat_repo/rust_hft/$manifest"
+  printf 'fixture lock\n' >"$compat_repo/rust_hft/${manifest%Cargo.toml}Cargo.lock"
+done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
+printf '[features]\ndefault=[]\n' >"$compat_repo/rust_hft/alpha-harness/app/Cargo.toml"
+git -C "$compat_repo" init -q
+git -C "$compat_repo" add rust_hft
+compat_helper="$compat_repo/.github/scripts/research-cache-layout.sh"
+fixture_inputs() {
+  local profiles='{}' manifest digest
+  cat "$compat_repo/rust_hft/Cargo.toml" "$compat_repo/rust_hft/workspaces.json" >"$work/profiles"
+  while IFS= read -r manifest; do
+    digest=$(sha256sum "$compat_repo/rust_hft/$manifest" | awk '{print $1}')
+    profiles=$(jq -c --arg manifest "$manifest" --arg digest "$digest" '. + {($manifest):$digest}' <<<"$profiles")
+    printf '%s\n' "$manifest" >>"$work/profiles"
+    cat "$compat_repo/rust_hft/$manifest" >>"$work/profiles"
+  done < <(jq -r '.workspaces[].manifest' "$compat_repo/rust_hft/workspaces.json")
+  bash "$compat_helper" manifest-inputs >>"$work/profiles"
+  digest=$(printf 'compiler/native fixture\n' | sha256sum | awk '{print $1}')
+  jq -Sn --arg digest "$digest" --arg profiles "$(sha256sum "$work/profiles" | awk '{print $1}')" \
+    --argjson owners "$profiles" \
+    --argjson locks "$(bash "$root/.github/scripts/research-workspace-locks.sh" "$compat_repo/rust_hft")" \
+    --argjson recipes "$(bash "$root/.github/scripts/research-release-products.sh" recipes cex-runner,controller | jq -s .)" \
+    '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",
+      compiler:$digest,native:$digest,flags:$digest,profiles:$profiles,recipe:$digest,
+      builder_image:("rust:fixture@sha256:"+$digest),recipes:$recipes,workspace_profiles:$owners,locks:$locks}'
+}
+fixture_inputs >"$work/full.json"
+cp "$work/full.json" "$work/full-before.json"
+bash "$compat_helper" compatibility-inputs "$work/full.json" >"$work/compat.json"
+cmp "$work/full-before.json" "$work/full.json"
+full_sha=$(sha256sum "$work/full.json" | awk '{print $1}')
+compat_sha=$(sha256sum "$work/compat.json" | awk '{print $1}')
+check_identity_change() {
+  local expected=$1 actual
+  [[ $(sha256sum "$work/changed.json" | awk '{print $1}') != "$full_sha" ]]
+  bash "$compat_helper" compatibility-inputs "$work/changed.json" >"$work/changed-compat.json"
+  actual=$(sha256sum "$work/changed-compat.json" | awk '{print $1}')
+  if [[ $expected == reuse ]]; then [[ $actual == "$compat_sha" ]]; else [[ $actual != "$compat_sha" ]]; fi
+}
+# Local feature and lock changes remain in complete provenance, not the restore prefix.
+cp "$compat_repo/rust_hft/alpha-harness/app/Cargo.toml" "$work/leaf-before"
+printf '[features]\ndefault=["scientific"]\n' >"$compat_repo/rust_hft/alpha-harness/app/Cargo.toml"
+fixture_inputs >"$work/changed.json"
+check_identity_change reuse
+cp "$work/leaf-before" "$compat_repo/rust_hft/alpha-harness/app/Cargo.toml"
+printf 'new fixture lock\n' >"$compat_repo/rust_hft/research-core/Cargo.lock"
+fixture_inputs >"$work/changed.json"
+check_identity_change reuse
+printf 'fixture lock\n' >"$compat_repo/rust_hft/research-core/Cargo.lock"
+
+changed_digest=$(printf 'changed environment\n' | sha256sum | awk '{print $1}')
+for field in compiler native flags recipe; do
+  jq -S --arg field "$field" --arg digest "$changed_digest" '.[$field]=$digest' "$work/full.json" >"$work/changed.json"
+  check_identity_change isolate
+done
+for update in '.target="aarch64-unknown-linux-gnu"' '.profile="research"' \
+  '.builder_image=("rust:changed@sha256:"+.compiler)' '.recipes[0].features="changed-feature"'; do
+  jq -S "$update" "$work/full.json" >"$work/changed.json"
+  check_identity_change isolate
+done
+# Owner profile bytes, the legacy root manifest and the registry remain bound.
+for path in research-core/Cargo.toml Cargo.toml workspaces.json; do
+  cp "$compat_repo/rust_hft/$path" "$work/root-before"
+  printf '\n' >>"$compat_repo/rust_hft/$path"
+  fixture_inputs >"$work/changed.json"
+  check_identity_change isolate
+  cp "$work/root-before" "$compat_repo/rust_hft/$path"
+done
+for field in schema target profile compiler native flags profiles recipe builder_image recipes workspace_profiles locks; do
+  jq --arg field "$field" 'del(.[$field])' "$work/full.json" >"$work/invalid.json"
+  if bash "$compat_helper" compatibility-inputs "$work/invalid.json" >"$work/rejected" 2>/dev/null; then
+    printf 'missing compatibility input accepted: %s\n' "$field" >&2; exit 1
+  fi
+  [[ ! -s $work/rejected ]]
+done
+for update in '.compiler=""' '.native="invalid"' '.recipes=[]' '.recipes[0].manifest="../outside/Cargo.toml"' \
+  '.workspace_profiles={}' '.locks={}' '.builder_image="rust:unpinned"'; do
+  jq "$update" "$work/full.json" >"$work/invalid.json"
+  if bash "$compat_helper" compatibility-inputs "$work/invalid.json" >"$work/rejected" 2>/dev/null; then
+    printf 'malformed compatibility input accepted: %s\n' "$update" >&2; exit 1
+  fi
+  [[ ! -s $work/rejected ]]
+done
+# Keep the full digest output and use the separate key only for dependency restore.
+grep -Fq "printf 'cache_sha256=%s" "$root/.github/scripts/capture-research-build-inputs.sh"
+grep -Fq 'dependency_cache_sha256=%s' "$root/.github/scripts/capture-research-build-inputs.sh"
+grep -Fq 'key: research-dependencies-v1-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}' "$root/.github/workflows/ploy-ci.yml"
+printf 'PASS: dependency compatibility identity, provenance preservation and fail-closed input contracts\n'
+[[ ${1:-} != --compatibility-key ]] || exit 0
+
 bash "$root/.github/scripts/research-release-products.sh" recipes all | jq -s '{recipes:.}' >"$work/inputs"
 bash "$helper" workspaces "$work/inputs" >"$work/layout"
 ruby -rpathname - "$root" "$work/layout" <<'RUBY'
