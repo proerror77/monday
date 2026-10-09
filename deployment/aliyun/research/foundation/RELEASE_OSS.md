@@ -129,8 +129,8 @@ This does not consume a scientific admission nonce or create another Run.
 Actual IAM remains an independently approved deployment prerequisite:
 
 1. RAM must trust the GitHub issuer, registered audience and exact repository/main/publisher workflow subject.
-2. Bind immutable IDs where the available RAM conditions support them.
-3. Verify the actual subject customization and supported claims before enabling publication.
+2. RAM documents only `oidc:iss`, `oidc:aud` and `oidc:sub` as OIDC trust condition keys. Do not invent separate conditions for workflow or repository IDs.
+3. Verify the actual GitHub subject template and token. The exact `sub` must bind the required immutable IDs, main ref and publisher workflow. A default repository/main subject alone does not isolate workflows. Repository-level subject changes can affect other OIDC consumers, including the collector. Inventory those consumers and review their compatibility before any template change. This branch changes no subject template.
 4. The base CI role itself must restrict read/create to the exact preapproved native source/Build prefixes in the existing bucket. A broad `research/sources/*` or `research/builds/*` role with only caller-supplied inline Policy is insufficient.
 5. The public `role_prefixes` list must match those trusted base-role resources. Updating that per-release scope is a separately approved IAM operation, not performed by CI or this branch. This initial model does not supply a low-interaction RSI publication loop: every new release needs independently approved scope or a separately reviewed trusted updater. An isolated fixed release namespace would be a different authorization model, requiring explicit parent approval and real overwrite/delete/negative tests; it is not implemented or treated as equivalent here. The caller-supplied session Policy adds restriction; it is not the trusted scope boundary.
 6. Deny delete, ACL changes, bucket mutations and overwrite-header bypass through the reviewed bucket/role policy.
@@ -165,7 +165,9 @@ No code enables versioning, retention, WORM or an irreversible object lock.
 
 References: [OSS V4 signing](https://www.alibabacloud.com/help/en/oss/developer-reference/recommend-to-use-signature-version-4),
 [PutObject overwrite/versioning behavior](https://www.alibabacloud.com/help/en/oss/developer-reference/putobject),
-[RAM AssumeRoleWithOIDC](https://www.alibabacloud.com/help/en/ram/developer-reference/api-sts-2015-04-01-assumerolewithoidc).
+[RAM AssumeRoleWithOIDC](https://www.alibabacloud.com/help/en/ram/developer-reference/api-sts-2015-04-01-assumerolewithoidc),
+[RAM OIDC condition keys](https://www.alibabacloud.com/help/en/ram/user-guide/create-a-ram-role-for-a-trusted-idp),
+[GitHub subject customization](https://docs.github.com/en/actions/reference/security/oidc#customizing-the-subject-claims-for-an-organization-or-repository).
 
 ## ACK execution using existing capacity
 
