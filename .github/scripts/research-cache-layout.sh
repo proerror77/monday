@@ -10,6 +10,41 @@ manifest_dir() {
   printf '%s\n' "${manifest%/Cargo.toml}"
 }
 case ${1:?command required} in
+  compatibility-inputs)
+    # Keep local dependency choices in provenance and Cargo's exact cache suffix.
+    # The restore prefix still binds every admitted compiler, native and profile input.
+    registry="$root/rust_hft/workspaces.json"
+    manifests=$(jq -er 'if .schema == "monday.cargo_workspaces.v1" and (.workspaces|length)>0
+      then .workspaces[].manifest else error("invalid workspace registry") end' "$registry")
+    owner_profiles='{}'
+    while IFS= read -r manifest; do
+      manifest_dir "$manifest" >/dev/null
+      digest=$(sha256sum "$root/rust_hft/$manifest" | awk '{print $1}')
+      owner_profiles=$(jq -c --arg manifest "$manifest" --arg digest "$digest" '. + {($manifest):$digest}' <<<"$owner_profiles")
+    done <<<"$manifests"
+    jq -Se --arg root_manifest "$(sha256sum "$root/rust_hft/Cargo.toml" | awk '{print $1}')" \
+      --arg registry "$(sha256sum "$registry" | awk '{print $1}')" --argjson owner_profiles "$owner_profiles" '
+      def digest: type == "string" and test("^[0-9a-f]{64}$");
+      def name: type == "string" and test("^[A-Za-z0-9_-]+$");
+      if .schema != "monday.compilation-inputs.v3" or
+        ([.compiler,.native,.flags,.profiles,.recipe,$root_manifest,$registry] | all(digest) | not) or
+        (.target | name | not) or (.profile | name | not) or
+        (.builder_image | type != "string" or (test("^.+@sha256:[0-9a-f]{64}$") | not)) or
+        .workspace_profiles != $owner_profiles or
+        (.locks | type != "object") or
+        ((.locks | keys) != ($owner_profiles | keys | map(sub("Cargo.toml$";"Cargo.lock")) | sort)) or
+        (.locks | all(.[];digest) | not) or
+        (.recipes | type != "array" or length == 0) or
+        (.recipes | all(.[];
+          (.manifest as $manifest | $owner_profiles | has($manifest)) and
+          (.package | name) and (.features | type == "string") and
+          (.binaries | type == "array" and length > 0 and all(.[];name))) | not)
+      then error("invalid compilation inputs for dependency cache compatibility")
+      else {schema:"monday.dependency-cache-compat.v1",target,profile,compiler,native,flags,
+        builder_image,workspace_profiles,recipe,recipes,
+        root_manifest:$root_manifest,workspace_registry:$registry}
+      end' "${2:?inputs required}"
+    ;;
   manifest-inputs)
     # Include local path/patch/default-feature manifests beyond recipe roots.
     work=$(mktemp -d)

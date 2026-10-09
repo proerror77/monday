@@ -267,7 +267,8 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: ${{ steps.research-cache-layout.outputs.workspaces }}
-          key: research-release-linux-amd64-${{ steps.build-inputs.outputs.cache_sha256 }}
+          # Manifest/lock changes vary the action suffix, while compatible dependencies can restore.
+          key: research-dependencies-v1-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build immutable research release
         working-directory: .
