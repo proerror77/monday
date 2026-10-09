@@ -4,6 +4,7 @@
 set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$script_dir/../.." && pwd)
+bash "$script_dir/test-release-source.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 sha=$(printf 'a%.0s' {1..40})

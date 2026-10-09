@@ -77,12 +77,19 @@ jobs:
           ref: refs/heads/main
           fetch-depth: 0
 
+      - name: Read original CI source from Release
+        id: release-source
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/read-release-source.sh "$GITHUB_OUTPUT"
+
       - name: Read authenticated reusable research source
         id: source-jobs
         if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && (inputs.target == 'research-runner' || inputs.target == 'prediction-research-runner' || inputs.target == 'campaign-cycle-controller' || inputs.target == 'all') && inputs.rebuild_research_runner != true)
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || steps.release-source.outputs.source_sha }}
           SOURCE_MODE: ${{ github.event_name == 'workflow_dispatch' && 'reuse' || 'automatic' }}
         run: |
           .github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID" "$GITHUB_OUTPUT" "$SOURCE_MODE"
@@ -119,7 +126,7 @@ jobs:
           SOURCE_CONCLUSION: ${{ github.event_name == 'workflow_run' && 'success' || '' }}
           SOURCE_EVENT: ${{ github.event_name == 'workflow_run' && 'push' || '' }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_SHA: ${{ steps.release-source.outputs.source_sha }}
           SOURCE_RUN_ID: ${{ steps.source-jobs.outputs.artifact_run_id }}
           AUTOMATION_STATE: ${{ steps.source-jobs.outputs.automation_state }}
           RESEARCH_PRODUCT: ${{ steps.source-jobs.outputs.research_product || 'all' }}

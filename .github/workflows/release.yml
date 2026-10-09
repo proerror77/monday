@@ -19,6 +19,21 @@ permissions:
   packages: write
 
 jobs:
+  source:
+    name: Release source v1 [${{ github.event.workflow_run.head_sha }}] [${{ github.event.workflow_run.id }}/${{ github.event.workflow_run.run_attempt }}]
+    if: github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Record original CI identity
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+          CI_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CI_RUN_ID" =~ ^[1-9][0-9]*$ && "$CI_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+
   admit:
     name: Admit release
     if: github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'
