@@ -15,6 +15,7 @@ on:
         type: choice
         options:
           - all
+          - research-products
           - research-runner
           - prediction-research-runner
           - campaign-cycle-controller
@@ -86,7 +87,7 @@ jobs:
 
       - name: Read authenticated reusable research source
         id: source-jobs
-        if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && (inputs.target == 'research-runner' || inputs.target == 'prediction-research-runner' || inputs.target == 'campaign-cycle-controller' || inputs.target == 'all') && inputs.rebuild_research_runner != true)
+        if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && (inputs.target == 'research-products' || inputs.target == 'research-runner' || inputs.target == 'prediction-research-runner' || inputs.target == 'campaign-cycle-controller' || inputs.target == 'all') && inputs.rebuild_research_runner != true)
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || steps.release-source.outputs.source_sha }}
@@ -165,6 +166,22 @@ jobs:
             --prediction-conclusion "$PREDICTION_CONCLUSION" \
             --security-conclusion "$SECURITY_CONCLUSION"
 
+      - name: Validate research publication settings before rebuild
+        if: steps.source.outputs.research_mode == 'rebuild'
+        env:
+          RESEARCH_PRODUCTS: ${{ steps.source.outputs.published_products }}
+          MONDAY_RELEASE_POLICY_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
+          MONDAY_RELEASE_SIGNING_KEY_PRESENT: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}
+          MONDAY_RELEASE_OSS_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+        run: |
+          set -euo pipefail
+          .github/scripts/publish-research-build-release.sh check-presence
+          IFS=, read -r -a products <<< "$RESEARCH_PRODUCTS"
+          for product in "${products[@]}"; do
+            PRODUCT="$product" .github/scripts/publish-research-build-release.sh check-public-policy
+          done
+
       - name: Select publish targets
         id: select
         env:
@@ -195,6 +212,9 @@ jobs:
     timeout-minutes: 90
     env:
       CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
     steps:
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -214,14 +234,17 @@ jobs:
         id: research-cache-layout
         working-directory: .
         run: bash .github/scripts/research-cache-layout.sh workspaces "${RUNNER_TEMP}/research-build-inputs.json" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - id: research-cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: ${{ steps.research-cache-layout.outputs.workspaces }}
-          key: research-release-linux-amd64-${{ steps.build-inputs.outputs.cache_sha256 }}
+          # Match Prediction's existing key plus job suffix without changing producer identity.
+          shared-key: research-dependencies-v1-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}-research-image-binaries
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build immutable research release
         env:
           GH_TOKEN: ${{ github.token }}
+          MONDAY_CACHE_EXACT_MATCH: ${{ steps.research-cache.outputs.cache-hit || 'unknown' }}
           MONDAY_BUILD_INPUTS_FILE: ${{ runner.temp }}/research-build-inputs.json
         run: bash .github/scripts/build-research-release.sh "${{ needs.selector.outputs.research_product }}"
       - name: Upload research image release
@@ -229,6 +252,15 @@ jobs:
         with:
           name: research-image-release-${{ needs.selector.outputs.source_sha }}-${{ needs.selector.outputs.research_product }}
           path: ${{ runner.temp }}/research-image-release.tar
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload recipe timing evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: research-recipe-timings-${{ needs.selector.outputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/research-recipe-probe/timings.jsonl
           if-no-files-found: error
           retention-days: 7
 
