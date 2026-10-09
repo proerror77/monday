@@ -281,6 +281,7 @@ for path in "${paths[@]}"; do
     .github/scripts/migrate-research-oss-policy.sh|.github/scripts/test-migrate-research-oss-policy.sh|\
     .github/scripts/verify-research-runner-binaries.sh|\
     .github/scripts/read-acr-publish-source.sh|.github/scripts/select-acr-publish-source.sh|\
+    .github/scripts/read-release-source.sh|.github/scripts/test-release-source.sh|\
     .github/scripts/test-acr-publish-source-readback.sh|\
     .github/workflows/release.yml|.github/scripts/decide-release-once.sh|\
     .github/scripts/read-release-published.sh|.github/scripts/release-orchestrator-admit.sh|\

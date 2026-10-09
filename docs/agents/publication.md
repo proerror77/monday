@@ -35,6 +35,14 @@ checks and Prediction artifacts. It retains its native workflow, job names and
 OIDC identity, which the existing Build issuer requires. GHCR failure does not
 replace ACR's CI admission decision.
 
+Release carries the original CI source in a dedicated native metadata job:
+`Release source v1 [<source SHA>] [<CI run ID>/<attempt>]`.
+ACR validates the exact Release attempt, its unique successful marker, and the
+original main-push CI attempt before using that source. The Release controller
+HEAD can differ from the original CI source. Missing or invalid markers fail
+closed; ACR never substitutes the controller HEAD. This marker grants no build,
+publication or runtime authority. All existing admission checks still follow.
+
 Pending evidence exits without publishing. The final upstream completion causes
 another evaluation. GHCR skips a full-SHA image tag or a successful nested
 publication job, including earlier attempts. ACR requires its own successful
