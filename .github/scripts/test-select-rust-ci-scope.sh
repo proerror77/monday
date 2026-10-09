@@ -32,6 +32,8 @@ printf '%s\n' package-lock.json >"$tmp_dir/root-node.txt"
 printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
 printf '%s\n' .github/scripts/run-prediction-platform-smoke.sh >"$tmp_dir/platform-smoke-runner.txt"
+printf '%s\n' .github/scripts/run-prediction-market-data-contracts.sh >"$tmp_dir/market-data-runner.txt"
+printf '%s\n' .github/scripts/run-prediction-research-contracts.sh >"$tmp_dir/research-runner.txt"
 printf '%s\n' .github/scripts/run-collector-control-contracts.sh >"$tmp_dir/control-scheduling.txt"
 printf '%s\n' .github/scripts/ci-owner-cache.sh >"$tmp_dir/ci-owner-cache.txt"
 printf '%s\n' .github/scripts/test-ci-owner-cache.sh >"$tmp_dir/ci-owner-cache-test.txt"
@@ -118,6 +120,85 @@ assert_security_jobs() {
     exit 1
   }
 }
+
+check_prediction_contract_runners() {
+  local event owner output fixture="$tmp_dir/market-contract" result
+  for event in pull_request push; do
+    for owner in market-data research; do
+      output=$(run_case "$owner-runner-$event" "$event" "$owner-runner.txt")
+      if [[ $owner == market-data ]]; then
+        assert_jobs "$output" ploy/rust-market-data,ploy/workflow-lint
+      else
+        assert_jobs "$output" ploy/rust-research-heavy,ploy/workflow-lint
+      fi
+      assert_flag "$output" research_product none
+    done
+  done
+
+  # These stubs check scheduling and failure propagation, not PostgreSQL behavior.
+  mkdir -p "$fixture/repo/.github/scripts" "$fixture/repo/rust_hft/prediction-markets" "$fixture/bin"
+  cp "$script_dir/run-prediction-market-data-contracts.sh" "$fixture/repo/.github/scripts/"
+  cat >"$fixture/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'cargo %s\n' "$*" >>"$CONTRACT_FIXTURE/calls"
+printf '%s\n' "$PWD" >>"$CONTRACT_FIXTURE/cwd"
+case " $* " in
+  *' --list '*)
+    [[ $CONTRACT_CASE == missing ]] || printf '%s: test\n' "$CONTRACT_PG_TEST"
+    ;;
+  *' --ignored --exact '*)
+    test -s "$CONTRACT_FIXTURE/migrated"
+    [[ $CONTRACT_CASE != test-failure ]] || exit 101
+    ;;
+esac
+SH
+  cat >"$fixture/bin/sqlx" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'sqlx %s\n' "$*" >>"$CONTRACT_FIXTURE/calls"
+[[ $* == 'migrate run' ]]
+[[ $CONTRACT_CASE != migration-failure ]] || exit 61
+printf 'migrated\n' >"$CONTRACT_FIXTURE/migrated"
+SH
+  chmod +x "$fixture/bin/cargo" "$fixture/bin/sqlx"
+  local pg_test=predict_fun::tests::postgres_predict_fun_restart_restores_clock_and_persists_failure_readiness
+  local scenario
+  for scenario in success missing migration-failure test-failure; do
+    rm -f "$fixture/migrated" "$fixture/calls" "$fixture/cwd"
+    result=0
+    PATH="$fixture/bin:$PATH" CONTRACT_FIXTURE="$fixture" CONTRACT_CASE="$scenario" CONTRACT_PG_TEST="$pg_test" \
+      DATABASE_URL=postgres://fixture PLOY_TEST_DATABASE_URL=postgres://fixture SQLX_CLI_VERSION=0.8.6 \
+      GITHUB_STEP_SUMMARY="$fixture/summary" \
+      bash "$fixture/repo/.github/scripts/run-prediction-market-data-contracts.sh" \
+      >"$fixture/output" 2>&1 || result=$?
+    case "$scenario" in
+      success)
+        [[ $result == 0 ]]
+        [[ $(sort -u "$fixture/cwd") == "$fixture/repo/rust_hft/prediction-markets" ]]
+        cat >"$fixture/expected" <<EOF
+cargo check --locked -p ploy-market-data --features live --lib
+cargo test --locked -p ploy-market-data --features live --lib
+cargo install sqlx-cli --locked --version 0.8.6 --no-default-features --features rustls,postgres
+sqlx migrate run
+cargo test --locked -p ploy-market-data --features live --lib -- --ignored --list
+cargo test --locked -p ploy-market-data --features live --lib $pg_test -- --ignored --exact
+EOF
+        diff -u "$fixture/expected" "$fixture/calls"
+        ;;
+      missing|migration-failure)
+        [[ $result != 0 ]]
+        if grep -Fq -- '--ignored --exact' "$fixture/calls"; then
+          echo 'PG test ran without migrations or a matching test target' >&2; exit 1
+        fi
+        ;;
+      test-failure) [[ $result == 101 ]] ;;
+    esac
+  done
+  printf 'Prediction contract runner ownership, migrated-test scheduling and failure propagation passed\n'
+}
+
+check_prediction_contract_runners
 
 check_prediction_tool_scope() {
   local event entry label path expected_owning expected_loop expected_product scope expected_jobs
@@ -1079,6 +1160,21 @@ abort 'configuration checks must not start services' if config_job.key?('service
 abort 'configuration failures must fail their lane' if config_job['continue-on-error']
 abort 'configuration parser is not selected' unless config_job.fetch('steps').any? { |step| step.fetch('run', '').include?('run-strategy-config-contracts.sh') && !step['continue-on-error'] }
 abort 'configuration lane missing from required gate' unless ploy.fetch('prediction-markets-gate').fetch('needs').include?('strategy-config-contracts')
+market = ploy.fetch('rust-market-data')
+research = ploy.fetch('rust-research-heavy')
+abort 'market-data lost its migrated PostgreSQL service' unless market.fetch('services')==research.fetch('services') && market.fetch('services').fetch('postgres').fetch('image')=='postgres:15'
+database_env = {
+  'DATABASE_URL'=>'postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test',
+  'PLOY_TEST_DATABASE_URL'=>'postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test'
+}
+[[market,'run-prediction-market-data-contracts.sh'],[research,'run-prediction-research-contracts.sh']].each do |job, script|
+  abort 'database contracts point outside their ephemeral service' unless job.fetch('env')==database_env
+  runner = job.fetch('steps').find { |step| step.fetch('run','')=="bash .github/scripts/#{script}" }
+  abort 'database contract runner missing or ignores failures' unless runner && runner['working-directory']=='.' && !runner['continue-on-error'] && !job['continue-on-error']
+end
+%w[rust-market-data rust-research-heavy].each do |id|
+  abort "database lane missing from required gate: #{id}" unless ploy.fetch('prediction-markets-gate').fetch('needs').include?(id)
+end
 %w[research-image-binaries rust-format rust-research-heavy].each do |id|
   abort "native compiler absent #{id}" unless ploy.fetch(id).to_s.include?('dtolnay/rust-toolchain@')
 end
@@ -1123,7 +1219,7 @@ if printf '%s' '{"selector":{"result":"success"},"rust":{"result":"skipped"}}' |
 fi
 printf '%s' '{"selector":{"result":"success"},"rust":{"result":"success"}}' | \
   bash "$gate" --expected-jobs ',ci/rust,'
-for selected in ploy/architecture-contracts ploy/strategy-config-contracts ci/rust-hft-engine-fast-lane ci/research-foundation; do
+for selected in ploy/architecture-contracts ploy/strategy-config-contracts ploy/rust-market-data ploy/rust-research-heavy ci/rust-hft-engine-fast-lane ci/research-foundation; do
   job=${selected#*/}
   [[ $selected == ci/* ]] && job=${job//-/_}
   for state in missing skipped failure cancelled; do

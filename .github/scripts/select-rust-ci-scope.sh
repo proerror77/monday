@@ -437,6 +437,11 @@ for path in "${paths[@]}"; do
       select_job ploy/workflow-lint
       continue
       ;;
+    .github/scripts/run-prediction-market-data-contracts.sh)
+      select_job ploy/rust-market-data
+      select_job ploy/workflow-lint
+      continue
+      ;;
     .github/scripts/run-prediction-platform-smoke.sh)
       select_job ploy/integration-regressions
       select_job ploy/workflow-lint
