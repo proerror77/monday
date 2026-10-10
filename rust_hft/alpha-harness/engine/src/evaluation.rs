@@ -118,7 +118,7 @@ impl ProposalContext<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreparedDataset {
     rows: Vec<ResearchRow>,
     feature_names: Vec<String>,
@@ -483,6 +483,150 @@ pub fn prepare_native_campaign_dataset(
     })
 }
 
+/// Add the independently authorized selection partition to a development-only
+/// native dataset. The sealed rows remain absent and inaccessible.
+pub fn attach_native_selection_rows(
+    mut dataset: PreparedDataset,
+    selection_rows: Vec<ResearchRow>,
+) -> Result<PreparedDataset, EvaluationError> {
+    let metadata = dataset
+        .withheld
+        .as_ref()
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
+    let selection = metadata
+        .selection
+        .as_ref()
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
+    let visible_end = metadata.visible_rows.end;
+    let selection_end = selection.original_rows.end;
+    if dataset.rows.len() != visible_end
+        || selection_rows.len() != selection_end.saturating_sub(visible_end)
+        || dataset.partitions.selection.as_ref() != Some(&selection.original_rows)
+        || dataset.partitions.sealed_holdout.start != metadata.holdout.original_rows.start
+    {
+        return Err(EvaluationError::InvalidNativePreparedEvidence);
+    }
+    let first_context_time = selection_rows
+        .first()
+        .and_then(|row| row.available_time.timestamp_nanos_opt())
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
+    if first_context_time < metadata.development_window.end_ns {
+        return Err(EvaluationError::InvalidNativePreparedEvidence);
+    }
+    validate_partition_clock(
+        &selection_rows,
+        &hft_cex_research_input::data::Window {
+            start_ns: first_context_time,
+            end_ns: selection.window.end_ns,
+        },
+    )?;
+    let holdout_start = DateTime::from_timestamp_nanos(metadata.holdout.window.start_ns);
+    let selection_offset = selection
+        .original_rows
+        .start
+        .checked_sub(visible_end)
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
+    let logical_selection_rows = selection_rows
+        .get(selection_offset..)
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
+    validate_partition_clock(logical_selection_rows, &selection.window)?;
+    if dataset.rows[..dataset.partitions.search.end]
+        .iter()
+        .any(|row| {
+            row.label_available_time >= DateTime::from_timestamp_nanos(selection.window.start_ns)
+        })
+        || logical_selection_rows
+            .iter()
+            .any(|row| row.label_available_time >= holdout_start)
+    {
+        return Err(EvaluationError::SelectionLabelReachesHoldout);
+    }
+    dataset.rows.extend(selection_rows);
+    dataset.feature_names = validate_numeric_rows(&dataset.rows, &dataset.protocol)?;
+    dataset.plan.folds = development_folds(
+        &dataset.rows,
+        &dataset.protocol,
+        &dataset.partitions,
+        holdout_start,
+    )?;
+    Ok(dataset)
+}
+
+/// Attach sealed data only after the caller has frozen a candidate and admitted
+/// the one-time holdout claim. This function itself has no I/O or claim power;
+/// callers supply bytes only after that authority transition.
+pub fn attach_native_sealed_holdout_rows(
+    mut dataset: PreparedDataset,
+    sealed_rows: Vec<ResearchRow>,
+) -> Result<PreparedDataset, EvaluationError> {
+    let metadata = dataset
+        .withheld
+        .as_ref()
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
+    let holdout = &metadata.holdout;
+    let selection_end = metadata
+        .selection
+        .as_ref()
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?
+        .original_rows
+        .end;
+    if dataset.rows.len() != selection_end
+        || sealed_rows.len() != metadata.total_rows.saturating_sub(selection_end)
+        || dataset.partitions.sealed_holdout != holdout.original_rows
+    {
+        return Err(EvaluationError::InvalidNativePreparedEvidence);
+    }
+    let holdout_offset = holdout.original_rows.start.saturating_sub(selection_end);
+    let holdout_rows = sealed_rows
+        .get(holdout_offset..)
+        .ok_or(EvaluationError::InvalidNativePreparedEvidence)?;
+    validate_partition_clock(holdout_rows, &holdout.window)?;
+    dataset.rows.extend(sealed_rows);
+    if dataset.rows.len() != metadata.total_rows {
+        return Err(EvaluationError::InvalidNativePreparedEvidence);
+    }
+    dataset.feature_names = validate_numeric_rows(&dataset.rows, &dataset.protocol)?;
+    if let Some(binding) = &dataset.protocol.calendar {
+        let clocks = dataset
+            .rows
+            .iter()
+            .map(|row| row.available_time)
+            .collect::<Vec<_>>();
+        if binding
+            .calendar
+            .resolve(&clocks, &dataset.protocol.labels)
+            .as_ref()
+            != Ok(binding)
+        {
+            return Err(EvaluationError::ProtocolMismatch);
+        }
+    }
+    validate_row_clocks(&dataset.rows, &dataset.protocol)?;
+    Ok(dataset)
+}
+
+fn validate_partition_clock(
+    rows: &[ResearchRow],
+    window: &hft_cex_research_input::data::Window,
+) -> Result<(), EvaluationError> {
+    let Some(first) = rows.first() else {
+        return Err(EvaluationError::InvalidNativePreparedEvidence);
+    };
+    if first.available_time.timestamp_nanos_opt() != Some(window.start_ns)
+        || rows.iter().any(|row| {
+            row.available_time
+                .timestamp_nanos_opt()
+                .is_none_or(|time| time < window.start_ns || time >= window.end_ns)
+        })
+        || rows
+            .windows(2)
+            .any(|pair| pair[0].available_time >= pair[1].available_time)
+    {
+        return Err(EvaluationError::InvalidNativePreparedEvidence);
+    }
+    Ok(())
+}
+
 /// Final evaluation has a separate entrypoint. Search/proposal contexts never
 /// acquire this view; its caller must hold the durable final dispatch authority.
 pub(crate) fn independent_selection_rows(
@@ -533,6 +677,10 @@ mod tests {
     use super::*;
     use alpha_domain::{EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationWalkForwardV1};
     use chrono::Duration;
+    use hft_cex_research_input::{
+        campaign::{NativeDatasetMetadataV1, OpaqueWithheldPartitionV1},
+        data::Window,
+    };
 
     fn rows(count: usize) -> Vec<ResearchRow> {
         let start = Utc::now();
@@ -581,6 +729,101 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn partial_native_fixture() -> (PreparedDataset, Vec<ResearchRow>) {
+        let protocol = protocol().with_independent_selection(7).unwrap();
+        let all_rows = rows(61);
+        let mut dataset = prepare_dataset(all_rows.clone(), &protocol).unwrap();
+        let partitions = dataset.partitions.clone();
+        let selection = partitions.selection.clone().unwrap();
+        let holdout = partitions.sealed_holdout.clone();
+        let ns = |index: usize| {
+            all_rows[index]
+                .available_time
+                .timestamp_nanos_opt()
+                .unwrap()
+        };
+        let metadata = NativeDatasetMetadataV1 {
+            total_rows: all_rows.len(),
+            original_window: Window {
+                start_ns: ns(0),
+                end_ns: ns(60) + 1,
+            },
+            original_rows_sha256: "a".repeat(64),
+            protocol_json: serde_json::to_string(&protocol).unwrap(),
+            protocol_sha256: "b".repeat(64),
+            search_rows: partitions.search.clone(),
+            visible_rows: 0..selection.start,
+            development_window: Window {
+                start_ns: ns(0),
+                end_ns: ns(selection.start - 1) + 1,
+            },
+            authorized_context_end_ns: ns(selection.start) - 1,
+            selection: Some(OpaqueWithheldPartitionV1 {
+                original_rows: selection.clone(),
+                window: Window {
+                    start_ns: ns(selection.start),
+                    end_ns: ns(selection.end),
+                },
+                source_content_sha256: "c".repeat(64),
+            }),
+            holdout: OpaqueWithheldPartitionV1 {
+                original_rows: holdout.clone(),
+                window: Window {
+                    start_ns: ns(holdout.start),
+                    end_ns: ns(holdout.end - 1) + 1,
+                },
+                source_content_sha256: "d".repeat(64),
+            },
+        };
+        dataset.rows.truncate(selection.start);
+        dataset.withheld = Some(metadata);
+        (dataset, all_rows)
+    }
+
+    #[test]
+    fn native_final_rows_are_staged_and_sealed_rows_stay_unavailable_until_attached() {
+        let (dataset, all_rows) = partial_native_fixture();
+        assert!(independent_selection_rows(&dataset)
+            .unwrap_err()
+            .contains("withheld"));
+        assert!(evaluate_sealed_holdout(&dataset, |_| Ok(())).is_err());
+
+        let selection_ready = attach_native_selection_rows(dataset, all_rows[42..49].to_vec())
+            .expect("independent selection rows");
+        assert_eq!(
+            independent_selection_rows(&selection_ready).unwrap().len(),
+            7
+        );
+        let called = std::cell::Cell::new(false);
+        assert!(evaluate_sealed_holdout(&selection_ready, |_| {
+            called.set(true);
+            Ok(())
+        })
+        .is_err());
+        assert!(
+            !called.get(),
+            "selection access must not invoke the sealed evaluator"
+        );
+
+        let sealed_ready =
+            attach_native_sealed_holdout_rows(selection_ready, all_rows[49..].to_vec())
+                .expect("embargo context and sealed rows after final authority transition");
+        assert_eq!(
+            evaluate_sealed_holdout(&sealed_ready, |rows| Ok(rows.len())).unwrap(),
+            10
+        );
+    }
+
+    #[test]
+    fn native_final_rows_reject_bad_selection_extent_and_cross_partition_labels() {
+        let (dataset, all_rows) = partial_native_fixture();
+        assert!(attach_native_selection_rows(dataset, all_rows[42..51].to_vec()).is_err());
+
+        let (dataset, mut all_rows) = partial_native_fixture();
+        all_rows[48].label_available_time = all_rows[51].available_time;
+        assert!(attach_native_selection_rows(dataset, all_rows[42..49].to_vec()).is_err());
     }
 
     #[test]

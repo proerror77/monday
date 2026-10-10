@@ -2223,6 +2223,12 @@ fn finalize_cex_candidate(
     weight_policy: &CexEqualAbsoluteWeightPolicyV1,
     replay_policy: &CexEventReplayPolicyV1,
     instrument_rules: &CexInstrumentRulesV2,
+    validate_sealed_binding: impl FnOnce(&CexFinalPrecommitV1) -> anyhow::Result<()>,
+    sealed_dataset_after_precommit: impl FnOnce(
+        &CexFinalPrecommitV1,
+    ) -> anyhow::Result<
+        alpha_engine::evaluation::PreparedDataset,
+    >,
 ) -> anyhow::Result<CexFinalizationReportV1> {
     let costs = &control_mission.spec.evaluation_protocol.costs;
     ensure_promotable_cex_costs(costs)?;
@@ -2419,6 +2425,7 @@ fn finalize_cex_candidate(
         &results_dir.join("final-precommit.json"),
         &precommit,
     )?;
+    validate_sealed_binding(&precommit)?;
 
     let claim = CexSealedHoldoutClaimV1::from_precommit(&precommit)?;
     let sealed_revision = open_cex_holdout(
@@ -2429,8 +2436,9 @@ fn finalize_cex_candidate(
         holdout_claim_put_url,
         holdout_claim_readback_url,
         || {
+            let sealed_dataset = sealed_dataset_after_precommit(&precommit)?;
             evaluator
-                .evaluate_sealed(&proposal, dataset)
+                .evaluate_sealed(&proposal, &sealed_dataset)
                 .map_err(anyhow::Error::msg)
         },
     )?;
@@ -2628,6 +2636,12 @@ pub(crate) fn finalize_formula_search_round(
     control_mission: &CexResearchMissionArtifactV1,
     store: &mut AlphaStore,
     dataset: &alpha_engine::evaluation::PreparedDataset,
+    validate_sealed_binding: impl FnOnce(&CexFinalPrecommitV1) -> anyhow::Result<()>,
+    sealed_dataset_after_precommit: impl FnOnce(
+        &CexFinalPrecommitV1,
+    ) -> anyhow::Result<
+        alpha_engine::evaluation::PreparedDataset,
+    >,
 ) -> anyhow::Result<CexFinalizationReportV1> {
     std::fs::create_dir_all(finalization_dir)?;
     let mission_id = control_mission.semantic_id()?;
@@ -2690,6 +2704,8 @@ pub(crate) fn finalize_formula_search_round(
         &weight_policy,
         &replay_policy,
         &materialization.snapshot.instrument_rules,
+        validate_sealed_binding,
+        sealed_dataset_after_precommit,
     )
 }
 
@@ -2728,6 +2744,8 @@ pub(crate) fn finalize_existing_search_round(
         control_mission,
         &mut store,
         &dataset,
+        |_| Ok(()),
+        |_| Ok(dataset.clone()),
     )
 }
 

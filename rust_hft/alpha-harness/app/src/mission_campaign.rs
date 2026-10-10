@@ -6420,6 +6420,7 @@ pub(crate) mod tests {
     pub(crate) struct NativePreparedFixture {
         pub(crate) request: CampaignRequest,
         pub(crate) inputs: prepared_inputs::VerifiedNativeCampaignPreparedInputs,
+        pub(crate) source_rows: Vec<alpha_engine::evaluation::ResearchRow>,
         _source: CampaignE2eFixture,
         _root: tempfile::TempDir,
     }
@@ -6489,9 +6490,22 @@ pub(crate) mod tests {
     pub(crate) fn native_prepared_fixture_for_tests() -> NativePreparedFixture {
         let source_fixture = campaign_e2e_fixture("native-body-equivalence", false, false, true);
         let (request, inputs, root) = prepare_native_source_fixture(&source_fixture).unwrap();
+        let render = PreparedCexInputs::load(
+            &source_fixture._render_fixture.feature_path,
+            &source_fixture._render_fixture.materialization_path,
+            true,
+        )
+        .unwrap();
+        let protocol = crate::mission_render::approved_evaluation_protocol_for_plan(
+            render.materialization(),
+            &request.research_plan,
+        )
+        .unwrap();
+        let source_rows = render.native_source_rows(&protocol).unwrap();
         NativePreparedFixture {
             request,
             inputs,
+            source_rows,
             _source: source_fixture,
             _root: root,
         }
