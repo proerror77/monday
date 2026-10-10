@@ -1581,6 +1581,20 @@ if assert_listing_monitor_triggers "$listing_monitor_counterexample"; then
   exit 1
 fi
 
+# Parser source and provenance must produce complete plans in both workflows.
+for event in pull_request push; do
+  for parser_file in LICENSE.txt SOURCE.json lib/tomlrb.rb; do
+    printf '%s\n' ".github/scripts/vendor/tomlrb/$parser_file" >"$tmp_dir/cache-parser.txt"
+    output=$(run_case cache-parser "$event" cache-parser.txt)
+    assert_flag "$output" selection_complete true
+    assert_flag "$output" toolchain true
+    assert_flag "$output" loop true
+    assert_flag "$output" research_product cex-runner,controller,prediction-runner
+    grep -q '^jobs=.*ci/ci-contracts' "$output"
+    grep -q '^jobs=.*ploy/workflow-lint' "$output"
+  done
+done
+
 printf 'rust CI scope selector tests passed\n'
 
 # Prediction-only work does not compile the unrelated CEX research/runtime lint
