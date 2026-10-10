@@ -14,6 +14,7 @@ esac
 compat_repo="$work/compat-repo"
 mkdir -p "$compat_repo/.github/scripts" "$compat_repo/rust_hft/alpha-harness/app"
 cp "$helper" "$compat_repo/.github/scripts/"
+cp "$root/.github/scripts/research-release-products.json" "$compat_repo/.github/scripts/"
 mkdir -p "$compat_repo/.github/scripts/vendor"
 cp -R "$root/.github/scripts/vendor/tomlrb" "$compat_repo/.github/scripts/vendor/"
 cp "$root/rust_hft/"{Cargo.toml,workspaces.json} "$compat_repo/rust_hft/"
@@ -40,7 +41,7 @@ fixture_inputs() {
   jq -Sn --arg digest "$digest" --arg profiles "$(sha256sum "$work/profiles" | awk '{print $1}')" \
     --argjson owners "$profiles" \
     --argjson locks "$(bash "$root/.github/scripts/research-workspace-locks.sh" "$compat_repo/rust_hft")" \
-    --argjson recipes "$(bash "$root/.github/scripts/research-release-products.sh" recipes cex-runner,controller | jq -s .)" \
+    --argjson recipes "$(bash "$root/.github/scripts/research-release-products.sh" recipes "${1:-cex-runner,controller}" | jq -s .)" \
     '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",
       compiler:$digest,native:$digest,flags:$digest,profiles:$profiles,recipe:$digest,
       builder_image:("rust:fixture@sha256:"+$digest),recipes:$recipes,workspace_profiles:$owners,locks:$locks}'
@@ -75,10 +76,29 @@ for field in compiler native flags recipe; do
   check_identity_change isolate
 done
 for update in '.target="aarch64-unknown-linux-gnu"' '.profile="research"' \
-  '.builder_image=("rust:changed@sha256:"+.compiler)' '.recipes[0].features="changed-feature"'; do
+  '.builder_image=("rust:changed@sha256:"+.compiler)'; do
   jq -S "$update" "$work/full.json" >"$work/changed.json"
   check_identity_change isolate
 done
+for update in '.recipes[0].features="changed-feature"' '.recipes[0].package="changed-package"' \
+  '.recipes[0].binaries=["changed-binary"]'; do
+  jq -S "$update" "$work/full.json" >"$work/changed.json"
+  check_identity_change reuse
+done
+# all -> subset changes exact coverage, never GitHub cache paths or compatibility.
+bash "$compat_helper" cache-paths "$work/full.json" >"$work/cache-paths"
+for product in all cex-runner controller prediction-runner; do
+  fixture_inputs "$product" >"$work/changed.json"
+  check_identity_change reuse
+  bash "$compat_helper" cache-paths "$work/changed.json" >"$work/changed-paths"
+  cmp "$work/cache-paths" "$work/changed-paths"
+  cmp <(jq -Sc .recipes "$work/changed.json") <(bash "$root/.github/scripts/research-release-products.sh" recipes "$product" | jq -Scs .)
+done
+[[ $(grep -c '/rust_hft/target/' "$work/cache-paths") == 4 ]]
+if grep -q '/cargo/bin\|/.cargo/bin' "$work/cache-paths"; then echo 'tool executables entered cache paths' >&2; exit 1; fi
+printf 'fn source_only_fixture() {}\n' >"$compat_repo/rust_hft/alpha-harness/app/source.rs"
+fixture_inputs >"$work/source-only.json"
+cmp "$work/full.json" "$work/source-only.json"
 # Dependency declarations change exact provenance without losing compatible bytes.
 owner="$compat_repo/rust_hft/research-core/platform/Cargo.toml"
 cp "$owner" "$work/owner-before"
@@ -99,8 +119,7 @@ for table in 'profile.release.package.cache-fixture' '"profile"."release"."packa
   check_identity_change isolate
   cp "$work/owner-before" "$owner"
 done
-# Whitespace, an inactive legacy workspace and unrelated owner profiles do not
-# change the selected owning-workspace compilation boundary.
+# Whitespace and inactive legacy workspace bytes do not change profiles.
 for path in research-core/Cargo.toml Cargo.toml workspaces.json; do
   cp "$compat_repo/rust_hft/$path" "$work/root-before"
   printf '\n' >>"$compat_repo/rust_hft/$path"
@@ -111,8 +130,14 @@ done
 cp "$compat_repo/rust_hft/prediction-markets/Cargo.toml" "$work/unselected-before"
 printf '\n[profile.release.build-override]\nopt-level=1\n' >>"$compat_repo/rust_hft/prediction-markets/Cargo.toml"
 fixture_inputs >"$work/changed.json"
-check_identity_change reuse
+check_identity_change isolate
 cp "$work/unselected-before" "$compat_repo/rust_hft/prediction-markets/Cargo.toml"
+# Profiles outside the four cached research owners remain unrelated.
+cp "$compat_repo/rust_hft/runtime/Cargo.toml" "$work/runtime-before"
+printf '\n[profile.release.build-override]\nopt-level=1\n' >>"$compat_repo/rust_hft/runtime/Cargo.toml"
+fixture_inputs >"$work/changed.json"
+check_identity_change reuse
+cp "$work/runtime-before" "$compat_repo/rust_hft/runtime/Cargo.toml"
 cp "$compat_repo/rust_hft/workspaces.json" "$work/registry-before"
 jq '(.workspaces[]|select(.manifest=="research-core/platform/Cargo.toml")|.id)="changed-control"' "$work/registry-before" >"$compat_repo/rust_hft/workspaces.json"
 fixture_inputs >"$work/changed.json"
@@ -125,6 +150,16 @@ if bash "$compat_helper" compatibility-inputs "$work/invalid.json" >"$work/rejec
 fi
 [[ ! -s $work/rejected ]]
 cp "$work/owner-before" "$owner"
+for profile in '[profile.unsupported]' $'[profile.unsupported]\ninherits="missing"' \
+  $'[profile.first]\ninherits="second"\n[profile.second]\ninherits="first"'; do
+  printf '\n%s\n' "$profile" >>"$owner"
+  fixture_inputs >"$work/invalid.json"
+  if bash "$compat_helper" compatibility-inputs "$work/invalid.json" >"$work/rejected" 2>/dev/null; then
+    echo 'unadmitted profile accepted' >&2; exit 1
+  fi
+  [[ ! -s $work/rejected ]]
+  cp "$work/owner-before" "$owner"
+done
 for field in schema target profile compiler native flags profiles recipe builder_image recipes workspace_profiles locks; do
   jq --arg field "$field" 'del(.[$field])' "$work/full.json" >"$work/invalid.json"
   if bash "$compat_helper" compatibility-inputs "$work/invalid.json" >"$work/rejected" 2>/dev/null; then
@@ -133,13 +168,29 @@ for field in schema target profile compiler native flags profiles recipe builder
   [[ ! -s $work/rejected ]]
 done
 for update in '.compiler=""' '.native="invalid"' '.recipes=[]' '.recipes[0].manifest="../outside/Cargo.toml"' \
-  '.workspace_profiles={}' '.locks={}' '.builder_image="rust:unpinned"'; do
+  '.recipes[0].manifest="runtime/Cargo.toml"' '.workspace_profiles={}' '.locks={}' '.builder_image="rust:unpinned"'; do
   jq "$update" "$work/full.json" >"$work/invalid.json"
   if bash "$compat_helper" compatibility-inputs "$work/invalid.json" >"$work/rejected" 2>/dev/null; then
     printf 'malformed compatibility input accepted: %s\n' "$update" >&2; exit 1
   fi
   [[ ! -s $work/rejected ]]
 done
+catalog="$compat_repo/.github/scripts/research-release-products.json"
+cp "$catalog" "$work/catalog-before"
+jq '.recipes[0].manifest="runtime/Cargo.toml"' "$work/catalog-before" >"$catalog"
+for command in compatibility-inputs cache-paths; do
+  if bash "$compat_helper" "$command" "$work/full.json" >"$work/rejected" 2>/dev/null; then
+    echo 'unknown catalog cache owner accepted' >&2; exit 1
+  fi
+  [[ ! -s $work/rejected ]]
+done
+cp "$work/catalog-before" "$catalog"
+mv "$compat_repo/.github/scripts/vendor/tomlrb/lib" "$compat_repo/.github/scripts/vendor/tomlrb/missing-lib"
+if bash "$compat_helper" compatibility-inputs "$work/full.json" >"$work/rejected" 2>/dev/null; then
+  echo 'missing Cargo TOML parser accepted' >&2; exit 1
+fi
+[[ ! -s $work/rejected ]]
+mv "$compat_repo/.github/scripts/vendor/tomlrb/missing-lib" "$compat_repo/.github/scripts/vendor/tomlrb/lib"
 # Keep the full digest output and use the separate key only for dependency restore.
 grep -Fq "printf 'cache_sha256=%s" "$root/.github/scripts/capture-research-build-inputs.sh"
 grep -Fq 'dependency_cache_sha256=%s' "$root/.github/scripts/capture-research-build-inputs.sh"
@@ -182,30 +233,47 @@ RUBY
 if bash "$helper" target-dir ../outside/Cargo.toml; then echo 'escaping target accepted' >&2; exit 1; fi
 mkdir -p "$work/repo/.github/scripts" "$work/repo/rust_hft" "$work/bin"
 cp "$helper" "$work/repo/.github/scripts/"
+cp "$root/.github/scripts/research-release-products.json" "$work/repo/.github/scripts/"
 cp "$root/rust_hft/workspaces.json" "$work/repo/rust_hft/"
 cat >"$work/bin/cargo" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ " $* " == *" --no-deps "* ]]; then extra=false; else extra=true; fi
+printf '%s\n' "$*" >>"$FIXTURE/metadata-calls"
 jq -n --arg root "$FIXTURE/repo" --argjson extra "$extra" '{packages:([
   {name:"local-code",manifest_path:($root+"/rust_hft/member/Cargo.toml"),targets:[{name:"local_code"}]},
   {name:"hft-data",manifest_path:($root+"/rust_hft/data-pipelines/core/Cargo.toml"),targets:[{name:"data"}]}
 ] + if $extra then [
   {name:"hidden-local",manifest_path:($root+"/vendor/hidden-local/Cargo.toml"),targets:[{name:"hidden_local"}]},
   {name:"outside-local",source:null,manifest_path:"/external/local/Cargo.toml",targets:[{name:"outside_local"}]},
-  {name:"data-encoding",source:"registry+https://example.invalid",manifest_path:"/external/registry/data-encoding/Cargo.toml",targets:[{name:"data_encoding"}]}
+  {name:"data-encoding",source:"registry+https://example.invalid",manifest_path:"/external/registry/data-encoding/Cargo.toml",targets:[{name:"data_encoding"}]},
+  {name:"libduckdb-sys",source:"registry+https://example.invalid",manifest_path:"/external/registry/libduckdb-sys/Cargo.toml",targets:[{name:"libduckdb_sys"}]},
+  {name:"local-code",source:"registry+https://example.invalid",manifest_path:"/external/registry/local-code/Cargo.toml",targets:[{name:"local_code"}]}
 ] else [] end)}'
 MOCK
 chmod +x "$work/bin/cargo"
 for id in data-pipelines prediction-markets research-core research-core--platform; do
   profile="$work/repo/rust_hft/target/$id/x86_64-unknown-linux-gnu/release"
   mkdir -p "$profile/"{build,.fingerprint,deps,incremental}
+  mkdir -p "$work/repo/rust_hft/target/$id/tmp" "$work/repo/rust_hft/target/$id/x86_64-unknown-linux-gnu/tmp"
+  printf 'local temporary object\n' >"$work/repo/rust_hft/target/$id/tmp/local.o"
+  printf 'unknown bytes\n' >"$work/repo/rust_hft/target/$id/x86_64-unknown-linux-gnu/tmp/local.o"
   mkdir -p "$profile/build/libduckdb-sys-native/out" "$profile/build/local-code-hash/out"
   printf 'native object\n' >"$profile/build/libduckdb-sys-native/out/native.o"
+  printf 'external build-script executable\n' >"$profile/build/libduckdb-sys-native/build-script-build"
+  printf 'external native codegen executable\n' >"$profile/build/libduckdb-sys-native/out/native-codegen"
+  chmod +x "$profile/build/libduckdb-sys-native/build-script-build" "$profile/build/libduckdb-sys-native/out/native-codegen"
   printf 'local object\n' >"$profile/build/local-code-hash/out/local.o"
   printf 'local\n' >"$profile/deps/liblocal_code-hash.rlib"
   printf 'hidden local\n' >"$profile/deps/libhidden_local-hash.rlib"
   printf 'outside local\n' >"$profile/deps/liboutside_local-hash.rlib"
+  printf 'deleted local\n' >"$profile/deps/libdeleted_local-hash.rlib"
+  mkdir -p "$profile/build/deleted-local-hash/out" "$profile/.fingerprint/deleted-local-hash" "$profile/examples"
+  printf 'unknown object\n' >"$profile/build/deleted-local-hash/out/native.o"
+  printf 'unknown fingerprint\n' >"$profile/.fingerprint/deleted-local-hash/lib-deleted_local"
+  printf 'local example executable\n' >"$profile/examples/local"
+  printf 'external dependency test executable\n' >"$profile/deps/data_encoding-hash"
+  chmod +x "$profile/deps/data_encoding-hash"
   printf 'incremental local\n' >"$profile/incremental/local.o"
   printf 'local fingerprint\n' >"$profile/.fingerprint/local-code-hash"
   printf 'native\n' >"$profile/deps/liblibduckdb_sys-hash.rlib"
@@ -222,10 +290,20 @@ for id in data-pipelines prediction-markets research-core research-core--platfor
   printf 'external dependency bytes\n' >"$profile/deps/libdata_encoding-hash.rlib"
   printf 'external build output' >"$profile/build/data-encoding-hash/out/dependency.o"
 done
-FIXTURE="$work" PATH="$work/bin:$PATH" bash "$work/repo/.github/scripts/research-cache-layout.sh" cleanup "$work/inputs"
+bash "$root/.github/scripts/research-release-products.sh" recipes prediction-runner | jq -s '{recipes:.}' >"$work/subset-inputs"
+FIXTURE="$work" PATH="$work/bin:$PATH" bash "$work/repo/.github/scripts/research-cache-layout.sh" cleanup "$work/subset-inputs"
+[[ $(grep -vc -- '--no-deps' "$work/metadata-calls") == 8 ]]
+grep -q -- '--features ploy-research/db' "$work/metadata-calls"
+grep -q -- '--features hft-research-platform/publisher' "$work/metadata-calls"
+if grep -q -- '--all-features' "$work/metadata-calls"; then echo 'cleanup used a feature union' >&2; exit 1; fi
 for id in data-pipelines prediction-markets research-core research-core--platform; do
   profile="$work/repo/rust_hft/target/$id/x86_64-unknown-linux-gnu/release"
+  [[ ! -e $work/repo/rust_hft/target/$id/tmp && ! -e $work/repo/rust_hft/target/$id/x86_64-unknown-linux-gnu/tmp ]]
   [[ -f $profile/build/libduckdb-sys-native/out/native.o && -f $profile/deps/liblibduckdb_sys-hash.rlib ]]
+  [[ -x $profile/build/libduckdb-sys-native/build-script-build ]]
+  [[ -x $profile/build/libduckdb-sys-native/out/native-codegen ]]
+  [[ ! -e $profile/deps/libdeleted_local-hash.rlib && ! -e $profile/build/deleted-local-hash && ! -e $profile/.fingerprint/deleted-local-hash ]]
+  [[ ! -e $profile/examples && ! -e $profile/deps/data_encoding-hash ]]
   [[ ! -e $profile/deps/libhidden_local-hash.rlib && ! -e $profile/build/local-code-hash && ! -e $profile/deps/liblocal_code-hash.rlib && ! -e $profile/.fingerprint/local-code-hash && ! -e $profile/local-code ]]
   [[ ! -e $profile/deps/liboutside_local-hash.rlib && ! -e $profile/incremental ]]
   [[ ! -e $profile/build/hft-data-hash && ! -e $profile/.fingerprint/hft-data-hash ]]
@@ -236,7 +314,7 @@ for id in data-pipelines prediction-markets research-core research-core--platfor
   [[ $(cat "$profile/deps/libdata_encoding-hash.rlib") == 'external dependency bytes' ]]
   [[ $(cat "$profile/build/data-encoding-hash/out/dependency.o") == 'external build output' ]]
 done
-printf 'PASS: exact local artifact names removed; external data-encoding fingerprint and bytes retained in all four targets\n'
+printf 'PASS: subset cleanup covers all four cached targets, removes local/unknown bytes and executables, retains external build scripts/native objects/codegen tools\n'
 # A local shared/vendor manifest outside the recipe roots changes cache identity
 # even when every owning Cargo.lock and recipe remains unchanged.
 mkdir -p "$work/repo/rust_hft/shared/cex-input" "$work/repo/vendor/local"

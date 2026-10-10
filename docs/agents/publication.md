@@ -129,6 +129,21 @@ Dependency reuse does not admit software artifacts from another source or produc
 Every recovery keeps current-main checks, original attempt identity, native
 signing, OSS admission and image readback requirements.
 
+Research dependency caches use the same four catalog owner targets for every
+product subset. Their compatible identity binds compiler and target libraries,
+native ABI, flags/configuration, builder, helper implementation, parser and all
+four owners' complete Cargo profiles. Selected packages, features and binaries
+remain in the complete v3 exact suffix; Cargo fingerprints rebuild changed
+dependencies. Only the selected recipes execute. A successful main save first
+cleans every cached owner, including unselected targets, removing local and
+unknown compilation bytes and product/test executables. Metadata-proven external
+dependency build scripts, native objects and codegen tools remain cache bytes.
+A compatibility schema change starts a new cold seed; a subset downloads the
+stable owner set.
+The workspace CI dependency cache also retains proven external build outputs,
+including native codegen tools. Changing that cleanup helper changes its exact
+key once; compatible dependency restoration still requires an actual hit.
+
 The separate native issuer signs each Build only after authenticated CI,
 original software producer, immutable OCI programs and OSS bytes agree.
 Preflight binds operator policy and TLS to the selected publication before
