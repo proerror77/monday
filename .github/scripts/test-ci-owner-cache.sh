@@ -171,9 +171,10 @@ while IFS= read -r manifest; do
   printf executable >"$profile/build/$package-hash/build-script-build"
   chmod +x "$profile/build/$package-hash/build-script-build"
   printf native >"$profile/build/libduckdb-sys-native/out/native.o"
+  printf executable >"$profile/build/libduckdb-sys-native/out/native-codegen"
   printf executable >"$profile/build/libduckdb-sys-native/build-script-build"
   printf executable >"$profile/deps/external-test-hash"
-  chmod +x "$profile/build/libduckdb-sys-native/build-script-build" "$profile/deps/external-test-hash"
+  chmod +x "$profile/build/libduckdb-sys-native/build-script-build" "$profile/build/libduckdb-sys-native/out/native-codegen" "$profile/deps/external-test-hash"
   printf local >"$profile/deps/lib$rust_name-hash.rlib"
   printf hidden >"$profile/deps/libhidden_local-hash.rlib"
   printf outside >"$profile/deps/libexternal_local-hash.rlib"
@@ -205,6 +206,7 @@ while IFS= read -r manifest; do
   profile="$target/debug"; package=package-${owner//\//-}; rust_name=${package//-/_}
   [[ -f $profile/build/libduckdb-sys-native/out/native.o && -f $profile/deps/liblibduckdb_sys-hash.rlib ]]
   [[ -x $profile/build/libduckdb-sys-native/build-script-build && ! -e $profile/deps/external-test-hash ]]
+  [[ -x $profile/build/libduckdb-sys-native/out/native-codegen ]]
   [[ ! -e $profile/build/$package-hash && ! -e $profile/deps/lib$rust_name-hash.rlib && ! -e $profile/deps/libhidden_local-hash.rlib ]]
   [[ ! -e $profile/deps/libexternal_local-hash.rlib && ! -e $profile/examples ]]
   [[ ! -e $profile/deps/libdeleted_local-hash.rlib && ! -e $profile/build/deleted-local-hash && ! -e $profile/.fingerprint/deleted-local-hash ]]
@@ -217,7 +219,7 @@ while IFS= read -r manifest; do
   [[ $(cat "$profile/deps/libdata_encoding-hash.rlib") == 'external dependency bytes' ]]
   [[ $(cat "$profile/build/data-encoding-hash/out/dependency.o") == 'external build output' ]]
 done < <(jq -r '.workspaces[].manifest' "$FIXTURE/rust_hft/workspaces.json")
-printf 'PASS: exact local artifact names removed; external data-encoding fingerprint and bytes retained in every CI owner target\n'
+printf 'PASS: local/unknown artifacts and product/test executables removed; external fingerprints/native bytes/codegen tools retained in every CI owner target\n'
 profile="$FIXTURE/rust_hft/research-core/target/debug"
 rm -rf "$profile/deps"
 mkdir -p "$work/outside"; printf untouched >"$work/outside/marker"
