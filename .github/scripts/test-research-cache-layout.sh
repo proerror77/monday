@@ -14,7 +14,6 @@ esac
 compat_repo="$work/compat-repo"
 mkdir -p "$compat_repo/.github/scripts" "$compat_repo/rust_hft/alpha-harness/app"
 cp "$helper" "$compat_repo/.github/scripts/"
-cp "$root/.github/scripts/cargo-cache-profile-inputs.py" "$compat_repo/.github/scripts/"
 cp "$root/rust_hft/"{Cargo.toml,workspaces.json} "$compat_repo/rust_hft/"
 while IFS= read -r manifest; do
   mkdir -p "$compat_repo/rust_hft/${manifest%/Cargo.toml}"
