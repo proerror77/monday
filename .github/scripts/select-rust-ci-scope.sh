@@ -724,6 +724,7 @@ for path in "${paths[@]}"; do
   # Preserve the first pass decision when code also requires ownership metadata.
   [[ ${ignored_documentation[$path]:-} == true ]] && continue
   case "$path" in
+    rust_hft/scripts/*.sh|\
     rust_hft/deployment/docker/*|rust_hft/deployment/k8s/*|rust_hft/.dockerignore|\
     rust_hft/Cargo.toml|rust_hft/Cargo.lock|rust_hft/prediction-markets/Cargo.toml|\
     rust_hft/prediction-markets/Cargo.lock|rust_hft/prediction-markets/ploy-frontend/*|\
