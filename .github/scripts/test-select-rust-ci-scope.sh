@@ -3,7 +3,7 @@
 set -euo pipefail
 
 case ${1:-} in
-  ''|--strategy-config|--production-scope|--documentation-scope|--prediction-tools) ;;
+  ''|--strategy-config|--production-scope|--documentation-scope|--prediction-tools|--publisher-scope) ;;
   *) printf 'unknown test scope: %s\n' "$1" >&2; exit 2 ;;
 esac
 
@@ -120,6 +120,186 @@ assert_security_jobs() {
     exit 1
   }
 }
+
+check_publisher_scope() {
+  ruby -I "$script_dir/vendor/tomlrb/lib" -rtomlrb -rjson -rfileutils -ropen3 - "$script_dir/../.." "$selector" "$fixtures/workspace-owners.fixture" "$tmp_dir" <<'RUBY'
+root, selector, metadata, tmp = ARGV
+repo = File.join(tmp, 'publisher-repo')
+FileUtils.mkdir_p(repo)
+PUBLISHER_REPO = repo
+platform = 'rust_hft/research-core/platform/Cargo.toml'
+lock = 'rust_hft/research-core/platform/Cargo.lock'
+lib = 'rust_hft/research-core/platform/src/lib.rs'
+source = 'rust_hft/research-core/platform/src/release_oss.rs'
+consumer = 'rust_hft/alpha-harness/app/Cargo.toml'
+recipe = '.github/scripts/research-release-products.json'
+def check(value, message)
+  raise ArgumentError, message unless value
+end
+def git(*args)
+  value, status = Open3.capture2('git', *args, chdir: PUBLISHER_REPO, err: File::NULL)
+  check(status.success?, "fixture git failed: #{args.first}")
+  value.strip
+end
+write = lambda do |path, value|
+  target = File.join(repo, path)
+  FileUtils.mkdir_p(File.dirname(target))
+  File.write(target, value)
+end
+commit = lambda do
+  git('add', '.')
+  git('commit', '-qm', 'scope fixture')
+  git('rev-parse', 'HEAD')
+end
+git('init', '-q')
+git('config', 'user.name', 'CI scope contract')
+git('config', 'user.email', 'ci@example.invalid')
+current = [platform, lock, lib, consumer, recipe].map { |p| [p, File.read(File.join(root, p))] }.to_h
+current[source] = "// publisher source fixture\n"
+dependency = Tomlrb.parse(current[platform]).fetch('dependencies').fetch('roxmltree')
+next_version = dependency.fetch('version').sub(/\d+\z/) { |v| (v.to_i + 1).to_s }
+xml_package = Tomlrb.parse(current[lock]).fetch('package').find { |p| p.fetch('name') == 'roxmltree' }
+xml_checksum = xml_package.fetch('checksum')
+xml_header = "name = \"roxmltree\"\nversion = \"#{xml_package.fetch('version')}\""
+changed_manifest = current[platform].sub(/^(roxmltree = .*version = ")[^"]+/) { "#{Regexp.last_match(1)}#{next_version}" }
+# Reconstruct the XML addition without Git history, network or registry metadata.
+baseline = current.dup
+baseline[source] = "// previous publisher source fixture\n"
+baseline[platform] = baseline[platform].gsub(/^roxmltree = .*\n/, '').sub('"dep:roxmltree", ', '')
+parts = baseline[lock].split("[[package]]\n")
+baseline[lock] = parts.first + parts.drop(1).reject { |p| p.start_with?("name = \"roxmltree\"\n") }.map { |p| "[[package]]\n#{p}" }.join
+baseline[lock] = baseline[lock].sub(" \"roxmltree\",\n", '')
+baseline.each { |path, value| write.call(path, value) }
+base = commit.call
+current.each { |path, value| write.call(path, value) }
+full = commit.call
+plan = lambda do |label, starting, edits, expected, event: 'push', supplied_base: true, extra_env: {}, selected_paths: nil|
+  git('reset', '--hard', starting)
+  edits.each { |path, value| write.call(path, value) }
+  head = commit.call
+  paths = File.join(tmp, "publisher-#{label}-#{event}.paths")
+  File.write(paths, selected_paths ? selected_paths.join("\n") + "\n" : git('diff', '--name-only', starting, head) + "\n")
+  output = File.join(tmp, "publisher-#{label}-#{event}.out")
+  args = ['bash', selector, '--event', event, '--head', head, '--changed-files', paths, '--metadata', metadata, '--output', output]
+  args += ['--base', starting] if supplied_base
+  _, errors, status = Open3.capture3({'GITHUB_REF' => 'refs/heads/main'}.merge(extra_env), *args, chdir: repo)
+  check(status.success?, "#{label}: selector failed: #{errors}")
+  values = File.readlines(output).map { |line| line.chomp.split('=', 2) }.to_h
+  if expected == 'publisher'
+    check(values['research_product'] == 'controller', "#{label}: expected controller; got #{values}")
+    check(values['owning_packages'] == ',hft-research-platform,', "#{label}: unrelated owners selected")
+    check(JSON.parse(values.fetch('image_matrix')) == {'include' => []}, "#{label}: unrelated runtime images selected")
+    %w[loop handoff focused collector control production_trading_image production_collector_image].each do |flag|
+      check(values[flag] == 'false', "#{label}: unexpected #{flag}")
+    end
+    %w[ci/rust ci/research-foundation ploy/research-image-binaries ploy/research-image-smoke].each do |job|
+      check(values.fetch('jobs').include?(",#{job},"), "#{label}: omitted #{job}")
+    end
+  else
+    check(values.fetch('research_product').include?('cex-runner') && values['loop'] == 'true', "#{label}: unknown/shared impact narrowed: #{values}")
+  end
+  %w[security/sast-semgrep security/cargo-audit security/secret-presence security/license-check security/cargo-machete security/secret-detection].each do |job|
+    check(values.fetch('security_jobs').include?(",#{job},"), "#{label}: omitted #{job}")
+  end
+  puts "PASS publisher scope: #{label} #{event} -> #{values.fetch('research_product')}"
+end
+%w[pull_request push].each do |event|
+  plan.call('xml-addition', base, current.select { |p, _| [platform, lock, source].include?(p) }, 'publisher', event: event)
+  plan.call('source-only', full, {source => current[source] + "// XML parser edit\n"}, 'publisher', event: event)
+  plan.call('manifest-only', full, {platform => changed_manifest}, 'publisher', event: event)
+  plan.call('lock-only', full, {lock => current[lock].sub(xml_checksum, 'f' * 64)}, 'publisher', event: event)
+  {
+    'profile' => current[platform].sub('lto = "thin"', 'lto = false'),
+    'resolver' => current[platform].sub('resolver = "2"', 'resolver = "3"'),
+    'shared-dependency' => current[platform].sub('anyhow = "1"', 'anyhow = "1.0.99"'),
+    'shared-feature' => current[platform].sub('default = []', 'default = ["publisher"]'),
+    'publisher-edge' => current[platform].sub('"dep:roxmltree", ', '"dep:roxmltree", "gateway", '),
+    'implicit-optional' => current[platform].sub('"dep:roxmltree", ', ''),
+    'nonoptional' => current[platform].sub(/^roxmltree = .+$/, "roxmltree = \"#{dependency.fetch('version')}\""),
+    'renamed-dependency' => current[platform].sub(/^(roxmltree = \{)/) { "#{Regexp.last_match(1)} package = \"other-xml\"," },
+    'unknown-dependency-key' => current[platform].sub(/^(roxmltree = \{)/) { "#{Regexp.last_match(1)} unknown = true," },
+    'dev-dependency' => current[platform].sub("[dev-dependencies]\n", "[dev-dependencies]\nother = \"1\"\n"),
+    'patch' => current[platform] + "\n[patch.crates-io]\nroxmltree = { path = \"../replacement\" }\n",
+    'malformed' => current[platform] + "\n[features]\n",
+    'unknown-key' => current[platform] + "\n[unknown]\nvalue = true\n"
+  }.each { |label, value| plan.call(label, full, {platform => value}, 'broad', event: event) }
+  other = Tomlrb.parse(current[lock]).fetch('package').find { |p| p.fetch('name') == 'serde' }
+  plan.call('lock-other-owner', full, {lock => current[lock].sub("name = \"serde\"\nversion = \"#{other.fetch('version')}\"", "name = \"serde\"\nversion = \"9.0.0\"")}, 'broad', event: event)
+  plan.call('lock-foreign-source', full, {lock => current[lock].sub(xml_header + "\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"", xml_header + "\nsource = \"git+https://example.invalid/roxmltree\"")}, 'broad', event: event)
+  plan.call('lock-transitive', full, {lock => current[lock].sub("checksum = \"#{xml_checksum}\"", "checksum = \"#{xml_checksum}\"\ndependencies = [\"serde\"]")}, 'broad', event: event)
+  plan.call('lock-unowned-leaf', full, {lock => current[lock] + "\n[[package]]\nname = \"unowned-parser\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"#{'a' * 64}\"\n"}, 'broad', event: event)
+  plan.call('lock-unknown-key', full, {lock => current[lock].sub("checksum = \"#{xml_checksum}\"", "checksum = \"#{xml_checksum}\"\nunknown = true")}, 'broad', event: event)
+  git('reset', '--hard', full)
+  shared_lock = current[lock] + "\n[[package]]\nname = \"other-xml-user\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"#{'a' * 64}\"\ndependencies = [\"roxmltree\"]\n"
+  write.call(lock, shared_lock)
+  shared_base = commit.call
+  plan.call('lock-existing-shared-leaf', shared_base, {lock => shared_lock.sub(xml_checksum, 'f' * 64)}, 'broad', event: event)
+  plan.call('gate-change', full, {source => current[source] + "// edit\n", lib => current[lib].sub("#[cfg(feature = \"publisher\")]\npub mod release_oss;", 'pub mod release_oss;')}, 'broad', event: event, selected_paths: [source])
+  plan.call('consumer-publisher', full, {source => current[source] + "// edit\n", consumer => current[consumer].sub('features = ["artifact-io",', 'features = ["publisher", "artifact-io",')}, 'broad', event: event, selected_paths: [source])
+  plan.call('consumer-feature-publisher', full, {source => current[source] + "// edit\n", consumer => current[consumer].sub("[features]\n", "[features]\npublisher-client = [\"hft-research-platform/publisher\"]\n")}, 'broad', event: event, selected_paths: [source])
+  plan.call('consumer-alias-publisher', full, {source => current[source] + "// edit\n", consumer => current[consumer].sub('hft-research-platform = { path', 'platform-client = { package = "hft-research-platform", path').sub("[features]\n", "[features]\npublisher-client = [\"platform-client?/publisher\"]\n")}, 'broad', event: event, selected_paths: [source])
+  workspace_alias = "[workspace]\n[workspace.dependencies]\nplatform-client = { package = \"hft-research-platform\", path = \"research-core/platform\" }\n"
+  aliased_consumer = current[consumer].sub(/^hft-research-platform = .*$/, 'platform-client = { workspace = true, features = ["publisher"] }')
+  plan.call('workspace-alias-publisher', full, {source => current[source] + "// edit\n", 'rust_hft/Cargo.toml' => workspace_alias, consumer => aliased_consumer}, 'broad', event: event, selected_paths: [source])
+  aliased_consumer = current[consumer].sub(/^hft-research-platform = .*$/, 'platform-client = { workspace = true }').sub("[features]\n", "[features]\npublisher-client = [\"platform-client?/publisher\"]\n")
+  plan.call('workspace-alias-feature-publisher', full, {source => current[source] + "// edit\n", 'rust_hft/Cargo.toml' => workspace_alias, consumer => aliased_consumer}, 'broad', event: event, selected_paths: [source])
+  plan.call('shared-profile-with-source', full, {source => current[source] + "// edit\n", platform => current[platform].sub('lto = "thin"', 'lto = false')}, 'broad', event: event, selected_paths: [source])
+  plan.call('recipe-feature', full, {source => current[source] + "// edit\n", recipe => current[recipe].sub('"features": "publisher"', '"features": "control"')}, 'broad', event: event, selected_paths: [source])
+  plan.call('shared-source', full, {source => current[source] + "// edit\n", 'rust_hft/research-core/platform/src/build.rs' => "// shared build change\n"}, 'broad', event: event)
+  plan.call('no-base', full, {platform => changed_manifest}, 'broad', event: event, supplied_base: false)
+  unavailable = File.join(tmp, 'without-toml-parser')
+  FileUtils.mkdir_p(unavailable)
+  shim = File.join(unavailable, 'ruby')
+  File.write(shim, "#!/usr/bin/env bash\nexit 3\n")
+  FileUtils.chmod(0o755, shim)
+  plan.call('unavailable-parser', full, {platform => changed_manifest}, 'broad', event: event, extra_env: {'PATH' => unavailable + File::PATH_SEPARATOR + ENV.fetch('PATH')})
+end
+puts 'Publisher-only and conservative fallback scope contracts passed'
+
+# Baseline lookup is isolated here. Native signing and publication admission
+# remain in their existing contracts. Test cumulative source impact only.
+isolated = File.join(tmp, 'publisher-carry', '.github', 'scripts')
+FileUtils.mkdir_p(File.join(isolated, 'vendor'))
+%w[select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json local-lock-impact.sh].each do |name|
+  FileUtils.cp(File.join(root, '.github', 'scripts', name), File.join(isolated, name))
+end
+FileUtils.cp_r(File.join(root, '.github', 'scripts', 'vendor', 'tomlrb'), File.join(isolated, 'vendor'))
+lookup = File.join(isolated, 'read-research-publish-baseline.sh')
+File.write(lookup, "#!/usr/bin/env bash\nset -euo pipefail\ncp \"$PUBLISHER_BASELINES\" \"$2\"\n")
+baselines = File.join(tmp, 'publisher-carry-baselines.json')
+File.write(baselines, JSON.generate(%w[cex-runner controller prediction-runner].map { |name| [name, full] }.to_h))
+[['publisher', {source => current[source] + "// unpublished XML change\n"}, 'controller'],
+ ['vendor', {'.github/scripts/vendor/tomlrb/lib/future.rb' => "# parser fixture\n"}, 'cex-runner,controller,prediction-runner']].each do |label, edits, expected|
+  git('reset', '--hard', full)
+  edits.each { |path, value| write.call(path, value) }
+  commit.call
+  write.call('README.md', "later documentation change\n")
+  head = commit.call
+  output = File.join(tmp, "publisher-carry-#{label}.out")
+  _, errors, status = Open3.capture3({'PUBLISHER_BASELINES' => baselines, 'SELECTED_JOBS' => ',,', 'SELECTED_RESEARCH_PRODUCT' => 'none'},
+    'bash', File.join(isolated, 'select-main-research-scope.sh'), head, output, metadata, chdir: repo)
+  check(status.success?, "#{label}: cumulative selector failed: #{errors}")
+  values = File.readlines(output).map { |line| line.chomp.split('=', 2) }.to_h
+  check(values['research_product'] == expected && values['research_pending_product'] == expected, "#{label}: unpublished impact lost: #{values}")
+  puts "PASS publisher cumulative scope: #{label} -> #{expected}"
+end
+RUBY
+}
+
+check_publisher_scope
+for event in pull_request push; do
+  for vendor_path in lib/tomlrb.rb lib/tomlrb/scanner.rb LICENSE.txt; do
+    printf '%s\n' ".github/scripts/vendor/tomlrb/$vendor_path" >"$tmp_dir/toml-vendor.txt"
+    vendor_scope=$(run_case "toml-vendor-${vendor_path//\//-}-$event" "$event" toml-vendor.txt)
+    assert_flag "$vendor_scope" research_product cex-runner,controller,prediction-runner
+    for flag in loop handoff focused collector control; do assert_flag "$vendor_scope" "$flag" true; done
+    grep -Fqx 'image_matrix={"include":[]}' "$vendor_scope"
+    for job in ci/rust ci/ci-contracts ploy/workflow-lint ploy/research-image-binaries ploy/research-image-smoke; do
+      grep -Fq ",$job," "$vendor_scope"
+    done
+  done
+done
+[[ ${1:-} != --publisher-scope ]] || exit 0
 
 check_prediction_contract_runners() {
   local event owner output fixture="$tmp_dir/market-contract" result

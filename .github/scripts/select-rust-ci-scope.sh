@@ -177,11 +177,8 @@ select_main_research_image_jobs() {
   fi
 }
 
-select_all() {
+select_all_rust_validation() {
   select_prediction_tools
-  image_live=true
-  image_paper=true
-  image_collector=true
   loop=true
   loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-cex-research-worker,hft-harnessctl,hft-research-ml
   handoff=true
@@ -192,6 +189,13 @@ select_all() {
   focused=true
   focused_packages=hft-live,hft-paper,hft-all-in-one,alpha-harness,hft-harnessctl
   toolchain=true
+}
+
+select_all() {
+  image_live=true
+  image_paper=true
+  image_collector=true
+  select_all_rust_validation
 }
 
 emit() {
@@ -275,6 +279,194 @@ if [[ -n $base ]]; then
   lock_base=$(git merge-base "$base" "$head")
   lock_head=$(git rev-parse "$head^{commit}")
 fi
+
+# Narrow only a proven publisher boundary. Missing TOML support or unfamiliar
+# manifest/lock syntax retains the ordinary conservative package selection.
+publisher_boundary=
+publisher_only_change() {
+  [[ -n $lock_base ]] || return 1
+  local library
+  library="$(dirname "${BASH_SOURCE[0]}")/vendor/tomlrb/lib"
+  if [[ -z $publisher_boundary ]]; then
+    if ruby -I "$library" -rjson -ropen3 - "$lock_base" "$lock_head" <<'RUBY'
+begin
+  require 'tomlrb'
+rescue LoadError
+  exit 3
+end
+before, after = ARGV
+platform = 'rust_hft/research-core/platform/Cargo.toml'
+def check(value)
+  raise ArgumentError, 'publisher boundary not proven' unless value
+end
+def content(revision, path)
+  value, status = Open3.capture2('git', 'show', "#{revision}:#{path}", err: File::NULL)
+  check(status.success?)
+  value
+end
+def manifest(revision, path)
+  Tomlrb.parse(content(revision, path))
+end
+def dependencies(value)
+  value.flat_map do |key, item|
+    if %w[dependencies dev-dependencies build-dependencies].include?(key)
+      check(item.is_a?(Hash))
+      item.to_a
+    elsif item.is_a?(Hash)
+      dependencies(item)
+    else
+      []
+    end
+  end
+end
+begin
+  [before, after].each do |revision|
+    value = manifest(revision, platform)
+    check(value.fetch('package').fetch('name') == 'hft-research-platform')
+    features = value.fetch('features')
+    check(features['default'] == [])
+    check(features.values.all? { |v| v.is_a?(Array) && v.all? { |f| f.is_a?(String) } })
+    check(features.all? { |name, values| name == 'publisher' || !values.include?('publisher') })
+    lib = content(revision, 'rust_hft/research-core/platform/src/lib.rs')
+    %w[release_oss release_publisher].each do |name|
+      check(lib.scan(/^#\[cfg\(feature = "publisher"\)\]\n(?:pub )?mod #{name};$/).length == 1)
+    end
+    recipe = JSON.parse(content(revision, '.github/scripts/research-release-products.json'))
+    check(recipe.fetch('schema') == 'monday.research-products.v2')
+    matches = recipe.fetch('recipes').select { |r| r.fetch('package') == 'hft-research-platform' }
+    check(matches.length == 1 && matches[0].fetch('manifest') == 'research-core/platform/Cargo.toml')
+    check(matches[0].fetch('features') == 'publisher' && matches[0].fetch('binaries') == ['research-release-publisher'])
+    check(recipe.fetch('products').select { |_, v| v.include?('research-release-publisher') }.keys == ['controller'])
+    check(recipe.fetch('recipes').all? { |r| r.fetch('package') == 'hft-research-platform' || !r.fetch('features').split(',').include?('publisher') })
+    paths, status = Open3.capture2('git', 'ls-tree', '-r', '--name-only', '-z', revision)
+    check(status.success?)
+    consumers = paths.split("\0").select { |path| path.end_with?('/Cargo.toml') && path != platform }.map { |path| manifest(revision, path) }
+    # Workspace aliases may omit package/path at the consumer. Treat any alias
+    # declared for this package in either owner or consumer as a possible edge.
+    aliases = consumers.flat_map { |consumer| dependencies(consumer) }.select do |name, dep|
+      name == 'hft-research-platform' || dep.is_a?(Hash) && dep['package'] == 'hft-research-platform'
+    end.map(&:first).uniq
+    consumers.each do |consumer|
+      edges = dependencies(consumer)
+      edges.each do |name, dep|
+        next unless aliases.include?(name)
+        check(dep.is_a?(Hash) && !dep.fetch('features', []).include?('publisher'))
+      end
+      consumer.fetch('features', {}).each_value do |values|
+        check(values.is_a?(Array) && values.all? { |v| v.is_a?(String) })
+        check(aliases.none? { |name| values.include?("#{name}/publisher") || values.include?("#{name}?/publisher") })
+      end
+    end
+  end
+  ['rust_hft/research-core/platform/src/lib.rs', '.github/scripts/research-release-products.json'].each do |path|
+    check(content(before, path) == content(after, path))
+  end
+rescue StandardError
+  exit 3
+end
+RUBY
+    then publisher_boundary=true; else publisher_boundary=false; fi
+  fi
+  [[ $publisher_boundary == true ]] || return 1
+  ruby -I "$library" -rjson -ropen3 - "$lock_base" "$lock_head" "$1" <<'RUBY'
+begin
+  require 'tomlrb'
+rescue LoadError
+  exit 3
+end
+before, after, path = ARGV
+platform = 'rust_hft/research-core/platform/Cargo.toml'
+def check(value)
+  raise ArgumentError, 'publisher impact not proven' unless value
+end
+def content(revision, path)
+  value, status = Open3.capture2('git', 'show', "#{revision}:#{path}", err: File::NULL)
+  check(status.success?)
+  value
+end
+def parse(revision, path)
+  Tomlrb.parse(content(revision, path))
+end
+def clone(value)
+  Marshal.load(Marshal.dump(value))
+end
+def exclusive(value, name)
+  dep = value.fetch('dependencies', {})[name]
+  return false unless dep.is_a?(Hash) && dep['optional'] == true && (dep.keys - %w[version optional default-features features]).empty?
+  return false unless dep['version'].is_a?(String) && (!dep.key?('default-features') || [true, false].include?(dep['default-features']))
+  return false unless !dep.key?('features') || dep['features'].is_a?(Array) && dep['features'].all? { |f| f.is_a?(String) }
+  features = value.fetch('features')
+  features.fetch('publisher').include?("dep:#{name}") && features.all? do |feature, values|
+    feature == 'publisher' || values.none? { |item| item == name || item == "dep:#{name}" || item.start_with?("#{name}/", "#{name}?/") }
+  end
+end
+begin
+  old, current = parse(before, platform), parse(after, platform)
+  a, b = clone(old), clone(current)
+  da, db = a.delete('dependencies'), b.delete('dependencies')
+  pa, pb = a.fetch('features').delete('publisher'), b.fetch('features').delete('publisher')
+  check(a == b)
+  changed_deps = (da.keys | db.keys).select { |n| da[n] != db[n] }
+  check(changed_deps.all? { |n| (!da.key?(n) || exclusive(old, n)) && (!db.key?(n) || exclusive(current, n)) })
+  ignored = changed_deps.map { |n| "dep:#{n}" }
+  check(pa.reject { |v| ignored.include?(v) } == pb.reject { |v| ignored.include?(v) })
+  if path == platform
+    check(!changed_deps.empty?)
+  elsif path == 'rust_hft/research-core/platform/Cargo.lock'
+    a, b = parse(before, path), parse(after, path)
+    ea, eb = a.delete('package'), b.delete('package')
+    check(a == b && [3, 4].include?(a['version']) && a.keys == ['version'])
+    index = lambda do |entries|
+      result = entries.map { |p| [[p.fetch('name'), p.fetch('version'), p.fetch('source', '')], p] }.to_h
+      check(result.length == entries.length)
+      result
+    end
+    ia, ib = index.call(ea), index.call(eb)
+    keys = ia.keys | ib.keys
+    names = keys.select { |k| ia[k] != ib[k] }.map(&:first).uniq
+    changed = names - ['hft-research-platform']
+    check(!changed.empty? && changed.all? do |n|
+      (old.fetch('dependencies').key?(n) || current.fetch('dependencies').key?(n)) &&
+        (!old.fetch('dependencies').key?(n) || exclusive(old, n)) && (!current.fetch('dependencies').key?(n) || exclusive(current, n))
+    end)
+    check((ea + eb).all? { |p| p.fetch('name') == 'hft-research-platform' || p.fetch('dependencies', []).none? { |d| changed.include?(d.split(' ').first) } })
+    keys.each do |key|
+      x, y = ia[key], ib[key]
+      next if x == y
+      if key.first == 'hft-research-platform'
+        check(x && y && !x.key?('source') && !y.key?('source'))
+        check(([x, y].flat_map(&:keys) - %w[name version dependencies]).empty?)
+        x, y = clone(x), clone(y)
+        dx, dy = x.delete('dependencies') || [], y.delete('dependencies') || []
+        check(x == y && dx.reject { |d| changed.include?(d.split(' ').first) } == dy.reject { |d| changed.include?(d.split(' ').first) })
+      else
+        [x, y].compact.each do |entry|
+          check((entry.keys - %w[name version source checksum dependencies]).empty?)
+          check(entry['version'].is_a?(String))
+          check(entry['source'] == 'registry+https://github.com/rust-lang/crates.io-index')
+          check(entry['checksum'].is_a?(String) && entry['checksum'].match?(/\A[0-9a-f]{64}\z/))
+          check(entry.fetch('dependencies', []).empty?)
+        end
+      end
+    end
+    ca, cb = clone(old), clone(current)
+    da, db = ca.delete('dependencies'), cb.delete('dependencies')
+    pa, pb = ca.fetch('features').delete('publisher'), cb.fetch('features').delete('publisher')
+    check(ca == cb && da.reject { |n, _| changed.include?(n) } == db.reject { |n, _| changed.include?(n) })
+    ignored = changed.map { |n| "dep:#{n}" }
+    check(pa.reject { |v| ignored.include?(v) } == pb.reject { |v| ignored.include?(v) })
+  elsif ['rust_hft/research-core/platform/src/release_oss.rs', 'rust_hft/research-core/platform/src/release_publisher.rs'].include?(path)
+    check(!content(before, path).empty? && !content(after, path).empty?)
+  else
+    raise ArgumentError, 'unknown publisher input'
+  end
+rescue StandardError
+  exit 3
+end
+RUBY
+}
+
+declare -A publisher_paths=()
 for path in "${paths[@]}"; do
   # workspace_runtime_retirement reads files directly, beyond Cargo's dependency
   # graph. Include the whole prediction tree (also its operational docs), retired
@@ -370,7 +562,11 @@ for path in "${paths[@]}"; do
       continue
       ;;
     rust_hft/Cargo.lock|rust_hft/runtime/Cargo.lock|rust_hft/shared/Cargo.lock|rust_hft/data-pipelines/Cargo.lock|rust_hft/research-core/Cargo.lock|rust_hft/research-core/platform/Cargo.lock|rust_hft/prediction-markets/Cargo.lock)
-      if [[ -n $lock_base ]] && narrowed=$(bash "$(dirname "${BASH_SOURCE[0]}")/local-lock-impact.sh" "$lock_base" "$lock_head" "$path"); then
+      if [[ $path == rust_hft/research-core/platform/Cargo.lock ]] && publisher_only_change "$path"; then
+        select_owning_package hft-research-platform
+        select_research_image_jobs controller
+        publisher_paths["$path"]=true
+      elif [[ -n $lock_base ]] && narrowed=$(bash "$(dirname "${BASH_SOURCE[0]}")/local-lock-impact.sh" "$lock_base" "$lock_head" "$path"); then
         lock_packages=$(jq -cn --argjson prior "$lock_packages" --argjson names "$narrowed" --arg workspace "${path%/Cargo.lock}" '$prior + [$names[] | {name:.,workspace:$workspace}]')
         needs_metadata=true
       elif [[ $path == rust_hft/prediction-markets/Cargo.lock ]]; then
@@ -392,7 +588,24 @@ for path in "${paths[@]}"; do
       select_job ploy/audit
       needs_metadata=true
       ;;
-    rust_hft/Cargo.toml|rust_hft/workspaces.json|rust_hft/runtime/Cargo.toml|rust_hft/shared/Cargo.toml|rust_hft/data-pipelines/Cargo.toml|rust_hft/research-core/Cargo.toml|rust_hft/research-core/platform/Cargo.toml)
+    rust_hft/research-core/platform/Cargo.toml|rust_hft/research-core/platform/src/release_oss.rs|rust_hft/research-core/platform/src/release_publisher.rs)
+      if publisher_only_change "$path"; then
+        select_owning_package hft-research-platform
+        select_research_image_jobs controller
+        publisher_paths["$path"]=true
+        continue
+      fi
+      if [[ $path != rust_hft/research-core/platform/Cargo.toml ]]; then
+        needs_metadata=true
+        continue
+      fi
+      select_all
+      select_all_rust_ci_jobs
+      select_job ci/research-foundation
+      select_research_image_jobs
+      continue
+      ;;
+    rust_hft/Cargo.toml|rust_hft/workspaces.json|rust_hft/runtime/Cargo.toml|rust_hft/shared/Cargo.toml|rust_hft/data-pipelines/Cargo.toml|rust_hft/research-core/Cargo.toml)
       select_all
       select_all_rust_ci_jobs
       select_job ci/research-foundation
@@ -452,6 +665,15 @@ for path in "${paths[@]}"; do
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
+    .github/scripts/vendor/tomlrb/*)
+      # This parser owns both cache compatibility and manifest impact proofs.
+      select_all_rust_validation
+      select_all_rust_ci_jobs
+      select_research_image_jobs
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
       continue
       ;;
     .github/scripts/ci-owner-cache.sh)
@@ -723,6 +945,7 @@ for path in "${paths[@]}"; do
   [[ $path == rust_hft/* ]] || continue
   # Preserve the first pass decision when code also requires ownership metadata.
   [[ ${ignored_documentation[$path]:-} == true ]] && continue
+  [[ ${publisher_paths[$path]:-} == true ]] && continue
   case "$path" in
     rust_hft/scripts/*.sh|\
     rust_hft/deployment/docker/*|rust_hft/deployment/k8s/*|rust_hft/.dockerignore|\
