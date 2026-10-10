@@ -1,0 +1,177 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: segment-index-backfill
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/name: segment-index-backfill
+    app.kubernetes.io/part-of: monday
+    research.monday/contract: segment-index-backfill-v1
+  annotations:
+    research.monday/description: "Backfill Parquet segment index from existing manifests"
+    research.monday/source-revision: REPLACE_WITH_SOURCE_SHA
+    research.monday/image-ref: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_DIGEST
+spec:
+  suspend: true
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  backoffLimit: 2
+  activeDeadlineSeconds: 14400  # 4 hours for full scan
+  ttlSecondsAfterFinished: 172800  # 2 days
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: segment-index-backfill
+        app.kubernetes.io/part-of: monday
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: monday-acr
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: backtest
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backfill
+          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/segment-index-backfill"]
+          args:
+            - --raw-root
+            - /lake/raw
+            - --index-output
+            - /lake/output/metadata/segments.parquet
+            - --market
+            - usdm
+            - --start-date
+            - "2026-08-01"
+            - --end-date
+            - "2026-09-30"
+            - --batch-size
+            - "1000"
+          env:
+            - name: RUST_LOG
+              value: "info,segment_index_backfill=debug"
+            - name: RUST_BACKTRACE
+              value: "1"
+          resources:
+            requests:
+              cpu: "2000m"
+              memory: 4Gi
+            limits:
+              cpu: "4000m"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: raw
+              mountPath: /lake/raw
+              readOnly: true
+            - name: output
+              mountPath: /lake/output
+            - name: work
+              mountPath: /work
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: raw
+          persistentVolumeClaim:
+            claimName: REPLACE_WITH_RAW_PVC_NAME
+            readOnly: true
+        - name: output
+          persistentVolumeClaim:
+            claimName: REPLACE_WITH_OUTPUT_PVC_NAME
+        - name: work
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: segment-index-backfill-instructions
+  namespace: monday-research
+data:
+  README.md: |
+    # Segment Index Backfill Job
+
+    ## Purpose
+    This job scans existing market tape manifests in OSS and builds a Parquet
+    index for fast segment discovery. This is a one-time operation after which
+    the collector will maintain the index incrementally.
+
+    ## Usage
+
+    1. Update the Job YAML with actual PVC names and image digest
+    2. Apply the Job:
+       ```bash
+       kubectl apply -f segment-index-backfill-job.yaml
+       ```
+
+    3. Unsuspend to start:
+       ```bash
+       kubectl patch job segment-index-backfill -n monday-research \
+         --type=json -p='[{"op":"replace","path":"/spec/suspend","value":false}]'
+       ```
+
+    4. Monitor progress:
+       ```bash
+       kubectl logs -n monday-research -l app.kubernetes.io/name=segment-index-backfill -f
+       ```
+
+    5. Verify output:
+       ```bash
+       # The Parquet file should be created at:
+       # /lake/output/metadata/segments.parquet
+
+       # You can query it with DuckDB:
+       duckdb -c "SELECT COUNT(*),
+                         SUM(CASE WHEN replay_safe THEN 1 ELSE 0 END) as safe_count
+                  FROM read_parquet('/path/to/segments.parquet')"
+       ```
+
+    ## Performance
+    - Processes ~1000 manifests/minute
+    - Full 2-month backfill: ~10-30 minutes
+    - Memory usage: ~2-4 GB
+    - Output size: ~10-50 MB
+
+    ## Incremental Updates
+    After initial backfill, the collector automatically appends new segments.
+    Re-run this job only if:
+    - Index file is lost/corrupted
+    - Need to add historical data outside collector's normal range
+    - Schema version changes
+
+    ## Troubleshooting
+
+    ### Job fails with "permission denied"
+    - Check PVC mount permissions
+    - Verify output PVC is writable (not readOnly)
+
+    ### "No manifests found"
+    - Check raw PVC path matches your OSS mount structure
+    - Verify date range covers available data
+
+    ### Memory limit exceeded
+    - Reduce --batch-size (default 1000 → try 500)
+    - Increase memory limit in Job spec
+
+    ### Slow progress
+    - OSS mount may not have metadata caching enabled
+    - Consider using discovery index if available

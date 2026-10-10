@@ -691,6 +691,7 @@ fn fresh_window_request(
         max_scan_entries: args.max_scan_entries,
         max_inputs: args.max_inputs,
         max_input_bytes: args.max_input_bytes,
+        discovery_index: args.discovery_index.clone(),
     }
 }
 
@@ -715,6 +716,7 @@ fn inventory_from_selection(
         max_scan_entries: args.max_scan_entries,
         max_inputs: args.max_inputs,
         max_input_bytes: args.max_input_bytes,
+        discovery_index: args.discovery_index.clone(),
     };
     freeze_inventory_from_selection(&request, selection)
 }
@@ -1871,6 +1873,7 @@ mod tests {
             materializer_timeout_seconds: 10,
             max_materializer_output_bytes: 1024,
             report_out: None,
+            discovery_index: None,
         }
     }
 
@@ -2109,6 +2112,7 @@ EOF
             materializer_timeout_seconds: 10,
             max_materializer_output_bytes: 16 * 1024,
             report_out: None,
+            discovery_index: None,
         };
 
         let raw_input = hft_collector::research_inventory::FrozenInput {

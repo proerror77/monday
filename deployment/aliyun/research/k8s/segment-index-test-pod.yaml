@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: segment-index-test
+  namespace: monday-research
+  labels:
+    app: segment-index-test
+    test-type: validation
+spec:
+  restartPolicy: Never
+  imagePullSecrets:
+    - name: monday-acr
+  nodeSelector:
+    kubernetes.io/arch: amd64
+    workload: backtest
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: test
+      # 使用实际存在的 research-runner 镜像
+      image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:929cc8c6273d3329ecb3d19cce8de318d6e2eb51e9bb7e947d34b993a58f4df6
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash"]
+      args:
+        - "-c"
+        - |
+          set -e
+          echo "=== Segment Index Test Pod ==="
+          echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo ""
+
+          echo "Step 1: Check repository status"
+          cd /workspace || { echo "Error: /workspace not found"; exit 1; }
+          git status || echo "Git not available or not a git repo"
+          git log --oneline -3 || true
+          echo ""
+
+          echo "Step 2: Check if segment index files exist"
+          if [ -f "rust_hft/tools/collector/src/segment_index.rs" ]; then
+            echo "✓ segment_index.rs found"
+            wc -l rust_hft/tools/collector/src/segment_index.rs
+          else
+            echo "✗ segment_index.rs NOT found"
+          fi
+
+          if [ -f "rust_hft/tools/collector/src/segment_index_query.rs" ]; then
+            echo "✓ segment_index_query.rs found"
+          else
+            echo "✗ segment_index_query.rs NOT found"
+          fi
+          echo ""
+
+          echo "Step 3: Check emergency fix script"
+          if [ -f "scripts/emergency_fix_2026_09_02.sh" ]; then
+            echo "✓ emergency_fix_2026_09_02.sh found"
+            head -20 scripts/emergency_fix_2026_09_02.sh
+          else
+            echo "✗ emergency_fix_2026_09_02.sh NOT found"
+          fi
+          echo ""
+
+          echo "Step 4: Verify OSS mounts"
+          if [ -d "/lake/raw" ]; then
+            echo "✓ /lake/raw mounted"
+            ls -la /lake/raw | head -5 || true
+          else
+            echo "✗ /lake/raw NOT mounted"
+          fi
+
+          if [ -d "/lake/output" ]; then
+            echo "✓ /lake/output mounted"
+            ls -la /lake/output | head -5 || true
+          else
+            echo "✗ /lake/output NOT mounted"
+          fi
+          echo ""
+
+          echo "Step 5: Check if DuckDB is available"
+          if command -v duckdb &> /dev/null; then
+            echo "✓ duckdb available"
+            duckdb --version || true
+          else
+            echo "✗ duckdb NOT available"
+          fi
+          echo ""
+
+          echo "Step 6: Test basic DuckDB query"
+          if command -v duckdb &> /dev/null && [ -f "/lake/output/metadata/segments.parquet" ]; then
+            echo "Testing Parquet query..."
+            duckdb -c "SELECT COUNT(*) FROM read_parquet('/lake/output/metadata/segments.parquet')" || echo "Query failed"
+          else
+            echo "Skipping query test (duckdb or parquet not available)"
+          fi
+          echo ""
+
+          echo "=== Test Complete ==="
+          echo "Keep pod running for manual inspection..."
+          sleep 3600
+      env:
+        - name: RUST_LOG
+          value: "info"
+      resources:
+        requests:
+          cpu: "100m"
+          memory: 256Mi
+        limits:
+          cpu: "500m"
+          memory: 512Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        readOnlyRootFilesystem: false
+      volumeMounts:
+        - name: raw
+          mountPath: /lake/raw
+          readOnly: true
+        - name: output
+          mountPath: /lake/output
+          readOnly: true
+        - name: workspace
+          mountPath: /workspace
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: raw
+      persistentVolumeClaim:
+        claimName: sol-market-1235-raw-0927
+        readOnly: true
+    - name: output
+      persistentVolumeClaim:
+        claimName: sol-market-1235-published-0927
+        readOnly: false
+    - name: workspace
+      emptyDir:
+        sizeLimit: 1Gi
+    - name: tmp
+      emptyDir:
+        sizeLimit: 500Mi
