@@ -9,6 +9,29 @@ manifest_dir() {
   jq -e --arg manifest "$manifest" 'any(.workspaces[];.manifest==$manifest)' "$root/rust_hft/workspaces.json" >/dev/null || return 1
   printf '%s\n' "${manifest%/Cargo.toml}"
 }
+cache_recipes() {
+  # Selection changes the exact build recipe, never the cache path/version.
+  jq -ce --slurpfile registry "$root/rust_hft/workspaces.json" '
+    def name: type == "string" and test("^[A-Za-z0-9_-]+$");
+    if .schema != "monday.research-products.v2" or (.recipes | type != "array" or length == 0) or
+       (.recipes | all(.[]; (.manifest as $manifest | $registry[0].workspaces | any(.manifest == $manifest)) and
+         (.package | name) and (.features | type == "string") and
+         (.binaries | type == "array" and length > 0 and all(.[];name))) | not) or
+       (.recipes | map(.manifest) | unique) != ["data-pipelines/Cargo.toml", "prediction-markets/Cargo.toml",
+         "research-core/Cargo.toml", "research-core/platform/Cargo.toml"]
+    then error("unadmitted research cache catalog") else .recipes end' "$root/.github/scripts/research-release-products.json"
+}
+cache_manifests() {
+  cache_recipes | jq -r 'map(.manifest)|unique|.[]'
+}
+validate_recipes() {
+  jq -e --argjson catalog "$(cache_recipes)" '
+    def name: type == "string" and test("^[A-Za-z0-9_-]+$");
+    .recipes | type == "array" and length>0 and all(.[];
+      (.manifest as $manifest | $catalog | any(.manifest == $manifest)) and
+      (.package|name) and (.features|type == "string") and
+      (.binaries|type == "array" and length>0 and all(.[];name)))' "$1" >/dev/null
+}
 case ${1:?command required} in
   compatibility-inputs)
     # Keep local dependency choices in provenance and Cargo's exact cache suffix.
@@ -43,8 +66,10 @@ case ${1:?command required} in
           (.binaries | type == "array" and length > 0 and all(.[];name))) | not)
       then error("invalid compilation inputs for dependency cache compatibility")
       else . end' "${2:?inputs required}" >"$work/validated.json"
-    ruby -I "$root/.github/scripts/vendor/tomlrb/lib" -rtomlrb -rjson -rdigest -rpathname - "$root" "$work/validated.json" >"$work/owner-profiles.json" <<'RUBY'
-root, inputs_file = ARGV
+    validate_recipes "$work/validated.json"
+    cache_recipes >"$work/cache-recipes.json"
+    ruby -I "$root/.github/scripts/vendor/tomlrb/lib" -rtomlrb -rjson -rdigest -rpathname - "$root" "$work/cache-recipes.json" >"$work/owner-profiles.json" <<'RUBY'
+root, recipes_file = ARGV
 begin
   registry = JSON.parse(File.read("#{root}/rust_hft/workspaces.json"))
   abort 'unsupported workspace registry' unless registry['schema'] == 'monday.cargo_workspaces.v1'
@@ -52,13 +77,28 @@ begin
   abort 'unsupported workspace entry' if owners.empty? || owners.any? { |owner| owner.keys.sort != %w[id manifest] }
   by_manifest = owners.to_h { |owner| [owner.fetch('manifest'), owner] }
   abort 'duplicate workspace entry' unless by_manifest.length == owners.length && owners.map { |owner| owner.fetch('id') }.uniq.length == owners.length
-  selected = JSON.parse(File.read(inputs_file)).fetch('recipes').map { |recipe| recipe.fetch('manifest') }.uniq.sort
+  selected = JSON.parse(File.read(recipes_file)).map { |recipe| recipe.fetch('manifest') }.uniq.sort
   abort 'unadmitted cache owner' if selected.empty? || selected.any? { |manifest| !by_manifest.key?(manifest) }
   profiles = selected.to_h do |manifest|
     path = "#{root}/rust_hft/#{manifest}"
     abort 'cache owner escaped repository' unless File.realpath(path).start_with?(File.realpath("#{root}/rust_hft") + '/')
     parsed = Tomlrb.load_file(path)
-    abort 'cache owner is not a standalone workspace with valid profiles' unless parsed['workspace'].is_a?(Hash) && parsed.fetch('profile', {}).is_a?(Hash)
+    abort 'cache owner is not a standalone workspace with valid profiles' unless parsed['workspace'].is_a?(Hash) &&
+      parsed.fetch('profile', {}).is_a?(Hash) && parsed.fetch('profile', {}).values.all? { |profile| profile.is_a?(Hash) }
+    owner_profiles = parsed.fetch('profile', {})
+    known_profiles = %w[dev test release bench] + owner_profiles.keys
+    owner_profiles.each do |name, profile|
+      abort 'unadmitted profile name' unless name.match?(/\A[A-Za-z0-9_-]+\z/)
+      parent = profile['inherits']
+      abort 'unadmitted inherited profile' if parent && (!parent.is_a?(String) || !known_profiles.include?(parent))
+      abort 'custom profile has no inheritance' if !%w[dev test release bench].include?(name) && !parent
+      seen = [name]
+      while parent
+        abort 'cyclic profile inheritance' if seen.include?(parent)
+        seen << parent
+        parent = owner_profiles.fetch(parent, {})['inherits']
+      end
+    end
     # Bind inherited, custom, package and build-override profiles together.
     [manifest, parsed.fetch('profile', {})]
   end
@@ -73,15 +113,15 @@ begin
     else value
     end
   end
-  puts JSON.generate(canonical.call({'schema'=>'monday.cargo-cache-profiles.v1', 'owners'=>selected.map { |manifest| by_manifest.fetch(manifest) }, 'profiles'=>profiles, 'parser_sha256'=>parser}))
+  puts JSON.generate(canonical.call({'schema'=>'monday.cargo-cache-profiles.v2', 'owners'=>selected.map { |manifest| by_manifest.fetch(manifest) }, 'profiles'=>profiles, 'parser_sha256'=>parser}))
 rescue StandardError => error
   warn "invalid Cargo cache profile inputs: #{error.class}"
   exit 1
 end
 RUBY
     jq -Se --slurpfile owner_profiles "$work/owner-profiles.json" '
-      {schema:"monday.dependency-cache-compat.v2",target,profile,compiler,native,flags,
-        builder_image,recipe,recipes,owner_profiles:$owner_profiles[0]}' "$work/validated.json"
+      {schema:"monday.dependency-cache-compat.v3",target,profile,compiler,native,flags,
+        builder_image,recipe,owner_profiles:$owner_profiles[0]}' "$work/validated.json"
     ;;
   manifest-inputs)
     # Include local path/patch/default-feature manifests beyond recipe roots.
@@ -120,7 +160,8 @@ RUBY
     ;;
   cache-paths)
     # Cache dependency registries and disjoint targets, never tool executables.
-    manifests=$(jq -er '.recipes|map(.manifest)|unique | if length>0 then .[] else error("empty cache layout") end' "${2:?inputs required}")
+    validate_recipes "${2:?inputs required}"
+    manifests=$(cache_manifests)
     printf 'cache_paths<<MONDAY_CACHE_PATHS\n'
     printf '%s\n' "${CARGO_HOME:-$HOME/.cargo}/registry" "${CARGO_HOME:-$HOME/.cargo}/git"
     while IFS= read -r manifest; do
@@ -132,12 +173,14 @@ RUBY
   cleanup)
     work=$(mktemp -d)
     trap 'rm -rf "$work"' EXIT
+    cache_recipes >"$work/cache-recipes.json"
+    validate_recipes "${2:?inputs required}"
     while IFS= read -r manifest; do
       cargo metadata --manifest-path "$root/rust_hft/$manifest" --locked --no-deps --format-version 1 >>"$work/local.jsonl"
     done < <(jq -er '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
-    # Include any local path/patch dependencies outside workspace membership.
-    # Metadata uses each recipe's exact features; this never compiles a union.
-    recipes=$(jq -ec '.recipes[]' "${2:?inputs required}")
+    # A subset restore also contains the other owners. Inspect every admitted
+    # recipe separately to clean those bytes; this never builds a feature union.
+    recipes=$(jq -ec '.[]' "$work/cache-recipes.json")
     while IFS= read -r recipe; do
       manifest=$(jq -er .manifest <<<"$recipe")
       manifest_dir "$manifest" >/dev/null
@@ -151,23 +194,38 @@ RUBY
       cargo metadata --manifest-path "$root/rust_hft/$manifest" --locked --format-version 1 "${metadata_args[@]}" >>"$work/local.jsonl"
     done <<<"$recipes"
     jq -s --arg root "$root/" '[.[].packages[]|select(.source == null or (.manifest_path|startswith($root)))|.name, .targets[].name]|unique|if length>0 then . else error("no local compilation packages") end' "$work/local.jsonl" >"$work/names.json"
-    ruby -rjson -rfileutils - "$root" "$work/names.json" "${2:?inputs required}" <<'RUBY'
-root, names_file, inputs_file = ARGV
+    jq -s --arg root "$root/" '[.[].packages[]|select(.source != null and (.manifest_path|startswith($root)|not))|.name, .targets[].name]|unique' "$work/local.jsonl" >"$work/external.json"
+    ruby -rjson -rfileutils - "$root" "$work/names.json" "$work/external.json" "$work/cache-recipes.json" <<'RUBY'
+root, names_file, external_file, recipes_file = ARGV
 names = JSON.parse(File.read(names_file)).flat_map { |n| [n, n.tr('-', '_'), "lib#{n.tr('-', '_')}"] }.uniq
-manifests = JSON.parse(File.read(inputs_file)).fetch('recipes').map { |r| r.fetch('manifest') }.uniq
+external = JSON.parse(File.read(external_file)).flat_map { |n| [n, n.tr('-', '_'), "lib#{n.tr('-', '_')}"] }.uniq
+manifests = JSON.parse(File.read(recipes_file)).map { |r| r.fetch('manifest') }.uniq
 allowed = JSON.parse(File.read("#{root}/rust_hft/workspaces.json")).fetch('workspaces').map { |w| w.fetch('manifest') }
 manifests.each do |manifest|
   abort 'unadmitted target manifest' unless allowed.include?(manifest)
   directory = "#{root}/rust_hft/target/#{File.dirname(manifest).gsub('/', '--')}"
+  abort 'invalid cache target' if File.symlink?(directory) || (File.exist?(directory) && !File.directory?(directory))
   next unless File.directory?(directory)
   abort 'cache target symlink escaped owning workspace' unless File.realpath(directory) == directory
+  Dir.children(directory).each do |name|
+    FileUtils.rm_rf("#{directory}/#{name}") unless %w[debug release x86_64-unknown-linux-gnu].include?(name)
+  end
+  triple = "#{directory}/x86_64-unknown-linux-gnu"
+  abort 'cache target triple symlink escaped owning workspace' if File.symlink?(triple)
+  if File.exist?(triple)
+    abort 'cache target triple escaped owning workspace' unless File.directory?(triple) && File.realpath(triple) == triple
+    Dir.children(triple).each { |name| FileUtils.rm_rf("#{triple}/#{name}") unless name == 'release' }
+  end
   ["#{directory}/debug", "#{directory}/release", "#{directory}/x86_64-unknown-linux-gnu/release"].each do |profile|
+    abort 'invalid cache profile' if File.symlink?(profile) || (File.exist?(profile) && !File.directory?(profile))
     next unless File.directory?(profile)
     abort 'profile symlink escaped target' unless File.realpath(profile) == profile
-    %w[build .fingerprint deps incremental].each { |kind| abort 'artifact directory symlink escaped target' if File.symlink?("#{profile}/#{kind}") }
-    FileUtils.rm_rf("#{profile}/incremental")
+    %w[build .fingerprint deps incremental].each do |kind|
+      path = "#{profile}/#{kind}"
+      abort 'invalid artifact directory or symlink escaped target' if File.symlink?(path) || (File.exist?(path) && !File.directory?(path))
+    end
     # Executables already went into the immutable release; cache no local bytes.
-    Dir.children(profile).each { |n| FileUtils.rm_f("#{profile}/#{n}") if File.file?("#{profile}/#{n}") || File.symlink?("#{profile}/#{n}") }
+    Dir.children(profile).each { |n| FileUtils.rm_rf("#{profile}/#{n}") unless %w[build .fingerprint deps].include?(n) }
     %w[build .fingerprint deps].each do |kind|
       path = "#{profile}/#{kind}"
       next unless File.directory?(path)
@@ -175,7 +233,19 @@ manifests.each do |manifest|
       Dir.children(path).each do |n|
         # Cargo appends a hash after the complete package or target name.
         # A local target named data must not match the data-encoding dependency.
-        FileUtils.rm_rf("#{path}/#{n}") if names.include?(n.rpartition('-').first)
+        package = n.rpartition('-').first
+        # Removed local packages are absent from current metadata. Reject all
+        # unknown bytes, with local names taking priority over external aliases.
+        FileUtils.rm_rf("#{path}/#{n}") if names.include?(package) || !external.include?(package)
+      end
+      Dir.glob("#{path}/**/*", File::FNM_DOTMATCH).each do |artifact|
+        next unless File.file?(artifact) && File.executable?(artifact)
+        next if artifact.match?(/\.(?:so(?:\.[0-9.]+)?|dylib|dll)\z/)
+        package = artifact.delete_prefix("#{path}/").split('/').first.rpartition('-').first
+        # Native code generators in out/ are also external build outputs. Cargo
+        # can mark the build script fresh and still require those programs.
+        next if kind == 'build' && external.include?(package)
+        FileUtils.rm_f(artifact)
       end
     end
   end

@@ -250,7 +250,8 @@ targets.each do |target|
       next unless File.file?(artifact) && File.executable?(artifact)
       next if artifact.match?(/\.(?:so(?:\.[0-9.]+)?|dylib|dll)\z/)
       package = artifact.delete_prefix("#{path}/").split('/').first.rpartition('-').first
-      next if kind == 'build' && external.include?(package) && File.basename(artifact).match?(/\Abuild[-_]script[-_]/)
+      # Fresh build scripts can still require native codegen tools in out/.
+      next if kind == 'build' && external.include?(package)
       FileUtils.rm_f(artifact)
     end
   end
