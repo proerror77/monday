@@ -11,13 +11,32 @@ cat >"$work/bin/gh" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${!#}" in
-  */workflows/acr-publish.yml/runs\?*) cat "$RESEARCH_SCOPE_FIXTURE/runs" ;;
-  */runs/100/attempts/2/jobs\?*) cat "$RESEARCH_SCOPE_FIXTURE/pair" ;;
-  */runs/200/attempts/2/jobs\?*) cat "$RESEARCH_SCOPE_FIXTURE/controller" ;;
-  */runs/300/attempts/2/jobs\?*) cat "$RESEARCH_SCOPE_FIXTURE/cex" ;;
+  */workflows/acr-publish.yml/runs\?*) fixture=runs ;;
+  */runs/100/attempts/2/jobs\?*) fixture=pair ;;
+  */runs/101/attempts/2/jobs\?*) fixture=empty ;;
+  */runs/200/attempts/2/jobs\?*) fixture=controller ;;
+  */runs/300/attempts/2/jobs\?*) fixture=cex ;;
   *) exit 91 ;;
 esac
+printf '%s\n' "$fixture" >>"$RESEARCH_SCOPE_FIXTURE/api-calls"
+if [[ -f $RESEARCH_SCOPE_FIXTURE/api-failure && $fixture == "$(cat "$RESEARCH_SCOPE_FIXTURE/api-failure-target")" ]]; then
+  remaining=$(cat "$RESEARCH_SCOPE_FIXTURE/api-failure-count")
+  if (( remaining > 0 )); then
+    printf '%s\n' "$((remaining - 1))" >"$RESEARCH_SCOPE_FIXTURE/api-failure-count"
+    if [[ $(cat "$RESEARCH_SCOPE_FIXTURE/api-failure") == hang ]]; then
+      printf '%s\n' "$$" >"$RESEARCH_SCOPE_FIXTURE/api-hang-pid"
+      sleep 60
+      exit 1
+    fi
+    printf '[{"partial":true}]\n'
+    printf 'private debug data must not reach diagnostics\n' >&2
+    printf 'gh: fixture failure (HTTP %s)\n' "$(cat "$RESEARCH_SCOPE_FIXTURE/api-failure")" >&2
+    exit 1
+  fi
+fi
+cat "$RESEARCH_SCOPE_FIXTURE/$fixture"
 MOCK
+printf '[{"total_count":0,"jobs":[]}]\n' >"$work/empty"
 chmod 0755 "$work/bin/gh"
 export PATH="$work/bin:$PATH"
 cd "$work/repo"
@@ -38,7 +57,7 @@ git commit -qm 'fixture docs B'
 head=$(git rev-parse HEAD)
 publisher() {
   jq -n --arg sha "$1" '[{total_count:1,workflow_runs:[{id:100,run_attempt:2,head_sha:$sha,head_branch:"main",event:"workflow_run",path:".github/workflows/acr-publish.yml",head_repository:{full_name:"fixture/repo"},status:"completed",conclusion:"success"}]}]' >"$work/runs"
-  jq -n --arg sha "$1" '[{jobs:[{id:7,run_id:100,run_attempt:2,name:("Research products published [cex-runner,controller,prediction-runner] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/pair"
+  jq -n --arg sha "$1" '[{total_count:1,jobs:[{id:7,run_id:100,run_attempt:2,head_sha:$sha,name:("Research products published [cex-runner,controller,prediction-runner] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/pair"
 }
 plan() {
   : >"$work/plan"
@@ -160,7 +179,7 @@ plan
 grep -Fqx research_product=controller "$work/plan"
 jq --arg sha "$controller_head" '.[0].total_count=2 | .[0].workflow_runs += [.[0].workflow_runs[0] | .id=200 | .head_sha=$sha]' "$work/runs" >"$work/edit"
 mv "$work/edit" "$work/runs"
-jq -n --arg sha "$controller_head" '[{jobs:[{id:8,run_id:200,run_attempt:2,name:("Research products published [controller] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/controller"
+jq -n --arg sha "$controller_head" '[{total_count:1,jobs:[{id:8,run_id:200,run_attempt:2,head_sha:$sha,name:("Research products published [controller] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/controller"
 plan
 grep -Fqx research_product=none "$work/plan"
 # Prediction impact survives a later documentation commit and a newer CEX-only
@@ -177,11 +196,11 @@ plan
 grep -Fqx research_product=prediction-runner "$work/plan"
 jq --arg sha "$head" '.[0].total_count=2 | .[0].workflow_runs += [.[0].workflow_runs[0] | .id=300 | .head_sha=$sha]' "$work/runs" >"$work/edit"
 mv "$work/edit" "$work/runs"
-jq -n --arg sha "$head" '[{jobs:[{id:9,run_id:300,run_attempt:2,name:("Research products published [cex-runner] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/cex"
+jq -n --arg sha "$head" '[{total_count:1,jobs:[{id:9,run_id:300,run_attempt:2,head_sha:$sha,name:("Research products published [cex-runner] ("+$sha+")"),status:"completed",conclusion:"success"}]}]' >"$work/cex"
 plan
 grep -Fqx research_product=prediction-runner "$work/plan"
 publisher "$pair_head"
-jq '.[0].jobs += [.[0].jobs[0]]' "$work/pair" >"$work/edit"
+jq '.[0].total_count=2 | .[0].jobs += [.[0].jobs[0] | .id=8]' "$work/pair" >"$work/edit"
 mv "$work/edit" "$work/pair"
 if plan >"$work/rejected" 2>&1; then echo 'ambiguous baseline admitted' >&2; exit 1; fi
 publisher "$pair_head"
@@ -220,3 +239,72 @@ plan
 grep -Fqx research_product=none "$work/plan"
 [[ $helper_base != "$head" ]]
 printf 'PASS: unpublished A survives docs B; separate product readbacks suppress completed work; malformed or ambiguous baselines fail\n'
+
+# Partial failed responses must be discarded before a bounded GET retry.
+reader="$root/.github/scripts/read-research-publish-baseline.sh"
+retry_fixture() {
+  publisher "$head"
+  printf '%s\n' "$1" >"$work/api-failure"
+  printf '%s\n' "$2" >"$work/api-failure-count"
+  printf '%s\n' "${3:-runs}" >"$work/api-failure-target"
+  : >"$work/api-calls"
+  rm -f "$work/retry-baseline"
+}
+read_baseline() { bash "$reader" "$head" "$work/retry-baseline" 2>"$work/retry-log"; }
+retry_fixture 502 1
+read_baseline
+jq -e --arg sha "$head" 'all(.[]; .==$sha)' "$work/retry-baseline" >/dev/null
+[[ $(grep -c '^runs$' "$work/api-calls") == 2 ]]
+grep -Fq 'resource=workflow_runs attempt=1 status=502 retry=true' "$work/retry-log"
+if grep -Fq 'private debug' "$work/retry-log"; then
+  echo 'GET retry leaked private diagnostics' >&2; exit 1
+fi
+retry_fixture 503 1 pair
+read_baseline
+[[ $(grep -c '^pair$' "$work/api-calls") == 2 ]]
+retry_fixture hang 1
+read_baseline
+[[ $(grep -c '^runs$' "$work/api-calls") == 2 ]]
+grep -Fq 'status=timeout retry=true' "$work/retry-log"
+if kill -0 "$(cat "$work/api-hang-pid")" 2>/dev/null; then
+  echo 'timed-out GET process remained alive' >&2; exit 1
+fi
+for status in 500 502 503 504; do
+  retry_fixture "$status" 10
+  if read_baseline; then echo 'persistent GET failure admitted' >&2; exit 1; fi
+  [[ $(grep -c '^runs$' "$work/api-calls") == 3 && ! -e $work/retry-baseline ]]
+done
+for status in 401 403 404 429; do
+  retry_fixture "$status" 10
+  if read_baseline; then echo 'permanent API rejection retried or admitted' >&2; exit 1; fi
+  [[ $(grep -c '^runs$' "$work/api-calls") == 1 && ! -e $work/retry-baseline ]]
+done
+rm "$work/api-failure"
+publisher "$head"
+cp "$work/runs" "$work/complete-runs"
+cp "$work/pair" "$work/complete-jobs"
+for broken in '[{}]' '[]' 'not JSON'; do
+  printf '%s\n' "$broken" >"$work/runs"
+  : >"$work/api-calls"
+  rm -f "$work/retry-baseline"
+  if read_baseline; then echo 'malformed pagination admitted' >&2; exit 1; fi
+  [[ $(grep -c '^runs$' "$work/api-calls") == 1 && ! -e $work/retry-baseline ]]
+done
+cp "$work/complete-runs" "$work/runs"
+for edit in '.[0].total_count=2' '.[0].jobs[0].run_attempt=1' '.[0].jobs[0].run_id=101' \
+  '.[0].jobs[0].head_sha="0000000000000000000000000000000000000000"' \
+  '.[0].total_count=2 | .[0].jobs += [.[0].jobs[0]]'; do
+  jq "$edit" "$work/complete-jobs" >"$work/pair"
+  rm -f "$work/retry-baseline"
+  if read_baseline; then echo 'partial or mismatched job response admitted' >&2; exit 1; fi
+  [[ ! -e $work/retry-baseline ]]
+done
+cp "$work/complete-jobs" "$work/pair"
+# Accept complete multiple pages and reject truncation even when JSON is valid.
+jq '.[0].total_count=2 | . + [.[0] | .workflow_runs[0].id=101]' "$work/complete-runs" >"$work/runs"
+read_baseline
+jq '.[0].total_count=2' "$work/complete-runs" >"$work/runs"
+rm -f "$work/retry-baseline"
+if read_baseline; then echo 'truncated run history admitted' >&2; exit 1; fi
+[[ ! -e $work/retry-baseline ]]
+printf 'PASS: bounded GET retry discards partial bytes; permanent failures, incomplete pages and mismatched identities fail closed\n'
