@@ -7,14 +7,77 @@ head=${1:?current source required} output=${2:?baseline output required}
 [[ $head =~ ^[0-9a-f]{40}$ ]]
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# Bound the complete history read, including pagination and retries. Never
+# print gh stderr: debug output can contain authentication headers.
+deadline=$(ruby -e 'puts Process.clock_gettime(Process::CLOCK_MONOTONIC) + 180')
+read_get() {
+  ruby - "$1" "$2" "$3" "$deadline" "$work" <<'RUBY'
+require 'json'
+require 'timeout'
+endpoint, output, collection, deadline, work = ARGV
+deadline = Float(deadline)
+3.times do |index|
+  remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  abort 'research baseline GET budget exhausted' unless remaining.positive?
+  response = File.join(work, 'response.json')
+  errors = File.join(work, 'response.stderr')
+  pid = Process.spawn('gh', 'api', '--method', 'GET', '--paginate', '--slurp', endpoint,
+                      out: response, err: errors, pgroup: true)
+  begin
+    _, status = Timeout.timeout([45, remaining].min) { Process.wait2(pid) }
+    code = status.exitstatus
+  rescue Timeout::Error
+    begin
+      Process.kill('KILL', -pid)
+    rescue Errno::ESRCH
+      # The process may exit between the deadline and cancellation.
+    end
+    Process.wait(pid) rescue Errno::ECHILD
+    code = 124
+  end
+  if code == 0
+    begin
+      pages = JSON.parse(File.read(response))
+      valid = pages.is_a?(Array) && !pages.empty? && pages.all? do |page|
+        page.is_a?(Hash) && page[collection].is_a?(Array) &&
+          page['total_count'].is_a?(Integer) && page['total_count'] >= 0
+      end
+      raise 'invalid pages' unless valid
+      entries = pages.flat_map { |page| page.fetch(collection) }
+      ids = entries.map { |entry| entry.is_a?(Hash) && entry['id'] }
+      raise 'incomplete pages' unless pages.all? { |page| page['total_count'] == entries.length }
+      raise 'invalid or duplicate ids' unless ids.all? { |id| id.is_a?(Integer) && id.positive? } && ids.uniq == ids
+    rescue JSON::ParserError, RuntimeError
+      abort "research baseline GET invalid response: resource=#{collection}"
+    end
+    abort 'research baseline GET budget exhausted' unless Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+    File.rename(response, output)
+    exit 0
+  end
+  http = File.read(errors).scan(/\(HTTP (\d{3})\)/).flatten.last
+  retryable = code == 124 || %w[500 502 503 504].include?(http)
+  retrying = retryable && index < 2
+  warn "research baseline GET failed: resource=#{collection} attempt=#{index + 1} status=#{code == 124 ? 'timeout' : http || 'unknown'} retry=#{retrying}"
+  exit 1 unless retrying
+  delay = index + 1
+  abort 'research baseline GET budget exhausted' unless deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC) > delay
+  sleep delay
+end
+RUBY
+}
 # The product catalog starts a new release contract. Older bundle markers do
 # not prove publication of these products. Query its complete publication era.
 migration=$(git log -1 --format=%H -G 'monday.research-products.v2' -- .github/scripts/research-release-products.json)
 [[ $migration =~ ^[0-9a-f]{40}$ ]] || { echo 'research product migration is missing' >&2; exit 1; }
 since=$(git show -s --format=%ct "$migration")
 since=$(ruby -e 'puts Time.at(Integer(ARGV[0])).utc.strftime("%Y-%m-%dT%H:%M:%SZ")' "$since")
-gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/workflows/acr-publish.yml/runs?branch=main&status=success&created=%3E%3D$since&per_page=100" >"$work/runs.json"
-jq -e 'length>0 and all(.[]; (.workflow_runs|type=="array") and (.total_count|type=="number" and .>=0))' "$work/runs.json" >/dev/null
+read_get "repos/$GITHUB_REPOSITORY/actions/workflows/acr-publish.yml/runs?branch=main&status=success&created=%3E%3D$since&per_page=100" "$work/runs.json" workflow_runs
+jq -e 'all(.[].workflow_runs[];
+  (.run_attempt|type=="number" and .>0 and floor==.) and
+  (.head_sha|type=="string" and test("^[0-9a-f]{40}$")) and
+  (.head_branch|type=="string") and (.path|type=="string") and (.event|type=="string") and
+  (.head_repository.full_name|type=="string") and (.status|type=="string") and
+  (.conclusion|type=="string"))' "$work/runs.json" >/dev/null
 jq -r --arg repo "$GITHUB_REPOSITORY" '
   [.[].workflow_runs[]? | select(.head_branch=="main" and .head_repository.full_name==$repo and
     .path==".github/workflows/acr-publish.yml" and (.event=="workflow_run" or .event=="workflow_dispatch") and
@@ -24,7 +87,10 @@ baseline='{"cex-runner":"BOOTSTRAP","controller":"BOOTSTRAP","prediction-runner"
 while IFS=$'\t' read -r run attempt source; do
   [[ $run =~ ^[1-9][0-9]*$ && $attempt =~ ^[1-9][0-9]*$ && $source =~ ^[0-9a-f]{40}$ ]] || exit 1
   git merge-base --is-ancestor "$migration" "$source" || continue
-  gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$run/attempts/$attempt/jobs?per_page=100" >"$work/jobs.json"
+  read_get "repos/$GITHUB_REPOSITORY/actions/runs/$run/attempts/$attempt/jobs?per_page=100" "$work/jobs.json" jobs
+  jq -e --argjson run "$run" --argjson attempt "$attempt" --arg source "$source" '
+    all(.[].jobs[]; .run_id==$run and .run_attempt==$attempt and .head_sha==$source and
+      (.name|type=="string") and (.status|type=="string"))' "$work/jobs.json" >/dev/null
   marker=$(jq -er --argjson run "$run" --argjson attempt "$attempt" --arg source "$source" '
     [.[].jobs[]? | select(.run_id==$run and .run_attempt==$attempt and .status=="completed" and .conclusion=="success" and
       (.name | startswith("Research products published")))] |
@@ -44,4 +110,5 @@ while IFS=$'\t' read -r run attempt source; do
 done <"$work/runs.tsv"
 # Each product bootstraps independently until its own readback succeeds. Old
 # mixed runner markers cannot prove that the split products were published.
+ruby -e 'abort "research baseline GET budget exhausted" unless Process.clock_gettime(Process::CLOCK_MONOTONIC) < Float(ARGV[0])' "$deadline"
 printf '%s\n' "$baseline" >"$output"
