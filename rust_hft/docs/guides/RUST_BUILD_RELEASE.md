@@ -17,25 +17,9 @@ incremental = true
 lto = false
 ```
 
-倉庫級 Cargo 配置會把 `sccache` 設成 Rust 編譯器 wrapper。本地構建前先安裝：
+`rust_hft/.cargo/config.toml` 只設置 `build.jobs = 8`。它不設置 `rustc-wrapper`，也不指定 linker。需要 sccache 的 CI lane 自己設置 `RUSTC_WRAPPER`。沒有安裝 sccache 的開發機和安全掃描因此不會被項目配置裡的 wrapper 擋住。
 
-```bash
-cargo install sccache --locked
-sccache --start-server
-```
-
-Linux 構建透過 `.cargo/config.toml` 使用 `clang` + `mold`，所以 Linux 開發機和 CI host 都需要安裝：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y clang mold
-```
-
-如果本地 sccache 暫時不可用，不要直接改共享配置，先對單次命令覆蓋：
-
-```bash
-cargo --config 'build.rustc-wrapper=""' check
-```
+2026-10-07 在 4 核機器上測量了 runtime workspace 默認成員的冷編譯、單行增量、空編譯和 `cargo check`。對照見 `docs/reports/2026-10-07-rust-build-speed.md`。mold、lld、`debug = "line-tables-only"`、依賴 `opt-level = 1`，以及把 sccache 寫進項目配置，都沒有採用。`jobs = 8` 比按核數並行更快，所以保留。本地構建不需要為了這份 Cargo 配置安裝 mold 或 lld。
 
 ## CI 快取路徑
 
