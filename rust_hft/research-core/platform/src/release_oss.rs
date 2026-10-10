@@ -7,6 +7,10 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+const VERSIONING_RESPONSE_LIMIT: usize = 4096;
+const VERSIONING_NODE_LIMIT: u32 = 32;
+const OSS_XML_NAMESPACE: &str = "http://doc.oss-cn-hangzhou.aliyuncs.com";
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OssConfig {
@@ -283,7 +287,7 @@ impl Oss {
             .map_err(|_| anyhow::anyhow!("OSS versioning read interrupted"))?
         {
             ensure!(
-                bytes.len() + chunk.len() <= 4096,
+                chunk.len() <= VERSIONING_RESPONSE_LIMIT - bytes.len(),
                 "OSS versioning response exceeds bound"
             );
             bytes.extend_from_slice(&chunk);
@@ -326,27 +330,58 @@ impl Oss {
 }
 
 fn require_unversioned_response(bytes: &[u8]) -> Result<()> {
-    let mut text = std::str::from_utf8(bytes)?.trim();
-    if text.starts_with("<?xml ") {
-        text = text
-            .split_once("?>")
-            .map(|(_, s)| s.trim())
-            .unwrap_or_default();
-    }
-    let root = text
-        .strip_prefix("<VersioningConfiguration")
+    ensure!(
+        bytes.len() <= VERSIONING_RESPONSE_LIMIT,
+        "OSS versioning response exceeds bound"
+    );
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("OSS versioning response is not UTF-8"))?;
+    let document = roxmltree::Document::parse_with_options(
+        text,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: VERSIONING_NODE_LIMIT,
+        },
+    )
+    .map_err(|_| anyhow::anyhow!("OSS versioning response is not bounded well-formed XML"))?;
+    let root = document.root_element();
+    // The tree parser coalesces identical namespace declarations. This response
+    // permits only one optional default namespace, so also count its raw '='.
+    let opening = text[root.range().start..]
+        .split_once('>')
+        .map(|(opening, _)| opening)
         .unwrap_or_default();
-    let root_name_ended =
-        root.starts_with('>') || root.starts_with('/') || root.starts_with(char::is_whitespace);
-    let empty = root.split_once('>').is_some_and(|(tag, tail)| {
-        if tag.trim_end().ends_with('/') {
-            tail.trim().is_empty()
-        } else {
-            tail.trim() == "</VersioningConfiguration>"
-        }
-    });
-    ensure!(root_name_ended && empty && !text.contains("Status") && !text.contains("Enabled") && !text.contains("Suspended"),
-        "OSS overwrite refusal requires a never-versioned bucket; do not change bucket settings automatically");
+    ensure!(
+        root.tag_name().name() == "VersioningConfiguration"
+            && root
+                .tag_name()
+                .namespace()
+                .is_none_or(|namespace| {
+                    namespace.is_empty() || namespace == OSS_XML_NAMESPACE
+                })
+            && root.attributes().len() == 0
+            && root.namespaces().all(|namespace| {
+                namespace.name().is_none()
+                    && (namespace.uri().is_empty() || namespace.uri() == OSS_XML_NAMESPACE)
+            })
+            && opening.bytes().filter(|byte| *byte == b'=').count() <= 1
+            && root.children().all(|node| {
+                node.is_comment()
+                    || (node.is_text()
+                        && node
+                            .text()
+                            .is_some_and(|text| text.bytes().all(|b| b" \t\r\n".contains(&b))))
+            })
+            && document.root().children().all(|node| {
+                node.is_element()
+                    || node.is_comment()
+                    || (node.is_text()
+                        && node
+                            .text()
+                            .is_some_and(|text| text.bytes().all(|b| b" \t\r\n".contains(&b))))
+            }),
+        "OSS overwrite refusal requires a never-versioned bucket; do not change bucket settings automatically"
+    );
     Ok(())
 }
 
@@ -439,6 +474,65 @@ mod tests {
         ] {
             assert!(require_unversioned_response(body).is_err());
         }
+    }
+    #[test]
+    fn release_oss_rejects_malformed_versioning_xml() {
+        let malformed = [
+            "<VersioningConfiguration broken/>",
+            "<VersioningConfiguration xmlns='unterminated/>",
+            "<VersioningConfiguration xmlns='first' xmlns='second'/>",
+            "<VersioningConfiguration xmlns='' xmlns=''/>",
+            "<VersioningConfiguration xmlns='http://doc.oss-cn-hangzhou.aliyuncs.com' xmlns='http://doc.oss-cn-hangzhou.aliyuncs.com'/>",
+            "<?xml invalid?><VersioningConfiguration/>",
+            "<VersioningConfiguration xmlns='&unknown;'/>",
+            "<VersioningConfiguration undeclared:attribute='value'/>",
+        ];
+        let accepted: Vec<_> = malformed
+            .iter()
+            .filter(|body| require_unversioned_response(body.as_bytes()).is_ok())
+            .collect();
+        assert!(accepted.is_empty(), "accepted malformed XML: {accepted:?}");
+    }
+    #[test]
+    fn release_oss_accepts_only_bounded_empty_versioning_documents() {
+        for body in [
+            "<VersioningConfiguration/>",
+            "<VersioningConfiguration></VersioningConfiguration>",
+            "<VersioningConfiguration xmlns=''/>",
+            "<?xml version='1.0' encoding='UTF-8'?><VersioningConfiguration xmlns='http://doc.oss-cn-hangzhou.aliyuncs.com'/>",
+            "<!-- before --><VersioningConfiguration> \t\r\n<!-- inside --></VersioningConfiguration><!-- after -->",
+        ] {
+            assert!(require_unversioned_response(body.as_bytes()).is_ok(), "rejected {body}");
+        }
+        for body in [
+            "<VersioningConfiguration xmlns='urn:foreign'/>",
+            "<VersioningConfiguration xmlns='http://doc.oss-cn-hangzhou.aliyuncs.com' xmlns:other='urn:foreign'/>",
+            "<VersioningConfiguration enabled='false'/>",
+            "<VersioningConfiguration><Status/></VersioningConfiguration>",
+            "<VersioningConfiguration>Enabled</VersioningConfiguration>",
+            "<VersioningConfiguration/><VersioningConfiguration/>",
+            "<VersioningConfiguration>\u{a0}</VersioningConfiguration>",
+            "<?instruction value?><VersioningConfiguration/>",
+            "<VersioningConfiguration><?instruction value?></VersioningConfiguration>",
+            "<!DOCTYPE VersioningConfiguration [<!ENTITY e ' '>]><VersioningConfiguration>&e;</VersioningConfiguration>",
+        ] {
+            assert!(require_unversioned_response(body.as_bytes()).is_err(), "accepted {body}");
+        }
+        let base = "<VersioningConfiguration/>";
+        let exact = format!(
+            "{}{}",
+            " ".repeat(VERSIONING_RESPONSE_LIMIT - base.len()),
+            base
+        );
+        assert!(require_unversioned_response(exact.as_bytes()).is_ok());
+        assert!(require_unversioned_response(format!(" {exact}").as_bytes()).is_err());
+        let crowded = format!(
+            "<VersioningConfiguration>{}</VersioningConfiguration>",
+            "<!-- node -->".repeat(VERSIONING_NODE_LIMIT as usize)
+        );
+        assert!(crowded.len() < VERSIONING_RESPONSE_LIMIT);
+        assert!(require_unversioned_response(crowded.as_bytes()).is_err());
+        assert!(require_unversioned_response(b"\xff<VersioningConfiguration/>").is_err());
     }
     fn config() -> OssConfig {
         OssConfig {
