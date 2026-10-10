@@ -339,6 +339,80 @@ check_documentation_scope() {
 check_documentation_scope
 [[ ${1:-} != --documentation-scope ]] || exit 0
 
+# A shell path already classified in pass one must not become a root Cargo
+# package when another changed file requires dependency metadata.
+check_mixed_rust_shell_scope() {
+  local event owner order source source_only mixed source_jobs mixed_jobs
+  local helper mode broad unknown collector_scope flag shell_only
+  local metadata="$fixtures/workspace-owners.fixture"
+  local shell_path=rust_hft/scripts/clickhouse/run_bitget_dedup.sh
+
+  for event in pull_request push; do
+    shell_only=$(run_case "shell-alone-$event" "$event" rust-shell-script.txt "$metadata")
+    assert_jobs "$shell_only" ci/rust-shell-scripts
+    assert_flag "$shell_only" research_product none
+    for flag in loop handoff json ondo collector control focused toolchain production_trading_image production_collector_image; do
+      assert_flag "$shell_only" "$flag" false
+    done
+
+    for owner in prediction cex; do
+      if [[ $owner == prediction ]]; then
+        source=rust_hft/prediction-markets/crates/ploy-strategy-bundles/src/lib.rs
+      else
+        source=rust_hft/alpha-harness/worker/src/main.rs
+      fi
+      printf '%s\n' "$source" >"$tmp_dir/mixed-shell-source.txt"
+      source_only=$(run_case "mixed-shell-$owner-$event-source" "$event" mixed-shell-source.txt "$metadata")
+      source_jobs=$(sed -n 's/^jobs=,\(.*\),$/\1/p' "$source_only")
+      for order in source-first shell-first; do
+        if [[ $order == source-first ]]; then
+          printf '%s\n' "$source" "$shell_path" >"$tmp_dir/mixed-shell.txt"
+        else
+          printf '%s\n' "$shell_path" "$source" >"$tmp_dir/mixed-shell.txt"
+        fi
+        mixed=$(run_case "mixed-shell-$owner-$event-$order" "$event" mixed-shell.txt "$metadata")
+        mixed_jobs=$(sed -n 's/^jobs=,\(.*\),$/\1/p' "$mixed")
+        diff -u <(printf '%s\n' "$source_jobs,ci/rust-shell-scripts" | tr ',' '\n' | sort) \
+          <(printf '%s\n' "$mixed_jobs" | tr ',' '\n' | sort)
+        diff -u <(sed '/^jobs=/d' "$source_only") <(sed '/^jobs=/d' "$mixed")
+      done
+    done
+
+    # The build drivers retain their explicit broad first-pass checks.
+    source=rust_hft/prediction-markets/crates/ploy-strategy-bundles/src/lib.rs
+    for helper in cargo-scoped.sh workspace-metadata.sh; do
+      for mode in alone mixed; do
+        printf '%s\n' "rust_hft/scripts/$helper" >"$tmp_dir/mixed-shell-driver.txt"
+        [[ $mode != mixed ]] || printf '%s\n' "$source" >>"$tmp_dir/mixed-shell-driver.txt"
+        broad=$(run_case "shell-driver-$helper-$event-$mode" "$event" mixed-shell-driver.txt "$metadata")
+        assert_flag "$broad" research_product cex-runner,controller,prediction-runner
+        for flag in loop handoff collector control; do assert_flag "$broad" "$flag" true; done
+        grep -Eq '^jobs=.*,(ci/rust),' "$broad"
+        grep -Eq '^jobs=.*,(ploy/rust-research-heavy),' "$broad"
+      done
+    done
+
+    # Only the already-classified .sh paths receive this exemption.
+    for unknown in future-input.json future-input.sh.disabled; do
+      printf '%s\n' "rust_hft/scripts/$unknown" "$source" >"$tmp_dir/mixed-shell-unknown.txt"
+      broad=$(run_case "shell-unknown-$unknown-$event" "$event" mixed-shell-unknown.txt "$metadata")
+      for flag in loop handoff collector control; do assert_flag "$broad" "$flag" true; done
+      grep -Eq '^jobs=.*,(ci/rust),' "$broad"
+    done
+
+    printf '%s\n' rust_hft/scripts/deploy-ecs-tools-collector.sh "$source" >"$tmp_dir/mixed-shell-collector.txt"
+    collector_scope=$(run_case "shell-collector-$event" "$event" mixed-shell-collector.txt "$metadata")
+    for flag in collector control toolchain production_collector_image; do assert_flag "$collector_scope" "$flag" true; done
+    for flag in loop handoff json ondo focused production_trading_image; do assert_flag "$collector_scope" "$flag" false; done
+    grep -Eq '^jobs=.*,(ci/rust-shell-scripts),' "$collector_scope"
+    grep -Eq '^jobs=.*,(ci/polymarket-evidence-compiler-image),' "$collector_scope"
+    grep -Eq '^jobs=.*,(ci/control-contracts),' "$collector_scope"
+  done
+  printf 'PASS: mixed shell/source edits preserve owning scope; build drivers, collector deployment and unknown inputs retain required checks\n'
+}
+
+check_mixed_rust_shell_scope
+
 # Keep test consumers while separating their release impact. The fixture includes
 # formula's real dev edge and synthetic dev consumers for every image selector.
 production_metadata="$fixtures/production-dependencies.fixture"

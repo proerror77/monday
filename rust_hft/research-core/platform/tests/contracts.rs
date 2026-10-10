@@ -364,6 +364,100 @@ fn replay_requires_seed_and_contiguous_order() {
 }
 
 #[test]
+fn heartbeat_rejects_invalid_ttl_without_changing_task() {
+    let mut task = Task::new(task_spec()).unwrap();
+    let lease = task.claim("owner", 1000, 1000).unwrap();
+    task.launched(&lease, 1001, handle(&task, &lease)).unwrap();
+    let before = task.clone();
+    for ttl in [-1, 0, 300_001] {
+        assert!(task.heartbeat(&lease, 1100, ttl).is_err(), "ttl={ttl}");
+        assert_eq!(task, before, "rejected heartbeat changed task: ttl={ttl}");
+    }
+    for ttl in [1, 300_000] {
+        let mut accepted = before.clone();
+        let renewed = accepted.heartbeat(&lease, 1100, ttl).unwrap();
+        let mut expected = before.clone();
+        let mut expected_lease = lease.clone();
+        expected_lease.expires_ms = 1100 + ttl;
+        expected.lease = Some(expected_lease.clone());
+        assert_eq!(renewed, expected_lease);
+        assert_eq!(accepted, expected);
+    }
+}
+
+#[test]
+fn heartbeat_rejects_foreign_expired_and_superseded_leases() {
+    let mut task = Task::new(task_spec()).unwrap();
+    let lease = task.claim("owner", 1000, 1000).unwrap();
+    task.launched(&lease, 1001, handle(&task, &lease)).unwrap();
+    let before = task.clone();
+    for field in ["task_id", "owner", "attempt", "fence", "expires_ms"] {
+        let mut foreign = lease.clone();
+        match field {
+            "task_id" => foreign.task_id = "another-task".into(),
+            "owner" => foreign.owner = "another-owner".into(),
+            "attempt" => foreign.attempt += 1,
+            "fence" => foreign.fence += 1,
+            "expires_ms" => foreign.expires_ms += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            task.heartbeat(&foreign, 1100, 1000).is_err(),
+            "field={field}"
+        );
+        assert_eq!(
+            task, before,
+            "foreign heartbeat changed task: field={field}"
+        );
+    }
+    for now in [lease.expires_ms, lease.expires_ms + 1] {
+        assert!(task.heartbeat(&lease, now, 1000).is_err(), "now={now}");
+        assert_eq!(task, before, "expired heartbeat changed task: now={now}");
+    }
+    let current = task.heartbeat(&lease, 1100, 1000).unwrap();
+    assert_ne!(current.expires_ms, lease.expires_ms);
+    let renewed = task.clone();
+    assert!(task.heartbeat(&lease, 1101, 1000).is_err());
+    assert_eq!(task, renewed, "superseded heartbeat changed task");
+    task.heartbeat(&current, 1101, 1000).unwrap();
+}
+
+#[test]
+fn stop_acknowledgement_rejects_wrong_identity_and_non_stopping_states() {
+    let reject = |task: &mut Task, attempt, fence| {
+        let before = task.clone();
+        assert!(task.stopped(attempt, fence).is_err());
+        assert_eq!(*task, before, "rejected stop acknowledgement changed task");
+    };
+    let mut task = Task::new(task_spec()).unwrap();
+    reject(&mut task, 0, 0);
+    let first = task.claim("owner", 1000, 1000).unwrap();
+    reject(&mut task, first.attempt, first.fence);
+    task.launched(&first, 1001, handle(&task, &first)).unwrap();
+    reject(&mut task, first.attempt, first.fence);
+    task.stop(State::Failed, true).unwrap();
+    for (attempt, fence) in [
+        (first.attempt + 1, first.fence),
+        (first.attempt, first.fence + 1),
+        (first.attempt + 1, first.fence + 1),
+    ] {
+        reject(&mut task, attempt, fence);
+    }
+    task.stopped(first.attempt, first.fence).unwrap();
+    assert_eq!(task.state, State::Queued);
+    assert!(task.lease.is_none() && task.execution.is_none());
+    reject(&mut task, first.attempt, first.fence);
+    let next = task.claim("owner", 1200, 1000).unwrap();
+    task.launched(&next, 1201, handle(&task, &next)).unwrap();
+    task.stop(State::Cancelled, false).unwrap();
+    reject(&mut task, first.attempt, first.fence);
+    task.stopped(next.attempt, next.fence).unwrap();
+    assert_eq!(task.state, State::Cancelled);
+    assert!(task.lease.is_none() && task.execution.is_none());
+    reject(&mut task, next.attempt, next.fence);
+}
+
+#[test]
 fn retry_waits_for_stop_and_fences_old_results() {
     let mut task = Task::new(task_spec()).unwrap();
     let first = task.claim("owner-a", 1000, 1000).unwrap();
