@@ -256,7 +256,9 @@ read_baseline
 jq -e --arg sha "$head" 'all(.[]; .==$sha)' "$work/retry-baseline" >/dev/null
 [[ $(grep -c '^runs$' "$work/api-calls") == 2 ]]
 grep -Fq 'resource=workflow_runs attempt=1 status=502 retry=true' "$work/retry-log"
-! grep -Fq 'private debug' "$work/retry-log"
+if grep -Fq 'private debug' "$work/retry-log"; then
+  echo 'GET retry leaked private diagnostics' >&2; exit 1
+fi
 retry_fixture 503 1 pair
 read_baseline
 [[ $(grep -c '^pair$' "$work/api-calls") == 2 ]]
