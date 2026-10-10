@@ -43,8 +43,6 @@ pub fn run(options: SweepOptions<'_>) -> anyhow::Result<()> {
     );
 
     let output_root = PathBuf::from(options.output_root);
-    std::fs::create_dir_all(&output_root)
-        .with_context(|| format!("無法建立輸出目錄: {}", output_root.display()))?;
 
     for planned in plan {
         let config_value = apply_strategy_overrides(&base, &planned.overrides)?;
@@ -53,6 +51,7 @@ pub fn run(options: SweepOptions<'_>) -> anyhow::Result<()> {
             &config_yaml,
             &format!("{}#{}", options.grid_path, planned.index),
         )?;
+        crate::validate_output_names(&cfg.output)?;
         let combo_output = output_root.join(format!("{:06}_{}", planned.index, planned.slug));
 
         info!(
@@ -284,24 +283,33 @@ execution:
         let base = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/backtest/default.yaml"),
         )
-        .unwrap()
-        .replace(
-            "summary_csv: backtest_summary.csv",
-            "summary_csv: backtest_trades.csv",
-        );
-        std::fs::write(&config_path, base).unwrap();
+        .unwrap();
         std::fs::write(&grid_path, GRID).unwrap();
+        let output_root = directory.path().join("output");
 
-        let error = run(SweepOptions {
-            config_path: config_path.to_str().unwrap(),
-            grid_path: grid_path.to_str().unwrap(),
-            output_root: directory.path().join("output").to_str().unwrap(),
-            shard_index: 0,
-            shard_count: 1,
-            dry_run: true,
-        })
-        .unwrap_err();
+        for name in ["backtest_trades.csv", "../summary.csv", "/tmp/summary.csv"] {
+            std::fs::write(
+                &config_path,
+                base.replace(
+                    "summary_csv: backtest_summary.csv",
+                    &format!("summary_csv: {name}"),
+                ),
+            )
+            .unwrap();
+            for dry_run in [true, false] {
+                let error = run(SweepOptions {
+                    config_path: config_path.to_str().unwrap(),
+                    grid_path: grid_path.to_str().unwrap(),
+                    output_root: output_root.to_str().unwrap(),
+                    shard_index: 0,
+                    shard_count: 1,
+                    dry_run,
+                })
+                .unwrap_err();
 
-        assert!(error.to_string().contains("output artifact names"));
+                assert!(error.to_string().contains("output artifact names"));
+                assert!(!output_root.exists());
+            }
+        }
     }
 }

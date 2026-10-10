@@ -61,6 +61,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(params_path) = args.params {
         apply_strategy_overrides(&mut cfg, &params_path)?;
     }
+    validate_output_names(&cfg.output)?;
 
     if args.dry_run {
         validate_dry_run(&cfg)?;
@@ -182,8 +183,12 @@ fn validate_output_names(output: &OutputConfig) -> anyhow::Result<()> {
     .into_iter()
     .flatten()
     {
-        if name.trim().is_empty() || !names.insert(name) {
-            anyhow::bail!("backtest output artifact names must be non-empty and unique");
+        if name.trim().is_empty()
+            || name.contains('\0')
+            || Path::new(name).file_name() != Some(std::ffi::OsStr::new(name))
+            || !names.insert(name)
+        {
+            anyhow::bail!("backtest output artifact names must be non-empty, unique filenames");
         }
     }
     Ok(())
@@ -356,7 +361,26 @@ mod tests {
         let mut config = BacktestConfig::from_file(config_path).unwrap();
         config.output.summary_csv = config.output.trades_csv.clone();
 
-        assert!(validate_dry_run(&config).is_err());
+        let error = validate_dry_run(&config).unwrap_err();
+        assert!(error.to_string().contains("output artifact names"));
+
+        for name in [
+            "../backtest_trades.csv",
+            "/tmp/backtest_trades.csv",
+            "./backtest_trades.csv",
+            "results/backtest_trades.csv",
+            "backtest_trades.csv/",
+            "..",
+            ".",
+            "",
+            " ",
+            "trades\0.csv",
+        ] {
+            config.output.summary_csv = "summary.csv".to_string();
+            config.output.trades_csv = name.to_string();
+            let error = validate_dry_run(&config).unwrap_err();
+            assert!(error.to_string().contains("unique filenames"), "{name:?}");
+        }
     }
 
     #[test]
@@ -391,6 +415,35 @@ mod tests {
                 replay_rows: 0,
             }),
         };
+
+        let invalid_directory = tempfile::tempdir().unwrap();
+        let sentinel = invalid_directory.path().join("sentinel.csv");
+        std::fs::write(&sentinel, b"existing output").unwrap();
+        let destination = invalid_directory.path().join("outputs");
+        for field in ["trades", "summary", "metrics", "evidence"] {
+            for name in [
+                "../sentinel.csv".to_string(),
+                sentinel.display().to_string(),
+            ] {
+                let mut invalid_output = output.clone();
+                match field {
+                    "trades" => invalid_output.trades_csv = name,
+                    "summary" => invalid_output.summary_csv = name,
+                    "metrics" => invalid_output.metrics_json = Some(name),
+                    "evidence" => invalid_output.evidence_json = name,
+                    _ => unreachable!(),
+                }
+                let error =
+                    write_outputs(&invalid_output, destination.to_str(), &result).unwrap_err();
+                assert!(error.to_string().contains("unique filenames"));
+                assert!(!destination.exists());
+                assert_eq!(std::fs::read(&sentinel).unwrap(), b"existing output");
+                assert_eq!(
+                    std::fs::read_dir(invalid_directory.path()).unwrap().count(),
+                    1
+                );
+            }
+        }
 
         write_outputs(&output, out_dir.path().to_str(), &result).unwrap();
 
