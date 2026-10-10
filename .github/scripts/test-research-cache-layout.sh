@@ -3,6 +3,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 helper=$root/.github/scripts/research-cache-layout.sh
 work=$(mktemp -d)
+work=$(cd "$work" && pwd -P)
 trap 'rm -rf "$work"' EXIT
 case ${1:-} in
   ''|--compatibility-key) ;;
@@ -13,6 +14,7 @@ esac
 compat_repo="$work/compat-repo"
 mkdir -p "$compat_repo/.github/scripts" "$compat_repo/rust_hft/alpha-harness/app"
 cp "$helper" "$compat_repo/.github/scripts/"
+cp "$root/.github/scripts/cargo-cache-profile-inputs.py" "$compat_repo/.github/scripts/"
 cp "$root/rust_hft/"{Cargo.toml,workspaces.json} "$compat_repo/rust_hft/"
 while IFS= read -r manifest; do
   mkdir -p "$compat_repo/rust_hft/${manifest%/Cargo.toml}"
@@ -76,14 +78,54 @@ for update in '.target="aarch64-unknown-linux-gnu"' '.profile="research"' \
   jq -S "$update" "$work/full.json" >"$work/changed.json"
   check_identity_change isolate
 done
-# Owner profile bytes, the legacy root manifest and the registry remain bound.
+# Dependency declarations change exact provenance without losing compatible bytes.
+owner="$compat_repo/rust_hft/research-core/platform/Cargo.toml"
+cp "$owner" "$work/owner-before"
+python3 - "$owner" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+changed = text.replace('version = "=0.20.0", optional = true', 'version = "=0.20.1", optional = true')
+assert changed != text, 'publisher dependency fixture did not change'
+path.write_text(changed)
+PY
+fixture_inputs >"$work/changed.json"
+check_identity_change reuse
+cp "$work/owner-before" "$owner"
+# Parse all profile tables, including quoted package and build overrides.
+for table in 'profile.release.package.cache-fixture' '"profile"."release"."package"."cache-fixture"' 'profile.release.build-override'; do
+  printf '\n[%s]\nopt-level=1\n' "$table" >>"$owner"
+  fixture_inputs >"$work/changed.json"
+  check_identity_change isolate
+  cp "$work/owner-before" "$owner"
+done
+# Whitespace, an inactive legacy workspace and unrelated owner profiles do not
+# change the selected owning-workspace compilation boundary.
 for path in research-core/Cargo.toml Cargo.toml workspaces.json; do
   cp "$compat_repo/rust_hft/$path" "$work/root-before"
   printf '\n' >>"$compat_repo/rust_hft/$path"
   fixture_inputs >"$work/changed.json"
-  check_identity_change isolate
+  check_identity_change reuse
   cp "$work/root-before" "$compat_repo/rust_hft/$path"
 done
+cp "$compat_repo/rust_hft/prediction-markets/Cargo.toml" "$work/unselected-before"
+printf '\n[profile.release.build-override]\nopt-level=1\n' >>"$compat_repo/rust_hft/prediction-markets/Cargo.toml"
+fixture_inputs >"$work/changed.json"
+check_identity_change reuse
+cp "$work/unselected-before" "$compat_repo/rust_hft/prediction-markets/Cargo.toml"
+cp "$compat_repo/rust_hft/workspaces.json" "$work/registry-before"
+jq '(.workspaces[]|select(.manifest=="research-core/platform/Cargo.toml")|.id)="changed-control"' "$work/registry-before" >"$compat_repo/rust_hft/workspaces.json"
+fixture_inputs >"$work/changed.json"
+check_identity_change isolate
+cp "$work/registry-before" "$compat_repo/rust_hft/workspaces.json"
+printf '\n[profile.release\n' >>"$owner"
+fixture_inputs >"$work/invalid.json"
+if bash "$compat_helper" compatibility-inputs "$work/invalid.json" >"$work/rejected" 2>/dev/null; then
+  printf 'invalid owner TOML accepted\n' >&2; exit 1
+fi
+[[ ! -s $work/rejected ]]
+cp "$work/owner-before" "$owner"
 for field in schema target profile compiler native flags profiles recipe builder_image recipes workspace_profiles locks; do
   jq --arg field "$field" 'del(.[$field])' "$work/full.json" >"$work/invalid.json"
   if bash "$compat_helper" compatibility-inputs "$work/invalid.json" >"$work/rejected" 2>/dev/null; then
@@ -102,9 +144,30 @@ done
 # Keep the full digest output and use the separate key only for dependency restore.
 grep -Fq "printf 'cache_sha256=%s" "$root/.github/scripts/capture-research-build-inputs.sh"
 grep -Fq 'dependency_cache_sha256=%s' "$root/.github/scripts/capture-research-build-inputs.sh"
-# Match the literal workflow expression, before GitHub expands it.
-# shellcheck disable=SC2016
-grep -Fq 'key: research-dependencies-v1-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}' "$root/.github/workflows/ploy-ci.yml"
+ruby -ryaml - "$root" <<'RUBY'
+root = ARGV.fetch(0)
+restores = %w[ploy-ci acr-publish].map do |workflow|
+  jobs = YAML.safe_load(File.read("#{root}/.github/workflows/#{workflow}.yml")).fetch('jobs')
+  steps = jobs.values.find { |job| ['Research image binaries', 'Research release binaries'].include?(job['name']) }.fetch('steps')
+  restore = steps.find { |step| step['id'] == 'research-cache' }
+  save = steps.find { |step| step['name'] == 'Save trusted research dependency cache' }
+  cleanup = steps.find { |step| step['name'] == 'Retain only dependency compilation bytes for trusted cache saves' }
+  abort 'restore action can save uncleaned bytes' unless restore.fetch('uses').start_with?('actions/cache/restore@')
+  abort 'cache save precedes dependency cleanup' unless steps.index(cleanup) < steps.index(save)
+  abort 'save is not success/main bound' unless save.fetch('if').include?("github.ref == 'refs/heads/main' && success()")
+  abort 'save can replace an exact cache' unless save.fetch('if').include?("cache-hit != 'true'")
+  abort 'restore/save paths drifted' unless restore.dig('with', 'path') == save.dig('with', 'path')
+  abort 'save key differs from attempted exact key' unless save.dig('with', 'key') == '${{ steps.research-cache.outputs.cache-primary-key }}'
+  key = restore.dig('with', 'key')
+  prefix = restore.dig('with', 'restore-keys')
+  abort 'exact cache key lacks complete v3 provenance' unless key == prefix + '${{ steps.build-inputs.outputs.cache_sha256 }}'
+  abort 'compatibility prefix is absent' unless prefix.include?('steps.build-inputs.outputs.dependency_cache_sha256')
+  install = steps.find { |step| step['name'] == 'Install build dependencies' }.fetch('run')
+  abort 'native container lacks TOML parser or zstd tools' unless install.include?('python3 zstd')
+  restore.fetch('with')
+end
+abort 'producer cache namespaces drifted' unless restores.uniq.length == 1
+RUBY
 printf 'PASS: dependency compatibility identity, provenance preservation and fail-closed input contracts\n'
 [[ ${1:-} != --compatibility-key ]] || exit 0
 
@@ -130,18 +193,21 @@ jq -n --arg root "$FIXTURE/repo" --argjson extra "$extra" '{packages:([
   {name:"hft-data",manifest_path:($root+"/rust_hft/data-pipelines/core/Cargo.toml"),targets:[{name:"data"}]}
 ] + if $extra then [
   {name:"hidden-local",manifest_path:($root+"/vendor/hidden-local/Cargo.toml"),targets:[{name:"hidden_local"}]},
-  {name:"data-encoding",manifest_path:"/external/registry/data-encoding/Cargo.toml",targets:[{name:"data_encoding"}]}
+  {name:"outside-local",source:null,manifest_path:"/external/local/Cargo.toml",targets:[{name:"outside_local"}]},
+  {name:"data-encoding",source:"registry+https://example.invalid",manifest_path:"/external/registry/data-encoding/Cargo.toml",targets:[{name:"data_encoding"}]}
 ] else [] end)}'
 MOCK
 chmod +x "$work/bin/cargo"
 for id in data-pipelines prediction-markets research-core research-core--platform; do
   profile="$work/repo/rust_hft/target/$id/x86_64-unknown-linux-gnu/release"
-  mkdir -p "$profile/"{build,.fingerprint,deps}
+  mkdir -p "$profile/"{build,.fingerprint,deps,incremental}
   mkdir -p "$profile/build/libduckdb-sys-native/out" "$profile/build/local-code-hash/out"
   printf 'native object\n' >"$profile/build/libduckdb-sys-native/out/native.o"
   printf 'local object\n' >"$profile/build/local-code-hash/out/local.o"
   printf 'local\n' >"$profile/deps/liblocal_code-hash.rlib"
   printf 'hidden local\n' >"$profile/deps/libhidden_local-hash.rlib"
+  printf 'outside local\n' >"$profile/deps/liboutside_local-hash.rlib"
+  printf 'incremental local\n' >"$profile/incremental/local.o"
   printf 'local fingerprint\n' >"$profile/.fingerprint/local-code-hash"
   printf 'native\n' >"$profile/deps/liblibduckdb_sys-hash.rlib"
   printf 'local executable\n' >"$profile/local-code"
@@ -162,6 +228,7 @@ for id in data-pipelines prediction-markets research-core research-core--platfor
   profile="$work/repo/rust_hft/target/$id/x86_64-unknown-linux-gnu/release"
   [[ -f $profile/build/libduckdb-sys-native/out/native.o && -f $profile/deps/liblibduckdb_sys-hash.rlib ]]
   [[ ! -e $profile/deps/libhidden_local-hash.rlib && ! -e $profile/build/local-code-hash && ! -e $profile/deps/liblocal_code-hash.rlib && ! -e $profile/.fingerprint/local-code-hash && ! -e $profile/local-code ]]
+  [[ ! -e $profile/deps/liboutside_local-hash.rlib && ! -e $profile/incremental ]]
   [[ ! -e $profile/build/hft-data-hash && ! -e $profile/.fingerprint/hft-data-hash ]]
   for artifact in data-hash.d libdata-hash.rlib libdata-hash.rmeta libdata-hash.so hft-data-hash; do
     [[ ! -e $profile/deps/$artifact ]]

@@ -32,7 +32,7 @@ for variable in CC CXX AR LD CFLAGS CXXFLAGS LDFLAGS RUSTC_BOOTSTRAP CARGO_BUILD
   BINDGEN_EXTRA_CLANG_ARGS PROTOC PROTOC_INCLUDE CMAKE_TOOLCHAIN_FILE; do
   printf '%s=%s\n' "$variable" "${!variable-}" >>"$work/native"
 done
-for command in clang cmake mold pkg-config protoc; do "$command" --version >>"$work/native"; done
+for command in clang cmake mold pkg-config protoc zstd zstdmt unzstd; do "$command" --version >>"$work/native"; done
 # Bind relevant Cargo overrides without capturing registry or service secrets.
 for variable in RUSTC RUSTDOC RUSTC_WORKSPACE_WRAPPER CARGO_INCREMENTAL; do
   printf '%s=%s\n' "$variable" "${!variable-}" >>"$work/flags"
@@ -65,6 +65,7 @@ locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
 cat "$root/.github/scripts/build-research-release.sh" \
   "$root/.github/scripts/build-research-recipes.sh" \
   "$root/.github/scripts/research-cache-layout.sh" \
+  "$root/.github/scripts/cargo-cache-profile-inputs.py" \
   "$root/.github/scripts/research-release-products.sh" \
   "$root/.github/scripts/research-release-products.json" \
   "$root/.github/scripts/research-release-source-sha.sh" \

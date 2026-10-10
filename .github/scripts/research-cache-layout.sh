@@ -22,12 +22,14 @@ case ${1:?command required} in
       digest=$(sha256sum "$root/rust_hft/$manifest" | awk '{print $1}')
       owner_profiles=$(jq -c --arg manifest "$manifest" --arg digest "$digest" '. + {($manifest):$digest}' <<<"$owner_profiles")
     done <<<"$manifests"
-    jq -Se --arg root_manifest "$(sha256sum "$root/rust_hft/Cargo.toml" | awk '{print $1}')" \
-      --arg registry "$(sha256sum "$registry" | awk '{print $1}')" --argjson owner_profiles "$owner_profiles" '
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    # Validate full provenance before deriving a narrower restore identity.
+    jq -Se --argjson owner_profiles "$owner_profiles" '
       def digest: type == "string" and test("^[0-9a-f]{64}$");
       def name: type == "string" and test("^[A-Za-z0-9_-]+$");
       if .schema != "monday.compilation-inputs.v3" or
-        ([.compiler,.native,.flags,.profiles,.recipe,$root_manifest,$registry] | all(digest) | not) or
+        ([.compiler,.native,.flags,.profiles,.recipe] | all(digest) | not) or
         (.target | name | not) or (.profile | name | not) or
         (.builder_image | type != "string" or (test("^.+@sha256:[0-9a-f]{64}$") | not)) or
         .workspace_profiles != $owner_profiles or
@@ -40,10 +42,11 @@ case ${1:?command required} in
           (.package | name) and (.features | type == "string") and
           (.binaries | type == "array" and length > 0 and all(.[];name))) | not)
       then error("invalid compilation inputs for dependency cache compatibility")
-      else {schema:"monday.dependency-cache-compat.v1",target,profile,compiler,native,flags,
-        builder_image,workspace_profiles,recipe,recipes,
-        root_manifest:$root_manifest,workspace_registry:$registry}
-      end' "${2:?inputs required}"
+      else . end' "${2:?inputs required}" >"$work/validated.json"
+    python3 "$root/.github/scripts/cargo-cache-profile-inputs.py" "$root" "$work/validated.json" >"$work/owner-profiles.json"
+    jq -Se --slurpfile owner_profiles "$work/owner-profiles.json" '
+      {schema:"monday.dependency-cache-compat.v2",target,profile,compiler,native,flags,
+        builder_image,recipe,recipes,owner_profiles:$owner_profiles[0]}' "$work/validated.json"
     ;;
   manifest-inputs)
     # Include local path/patch/default-feature manifests beyond recipe roots.
@@ -80,6 +83,17 @@ case ${1:?command required} in
     done <<<"$manifests"
     printf 'MONDAY_CACHE_LAYOUT\n'
     ;;
+  cache-paths)
+    # Cache dependency registries and disjoint targets, never tool executables.
+    manifests=$(jq -er '.recipes|map(.manifest)|unique | if length>0 then .[] else error("empty cache layout") end' "${2:?inputs required}")
+    printf 'cache_paths<<MONDAY_CACHE_PATHS\n'
+    printf '%s\n' "${CARGO_HOME:-$HOME/.cargo}/registry" "${CARGO_HOME:-$HOME/.cargo}/git"
+    while IFS= read -r manifest; do
+      directory=$(manifest_dir "$manifest")
+      printf '%s/rust_hft/target/%s\n' "$root" "${directory//\//--}"
+    done <<<"$manifests"
+    printf 'MONDAY_CACHE_PATHS\n'
+    ;;
   cleanup)
     work=$(mktemp -d)
     trap 'rm -rf "$work"' EXIT
@@ -101,7 +115,7 @@ case ${1:?command required} in
       fi
       cargo metadata --manifest-path "$root/rust_hft/$manifest" --locked --format-version 1 "${metadata_args[@]}" >>"$work/local.jsonl"
     done <<<"$recipes"
-    jq -s --arg root "$root/" '[.[].packages[]|select(.manifest_path|startswith($root))|.name, .targets[].name]|unique|if length>0 then . else error("no local compilation packages") end' "$work/local.jsonl" >"$work/names.json"
+    jq -s --arg root "$root/" '[.[].packages[]|select(.source == null or (.manifest_path|startswith($root)))|.name, .targets[].name]|unique|if length>0 then . else error("no local compilation packages") end' "$work/local.jsonl" >"$work/names.json"
     ruby -rjson -rfileutils - "$root" "$work/names.json" "${2:?inputs required}" <<'RUBY'
 root, names_file, inputs_file = ARGV
 names = JSON.parse(File.read(names_file)).flat_map { |n| [n, n.tr('-', '_'), "lib#{n.tr('-', '_')}"] }.uniq
@@ -115,7 +129,8 @@ manifests.each do |manifest|
   ["#{directory}/debug", "#{directory}/release", "#{directory}/x86_64-unknown-linux-gnu/release"].each do |profile|
     next unless File.directory?(profile)
     abort 'profile symlink escaped target' unless File.realpath(profile) == profile
-    %w[build .fingerprint deps].each { |kind| abort 'artifact directory symlink escaped target' if File.symlink?("#{profile}/#{kind}") }
+    %w[build .fingerprint deps incremental].each { |kind| abort 'artifact directory symlink escaped target' if File.symlink?("#{profile}/#{kind}") }
+    FileUtils.rm_rf("#{profile}/incremental")
     # Executables already went into the immutable release; cache no local bytes.
     Dir.children(profile).each { |n| FileUtils.rm_f("#{profile}/#{n}") if File.file?("#{profile}/#{n}") || File.symlink?("#{profile}/#{n}") }
     %w[build .fingerprint deps].each do |kind|
