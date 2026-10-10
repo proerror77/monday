@@ -1,0 +1,44 @@
+{
+  "name": "tomlrb",
+  "version": "2.0.3",
+  "license": "MIT",
+  "upstream": "https://github.com/fbernier/tomlrb/tree/v2.0.3",
+  "tag_object": "5f4bded3da1e1542f690e96c2400a58471a0ef0d",
+  "archive_sha256": "5b6678810adcc3144fffa48d86ad26f12f3bb64dc568fcb1d64b0754108a3ecb",
+  "files": {
+    "LICENSE.txt": "1a0d2c202df0e648c43fdfe7b8822bbf35ab642af74a2200e2744e4d4ccf3b09",
+    "lib/tomlrb.rb": "b504b5c16b5d29ac10b9504d8c623299ebc5f2247a28927e5ecbcf66b61b2f69",
+    "lib/tomlrb/generated_parser.rb": "cf3dd66ba6cf5b5f2ff70ffa6e80154f5849c28a5f55f872f0e848c8974c3b10",
+    "lib/tomlrb/handler.rb": "be5cec2e5f0a65394540179c9a73099ec224764f3b4e12f3b33ec4e0fbec0d28",
+    "lib/tomlrb/local_date.rb": "edcb88eb6bf9f89ebd015ae506b539183cc615e8fbd48783b1a2ac19e1a6cf29",
+    "lib/tomlrb/local_date_time.rb": "24b190649a5e9e0046147b7a1d720e4e0299bbd36959feaefedc306f74128d07",
+    "lib/tomlrb/local_time.rb": "c120efd5feba5b1ee68365182d7f432b90cefe45dbeebb98cdb2292ef7ca2483",
+    "lib/tomlrb/parser.rb": "c27f82064a72bb6a65d78894d5086c87f62a16ee0aecdcb6537a77d342f19ae1",
+    "lib/tomlrb/parser.y": "867d60344f5b3a9f0f550c4c7a4bad5b101f9f40a8c314056de6260c8523c61a",
+    "lib/tomlrb/scanner.rb": "c56a00f0fb741a9a48eea625c4aa1a8e25fa4123f57da493a0657dbbc89eca3a",
+    "lib/tomlrb/string_utils.rb": "8bac926dc6b9c733f27b2516eeb3b045e3f8ac11c857a0b7c98d13f054bb6428",
+    "lib/tomlrb/version.rb": "b2828b6107e81be66df4a22b47b257ef860d0c5d9b1c3ebcfa7ae93cf927f397"
+  },
+  "commit": "db2eddb1499a40ec570dfa1ec5b1353423499168",
+  "upstream_files": {
+    "LICENSE.txt": "1a0d2c202df0e648c43fdfe7b8822bbf35ab642af74a2200e2744e4d4ccf3b09",
+    "lib/tomlrb.rb": "b504b5c16b5d29ac10b9504d8c623299ebc5f2247a28927e5ecbcf66b61b2f69",
+    "lib/tomlrb/generated_parser.rb": "47171838f91e3122cc7fb6b29b122bc17442189f6c994d69f2535a402a4e262f",
+    "lib/tomlrb/handler.rb": "be5cec2e5f0a65394540179c9a73099ec224764f3b4e12f3b33ec4e0fbec0d28",
+    "lib/tomlrb/local_date.rb": "edcb88eb6bf9f89ebd015ae506b539183cc615e8fbd48783b1a2ac19e1a6cf29",
+    "lib/tomlrb/local_date_time.rb": "24b190649a5e9e0046147b7a1d720e4e0299bbd36959feaefedc306f74128d07",
+    "lib/tomlrb/local_time.rb": "c120efd5feba5b1ee68365182d7f432b90cefe45dbeebb98cdb2292ef7ca2483",
+    "lib/tomlrb/parser.rb": "c27f82064a72bb6a65d78894d5086c87f62a16ee0aecdcb6537a77d342f19ae1",
+    "lib/tomlrb/parser.y": "48adc0b5aa38f531eb5e58f03196c652374d38c638b85443599a110057734b70",
+    "lib/tomlrb/scanner.rb": "c56a00f0fb741a9a48eea625c4aa1a8e25fa4123f57da493a0657dbbc89eca3a",
+    "lib/tomlrb/string_utils.rb": "8bac926dc6b9c733f27b2516eeb3b045e3f8ac11c857a0b7c98d13f054bb6428",
+    "lib/tomlrb/version.rb": "b2828b6107e81be66df4a22b47b257ef860d0c5d9b1c3ebcfa7ae93cf927f397"
+  },
+  "local_patch": {
+    "description": "Remove trailing whitespace to pass repository diff checks. Parser tokens and behavior remain unchanged.",
+    "files": [
+      "lib/tomlrb/generated_parser.rb",
+      "lib/tomlrb/parser.y"
+    ]
+  }
+}

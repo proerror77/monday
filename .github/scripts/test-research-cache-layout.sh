@@ -14,6 +14,8 @@ esac
 compat_repo="$work/compat-repo"
 mkdir -p "$compat_repo/.github/scripts" "$compat_repo/rust_hft/alpha-harness/app"
 cp "$helper" "$compat_repo/.github/scripts/"
+mkdir -p "$compat_repo/.github/scripts/vendor"
+cp -R "$root/.github/scripts/vendor/tomlrb" "$compat_repo/.github/scripts/vendor/"
 cp "$root/rust_hft/"{Cargo.toml,workspaces.json} "$compat_repo/rust_hft/"
 while IFS= read -r manifest; do
   mkdir -p "$compat_repo/rust_hft/${manifest%/Cargo.toml}"
@@ -80,15 +82,13 @@ done
 # Dependency declarations change exact provenance without losing compatible bytes.
 owner="$compat_repo/rust_hft/research-core/platform/Cargo.toml"
 cp "$owner" "$work/owner-before"
-python3 - "$owner" <<'PY'
-from pathlib import Path
-import sys
-path = Path(sys.argv[1])
-text = path.read_text()
-changed = text.replace('version = "=0.20.0", optional = true', 'version = "=0.20.1", optional = true')
-assert changed != text, 'publisher dependency fixture did not change'
-path.write_text(changed)
-PY
+ruby - "$owner" <<'RUBY'
+path = ARGV.fetch(0)
+text = File.read(path)
+changed = text.sub('version = "=0.20.0", optional = true', 'version = "=0.20.1", optional = true')
+abort 'publisher dependency fixture did not change' if changed == text
+File.write(path, changed)
+RUBY
 fixture_inputs >"$work/changed.json"
 check_identity_change reuse
 cp "$work/owner-before" "$owner"
@@ -162,7 +162,7 @@ restores = %w[ploy-ci acr-publish].map do |workflow|
   abort 'exact cache key lacks complete v3 provenance' unless key == prefix + '${{ steps.build-inputs.outputs.cache_sha256 }}'
   abort 'compatibility prefix is absent' unless prefix.include?('steps.build-inputs.outputs.dependency_cache_sha256')
   install = steps.find { |step| step['name'] == 'Install build dependencies' }.fetch('run')
-  abort 'native container lacks TOML parser or zstd tools' unless install.include?('python3 zstd')
+  abort 'native container lacks Ruby or zstd tools' unless install.include?('ruby binutils zstd')
   restore.fetch('with')
 end
 abort 'producer cache namespaces drifted' unless restores.uniq.length == 1

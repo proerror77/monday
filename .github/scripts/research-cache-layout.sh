@@ -43,52 +43,42 @@ case ${1:?command required} in
           (.binaries | type == "array" and length > 0 and all(.[];name))) | not)
       then error("invalid compilation inputs for dependency cache compatibility")
       else . end' "${2:?inputs required}" >"$work/validated.json"
-    python3 - "$root" "$work/validated.json" >"$work/owner-profiles.json" <<'PYTHON'
-"""Bind selected owning-workspace profiles without hashing dependency declarations."""
-
-import json
-from pathlib import Path
-import sys
-import tomllib
-
-
-def profile_inputs(root: Path, inputs: dict) -> dict:
-    registry = json.loads((root / "rust_hft/workspaces.json").read_text())
-    if registry.get("schema") != "monday.cargo_workspaces.v1":
-        raise ValueError("unsupported workspace registry")
-    owners = registry["workspaces"]
-    if not owners or any(set(owner) != {"id", "manifest"} for owner in owners):
-        raise ValueError("unsupported workspace entry")
-    by_manifest = {owner["manifest"]: owner for owner in owners}
-    if len(by_manifest) != len(owners) or len({owner["id"] for owner in owners}) != len(owners):
-        raise ValueError("duplicate workspace entry")
-    selected = sorted({recipe["manifest"] for recipe in inputs["recipes"]})
-    if not selected or any(manifest not in by_manifest for manifest in selected):
-        raise ValueError("unadmitted cache owner")
-    profiles = {}
-    for manifest in selected:
-        path = root / "rust_hft" / manifest
-        if not path.resolve().is_relative_to((root / "rust_hft").resolve()):
-            raise ValueError("cache owner escaped repository")
-        with path.open("rb") as source:
-            parsed = tomllib.load(source)
-        if not isinstance(parsed.get("workspace"), dict) or not isinstance(parsed.get("profile", {}), dict):
-            raise ValueError("cache owner is not a standalone workspace with valid profiles")
-        # Every custom profile, inherited profile, package override and build
-        # override remains bound. Cargo resolves dependencies from the exact key.
-        profiles[manifest] = parsed.get("profile", {})
-    return {"schema": "monday.cargo-cache-profiles.v1",
-            "owners": [by_manifest[manifest] for manifest in selected], "profiles": profiles}
-
-
-if __name__ == "__main__":
-    try:
-        result = profile_inputs(Path(sys.argv[1]), json.loads(Path(sys.argv[2]).read_text()))
-        output = json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    except (ValueError, KeyError, TypeError, OSError, IndexError) as error:
-        sys.exit(f"invalid Cargo cache profile inputs: {error}")
-    print(output)
-PYTHON
+    ruby -I "$root/.github/scripts/vendor/tomlrb/lib" -rtomlrb -rjson -rdigest -rpathname - "$root" "$work/validated.json" >"$work/owner-profiles.json" <<'RUBY'
+root, inputs_file = ARGV
+begin
+  registry = JSON.parse(File.read("#{root}/rust_hft/workspaces.json"))
+  abort 'unsupported workspace registry' unless registry['schema'] == 'monday.cargo_workspaces.v1'
+  owners = registry.fetch('workspaces')
+  abort 'unsupported workspace entry' if owners.empty? || owners.any? { |owner| owner.keys.sort != %w[id manifest] }
+  by_manifest = owners.to_h { |owner| [owner.fetch('manifest'), owner] }
+  abort 'duplicate workspace entry' unless by_manifest.length == owners.length && owners.map { |owner| owner.fetch('id') }.uniq.length == owners.length
+  selected = JSON.parse(File.read(inputs_file)).fetch('recipes').map { |recipe| recipe.fetch('manifest') }.uniq.sort
+  abort 'unadmitted cache owner' if selected.empty? || selected.any? { |manifest| !by_manifest.key?(manifest) }
+  profiles = selected.to_h do |manifest|
+    path = "#{root}/rust_hft/#{manifest}"
+    abort 'cache owner escaped repository' unless File.realpath(path).start_with?(File.realpath("#{root}/rust_hft") + '/')
+    parsed = Tomlrb.load_file(path)
+    abort 'cache owner is not a standalone workspace with valid profiles' unless parsed['workspace'].is_a?(Hash) && parsed.fetch('profile', {}).is_a?(Hash)
+    # Bind inherited, custom, package and build-override profiles together.
+    [manifest, parsed.fetch('profile', {})]
+  end
+  parser_root = "#{root}/.github/scripts/vendor/tomlrb/lib"
+  parser_files = Dir.glob("#{parser_root}/**/*.rb").sort
+  abort 'empty Cargo TOML parser' if parser_files.empty?
+  parser = Digest::SHA256.hexdigest(parser_files.map { |path| "#{Pathname.new(path).relative_path_from(Pathname.new(parser_root))}:#{Digest::SHA256.file(path).hexdigest}\n" }.join)
+  canonical = lambda do |value|
+    case value
+    when Hash then value.keys.sort.to_h { |key| [key, canonical.call(value.fetch(key))] }
+    when Array then value.map { |item| canonical.call(item) }
+    else value
+    end
+  end
+  puts JSON.generate(canonical.call({'schema'=>'monday.cargo-cache-profiles.v1', 'owners'=>selected.map { |manifest| by_manifest.fetch(manifest) }, 'profiles'=>profiles, 'parser_sha256'=>parser}))
+rescue StandardError => error
+  warn "invalid Cargo cache profile inputs: #{error.class}"
+  exit 1
+end
+RUBY
     jq -Se --slurpfile owner_profiles "$work/owner-profiles.json" '
       {schema:"monday.dependency-cache-compat.v2",target,profile,compiler,native,flags,
         builder_image,recipe,recipes,owner_profiles:$owner_profiles[0]}' "$work/validated.json"

@@ -71,6 +71,8 @@ cat "$root/.github/scripts/build-research-release.sh" \
   "$root/.github/scripts/research-workspace-locks.sh" \
   "$root/.github/scripts/verify-research-runtime-abi.sh" \
   "$root/.github/scripts/verify-research-runner-binaries.sh" >"$work/recipe"
+# Bind the fixed CI parser implementation alongside the build recipe.
+find "$root/.github/scripts/vendor/tomlrb/lib" -type f -name '*.rb' -print0 | LC_ALL=C sort -z | xargs -0 cat >>"$work/recipe"
 jq -S -n --arg compiler "$(sha256sum "$work/compiler" | awk '{print $1}')" \
   --arg native "$(sha256sum "$work/native" | awk '{print $1}')" \
   --arg flags "$(sha256sum "$work/flags" | awk '{print $1}')" \

@@ -1049,8 +1049,8 @@ grep -Fqx '      CARGO_PROFILE_DEV_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '      CARGO_PROFILE_TEST_DEBUG: "0"' "$ci_workflow"
 grep -Fqx '  rust_fast_gates:' "$ci_workflow"
 grep -Fqx '      - rust_fast_gates' "$ci_workflow"
-# Compilation cache is Swatinem/rust-cache only. sccache must not wrap rustc or
-# write a GHA backend; pull requests restore main's cache and do not save.
+# Compilation caches retain external dependencies. sccache must not wrap rustc
+# or write a GHA backend; pull requests restore main's cache and do not save.
 for workflow in \
   "$ci_workflow" \
   "$script_dir/../workflows/ploy-ci.yml" \
@@ -1091,12 +1091,16 @@ grep -Fq "find rust_hft/scripts -type f -name '*.sh' -exec bash -n {} \\;" <<<"$
 grep -Fq 'Enforce Rust-only research and runtime source' <<<"$fast_gates_block"
 grep -Fq 'Python runtime or package-manager command' <<<"$fast_gates_block"
 
-# Each heavy Rust job saves Swatinem/rust-cache only from main.
-grep -Fq 'uses: Swatinem/rust-cache@' <<<"$rust_job_block"
-grep -Fq 'save-if: false' <<<"$rust_job_block"
-grep -Fq "if: \${{ github.ref == 'refs/heads/main' && success() && needs.scope.outputs.toolchain == 'true' }}" <<<"$rust_job_block"
+# The heavy owning-workspace job restores compatible inputs and saves only
+# cleaned dependency paths from main. The separate fast lane keeps its cache.
+grep -Fq 'uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830' <<<"$rust_job_block"
+grep -Fq 'restore-keys: ${{ steps.cache-info.outputs.compat_prefix }}' <<<"$rust_job_block"
+[[ $(grep -Fc 'path: ${{ steps.cache-info.outputs.cache_paths }}' <<<"$rust_job_block") -eq 2 ]]
+[[ $(grep -Fc 'key: ${{ steps.cache-info.outputs.key }}' <<<"$rust_job_block") -eq 2 ]]
+grep -Fq "if: \${{ github.ref == 'refs/heads/main' && success() && needs.scope.outputs.toolchain == 'true' && steps.owner-cache.outputs.cache-hit != 'true' }}" <<<"$rust_job_block"
 grep -Fq 'Save trusted workspace dependency cache' <<<"$rust_job_block"
-grep -Fq 'save-if: true' <<<"$rust_job_block"
+grep -Fq 'uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830' <<<"$rust_job_block"
+grep -Fq 'ci-owner-cache.sh" cache-input' <<<"$rust_job_block"
 fast_lane_block=$(job_block rust_hft_engine_fast_lane)
 grep -Fq 'uses: Swatinem/rust-cache@' <<<"$fast_lane_block"
 grep -Fq "save-if: \${{ github.ref == 'refs/heads/main' }}" <<<"$fast_lane_block"
@@ -1130,7 +1134,7 @@ recorder_block=$(job_block market_recorder_contract)
 grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$recorder_block"
 grep -Fq "contains(needs.scope.outputs.jobs, ',ci/market-recorder-contract,')" <<<"$recorder_block"
 if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; then echo "unexpected duplicate CI command" >&2; exit 1; fi
-grep -Fq 'key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}' <<<"$rust_job_block"
+grep -Fq 'ci-owner-cache.sh" cleanup' <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
 grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"

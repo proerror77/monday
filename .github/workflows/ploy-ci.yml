@@ -254,7 +254,7 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends clang cmake mold pkg-config protobuf-compiler gh jq ruby binutils python3 zstd
+          apt-get install -y --no-install-recommends clang cmake mold pkg-config protobuf-compiler gh jq ruby binutils zstd
       - name: Capture compiler, native environment and scoped recipe
         id: build-inputs
         working-directory: .

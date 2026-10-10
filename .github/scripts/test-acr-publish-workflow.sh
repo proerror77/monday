@@ -213,7 +213,7 @@ repo_root = File.expand_path('../..', File.dirname(ARGV[0]))
   abort 'release builder lost bookworm ABI binding' unless job.fetch('container').fetch('image') == 'rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec'
   dependencies = job.fetch('steps').find { |step| step.fetch('name','') == 'Install build dependencies' }.fetch('run')
   abort 'bookworm release uses Ubuntu package sources' if dependencies.include?('install-ubuntu-packages.sh')
-  %w[gh jq ruby binutils python3 zstd].each { |tool| abort "bookworm release dependency missing: #{tool}" unless dependencies.split.include?(tool) }
+  %w[gh jq ruby binutils zstd].each { |tool| abort "bookworm release dependency missing: #{tool}" unless dependencies.split.include?(tool) }
   abort 'release compiles whole workspace' if job.to_s.include?('--workspace') || job.to_s.include?('--all-features')
   abort 'release lost bounded native builder' unless job.fetch('steps').any? { |s|s.fetch('run','').include?('build-research-release.sh') }
   job.fetch('steps').each do |step|
