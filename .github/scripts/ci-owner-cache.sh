@@ -87,7 +87,8 @@ targets.each do |target|
     path = "#{profile}/#{kind}"
     next unless File.directory?(path)
     Dir.children(path).each do |name|
-      FileUtils.rm_r("#{path}/#{name}") if names.any? { |local| name.start_with?("#{local}-") }
+      # Match the full name before Cargo's hash, not a local package prefix.
+      FileUtils.rm_r("#{path}/#{name}") if names.include?(name.rpartition('-').first)
     end
   end
 end

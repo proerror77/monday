@@ -102,6 +102,8 @@ done
 # Keep the full digest output and use the separate key only for dependency restore.
 grep -Fq "printf 'cache_sha256=%s" "$root/.github/scripts/capture-research-build-inputs.sh"
 grep -Fq 'dependency_cache_sha256=%s' "$root/.github/scripts/capture-research-build-inputs.sh"
+# Match the literal workflow expression, before GitHub expands it.
+# shellcheck disable=SC2016
 grep -Fq 'key: research-dependencies-v1-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}' "$root/.github/workflows/ploy-ci.yml"
 printf 'PASS: dependency compatibility identity, provenance preservation and fail-closed input contracts\n'
 [[ ${1:-} != --compatibility-key ]] || exit 0
@@ -123,7 +125,13 @@ cat >"$work/bin/cargo" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ " $* " == *" --no-deps "* ]]; then extra=false; else extra=true; fi
-jq -n --arg root "$FIXTURE/repo" --argjson extra "$extra" '{packages:([{name:"local-code",manifest_path:($root+"/rust_hft/member/Cargo.toml"),targets:[{name:"local_code"}]}] + if $extra then [{name:"hidden-local",manifest_path:($root+"/vendor/hidden-local/Cargo.toml"),targets:[{name:"hidden_local"}]}] else [] end)}'
+jq -n --arg root "$FIXTURE/repo" --argjson extra "$extra" '{packages:([
+  {name:"local-code",manifest_path:($root+"/rust_hft/member/Cargo.toml"),targets:[{name:"local_code"}]},
+  {name:"hft-data",manifest_path:($root+"/rust_hft/data-pipelines/core/Cargo.toml"),targets:[{name:"data"}]}
+] + if $extra then [
+  {name:"hidden-local",manifest_path:($root+"/vendor/hidden-local/Cargo.toml"),targets:[{name:"hidden_local"}]},
+  {name:"data-encoding",manifest_path:"/external/registry/data-encoding/Cargo.toml",targets:[{name:"data_encoding"}]}
+] else [] end)}'
 MOCK
 chmod +x "$work/bin/cargo"
 for id in data-pipelines prediction-markets research-core research-core--platform; do
@@ -137,13 +145,32 @@ for id in data-pipelines prediction-markets research-core research-core--platfor
   printf 'local fingerprint\n' >"$profile/.fingerprint/local-code-hash"
   printf 'native\n' >"$profile/deps/liblibduckdb_sys-hash.rlib"
   printf 'local executable\n' >"$profile/local-code"
+  # Local data and hft-data artifacts must be removed without deleting data-encoding.
+  mkdir -p "$profile/build/hft-data-hash/out" "$profile/.fingerprint/hft-data-hash" \
+    "$profile/.fingerprint/data-encoding-hash" "$profile/build/data-encoding-hash/out"
+  printf 'local data object\n' >"$profile/build/hft-data-hash/out/local.o"
+  printf 'local data fingerprint\n' >"$profile/.fingerprint/hft-data-hash/lib-data"
+  for artifact in data-hash.d libdata-hash.rlib libdata-hash.rmeta libdata-hash.so hft-data-hash; do
+    printf 'local data\n' >"$profile/deps/$artifact"
+  done
+  printf 'external dependency fingerprint\n' >"$profile/.fingerprint/data-encoding-hash/lib-data_encoding"
+  printf 'external dependency bytes\n' >"$profile/deps/libdata_encoding-hash.rlib"
+  printf 'external build output' >"$profile/build/data-encoding-hash/out/dependency.o"
 done
 FIXTURE="$work" PATH="$work/bin:$PATH" bash "$work/repo/.github/scripts/research-cache-layout.sh" cleanup "$work/inputs"
 for id in data-pipelines prediction-markets research-core research-core--platform; do
   profile="$work/repo/rust_hft/target/$id/x86_64-unknown-linux-gnu/release"
   [[ -f $profile/build/libduckdb-sys-native/out/native.o && -f $profile/deps/liblibduckdb_sys-hash.rlib ]]
   [[ ! -e $profile/deps/libhidden_local-hash.rlib && ! -e $profile/build/local-code-hash && ! -e $profile/deps/liblocal_code-hash.rlib && ! -e $profile/.fingerprint/local-code-hash && ! -e $profile/local-code ]]
+  [[ ! -e $profile/build/hft-data-hash && ! -e $profile/.fingerprint/hft-data-hash ]]
+  for artifact in data-hash.d libdata-hash.rlib libdata-hash.rmeta libdata-hash.so hft-data-hash; do
+    [[ ! -e $profile/deps/$artifact ]]
+  done
+  [[ $(cat "$profile/.fingerprint/data-encoding-hash/lib-data_encoding") == 'external dependency fingerprint' ]]
+  [[ $(cat "$profile/deps/libdata_encoding-hash.rlib") == 'external dependency bytes' ]]
+  [[ $(cat "$profile/build/data-encoding-hash/out/dependency.o") == 'external build output' ]]
 done
+printf 'PASS: exact local artifact names removed; external data-encoding fingerprint and bytes retained in all four targets\n'
 # A local shared/vendor manifest outside the recipe roots changes cache identity
 # even when every owning Cargo.lock and recipe remains unchanged.
 mkdir -p "$work/repo/rust_hft/shared/cex-input" "$work/repo/vendor/local"

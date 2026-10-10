@@ -2,6 +2,7 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work=$(mktemp -d)
+work=$(cd "$work" && pwd -P)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/repo/.github/scripts" "$work/repo/rust_hft/scripts" "$work/bin"
 cp "$root/.github/scripts/ci-owner-cache.sh" "$work/repo/.github/scripts/"
@@ -14,6 +15,40 @@ for command in cc c++ clang mold protoc ldd; do
   printf '#!/usr/bin/env bash\nprintf "%%s version fixture\\n" "${0##*/}"\n' >"$work/native-bin/$command"
   chmod +x "$work/native-bin/$command"
 done
+export REAL_NATIVE_CAT
+REAL_NATIVE_CAT=$(command -v cat)
+cat >"$work/native-bin/uname" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# == 1 ]]
+case "$1" in
+  -s) printf 'Linux\n' ;;
+  -ms) printf 'Linux x86_64\n' ;;
+  *) exit 92 ;;
+esac
+MOCK
+cat >"$work/native-bin/dpkg-query" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# == 2 && $1 == -W && $2 == -f=* ]]
+printf 'fixture-native-toolchain\t1\tamd64\n'
+MOCK
+cat >"$work/native-bin/cat" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $# == 1 && $1 == /etc/os-release ]]; then
+  printf 'NAME=Monday-native-fixture\nVERSION_ID=1\n'
+else
+  exec "$REAL_NATIVE_CAT" "$@"
+fi
+MOCK
+chmod +x "$work/native-bin/"{uname,dpkg-query,cat}
+if [[ $(uname -s) != Linux ]]; then
+  if bash "$root/.github/scripts/ci-owner-cache.sh" native-input; then
+    echo 'native cache input accepted a non-Linux host' >&2
+    exit 1
+  fi
+fi
 native_before=$(PATH="$work/native-bin:$PATH" bash "$root/.github/scripts/ci-owner-cache.sh" native-input)
 native_after=$(PATH="$work/native-bin:$PATH" CXXFLAGS=-DFIXTURE_NATIVE_INPUT_CHANGED bash "$root/.github/scripts/ci-owner-cache.sh" native-input)
 [[ $native_before != "$native_after" ]]
@@ -55,10 +90,12 @@ if [[ $1 == metadata ]]; then
   [[ " $* " != *" --all-features "* ]] || extra=true
   jq -n --arg manifest "$manifest" --arg package "$package" --arg root "$FIXTURE" --argjson extra "$extra" '
     {workspace_root:($manifest|sub("/Cargo.toml$";"")),workspace_members:[$package],packages:(
-     [{id:$package,name:$package,manifest_path:$manifest,targets:[{name:($package|gsub("-";"_"))}]}] +
+     [{id:$package,name:$package,manifest_path:$manifest,targets:[{name:($package|gsub("-";"_"))}]},
+      {id:"hft-data",name:"hft-data",manifest_path:($root+"/rust_hft/data-pipelines/core/Cargo.toml"),targets:[{name:"data"}]}] +
      if $extra then [{id:"vendor",name:"hidden-local",manifest_path:($root+"/vendor/hidden/Cargo.toml"),targets:[{name:"hidden_local"}]},
        {id:"outside",name:"external-local",source:null,manifest_path:"/external/path/Cargo.toml",targets:[{name:"external_local"}]},
-       {id:"registry",name:"libduckdb-sys",source:"registry+https://github.com/rust-lang/crates.io-index",manifest_path:"/registry/libduckdb/Cargo.toml",targets:[{name:"libduckdb_sys"}]}] else [] end)}'
+       {id:"registry",name:"libduckdb-sys",source:"registry+https://github.com/rust-lang/crates.io-index",manifest_path:"/registry/libduckdb/Cargo.toml",targets:[{name:"libduckdb_sys"}]},
+       {id:"encoding",name:"data-encoding",source:"registry+https://github.com/rust-lang/crates.io-index",manifest_path:"/registry/data-encoding/Cargo.toml",targets:[{name:"data_encoding"}]}] else [] end)}'
 else
   [[ ${FAIL_CARGO:-0} != 1 ]] || exit 19
   jq -cn --arg target "${CARGO_TARGET_DIR:-unset}" --args \
@@ -116,6 +153,17 @@ while IFS= read -r manifest; do
   printf executable >"$profile/$package"
   printf incremental >"$profile/incremental/data"
   printf executable >"$profile/examples/example"
+  # The local target data must not remove the external package data-encoding.
+  mkdir -p "$profile/build/hft-data-hash/out" "$profile/.fingerprint/hft-data-hash" \
+    "$profile/.fingerprint/data-encoding-hash" "$profile/build/data-encoding-hash/out"
+  printf 'local data object' >"$profile/build/hft-data-hash/out/local.o"
+  printf 'local data fingerprint' >"$profile/.fingerprint/hft-data-hash/lib-data"
+  for artifact in data-hash.d libdata-hash.rlib libdata-hash.rmeta libdata-hash.so hft-data-hash; do
+    printf 'local data' >"$profile/deps/$artifact"
+  done
+  printf 'external dependency fingerprint' >"$profile/.fingerprint/data-encoding-hash/lib-data_encoding"
+  printf 'external dependency bytes' >"$profile/deps/libdata_encoding-hash.rlib"
+  printf 'external build output' >"$profile/build/data-encoding-hash/out/dependency.o"
 done < <(jq -r '.workspaces[].manifest' "$FIXTURE/rust_hft/workspaces.json")
 MONDAY_CARGO_TARGET_LAYOUT=owning-workspace-v1 bash "$FIXTURE/.github/scripts/ci-owner-cache.sh" cleanup
 while IFS= read -r manifest; do
@@ -126,7 +174,15 @@ while IFS= read -r manifest; do
   [[ ! -e $profile/build/$package-hash && ! -e $profile/deps/lib$rust_name-hash.rlib && ! -e $profile/deps/libhidden_local-hash.rlib ]]
   [[ ! -e $profile/deps/libexternal_local-hash.rlib && ! -e $profile/examples ]]
   [[ ! -e $profile/.fingerprint/$package-hash && ! -e $profile/$package && ! -e $profile/incremental ]]
+  [[ ! -e $profile/build/hft-data-hash && ! -e $profile/.fingerprint/hft-data-hash ]]
+  for artifact in data-hash.d libdata-hash.rlib libdata-hash.rmeta libdata-hash.so hft-data-hash; do
+    [[ ! -e $profile/deps/$artifact ]]
+  done
+  [[ $(cat "$profile/.fingerprint/data-encoding-hash/lib-data_encoding") == 'external dependency fingerprint' ]]
+  [[ $(cat "$profile/deps/libdata_encoding-hash.rlib") == 'external dependency bytes' ]]
+  [[ $(cat "$profile/build/data-encoding-hash/out/dependency.o") == 'external build output' ]]
 done < <(jq -r '.workspaces[].manifest' "$FIXTURE/rust_hft/workspaces.json")
+printf 'PASS: exact local artifact names removed; external data-encoding fingerprint and bytes retained in every CI owner target\n'
 profile="$FIXTURE/rust_hft/research-core/target/debug"
 rm -rf "$profile/deps"
 mkdir -p "$work/outside"; printf untouched >"$work/outside/marker"

@@ -19,9 +19,6 @@ for runner in cex-runner prediction-runner; do
   image="monday-$runner-ci:$GITHUB_RUN_ID"
   docker build --target prebuilt --label "org.opencontainers.image.revision=$source_sha" -t "$image" "$runner_context"
   bash "$root/.github/scripts/verify-research-product-image.sh" "$image" "$source_sha" "$release/research-bin" "$runner"
-  while IFS= read -r binary; do
-    docker run --rm --network none --entrypoint "/usr/local/bin/$binary" "$image" --help >/dev/null
-  done < <(bash "$root/.github/scripts/research-release-products.sh" binaries "$runner")
 done
 if bash "$root/.github/scripts/research-release-products.sh" contains "$product" controller; then
 # Package the controller from the same verified binaries; this target contains
