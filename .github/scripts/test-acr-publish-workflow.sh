@@ -213,7 +213,7 @@ repo_root = File.expand_path('../..', File.dirname(ARGV[0]))
   abort 'release builder lost bookworm ABI binding' unless job.fetch('container').fetch('image') == 'rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec'
   dependencies = job.fetch('steps').find { |step| step.fetch('name','') == 'Install build dependencies' }.fetch('run')
   abort 'bookworm release uses Ubuntu package sources' if dependencies.include?('install-ubuntu-packages.sh')
-  %w[gh jq ruby binutils].each { |tool| abort "bookworm release dependency missing: #{tool}" unless dependencies.split.include?(tool) }
+  %w[gh jq ruby binutils zstd].each { |tool| abort "bookworm release dependency missing: #{tool}" unless dependencies.split.include?(tool) }
   abort 'release compiles whole workspace' if job.to_s.include?('--workspace') || job.to_s.include?('--all-features')
   abort 'release lost bounded native builder' unless job.fetch('steps').any? { |s|s.fetch('run','').include?('build-research-release.sh') }
   job.fetch('steps').each do |step|
@@ -237,18 +237,25 @@ abort 'manual dependency restore uses a different Rust toolchain' unless toolcha
 %w[research-cache-layout build-inputs].each do |id|
   abort "manual build lost #{id}" unless manual_builder.fetch('steps').any? { |step| step['id']==id }
 end
-# Pinned rust-cache uses shared-key instead of key plus the default job suffix.
+# Both producers bind an exact key and the same admitted restore prefix.
 effective_prefix = lambda do |job, id|
   step = job.fetch('steps').find { |entry| entry['id']=='research-cache' }
-  abort 'cache action changed' unless step.fetch('uses')=='Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6'
+  abort 'cache restore can save uncleaned bytes' unless step.fetch('uses')=='actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830'
   settings = step.fetch('with')
-  abort 'dependency cache lost environment or target validation' unless settings.keys.sort == (id=='research-image-binaries' ? %w[key save-if workspaces] : %w[save-if shared-key workspaces])
-  abort 'dependency cache escaped owner paths' unless settings.fetch('workspaces')=='${{ steps.research-cache-layout.outputs.workspaces }}'
-  abort 'untrusted dependency cache save' unless settings.fetch('save-if')=="${{ github.ref == 'refs/heads/main' }}"
-  settings['shared-key'] || "#{settings.fetch('key')}-#{id}"
+  abort 'dependency cache lost environment or target validation' unless settings.keys.sort == %w[key path restore-keys]
+  abort 'dependency cache escaped owner paths' unless settings.fetch('path')=='${{ steps.research-cache-layout.outputs.cache_paths }}'
+  prefix = settings.fetch('restore-keys')
+  abort 'exact key omits full compilation provenance' unless settings.fetch('key')==prefix+'${{ steps.build-inputs.outputs.cache_sha256 }}'
+  save = find_step.call(job,'Save trusted research dependency cache')
+  abort 'untrusted dependency cache save' unless save.fetch('if')=="${{ github.ref == 'refs/heads/main' && success() && steps.research-cache.outputs.cache-hit != 'true' }}"
+  abort 'cache save action is not pinned' unless save.fetch('uses')=='actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830'
+  abort 'saved cache differs from restore attempt' unless save.fetch('with')=={'path'=>settings.fetch('path'),'key'=>'${{ steps.research-cache.outputs.cache-primary-key }}'}
+  cleanup = find_step.call(job,'Retain only dependency compilation bytes for trusted cache saves')
+  abort 'cache save precedes dependency cleanup' unless job.fetch('steps').index(cleanup)<job.fetch('steps').index(save)
+  prefix
 end
-expected_prefix = 'research-dependencies-v1-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}-research-image-binaries'
-abort 'manual producer cannot restore the existing Prediction dependency cache' unless [effective_prefix.call(prediction_builder,'research-image-binaries'),effective_prefix.call(manual_builder,'research-runner-binaries')].all? { |prefix| prefix==expected_prefix }
+expected_prefix = 'research-dependencies-v2-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}-'
+abort 'manual producer cannot restore compatible Prediction dependencies' unless [effective_prefix.call(prediction_builder,'research-image-binaries'),effective_prefix.call(manual_builder,'research-runner-binaries')].all? { |prefix| prefix==expected_prefix }
 abort 'manual producer changes trusted cache cleanup' unless find_step.call(manual_builder,'Retain only dependency compilation bytes for trusted cache saves')==find_step.call(prediction_builder,'Retain only dependency compilation bytes for trusted cache saves')
 manual_build = find_step.call(manual_builder,'Build immutable research release')
 abort 'manual timing evidence omits actual cache restore status' unless manual_build.fetch('env').fetch('MONDAY_CACHE_EXACT_MATCH')=="${{ steps.research-cache.outputs.cache-hit || 'unknown' }}"

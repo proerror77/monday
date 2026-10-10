@@ -32,7 +32,7 @@ for variable in CC CXX AR LD CFLAGS CXXFLAGS LDFLAGS RUSTC_BOOTSTRAP CARGO_BUILD
   BINDGEN_EXTRA_CLANG_ARGS PROTOC PROTOC_INCLUDE CMAKE_TOOLCHAIN_FILE; do
   printf '%s=%s\n' "$variable" "${!variable-}" >>"$work/native"
 done
-for command in clang cmake mold pkg-config protoc; do "$command" --version >>"$work/native"; done
+for command in clang cmake mold pkg-config protoc zstd zstdmt unzstd; do "$command" --version >>"$work/native"; done
 # Bind relevant Cargo overrides without capturing registry or service secrets.
 for variable in RUSTC RUSTDOC RUSTC_WORKSPACE_WRAPPER CARGO_INCREMENTAL; do
   printf '%s=%s\n' "$variable" "${!variable-}" >>"$work/flags"
@@ -71,6 +71,8 @@ cat "$root/.github/scripts/build-research-release.sh" \
   "$root/.github/scripts/research-workspace-locks.sh" \
   "$root/.github/scripts/verify-research-runtime-abi.sh" \
   "$root/.github/scripts/verify-research-runner-binaries.sh" >"$work/recipe"
+# Bind the fixed CI parser implementation alongside the build recipe.
+find "$root/.github/scripts/vendor/tomlrb/lib" -type f -name '*.rb' -print0 | LC_ALL=C sort -z | xargs -0 cat >>"$work/recipe"
 jq -S -n --arg compiler "$(sha256sum "$work/compiler" | awk '{print $1}')" \
   --arg native "$(sha256sum "$work/native" | awk '{print $1}')" \
   --arg flags "$(sha256sum "$work/flags" | awk '{print $1}')" \

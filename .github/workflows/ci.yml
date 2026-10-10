@@ -431,26 +431,20 @@ jobs:
         env:
           MONDAY_CI_CACHE_PLAN: ${{ toJSON(needs.scope.outputs) }}
         run: |
-          {
-            echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')"
-            bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" native-input
-            bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" coverage-input
-          } >> "$GITHUB_OUTPUT"
+          native=$(bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" native-input)
+          coverage=$(bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" coverage-input)
+          export MONDAY_CI_CACHE_NATIVE=${native#native=}
+          export MONDAY_CI_CACHE_COVERAGE=${coverage#coverage=}
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" cache-input >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
+        id: owner-cache
         if: ${{ (needs.scope.outputs.toolchain == 'true') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          workspaces: |
-            rust_hft/shared -> target
-            rust_hft/data-pipelines -> ../target
-            rust_hft/research-core -> target
-            rust_hft/research-core/platform -> target
-            rust_hft/runtime -> target
-            rust_hft/prediction-markets -> target
-          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/scripts/test-rust-workspaces.sh', '.github/scripts/check-collector-test-presence.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
-          cache-all-crates: false
-          save-if: false
+          path: ${{ steps.cache-info.outputs.cache_paths }}
+          key: ${{ steps.cache-info.outputs.key }}
+          restore-keys: ${{ steps.cache-info.outputs.compat_prefix }}
 
       - name: Test directly changed Rust packages
         id: owning
@@ -614,19 +608,11 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" cleanup
 
       - name: Save trusted workspace dependency cache
-        if: ${{ github.ref == 'refs/heads/main' && success() && needs.scope.outputs.toolchain == 'true' }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: ${{ github.ref == 'refs/heads/main' && success() && needs.scope.outputs.toolchain == 'true' && steps.owner-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          workspaces: |
-            rust_hft/shared -> target
-            rust_hft/data-pipelines -> ../target
-            rust_hft/research-core -> target
-            rust_hft/research-core/platform -> target
-            rust_hft/runtime -> target
-            rust_hft/prediction-markets -> target
-          key: rust_hft-ci-owner-v1-rust-${{ steps.cache-info.outputs.rust }}-native-${{ steps.cache-info.outputs.native }}-scope-${{ steps.cache-info.outputs.coverage }}-${{ hashFiles('rust_hft/scripts/cargo-scoped.sh', 'rust_hft/scripts/workspace-metadata.sh', 'rust_hft/workspaces.json', '.github/scripts/ci-owner-cache.sh', '.github/scripts/test-rust-workspaces.sh', '.github/scripts/check-collector-test-presence.sh', '.github/workflows/ci.yml', '.github/scripts/select-rust-ci-scope.sh', 'deployment/aliyun/test-polymarket-raw-ops-control-plane.sh') }}
-          cache-all-crates: false
-          save-if: true
+          path: ${{ steps.cache-info.outputs.cache_paths }}
+          key: ${{ steps.cache-info.outputs.key }}
 
   clippy_strict:
     name: Code Quality - Clippy (STRICT)
