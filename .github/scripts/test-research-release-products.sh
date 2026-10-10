@@ -3,6 +3,8 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# Match realpath guards when macOS exposes its temporary root through an alias.
+work=$(cd "$work" && pwd -P)
 export GITHUB_RUN_ATTEMPT=2 MONDAY_RELEASE_JOB_ID=7 MONDAY_BUILD_INPUTS_FILE="$work/inputs.json"
 sha=1111111111111111111111111111111111111111
 # Domain-only recipes must stay independently buildable. Shared CEX/controller
@@ -95,6 +97,29 @@ done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
 printf '#!/usr/bin/env bash\nexit 0\n' >"$fixture/.github/scripts/verify-research-runtime-abi.sh"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "1111111111111111111111111111111111111111"\n' >"$fixture/bin/git"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" 7\n' >"$fixture/bin/gh"
+# The producer targets Linux. Inject host metrics only in this test fixture.
+export MONDAY_TEST_AWK MONDAY_TEST_CPUINFO_FILE MONDAY_TEST_CARGO_BUILD_LOG
+MONDAY_TEST_AWK=$(command -v awk)
+MONDAY_TEST_CPUINFO_FILE="$fixture/cpuinfo"
+MONDAY_TEST_CARGO_BUILD_LOG="$fixture/cargo-builds"
+printf 'processor : 0\nmodel name : Monday fixture CPU\nprocessor : 1\nmodel name : ignored second CPU\n' >"$MONDAY_TEST_CPUINFO_FILE"
+cat >"$fixture/bin/awk" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+arguments=("$@")
+for index in "${!arguments[@]}"; do
+  if [[ ${arguments[index]} == /proc/cpuinfo ]]; then
+    arguments[index]=${MONDAY_TEST_CPUINFO_FILE:?}
+  fi
+done
+exec "${MONDAY_TEST_AWK:?}" "${arguments[@]}"
+MOCK
+cat >"$fixture/bin/nproc" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# == 0 ]] || exit 91
+printf '8\n'
+MOCK
 cat >"$fixture/bin/cargo" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -102,6 +127,7 @@ if [[ $1 == metadata ]]; then
   jq -n --arg root "$PWD" '{packages:[{name:"alpha-harness",manifest_path:($root+"/alpha-harness/Cargo.toml"),targets:[{name:"alpha_harness"}]}]}'
   exit
 fi
+printf 'build\n' >>"${MONDAY_TEST_CARGO_BUILD_LOG:?}"
 [[ ${FAIL_RECIPE:-0} != 1 ]] || exit 37
 target='' binaries=()
 while [[ $# -gt 0 ]]; do
@@ -134,8 +160,21 @@ printf 'PASS: controller-only release builds five admitted executables including
 # The opt-in probe must run all three controller recipes through three exact-input phases with one input identity.
 jq -es 'length==9 and ([.[].phase]|sort)==["after-cache-lookup","after-cache-lookup","after-cache-lookup","dependency-warm-local","dependency-warm-local","dependency-warm-local","warm-local","warm-local","warm-local"]
   and ([.[].compilation_inputs_sha256]|unique|length)==1
-  and all(.[]; .source_sha=="1111111111111111111111111111111111111111" and .compiler_artifacts>0)' \
+  and all(.[]; .source_sha=="1111111111111111111111111111111111111111" and .compiler_artifacts>0
+    and .runner.cpu_model=="Monday fixture CPU" and .runner.logical_cpus==8)' \
   "$fixture/output/research-recipe-probe/timings.jsonl" >/dev/null
+# A missing metrics input must fail before Cargo, timings, or release creation.
+mkdir -p "$fixture/cpuinfo-failed-output"
+if MONDAY_TEST_CPUINFO_FILE="$fixture/missing-cpuinfo" MONDAY_TEST_CARGO_BUILD_LOG="$fixture/cpuinfo-failed-builds" \
+  PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/cpuinfo-failed-output" GITHUB_REPOSITORY=fixture/monday \
+  GITHUB_RUN_ID=42 MONDAY_BUILD_INPUTS_FILE="$fixture/inputs.json" \
+  bash "$fixture/.github/scripts/build-research-release.sh" controller >"$work/rejection" 2>&1; then
+  echo 'missing CPU information accepted by the producer' >&2; exit 1
+fi
+grep -Fq "$fixture/missing-cpuinfo" "$work/rejection"
+[[ ! -e $fixture/cpuinfo-failed-builds ]]
+[[ ! -e $fixture/cpuinfo-failed-output/research-recipe-probe/timings.jsonl ]]
+[[ ! -e $fixture/cpuinfo-failed-output/research-image-release.tar ]]
 # A compiler failure must block the producer before artifact creation.
 mkdir -p "$fixture/failed-output"
 if FAIL_RECIPE=1 PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/failed-output" GITHUB_REPOSITORY=fixture/monday \

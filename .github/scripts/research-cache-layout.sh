@@ -123,7 +123,9 @@ manifests.each do |manifest|
       next unless File.directory?(path)
       abort 'artifact directory symlink escaped target' unless File.realpath(path) == path
       Dir.children(path).each do |n|
-        FileUtils.rm_rf("#{path}/#{n}") if names.any? { |name| n.start_with?("#{name}-") }
+        # Cargo appends a hash after the complete package or target name.
+        # A local target named data must not match the data-encoding dependency.
+        FileUtils.rm_rf("#{path}/#{n}") if names.include?(n.rpartition('-').first)
       end
     end
   end
