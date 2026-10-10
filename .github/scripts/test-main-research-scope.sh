@@ -140,6 +140,23 @@ if focused_plan defer-unconfigured '{}'; then echo 'baseline failure hidden by d
 rm "$work/baseline-failure"
 printf '{}\n' >"$work/baselines"
 if focused_plan defer-unconfigured '{}'; then echo 'missing baseline hidden by deferral' >&2; exit 1; fi
+# A parser change remains an unpublished input after a later docs-only push.
+previous_head=$head
+mkdir -p .github/scripts/vendor/tomlrb
+printf 'changed parser provenance\n' >.github/scripts/vendor/tomlrb/LICENSE.txt
+git add -f .github/scripts/vendor/tomlrb/LICENSE.txt
+git commit -qm 'fixture cache parser change'
+printf 'docs after parser\n' >>README.md
+git commit -qam 'fixture docs after parser'
+head=$(git rev-parse HEAD)
+jq -n --arg base "$previous_head" '{"cex-runner":$base,"controller":$base,"prediction-runner":$base}' >"$work/baselines"
+focused_plan always '{}'
+grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+focused_plan defer-unconfigured '{}'
+grep -Fqx research_pending_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+grep -Fqx research_deferred_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+git checkout -q --detach "$previous_head"
+head=$previous_head
 printf 'PASS: carry deferral preserves direct products/jobs, original baselines and conservative policy classification\n'
 [[ ${1:-} != --deferred-carry ]] || exit 0
 publisher "$base"

@@ -454,6 +454,15 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
+    .github/scripts/vendor/tomlrb/*)
+      # The cache parser changes compilation identity for every research owner.
+      select_all
+      select_all_rust_ci_jobs
+      select_research_image_jobs
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      continue
+      ;;
     .github/scripts/ci-owner-cache.sh)
       loop=true
       loop_packages=alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-cex-research-worker,hft-harnessctl,hft-research-ml

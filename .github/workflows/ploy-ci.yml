@@ -254,7 +254,7 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends clang cmake mold pkg-config protobuf-compiler gh jq ruby binutils
+          apt-get install -y --no-install-recommends clang cmake mold pkg-config protobuf-compiler gh jq ruby binutils zstd
       - name: Capture compiler, native environment and scoped recipe
         id: build-inputs
         working-directory: .
@@ -262,14 +262,14 @@ jobs:
       - name: Select owning-workspace cache targets
         id: research-cache-layout
         working-directory: .
-        run: bash .github/scripts/research-cache-layout.sh workspaces "${RUNNER_TEMP}/research-build-inputs.json" >> "$GITHUB_OUTPUT"
+        run: bash .github/scripts/research-cache-layout.sh cache-paths "${RUNNER_TEMP}/research-build-inputs.json" >> "$GITHUB_OUTPUT"
       - id: research-cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          workspaces: ${{ steps.research-cache-layout.outputs.workspaces }}
-          # Manifest/lock changes vary the action suffix, while compatible dependencies can restore.
-          key: research-dependencies-v1-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          path: ${{ steps.research-cache-layout.outputs.cache_paths }}
+          # Exact provenance varies the suffix. The prefix retains compilation boundaries.
+          key: research-dependencies-v2-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}-${{ steps.build-inputs.outputs.cache_sha256 }}
+          restore-keys: research-dependencies-v2-linux-amd64-${{ steps.build-inputs.outputs.dependency_cache_sha256 }}-
       - name: Build immutable research release
         working-directory: .
         env:
@@ -299,6 +299,13 @@ jobs:
         if: ${{ github.ref == 'refs/heads/main' && success() }}
         working-directory: .
         run: bash .github/scripts/research-cache-layout.sh cleanup "${RUNNER_TEMP}/research-build-inputs.json"
+
+      - name: Save trusted research dependency cache
+        if: ${{ github.ref == 'refs/heads/main' && success() && steps.research-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.research-cache-layout.outputs.cache_paths }}
+          key: ${{ steps.research-cache.outputs.cache-primary-key }}
 
   research-image-smoke:
     name: Research image smoke
