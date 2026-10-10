@@ -26,9 +26,22 @@ job=$(jq -er --arg name "$job_name" --argjson run "$run_id" --argjson attempt "$
   [.[].jobs[]?|select(.name==$name and .run_id==$run and .run_attempt==$attempt and .status=="completed" and .conclusion=="success")] |
   if length==1 then .[0].id else error("missing/ambiguous successful image producer") end' "$destination/jobs.json")
 name="tested-image-$product-$source_sha-$attempt"
-gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" >"$destination/artifacts.json"
-count=$(jq --arg name "$name" '[.artifacts[]|select(.name==$name and .expired==false)]|length' "$destination/artifacts.json")
-[[ $count == 1 ]] || missing
+gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" >"$destination/artifacts.json"
+# A partial listing must not authorize the optional publisher to rebuild.
+# Count every page before deciding whether the retained image is absent.
+jq -e '
+  type=="array" and length>0 and
+  all(.[]; type=="object" and (.total_count|type=="number" and .>=0 and floor==.) and
+    (.artifacts|type=="array")) and
+  ([.[].total_count]|unique|length)==1 and
+  ([.[].artifacts[]]|length)==.[0].total_count and
+  all(.[].artifacts[]; type=="object" and (.id|type=="number" and .>0 and floor==.) and
+    (.name|type=="string" and length>0) and (.expired|type=="boolean")) and
+  ([.[].artifacts[].id]|unique|length)==.[0].total_count
+' "$destination/artifacts.json" >/dev/null || { echo 'Incomplete or ambiguous tested image artifact listing' >&2; exit 1; }
+count=$(jq --arg name "$name" '[.[].artifacts[]|select(.name==$name and .expired==false)]|length' "$destination/artifacts.json")
+[[ $count != 0 ]] || missing
+[[ $count == 1 ]] || { echo 'Ambiguous retained tested image artifact' >&2; exit 1; }
 gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name "$name" --dir "$destination/bundle"
 manifest="$destination/bundle/image.json"
 [[ -f $manifest && ! -L $manifest && -f $destination/bundle/image.tar && ! -L $destination/bundle/image.tar ]] || exit 1
