@@ -1,7 +1,6 @@
 //! Frozen point-in-time feature inputs, byte-bound import and trace validation.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::BufRead,
@@ -174,7 +173,7 @@ pub fn import_feature_dataset_for_reuse(
     let facts = validate_rows(&rows, created_at)?;
 
     let bytes = input_bytes;
-    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let hash = crate::sha256(&bytes);
     std::fs::create_dir_all(artifact_dir)
         .map_err(|error| format!("failed to create feature artifact directory: {error}"))?;
     let artifact_path = artifact_dir.join(format!("{hash}.jsonl"));
@@ -209,7 +208,7 @@ pub fn read_feature_rows(
 ) -> Result<Vec<PointInTimeFeatureRow>, String> {
     let bytes = std::fs::read(&manifest.artifact_path)
         .map_err(|error| format!("failed to read feature artifact: {error}"))?;
-    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let hash = crate::sha256(&bytes);
     if hash != manifest.artifact_sha256
         || manifest.manifest_id != format!("dataset-{hash}")
         || manifest

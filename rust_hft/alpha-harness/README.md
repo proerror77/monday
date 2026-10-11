@@ -19,6 +19,13 @@ Its `streaming` feature pins files, verifies each consumed pass, and preserves
 causal windows and label maturity. Operator and fitting code use these readers.
 The platform's default input contract does not enable columnar readers.
 
+The input crate's explicit `feature-jsonl` feature owns the PIT JSONL types,
+validation and content-addressed IO used by materializers and the harness.
+It preserves v2 historical reads and v3 writes, raw-byte hashes, float parsing,
+series boundaries and point-in-time clocks. Its default contract enables no
+JSONL IO. The worker still depends on collector telemetry and operator/data
+helpers; moving this input implementation does not complete worker isolation.
+
 `alpha-harness` is the operator. Its default graph excludes Burn, ML fitting
 and ONNX. It owns freeze, finalization, dispatch, stopping and independent
 settlement readback. The generated Job invokes `monday-cex-worker mission
