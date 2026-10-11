@@ -764,7 +764,9 @@ impl VenueSpec {
 /// This is exposure evidence, never an account balance or a new execution grant.
 #[derive(Debug, Clone)]
 pub struct PendingRiskExposure {
+    pub strategy_id: String,
     pub symbol: Symbol,
+    pub quantity: Quantity,
     pub asset_class: AssetClass,
     pub product_type: ProductType,
     pub notional: rust_decimal::Decimal,
@@ -1088,6 +1090,7 @@ pub struct OrderRecord {
 #[derive(Debug, Clone, Copy)]
 pub struct OrderRiskView<'a> {
     pub order_id: &'a OrderId,
+    pub strategy_id: Option<&'a str>,
     pub client_order_id: Option<&'a str>,
     pub account_id: Option<&'a AccountId>,
     pub venue: Option<VenueId>,
@@ -1103,6 +1106,7 @@ impl<'a> From<&'a OrderRecord> for OrderRiskView<'a> {
     fn from(order: &'a OrderRecord) -> Self {
         Self {
             order_id: &order.order_id,
+            strategy_id: order.strategy_id.as_deref(),
             client_order_id: order.client_order_id.as_deref(),
             account_id: order.account_id.as_ref(),
             venue: order.venue,

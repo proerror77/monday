@@ -1124,6 +1124,7 @@ impl ports::OrderManager for OmsCore {
         let order = self.orders.get(order_id)?;
         Some(ports::OrderRiskView {
             order_id: &order.order_id,
+            strategy_id: order.strategy_id.as_deref(),
             client_order_id: order.client_order_id.as_deref(),
             account_id: order.account_id.as_ref(),
             venue: order.venue,

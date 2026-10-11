@@ -1611,25 +1611,8 @@ impl Engine {
         }
 
         // 階段 2: 處理執行事件 (來自执行队列) - 非阻塞批量接收
-        let mut exec_processed = 0u32;
-        let mut execution_events_buf = std::mem::take(&mut self.execution_events_buf);
-        execution_events_buf.clear();
-        if let Some(queues) = &mut self.execution_queues {
-            queues.receive_events_into(&mut execution_events_buf);
-        }
-        for ev in &execution_events_buf {
-            self.handle_execution_event(ev)?;
-            exec_processed += 1;
-            self.stats.execution_events_processed += 1;
-            if let ExecutionEvent::ExecutionStreamSynchronized { stream_id, .. } = ev {
-                if let Some(queues) = &self.execution_queues {
-                    queues.acknowledge_applied_execution_stream(*stream_id);
-                }
-            }
-        }
+        let exec_processed = self.drain_execution_reports()?;
         result.execution_events_processed = exec_processed;
-        execution_events_buf.clear();
-        self.execution_events_buf = execution_events_buf;
 
         // 階段 3: 檢查是否需要發佈快照
         if should_flip
@@ -1679,6 +1662,30 @@ impl Engine {
         }
 
         Ok(result)
+    }
+
+    /// Apply one bounded batch through the canonical owners without running strategies.
+    /// Startup bootstrap uses this same path for connection/synchronization markers.
+    pub(crate) fn drain_execution_reports(&mut self) -> HftResult<u32> {
+        let mut processed = 0u32;
+        let mut events = std::mem::take(&mut self.execution_events_buf);
+        events.clear();
+        if let Some(queues) = &mut self.execution_queues {
+            queues.receive_events_into(&mut events);
+        }
+        for event in &events {
+            self.handle_execution_event(event)?;
+            processed += 1;
+            self.stats.execution_events_processed += 1;
+            if let ExecutionEvent::ExecutionStreamSynchronized { stream_id, .. } = event {
+                if let Some(queues) = &self.execution_queues {
+                    queues.acknowledge_applied_execution_stream(*stream_id);
+                }
+            }
+        }
+        events.clear();
+        self.execution_events_buf = events;
+        Ok(processed)
     }
 
     // 注意：执行客户端连接和流准备现在由 ExecutionWorker 处理

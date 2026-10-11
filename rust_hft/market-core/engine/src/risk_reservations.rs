@@ -39,6 +39,7 @@ impl Default for RiskReservationCheckpoint {
 #[serde(deny_unknown_fields)]
 pub(super) struct Valuation {
     client_order_id: String,
+    strategy_id: String,
     account_id: Option<AccountId>,
     venue: Option<VenueId>,
     symbol: Symbol,
@@ -84,6 +85,7 @@ impl Valuation {
         .ok_or_else(|| risk_error("pending order risk cannot be valued"))?;
         let valuation = Self {
             client_order_id: envelope.client_order_id.clone(),
+            strategy_id: intent.strategy_id.clone(),
             account_id: envelope.account_id.clone(),
             venue: intent.target_venue,
             symbol: intent.symbol.clone(),
@@ -99,6 +101,7 @@ impl Valuation {
 
     fn validate(&self) -> HftResult<()> {
         if self.client_order_id.trim().is_empty()
+            || self.strategy_id.trim().is_empty()
             || self.quantity.0 <= Decimal::ZERO
             || self.unit_price.0 <= Decimal::ZERO
             || self.quantity.0.checked_mul(self.unit_price.0).is_none()
@@ -125,7 +128,9 @@ impl Valuation {
         add_gross(&mut view.account, &self.symbol, quantity, price)?;
         if quantity.0 > Decimal::ZERO {
             view.pending.push(ports::PendingRiskExposure {
+                strategy_id: self.strategy_id.clone(),
                 symbol: self.symbol.clone(),
+                quantity,
                 asset_class: self.asset_class,
                 product_type: self.product_type,
                 notional: quantity
@@ -139,6 +144,7 @@ impl Valuation {
 
     fn matches_record(&self, order: OrderRiskView<'_>) -> bool {
         order.client_order_id == Some(self.client_order_id.as_str())
+            && order.strategy_id == Some(self.strategy_id.as_str())
             && self
                 .account_id
                 .as_ref()
@@ -243,6 +249,14 @@ impl RiskReservations {
         self.recovery_required = true;
     }
 
+    pub(super) fn is_pristine(&self) -> bool {
+        !self.recovery_required
+            && !self.checkpoint_supplied
+            && self.checkpoint.queued.is_empty()
+            && self.checkpoint.orders.is_empty()
+            && self.checkpoint.cancelled.is_empty()
+    }
+
     pub(super) fn is_ready(&self) -> bool {
         !self.recovery_required
     }
@@ -291,6 +305,7 @@ impl RiskReservations {
             quantity,
             venue,
             requested_price,
+            strategy_id,
             ..
         } = event
         else {
@@ -314,6 +329,7 @@ impl RiskReservations {
                 || valuation
                     .venue
                     .is_some_and(|expected| *venue != Some(expected))
+                || &valuation.strategy_id != strategy_id
                 || &valuation.symbol != symbol
                 || valuation.side != *side
                 || valuation.quantity != *quantity

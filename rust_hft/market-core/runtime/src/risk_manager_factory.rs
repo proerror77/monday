@@ -1163,7 +1163,9 @@ mod tests {
                         account: &pending_account,
                         exposure: &pending_account,
                         pending_exposure: &[ports::PendingRiskExposure {
+                            strategy_id: intent.strategy_id.clone(),
                             symbol: intent.symbol.clone(),
+                            quantity: Quantity(Decimal::ONE),
                             asset_class: AssetClass::TokenizedSecurity,
                             product_type: ProductType::TokenizedSecuritySpot,
                             notional: Decimal::from(950),

@@ -649,6 +649,7 @@ impl ExecutionControlHandle {
         let mut baseline_processed_fill_ids =
             std::collections::HashMap::<OrderId, std::collections::HashSet<String>>::new();
         let mut baseline_recent_accounting_event_ids = Vec::new();
+        let mut baseline_order_meta = HashMap::new();
         let mut saw_balances = false;
         for client in &snapshot.clients {
             let balances = client.balances.as_ref().ok_or_else(|| {
@@ -716,6 +717,15 @@ impl ExecutionControlHandle {
                         client.client_index
                     )));
                 }
+                let metadata = (fill.symbol.clone(), fill.side);
+                if baseline_order_meta
+                    .insert(fill.order_id.clone(), metadata.clone())
+                    .is_some_and(|previous| previous != metadata)
+                {
+                    return Err(HftError::Execution(
+                        "account bootstrap found conflicting historical order identity".into(),
+                    ));
+                }
                 let inserted = baseline_processed_fill_ids
                     .entry(fill.order_id.clone())
                     .or_default()
@@ -737,12 +747,54 @@ impl ExecutionControlHandle {
         }
 
         let mut engine = self.engine.lock().await;
+        // A fresh private stream can already contain connection/synchronization markers.
+        // Apply reports canonically before checking for execution history; never drop them.
+        let limit = engine
+            .execution_queues
+            .as_ref()
+            .map_or(0, |queues| queues.pristine_bootstrap_report_limit());
+        let mut processed = 0;
+        while engine
+            .execution_queues
+            .as_ref()
+            .is_some_and(|queues| queues.has_pending_events())
+        {
+            if processed >= limit {
+                return Ok(false);
+            }
+            let batch = engine.drain_execution_reports()? as usize;
+            if batch == 0 {
+                return Ok(false);
+            }
+            processed = processed.saturating_add(batch);
+        }
         let current = engine.export_portfolio_state();
-        let pristine = current.account_view.cash_balance == Decimal::ZERO
+        let oms = engine.export_oms_checkpoint();
+        let pristine = engine.risk_reservations.is_pristine()
+            && !engine.reconciliation_halted()
+            && engine.trading_mode() != crate::TradingMode::Emergency
+            && engine.order_submit_ts.is_empty()
+            && engine.order_account_map.is_empty()
+            && engine
+                .execution_queues
+                .as_ref()
+                .is_none_or(|queues| !queues.has_sent_intents())
+            && current.account_view.cash_balance == Decimal::ZERO
             && current.account_view.positions.is_empty()
             && current.account_view.realized_pnl == Decimal::ZERO
             && current.account_view.unrealized_pnl == Decimal::ZERO
-            && engine.export_oms_state().is_empty();
+            && current.account_view.high_water_mark == Decimal::ZERO
+            && current.account_view.drawdown_pct == 0.0
+            && current.account_view.max_drawdown_pct == 0.0
+            && current.total_fees == Decimal::ZERO
+            && current.order_meta.is_empty()
+            && current.processed_fill_ids.is_empty()
+            && current.processed_fee_ids.is_empty()
+            && current.recent_accounting_event_ids.is_empty()
+            && current.reconciliation_exceptions.is_empty()
+            && oms.orders.is_empty()
+            && oms.notional_contracts.is_empty()
+            && oms.reconciliation_exceptions.is_empty();
         if !pristine {
             return Ok(false);
         }
@@ -768,7 +820,7 @@ impl ExecutionControlHandle {
         engine.import_portfolio_state(ports::PortfolioState {
             account_view,
             total_fees: Decimal::ZERO,
-            order_meta: current.order_meta,
+            order_meta: baseline_order_meta,
             market_prices: current.market_prices,
             processed_fill_ids: baseline_processed_fill_ids,
             processed_fee_ids: HashMap::new(),
@@ -776,6 +828,9 @@ impl ExecutionControlHandle {
             reconciliation_exceptions: Vec::new(),
             canonical_state_digest: None,
         })?;
+        // The same guarded pristine check proves there was no queued or submitted risk to lose.
+        // Import remains paused until the subsequent complete independent readback succeeds.
+        engine.import_risk_reservations(crate::RiskReservationCheckpoint::default())?;
         Ok(true)
     }
 
@@ -3090,6 +3145,9 @@ mod tests {
                 client_index: 0,
                 venue: Some(VenueId::POLYMARKET),
                 account_id: Some(hft_core::AccountId("polymarket-main".to_string())),
+                asset_inventory_capability: Some(
+                    ports::AssetInventoryCapability::PositionSnapshotRequired,
+                ),
                 open_orders: Ok(open_orders),
                 balances: Some(Ok(vec![balance(
                     "pUSD",
@@ -3147,6 +3205,153 @@ mod tests {
             .bootstrap_pristine_account(&polymarket_account_snapshot(Vec::new()))
             .await
             .expect("non-pristine portfolio must not be overwritten"));
+    }
+
+    #[tokio::test]
+    async fn pristine_bootstrap_with_stream_markers_reconciles_before_resume() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+        engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+        let (queues, mut worker) = crate::create_execution_queues(crate::ExecutionQueueConfig {
+            batch_size: 1,
+            ..Default::default()
+        });
+        engine.set_execution_queues(queues);
+        worker
+            .send_event(ExecutionEvent::ConnectionStatus {
+                connected: true,
+                timestamp: hft_core::now_micros(),
+            })
+            .unwrap();
+        worker
+            .send_event(ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 42,
+                connected: true,
+                timestamp: hft_core::now_micros(),
+            })
+            .unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(engine.clone(), Some(tx), false);
+        let mut snapshot = polymarket_account_snapshot(Vec::new());
+        snapshot.clients[0]
+            .positions
+            .as_mut()
+            .unwrap()
+            .as_mut()
+            .unwrap()[0]
+            .unrealized_pnl = Decimal::ZERO;
+        assert!(control.bootstrap_pristine_account(&snapshot).await.unwrap());
+        assert_eq!(worker.try_receive_applied_execution_stream(), Some(42));
+        assert_eq!(engine.lock().await.trading_mode(), TradingMode::Paused);
+        engine.lock().await.resume_trading();
+        assert_eq!(engine.lock().await.trading_mode(), TradingMode::Paused);
+        let responder = tokio::spawn(async move {
+            let Some(ControlCommand::Reconcile { reply, .. }) = rx.recv().await else {
+                panic!("expected complete readback request");
+            };
+            reply.send(snapshot).unwrap();
+        });
+        let report = control.reconcile(true).await.unwrap();
+        responder.await.unwrap();
+        assert!(report.complete && report.healthy, "{report:?}");
+        control.resume_trading().await.unwrap();
+        assert_eq!(engine.lock().await.trading_mode(), TradingMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cannot_erase_queued_or_prior_recovery_risk() {
+        for recovering in [false, true] {
+            let mut engine = Engine::new(EngineConfig::default());
+            engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+            engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+            let (queues, _worker) =
+                crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+            engine.set_execution_queues(queues);
+            if recovering {
+                engine.import_oms_state(HashMap::new());
+            } else {
+                let envelope = ports::OrderIntentEnvelope::new(
+                    ports::OrderIntent::crypto_spot(
+                        Symbol::new("123"),
+                        Side::Buy,
+                        Quantity(Decimal::ONE),
+                        hft_core::OrderType::Limit,
+                        Some(Price(Decimal::ONE)),
+                        hft_core::TimeInForce::GTC,
+                        "bootstrap-risk".into(),
+                        Some(VenueId::POLYMARKET),
+                    ),
+                    ports::OrderIntentLifecycle::new(hft_core::now_micros(), u64::MAX),
+                );
+                engine
+                    .submit_order_intent_envelope(envelope, hft_core::now_micros(), None)
+                    .unwrap();
+            }
+            let before_portfolio = engine.export_portfolio_state();
+            let before_risk = engine.export_risk_reservations();
+            let engine = Arc::new(Mutex::new(engine));
+            let control = ExecutionControlHandle::new(engine.clone(), None, false);
+            assert!(!control
+                .bootstrap_pristine_account(&polymarket_account_snapshot(Vec::new()))
+                .await
+                .unwrap());
+            let engine = engine.lock().await;
+            assert_eq!(engine.export_risk_reservations(), before_risk);
+            assert_eq!(
+                serde_json::to_value(engine.export_portfolio_state()).unwrap(),
+                serde_json::to_value(before_portfolio).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_applies_order_reports_before_deciding_the_account_is_pristine() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+        engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+        let (queues, mut worker) = crate::create_execution_queues(crate::ExecutionQueueConfig {
+            batch_size: 1,
+            ..Default::default()
+        });
+        engine.set_execution_queues(queues);
+        worker
+            .send_event(ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 43,
+                connected: true,
+                timestamp: hft_core::now_micros(),
+            })
+            .unwrap();
+        worker
+            .send_event(ExecutionEvent::OrderNew {
+                order_id: OrderId("unbound".into()),
+                client_order_id: Some("unbound-client".into()),
+                account_id: Some(hft_core::AccountId("polymarket-main".into())),
+                symbol: Symbol::new("123"),
+                side: Side::Buy,
+                quantity: Quantity(Decimal::ONE),
+                requested_price: Some(Price(Decimal::ONE)),
+                arrival_price: None,
+                timestamp: hft_core::now_micros(),
+                venue: Some(VenueId::POLYMARKET),
+                strategy_id: "unbound".into(),
+            })
+            .unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+        let control = ExecutionControlHandle::new(engine.clone(), None, false);
+        assert!(!control
+            .bootstrap_pristine_account(&polymarket_account_snapshot(Vec::new()))
+            .await
+            .unwrap());
+        let engine = engine.lock().await;
+        assert!(engine
+            .export_oms_state()
+            .contains_key(&OrderId("unbound".into())));
+        assert_eq!(
+            engine.export_portfolio_state().account_view.cash_balance,
+            Decimal::ZERO
+        );
+        assert!(!engine.risk_reservations.is_ready());
     }
 
     #[tokio::test]
@@ -3391,6 +3596,7 @@ mod tests {
         assert_eq!(orders.len(), 1);
         let mut order = orders.drain().next().unwrap().1;
         order.client_order_id = Some(format!("admitted-{}", order.order_id.0));
+        order.strategy_id = Some("replacement-fixture".into());
         order.limit_price = order
             .limit_price
             .or(order.avg_price)

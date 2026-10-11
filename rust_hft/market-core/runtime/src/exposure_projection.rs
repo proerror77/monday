@@ -54,6 +54,34 @@ impl ExposureProjector {
         }
     }
 
+    /// Pending orders have not reduced any actual position. Keep them gross even
+    /// when two admitted strategies submitted opposite sides for the same symbol.
+    pub(crate) fn reserve_pending(
+        &mut self,
+        pending: &ports::PendingRiskExposure,
+    ) -> Result<(), &'static str> {
+        if pending.quantity.0 <= Decimal::ZERO || pending.notional <= Decimal::ZERO {
+            return Err("pending exposure lacks a positive quantity or valuation");
+        }
+        let existing = self
+            .remaining_quantity
+            .get(&pending.symbol)
+            .copied()
+            .unwrap_or_default();
+        let quantity = existing
+            .abs()
+            .checked_add(pending.quantity.0)
+            .ok_or("pending position overflow")?;
+        let notional = self
+            .gross_notional
+            .checked_add(pending.notional)
+            .ok_or("pending notional overflow")?;
+        self.remaining_quantity
+            .insert(pending.symbol.clone(), quantity);
+        self.gross_notional = notional;
+        Ok(())
+    }
+
     pub(crate) fn project(
         &mut self,
         intent: &OrderIntent,

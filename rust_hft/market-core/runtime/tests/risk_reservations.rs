@@ -151,6 +151,17 @@ impl Harness {
     }
 
     async fn submit(&mut self, symbol: &str, side: Side, price: i64) -> HftResult<OrderId> {
+        self.submit_for_strategy(symbol, side, price, "reservation-test")
+            .await
+    }
+
+    async fn submit_for_strategy(
+        &mut self,
+        symbol: &str,
+        side: Side,
+        price: i64,
+        strategy: &str,
+    ) -> HftResult<OrderId> {
         let now = now_micros();
         let envelope = OrderIntentEnvelope::new(
             OrderIntent::crypto_spot(
@@ -160,7 +171,7 @@ impl Harness {
                 OrderType::Limit,
                 Some(Price(Decimal::from(price))),
                 TimeInForce::GTC,
-                "reservation-test".into(),
+                strategy.into(),
                 Some(VenueId::BINANCE),
             ),
             OrderIntentLifecycle::new(now, u64::MAX),
@@ -670,4 +681,102 @@ async fn mismatched_terminal_oms_cannot_discard_admitted_risk_on_restore() {
         recovered.engine.lock().await.trading_mode(),
         engine::TradingMode::Paused
     );
+}
+
+impl Harness {
+    async fn enable_portfolio_risk(&mut self) {
+        let config = SystemRiskConfig {
+            risk_type: "Default".into(),
+            global_position_limit: Decimal::from(100),
+            global_notional_limit: Decimal::from(1_000),
+            max_orders_per_second: 100,
+            staleness_threshold_us: 60_000_000,
+            max_daily_loss: Decimal::from(10_000),
+            max_drawdown_pct: 5.0,
+            ..Default::default()
+        };
+        let portfolios = ["alpha-a", "alpha-b"]
+            .into_iter()
+            .map(|strategy| runtime::PortfolioSpec {
+                name: strategy.into(),
+                strategies: vec![strategy.into()],
+                max_notional: Some(Decimal::from(100)),
+                ..Default::default()
+            })
+            .collect();
+        let strategies: Vec<_> = ["alpha-a", "alpha-b", "unassigned"]
+            .into_iter()
+            .map(|name| runtime::StrategyConfig {
+                name: name.into(),
+                strategy_type: runtime::StrategyType::Imbalance,
+                symbols: vec![],
+                params: runtime::StrategyParams::Imbalance {
+                    obi_threshold: 0.5,
+                    lot: Decimal::ONE,
+                    top_levels: 1,
+                },
+                risk_limits: Default::default(),
+            })
+            .collect();
+        self.engine
+            .lock()
+            .await
+            .register_risk_manager_boxed(Box::new(runtime::PortfolioBudgetRiskManager::new(
+                RiskManagerFactory::create_strategy_aware_risk_manager(&config),
+                portfolios,
+                &strategies,
+            )));
+    }
+}
+
+#[tokio::test]
+async fn pending_orders_reserve_only_their_declared_portfolio() {
+    let mut h = Harness::new(8);
+    h.enable_portfolio_risk().await;
+    h.submit_for_strategy("BTCUSDT", Side::Buy, 60, "alpha-a")
+        .await
+        .unwrap();
+    h.bind_next().await;
+    h.submit_for_strategy("ETHUSDT", Side::Buy, 60, "alpha-b")
+        .await
+        .unwrap();
+    h.bind_next().await;
+    assert!(h
+        .submit_for_strategy("SOLUSDT", Side::Buy, 60, "alpha-a")
+        .await
+        .is_err());
+    assert!(h.worker.receive_envelopes().is_empty());
+}
+
+#[tokio::test]
+async fn declared_unassigned_strategy_does_not_consume_a_portfolio_budget() {
+    let mut h = Harness::new(8);
+    h.enable_portfolio_risk().await;
+    h.submit_for_strategy("BTCUSDT", Side::Buy, 60, "unassigned")
+        .await
+        .unwrap();
+    h.bind_next().await;
+    h.submit_for_strategy("ETHUSDT", Side::Buy, 60, "alpha-a")
+        .await
+        .unwrap();
+    assert_eq!(h.worker.receive_envelopes().len(), 1);
+}
+
+#[tokio::test]
+async fn unknown_strategy_cannot_be_assumed_outside_a_portfolio_budget() {
+    let mut h = Harness::new(8);
+    h.enable_portfolio_risk().await;
+    assert!(h
+        .submit_for_strategy("XRPUSDT", Side::Buy, 60, "")
+        .await
+        .is_err());
+    h.submit_for_strategy("BTCUSDT", Side::Buy, 60, "unknown")
+        .await
+        .unwrap();
+    h.bind_next().await;
+    assert!(h
+        .submit_for_strategy("ETHUSDT", Side::Buy, 60, "alpha-a")
+        .await
+        .is_err());
+    assert!(h.worker.receive_envelopes().is_empty());
 }

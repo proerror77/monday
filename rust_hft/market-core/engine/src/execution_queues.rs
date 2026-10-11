@@ -134,6 +134,21 @@ pub fn create_execution_queues(config: ExecutionQueueConfig) -> (EngineQueues, W
 }
 
 impl EngineQueues {
+    pub(crate) fn has_pending_events(&self) -> bool {
+        !self.event_consumer.is_empty()
+    }
+
+    pub(crate) fn pristine_bootstrap_report_limit(&self) -> usize {
+        self.config
+            .event_queue_capacity
+            .max(self.config.batch_size)
+            .max(2)
+    }
+
+    pub(crate) fn has_sent_intents(&self) -> bool {
+        self.stats.intents_sent != 0
+    }
+
     /// 发送订单意图到执行 worker (非阻塞)
     #[allow(clippy::result_large_err)] // Returning ownership avoids a heap allocation on the hot path.
     pub fn send_intent(
