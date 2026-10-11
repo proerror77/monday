@@ -358,6 +358,7 @@ struct State {
     claims: BTreeSet<String>,
     controls: BTreeSet<String>,
     source_reads: u64,
+    anchors: Vec<String>,
 }
 fn open(path: &Path, create: bool) -> Result<std::fs::File> {
     ensure!(path.is_absolute(), "budget ledger requires absolute path");
@@ -395,12 +396,14 @@ fn now() -> Result<u64> {
 fn initialization_path(path: &Path) -> PathBuf {
     path.with_extension("initialized")
 }
-fn require_initialization(path: &Path, header: &Header) -> Result<()> {
+fn require_initialization(path: &Path, state: &State) -> Result<()> {
     let mut marker = open(&initialization_path(path), false)?;
     let mut bytes = Vec::new();
-    Read::by_ref(&mut marker).take(66).read_to_end(&mut bytes)?;
+    Read::by_ref(&mut marker)
+        .take(LEDGER_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
     ensure!(
-        bytes == format!("{}\n", crate::identity(header)?).as_bytes(),
+        bytes == format!("{}\n", state.anchors.join("\n")).as_bytes(),
         "budget initialization marker missing or changed"
     );
     Ok(())
@@ -580,7 +583,7 @@ impl Ledger {
     pub fn from_path(path: &Path) -> Result<Self> {
         let mut file = open(path, false)?;
         let state = Self::read(&mut file)?;
-        require_initialization(path, &state.header)?;
+        require_initialization(path, &state)?;
         let m = file.metadata()?;
         Ok(Self {
             reference: Reference {
@@ -627,6 +630,7 @@ impl Ledger {
         );
         let mut state = State {
             previous: crate::identity(&header)?,
+            anchors: vec![crate::identity(&header)?],
             header,
             records: 0,
             reserved: Limits::default(),
@@ -645,6 +649,7 @@ impl Ledger {
             state.apply(&record.action, false)?;
             state.records = record.sequence;
             state.previous = crate::identity(&record)?;
+            state.anchors.push(state.previous.clone());
         }
         Ok(state)
     }
@@ -656,7 +661,7 @@ impl Ledger {
             "budget ledger replaced"
         );
         let state = Self::read(&mut file)?;
-        require_initialization(&self.reference.ledger_path, &state.header)?;
+        require_initialization(&self.reference.ledger_path, &state)?;
         ensure!(
             crate::identity(&state.header.envelope)? == self.reference.envelope_sha256
                 && crate::identity(&state.header)? == self.reference.binding_sha256,
@@ -683,6 +688,20 @@ impl Ledger {
                 .is_some_and(|n| n <= LEDGER_LIMIT),
             "budget ledger capacity exhausted"
         );
+        // Commit the intention first. Losing a complete journal record cannot reset it.
+        let mut marker = open(&initialization_path(&self.reference.ledger_path), false)?;
+        let anchor = format!("{}\n", crate::identity(&record)?);
+        ensure!(
+            marker
+                .metadata()?
+                .len()
+                .checked_add(anchor.len() as u64)
+                .is_some_and(|n| n <= LEDGER_LIMIT),
+            "budget anchor capacity exhausted"
+        );
+        marker.seek(SeekFrom::End(0))?;
+        marker.write_all(anchor.as_bytes())?;
+        marker.sync_all()?;
         file.seek(SeekFrom::End(0))?;
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
@@ -1190,6 +1209,14 @@ pub(crate) mod tests {
         let dir = directory()?;
         let (b, i, mut e) = fixture("controller", 1, 1);
         e.expires_at_ms = now()? + 1000;
+        let ready = Ledger::create(
+            &dir.path().canonicalize()?.join("ready"),
+            e.clone(),
+            b.clone(),
+            i.clone(),
+            "d".repeat(64),
+        )?;
+        exchange(&ready, Phase::Source)?;
         let l = Ledger::create(
             &dir.path().canonicalize()?.join("ledger"),
             e,
@@ -1201,7 +1228,8 @@ pub(crate) mod tests {
         l.reserve(Phase::Source, Service::Oidc, "oidc", 0, 64)?;
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert_eq!(l.status()?.reserved.requests, 1);
-        assert!(l.claim("source_ready").is_err());
+        // All prerequisites exist; only expiry prevents this new claim.
+        assert!(ready.claim("preflight").is_err());
         assert!(l
             .reserve(Phase::Source, Service::Sts, "sts", 64, 64)
             .is_err());
@@ -1249,6 +1277,32 @@ pub(crate) mod tests {
         assert!(ledger(dir.path()).is_err());
         assert!(!path.exists());
         assert!(initialization_path(&path).exists());
+        Ok(())
+    }
+    #[test]
+    fn budget_complete_record_removal_and_interrupted_append_cannot_refund() -> Result<()> {
+        let dir = directory()?;
+        let l = ledger(dir.path())?;
+        let path = l.reference().ledger_path;
+        l.claim("source_exchange")?;
+        let before = std::fs::read(&path)?;
+        l.reserve(Phase::Source, Service::Oidc, "oidc", 0, 64)?;
+        let after = std::fs::read(&path)?;
+        std::fs::write(&path, &before)?; // Entire last line lost; still valid JSONL.
+        assert!(Ledger::from_path(&path).is_err());
+        assert!(l
+            .reserve(Phase::Source, Service::Oidc, "oidc", 0, 64)
+            .is_err());
+        assert!(ledger(dir.path()).is_err());
+        std::fs::write(&path, &after)?;
+        assert_eq!(l.status()?.reserved.requests, 1);
+        // Simulate the durable intent completing before a crashed journal append.
+        let mut marker = std::fs::OpenOptions::new()
+            .append(true)
+            .open(initialization_path(&path))?;
+        marker.write_all(format!("{}\n", "e".repeat(64)).as_bytes())?;
+        marker.sync_all()?;
+        assert!(Ledger::from_path(&path).is_err());
         Ok(())
     }
     #[test]

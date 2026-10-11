@@ -410,7 +410,9 @@ Both wrapper modes use the same private path:
 `RUNNER_TEMP/research-oss-budget/RUN_ID/ATTEMPT/PRODUCT/ledger.jsonl`.
 The directory is private. Initialization creates an exclusive permanent marker before the journal.
 An existing marker, missing journal or incomplete journal denies reinitialization.
-Reservations use an exclusive process lock, ordered hash-linked records and `fsync` before sending.
+Reservations use an exclusive process lock and ordered hash-linked records.
+Each record digest is synced to the permanent marker before syncing the journal and sending.
+Whole-record truncation or interrupted append makes the two files disagree and stops execution.
 Exchange, preflight and publication each have one-time ordered claims.
 Missing, changed, linked, replaced, overdrawn or expired state stops execution.
 Crash recovery never refunds reservations or resumes a consumed exchange.
@@ -464,6 +466,8 @@ It contains public run/product identity, reserved counters, service counts and c
 It omits private paths, cloud identities, policy hashes, STS credentials, JWTs and signing material.
 If the private journal cannot be verified, the wrapper reports `usage_known: false` and fails.
 The workflow must retain this public receipt with `always()`.
+INT and TERM run the exit summary. SIGKILL or runner loss cannot guarantee a receipt.
+A surviving workflow can independently invoke `budget-summary`; destroyed state remains unknown.
 Never retain the private journal, marker or session.
 A missing receipt is not zero expenditure or a successful publication.
 
