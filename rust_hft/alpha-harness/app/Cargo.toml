@@ -7,16 +7,18 @@ publish = false
 
 [features]
 default = ["operator"]
-operator = ["alpha-engine/llm"]
-scientific = ["alpha-engine/fitting", "hft-research-platform/artifact-io", "dep:hft-cex-search-driver"]
+operator = ["alpha-engine/llm", "dep:hft-collector", "dep:hft-research-dispatch-io", "dep:hft-research-platform"]
+scientific = ["alpha-engine/fitting", "dep:hft-cex-search-driver"]
 onnx-compatibility = ["operator", "dep:alpha-onnx-evaluator"]
 
 [dependencies]
 hft-cex-search-driver = { path = "../search-driver", optional = true }
-hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["artifact-io", "native-admission", "release-verification", "campaign-result-validation"] }
-hft-cex-research-input = { path = "../../research-core/cex-input", features = ["streaming", "market-parquet"] }
+hft-research-platform = { path = "../../research-core/platform", optional = true, default-features = false, features = ["native-admission", "release-verification"] }
+hft-research-worker-contracts = { path = "../../research-core/worker-contracts" }
+hft-research-worker-io = { path = "../../research-core/worker-io" }
+hft-cex-research-input = { path = "../../research-core/cex-input", features = ["feature-jsonl", "streaming", "market-parquet"] }
 hft-research-artifacts = { path = "../../research-core/artifacts" }
-hft-research-dispatch-io = { path = "../../research-core/dispatch-io" }
+hft-research-dispatch-io = { path = "../../research-core/dispatch-io", optional = true }
 alpha-domain = { path = "../domain" }
 alpha-engine = { path = "../engine", default-features = false, features = ["kernel"] }
 alpha-onnx-evaluator = { path = "../onnx-evaluator", optional = true }
@@ -29,7 +31,8 @@ clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 governance = { package = "hft-governance-contracts", path = "../../governance-contracts" }
 hex = { workspace = true }
-hft-collector = { path = "../../tools/collector", features = ["collector-binance"] }
+hft-collector = { path = "../../tools/collector", optional = true, features = ["collector-binance"] }
+hft-data = { path = "../../data-pipelines/core" }
 hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 hft-backtest = { path = "../../apps/backtest" }
 hft-research-manifest = { path = "../../research-core/manifest" }
@@ -47,6 +50,8 @@ path = "src/main.rs"
 required-features = ["operator"]
 
 [dev-dependencies]
+hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["native-admission", "release-verification"] }
+hft-research-dispatch-io = { path = "../../research-core/dispatch-io" }
 hft-prepared-market-io = { path = "../../research-core/prepared-market-io" }
 parquet = { version = "59.1", default-features = false, features = ["zstd"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

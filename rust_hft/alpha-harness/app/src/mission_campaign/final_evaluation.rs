@@ -254,6 +254,7 @@ impl FinalRequest {
     }
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
     if !args.seeds.is_empty() || args.research_plan.is_some() {
         bail!("final evaluation cannot add seeds or a research plan");
@@ -294,6 +295,7 @@ pub(crate) fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
     )
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     let plan: FinalFreeze = mission_dispatch::final_admission::read_bounded_json(&args.freeze)?;
     plan.canonical_request.validate()?;

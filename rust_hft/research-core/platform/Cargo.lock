@@ -689,6 +689,8 @@ dependencies = [
  "hft-cex-research-input",
  "hft-research-agent-contracts",
  "hft-research-agent-improvement",
+ "hft-research-worker-contracts",
+ "hft-research-worker-io",
  "hmac",
  "jsonwebtoken",
  "reqwest",
@@ -700,6 +702,34 @@ dependencies = [
  "sqlx-core",
  "sqlx-postgres",
  "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "hft-research-worker-contracts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "hft-cex-research-input",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "hft-research-worker-io"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "hft-research-worker-contracts",
+ "reqwest",
+ "rustix 0.38.44",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
  "tokio-util",
  "zip",

@@ -1,8 +1,8 @@
 use crate::mission_objects::{cex_campaign_round_root, cex_global_holdout_claim_object};
+use hft_research_artifacts::identity::{canonical_tokyo_oss_internal_object, validate_dns_label};
 #[cfg(feature = "scientific")]
 use hft_research_artifacts::publish_immutable_file;
 use hft_research_artifacts::{fetch_to_file, normalized_sha256};
-use hft_research_dispatch_io::{canonical_tokyo_oss_internal_object, validate_dns_label};
 pub(crate) mod final_evaluation;
 pub(crate) mod market_encoder;
 #[cfg(feature = "scientific")]
@@ -13,6 +13,7 @@ pub(crate) mod representation;
 pub(crate) mod sequence;
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(any(feature = "operator", test))]
 pub(crate) mod workflow;
 use crate::cli::print_json;
 use crate::cli::CampaignFinalizeArgs;
@@ -657,6 +658,7 @@ pub fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
     execute_loaded_request(args, loaded)
 }
 
+#[cfg(any(feature = "operator", test))]
 pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
     if market_encoder::is_market_encoder_plan(args.research_plan.as_deref())? {
         return market_encoder::freeze(args);
@@ -709,6 +711,7 @@ pub fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
     })
 }
 
+#[cfg(any(feature = "operator", test))]
 pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
     let source = mission_dispatch::read_authenticated_settled_campaign_source(
         &args.control,
@@ -849,6 +852,7 @@ pub fn learn(args: CampaignLearnArgs) -> anyhow::Result<()> {
     print_json(&report)
 }
 
+#[cfg(any(feature = "operator", test))]
 pub fn propose_next_family(args: CampaignStudyProposeArgs) -> anyhow::Result<()> {
     let authenticated = mission_dispatch::read_authenticated_campaign_parent(
         &args.parent_control,
@@ -1463,6 +1467,7 @@ fn campaign_learn_report(
     })
 }
 
+#[cfg(any(feature = "operator", test))]
 pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     if market_encoder::is_market_encoder_freeze(&args.freeze)? {
         return market_encoder::finalize(args);
@@ -1483,6 +1488,7 @@ pub fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     })
 }
 
+#[cfg(any(feature = "operator", test))]
 fn finalize_with_native_readback(
     args: CampaignFinalizeArgs,
     acquire: impl FnOnce(
@@ -2345,7 +2351,7 @@ fn canonical_https_object_prefix(label: &str, value: &str) -> anyhow::Result<Str
         .context("campaign inputs output root host is missing")?;
     if !host.ends_with(&format!(
         ".{}",
-        hft_research_dispatch_io::TOKYO_OSS_INTERNAL_ENDPOINT
+        hft_research_artifacts::identity::TOKYO_OSS_INTERNAL_ENDPOINT
     )) {
         bail!("{label} must target the Tokyo OSS internal endpoint");
     }
@@ -8070,7 +8076,7 @@ pub(crate) mod tests {
         .unwrap();
         request.holdout_claim_put_url = format!(
             "{campaign_root}/holdout-id-sha256={}/sealed-holdout-claim.json",
-            hft_research_dispatch_io::sha256_text(&request.holdout_id)
+            hft_research_artifacts::identity::sha256_text(&request.holdout_id)
         );
         request.holdout_claim_readback_url = request.holdout_claim_put_url.clone();
 

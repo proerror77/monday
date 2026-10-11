@@ -1,6 +1,7 @@
 //! Scoped immutable artifact transport shared by scientific and preparation workers.
-use crate::{orchestrator::Artifact, sha256};
+use crate::sha256;
 use anyhow::{ensure, Context, Result};
+use hft_research_worker_contracts::task::Artifact;
 
 /// The gateway must enforce per-attempt write identity and immutable object keys.
 /// No bucket-wide key, signing key, deployment or database write key is needed.
@@ -14,7 +15,7 @@ impl Writer {
     pub fn new(
         endpoint: &str,
         token: String,
-        context: &crate::orchestrator::AttemptContext,
+        context: &hft_research_worker_contracts::task::AttemptContext,
     ) -> Result<Self> {
         Self::with_tls(
             endpoint,
@@ -26,7 +27,7 @@ impl Writer {
     pub fn with_tls(
         endpoint: &str,
         token: String,
-        context: &crate::orchestrator::AttemptContext,
+        context: &hft_research_worker_contracts::task::AttemptContext,
         tls: &crate::transport::TlsConfig,
     ) -> Result<Self> {
         context.validate()?;

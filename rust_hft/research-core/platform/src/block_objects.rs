@@ -19,9 +19,9 @@ pub struct Objects {
 
 impl Objects {
     pub fn new() -> Result<Self> {
-        Self::with_tls(&crate::transport::TlsConfig::default())
+        Self::with_tls(&hft_research_worker_io::transport::TlsConfig::default())
     }
-    pub fn with_tls(tls: &crate::transport::TlsConfig) -> Result<Self> {
+    pub fn with_tls(tls: &hft_research_worker_io::transport::TlsConfig) -> Result<Self> {
         Ok(Self {
             client: tls.client(std::time::Duration::from_secs(30), true)?,
         })

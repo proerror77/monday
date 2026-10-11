@@ -190,6 +190,7 @@ pub(crate) fn is_market_encoder_freeze(path: &Path) -> anyhow::Result<bool> {
     Ok(value["schema_version"] == FREEZE_SCHEMA)
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     let frozen: MarketFreeze = read_json(&args.freeze)?;
     if frozen.schema_version != FREEZE_SCHEMA {
@@ -228,6 +229,7 @@ pub(crate) fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     )
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
     if args.reuse.is_some()
         || args.reuse_sha256.is_some()

@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
-use hft_research_platform::{
-    orchestrator::TaskSpec,
-    postgres::Ledger,
-    preparation::PreparationPlan,
-    research::{Experiment, ResearchTool, Run, Session, SessionSnapshot},
+use {
+    hft_research_platform::postgres::Ledger, hft_research_platform::preparation::PreparationPlan,
+    hft_research_platform::research::Experiment, hft_research_platform::research::ResearchTool,
+    hft_research_platform::research::Session, hft_research_platform::research::SessionSnapshot,
+    hft_research_worker_contracts::research::Run, hft_research_worker_contracts::task::TaskSpec,
 };
 
 async fn ledger() -> Result<Ledger> {
@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
         }
         ["tool",endpoint,token_path,path] => {
             let tool: ResearchTool = read(path)?;
-            let tls = hft_research_platform::transport::TlsConfig {
+            let tls = hft_research_worker_io::transport::TlsConfig {
                 ca_file: std::env::var_os("MONDAY_RESEARCH_TOOL_CA_FILE").map(Into::into),
                 identity_file: std::env::var_os("MONDAY_RESEARCH_TOOL_IDENTITY_FILE").map(Into::into),
             };
@@ -63,16 +63,16 @@ async fn main() -> Result<()> {
         }
         ["plan-build",path]=>{let build:hft_research_platform::build::BuildSpec=read(path)?;println!("{}",serde_json::to_string(&build.cargo_arguments()?)?);}
         ["register-native-admission",path]=>{
-            let signed:hft_research_platform::admission::SignedNativeAdmission=read(path)?;
+            let signed:hft_research_worker_contracts::admission::SignedNativeAdmission=read(path)?;
             let trust_path=std::env::var("MONDAY_RESEARCH_NATIVE_ADMISSION_TRUST_FILE").context("operator native reservation trust file required")?;
-            let trust:hft_research_platform::admission::NativeAdmissionTrust=read(&trust_path)?;
+            let trust:hft_research_worker_contracts::admission::NativeAdmissionTrust=read(&trust_path)?;
             let verified=trust.verify(&signed)?;
             println!("{}",ledger().await?.register_native_admission(&verified).await?);
         }
         ["register-native-campaign-inputs",signed_path,manifest_path,blocks_path]=>{
-            let signed:hft_research_platform::admission::SignedNativeAdmission=read(signed_path)?;
+            let signed:hft_research_worker_contracts::admission::SignedNativeAdmission=read(signed_path)?;
             let trust_path=std::env::var("MONDAY_RESEARCH_NATIVE_ADMISSION_TRUST_FILE").context("operator native reservation trust file required")?;
-            let trust:hft_research_platform::admission::NativeAdmissionTrust=read(&trust_path)?;
+            let trust:hft_research_worker_contracts::admission::NativeAdmissionTrust=read(&trust_path)?;
             let native=trust.verify(&signed)?;
             let manifest:hft_cex_research_input::campaign::CampaignPreparedInputsV1=read_bounded(manifest_path,64*1024*1024)?;
             let mut source=hft_cex_research_input::prepared::SharedFiles::new(std::path::Path::new(blocks_path))?;
@@ -83,8 +83,8 @@ async fn main() -> Result<()> {
         ["register-native-request-revocation",path]=>{
             let signed:hft_research_platform::revocation::SignedNativeRequestRevocation=read(path)?;
             let trust_path=std::env::var("MONDAY_RESEARCH_NATIVE_ADMISSION_TRUST_FILE").context("operator native reservation trust file required")?;
-            let trust:hft_research_platform::admission::NativeAdmissionTrust=read(&trust_path)?;
-            let verified=trust.verify_revocation(&signed)?;
+            let trust:hft_research_worker_contracts::admission::NativeAdmissionTrust=read(&trust_path)?;
+            let verified=hft_research_platform::revocation::verify_revocation(&trust, &signed)?;
             println!("{}",ledger().await?.register_native_request_revocation(&verified).await?);
         }
         ["subscribe",tenant,session,run]=>{ledger().await?.subscribe(tenant,session,run).await?;println!("subscribed");}

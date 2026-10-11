@@ -1,9 +1,13 @@
 use super::*;
-use hft_research_platform::{
-    execution::{render, resource_name, Acceptance, Backend, Profile},
-    orchestrator::{TaskKind, WorkerConfigurationRef},
-};
 use serde_json::json;
+use {
+    hft_research_platform::execution::render, hft_research_platform::execution::resource_name,
+    hft_research_platform::execution::Acceptance,
+    hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::execution::Profile,
+    hft_research_worker_contracts::task::TaskKind,
+    hft_research_worker_contracts::task::WorkerConfigurationRef,
+};
 
 fn fixture() -> (
     TaskSpec,

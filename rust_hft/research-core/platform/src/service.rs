@@ -3,11 +3,11 @@
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    execution::{Backend, Kubernetes, Observation},
-    orchestrator::{ResultReceipt, State, Task},
-    postgres::Ledger,
-    sha256,
+use {
+    crate::execution::Kubernetes, crate::execution::Observation, crate::orchestrator::State,
+    crate::orchestrator::Task, crate::postgres::Ledger, crate::sha256,
+    hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::task::ResultReceipt,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -23,7 +23,7 @@ pub struct ServiceConfig {
     pub build_oss: crate::build_objects::OssLocation,
     pub build_oss_session_file: std::path::PathBuf,
     #[serde(default)]
-    pub artifact_tls: crate::transport::TlsConfig,
+    pub artifact_tls: hft_research_worker_io::transport::TlsConfig,
     pub lease_ms: i64,
     pub agent_api: Option<crate::agent_api::AgentApiConfig>,
     #[serde(default)]
@@ -45,7 +45,7 @@ pub struct ArtifactGateway {
 #[derive(Debug)]
 pub struct ResultReadback {
     receipt: ResultReceipt,
-    campaign: Option<crate::campaign_result::CexCampaignResultReceipt>,
+    campaign: Option<hft_research_worker_contracts::campaign_result::CexCampaignResultReceipt>,
 }
 
 impl ArtifactGateway {
@@ -63,12 +63,16 @@ impl ArtifactGateway {
         })
     }
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
-        Self::with_tls(endpoint, token, &crate::transport::TlsConfig::default())
+        Self::with_tls(
+            endpoint,
+            token,
+            &hft_research_worker_io::transport::TlsConfig::default(),
+        )
     }
     pub fn with_tls(
         endpoint: &str,
         token: String,
-        tls: &crate::transport::TlsConfig,
+        tls: &hft_research_worker_io::transport::TlsConfig,
     ) -> Result<Self> {
         let base = reqwest::Url::parse(endpoint)?;
         ensure!(
@@ -155,7 +159,7 @@ impl ArtifactGateway {
         // that readback within this receipt, including its object key and size.
         let mut verified = std::collections::BTreeSet::new();
         let mut campaign = None;
-        if task.spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+        if task.spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
             let artifact = receipt
                 .artifacts
                 .iter()
@@ -173,7 +177,7 @@ impl ArtifactGateway {
                 bytes.len() as u64 == artifact.bytes && sha256(&bytes) == artifact.sha256,
                 "Campaign evidence receipt changed"
             );
-            let science: crate::campaign_result::CexCampaignResultReceipt =
+            let science: hft_research_worker_contracts::campaign_result::CexCampaignResultReceipt =
                 serde_json::from_slice(&bytes)?;
             science.validate(&task.spec, &receipt.artifacts)?;
             for round in &science.rounds {
@@ -249,7 +253,7 @@ impl ArtifactGateway {
 
     pub(crate) async fn verify_artifact(
         &self,
-        artifact: &crate::orchestrator::Artifact,
+        artifact: &hft_research_worker_contracts::task::Artifact,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
         let mut response = self
@@ -283,8 +287,8 @@ impl ArtifactGateway {
 
     async fn verify_native_archive(
         &self,
-        artifact: &crate::orchestrator::Artifact,
-        entries: &[crate::campaign_result::ArchiveEntry],
+        artifact: &hft_research_worker_contracts::task::Artifact,
+        entries: &[hft_research_worker_contracts::campaign_result::ArchiveEntry],
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
         use std::io::Write;
@@ -321,7 +325,11 @@ impl ArtifactGateway {
             "native archive content changed"
         );
         file.as_file().sync_all()?;
-        crate::campaign_result::verify_archive_entries(file.reopen()?, entries, 512 * 1024 * 1024)?;
+        hft_research_worker_io::archive::verify_archive_entries(
+            file.reopen()?,
+            entries,
+            512 * 1024 * 1024,
+        )?;
         Ok(())
     }
 }
@@ -369,7 +377,9 @@ impl Reconciler {
                 .stop(&locked.task.spec, &lease, locked.task.execution.as_ref())
                 .await?
             {
-                if locked.task.spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+                if locked.task.spec.kind
+                    == hft_research_worker_contracts::task::TaskKind::CexCampaign
+                {
                     let issuer = self
                         .issuer
                         .as_ref()
@@ -434,7 +444,9 @@ impl Reconciler {
             }
             let acceptance = self.ledger.acceptance(&locked.task.spec).await?;
             let issued =
-                if locked.task.spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+                if locked.task.spec.kind
+                    == hft_research_worker_contracts::task::TaskKind::CexCampaign
+                {
                     Some(
                         locked
                             .issue_attempt_identity(self.issuer.as_ref().context(
@@ -548,11 +560,6 @@ pub fn config_identity(config: &ServiceConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        execution::{Backend, Profile},
-        orchestrator::{Artifact, Task, TaskKind, TaskSpec},
-        sha256,
-    };
     use hft_cex_research_input::{
         data::{
             BlockRef, DataViewSpec, Exit, FeatureFrame, PublishedView, Split, TypedBlock, Window,
@@ -560,6 +567,14 @@ mod tests {
         identity, prepared,
     };
     use std::{collections::BTreeMap, sync::Arc};
+    use {
+        crate::orchestrator::Task, crate::sha256,
+        hft_research_worker_contracts::execution::Backend,
+        hft_research_worker_contracts::execution::Profile,
+        hft_research_worker_contracts::task::Artifact,
+        hft_research_worker_contracts::task::TaskKind,
+        hft_research_worker_contracts::task::TaskSpec,
+    };
 
     #[tokio::test]
     async fn prepared_receipt_verifies_each_key_even_when_digests_match() -> Result<()> {

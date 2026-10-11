@@ -1,8 +1,11 @@
 //! Builds contain compiler inputs, never scientific parameters or Attempt state.
 //! A writable Cargo cache is an optimization, not an executable or admission.
-use crate::{identity, orchestrator::Artifact, sha256, valid_digest};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
+use {
+    crate::identity, crate::sha256, crate::valid_digest,
+    hft_research_worker_contracts::task::Artifact,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

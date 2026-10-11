@@ -1,12 +1,12 @@
 use ed25519_dalek::{Signer, SigningKey};
-use hft_research_platform::{
-    build::BuildArtifact,
-    identity,
-    orchestrator::Artifact,
-    release::{
-        BuildReleaseReceipt, BuildReleaseTrust, ReleaseProducer, SignedBuildRelease, SourceArchive,
-    },
-    sha256,
+use {
+    hft_research_platform::build::BuildArtifact,
+    hft_research_platform::release::BuildReleaseReceipt,
+    hft_research_platform::release::BuildReleaseTrust,
+    hft_research_platform::release::ReleaseProducer,
+    hft_research_platform::release::SignedBuildRelease,
+    hft_research_platform::release::SourceArchive, hft_research_worker_contracts::identity,
+    hft_research_worker_contracts::sha256, hft_research_worker_contracts::task::Artifact,
 };
 
 pub fn attest(

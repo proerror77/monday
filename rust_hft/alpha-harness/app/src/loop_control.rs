@@ -569,7 +569,7 @@ mod tests {
     };
     use alpha_store::{ApprovalRecord, EvaluationRecord, MemoryRecord, RegistryRevision};
     use chrono::Duration;
-    use hft_collector::{
+    use hft_cex_research_input::ohlcv::{
         CandleInterval, DatasetManifest, DatasetTimeBounds, OhlcvTraceRow, QualityReport,
     };
     use sha2::{Digest, Sha256};

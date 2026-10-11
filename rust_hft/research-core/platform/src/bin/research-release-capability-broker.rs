@@ -7,14 +7,6 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use hft_research_platform::{
-    artifact_identity::{read_capabilities, Access, Capability},
-    build::pinned_image,
-    identity,
-    release_publisher::{read_json, PublisherPolicy},
-    sha256,
-    transport::TlsConfig,
-};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -29,6 +21,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{io::AsyncReadExt, process::Command};
+use {
+    hft_research_platform::artifact_identity::read_capabilities,
+    hft_research_platform::artifact_identity::Access,
+    hft_research_platform::artifact_identity::Capability,
+    hft_research_platform::build::pinned_image,
+    hft_research_platform::release_publisher::read_json,
+    hft_research_platform::release_publisher::PublisherPolicy,
+    hft_research_worker_contracts::identity, hft_research_worker_contracts::sha256,
+    hft_research_worker_io::transport::TlsConfig,
+};
 
 // Probe the bundle reader inside the actual namespace before any source fetch.
 const PLANNER_BOOTSTRAP: &str =
@@ -484,7 +486,7 @@ fn journal(config: &Config) -> Result<Journal> {
                 .replays
                 .keys()
                 .chain(journal.issued.keys())
-                .all(|hash| hft_research_platform::valid_digest(hash)),
+                .all(|hash| hft_research_worker_contracts::valid_digest(hash)),
         "invalid issuance journal"
     );
     Ok(journal)
@@ -1309,8 +1311,11 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use base64::Engine;
-    use hft_research_platform::{build::BuildSpec, orchestrator::Artifact, release::SourceArchive};
     use jsonwebtoken::{encode, EncodingKey, Header};
+    use {
+        hft_research_platform::build::BuildSpec, hft_research_platform::release::SourceArchive,
+        hft_research_worker_contracts::task::Artifact,
+    };
 
     fn fixture() -> (
         tempfile::TempDir,

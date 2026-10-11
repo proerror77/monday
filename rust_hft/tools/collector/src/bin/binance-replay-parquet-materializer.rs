@@ -164,7 +164,7 @@ fn log_event(event: &str, details: Value) {
             "component": "binance-replay-parquet-materializer",
             "event": event,
             "details": details,
-            "memory": hft_collector::research_memory::observe_research_memory(),
+            "memory": hft_research_artifacts::memory::observe_research_memory(),
         })
     );
 }

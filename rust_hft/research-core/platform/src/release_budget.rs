@@ -2,10 +2,10 @@
 //! A durable reservation precedes each send. Failures never refund it.
 use crate::{
     build_objects::BudgetReference as Reference,
-    orchestrator::Artifact,
     release::{ReleaseProducer, SourceArchive},
 };
 use anyhow::{ensure, Context, Result};
+use hft_research_worker_contracts::task::Artifact;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
