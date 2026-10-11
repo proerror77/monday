@@ -20,14 +20,14 @@ impl ClickHouse {
             endpoint,
             user,
             password,
-            &crate::transport::TlsConfig::default(),
+            &hft_research_worker_io::transport::TlsConfig::default(),
         )
     }
     pub fn with_tls(
         endpoint: &str,
         user: String,
         password: String,
-        tls: &crate::transport::TlsConfig,
+        tls: &hft_research_worker_io::transport::TlsConfig,
     ) -> Result<Self> {
         let endpoint = reqwest::Url::parse(endpoint)?;
         ensure!(

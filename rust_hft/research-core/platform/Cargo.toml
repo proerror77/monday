@@ -13,10 +13,11 @@ hmac = { version = "0.12", optional = true }
 roxmltree = { version = "=0.20.0", optional = true }
 chrono = { version = "0.4", optional = true }
 base64 = { version = "0.22", optional = true }
-zip = { version = "6", optional = true, default-features = false, features = ["deflate"] }
 tempfile = { version = "3", optional = true }
 hft-cex-research-input = { path = "../cex-input" }
 hft-research-agent-contracts = { path = "../agent-contracts" }
+hft-research-worker-contracts = { path = "../worker-contracts" }
+hft-research-worker-io = { path = "../worker-io", optional = true }
 ed25519-dalek = { version = "=2.2.0", optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "process", "io-util", "io-std"] }
 reqwest = { workspace = true, optional = true, features = ["rustls-tls", "json"] }
@@ -32,9 +33,7 @@ sqlx-postgres = { version = "=0.8.6", optional = true, default-features = false,
 
 [features]
 default = []
-artifact-io = ["dep:tokio", "dep:reqwest", "dep:rustix", "dep:tokio-util", "dep:base64", "tokio/fs", "reqwest/stream"]
-campaign-result-validation = ["dep:zip"]
-control = ["dep:hmac", "dep:chrono", "artifact-io", "campaign-result-validation", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:tempfile", "dep:getrandom", "native-admission", "release-verification", "researcher-verification"]
+control = ["dep:hmac", "dep:chrono", "dep:tokio", "dep:reqwest", "dep:rustix", "dep:tokio-util", "dep:base64", "tokio/fs", "reqwest/stream", "dep:hft-research-worker-io", "dep:sqlx-core", "dep:sqlx-postgres", "dep:axum", "dep:tempfile", "dep:getrandom", "native-admission", "release-verification", "researcher-verification"]
 native-admission = ["dep:ed25519-dalek"]
 release-verification = ["dep:ed25519-dalek"]
 researcher-verification = ["release-verification"]

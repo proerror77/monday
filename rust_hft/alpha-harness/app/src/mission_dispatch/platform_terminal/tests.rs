@@ -1,11 +1,17 @@
 //! Synthetic PG facts bind a genuine finalized-input/source-ledger fixture.
 //! This tests readonly binding, not a live platform snapshot or scientific Run.
 use alpha_store::campaign_ledger::VerifiedCampaignPlatformTerminalSource;
-use hft_research_platform::{
-    admission::{NativeAdmission, NativeAdmissionTrust},
-    execution::{resource_name, AttemptIdentityRef, ExecutionHandle},
-    orchestrator::{Admission, Lease, State, Task, TaskSpec},
-    research::{NativeTerminalSnapshot, Run, TerminalLedgerEvent},
+use {
+    hft_research_platform::execution::resource_name,
+    hft_research_platform::execution::AttemptIdentityRef,
+    hft_research_platform::execution::ExecutionHandle, hft_research_platform::orchestrator::State,
+    hft_research_platform::orchestrator::Task,
+    hft_research_platform::research::NativeTerminalSnapshot,
+    hft_research_platform::research::TerminalLedgerEvent,
+    hft_research_worker_contracts::admission::NativeAdmission,
+    hft_research_worker_contracts::admission::NativeAdmissionTrust,
+    hft_research_worker_contracts::research::Run, hft_research_worker_contracts::task::Admission,
+    hft_research_worker_contracts::task::Lease, hft_research_worker_contracts::task::TaskSpec,
 };
 
 #[test]
@@ -44,7 +50,7 @@ fn retained_terminal_signature_rechecks_scientific_and_release_roles_without_a_k
             &file.path().canonicalize().unwrap(),
         )
         .unwrap();
-    trust.verify_terminal_audit(&restored).unwrap();
+    hft_research_platform::terminal_audit::verify_terminal_audit(&trust, &restored).unwrap();
     let verify = |authority: &[[u8; 32]], release: &[[u8; 32]]| {
         super::observer::verify_retained_witness(
             &restored,

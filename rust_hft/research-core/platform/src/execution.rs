@@ -1,86 +1,16 @@
 //! Kubernetes/ACS Jobs and AgentSandbox use the same persisted task identity.
 //! No ECS/ACK provisioning, GitHub run, or CI receipt appears in this contract.
 use anyhow::{ensure, Context, Result};
+#[cfg(feature = "control")]
+use hft_research_worker_contracts::execution::valid_dns_label;
+use hft_research_worker_contracts::execution::{Backend, Profile};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{
-    identity,
-    orchestrator::{Lease, TaskSpec},
-    valid_digest,
+use {
+    crate::identity, crate::valid_digest, hft_research_worker_contracts::task::Lease,
+    hft_research_worker_contracts::task::TaskSpec,
 };
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Backend {
-    KubernetesJob,
-    AcsJob,
-    AgentSandbox,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Profile {
-    pub backend: Backend,
-    pub cluster: String,
-    pub namespace: String,
-    pub service_account: String,
-    pub architecture: String,
-    pub cpu_millis: u32,
-    pub memory_mib: u32,
-    pub scratch_mib: u32,
-    pub gpu: u16,
-    /// Profile acceptance binds scheduler, network, identity, cancellation,
-    /// artifact access and (when used) the shared mount, on this exact target.
-    pub acceptance_sha256: String,
-    pub prepared_pvc: Option<String>,
-    /// Operator-owned immutable secret containing scoped worker configuration.
-    pub worker_secret: Option<String>,
-}
-
-fn dns_label(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 63
-        && value
-            .bytes()
-            .all(|v| v.is_ascii_lowercase() || v.is_ascii_digit() || v == b'-')
-        && !value.starts_with('-')
-        && !value.ends_with('-')
-}
-
-impl Profile {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.cluster.is_empty()
-                && dns_label(&self.namespace)
-                && dns_label(&self.service_account),
-            "invalid execution target"
-        );
-        ensure!(
-            matches!(self.architecture.as_str(), "amd64" | "arm64"),
-            "unsupported architecture"
-        );
-        ensure!(
-            self.cpu_millis > 0
-                && self.cpu_millis <= 256_000
-                && self.memory_mib > 0
-                && self.scratch_mib > 0,
-            "invalid resources"
-        );
-        ensure!(self.gpu == 0, "no accepted GPU trainer/provider contract");
-        ensure!(
-            valid_digest(&self.acceptance_sha256),
-            "missing provider acceptance identity"
-        );
-        if let Some(pvc) = &self.prepared_pvc {
-            ensure!(dns_label(pvc), "invalid prepared PVC");
-        }
-        if let Some(secret) = &self.worker_secret {
-            ensure!(dns_label(secret), "invalid worker secret");
-        }
-        Ok(())
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -146,7 +76,7 @@ pub struct AttemptIdentityRef {
 impl AttemptIdentityRef {
     pub fn validate(&self, spec: &TaskSpec, lease: &Lease) -> Result<()> {
         ensure!(
-            spec.kind == crate::orchestrator::TaskKind::CexCampaign
+            spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign
                 && self.secret_name == format!("{}-identity", resource_name(lease))
                 && !self.secret_uid.is_empty()
                 && self.secret_uid.len() <= 128
@@ -209,7 +139,7 @@ fn task_label(task_id: &str) -> String {
 
 pub fn render(spec: &TaskSpec, lease: &Lease, acceptance: &Acceptance) -> Result<Value> {
     acceptance.admit(spec)?;
-    let context = crate::orchestrator::AttemptContext {
+    let context = hft_research_worker_contracts::task::AttemptContext {
         spec: spec.clone(),
         lease: lease.clone(),
     };
@@ -255,7 +185,7 @@ pub fn render(spec: &TaskSpec, lease: &Lease, acceptance: &Acceptance) -> Result
             "volumes": [{"name": "scratch", "emptyDir": {"sizeLimit": format!("{}Mi", spec.profile.scratch_mib)}}]
         }
     });
-    if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+    if spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
         ensure!(
             spec.profile.gpu == 0 && spec.profile.backend != Backend::AgentSandbox,
             "native CEX Campaign requires admitted CPU Job compute"
@@ -293,7 +223,7 @@ pub fn render(spec: &TaskSpec, lease: &Lease, acceptance: &Acceptance) -> Result
             .push(json!({"name":"prepared","mountPath":"/prepared","readOnly":true}));
     }
     if let Some(secret) = &spec.profile.worker_secret {
-        if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+        if spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
             pod["spec"]["volumes"].as_array_mut().unwrap().push(json!({"name":"configuration-inputs","secret":{"secretName":secret,"defaultMode":288}}));
             pod["spec"]["initContainers"] = json!([{
                 "name":"stage-configuration", "image":spec.image, "command":[spec.command[0],"--stage-configuration"],
@@ -396,7 +326,7 @@ impl Kubernetes {
             let data: std::collections::BTreeMap<String, String> =
                 serde_json::from_value(value["data"].clone())?;
             ensure!(
-                crate::orchestrator::worker_configuration_reference(
+                hft_research_worker_contracts::task::worker_configuration_reference(
                     &spec.profile.namespace,
                     &expected.secret_name,
                     &expected.secret_uid,
@@ -404,13 +334,14 @@ impl Kubernetes {
                 )? == *expected,
                 "worker configuration contents changed"
             );
-            if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+            if spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
                 use base64::Engine;
                 let bytes = base64::engine::general_purpose::STANDARD.decode(
                     data.get("native-trust.json")
                         .context("Campaign configuration lacks native trust")?,
                 )?;
-                let trust: crate::admission::NativeAdmissionTrust = serde_json::from_slice(&bytes)?;
+                let trust: hft_research_worker_contracts::admission::NativeAdmissionTrust =
+                    serde_json::from_slice(&bytes)?;
                 native_trust_sha256 = Some(identity(&trust)?);
             }
         }
@@ -498,23 +429,24 @@ impl Kubernetes {
             "invalid remaining deadline"
         );
         let native_trust = self.verify_worker_configuration(spec).await?;
-        let mut attempt_identity = if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
-            let issued = identity.context(
-                "native Campaign launch requires controlled per-Attempt identity issuance",
-            )?;
-            issued.matches_context(&crate::orchestrator::AttemptContext {
-                spec: spec.clone(),
-                lease: lease.clone(),
-            })?;
-            ensure!(
-                native_trust.as_deref() == Some(issued.native_trust_sha256()),
-                "static native trust differs from verified PG admission"
-            );
-            Some(self.prepare_attempt_identity(spec, lease, issued).await?)
-        } else {
-            ensure!(identity.is_none(), "unexpected late Campaign identity");
-            None
-        };
+        let mut attempt_identity =
+            if spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
+                let issued = identity.context(
+                    "native Campaign launch requires controlled per-Attempt identity issuance",
+                )?;
+                issued.matches_context(&hft_research_worker_contracts::task::AttemptContext {
+                    spec: spec.clone(),
+                    lease: lease.clone(),
+                })?;
+                ensure!(
+                    native_trust.as_deref() == Some(issued.native_trust_sha256()),
+                    "static native trust differs from verified PG admission"
+                );
+                Some(self.prepare_attempt_identity(spec, lease, issued).await?)
+            } else {
+                ensure!(identity.is_none(), "unexpected late Campaign identity");
+                None
+            };
         let mut resource = render(spec, lease, acceptance)?;
         if let Some(reference) = &attempt_identity {
             install_attempt_identity(&mut resource, reference)?;
@@ -771,8 +703,8 @@ impl Kubernetes {
     pub async fn observe(&self, handle: &ExecutionHandle) -> Result<Observation> {
         ensure!(
             handle.cluster == self.cluster
-                && dns_label(&handle.namespace)
-                && dns_label(&handle.name),
+                && valid_dns_label(&handle.namespace)
+                && valid_dns_label(&handle.name),
             "invalid handle target"
         );
         let path = format!(
@@ -934,7 +866,7 @@ impl Kubernetes {
         let pod_name = permit.pod()["metadata"]["name"]
             .as_str()
             .context("original Pod name missing")?;
-        ensure!(dns_label(pod_name), "invalid original Pod name");
+        ensure!(valid_dns_label(pod_name), "invalid original Pod name");
         if let Some(pod) = self
             .read(&format!(
                 "/api/v1/namespaces/{}/pods/{pod_name}",
@@ -984,7 +916,9 @@ impl Kubernetes {
 }
 
 #[cfg(feature = "control")]
-fn read_launch_context(worker: &Value) -> Result<crate::orchestrator::AttemptContext> {
+fn read_launch_context(
+    worker: &Value,
+) -> Result<hft_research_worker_contracts::task::AttemptContext> {
     let env = worker["env"]
         .as_array()
         .context("launch environment missing")?;
@@ -997,7 +931,7 @@ fn read_launch_context(worker: &Value) -> Result<crate::orchestrator::AttemptCon
         .as_str()
         .context("launch context missing")?;
     ensure!(value.len() <= 64 * 1024, "launch context exceeds bound");
-    let context: crate::orchestrator::AttemptContext = serde_json::from_str(value)?;
+    let context: hft_research_worker_contracts::task::AttemptContext = serde_json::from_str(value)?;
     context.validate()?;
     Ok(context)
 }
@@ -1344,7 +1278,9 @@ pub(crate) fn verify_retirement_observation(
     ensure!(
         pod["kind"] == "Pod"
             && pod["apiVersion"] == "v1"
-            && pod["metadata"]["name"].as_str().is_some_and(dns_label),
+            && pod["metadata"]["name"]
+                .as_str()
+                .is_some_and(valid_dns_label),
         "invalid original Pod identity"
     );
     for pointer in [
@@ -1409,7 +1345,7 @@ pub(crate) fn verify_retirement_observation(
     let worker = &actual["containers"][0];
     ensure!(
         read_launch_context(worker)?
-            == (crate::orchestrator::AttemptContext {
+            == (hft_research_worker_contracts::task::AttemptContext {
                 spec: spec.clone(),
                 lease: lease.clone()
             }),
@@ -1621,7 +1557,7 @@ mod stop_tests {
     async fn launcher_recovers_original_context_and_cleans_only_owned_secret() -> Result<()> {
         use base64::Engine;
         let mut spec = cex_spec();
-        let trust = crate::admission::NativeAdmissionTrust {
+        let trust = hft_research_worker_contracts::admission::NativeAdmissionTrust {
             schema: "transport-fixture".into(),
             native_reservation_keys: Default::default(),
         };
@@ -1634,12 +1570,14 @@ mod stop_tests {
             ),
         ]
         .into();
-        spec.worker_configuration = Some(crate::orchestrator::worker_configuration_reference(
-            "research",
-            "configuration",
-            "configuration-original",
-            &data,
-        )?);
+        spec.worker_configuration = Some(
+            hft_research_worker_contracts::task::worker_configuration_reference(
+                "research",
+                "configuration",
+                "configuration-original",
+                &data,
+            )?,
+        );
         let mut task = crate::orchestrator::Task::new(spec.clone())?;
         let now = i64::try_from(
             std::time::SystemTime::now()
@@ -1711,7 +1649,7 @@ mod stop_tests {
     fn cex_spec() -> TaskSpec {
         TaskSpec {
             schema: 1,
-            kind: crate::orchestrator::TaskKind::CexCampaign,
+            kind: hft_research_worker_contracts::task::TaskKind::CexCampaign,
             run_manifest_sha256: "a".repeat(64),
             view_manifest_sha256: "b".repeat(64),
             source_sha256: "c".repeat(64),
@@ -1735,12 +1673,14 @@ mod stop_tests {
             max_attempts: 1,
             output_prefix: "research/results".into(),
             fit_identity_sha256: None,
-            worker_configuration: Some(crate::orchestrator::WorkerConfigurationRef {
-                schema: "monday.worker_configuration.v1".into(),
-                secret_name: "configuration".into(),
-                secret_uid: "static-uid".into(),
-                configuration_sha256: "f".repeat(64),
-            }),
+            worker_configuration: Some(
+                hft_research_worker_contracts::task::WorkerConfigurationRef {
+                    schema: "monday.worker_configuration.v1".into(),
+                    secret_name: "configuration".into(),
+                    secret_uid: "static-uid".into(),
+                    configuration_sha256: "f".repeat(64),
+                },
+            ),
         }
     }
 
@@ -1787,7 +1727,7 @@ mod stop_tests {
         let mut changed = object;
         changed["metadata"]["labels"]["monday.io/fence"] = json!("2");
         assert!(verify_identity_reference(&changed, &spec, &reference).is_err());
-        let context = crate::orchestrator::AttemptContext { spec, lease };
+        let context = hft_research_worker_contracts::task::AttemptContext { spec, lease };
         let value = serde_json::to_string(&context).unwrap();
         let mut worker = json!({"env":[{"name":"MONDAY_ATTEMPT_CONTEXT","value":value}]});
         assert_eq!(read_launch_context(&worker).unwrap(), context);

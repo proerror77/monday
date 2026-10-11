@@ -12,16 +12,16 @@ use alpha_store::{
     AlphaStore,
 };
 use anyhow::{ensure, Context};
-use hft_research_platform::{
-    admission::NativeAdmissionTrust,
-    build::BuildArtifact,
-    orchestrator::State,
-    release::{BuildReleaseTrust, SignedBuildRelease},
-};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+};
+use {
+    hft_research_platform::build::BuildArtifact, hft_research_platform::orchestrator::State,
+    hft_research_platform::release::BuildReleaseTrust,
+    hft_research_platform::release::SignedBuildRelease,
+    hft_research_worker_contracts::admission::NativeAdmissionTrust,
 };
 
 #[derive(Deserialize)]
@@ -334,7 +334,7 @@ pub(super) fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
             observation.native_witness_key_id.clone(),
             &key,
         )?;
-        native_trust.verify_terminal_audit(&signed)?;
+        hft_research_platform::terminal_audit::verify_terminal_audit(&native_trust, &signed)?;
         platform_admission::retain(&signed_path, &serde_json::to_vec_pretty(&signed)?)?;
         signed
     };
@@ -372,7 +372,7 @@ pub(super) fn verify_retained_witness(
         authority_keys,
         release_keys,
     )?;
-    trust.verify_terminal_audit(signed)?;
+    hft_research_platform::terminal_audit::verify_terminal_audit(&trust, signed)?;
     ensure!(
         signed.evidence == *expected && signed.key_id == key_id,
         "retained terminal witness changed original audit, issuer or signer role"
@@ -589,15 +589,21 @@ fn construct(
         retained_manifest_sha256,
         platform_snapshot_sha256: facts.snapshot_sha256,
         observer_release_sha256: facts.observer_release_sha256,
-        native_admission_sha256: hft_research_platform::identity(&facts.snapshot.native_admission)?,
-        native_trust_sha256: hft_research_platform::identity(&facts.snapshot.native_trust)?,
+        native_admission_sha256: hft_research_worker_contracts::identity(
+            &facts.snapshot.native_admission,
+        )?,
+        native_trust_sha256: hft_research_worker_contracts::identity(&facts.snapshot.native_trust)?,
         collection_sha256: facts.snapshot.task.spec.view_manifest_sha256.clone(),
         task_id: facts.snapshot.task.id.clone(),
         attempt: facts.lease.attempt,
         fence: facts.lease.fence,
         terminal_revision: facts.snapshot.terminal_revision,
-        terminal_event_sha256: hft_research_platform::identity(&facts.snapshot.terminal_event)?,
-        execution_event_sha256: hft_research_platform::identity(&facts.snapshot.execution_event)?,
+        terminal_event_sha256: hft_research_worker_contracts::identity(
+            &facts.snapshot.terminal_event,
+        )?,
+        execution_event_sha256: hft_research_worker_contracts::identity(
+            &facts.snapshot.execution_event,
+        )?,
         job_uid: stopped.handle.uid,
         pod_uid: stopped.pod_uid,
         job_sha256: stopped.job_sha256,
@@ -647,16 +653,16 @@ fn restore(
         true,
     )?;
     ensure!(
-        hft_research_platform::sha256(&snapshot) == audit.platform_snapshot_sha256,
+        hft_research_worker_contracts::sha256(&snapshot) == audit.platform_snapshot_sha256,
         "retained readonly facts changed"
     );
     let snapshot: hft_research_platform::research::NativeTerminalSnapshot =
         serde_json::from_slice(&snapshot)?;
     trust.verify(&snapshot.native_admission)?;
     ensure!(
-        hft_research_platform::identity(&snapshot.native_admission)?
+        hft_research_worker_contracts::identity(&snapshot.native_admission)?
             == audit.native_admission_sha256
-            && hft_research_platform::identity(trust)? == audit.native_trust_sha256
+            && hft_research_worker_contracts::identity(trust)? == audit.native_trust_sha256
             && snapshot.task.id == audit.task_id
             && snapshot.terminal_revision == audit.terminal_revision,
         "retained audit changed native identity or terminal revision"

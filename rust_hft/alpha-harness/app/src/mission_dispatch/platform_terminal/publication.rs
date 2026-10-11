@@ -83,7 +83,7 @@ pub(super) fn publish_witness(
     publish_file(
         client,
         path,
-        &hft_research_platform::sha256(bytes),
+        &hft_research_worker_contracts::sha256(bytes),
         bytes.len() as u64,
         access,
     )
@@ -221,7 +221,7 @@ mod tests {
             let result = publish_file(
                 &client,
                 &path,
-                &hft_research_platform::sha256(&bytes),
+                &hft_research_worker_contracts::sha256(&bytes),
                 bytes.len() as u64,
                 &access,
             );

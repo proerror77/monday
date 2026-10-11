@@ -1,6 +1,6 @@
 #![cfg(feature = "control")]
 use anyhow::{ensure, Result};
-use hft_research_platform::transport::TlsConfig;
+use hft_research_worker_io::transport::TlsConfig;
 use std::{
     path::Path,
     process::{Command, Stdio},
@@ -140,7 +140,7 @@ async fn private_tls_requires_real_ca_hostname_and_client_identity() -> Result<(
         "valid private TLS identity rejected"
     );
     let descriptor = hft_research_platform::block_objects::ObjectDescriptor {
-        sha256: hft_research_platform::sha256(body),
+        sha256: hft_research_worker_contracts::sha256(body),
         bytes: body.len() as u64,
         url: endpoint.clone(),
     };

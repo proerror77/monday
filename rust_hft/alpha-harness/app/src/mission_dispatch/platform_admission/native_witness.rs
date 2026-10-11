@@ -2,7 +2,7 @@
 //! This module never runs Cargo or serializes private signing material.
 use anyhow::{ensure, Context};
 use ed25519_dalek::SigningKey;
-use hft_research_platform::admission::NativeAdmissionTrust;
+use hft_research_worker_contracts::admission::NativeAdmissionTrust;
 use rustix::fs::{open, openat, Mode, OFlags};
 use std::{
     fs::File,
@@ -187,7 +187,7 @@ mod tests {
         .unwrap();
         // The retained signature is cryptographically valid. Role separation
         // still rejects it without reading or requiring any private key file.
-        trust.verify_revocation(&signed).unwrap();
+        hft_research_platform::revocation::verify_revocation(&trust, &signed).unwrap();
         assert!(check_public_role(&signed.key_id, &trust, &[public], &[]).is_err());
         assert!(check_public_role(&signed.key_id, &trust, &[], &[public]).is_err());
         assert_eq!(

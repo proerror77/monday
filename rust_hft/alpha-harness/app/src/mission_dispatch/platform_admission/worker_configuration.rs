@@ -11,13 +11,13 @@ use std::{
 };
 
 pub(super) struct VerifiedWorkerConfiguration {
-    reference: hft_research_platform::orchestrator::WorkerConfigurationRef,
+    reference: hft_research_worker_contracts::task::WorkerConfigurationRef,
 }
 impl VerifiedWorkerConfiguration {
     pub(super) fn name(&self) -> &str {
         &self.reference.secret_name
     }
-    pub(super) fn reference(&self) -> &hft_research_platform::orchestrator::WorkerConfigurationRef {
+    pub(super) fn reference(&self) -> &hft_research_worker_contracts::task::WorkerConfigurationRef {
         &self.reference
     }
 }
@@ -44,7 +44,7 @@ pub(super) fn readback(
     name: &str,
     expected_request: &[u8],
     expected_request_sha256: &str,
-    native_trust: &hft_research_platform::admission::NativeAdmissionTrust,
+    native_trust: &hft_research_worker_contracts::admission::NativeAdmissionTrust,
 ) -> anyhow::Result<VerifiedWorkerConfiguration> {
     let observed = kubectl_json(
         &kubectl_binary(),
@@ -86,7 +86,7 @@ fn verify_readback(
     name: &str,
     expected_request: &[u8],
     expected_request_sha256: &str,
-    native_trust: &hft_research_platform::admission::NativeAdmissionTrust,
+    native_trust: &hft_research_worker_contracts::admission::NativeAdmissionTrust,
 ) -> anyhow::Result<VerifiedWorkerConfiguration> {
     ensure!(
         observed["apiVersion"] == "v1"
@@ -130,7 +130,7 @@ fn verify_readback(
         .context("worker configuration lacks finalized request")?;
     ensure!(
         request == expected_request
-            && hft_research_platform::sha256(request) == expected_request_sha256,
+            && hft_research_worker_contracts::sha256(request) == expected_request_sha256,
         "worker configuration differs from inspected finalized request"
     );
     let config = decoded
@@ -193,7 +193,7 @@ fn verify_readback(
         trust_bytes.len() <= 64 * 1024,
         "public native witness trust exceeds bound"
     );
-    let observed_trust: hft_research_platform::admission::NativeAdmissionTrust =
+    let observed_trust: hft_research_worker_contracts::admission::NativeAdmissionTrust =
         serde_json::from_slice(trust_bytes)?;
     ensure!(
         serde_json::to_value(&observed_trust)? == serde_json::to_value(native_trust)?,
@@ -218,7 +218,7 @@ fn verify_readback(
             ))
         })
         .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-    let reference = hft_research_platform::orchestrator::worker_configuration_reference(
+    let reference = hft_research_worker_contracts::task::worker_configuration_reference(
         namespace, name, uid, &encoded,
     )?;
     Ok(VerifiedWorkerConfiguration { reference })
@@ -231,7 +231,7 @@ pub(super) fn from_test_readback_peer(
     name: &str,
     request: &[u8],
     request_sha256: &str,
-    native_trust: &hft_research_platform::admission::NativeAdmissionTrust,
+    native_trust: &hft_research_worker_contracts::admission::NativeAdmissionTrust,
 ) -> anyhow::Result<VerifiedWorkerConfiguration> {
     verify_readback(
         observed,
@@ -248,7 +248,7 @@ mod tests {
     use super::*;
     #[test]
     fn declared_immutable_or_hash_without_actual_configuration_never_proves_a_worker() {
-        let trust = hft_research_platform::admission::NativeAdmissionTrust {
+        let trust = hft_research_worker_contracts::admission::NativeAdmissionTrust {
             schema: "monday.native_reservation_trust.v1".into(),
             native_reservation_keys: [("host".into(), "1".repeat(64))].into(),
         };
@@ -258,7 +258,7 @@ mod tests {
             "monday-research",
             "worker",
             b"{}",
-            &hft_research_platform::sha256(b"{}"),
+            &hft_research_worker_contracts::sha256(b"{}"),
             &trust,
         )
         .is_err());
@@ -269,7 +269,7 @@ mod tests {
             "monday-research",
             "worker",
             b"{}",
-            &hft_research_platform::sha256(b"{}"),
+            &hft_research_worker_contracts::sha256(b"{}"),
             &trust,
         )
         .is_err());

@@ -1,7 +1,6 @@
 //! Read-only PG facts come from the actual released host observer. A JSON path
 //! or a worker-supplied digest cannot manufacture this private transport value.
 use anyhow::{ensure, Context};
-use hft_research_platform::{orchestrator::Artifact, release::VerifiedBuildRelease};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
@@ -10,6 +9,10 @@ use std::{
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
+};
+use {
+    hft_research_platform::release::VerifiedBuildRelease,
+    hft_research_worker_contracts::task::Artifact,
 };
 
 pub(super) struct ReadonlySnapshotBytes {
@@ -210,7 +213,7 @@ mod tests {
             schema: 2,
             code_commit: source.code_commit.clone(),
             workspace_manifest: "research-core/Cargo.toml".into(),
-            source_manifest_sha256: hft_research_platform::identity(&source).unwrap(),
+            source_manifest_sha256: hft_research_worker_contracts::identity(&source).unwrap(),
             cargo_lock_sha256: sha('b'),
             toolchain_manifest_sha256: sha('c'),
             target: "x86_64-unknown-linux-gnu".into(),
@@ -228,7 +231,7 @@ mod tests {
             name: "researchctl".into(),
             blob: Artifact {
                 key: format!("research/builds/{}/researchctl", build.id().unwrap()),
-                sha256: hft_research_platform::sha256(bytes),
+                sha256: hft_research_worker_contracts::sha256(bytes),
                 bytes: bytes.len() as u64,
             },
         };
@@ -261,7 +264,7 @@ mod tests {
             build,
             image: signed.receipt.image.clone(),
             executables: vec![executable],
-            release_receipt_sha256: hft_research_platform::identity(&signed).unwrap(),
+            release_receipt_sha256: hft_research_worker_contracts::identity(&signed).unwrap(),
         };
         BuildReleaseTrust {
             schema: 1,
@@ -309,7 +312,7 @@ mod tests {
         .is_err());
         let artifact = Artifact {
             key: "fixture/researchctl".into(),
-            sha256: hft_research_platform::sha256(bytes),
+            sha256: hft_research_worker_contracts::sha256(bytes),
             bytes: bytes.len() as u64,
         };
         retain_executable(&source, &pinned, &artifact).unwrap();

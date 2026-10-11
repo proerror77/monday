@@ -1,23 +1,23 @@
 //! Mechanical retirement of retained native Jobs. No execution, refund, grant,
 //! scientific validation or Agent capability is issued here. Publication and
 //! provider absence are independent readbacks; signatures alone cannot delete.
-use crate::{
-    execution::{Acceptance, Backend, ExecutionHandle, Kubernetes},
-    identity,
-    orchestrator::{Artifact, AttemptContext, Lease, State, TaskKind},
-    postgres::Ledger,
-    research::NativeTerminalSnapshot,
-    service::ArtifactGateway,
-    sha256,
-    terminal_audit::{SignedNativeTerminalAuditWitness, VerifiedNativeTerminalAuditWitness},
-    valid_digest,
-};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx_core::{query::query, query_scalar::query_scalar, row::Row, transaction::Transaction};
 use sqlx_postgres::Postgres;
 use std::collections::{BTreeMap, BTreeSet};
+use {
+    crate::execution::Acceptance, crate::execution::ExecutionHandle, crate::execution::Kubernetes,
+    crate::identity, crate::orchestrator::State, crate::postgres::Ledger,
+    crate::research::NativeTerminalSnapshot, crate::service::ArtifactGateway, crate::sha256,
+    crate::terminal_audit::SignedNativeTerminalAuditWitness,
+    crate::terminal_audit::VerifiedNativeTerminalAuditWitness, crate::valid_digest,
+    hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::task::Artifact,
+    hft_research_worker_contracts::task::AttemptContext,
+    hft_research_worker_contracts::task::Lease, hft_research_worker_contracts::task::TaskKind,
+};
 
 pub const MIGRATION: &str = include_str!("../sql/native_terminal_retirement.sql");
 const FILE_LIMIT: u64 = 512 * 1024 * 1024;
@@ -269,7 +269,8 @@ async fn readback(
     );
     let signed: SignedNativeTerminalAuditWitness =
         serde_json::from_slice(&required(gateway, &signed_key, 1024 * 1024).await?)?;
-    let verified = scope.snapshot.native_trust.verify_terminal_audit(&signed)?;
+    let verified =
+        crate::terminal_audit::verify_terminal_audit(&scope.snapshot.native_trust, &signed)?;
     let witness = verified.evidence();
     ensure!(
         signed.evidence_sha256 == witness_id
@@ -460,7 +461,7 @@ async fn readback(
             .result
             .as_ref()
             .context("successful terminal lacks immutable result")?;
-        let campaign: crate::campaign_result::CexCampaignResultReceipt =
+        let campaign: hft_research_worker_contracts::campaign_result::CexCampaignResultReceipt =
             serde_json::from_value(get("cex-campaign.json")?.1.clone())?;
         campaign.validate(&scope.snapshot.task.spec, &result.artifacts)?;
         ensure!(
@@ -550,7 +551,7 @@ pub struct RetirementPermit {
     published: PublishedAudit,
 }
 impl RetirementPermit {
-    pub(crate) fn spec(&self) -> &crate::orchestrator::TaskSpec {
+    pub(crate) fn spec(&self) -> &hft_research_worker_contracts::task::TaskSpec {
         &self.published.scope.snapshot.task.spec
     }
     pub(crate) fn lease(&self) -> &Lease {

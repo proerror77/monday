@@ -5,13 +5,6 @@ use super::{
 };
 use alpha_store::campaign_ledger::{CampaignPlatformTransferV1, VerifiedCampaignPlatformExport};
 use anyhow::{ensure, Context};
-use hft_research_platform::{
-    admission::{sign, NativeAdmission, NativeAdmissionTrust},
-    build::BuildArtifact,
-    execution::Profile,
-    orchestrator::Admission,
-    release::{BuildReleaseTrust, SignedBuildRelease},
-};
 use reqwest::blocking::Client;
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{
@@ -20,6 +13,15 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     time::Duration,
+};
+use {
+    hft_research_platform::admission::sign, hft_research_platform::build::BuildArtifact,
+    hft_research_platform::release::BuildReleaseTrust,
+    hft_research_platform::release::SignedBuildRelease,
+    hft_research_worker_contracts::admission::NativeAdmission,
+    hft_research_worker_contracts::admission::NativeAdmissionTrust,
+    hft_research_worker_contracts::execution::Profile,
+    hft_research_worker_contracts::task::Admission,
 };
 
 #[derive(Debug, Clone, clap::Args)]
@@ -271,7 +273,7 @@ pub(super) fn export(args: PlatformExportArgs) -> anyhow::Result<()> {
                 &release_public_keys,
             )?;
             let signed = if signed_path.exists() {
-                let old: hft_research_platform::admission::SignedNativeAdmission =
+                let old: hft_research_worker_contracts::admission::SignedNativeAdmission =
                     read(&signed_path)?;
                 native_trust.verify(&old)?;
                 ensure!(

@@ -3,14 +3,15 @@
 use super::snapshot_transport::{self, ReadonlySnapshotBytes};
 use alpha_store::campaign_ledger::VerifiedCampaignPlatformTerminalSource;
 use anyhow::{ensure, Context};
-use hft_research_platform::{
-    admission::NativeAdmissionTrust,
-    execution::ExecutionHandle,
-    orchestrator::{AttemptContext, Lease, TaskKind},
-    release::VerifiedBuildRelease,
-    research::NativeTerminalSnapshot,
-};
 use std::path::Path;
+use {
+    hft_research_platform::execution::ExecutionHandle,
+    hft_research_platform::release::VerifiedBuildRelease,
+    hft_research_platform::research::NativeTerminalSnapshot,
+    hft_research_worker_contracts::admission::NativeAdmissionTrust,
+    hft_research_worker_contracts::task::AttemptContext,
+    hft_research_worker_contracts::task::Lease, hft_research_worker_contracts::task::TaskKind,
+};
 
 pub(super) struct VerifiedPlatformFacts {
     pub(super) snapshot: NativeTerminalSnapshot,
@@ -46,7 +47,7 @@ fn bind(
     let observed = verify_snapshot(source, &snapshot, native_trust)?;
     Ok(VerifiedPlatformFacts {
         snapshot,
-        snapshot_sha256: hft_research_platform::sha256(bytes.bytes()),
+        snapshot_sha256: hft_research_worker_contracts::sha256(bytes.bytes()),
         observer_release_sha256: bytes.observer_release_sha256().into(),
         snapshot_bytes: bytes.bytes().to_vec(),
         lease: observed.0,
@@ -62,8 +63,8 @@ pub(super) fn verify_snapshot(
     // Trust comes from the host's independently approved public trust file. The
     // database cannot nominate a new issuer by returning another trust document.
     ensure!(
-        hft_research_platform::identity(native_trust)?
-            == hft_research_platform::identity(&snapshot.native_trust)?,
+        hft_research_worker_contracts::identity(native_trust)?
+            == hft_research_worker_contracts::identity(&snapshot.native_trust)?,
         "readonly snapshot changed independently expected native witness trust"
     );
     let native = native_trust.verify(&snapshot.native_admission)?;

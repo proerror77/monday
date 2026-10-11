@@ -25,7 +25,7 @@ pub(super) fn retain(root: &Path) -> anyhow::Result<String> {
     };
     let bytes = serde_json::to_vec_pretty(&manifest)?;
     super::super::platform_admission::retain(&root.join("retained-manifest.json"), &bytes)?;
-    Ok(hft_research_platform::sha256(&bytes))
+    Ok(hft_research_worker_contracts::sha256(&bytes))
 }
 
 pub(super) fn verify(root: &Path, expected: &str) -> anyhow::Result<()> {
@@ -35,7 +35,7 @@ pub(super) fn verify(root: &Path, expected: &str) -> anyhow::Result<()> {
         true,
     )?;
     ensure!(
-        hft_research_platform::sha256(&bytes) == expected,
+        hft_research_worker_contracts::sha256(&bytes) == expected,
         "retained terminal manifest changed"
     );
     let manifest: Manifest = serde_json::from_slice(&bytes)?;

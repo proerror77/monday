@@ -180,6 +180,15 @@ scientific model, scheduler, database, risk or execution crate. CEX Campaign and
 holdout object bindings remain CEX-owned.
 The CEX harness contains no Prediction command or Prediction-owned dependency.
 
+`hft-research-worker-contracts` owns the shared task, lease, Run, native admission
+and result wire identities, including their strict receiver validation. It has
+no transport, database or scheduler dependency. `hft-research-worker-io` owns
+bounded archive verification, private configuration staging and the existing
+Attempt-scoped HTTPS artifact writer. It consumes those contracts directly.
+The control platform owns signature issuance, PG import, Task state transitions,
+checkpoint staging and provider clients. Both consumers use the single contract
+implementation; the platform does not export compatibility aliases.
+
 `alpha-engine` selects the persistent search kernel and LLM proposals separately.
 The `kernel` feature includes the original budgeted search implementation. The
 `llm` feature includes the original HTTP proposal and failure-critic client.
@@ -193,12 +202,16 @@ operator CLI, legacy loop controller, data preparation and approval commands.
 It retains `kernel` and `fitting`, frozen input checks, native Campaign execution,
 independent final evaluation and result readback. Governance handoff helpers
 remain available to scientific tests, without entering the worker's normal graph.
-The worker still consumes shared application, store and control code;
-this feature boundary is one step toward separating the scientific application.
-Its normal graph excludes collector, ClickHouse and venue acquisition adapters.
+The worker still consumes shared application and scientific store code.
+Its normal graph excludes collector, ClickHouse, venue acquisition adapters and
+the control platform application. Native signature, lease, budget and result
+bindings are verified through the shared worker contracts and IO.
 Cluster submission, controller and operator entrypoints compile only for the
 operator or its tests. The worker retains pure Job rendering and execution
 binding verification, while its normal graph excludes cluster IO.
+Representation identities still bind their input algorithms and materializer
+sources. Removing unrelated application dependencies does not remove that
+scientific provenance or prevent those inputs from invalidating a build.
 The published operator and worker use separate build recipes. A combined Cargo
 package selection unifies their features and does not verify this boundary.
 

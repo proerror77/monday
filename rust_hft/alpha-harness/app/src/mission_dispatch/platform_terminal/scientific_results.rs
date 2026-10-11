@@ -3,10 +3,6 @@
 use super::platform_facts::VerifiedPlatformFacts;
 use alpha_store::campaign_ledger::CampaignPlatformScientificStatusV1;
 use anyhow::{ensure, Context};
-use hft_research_platform::{
-    campaign_result::{CexCampaignResultReceipt, ScientificStatus},
-    orchestrator::Artifact,
-};
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,6 +10,11 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::Path,
+};
+use {
+    hft_research_worker_contracts::campaign_result::CexCampaignResultReceipt,
+    hft_research_worker_contracts::campaign_result::ScientificStatus,
+    hft_research_worker_contracts::task::Artifact,
 };
 
 pub(super) fn read(
@@ -113,7 +114,7 @@ pub(super) fn read(
             &urls[&round.result_zip.artifact.key],
             &bundle,
         )?;
-        hft_research_platform::campaign_result::verify_archive_entries(
+        hft_research_worker_io::archive::verify_archive_entries(
             File::open(&bundle)?,
             &round.entries,
             512 * 1024 * 1024,

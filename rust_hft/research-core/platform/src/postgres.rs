@@ -5,11 +5,11 @@ use serde_json::Value;
 use sqlx_core::{query::query, query_scalar::query_scalar, row::Row, transaction::Transaction};
 use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
 
-use crate::{
-    execution::Acceptance,
-    identity,
-    orchestrator::{ResultReceipt, State, Task, TaskKind, TaskSpec},
-    preparation::PreparationPlan,
+use {
+    crate::execution::Acceptance, crate::identity, crate::orchestrator::State,
+    crate::orchestrator::Task, crate::preparation::PreparationPlan,
+    hft_research_worker_contracts::task::ResultReceipt,
+    hft_research_worker_contracts::task::TaskKind, hft_research_worker_contracts::task::TaskSpec,
 };
 
 pub const MIGRATION: &str = include_str!("../sql/postgres.sql");
@@ -178,10 +178,11 @@ impl Ledger {
         let row = query("SELECT t.document,t.revision,r.document AS run,n.document AS native,n.trust_document,n.trust_sha256,n.evidence_sha256 FROM research.tasks t JOIN research.runs r ON r.run_sha256=t.run_manifest_sha256 AND r.tenant=t.tenant JOIN research.native_admission_imports n ON n.request_sha256=t.request_sha256 AND n.tenant=t.tenant WHERE t.task_id=$1 AND t.tenant=$2")
             .bind(request).bind(tenant).fetch_one(&mut *tx).await?;
         let task: Task = serde_json::from_value(row.get("document"))?;
-        let run: crate::research::Run = serde_json::from_value(row.get("run"))?;
-        let native: crate::admission::SignedNativeAdmission =
+        let run: hft_research_worker_contracts::research::Run =
+            serde_json::from_value(row.get("run"))?;
+        let native: hft_research_worker_contracts::admission::SignedNativeAdmission =
             serde_json::from_value(row.get("native"))?;
-        let trust: crate::admission::NativeAdmissionTrust =
+        let trust: hft_research_worker_contracts::admission::NativeAdmissionTrust =
             serde_json::from_value(row.get("trust_document"))?;
         let verified = trust.verify(&native)?;
         run.admit(&task.spec)?;
@@ -468,12 +469,12 @@ impl Ledger {
     pub async fn admission(
         &self,
         spec: &TaskSpec,
-    ) -> Result<Option<crate::orchestrator::Admission>> {
+    ) -> Result<Option<hft_research_worker_contracts::task::Admission>> {
         let row=query("SELECT a.document,n.document AS native_document,n.trust_document,n.trust_sha256,n.evidence_sha256,n.tenant,research.native_request_deadline_ms(n.request_sha256) AS native_deadline_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms FROM research.admissions a JOIN research.native_admission_imports n USING(request_sha256) WHERE a.request_sha256=$1 AND research.native_request_deadline_ms(n.request_sha256)>floor(extract(epoch FROM clock_timestamp())*1000)::bigint AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=a.request_sha256)").bind(spec.id()?).fetch_optional(&self.pool).await?;
         let Some(row) = row else { return Ok(None) };
-        let signed: crate::admission::SignedNativeAdmission =
+        let signed: hft_research_worker_contracts::admission::SignedNativeAdmission =
             serde_json::from_value(row.get("native_document"))?;
-        let trust: crate::admission::NativeAdmissionTrust =
+        let trust: hft_research_worker_contracts::admission::NativeAdmissionTrust =
             serde_json::from_value(row.get("trust_document"))?;
         let verified = trust.verify(&signed)?;
         ensure!(
@@ -488,7 +489,8 @@ impl Ledger {
             "native request revoked or expired"
         );
         let value: Value = row.get("document");
-        let admission: crate::orchestrator::Admission = serde_json::from_value(value)?;
+        let admission: hft_research_worker_contracts::task::Admission =
+            serde_json::from_value(value)?;
         admission.validate(spec)?;
         ensure!(
             admission == signed.evidence.admission,
@@ -628,10 +630,10 @@ impl Ledger {
             .bind(&task.spec.run_manifest_sha256)
             .fetch_one(&self.pool)
             .await?;
-        let run: crate::research::Run = serde_json::from_value(value)?;
+        let run: hft_research_worker_contracts::research::Run = serde_json::from_value(value)?;
         run.admit(&task.spec)?;
         let artifact = self.build_artifact(&run.build_artifact_sha256).await?;
-        run.admit_build(&artifact)?;
+        crate::research::admit_run_build(&run, &artifact)?;
         let arch = if artifact.build.target.starts_with("x86_64-") {
             "amd64"
         } else {
@@ -643,9 +645,16 @@ impl Ledger {
         );
         Ok(artifact)
     }
-    pub async fn register_run(&self, tenant: &str, run: &crate::research::Run) -> Result<String> {
+    pub async fn register_run(
+        &self,
+        tenant: &str,
+        run: &hft_research_worker_contracts::research::Run,
+    ) -> Result<String> {
         let id = run.id()?;
-        run.admit_build(&self.build_artifact(&run.build_artifact_sha256).await?)?;
+        crate::research::admit_run_build(
+            run,
+            &self.build_artifact(&run.build_artifact_sha256).await?,
+        )?;
         let mut tx = self.pool.begin().await?;
         Self::authority(&mut tx, false).await?;
         let exists:bool=query_scalar("SELECT EXISTS(SELECT 1 FROM research.experiments WHERE experiment_sha256=$1 AND tenant=$2)").bind(&run.experiment_sha256).bind(tenant).fetch_one(&mut *tx).await?;
@@ -804,14 +813,18 @@ impl Ledger {
             snapshot,
         })
     }
-    pub async fn run_for_tenant(&self, tenant: &str, id: &str) -> Result<crate::research::Run> {
+    pub async fn run_for_tenant(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<hft_research_worker_contracts::research::Run> {
         let value: Value =
             query_scalar("SELECT document FROM research.runs WHERE run_sha256=$1 AND tenant=$2")
                 .bind(id)
                 .bind(tenant)
                 .fetch_one(&self.pool)
                 .await?;
-        let run: crate::research::Run = serde_json::from_value(value)?;
+        let run: hft_research_worker_contracts::research::Run = serde_json::from_value(value)?;
         ensure!(run.id()? == id, "corrupt run identity");
         Ok(run)
     }
@@ -834,7 +847,8 @@ impl Ledger {
     }
     pub async fn approved_request(&self, tenant: &str, id: &str) -> Result<TaskSpec> {
         let value:Value=query_scalar("SELECT a.document FROM research.admissions a JOIN research.native_admission_imports n USING(request_sha256) WHERE a.request_sha256=$1 AND n.tenant=$2 AND research.native_request_deadline_ms(n.request_sha256)>floor(extract(epoch FROM clock_timestamp())*1000)::bigint AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=a.request_sha256)").bind(id).bind(tenant).fetch_one(&self.pool).await?;
-        let admission: crate::orchestrator::Admission = serde_json::from_value(value)?;
+        let admission: hft_research_worker_contracts::task::Admission =
+            serde_json::from_value(value)?;
         admission.validate(&admission.task_spec)?;
         self.admission(&admission.task_spec)
             .await?
@@ -1152,13 +1166,14 @@ impl LockedTask {
             .bind(&self.task.id)
             .fetch_one(&mut *self.tx)
             .await?;
-            let admission: crate::orchestrator::Admission = serde_json::from_value(value)?;
+            let admission: hft_research_worker_contracts::task::Admission =
+                serde_json::from_value(value)?;
             admission.validate(&self.task.spec)?;
             let row=query("SELECT document,trust_document,trust_sha256,evidence_sha256 FROM research.native_admission_imports WHERE request_sha256=$1 AND research.native_request_deadline_ms(request_sha256)>floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
                 .bind(&self.task.id).fetch_one(&mut *self.tx).await?;
-            let native: crate::admission::SignedNativeAdmission =
+            let native: hft_research_worker_contracts::admission::SignedNativeAdmission =
                 serde_json::from_value(row.get("document"))?;
-            let trust: crate::admission::NativeAdmissionTrust =
+            let trust: hft_research_worker_contracts::admission::NativeAdmissionTrust =
                 serde_json::from_value(row.get("trust_document"))?;
             let verified = trust.verify(&native)?;
             verified.evidence().active_at(clock(&mut self.tx).await?)?;

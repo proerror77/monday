@@ -6,13 +6,15 @@ use super::{
 };
 use alpha_store::{campaign_ledger::VerifiedCampaignPlatformRevocation, AlphaStore};
 use anyhow::{ensure, Context};
-use hft_research_platform::{
-    admission::NativeAdmissionTrust,
-    release::BuildReleaseTrust,
-    revocation::{sign_revocation, NativeRequestRevocation, SignedNativeRequestRevocation},
-};
 use serde::Deserialize;
 use std::{collections::BTreeMap, io::Read, path::PathBuf};
+use {
+    hft_research_platform::release::BuildReleaseTrust,
+    hft_research_platform::revocation::sign_revocation,
+    hft_research_platform::revocation::NativeRequestRevocation,
+    hft_research_platform::revocation::SignedNativeRequestRevocation,
+    hft_research_worker_contracts::admission::NativeAdmissionTrust,
+};
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct PlatformRevocationsArgs {
@@ -132,7 +134,7 @@ pub(super) fn export(args: PlatformRevocationsArgs) -> anyhow::Result<()> {
         )?;
         let signed = if retained.exists() {
             let signed: SignedNativeRequestRevocation = signed_export::read(&retained)?;
-            trust.verify_revocation(&signed)?;
+            hft_research_platform::revocation::verify_revocation(&trust, &signed)?;
             ensure!(
                 signed.key_id == projection.native_witness_key_id
                     && signed.evidence == statement(reason, signed.evidence.issued_ms)?,
@@ -149,7 +151,7 @@ pub(super) fn export(args: PlatformRevocationsArgs) -> anyhow::Result<()> {
                 &forbidden_release_keys,
             )?;
             let signed = sign_revocation(evidence, projection.native_witness_key_id.clone(), &key)?;
-            trust.verify_revocation(&signed)?;
+            hft_research_platform::revocation::verify_revocation(&trust, &signed)?;
             signed_export::retain(&retained, &serde_json::to_vec_pretty(&signed)?)?;
             signed
         };

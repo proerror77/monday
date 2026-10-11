@@ -1,9 +1,11 @@
-use hft_research_platform::{
-    build::{BuildArtifact, BuildSpec, BuiltExecutable},
-    execution::{Backend, Profile},
-    orchestrator::{Artifact, State, Task, TaskKind, TaskSpec},
-    research::Run,
-    sha256,
+use {
+    hft_research_platform::build::BuildArtifact, hft_research_platform::build::BuildSpec,
+    hft_research_platform::build::BuiltExecutable, hft_research_platform::orchestrator::State,
+    hft_research_platform::orchestrator::Task, hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::execution::Profile,
+    hft_research_worker_contracts::research::Run, hft_research_worker_contracts::sha256,
+    hft_research_worker_contracts::task::Artifact, hft_research_worker_contracts::task::TaskKind,
+    hft_research_worker_contracts::task::TaskSpec,
 };
 #[cfg(any(feature = "control", feature = "release-verification"))]
 mod common;
@@ -77,8 +79,8 @@ fn parameter_experiments_and_retry_reuse_one_verified_build() {
     second.data_manifest_sha256 = hash('e');
     assert_ne!(first.id().unwrap(), second.id().unwrap());
     assert_eq!(first.build_artifact_sha256, second.build_artifact_sha256);
-    first.admit_build(&artifact).unwrap();
-    second.admit_build(&artifact).unwrap();
+    hft_research_platform::research::admit_run_build(&first, &artifact).unwrap();
+    hft_research_platform::research::admit_run_build(&second, &artifact).unwrap();
     artifact
         .verify_bytes(|_| Ok(b"executable fixture".to_vec()))
         .unwrap();
@@ -191,7 +193,7 @@ fn compiler_inputs_invalidate_build_and_cache_never_proves_executable_bytes() {
         .any(|a| a == "--workspace" || a == "--all-features"));
     let mut changed_run = run(&artifact);
     changed_run.image = format!("other@sha256:{}", hash('f'));
-    assert!(changed_run.admit_build(&artifact).is_err());
+    assert!(hft_research_platform::research::admit_run_build(&changed_run, &artifact).is_err());
 }
 
 #[test]
@@ -203,7 +205,7 @@ fn signed_release_import_binds_source_compiler_image_and_executables() {
     assert_eq!(verified.signed(), &signed);
     assert_eq!(
         verified.trust_sha256(),
-        hft_research_platform::identity(&trust).unwrap()
+        hft_research_worker_contracts::identity(&trust).unwrap()
     );
     for changed in [
         {
@@ -277,7 +279,8 @@ fn untrusted_or_tampered_release_cannot_be_repaired_with_new_hashes() {
         },
     ] {
         let mut rewritten = artifact.clone();
-        rewritten.release_receipt_sha256 = hft_research_platform::identity(&tampered).unwrap();
+        rewritten.release_receipt_sha256 =
+            hft_research_worker_contracts::identity(&tampered).unwrap();
         assert!(trust.verify(&rewritten, &tampered).is_err());
     }
 }
@@ -315,7 +318,8 @@ fn trusted_signature_cannot_admit_an_incomplete_or_wrong_source_receipt() {
             .to_string()
             .to_ascii_lowercase();
         let mut rewritten = artifact.clone();
-        rewritten.release_receipt_sha256 = hft_research_platform::identity(&invalid).unwrap();
+        rewritten.release_receipt_sha256 =
+            hft_research_worker_contracts::identity(&invalid).unwrap();
         assert!(trust.verify(&rewritten, &invalid).is_err());
     }
 }

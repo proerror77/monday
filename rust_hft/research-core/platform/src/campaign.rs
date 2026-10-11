@@ -1,11 +1,14 @@
 //! Development-only native Campaign collections bound to an admitted fixed Run.
-use crate::{admission::VerifiedNativeAdmission, orchestrator::TaskKind};
 #[cfg(feature = "control")]
 use anyhow::Context;
 use anyhow::{ensure, Result};
 use hft_cex_research_input::{
     campaign::{CampaignPreparedInputsV1, VerifiedCampaignPreparedInputsV1},
     data::BlockSource,
+};
+use {
+    hft_research_worker_contracts::admission::VerifiedNativeAdmission,
+    hft_research_worker_contracts::task::TaskKind,
 };
 
 /// The complete collection hash is authenticated by the native source witness.
@@ -58,14 +61,14 @@ impl crate::postgres::Ledger {
     pub(crate) async fn validate_campaign_result(
         &self,
         task: &crate::orchestrator::Task,
-        result: &crate::campaign_result::CexCampaignResultReceipt,
+        result: &hft_research_worker_contracts::campaign_result::CexCampaignResultReceipt,
     ) -> Result<()> {
         use sqlx_core::{query::query, row::Row};
         // Resolve immutable native scope from PG. A caller's receipt cannot
         // supply a different protocol, grant, source preparation, or budget.
         let row = query("SELECT n.document AS native,i.document AS inputs FROM research.native_admission_imports n JOIN research.native_campaign_inputs c USING(request_sha256) JOIN research.inputs i ON i.manifest_sha256=c.manifest_sha256 JOIN research.tasks t ON t.task_id=n.request_sha256 AND t.tenant=n.tenant WHERE n.request_sha256=$1 AND c.tenant=n.tenant AND c.manifest_sha256=$2")
             .bind(&task.id).bind(&task.spec.view_manifest_sha256).fetch_one(&self.pool).await?;
-        let native: crate::admission::SignedNativeAdmission =
+        let native: hft_research_worker_contracts::admission::SignedNativeAdmission =
             serde_json::from_value(row.get("native"))?;
         let inputs: CampaignPreparedInputsV1 = serde_json::from_value(row.get("inputs"))?;
         ensure!(
@@ -93,9 +96,10 @@ impl crate::postgres::Ledger {
         let stored = query("SELECT n.document FROM research.native_admission_imports n JOIN research.admissions a USING(request_sha256) WHERE n.request_sha256=$1 AND n.tenant=$2 FOR UPDATE OF a")
             .bind(request).bind(&evidence.tenant).fetch_one(&mut *tx).await?;
         ensure!(
-            serde_json::from_value::<crate::admission::SignedNativeAdmission>(
-                stored.get("document")
-            )? == *native.signed(),
+            serde_json::from_value::<
+                hft_research_worker_contracts::admission::SignedNativeAdmission,
+            >(stored.get("document"))?
+                == *native.signed(),
             "Campaign input publication changed imported native witness"
         );
         let now: i64 =

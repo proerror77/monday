@@ -18,7 +18,7 @@ cex_graph_failure() {
   printf 'CEX dependency assertion failed: %s\n' "$assertion" >&2
   printf 'Actual related package features from %s:\n' "${graph##*/}" >&2
   awk -F'|' '
-    $1 ~ /^(alpha-(harness|engine|onnx-evaluator)|hft-(cex-research-worker|research-ml|research-dispatch-io|infer-onnx|collector|binance-depth|data-adapter-[a-z-]+)|burn[^ ]*|clickhouse|ort) / {
+    $1 ~ /^(alpha-(harness|engine|onnx-evaluator)|hft-(cex-research-worker|research-ml|research-dispatch-io|research-platform|research-worker-(contracts|io)|infer-onnx|collector|binance-depth|data-adapter-[a-z-]+)|burn[^ ]*|clickhouse|ort) / {
       print; found=1
     }
     END {if (!found) print "<no related package rows>"}
@@ -58,8 +58,8 @@ check_cex_products() {
   if grep -Eq '^(hft-collector |clickhouse |hft-data-adapter-|hft-binance-depth )' "$work/cex-worker.tree"; then
     cex_graph_failure 'worker must exclude acquisition, ClickHouse and venue adapters' "$work/cex-worker.tree"
   fi
-  if grep -Eq '^hft-research-dispatch-io ' "$work/cex-worker.tree"; then
-    cex_graph_failure 'worker must exclude cluster operations' "$work/cex-worker.tree"
+  if grep -Eq '^(hft-research-dispatch-io|hft-research-platform) ' "$work/cex-worker.tree"; then
+    cex_graph_failure 'worker must exclude the control application and cluster operations' "$work/cex-worker.tree"
   fi
   if ! grep -q '^hft-research-ml ' "$work/cex-worker.tree"; then
     cex_graph_failure 'worker must include hft-research-ml' "$work/cex-worker.tree"
@@ -138,6 +138,16 @@ for profile in default researcher-verification control,gateway,publisher,researc
     echo 'control pulls scientific domain, acquisition, training or Parquet' >&2; exit 1
   fi
 done
+cargo tree --manifest-path "$root/rust_hft/shared/Cargo.toml" \
+  -p hft-research-worker-contracts --locked --edges normal --prefix none >"$work/worker-contracts.tree"
+if grep -E '^(alpha-|burn|ort |reqwest |tokio |zip |parquet |sqlx|axum |hft-(collector|data|research-platform|research-worker-io|research-dispatch-io|research-ml|execution-adapter-[a-z-]+) )' "$work/worker-contracts.tree"; then
+  echo 'worker contracts import IO, control, science or execution' >&2; exit 1
+fi
+cargo tree --manifest-path "$root/rust_hft/shared/Cargo.toml" \
+  -p hft-research-worker-io --locked --edges normal --prefix none >"$work/worker-io.tree"
+if grep -E '^(alpha-|burn|ort |parquet |sqlx|axum |hft-(collector|data|research-platform|research-dispatch-io|research-ml|execution-adapter-[a-z-]+) )' "$work/worker-io.tree"; then
+  echo 'worker IO imports control, science, acquisition or execution' >&2; exit 1
+fi
 cargo tree --manifest-path "$root/rust_hft/shared/Cargo.toml" \
   -p hft-research-agent-contracts --locked --edges normal --prefix none >"$work/agent-contracts.tree"
 if grep -E '^(alpha-|burn|ort |parquet |tokio |reqwest |axum |sqlx|hft-(collector|research-platform|research-ml|data|execution-adapter-[a-z-]+) )' "$work/agent-contracts.tree"; then
