@@ -1,6 +1,6 @@
 use anyhow::{bail, Context};
 pub use data::binance_lob_replay::{
-    source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
+    ReplaySequenceEvent, ReplaySequenceValidator,
 };
 use data::binance_market_tape::{
     event_type_allowed, market_tape_schema, supported_schema, AggregateTrade,
@@ -8,6 +8,7 @@ use data::binance_market_tape::{
     LobContinuitySummary, LobContinuitySummaryBuilder, AGGREGATE_TRADE_SUMMARY_CONTRACT,
     LEGACY_LOB_TAPE_SCHEMA, MARKET_TAPE_SCHEMA_V2,
 };
+use hft_research_manifest::binance::Market;
 use hft_binance_depth::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
 use rand::random;
 use rust_decimal::Decimal;

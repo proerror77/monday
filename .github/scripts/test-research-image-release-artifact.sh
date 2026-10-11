@@ -157,10 +157,10 @@ release="$tmp_dir/release"
 mkdir -p "$repo/prediction-markets" "$release/research-bin"
 printf 'root lock\n' >"$repo/Cargo.lock"
 printf 'prediction lock\n' >"$repo/prediction-markets/Cargo.lock"
-for binary in hft-backtest alpha-harness monday-cex-worker lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer clickhouse-analytics-materializer monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot monday-prediction-worker monday-prediction-operator; do
+while IFS= read -r binary; do
   printf '%s\n' "$binary" >"$release/research-bin/$binary"
   chmod 0755 "$release/research-bin/$binary"
-done
+done < <(bash "$script_dir/research-release-products.sh" binaries all)
 
 cp "$root/rust_hft/workspaces.json" "$repo/workspaces.json"
 while IFS= read -r manifest; do

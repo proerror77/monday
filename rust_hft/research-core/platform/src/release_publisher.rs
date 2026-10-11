@@ -2638,8 +2638,8 @@ mod tests {
         };
         let mut calls = 0;
         for (product, programs, build_count, expected_calls) in [
-            ("cex-runner", 7, 4, 66),
-            ("controller", 4, 2, 39),
+            ("cex-runner", 8, 5, 78),
+            ("controller", 1, 1, 21),
             ("prediction-runner", 5, 3, 51),
         ] {
             let names =
@@ -2656,8 +2656,9 @@ mod tests {
                 ".github/workflows/ploy-ci.yml",
             )?;
             assert_eq!(inventory.program_objects.len(), programs);
-            assert_eq!(inventory.publication_limits()?.requests, expected_calls);
-            calls += expected_calls;
+            let measured_calls = inventory.publication_limits()?.requests;
+            assert_eq!(measured_calls, expected_calls);
+            calls += measured_calls;
             let (binding, _, _) = crate::release_budget::tests::fixture(product, 1, 1);
             inventory.validate(&binding)?;
             for object in &inventory.program_objects {
@@ -2667,7 +2668,7 @@ mod tests {
                 assert_eq!(object.sha256, sha256(&bytes));
             }
         }
-        assert_eq!(calls, 156);
+        assert_eq!(calls, 150);
         let names = BTreeSet::from(["alpha-harness".into()]);
         let builds = project_builds(&source(), &manifest.build_inputs, &names)?;
         std::fs::write(

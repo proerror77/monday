@@ -37,9 +37,14 @@ else
   # Bound each offline startup and remove its container if the client times out.
   while IFS= read -r binary; do
     printf 'Research runtime smoke: product=%s binary=%s\n' "$product" "$binary"
+    argument=--help
+    [[ $binary != monday-cex-prepare ]] || argument=--version
     timeout --kill-after=5s 30s docker run --rm --network none \
       --cidfile "$work/smoke.cid" --entrypoint "/usr/local/bin/$binary" \
-      "$image" --help >/dev/null
+      "$image" "$argument" >"$work/startup.txt"
+    if [[ $binary == monday-cex-prepare ]]; then
+      grep -Fxq "monday-cex-prepare $source_sha" "$work/startup.txt"
+    fi
     rm -f "$work/smoke.cid"
   done <<< "$expected"
 fi

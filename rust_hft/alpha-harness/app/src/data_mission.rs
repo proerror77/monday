@@ -3,19 +3,13 @@ use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
-use data::binance_lob_replay::source_revision;
-#[cfg(feature = "operator")]
-use data::binance_lob_replay::Market;
 use hft_cex_research_input::feature_matrix::{
     import_feature_dataset, read_feature_rows, DataModality, FeatureDatasetManifest,
 };
 use hft_cex_research_input::ohlcv::{DatasetManifest, OhlcvTraceRow};
-#[cfg(feature = "operator")]
-use hft_collector::{acquire_dataset, DataAcquisitionMission};
-#[cfg(feature = "operator")]
-use hft_research_artifacts::temporary_output_file;
 #[cfg(test)]
-use hft_research_artifacts::{write_json_atomic, write_json_atomic_bounded};
+use hft_research_artifacts::{temporary_output_file, write_json_atomic, write_json_atomic_bounded};
+use hft_research_manifest::source::source_revision;
 use hft_research_manifest::{
     CexReplayDatasetManifestV1, CexReplayDatasetManifestV2, CexReplayDatasetManifestV3,
     CexReplayDatasetManifestV4, CexReplayDatasetManifestV5, CexReplaySeriesV1, CexReplaySnapshotV1,
@@ -25,8 +19,6 @@ use hft_research_manifest::{
     CEX_REPLAY_DATASET_SCHEMA_V5, CEX_REPLAY_SNAPSHOT_SCHEMA_V3, CEX_REPLAY_SNAPSHOT_SCHEMA_V4,
 };
 use sha2::{Digest, Sha256};
-#[cfg(feature = "operator")]
-use std::io::Write;
 use std::{collections::BTreeSet, io::BufRead, path::Path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,11 +29,15 @@ pub(crate) struct FeatureDecisionClock {
 }
 
 #[cfg(feature = "operator")]
-pub async fn acquire_and_register(
-    store: &mut AlphaStore,
-    mission: &DataAcquisitionMission,
-) -> anyhow::Result<DatasetManifest> {
-    let manifest = acquire_dataset(mission).await.map_err(anyhow::Error::msg)?;
+pub fn register_dataset(store: &mut AlphaStore, path: &Path) -> anyhow::Result<DatasetManifest> {
+    let bytes = hft_cex_research_input::preparation::read_file_bounded(
+        path,
+        1024 * 1024,
+        "dataset manifest",
+    )?;
+    let manifest: DatasetManifest = serde_json::from_slice(&bytes)?;
+    // Validate the actual content-addressed trace before writing its registry record.
+    load_research_rows(&manifest, 0.0, 0.0, 0.0)?;
     store.put_registry_revision(&RegistryRevision {
         revision_id: manifest.manifest_id.clone(),
         registry_kind: "dataset".to_string(),
@@ -961,89 +957,6 @@ pub(crate) fn feature_decision_clocks(
         .collect())
 }
 
-pub fn default_manifest_path(manifest: &DatasetManifest) -> std::path::PathBuf {
-    manifest
-        .artifact_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("{}.manifest.json", manifest.manifest_id))
-}
-
-/// Prepare immutable input selection for the existing materialization entrypoint.
-#[cfg(feature = "operator")]
-pub(crate) fn freeze_research_inventory_request(
-    args: &crate::cli::FreezeInventoryArgs,
-) -> anyhow::Result<hft_collector::research_inventory::FrozenInventory> {
-    let request = hft_collector::research_inventory::InventoryRequest {
-        raw_root: args.raw_root.clone(),
-        reference_root: args.reference_root.clone(),
-        start_received_at_ns: args.start_received_at_ns,
-        end_received_at_ns: args.end_received_at_ns,
-        market: args.market.parse::<Market>().map_err(anyhow::Error::msg)?,
-        symbol: args.symbol.clone(),
-        source_revision: crate::cli::BUILD_SOURCE_REVISION.to_string(),
-        image_ref: args.image_ref.clone(),
-        mission_id: args.mission_id.clone(),
-        output_prefix: args.output_prefix.clone(),
-        bucket_ms: args.bucket_ms,
-        label_horizon_buckets: args.label_horizon_buckets,
-        top_depth: args.top_depth,
-        max_scan_entries: args.max_scan_entries,
-        max_inputs: args.max_inputs,
-        max_input_bytes: args.max_input_bytes,
-    };
-    hft_collector::research_inventory::freeze_inventory(&request)
-}
-
-#[cfg(feature = "operator")]
-pub fn verify_materialization_manifest(
-    args: crate::cli::VerifyMaterializationManifestArgs,
-) -> anyhow::Result<()> {
-    use hft_collector::research_inventory::{
-        verify_materialization_manifest_metadata, MaterializationManifestKind,
-    };
-    let kind = match args.kind {
-        crate::cli::MaterializationManifestKindArg::Raw => MaterializationManifestKind::Raw,
-        crate::cli::MaterializationManifestKindArg::Reference => {
-            MaterializationManifestKind::Reference
-        }
-    };
-    let window = match (args.start_received_at_ns, args.end_received_at_ns) {
-        (Some(start), Some(end)) => Some((start, end)),
-        (None, None) => None,
-        _ => bail!("materialization manifest requires both window bounds together"),
-    };
-    verify_materialization_manifest_metadata(
-        &args.manifest,
-        &args.manifest_sha256,
-        kind,
-        args.market.parse::<Market>().map_err(anyhow::Error::msg)?,
-        window,
-    )?;
-    crate::cli::print_json(&serde_json::json!({
-        "status": "verified", "kind": kind, "manifest_sha256": args.manifest_sha256,
-        "requires_pit_admission": true,
-    }))
-}
-
-/// Prepare immutable input selection for the existing materialization entrypoint.
-#[cfg(feature = "operator")]
-pub fn freeze_research_inventory(args: crate::cli::FreezeInventoryArgs) -> anyhow::Result<()> {
-    let inventory = freeze_research_inventory_request(&args)?;
-    let mut output = temporary_output_file(&args.output, ".frozen-inventory-")?;
-    output
-        .as_file_mut()
-        .write_all(inventory.inventory_env.as_bytes())?;
-    output.as_file().sync_all()?;
-    output
-        .persist_noclobber(&args.output)
-        .map_err(|error| error.error)?;
-    if hft_research_artifacts::sha256_file(&args.output)? != inventory.inventory_sha256 {
-        bail!("frozen inventory output readback differs");
-    }
-    crate::cli::print_json(&serde_json::json!({"output":args.output,"inventory":inventory}))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1802,6 +1715,24 @@ mod tests {
         manifest.artifact_path = artifact_path;
         manifest.artifact_sha256 = hash.clone();
         manifest.manifest_id = format!("dataset-{hash}");
+    }
+
+    #[cfg(feature = "operator")]
+    #[test]
+    fn dataset_registration_requires_verified_trace_bytes() {
+        let (directory, manifest, _) = trace_fixture();
+        let path = directory.join("manifest.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        assert_eq!(register_dataset(&mut store, &path).unwrap(), manifest);
+        assert_eq!(read_registered_manifest(&store, &path).unwrap(), manifest);
+        let mut empty_store = AlphaStore::open_in_memory().unwrap();
+        std::fs::write(&manifest.artifact_path, b"altered trace").unwrap();
+        assert!(register_dataset(&mut empty_store, &path).is_err());
+        assert!(empty_store
+            .get_registry_revision(&manifest.manifest_id)
+            .is_err());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

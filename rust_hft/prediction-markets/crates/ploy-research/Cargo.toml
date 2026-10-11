@@ -20,6 +20,7 @@ rl = []
 strategy-runtime = []
 
 [dependencies]
+hft-research-manifest = { path = "../../../research-core/manifest" }
 data = { package = "hft-data", path = "../../../data-pipelines/core" }
 rand.workspace = true
 chrono.workspace = true

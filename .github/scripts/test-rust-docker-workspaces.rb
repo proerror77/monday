@@ -133,6 +133,39 @@ def check_recipe(path, source, packages)
     end
   end
   raise "#{path}: no checked Cargo build/fetch/test command" if commands.zero?
+  check_data_preparation_distribution(path, source)
+end
+
+def check_data_preparation_distribution(path, source)
+  return unless path == 'deployment/aliyun/research/Dockerfile.research-data'
+
+  logical = source.gsub(/\\\r?\n\s*/, ' ')
+  commands = logical.lines.map { |line| line[/^RUN\s+(.+)/, 1] }.compact
+                    .flat_map { |body| body.split(/\s+&&\s+/) }
+                    .map { |command| Shellwords.split(command) }
+  binary = 'monday-cex-prepare'
+  built = commands.any? do |tokens|
+    pairs = tokens.each_cons(2).to_a
+    pairs.include?(%w[cargo build]) &&
+      pairs.include?(['-p', 'hft-cex-data-preparation']) &&
+      pairs.include?(['--bin', binary])
+  end
+  raise "#{path}: materialization verifier is not built" unless built
+  unless commands.include?(['install', '-D', '-m', '0755', "target/release/#{binary}", "/out/#{binary}"])
+    raise "#{path}: materialization verifier is not installed in the exported binaries"
+  end
+  checksums = commands.find { |tokens| tokens.first == 'sha256sum' && tokens.last(2) == ['>', 'SHA256SUMS'] }
+  raise "#{path}: materialization verifier has no exported checksum" unless checksums && checksums.include?(binary)
+  unless commands.include?(['export', 'MONDAY_SOURCE_REVISION=$SOURCE_REVISION']) &&
+         commands.include?(['test', "$(/out/#{binary} --version)", '=', "#{binary} $SOURCE_REVISION"])
+    raise "#{path}: materialization verifier has no exact-source version readback"
+  end
+  {'binaries' => '/', 'runtime' => '/opt/monday/'}.each do |stage, destination|
+    block = logical.split(/^FROM /).find { |part| part.lines.first.match?(/\bAS #{stage}\s*$/) }
+    unless block && block.lines.any? { |line| line.strip == "COPY --from=validated /out/ #{destination}" }
+      raise "#{path}: #{stage} does not consume the verified data binaries"
+    end
+  end
 end
 
 recipes = tracked('*Dockerfile*').select do |path|
@@ -188,7 +221,14 @@ if ARGV == ['--self-test']
     'wrong data owner' => data_source.sub('--manifest-path data-pipelines/Cargo.toml --release', '--manifest-path runtime/Cargo.toml --release'),
     'wrong test owner' => data_source.sub('cargo test --manifest-path shared/Cargo.toml', 'cargo test --manifest-path runtime/Cargo.toml'),
     'missing test owner' => data_source.sub('cargo test --manifest-path shared/Cargo.toml', 'cargo test'),
-    'missing source COPY' => data_source.sub('COPY rust_hft/ rust_hft/', 'COPY unrelated/ rust_hft/')
+    'missing source COPY' => data_source.sub('COPY rust_hft/ rust_hft/', 'COPY unrelated/ rust_hft/'),
+    'missing preparation build' => data_source.sub('-p hft-cex-data-preparation --bin monday-cex-prepare', '-p hft-collector --bin research-data-service'),
+    'missing preparation install' => data_source.sub('target/release/monday-cex-prepare /out/monday-cex-prepare', 'target/release/alpha-harness /out/alpha-harness'),
+    'missing preparation checksum' => data_source.sub('clickhouse-analytics-materializer alpha-harness monday-cex-prepare', 'clickhouse-analytics-materializer alpha-harness'),
+    'wrong preparation source' => data_source.sub('export MONDAY_SOURCE_REVISION="$SOURCE_REVISION"', 'export MONDAY_SOURCE_REVISION="unbound"'),
+    'missing preparation readback' => data_source.sub('/out/monday-cex-prepare --version', '/out/alpha-harness --version'),
+    'wrong binary export stage' => data_source.sub("COPY --from=validated /out/ /\n", "COPY --from=source /out/ /\n"),
+    'wrong runtime copy stage' => data_source.sub('COPY --from=validated /out/ /opt/monday/', 'COPY --from=source /out/ /opt/monday/')
   }.each do |name, changed|
     abort "invalid data recipe mutation: #{name}" if changed == data_source
     begin

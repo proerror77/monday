@@ -7,6 +7,7 @@ use alpha_store::campaign_ledger::VerifiedCampaignPlanningPermission;
 use hft_cex_research_input::campaign::{
     NativeDatasetMetadataV1, NativeResearchRowV1, NativeSourceBindingV1,
 };
+use hft_cex_research_input::materialization::Materialization;
 
 /// Only the approved normalized projection is borrowable by a planner. The
 /// original decoder's replay, complete manifest and transports stay private.
@@ -927,7 +928,7 @@ fn check_current_authority(
 fn project_signed_search_view(
     root: &VerifiedCampaignRootGrant,
     request: &CampaignRequest,
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
 ) -> anyhow::Result<PlanningViewV1> {
     let execution = &root.grant().execution;
     if request.campaign_inputs_sha256 != execution.campaign_inputs_sha256

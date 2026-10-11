@@ -30,10 +30,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo build --manifest-path data-pipelines/Cargo.toml --release --locked \
        -p hft-collector --bin research-data-service --bin clickhouse-analytics-materializer \
        --bin lob-pit-materializer --bin binance-market-tape-slicer --bin binance-replay-parquet-materializer \
+    && cargo build --manifest-path data-pipelines/Cargo.toml --release --locked \
+       -p hft-cex-data-preparation --bin monday-cex-prepare \
     && cargo build --manifest-path research-core/Cargo.toml --release --locked -p alpha-harness --bin alpha-harness \
     && install -D -m 0755 target/release/research-data-service /out/research-data-service \
     && install -D -m 0755 target/release/clickhouse-analytics-materializer /out/clickhouse-analytics-materializer \
     && install -D -m 0755 target/release/alpha-harness /out/alpha-harness \
+    && install -D -m 0755 target/release/monday-cex-prepare /out/monday-cex-prepare \
+    && test "$(/out/monday-cex-prepare --version)" = "monday-cex-prepare $SOURCE_REVISION" \
     && install -D -m 0755 target/release/lob-pit-materializer /out/lob-pit-materializer \
     && install -D -m 0755 target/release/binance-market-tape-slicer /out/binance-market-tape-slicer \
     && install -D -m 0755 target/release/binance-replay-parquet-materializer /out/binance-replay-parquet-materializer \
@@ -41,7 +45,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && { printf 'execution_host=ack\nsource_revision=%s\ntest_verdict=passed\n' "$SOURCE_REVISION"; \
          rustc -Vv; sha256sum shared/Cargo.lock data-pipelines/Cargo.lock research-core/Cargo.lock; \
        } > /out/build-receipt.txt \
-    && cd /out && sha256sum research-data-service clickhouse-analytics-materializer alpha-harness \
+    && cd /out && sha256sum research-data-service clickhouse-analytics-materializer alpha-harness monday-cex-prepare \
        lob-pit-materializer binance-market-tape-slicer binance-replay-parquet-materializer > SHA256SUMS
 
 FROM scratch AS binaries

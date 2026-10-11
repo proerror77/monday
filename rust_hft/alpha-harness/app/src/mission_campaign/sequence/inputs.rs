@@ -1,7 +1,8 @@
 //! Admission of an immutable sequence cohort and its original PIT receipts.
 use crate::mission_render::approved_validation;
-use crate::mission_runner::{decode_materialization, validate_materialization};
+use crate::mission_runner::validate_materialization;
 use anyhow::{bail, Context};
+use hft_cex_research_input::materialization::decode_materialization;
 use hft_research_manifest::sequence::{
     valid_sha256, SequenceDatasetV1, SequenceInputSpecV1, SequenceViewV1,
 };

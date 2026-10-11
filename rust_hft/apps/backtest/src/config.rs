@@ -4,9 +4,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context};
-use data::binance_lob_replay::{
-    source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
-};
+use data::binance_lob_replay::{ReplaySequenceEvent, ReplaySequenceValidator};
+use hft_research_manifest::binance::Market;
+use hft_research_manifest::source::source_revision;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
 use parquet::schema::parser::parse_message_type;
