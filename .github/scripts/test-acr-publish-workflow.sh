@@ -186,7 +186,7 @@ selector_steps = acr_selector.fetch('steps')
 source_index = selector_steps.index { |step| step['id']=='source' }
 prebuild_index = selector_steps.index { |step| step['name']=='Validate research publication settings before rebuild' }
 matrix_index = selector_steps.index { |step| step['id']=='select' }
-abort 'manual compilation can start before source/configuration validation' unless source_index && prebuild_index && matrix_index && source_index<prebuild_index && prebuild_index<matrix_index && acr.fetch('jobs').fetch('research-runner-binaries').fetch('needs')=='selector'
+abort 'manual compilation can start before source/configuration validation' unless source_index && prebuild_index && matrix_index && source_index<prebuild_index && prebuild_index<matrix_index && acr.fetch('jobs').fetch('research-runner-binaries').fetch('needs')==['selector','research-environments']
 prebuild = selector_steps.fetch(prebuild_index)
 abort 'configuration preflight is not scoped to explicit rebuilds' unless prebuild.fetch('if')=="steps.source.outputs.research_mode == 'rebuild'"
 abort 'prebuild check receives credentials or loses selected products' unless prebuild.fetch('env')=={
@@ -335,7 +335,7 @@ acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
 end
 publication=acr.fetch('jobs').fetch('publish')
 abort 'release job cannot obtain its own OIDC identity' unless publication.fetch('permissions')=={'actions'=>'read','checks'=>'read','contents'=>'read','id-token'=>'write','pull-requests'=>'read'}
-abort 'binary predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries']
+abort 'binary or environment predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries','research-environments']
 steps=publication.fetch('steps')
 presence=steps.index { |s|s.fetch('name','')=='Require research publication settings before preparation' }
 public_policy=steps.index { |s|s.fetch('name','')=='Validate public research publication policy before preparation' }
@@ -424,7 +424,7 @@ RUBY
 for publish_target in all research-runner prediction-research-runner campaign-cycle-controller research-products; do
   : >"$tmp_dir/matrix-output"
   TARGET="$publish_target" PUBLISHED_PRODUCTS=controller,prediction-runner GITHUB_OUTPUT="$tmp_dir/matrix-output" bash "$tmp_dir/select-matrix.sh"
-  sed 's/^matrix=//' "$tmp_dir/matrix-output" >"$tmp_dir/matrix.json"
+  sed -n 's/^matrix=//p' "$tmp_dir/matrix-output" >"$tmp_dir/matrix.json"
   ruby -rjson - "$tmp_dir/matrix.json" "$tmp_dir/controller-condition.txt" "$publish_target" <<'RUBY'
 rows=JSON.parse(File.read(ARGV[0])).fetch('include')
 expected = case ARGV[2]
@@ -455,7 +455,7 @@ fixture_sha=$(printf 'a%.0s' {1..40})
 TARGET=$(sed -n 's/^publish_target=//p' "$tmp_dir/union-source") \
   PUBLISHED_PRODUCTS=$(sed -n 's/^published_products=//p' "$tmp_dir/union-source") \
   GITHUB_OUTPUT="$tmp_dir/matrix-output" bash "$tmp_dir/select-matrix.sh"
-sed 's/^matrix=//' "$tmp_dir/matrix-output" | jq -e '
+sed -n 's/^matrix=//p' "$tmp_dir/matrix-output" | jq -e '
   (.include | map(.repository) | sort)==["campaign-cycle-controller","prediction-research-runner","research-runner"]
   and (.include | map(.product) | sort)==["cex-runner","controller","prediction-runner"]
   and all(.include[]; .research_artifact==true)
@@ -567,3 +567,5 @@ if jq -e --arg product foreign -f "$selector" "$tmp_dir/oss-products.json" >/dev
 jq '.oss_by_product.controller.role_arn=.oss_by_product["cex-runner"].role_arn' "$tmp_dir/oss-products.json" >"$tmp_dir/oss-shared-role.json"
 if jq -e --arg product controller -f "$selector" "$tmp_dir/oss-shared-role.json" >/dev/null 2>&1; then exit 1; fi
 bash "$script_dir/test-migrate-research-oss-policy.sh"
+
+bash "$script_dir/test-automatic-research-publication.sh"

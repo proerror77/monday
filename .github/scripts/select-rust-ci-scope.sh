@@ -494,7 +494,10 @@ for path in "${paths[@]}"; do
     .github/workflows/release.yml|.github/scripts/decide-release-once.sh|\
     .github/scripts/read-release-published.sh|.github/scripts/release-orchestrator-admit.sh|\
     .github/scripts/test-release-once.sh|.github/scripts/write-release-record.sh|\
-    .github/scripts/test-release-record.sh)
+    .github/scripts/test-release-record.sh|\
+    .github/scripts/read-automatic-research-publication.sh|\
+    .github/scripts/automatic-research-publication.jq|\
+    .github/scripts/test-automatic-research-publication.sh)
       # Release policy changes run source/signature/manifest contracts on both
       # PR and main push. Only actual image/source/dependency inputs rebuild.
       select_job ci/ci-contracts
