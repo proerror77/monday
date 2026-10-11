@@ -1343,7 +1343,7 @@ grep -Fq \
   'uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8' \
   "$WORKFLOW"
 ruby -ryaml - "$WORKFLOW" <<'RUBY'
-steps=YAML.safe_load(File.read(ARGV[0])).fetch('jobs').fetch('publish').fetch('steps')
+steps=YAML.safe_load(File.read(ARGV[0])).fetch('jobs').fetch('publish-ordinary').fetch('steps')
 uploads=steps.select { |step| step.dig('with','name')=='hft-trading-ecs-linux-amd64-${{ github.sha }}' }
 abort 'missing or duplicate trading host artifact upload' unless uploads.length==1
 upload=uploads.fetch(0)
