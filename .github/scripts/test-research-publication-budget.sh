@@ -131,6 +131,7 @@ printf 'unapproved archive made a network request\n' >>"$READINESS_NETWORK_LOG"
 exit 91
 MOCK
 chmod +x "$work/tools/gh"
+archive_signer_present=true
 for expression in 'null' '.expires_at=1791680400' '.max_estimated_micro_cny=1' '.max_oss_requests=1'; do
   jq "$expression" "$work/operations.json" >"$work/invalid.json"
   : >"$work/readiness-output"
@@ -139,7 +140,7 @@ for expression in 'null' '.expires_at=1791680400' '.max_estimated_micro_cny=1' '
     GITHUB_WORKFLOW_REF=proerror77/monday/.github/workflows/acr-publish.yml@refs/heads/main \
     MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY="$(cat "$work/invalid.json")" \
     MONDAY_RESEARCH_AUTOMATIC_PUBLICATION='{}' MONDAY_RESEARCH_RELEASE_POLICY="$(cat "$work/oss-policy.json")" \
-    MONDAY_RELEASE_SIGNING_KEY_PRESENT=true \
+    MONDAY_RELEASE_SIGNING_KEY_PRESENT="$archive_signer_present" \
     bash "$script_dir/research-archive-readiness.sh" "$source_sha" "$products" '{"include":[]}' "$work/readiness-output" \
     >"$work/out" 2>"$work/err"
   grep -Fqx ready=false "$work/readiness-output"
