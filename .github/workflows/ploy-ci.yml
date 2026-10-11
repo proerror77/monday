@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       research_cache_probe:
-        description: Re-run the exact research recipes in the same ephemeral target
+        description: Compare serial and bounded-parallel recipes with the same warmed dependencies
         type: boolean
         default: false
 

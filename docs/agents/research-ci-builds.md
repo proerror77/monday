@@ -49,5 +49,30 @@ hashes therefore bind its implementation. Changing it starts a new compatible
 cache identity. Compare serial and concurrent runs on the same source, runner
 and warmed dependency cache. A first cold run cannot establish a speedup.
 
+Use Prediction Markets CI's existing `workflow_dispatch` input
+`research_cache_probe=true` for a paired measurement on its selected source.
+The ordinary CI path still builds each selected recipe once.
+The probe first populates dependencies and checks a warm local rebuild. It then
+cleans local outputs with the same cache helper before each measured phase:
+
+| Phase | Requested owner concurrency | Cargo jobs on a four-CPU runner |
+| --- | --- | --- |
+| `dependency-warm-serial` | 1 | 4 |
+| `dependency-warm-parallel` | 2 | 2 per owner |
+
+Every recipe record includes `phase_seconds` and the full `build_inputs` object.
+Both phases must retain the same input hash, target, profile, source and binary
+hashes. The probe fails if executable bytes differ. Read actual concurrency too:
+a memory or product limit can reduce a requested two-owner phase to one owner.
+
+Compare phase wall time, not the sum of overlapping recipe times. Also inspect
+fresh/rebuilt dependency counts and the recorded native artifacts. Fixed slots
+do not increase the long owner's jobs after a short owner finishes. Retain the
+serial mode until a matching hosted comparison establishes the better schedule.
+
+Signals sent only to the outer release Bash PID propagate through the recipe
+wrapper to the Ruby supervisor. Each wrapper waits for child cleanup before
+returning failure. The cancellation test uses that single-PID path.
+
 Publication still consumes one producer job and one verified release bundle.
 This change does not introduce matrix producers or change release provenance.

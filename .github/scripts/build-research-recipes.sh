@@ -3,8 +3,8 @@
 set -euo pipefail
 [[ $# == 2 || $# == 5 ]] || exit 2
 product=${1:?product required}
-phase=${2:?after-cache-lookup, warm-local or dependency-warm-local required}
-[[ $phase == after-cache-lookup || $phase == warm-local || $phase == dependency-warm-local ]] || exit 2
+phase=${2:?recipe measurement phase required}
+[[ $phase == after-cache-lookup || $phase == warm-local || $phase == dependency-warm-serial || $phase == dependency-warm-parallel ]] || exit 2
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root/rust_hft"
 inputs=${MONDAY_BUILD_INPUTS_FILE:?}
@@ -44,8 +44,21 @@ if [[ $# == 2 ]]; then
     timing_files+=("$work/$phase-${owner//\//--}.timings.jsonl")
     : >"${timing_files[${#timing_files[@]}-1]}"
   done < <(jq -r 'map(.manifest)|unique|.[]' <<<"$recipes")
-  status=0
-  ruby -rjson - "$root/.github/scripts/build-research-recipes.sh" "$product" "$phase" "$inputs" "$cpus" "$memory_mib" <<'RUBY' || status=$?
+  phase_start=$(date +%s)
+  scheduler_pid='' scheduler_starting=1 scheduler_cancelled=0
+  # Invoked by the signal traps below.
+  # shellcheck disable=SC2329
+  cancel_scheduler() {
+    scheduler_cancelled=$1
+    if [[ -n $scheduler_pid ]]; then
+      kill -TERM "$scheduler_pid" 2>/dev/null || true
+    elif (( scheduler_starting == 0 )); then exit "$scheduler_cancelled"; fi
+  }
+  trap 'cancel_scheduler 130' INT
+  trap 'cancel_scheduler 143' TERM
+  # Background execution lets Bash handle a signal sent only to its own PID.
+  # The Ruby supervisor receives that signal and reaps its owned process groups.
+  ruby -rjson - "$root/.github/scripts/build-research-recipes.sh" "$product" "$phase" "$inputs" "$cpus" "$memory_mib" <<'RUBY' &
 script, product, phase, inputs, cpus, memory = ARGV
 cpus, memory = Integer(cpus), Integer(memory)
 requested = ENV.fetch('MONDAY_RESEARCH_BUILD_CONCURRENCY', '2')
@@ -106,16 +119,31 @@ ensure
 end
 exit status
 RUBY
+  scheduler_pid=$!
+  scheduler_starting=0
+  if (( scheduler_cancelled != 0 )); then kill -TERM "$scheduler_pid" 2>/dev/null || true; fi
+  status=0
+  while true; do
+    if wait "$scheduler_pid"; then break; else status=$?; fi
+    # A trapped signal interrupts wait before the child finishes its cleanup.
+    if (( scheduler_cancelled == 0 )) || ! kill -0 "$scheduler_pid" 2>/dev/null; then break; fi
+  done
+  scheduler_pid=''
+  if (( scheduler_cancelled != 0 )); then status=$scheduler_cancelled; fi
+  trap - INT TERM
+  phase_seconds=$(( $(date +%s) - phase_start ))
   # Validate the complete recipe set before emitting successful phase evidence.
   # Failed phases retain completed measurements without admitting an artifact.
-  jq -sc --argjson status "$status" --argjson recipes "$recipes" --arg source "$source_sha" --arg inputs "$inputs_sha" '
+  jq -sc --argjson status "$status" --argjson recipes "$recipes" --arg source "$source_sha" --arg inputs "$inputs_sha" \
+    --argjson phase_seconds "$phase_seconds" --slurpfile build_inputs "$inputs" '
     if $status == 0 then
       if length != ($recipes|length) or (all(.[]; .source_sha==$source and .compilation_inputs_sha256==$inputs)|not)
       then error("incomplete or mismatched owner evidence") else
         . as $measurements | $recipes[] as $recipe |
         [$measurements[]|select(.recipe==$recipe)] | if length==1 then .[] else error("duplicate or missing recipe") end
       end
-    else .[] end' "${timing_files[@]}" | tee -a "$work/timings.jsonl"
+    else .[] end | . + {phase_seconds:$phase_seconds,build_inputs:$build_inputs[0]}' \
+    "${timing_files[@]}" | tee -a "$work/timings.jsonl"
   [[ $(sha256sum "$inputs" | awk '{print $1}') == "$inputs_sha" ]]
   exit "$status"
 fi

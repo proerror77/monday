@@ -209,9 +209,13 @@ while IFS= read -r binary; do
 done < <(bash "$products" binaries controller)
 printf 'PASS: controller-only release builds five admitted executables including the ACK importer; product, archive and unadmitted control bytes fail closed\n'
 
-# The opt-in probe must run all three controller recipes through three exact-input phases with one input identity.
-jq -es 'length==9 and ([.[].phase]|sort)==["after-cache-lookup","after-cache-lookup","after-cache-lookup","dependency-warm-local","dependency-warm-local","dependency-warm-local","warm-local","warm-local","warm-local"]
+# The opt-in probe compares both schedules after identical dependency-only cleanup.
+jq -es 'length==12 and ([.[].phase]|sort)==["after-cache-lookup","after-cache-lookup","after-cache-lookup","dependency-warm-parallel","dependency-warm-parallel","dependency-warm-parallel","dependency-warm-serial","dependency-warm-serial","dependency-warm-serial","warm-local","warm-local","warm-local"]
   and ([.[].compilation_inputs_sha256]|unique|length)==1
+  and ([.[].build_inputs]|unique|length)==1
+  and all(.[]; .build_inputs.profile=="release" and .build_inputs.target=="x86_64-unknown-linux-gnu" and .phase_seconds>=0)
+  and all(.[]|select(.phase=="dependency-warm-serial"); .scheduler.requested_owner_concurrency==1 and .scheduler.owner_concurrency==1 and .scheduler.cargo_jobs==8)
+  and all(.[]|select(.phase=="dependency-warm-parallel"); .scheduler.requested_owner_concurrency==2 and .scheduler.owner_concurrency==2 and .scheduler.cargo_jobs==4)
   and all(.[]; .source_sha=="1111111111111111111111111111111111111111" and .compiler_artifacts>0
     and .runner.cpu_model=="Monday fixture CPU" and .runner.logical_cpus==8)' \
   "$fixture/output/research-recipe-probe/timings.jsonl" >/dev/null
@@ -304,22 +308,22 @@ for pid_file in "$MONDAY_TEST_COMPILER_PID" "$MONDAY_TEST_FAILED_COMPILER_PID"; 
 done
 grep -Fq 'research recipe owner failed: research-core/Cargo.toml status=37' "$work/cancel.log"
 
-# External cancellation must also terminate the groups outside the launcher's group.
+# Signal only the outer release Bash PID; both supervisors must forward cancellation.
 rm -f "$MONDAY_TEST_COMPILER_PID"
 rm -rf "$MONDAY_TEST_TARGET_LOCKS"
 mkdir -p "$MONDAY_TEST_TARGET_LOCKS" "$fixture/interrupted-output"
 MONDAY_TEST_CARGO_MODE=interrupted PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/interrupted-output" \
-  MONDAY_SOURCE_REVISION="$sha" MONDAY_BUILD_INPUTS_FILE="$fixture/all-inputs.json" \
-  ruby - "$fixture/.github/scripts/build-research-recipes.sh" "$MONDAY_TEST_COMPILER_PID" "$work/interrupted.log" <<'RUBY'
+  GITHUB_REPOSITORY=fixture/monday GITHUB_RUN_ID=42 MONDAY_BUILD_INPUTS_FILE="$fixture/all-inputs.json" \
+  ruby - "$fixture/.github/scripts/build-research-release.sh" "$MONDAY_TEST_COMPILER_PID" "$work/interrupted.log" <<'RUBY'
 script, compiler_file, log = ARGV
-pid = Process.spawn('bash', script, 'all', 'after-cache-lookup', pgroup:true, out:log, err:log)
+pid = Process.spawn('bash', script, 'all', pgroup:true, out:log, err:log)
 begin
   deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
   until File.exist?(compiler_file)
     abort 'interrupted compiler did not start' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
     sleep 0.05
   end
-  Process.kill('TERM', -pid)
+  Process.kill('TERM', pid)
   _, status = Process.wait2(pid)
   abort 'interrupted producer succeeded' if status.success?
   compiler = Integer(File.read(compiler_file))
@@ -341,6 +345,7 @@ ensure
   Process.wait(pid) rescue Errno::ECHILD
 end
 RUBY
+[[ ! -e $fixture/interrupted-output/research-image-release.tar ]]
 
 # Invalid resource requests fail before starting a compiler.
 for request in cpu concurrency; do
