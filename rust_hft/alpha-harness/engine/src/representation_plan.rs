@@ -134,7 +134,7 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../../tools/collector/src/polymarket_upload.rs"),
         source!("../../../tools/collector/src/binance_spot_reference_artifact.rs"),
         source!("../../../tools/collector/src/binance_usdm_reference_artifact.rs"),
-        source!("../../../tools/collector/src/feature_matrix.rs"),
+        source!("../../../research-core/cex-input/src/feature_matrix.rs"),
         source!("../../../research-core/manifest/src/lib.rs"),
         source!("../../../research-core/manifest/src/sequence.rs"),
         source!("../../../research-core/manifest/src/market_encoder.rs"),
