@@ -1,16 +1,25 @@
+use hft_research_artifacts::identity::validate_dns_label;
+#[cfg(any(feature = "operator", test))]
 use hft_research_dispatch_io::{
     ensure_kubectl_success, kubectl_binary, kubectl_json, kubectl_with_input,
-    validate_cluster_target, validate_dns_label,
+    validate_cluster_target,
 };
 pub(crate) mod admission;
+#[cfg(any(feature = "operator", test))]
 pub(crate) mod controller;
 pub(crate) mod final_admission;
+#[cfg(any(feature = "operator", test))]
 pub(crate) mod final_authority;
+#[cfg(any(feature = "operator", test))]
 pub(crate) mod platform_admission;
+#[cfg(any(feature = "operator", test))]
 pub(crate) mod platform_terminal;
 pub(crate) mod sequence_admission;
+#[cfg(any(feature = "operator", test))]
 pub(crate) mod stage_controller;
+#[cfg(any(feature = "operator", test))]
 pub(crate) mod study_authority;
+#[cfg(any(feature = "operator", test))]
 mod terminal;
 
 use crate::{
@@ -120,6 +129,7 @@ enum SubmissionObjectState {
     Adopted,
 }
 
+#[cfg(any(feature = "operator", test))]
 pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
     if sequence_admission::is_study_submission(&args.submission)? {
         return sequence_admission::inspect(args);
@@ -145,10 +155,12 @@ pub fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
     )?)
 }
 
+#[cfg(any(feature = "operator", test))]
 pub fn status(args: crate::cli::MissionDispatchStatusArgs) -> anyhow::Result<()> {
     print_json(&status_report(&args)?)
 }
 
+#[cfg(any(feature = "operator", test))]
 fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> anyhow::Result<Value> {
     validate_cluster_target(&args.context, &args.namespace)?;
     if sequence_admission::is_study_submission(&args.submission)? {
@@ -187,6 +199,7 @@ fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> anyhow::Result
     }))
 }
 
+#[cfg(any(feature = "operator", test))]
 pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     if sequence_admission::is_study_submission(&args.submission)? {
         return sequence_admission::settle(args);
@@ -202,6 +215,7 @@ pub fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     terminal::settle(args)
 }
 
+#[cfg(any(feature = "operator", test))]
 pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     if args.readback_cache.is_some() || args.model_report.is_some() {
         anyhow::bail!("readback cache and model report options are settlement-only");
@@ -271,6 +285,7 @@ pub fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
 /// Read back the parent terminal through the authenticated dispatch ledger.
 /// Caller-provided hashes are only cross-checks; the family and Study receipts
 /// are the source of truth for a next-family proposal.
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn read_authenticated_settled_campaign_source(
     control_path: &Path,
     submission_path: &Path,
@@ -363,6 +378,7 @@ pub(crate) fn read_authenticated_settled_campaign_source(
     })
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn read_authenticated_campaign_parent(
     control_path: &Path,
     submission_path: &Path,
@@ -492,6 +508,7 @@ pub(super) struct RenderedDispatch {
     pub manifest: Value,
 }
 
+#[cfg(any(feature = "operator", test))]
 fn submit_rendered_job<A: DispatchAdmission>(
     args: &MissionDispatchSubmitArgs,
     rendered: RenderedDispatch,
@@ -621,6 +638,7 @@ fn submit_rendered_job<A: DispatchAdmission>(
     Ok(())
 }
 
+#[cfg(any(feature = "operator", test))]
 fn resolve_dispatch_job(
     claim: &alpha_store::campaign_ledger::CampaignDispatchClaimV1,
     first_create: bool,
@@ -654,6 +672,7 @@ fn resolve_dispatch_job(
     Ok(job)
 }
 
+#[cfg(any(feature = "operator", test))]
 fn create_or_adopt_job(
     kubectl: &std::path::Path,
     context: &str,
@@ -711,6 +730,7 @@ fn create_or_adopt_job(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "operator", test))]
 fn create_or_adopt_secret(
     kubectl: &std::path::Path,
     context: &str,
@@ -765,6 +785,7 @@ fn create_or_adopt_secret(
     }
 }
 
+#[cfg(any(feature = "operator", test))]
 fn adopt_existing_job(
     job: &Value,
     expected_job: &Value,
@@ -779,6 +800,7 @@ fn adopt_existing_job(
     Ok(())
 }
 
+#[cfg(any(feature = "operator", test))]
 fn read_back_secret(
     kubectl: &std::path::Path,
     context: &str,
@@ -814,6 +836,7 @@ fn read_back_secret(
     Ok(secret)
 }
 
+#[cfg(any(feature = "operator", test))]
 fn read_back_job(
     kubectl: &std::path::Path,
     context: &str,
@@ -1137,6 +1160,7 @@ fn validate_submission_structure(
     })
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn write_submission(
     path: &Path,
     attempt_id: &str,

@@ -21,7 +21,7 @@ struct Config {
     research_endpoint: String,
     research_token_file: String,
     #[serde(default)]
-    research_tls: hft_research_platform::transport::TlsConfig,
+    research_tls: hft_research_worker_io::transport::TlsConfig,
 }
 
 #[derive(Deserialize)]
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (config_path, resume) = match args.as_slice() {
         [operation, config] if operation == "start" => (config.as_str(), None),
-        [operation, config, checkpoint, native] if operation == "resume" && hft_research_platform::valid_digest(checkpoint) => (config.as_str(), Some((checkpoint.as_str(), native.as_str()))),
+        [operation, config, checkpoint, native] if operation == "resume" && hft_research_worker_contracts::valid_digest(checkpoint) => (config.as_str(), Some((checkpoint.as_str(), native.as_str()))),
         _ => bail!("usage: research-session start CONFIG | resume CONFIG CHECKPOINT_SHA256 NATIVE_STATE; typed operator commands on stdin"),
     };
     let config: Config = read(config_path)?;

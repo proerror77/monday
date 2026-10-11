@@ -64,7 +64,7 @@ pub(super) fn verify_and_readback(
 }
 
 fn verify_bytes(
-    object: &hft_research_platform::orchestrator::Artifact,
+    object: &hft_research_worker_contracts::task::Artifact,
     mut read: impl Read,
 ) -> anyhow::Result<()> {
     let mut hash = Sha256::new();

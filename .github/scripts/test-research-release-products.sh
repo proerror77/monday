@@ -15,8 +15,8 @@ jq -s -e 'length==3 and all(.[]; .manifest=="prediction-markets/Cargo.toml") and
 bash "$products" recipes cex-runner >"$work/cex-recipes"
 jq -s -e 'length==4 and any(.[]; .package=="hft-cex-research-worker" and .binaries==["monday-cex-worker"]) and all(.[]; .package!="ploy-research" and .manifest!="prediction-markets/Cargo.toml")' "$work/cex-recipes" >/dev/null
 [[ $(bash "$products" binaries cex-runner | wc -l) -eq 7 ]]
-[[ $(bash "$products" binaries all | wc -l) -eq 13 ]]
-[[ $(bash "$products" binaries cex-runner,controller | wc -l) -eq 8 ]]
+[[ $(bash "$products" binaries all | wc -l) -eq 12 ]]
+[[ $(bash "$products" binaries cex-runner,controller | wc -l) -eq 7 ]]
 [[ $(bash "$products" merge controller prediction-runner) == controller,prediction-runner ]]
 for invalid in runner paired '' 'cex-runner,cex-runner' 'prediction-runner,unknown' 'all,controller'; do
   if bash "$products" normalize "$invalid" >"$work/rejection" 2>&1; then
@@ -38,13 +38,13 @@ end
 RUBY
 mkdir -p "$work/controller/research-bin"
 bash "$root/.github/scripts/research-release-products.sh" binaries controller >"$work/binaries"
-[[ $(wc -l <"$work/binaries") -eq 5 ]]
+[[ $(wc -l <"$work/binaries") -eq 4 ]]
 while IFS= read -r binary; do
   printf 'mock executable: %s\n' "$binary" >"$work/controller/research-bin/$binary"
   chmod 0755 "$work/controller/research-bin/$binary"
 done <"$work/binaries"
 bash "$root/.github/scripts/research-release-products.sh" recipes controller >"$work/recipes"
-jq -s -e 'length==3 and any(.[]; .package=="hft-research-platform" and .manifest=="research-core/platform/Cargo.toml" and .features=="publisher" and .binaries==["research-release-publisher"]) and any(.[]; .package=="alpha-harness") and any(.[]; .package=="hft-collector") and
+jq -s -e 'length==2 and all(.[]; .package!="hft-research-platform") and any(.[]; .package=="alpha-harness") and any(.[]; .package=="hft-collector") and
   all(.[]; .package!="hft-backtest" and .package!="ploy-research")' "$work/recipes" >/dev/null
 locks=$(bash "$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
 workspace_profiles=$(ruby -rjson -rdigest -e 'root=ARGV[0]; puts JSON.generate(JSON.parse(File.read("#{root}/workspaces.json")).fetch("workspaces").to_h{|owner| manifest=owner.fetch("manifest"); [manifest,Digest::SHA256.file("#{root}/#{manifest}").hexdigest]})' "$root/rust_hft")
@@ -207,10 +207,10 @@ MONDAY_RESEARCH_CACHE_PROBE=1 PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/ou
 while IFS= read -r binary; do
   test "$(cat "$fixture/output/research-release/research-bin/$binary")" = "fresh target executable: $binary"
 done < <(bash "$products" binaries controller)
-printf 'PASS: controller-only release builds five admitted executables including the ACK importer; product, archive and unadmitted control bytes fail closed\n'
+printf 'PASS: controller-only release builds four admitted executables without release tools; product, archive and unadmitted control bytes fail closed\n'
 
 # The opt-in probe compares both schedules after identical dependency-only cleanup.
-jq -es 'length==12 and ([.[].phase]|sort)==["after-cache-lookup","after-cache-lookup","after-cache-lookup","dependency-warm-parallel","dependency-warm-parallel","dependency-warm-parallel","dependency-warm-serial","dependency-warm-serial","dependency-warm-serial","warm-local","warm-local","warm-local"]
+jq -es 'length==8 and ([.[].phase]|sort)==["after-cache-lookup","after-cache-lookup","dependency-warm-parallel","dependency-warm-parallel","dependency-warm-serial","dependency-warm-serial","warm-local","warm-local"]
   and ([.[].compilation_inputs_sha256]|unique|length)==1
   and ([.[].build_inputs]|unique|length)==1
   and all(.[]; .build_inputs.profile=="release" and .build_inputs.target=="x86_64-unknown-linux-gnu" and .phase_seconds>=0)
@@ -278,7 +278,7 @@ events.sort_by { |event| event.fetch('at') }.each do |event|
 end
 abort 'independent owners never overlapped' unless maximum == 2 && active.empty?
 RUBY
-jq -es 'length==8 and all(.[]; .scheduler.owner_concurrency==2 and .scheduler.cargo_jobs==2)' \
+jq -es 'length==7 and all(.[]; .scheduler.owner_concurrency==2 and .scheduler.cargo_jobs==2)' \
   "$fixture/parallel-output/research-recipe-probe/timings.jsonl" >/dev/null
 
 # Low available memory reduces overlap. Explicit serial mode uses the same recipes.
@@ -289,7 +289,7 @@ for mode in memory serial; do
   PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/$mode-output" MONDAY_SOURCE_REVISION="$sha" \
     MONDAY_BUILD_INPUTS_FILE="$fixture/inputs.json" MONDAY_RESEARCH_BUILD_CONCURRENCY=$([[ $mode == serial ]] && echo 1 || echo 2) \
     bash "$fixture/.github/scripts/build-research-recipes.sh" controller after-cache-lookup >"$work/$mode.log"
-  jq -es 'length==3 and all(.[]; .scheduler.owner_concurrency==1 and .scheduler.cargo_jobs==8)' \
+  jq -es 'length==2 and all(.[]; .scheduler.owner_concurrency==1 and .scheduler.cargo_jobs==8)' \
     "$fixture/$mode-output/research-recipe-probe/timings.jsonl" >/dev/null
 done
 
@@ -364,3 +364,4 @@ for request in cpu concurrency; do
   [[ $code != 0 && ! -e $fixture/invalid-$request-builds ]]
 done
 printf 'PASS: owner overlap, exact recipes, CPU/memory admission, serial mode, cancellation and compiler-tree failure cleanup\n'
+bash "$root/.github/scripts/test-research-release-tools.sh"

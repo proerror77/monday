@@ -46,8 +46,8 @@ pub async fn worker_main() -> anyhow::Result<()> {
         if argv.len() != 2 {
             anyhow::bail!("configuration staging accepts no path, execution, or network arguments");
         }
-        let context = hft_research_platform::orchestrator::AttemptContext::from_environment()?;
-        return hft_research_platform::worker_configuration::stage_configuration(&context);
+        let context = hft_research_worker_io::configuration::attempt_context_from_environment()?;
+        return hft_research_worker_io::configuration::stage_configuration(&context);
     }
     let result = cli::run_worker(cli::WorkerCli::parse()).await;
     if result.is_err() {

@@ -1,12 +1,14 @@
 #![cfg(feature = "publisher")]
 mod common;
 use anyhow::{ensure, Result};
-use hft_research_platform::{
-    build::{BuildArtifact, BuildSpec, BuiltExecutable},
-    orchestrator::Artifact,
-    postgres::{Ledger, BUILD_IMPORT_ADMISSION_MIGRATION, BUILD_RELEASE_MIGRATION, MIGRATION},
-};
 use std::process::Command;
+use {
+    hft_research_platform::build::BuildArtifact, hft_research_platform::build::BuildSpec,
+    hft_research_platform::build::BuiltExecutable, hft_research_platform::postgres::Ledger,
+    hft_research_platform::postgres::BUILD_IMPORT_ADMISSION_MIGRATION,
+    hft_research_platform::postgres::BUILD_RELEASE_MIGRATION,
+    hft_research_platform::postgres::MIGRATION, hft_research_worker_contracts::task::Artifact,
+};
 fn h(c: char) -> String {
     c.to_string().repeat(64)
 }

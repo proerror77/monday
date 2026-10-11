@@ -39,7 +39,7 @@ pub(super) fn publish(
         let expected = format!("{origin}/{key}");
         for url in [&access.put_url, &access.readback_url] {
             ensure!(
-                hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
+                hft_research_artifacts::identity::canonical_tokyo_oss_internal_object(
                     "terminal observation",
                     url
                 )? == expected,
@@ -54,8 +54,10 @@ pub(super) fn publish(
 pub(super) fn validate_witness_access(expected: &str, access: &Publication) -> anyhow::Result<()> {
     for url in [&access.put_url, &access.readback_url] {
         ensure!(
-            hft_research_dispatch_io::canonical_tokyo_oss_internal_object("terminal witness", url)?
-                == expected,
+            hft_research_artifacts::identity::canonical_tokyo_oss_internal_object(
+                "terminal witness",
+                url
+            )? == expected,
             "terminal witness publication changed original operation or signed evidence"
         );
     }
@@ -71,15 +73,17 @@ pub(super) fn publish_witness(
 ) -> anyhow::Result<()> {
     for url in [&access.put_url, &access.readback_url] {
         ensure!(
-            hft_research_dispatch_io::canonical_tokyo_oss_internal_object("terminal witness", url)?
-                == expected,
+            hft_research_artifacts::identity::canonical_tokyo_oss_internal_object(
+                "terminal witness",
+                url
+            )? == expected,
             "terminal witness publication changed original operation or signed evidence"
         );
     }
     publish_file(
         client,
         path,
-        &hft_research_platform::sha256(bytes),
+        &hft_research_worker_contracts::sha256(bytes),
         bytes.len() as u64,
         access,
     )
@@ -217,7 +221,7 @@ mod tests {
             let result = publish_file(
                 &client,
                 &path,
-                &hft_research_platform::sha256(&bytes),
+                &hft_research_worker_contracts::sha256(&bytes),
                 bytes.len() as u64,
                 &access,
             );

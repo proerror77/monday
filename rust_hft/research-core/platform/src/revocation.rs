@@ -1,8 +1,11 @@
 //! Signed source revocation witnesses never create admission or refund budget.
-use crate::{admission::NativeAdmissionTrust, identity, valid_digest};
 use anyhow::{ensure, Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use {
+    crate::identity, crate::valid_digest,
+    hft_research_worker_contracts::admission::NativeAdmissionTrust,
+};
 
 pub const NATIVE_REQUEST_REVOCATION_SCHEMA: &str = "monday.native_request_revocation.v1";
 
@@ -51,7 +54,10 @@ impl NativeRequestRevocation {
         self.validate()?;
         identity(self)
     }
-    pub fn matches_admission(&self, admission: &crate::admission::NativeAdmission) -> Result<()> {
+    pub fn matches_admission(
+        &self,
+        admission: &hft_research_worker_contracts::admission::NativeAdmission,
+    ) -> Result<()> {
         self.validate()?;
         admission.validate()?;
         ensure!(
@@ -82,7 +88,7 @@ impl SignedNativeRequestRevocation {
                 && self.evidence.id()? == self.evidence_sha256,
             "invalid native revocation signer or evidence"
         );
-        crate::admission::native_signing_bytes(
+        hft_research_worker_contracts::admission::native_signing_bytes(
             NATIVE_REQUEST_REVOCATION_SCHEMA,
             &self.key_id,
             &self.evidence_sha256,
@@ -131,45 +137,43 @@ impl VerifiedNativeRequestRevocation {
     }
 }
 
-impl NativeAdmissionTrust {
-    pub fn verify_revocation(
-        &self,
-        signed: &SignedNativeRequestRevocation,
-    ) -> Result<VerifiedNativeRequestRevocation> {
+pub fn verify_revocation(
+    trust: &NativeAdmissionTrust,
+    signed: &SignedNativeRequestRevocation,
+) -> Result<VerifiedNativeRequestRevocation> {
+    ensure!(
+        trust.schema == "monday.native_reservation_trust.v1"
+            && (1..=32).contains(&trust.native_reservation_keys.len()),
+        "native reservation trust required"
+    );
+    let public = trust
+        .native_reservation_keys
+        .get(&signed.key_id)
+        .context("untrusted native revocation issuer")?;
+    let decode = |value: &str, bytes: usize| -> Result<Vec<u8>> {
         ensure!(
-            self.schema == "monday.native_reservation_trust.v1"
-                && (1..=32).contains(&self.native_reservation_keys.len()),
-            "native reservation trust required"
+            value.len() == bytes * 2
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid native revocation signature encoding"
         );
-        let public = self
-            .native_reservation_keys
-            .get(&signed.key_id)
-            .context("untrusted native revocation issuer")?;
-        let decode = |value: &str, bytes: usize| -> Result<Vec<u8>> {
-            ensure!(
-                value.len() == bytes * 2
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-                "invalid native revocation signature encoding"
-            );
-            (0..value.len())
-                .step_by(2)
-                .map(|index| u8::from_str_radix(&value[index..index + 2], 16).map_err(Into::into))
-                .collect()
-        };
-        let public: [u8; 32] = decode(public, 32)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid native public key"))?;
-        let signature = Signature::from_slice(&decode(&signed.signature_hex, 64)?)?;
-        VerifyingKey::from_bytes(&public)?.verify_strict(&signed.signing_bytes()?, &signature)?;
-        Ok(VerifiedNativeRequestRevocation {
-            signed: signed.clone(),
-            trust_sha256: identity(self)?,
-            #[cfg(feature = "control")]
-            trust_document: serde_json::to_value(self)?,
-        })
-    }
+        (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).map_err(Into::into))
+            .collect()
+    };
+    let public: [u8; 32] = decode(public, 32)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid native public key"))?;
+    let signature = Signature::from_slice(&decode(&signed.signature_hex, 64)?)?;
+    VerifyingKey::from_bytes(&public)?.verify_strict(&signed.signing_bytes()?, &signature)?;
+    Ok(VerifiedNativeRequestRevocation {
+        signed: signed.clone(),
+        trust_sha256: identity(trust)?,
+        #[cfg(feature = "control")]
+        trust_document: serde_json::to_value(trust)?,
+    })
 }
 
 #[cfg(feature = "control")]
@@ -187,7 +191,7 @@ impl crate::postgres::Ledger {
         let row = query("SELECT a.document AS admission,n.document AS native_document,n.trust_document,n.trust_sha256,n.evidence_sha256 FROM research.admissions a JOIN research.native_admission_imports n USING(request_sha256) WHERE a.request_sha256=$1 AND n.tenant=$2 FOR UPDATE OF a")
             .bind(&evidence.request_sha256).bind(&evidence.tenant).fetch_one(&mut *tx).await?;
         use sqlx_core::row::Row;
-        let native: crate::admission::SignedNativeAdmission =
+        let native: hft_research_worker_contracts::admission::SignedNativeAdmission =
             serde_json::from_value(row.get("native_document"))?;
         let native_trust: NativeAdmissionTrust = serde_json::from_value(row.get("trust_document"))?;
         let original = native_trust.verify(&native)?;
@@ -195,7 +199,7 @@ impl crate::postgres::Ledger {
             original.trust_sha256() == row.get::<String, _>("trust_sha256")
                 && native.evidence_sha256 == row.get::<String, _>("evidence_sha256")
                 && native.evidence.admission
-                    == serde_json::from_value::<crate::orchestrator::Admission>(
+                    == serde_json::from_value::<hft_research_worker_contracts::task::Admission>(
                         row.get("admission")
                     )?,
             "original native admission import changed"

@@ -107,6 +107,7 @@ dependencies = [
  "hft-cex-research-input",
  "hft-cex-search-driver",
  "hft-collector",
+ "hft-data",
  "hft-factor-dsl",
  "hft-governance-contracts",
  "hft-prepared-market-io",
@@ -114,6 +115,8 @@ dependencies = [
  "hft-research-dispatch-io",
  "hft-research-manifest",
  "hft-research-platform",
+ "hft-research-worker-contracts",
+ "hft-research-worker-io",
  "parquet",
  "reqwest",
  "rustix 0.38.44",
@@ -3158,11 +3161,13 @@ dependencies = [
  "futures",
  "hex",
  "hft-binance-depth",
+ "hft-cex-research-input",
  "hft-core",
  "hft-data",
  "hft-data-adapter-binance",
  "hft-integration",
  "hft-prepared-market-io",
+ "hft-research-artifacts",
  "hft-research-manifest",
  "http 0.2.12",
  "libc",
@@ -3366,6 +3371,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -3379,9 +3385,8 @@ name = "hft-research-dispatch-io"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "reqwest",
+ "hft-research-artifacts",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -3422,10 +3427,34 @@ name = "hft-research-platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "ed25519-dalek",
  "hft-cex-research-input",
  "hft-research-agent-contracts",
+ "hft-research-worker-contracts",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "hft-research-worker-contracts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "hft-cex-research-input",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "hft-research-worker-io"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "hft-research-worker-contracts",
  "reqwest",
  "rustix 0.38.44",
  "serde",

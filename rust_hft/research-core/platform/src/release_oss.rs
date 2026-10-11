@@ -158,7 +158,7 @@ impl Oss {
         key: &str,
         version: Option<&str>,
         limit: u64,
-    ) -> Result<crate::transport::BoundedBody> {
+    ) -> Result<hft_research_worker_io::transport::BoundedBody> {
         let request = self.transport.get_request(key, version, limit)?;
         if self.budget.is_some() {
             self.reserve(
@@ -182,8 +182,10 @@ impl Oss {
             .await
             .map_err(|_| anyhow::anyhow!("OSS versioning read unavailable"))?;
         ensure!(response.status().is_success(), "OSS versioning read denied");
-        let mut response =
-            crate::transport::BoundedBody::new(response, VERSIONING_RESPONSE_LIMIT as u64)?;
+        let mut response = hft_research_worker_io::transport::BoundedBody::new(
+            response,
+            VERSIONING_RESPONSE_LIMIT as u64,
+        )?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -240,8 +242,10 @@ impl Oss {
             response.status().is_success() || response.status() == reqwest::StatusCode::CONFLICT,
             "OSS upload rejected"
         );
-        let mut response =
-            crate::transport::BoundedBody::new(response, budget::SMALL_RESPONSE_LIMIT)?;
+        let mut response = hft_research_worker_io::transport::BoundedBody::new(
+            response,
+            budget::SMALL_RESPONSE_LIMIT,
+        )?;
         while response.chunk().await?.is_some() {}
         Ok(())
     }

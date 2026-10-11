@@ -1,18 +1,18 @@
 //! Exchange job identity for a bounded source/Build capability. Never mint one.
 use anyhow::{bail, ensure, Context, Result};
-use hft_research_platform::{
-    build::pinned_image,
-    identity,
-    release_budget::{self as budget, Ledger},
-    release_publisher::{read_json, PublisherPolicy},
-    transport::TlsConfig,
-};
 use std::{
     collections::BTreeSet,
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use {
+    hft_research_platform::build::pinned_image, hft_research_platform::release_budget as budget,
+    hft_research_platform::release_budget::Ledger,
+    hft_research_platform::release_publisher::read_json,
+    hft_research_platform::release_publisher::PublisherPolicy,
+    hft_research_worker_contracts::identity, hft_research_worker_io::transport::TlsConfig,
 };
 
 const LIFETIME_MS: u64 = 60 * 60 * 1000;
@@ -159,7 +159,7 @@ async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>> {
         "capability exchange rejected"
     );
     let mut response =
-        hft_research_platform::transport::BoundedBody::new(response, MAX_RESPONSE as u64)?;
+        hft_research_worker_io::transport::BoundedBody::new(response, MAX_RESPONSE as u64)?;
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -625,7 +625,7 @@ mod tests {
         let source = SourceArchive {
             schema: 1,
             code_commit: "a".repeat(40),
-            archive: hft_research_platform::orchestrator::Artifact {
+            archive: hft_research_worker_contracts::task::Artifact {
                 key: format!("research/sources/{}/source.tar", "a".repeat(40)),
                 sha256: "c".repeat(64),
                 bytes: 1,

@@ -33,7 +33,7 @@ the shared orchestration's broader admission imply research acceptance.
 Keep `MONDAY_RESEARCH_RELEASE_POLICY` and `MONDAY_RESEARCH_RELEASE_SIGNING_KEY`.
 Remove the ordinary workflow's Gateway, Broker and optional PG import settings.
 Retain existing ACR configuration and publisher job `id-token:write`.
-The issuer compiles before any private signing credential enters its environment.
+The independent release-tools job compiles before publication. Its verified artifact enters the publisher before any private signing credential. The publisher never compiles a replacement tool.
 
 For CI, add `oss_by_product` to the repository public policy, keyed by `cex-runner`, `prediction-runner` and/or `controller`. Each selected product needs its own approved existing RAM role and the fixed publication namespaces below. New source or Build hashes require no map update. CI projects only that product’s entry into the native PublisherPolicy `oss` field using `select-research-oss-policy.jq`. Missing products, unknown keys and shared role ARNs fail closed; no union role scope is used. ACK receives a separately pinned native policy with a single `oss` entry.
 
@@ -241,10 +241,40 @@ References: [OSS V4 signing](https://www.alibabacloud.com/help/en/oss/developer-
 
 ## ACK execution using existing capacity
 
-The `controller` product now builds `research-release-publisher` with its owning platform workspace, locked release profile and `publisher` feature. The existing compiler-input manifest records that recipe, lock/profile bytes and compiler environment; producer artifacts and controller OCI verification include its executable digest and exact readback. The controller image installs git, gh, Ruby, unzip and CA certificates and verifies these dependencies plus the source-bound importer CLI offline. Neither probe invokes the campaign entrypoint or supplies credentials.
+The independent `research-release-tools-SOURCE_SHA` Actions artifact contains
+`research-release-publisher` and `research-release-capability`. Its platform-owned
+recipe uses `--locked --no-default-features --features publisher --release` and
+`x86_64-unknown-linux-gnu`. The tools manifest binds source, producer workflow,
+run, attempt and job, the pinned builder, actual compiler fingerprints, native
+and flag fingerprints, platform manifest/profile and lock bytes, recipe inputs,
+and each executable SHA-256. It is not a fourth research image product.
 
-Use that authenticated release binary for the existing controlled ACK execution image; never install the separate temporary CI debug issuer. The actual existing control capacity and its operator execution surface must still be read back before deployment. The controller artifact is a packaging source, not permission to replace a different control service or start a Campaign.
-The foundation Dockerfile requires that verified binary in `research-control-bin`; stage it only from the authenticated controller artifact after checking the exact source/compiler/producer/digest. Its reviewed runtime base must independently supply git, gh, Ruby, unzip and CA. Merely building that Dockerfile or copying a host binary does not establish those prerequisites.
+The three image products exclude these tools. In particular, the Campaign
+Controller image no longer packages the publisher/importer. Publisher-only
+changes select the tools producer and its validation; they do not add image or
+source archive carry. Existing pending image and approved archive work still
+selects the current-source tools needed by publication.
+
+Use the authenticated artifact from the same software producer run and exact
+source as the release. The downloader checks the successful tools job, artifact
+identity and bytes, then rereads the run attempt and job. Missing, expired,
+ambiguous, wrong-source or modified tools fail closed. There is no host/debug
+rebuild fallback. On an independently reviewed operator host, first check out
+the exact source, then stage the verified importer:
+
+```bash
+bash .github/scripts/download-research-release-tools.sh \
+  SOFTWARE_RUN_ID EXACT_SOURCE_SHA rust_hft/research-release-tools
+```
+
+The foundation Dockerfile copies only the publisher from that verified
+`rust_hft/research-release-tools/release-tools` directory. Other control programs
+still come from their separately verified `research-control-bin` inputs. The
+reviewed runtime base must supply git, gh, Ruby, unzip and CA certificates. The
+actual existing control capacity and its operator execution surface require
+independent readback before deployment. An artifact or image build grants no
+permission to replace a service, start a Campaign, sign a release or import PG.
+No signing keys or PG roles move with this packaging change.
 Run the importer through the existing operator execution surface in that Pod or host.
 Do not add a release Gateway/Broker Pod, service, ingress or PVC.
 Do not mount signing keys or collector credentials there.

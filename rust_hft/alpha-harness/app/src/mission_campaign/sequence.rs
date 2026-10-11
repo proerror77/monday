@@ -135,6 +135,7 @@ pub(crate) fn is_sequence_freeze(path: &Path) -> anyhow::Result<bool> {
     Ok(value["schema_version"] == FREEZE_SCHEMA)
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     let frozen: SequenceFreeze = read_json(&args.freeze)?;
     if frozen.schema_version != FREEZE_SCHEMA {
@@ -169,6 +170,7 @@ pub(crate) fn finalize(args: CampaignFinalizeArgs) -> anyhow::Result<()> {
     )
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn freeze(args: CampaignFreezeArgs) -> anyhow::Result<()> {
     if args.reuse.is_some()
         || args.final_evaluation_control.is_some()

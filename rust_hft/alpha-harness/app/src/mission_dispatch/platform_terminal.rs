@@ -61,5 +61,5 @@ fn audit_package_id(
 ) -> anyhow::Result<String> {
     // Generic readonly receivers can reproduce this sorted JSON object identity
     // without importing the source ledger's typed serializers.
-    hft_research_platform::identity(&serde_json::to_value(audit)?)
+    hft_research_worker_contracts::identity(&serde_json::to_value(audit)?)
 }

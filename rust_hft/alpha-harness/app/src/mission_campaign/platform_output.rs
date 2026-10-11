@@ -1,12 +1,14 @@
 //! Exact native evidence published through the admitted platform Attempt writer.
 use super::*;
-use hft_research_platform::{
-    artifact_io::Writer,
-    campaign_result::{
-        ArchiveEntry, CampaignRoundEvidence, CexCampaignResultReceipt, PublishedNativeArtifact,
-        ScientificStatus,
-    },
-    orchestrator::{AttemptContext, ResultReceipt, TaskKind},
+use {
+    hft_research_worker_contracts::campaign_result::ArchiveEntry,
+    hft_research_worker_contracts::campaign_result::CampaignRoundEvidence,
+    hft_research_worker_contracts::campaign_result::CexCampaignResultReceipt,
+    hft_research_worker_contracts::campaign_result::PublishedNativeArtifact,
+    hft_research_worker_contracts::campaign_result::ScientificStatus,
+    hft_research_worker_contracts::task::AttemptContext,
+    hft_research_worker_contracts::task::ResultReceipt,
+    hft_research_worker_contracts::task::TaskKind, hft_research_worker_io::artifact::Writer,
 };
 #[cfg(test)]
 mod transport_fixture;
@@ -21,7 +23,7 @@ struct ArtifactConfig {
     schema_version: String,
     artifact_gateway: String,
     artifact_token_file: PathBuf,
-    artifact_tls: hft_research_platform::transport::TlsConfig,
+    artifact_tls: hft_research_worker_io::transport::TlsConfig,
 }
 
 pub(super) struct BoundOutput {
@@ -39,7 +41,7 @@ impl BoundOutput {
             }
             return Ok(None);
         }
-        let context = AttemptContext::from_environment()?;
+        let context = hft_research_worker_io::configuration::attempt_context_from_environment()?;
         Self::from_context_at(
             loaded,
             native,
@@ -93,7 +95,7 @@ impl BoundOutput {
                 raw.insert(name, bytes);
             }
         }
-        let actual = hft_research_platform::orchestrator::worker_configuration_reference(
+        let actual = hft_research_worker_contracts::task::worker_configuration_reference(
             &context.spec.profile.namespace,
             &expected.secret_name,
             &expected.secret_uid,
@@ -129,9 +131,9 @@ impl BoundOutput {
         if trust_bytes.len() > 64 * 1024 {
             bail!("native issuer trust exceeds bound");
         }
-        let trust: hft_research_platform::admission::NativeAdmissionTrust =
+        let trust: hft_research_worker_contracts::admission::NativeAdmissionTrust =
             serde_json::from_slice(trust_bytes)?;
-        let signed: hft_research_platform::admission::SignedNativeAdmission =
+        let signed: hft_research_worker_contracts::admission::SignedNativeAdmission =
             serde_json::from_slice(&read_private_bounded(
                 &identity.join("native-admission.json"),
                 64 * 1024,
@@ -161,7 +163,7 @@ impl BoundOutput {
             &config.artifact_gateway,
             token.trim().to_string(),
             &context,
-            &hft_research_platform::transport::TlsConfig {
+            &hft_research_worker_io::transport::TlsConfig {
                 ca_file: Some(configuration.join("ca.pem")),
                 identity_file: Some(identity.join("tls.pem")),
             },

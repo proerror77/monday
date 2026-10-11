@@ -72,6 +72,7 @@ use hft_backtest::engine::{
     TargetPositionReplayTraceEvent, LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
     TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
 };
+use hft_cex_research_input::feature_matrix::FeatureDatasetManifest;
 use hft_research_artifacts::fetch_to_file;
 use hft_research_artifacts::normalized_sha256;
 #[cfg(feature = "scientific")]
@@ -192,7 +193,7 @@ fn research_event_value(
         "component": component,
         "event": event,
         "details": details,
-        "memory": hft_collector::research_memory::observe_research_memory(),
+        "memory": hft_research_artifacts::memory::observe_research_memory(),
     })
 }
 
@@ -4344,11 +4345,11 @@ fn validate_holdout_claim_binding(
         bail!("CEX result and holdout claim transports must match");
     }
     if put_is_remote {
-        let claim_object = hft_research_dispatch_io::canonical_https_object(
+        let claim_object = hft_research_artifacts::identity::canonical_https_object(
             "CEX holdout claim",
             &args.holdout_claim_put_url,
         )?;
-        let claim_readback_object = hft_research_dispatch_io::canonical_https_object(
+        let claim_readback_object = hft_research_artifacts::identity::canonical_https_object(
             "CEX holdout claim readback",
             &args.holdout_claim_readback_url,
         )?;
@@ -4487,8 +4488,8 @@ fn validate_result_readback_binding(
         result_readback_url.starts_with("http://") || result_readback_url.starts_with("https://");
     let same_object = match (put_is_remote, readback_is_remote) {
         (true, true) => {
-            hft_research_dispatch_io::canonical_https_object("CEX result", result_put_url)?
-                == hft_research_dispatch_io::canonical_https_object(
+            hft_research_artifacts::identity::canonical_https_object("CEX result", result_put_url)?
+                == hft_research_artifacts::identity::canonical_https_object(
                     "CEX result readback",
                     result_readback_url,
                 )?
@@ -4550,7 +4551,7 @@ pub(crate) fn validate_mission_materialization_binding(
 
 pub(crate) fn validate_mission_dataset_binding(
     mission: &CexResearchMissionArtifactV1,
-    features: &hft_collector::FeatureDatasetManifest,
+    features: &FeatureDatasetManifest,
     dataset: &CexReplayDatasetManifestV5,
 ) -> anyhow::Result<()> {
     if mission.spec.inputs.feature.id != features.manifest_id
@@ -4642,7 +4643,7 @@ pub(crate) fn validate_materialization(
             bail!("source success marker does not bind its segment");
         }
     }
-    if hft_collector::lob_archiver::source_revision(source_sha256s.iter().map(String::as_str))
+    if data::binance_lob_replay::source_revision(source_sha256s.iter().map(String::as_str))
         != source_revision
     {
         bail!("materialization source revision does not bind its source segments");
@@ -5678,7 +5679,7 @@ fn load_native_archive_input(
         );
     }
     let render = native.render_inputs();
-    let features: hft_collector::FeatureDatasetManifest = read_bundle_json(
+    let features: FeatureDatasetManifest = read_bundle_json(
         archive,
         "results/feature-manifest.json",
         MAX_MATERIALIZATION_BYTES,
@@ -5724,7 +5725,7 @@ fn load_metric_verification_dataset(
     archive: &mut zip::ZipArchive<File>,
     mission: &CexResearchMissionArtifactV1,
 ) -> anyhow::Result<alpha_engine::evaluation::PreparedDataset> {
-    let mut features: hft_collector::FeatureDatasetManifest = read_bundle_json(
+    let mut features: FeatureDatasetManifest = read_bundle_json(
         archive,
         "results/feature-manifest.json",
         MAX_MATERIALIZATION_BYTES,
@@ -6422,7 +6423,7 @@ pub(crate) mod tests {
         }
     }
     use chrono::{Duration as ChronoDuration, Utc};
-    use hft_collector::{DataModality, PointInTimeFeatureRow};
+    use hft_cex_research_input::feature_matrix::{DataModality, PointInTimeFeatureRow};
     use parquet::{
         data_type::{ByteArray, ByteArrayType, Int64Type},
         file::{
@@ -10257,7 +10258,7 @@ message binance_replay {
         let ingestion_time = Utc::now() - ChronoDuration::seconds(1);
         let source_content_sha256 = "1".repeat(64);
         let source_revision =
-            hft_collector::lob_archiver::source_revision([source_content_sha256.as_str()]);
+            data::binance_lob_replay::source_revision([source_content_sha256.as_str()]);
         let rows = (0..160)
             .map(|index| {
                 let event_time = ingestion_time - ChronoDuration::seconds(300 - index);
@@ -10925,7 +10926,7 @@ message binance_replay {
         override_mission.validate().unwrap();
         let override_mission_id = override_mission.semantic_id().unwrap();
         let store = AlphaStore::open(results_dir.join("alpha.duckdb")).unwrap();
-        let feature_manifest: hft_collector::FeatureDatasetManifest = serde_json::from_slice(
+        let feature_manifest: FeatureDatasetManifest = serde_json::from_slice(
             &std::fs::read(results_dir.join("feature-manifest.json")).unwrap(),
         )
         .unwrap();

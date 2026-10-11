@@ -1,15 +1,5 @@
 //! Independent release issuer. This module is absent from research services.
 //! Inputs are authenticated/read back before a private key signs any receipt.
-use crate::{
-    build::{pinned_image, BuildArtifact, BuildSpec, BuiltExecutable},
-    identity,
-    orchestrator::Artifact,
-    release::{
-        BuildReleaseReceipt, BuildReleaseTrust, ReleaseProducer, SignedBuildRelease, SourceArchive,
-    },
-    release_budget::{Binding, Envelope, Inventory, Ledger},
-    sha256, valid_digest,
-};
 use anyhow::{ensure, Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
@@ -20,6 +10,15 @@ use std::{
     io::Read,
     path::Path,
     process::{Command, Stdio},
+};
+use {
+    crate::build::pinned_image, crate::build::BuildArtifact, crate::build::BuildSpec,
+    crate::build::BuiltExecutable, crate::identity, crate::release::BuildReleaseReceipt,
+    crate::release::BuildReleaseTrust, crate::release::ReleaseProducer,
+    crate::release::SignedBuildRelease, crate::release::SourceArchive,
+    crate::release_budget::Binding, crate::release_budget::Envelope,
+    crate::release_budget::Inventory, crate::release_budget::Ledger, crate::sha256,
+    crate::valid_digest, hft_research_worker_contracts::task::Artifact,
 };
 const MAX_OBJECT: u64 = 512 * 1024 * 1024;
 const MAX_JSON: u64 = 1024 * 1024;
@@ -36,7 +35,7 @@ pub struct PublisherPolicy {
     pub builder_image: String,
     pub image_repositories: BTreeMap<String, String>,
     #[serde(default)]
-    pub tls: crate::transport::TlsConfig,
+    pub tls: hft_research_worker_io::transport::TlsConfig,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -509,8 +508,8 @@ pub struct ReleaseGateway {
     token: String,
 }
 fn body_read_error(error: anyhow::Error, exceeded: &str, interrupted: &str) -> anyhow::Error {
-    if error.downcast_ref::<crate::transport::BodyReadError>()
-        == Some(&crate::transport::BodyReadError::PayloadLimitExceeded)
+    if error.downcast_ref::<hft_research_worker_io::transport::BodyReadError>()
+        == Some(&hft_research_worker_io::transport::BodyReadError::PayloadLimitExceeded)
     {
         anyhow::anyhow!(exceeded.to_owned())
     } else {
@@ -536,7 +535,11 @@ impl ReleaseGateway {
             .check(source)
             .await
     }
-    async fn get(&self, key: &str, limit: u64) -> Result<crate::transport::BoundedBody> {
+    async fn get(
+        &self,
+        key: &str,
+        limit: u64,
+    ) -> Result<hft_research_worker_io::transport::BoundedBody> {
         if let Some(oss) = &self.oss {
             return oss.get(key, None, limit).await;
         }
@@ -549,7 +552,7 @@ impl ReleaseGateway {
             .map_err(|_| anyhow::anyhow!("release read unavailable"))?
             .error_for_status()
             .map_err(|_| anyhow::anyhow!("release evidence missing"))?;
-        crate::transport::BoundedBody::new(response, limit).map_err(|error| {
+        hft_research_worker_io::transport::BoundedBody::new(response, limit).map_err(|error| {
             body_read_error(
                 error,
                 "release readback exceeds bound",
@@ -574,7 +577,7 @@ impl ReleaseGateway {
         );
         Ok(Self {
             oss: None,
-            client: crate::transport::TlsConfig::default()
+            client: hft_research_worker_io::transport::TlsConfig::default()
                 .client(std::time::Duration::from_secs(120), true)?,
             base,
             token,
@@ -583,7 +586,7 @@ impl ReleaseGateway {
     pub fn with_tls(
         endpoint: &str,
         token: String,
-        tls: &crate::transport::TlsConfig,
+        tls: &hft_research_worker_io::transport::TlsConfig,
     ) -> Result<Self> {
         let mut gateway = Self::new(endpoint, token)?;
         gateway.client = tls.client(std::time::Duration::from_secs(120), true)?;
@@ -1898,7 +1901,7 @@ pub fn read_import_admission(
     policy: &PublisherPolicy,
 ) -> Result<VerifiedImportAdmission> {
     let signed: SignedImportAdmission =
-        serde_json::from_slice(&crate::transport::read_private_file(path)?)?;
+        serde_json::from_slice(&hft_research_worker_io::transport::read_private_file(path)?)?;
     VerifiedImportAdmission::from_signed(signed, policy)
 }
 
@@ -2082,7 +2085,7 @@ mod tests {
             });
             // Cleartext loopback fixture only. Public constructors still reject HTTP.
             let gateway=ReleaseGateway {
-                oss:None, client:crate::transport::TlsConfig::default().client(std::time::Duration::from_secs(2),false)?,
+                oss:None, client:hft_research_worker_io::transport::TlsConfig::default().client(std::time::Duration::from_secs(2),false)?,
                 base:format!("http://{address}/").parse()?,token:"synthetic-reader".into(),
             };
             let artifact=Artifact {key:"research/sources/fixture/source.tar".into(),sha256:sha256(b"data"),bytes:4};
@@ -2636,7 +2639,7 @@ mod tests {
         let mut calls = 0;
         for (product, programs, build_count, expected_calls) in [
             ("cex-runner", 7, 4, 66),
-            ("controller", 5, 3, 51),
+            ("controller", 4, 2, 39),
             ("prediction-runner", 5, 3, 51),
         ] {
             let names =
@@ -2664,7 +2667,7 @@ mod tests {
                 assert_eq!(object.sha256, sha256(&bytes));
             }
         }
-        assert_eq!(calls, 168);
+        assert_eq!(calls, 156);
         let names = BTreeSet::from(["alpha-harness".into()]);
         let builds = project_builds(&source(), &manifest.build_inputs, &names)?;
         std::fs::write(

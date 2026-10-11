@@ -2,10 +2,10 @@
 //! A durable reservation precedes each send. Failures never refund it.
 use crate::{
     build_objects::BudgetReference as Reference,
-    orchestrator::Artifact,
     release::{ReleaseProducer, SourceArchive},
 };
 use anyhow::{ensure, Context, Result};
+use hft_research_worker_contracts::task::Artifact;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -381,7 +381,17 @@ fn open(path: &Path, create: bool) -> Result<std::fs::File> {
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
     Ok(file)
 }
+#[cfg(test)]
+std::thread_local! {
+    // An expiry test must not race filesystem setup or other test threads.
+    static TEST_CLOCK_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 fn now() -> Result<u64> {
+    #[cfg(test)]
+    if let Some(value) = TEST_CLOCK_MS.with(|clock| clock.get()) {
+        return Ok(value);
+    }
     u64::try_from(chrono::Utc::now().timestamp_millis()).context("invalid budget clock")
 }
 fn initialization_path(path: &Path) -> PathBuf {
@@ -1197,9 +1207,17 @@ pub(crate) mod tests {
     }
     #[test]
     fn budget_expired_ledger_still_reports_history_but_cannot_charge_or_claim() -> Result<()> {
+        let started_at = now()?;
+        struct RestoreClock(Option<u64>);
+        impl Drop for RestoreClock {
+            fn drop(&mut self) {
+                TEST_CLOCK_MS.with(|clock| clock.set(self.0));
+            }
+        }
+        let _clock = RestoreClock(TEST_CLOCK_MS.with(|clock| clock.replace(Some(started_at))));
         let dir = directory()?;
         let (b, i, mut e) = fixture("controller", 1, 1);
-        e.expires_at_ms = now()? + 1000;
+        e.expires_at_ms = started_at + 1000;
         let ready = Ledger::create(
             &dir.path().canonicalize()?.join("ready"),
             e.clone(),
@@ -1217,7 +1235,7 @@ pub(crate) mod tests {
         )?;
         l.claim("source_exchange")?;
         l.reserve(Phase::Source, Service::Oidc, "oidc", 0, 64)?;
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        TEST_CLOCK_MS.with(|clock| clock.set(Some(started_at + 1100)));
         assert_eq!(l.status()?.reserved.requests, 1);
         // All prerequisites exist; only expiry prevents this new claim.
         assert!(ready.claim("preflight").is_err());

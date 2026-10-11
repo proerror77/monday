@@ -1,21 +1,31 @@
 #![cfg(all(feature = "control", feature = "publisher"))]
 use anyhow::Result;
-use hft_research_platform::{
-    admission::{sign, NativeAdmission, NativeAdmissionTrust},
-    artifact_identity::{AttemptIdentityConfig, AttemptIdentityIssuer},
-    build::{BuildArtifact, BuildSpec, BuiltExecutable},
-    execution::{Backend, Profile},
-    identity,
-    orchestrator::{Admission, Artifact, State, Task, TaskKind, TaskSpec},
-    postgres::{
-        Ledger, BUILD_IMPORT_ADMISSION_MIGRATION, BUILD_RELEASE_MIGRATION, MIGRATION,
-        NATIVE_ADMISSION_MIGRATION, NATIVE_REQUEST_REVOCATION_MIGRATION,
-    },
-    research::{Experiment, Run},
-    revocation::{sign_revocation, NativeRequestRevocation, NATIVE_REQUEST_REVOCATION_SCHEMA},
-};
 use sqlx_core::{query::query, query_scalar::query_scalar};
 use std::{collections::BTreeMap, os::unix::fs::PermissionsExt};
+use {
+    hft_research_platform::admission::sign,
+    hft_research_platform::artifact_identity::AttemptIdentityConfig,
+    hft_research_platform::artifact_identity::AttemptIdentityIssuer,
+    hft_research_platform::build::BuildArtifact, hft_research_platform::build::BuildSpec,
+    hft_research_platform::build::BuiltExecutable, hft_research_platform::orchestrator::State,
+    hft_research_platform::orchestrator::Task, hft_research_platform::postgres::Ledger,
+    hft_research_platform::postgres::BUILD_IMPORT_ADMISSION_MIGRATION,
+    hft_research_platform::postgres::BUILD_RELEASE_MIGRATION,
+    hft_research_platform::postgres::MIGRATION,
+    hft_research_platform::postgres::NATIVE_ADMISSION_MIGRATION,
+    hft_research_platform::postgres::NATIVE_REQUEST_REVOCATION_MIGRATION,
+    hft_research_platform::research::Experiment,
+    hft_research_platform::revocation::sign_revocation,
+    hft_research_platform::revocation::NativeRequestRevocation,
+    hft_research_platform::revocation::NATIVE_REQUEST_REVOCATION_SCHEMA,
+    hft_research_worker_contracts::admission::NativeAdmission,
+    hft_research_worker_contracts::admission::NativeAdmissionTrust,
+    hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::execution::Profile, hft_research_worker_contracts::identity,
+    hft_research_worker_contracts::research::Run, hft_research_worker_contracts::task::Admission,
+    hft_research_worker_contracts::task::Artifact, hft_research_worker_contracts::task::TaskKind,
+    hft_research_worker_contracts::task::TaskSpec,
+};
 mod common;
 fn hash(c: char) -> String {
     c.to_string().repeat(64)
@@ -43,6 +53,7 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
             BUILD_IMPORT_ADMISSION_MIGRATION,
             NATIVE_ADMISSION_MIGRATION,
             NATIVE_REQUEST_REVOCATION_MIGRATION,
+            hft_research_platform::provider_operations::MIGRATION,
         ] {
             sqlx_core::raw_sql::raw_sql(migration)
                 .execute(&pool)
@@ -208,11 +219,10 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
         issued_ms: now,
     };
     ledger
-        .register_native_request_revocation(&trust.verify_revocation(&sign_revocation(
-            revoke.clone(),
-            "identity-fixture-host".into(),
-            &key,
-        )?)?)
+        .register_native_request_revocation(&hft_research_platform::revocation::verify_revocation(
+            &trust,
+            &sign_revocation(revoke.clone(), "identity-fixture-host".into(), &key)?,
+        )?)
         .await?;
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().canonicalize()?;
@@ -257,7 +267,7 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
     assert_eq!(issued.deadline_ms(), revoke.effective_ms);
     assert!(issued.deadline_ms() > task.lease.as_ref().unwrap().expires_ms);
     assert_eq!(issued.native_evidence_sha256(), signed.evidence_sha256);
-    let mounted: hft_research_platform::admission::SignedNativeAdmission =
+    let mounted: hft_research_worker_contracts::admission::SignedNativeAdmission =
         serde_json::from_slice(&issued.late_files()["native-admission.json"])?;
     trust.verify(&mounted)?;
     assert!(mounted == signed);
@@ -269,7 +279,7 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
         .unwrap()
         .iter()
         .any(
-            |cap| cap["token_sha256"] == hft_research_platform::sha256(&token)
+            |cap| cap["token_sha256"] == hft_research_worker_contracts::sha256(&token)
                 && cap["expires_ms"] == revoke.effective_ms
         ));
     tx.rollback().await?;
@@ -322,11 +332,10 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
     revoke.reason_receipt_sha256 = hash('2');
     revoke.effective_ms = now - 1;
     ledger
-        .register_native_request_revocation(&trust.verify_revocation(&sign_revocation(
-            revoke,
-            "identity-fixture-host".into(),
-            &key,
-        )?)?)
+        .register_native_request_revocation(&hft_research_platform::revocation::verify_revocation(
+            &trust,
+            &sign_revocation(revoke, "identity-fixture-host".into(), &key)?,
+        )?)
         .await?;
     let mut tx = pool.begin().await?;
     assert!(issuer.issue_for_task(&mut tx, &task).await.is_err());
@@ -366,6 +375,31 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
         .await?
         .is_none());
     cleanup_tx.rollback().await?;
+    // This fixture inserted its active Task directly, without the new atomic
+    // claim journal. Such a legacy Attempt cannot invent never-sent evidence.
+    let mut legacy = ledger
+        .lock_next("identity-fixture-controller", 30_000)
+        .await?
+        .unwrap();
+    assert_eq!(legacy.task.id, task_id);
+    legacy.task.stop(State::Cancelled, false)?;
+    let mut mutation =
+        hft_research_platform::provider_operations::ProviderMutation::new(ledger.clone(), legacy);
+    assert!(mutation
+        .permits_absence(hft_research_platform::provider_operations::CreateKind::Execution)
+        .await
+        .is_err());
+    let mut legacy = mutation.into_locked().await?;
+    legacy
+        .task
+        .stopped(legacy.task.attempt, legacy.task.fence)?;
+    assert!(legacy
+        .commit("fixture_forbidden_legacy_refund")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("unresolved provider create"));
+    assert_eq!(ledger.read(&task_id).await?.state, State::Stopping);
     pool.close().await;
     Ok(())
 }

@@ -5,12 +5,16 @@ use hft_cex_research_input::{
     },
     prepared,
 };
-use hft_research_platform::{
-    execution::{self, Acceptance, Backend, ExecutionHandle, Profile},
-    identity,
-    orchestrator::{Artifact, ResultReceipt, State, Task, TaskKind, TaskSpec},
-    preparation::{PreparationPlan, PREPARE_SQL},
-    sha256,
+use {
+    hft_research_platform::execution, hft_research_platform::execution::Acceptance,
+    hft_research_platform::execution::ExecutionHandle, hft_research_platform::orchestrator::State,
+    hft_research_platform::orchestrator::Task, hft_research_platform::preparation::PreparationPlan,
+    hft_research_platform::preparation::PREPARE_SQL,
+    hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::execution::Profile, hft_research_worker_contracts::identity,
+    hft_research_worker_contracts::sha256, hft_research_worker_contracts::task::Artifact,
+    hft_research_worker_contracts::task::ResultReceipt,
+    hft_research_worker_contracts::task::TaskKind, hft_research_worker_contracts::task::TaskSpec,
 };
 
 fn hash(c: char) -> String {
@@ -87,7 +91,7 @@ fn acceptance(task: &TaskSpec) -> Acceptance {
         artifact_readback: true,
     }
 }
-fn handle(task: &Task, lease: &hft_research_platform::orchestrator::Lease) -> ExecutionHandle {
+fn handle(task: &Task, lease: &hft_research_worker_contracts::task::Lease) -> ExecutionHandle {
     ExecutionHandle {
         backend: task.spec.profile.backend,
         cluster: task.spec.profile.cluster.clone(),
@@ -532,7 +536,7 @@ fn job_admission_is_pinned_and_resources_are_bounded() {
         .unwrap()["value"]
         .as_str()
         .unwrap();
-    let mut context: hft_research_platform::orchestrator::AttemptContext =
+    let mut context: hft_research_worker_contracts::task::AttemptContext =
         serde_json::from_str(encoded).unwrap();
     context.validate().unwrap();
     assert_eq!(context.spec, task.spec);
@@ -687,7 +691,7 @@ fn streaming_order_checks_block_boundaries_and_never_reopens_segments() {
 
 #[test]
 fn task_admission_preserves_exact_native_grant_and_attempt_budget() {
-    use hft_research_platform::orchestrator::Admission;
+    use hft_research_worker_contracts::task::Admission;
     let spec = task_spec();
     let mut admission = Admission {
         schema: 1,
@@ -717,7 +721,7 @@ fn campaign_launch_requires_late_identity_and_preserves_original_context() {
     spec.max_attempts = 1;
     spec.profile.worker_secret = Some("static-configuration".into());
     spec.worker_configuration = Some(
-        hft_research_platform::orchestrator::WorkerConfigurationRef {
+        hft_research_worker_contracts::task::WorkerConfigurationRef {
             schema: "monday.worker_configuration.v1".into(),
             secret_name: "static-configuration".into(),
             secret_uid: "static-uid".into(),

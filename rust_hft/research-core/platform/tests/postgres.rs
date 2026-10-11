@@ -1,12 +1,18 @@
 #![cfg(feature = "control")]
 #[cfg(feature = "publisher")]
+use anyhow::Context;
+#[cfg(feature = "publisher")]
 use hft_cex_research_input::data::{BlockRef, DataViewSpec, Exit, PublishedView, Split, Window};
 #[cfg(feature = "publisher")]
-use hft_research_platform::{
-    execution::{Acceptance, Backend, Profile},
-    identity,
-    orchestrator::{State, TaskKind, TaskSpec},
-    postgres::{Ledger, BUILD_RELEASE_MIGRATION, MIGRATION, SESSION_DELIVERY_MIGRATION},
+use {
+    hft_research_platform::execution::Acceptance, hft_research_platform::orchestrator::State,
+    hft_research_platform::postgres::Ledger,
+    hft_research_platform::postgres::BUILD_RELEASE_MIGRATION,
+    hft_research_platform::postgres::MIGRATION,
+    hft_research_platform::postgres::SESSION_DELIVERY_MIGRATION,
+    hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::execution::Profile, hft_research_worker_contracts::identity,
+    hft_research_worker_contracts::task::TaskKind, hft_research_worker_contracts::task::TaskSpec,
 };
 #[cfg(feature = "publisher")]
 mod common;
@@ -14,6 +20,577 @@ mod common;
 #[cfg(feature = "publisher")]
 fn hash(c: char) -> String {
     c.to_string().repeat(64)
+}
+
+#[cfg(feature = "publisher")]
+async fn assert_detached_readbacks<F, A>(
+    ledger: &Ledger,
+    pool: &sqlx_postgres::PgPool,
+    url: &str,
+    template: TaskSpec,
+    admit: A,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+    A: Fn(TaskSpec) -> F,
+{
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::timeout;
+    let original_run = ledger
+        .run_for_tenant("fixture", &template.run_manifest_sha256)
+        .await?;
+    for (index, case) in [
+        "progress",
+        "cancel",
+        "revoke",
+        "authority-witness",
+        "lease",
+        "admission-wait-expiry",
+        "deadline",
+        "revision",
+        "fence",
+        "reconnect",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx_core::query::query(
+            "UPDATE research.authority SET mode='postgres',concurrency_limit=1,legacy_quiescence_sha256=$1,migration_receipt_sha256=$2",
+        )
+        .bind(hash('a')).bind(hash('b'))
+        .execute(pool)
+        .await?;
+        let mut ids = Vec::new();
+        for peer in 0..if case == "progress" { 3 } else { 1 } {
+            let mut spec = template.clone();
+            spec.timeout_ms = 10_000;
+            spec.max_attempts = 2;
+            spec.command.push(format!("readback-{case}-{peer}"));
+            let mut run = original_run.clone();
+            run.seed = 1000 + index as u64 * 3 + peer;
+            run.command = spec.command.clone();
+            spec.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
+            admit(spec.clone()).await?;
+            ids.push(
+                ledger
+                    .submit("fixture", &format!("readback-{case}-{peer}"), spec)
+                    .await?,
+            );
+        }
+        let mut locked = ledger
+            .lock_next("readback-owner", 30_000)
+            .await?
+            .context("readback fixture was not claimed")?;
+        anyhow::ensure!(locked.task.id == ids[0]);
+        if case == "lease" {
+            locked.task.lease.as_mut().unwrap().expires_ms = locked.now_ms + 150;
+        }
+        if case == "admission-wait-expiry" {
+            locked.task.lease.as_mut().unwrap().expires_ms = locked.now_ms + 1000;
+        }
+        if case == "deadline" {
+            locked.task.deadline_ms = Some(locked.now_ms + 150);
+        }
+        let snapshot = locked.release_for_readback().await?;
+
+        // An actual GET stays pending until after the competing PG operations.
+        // No Kubernetes resource or scientific work is created by this fixture.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (started, wait_started) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0; 4096];
+            let count = socket.read(&mut request).await?;
+            anyhow::ensure!(
+                std::str::from_utf8(&request[..count])?.starts_with("GET /slow-readback ")
+            );
+            let _ = started.send(());
+            wait_release.await?;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ncode")
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let read = tokio::spawn(async move {
+            Ok::<_, anyhow::Error>(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(10))
+                    .build()?
+                    .get(format!("http://{address}/slow-readback"))
+                    .send()
+                    .await?
+                    .bytes()
+                    .await?,
+            )
+        });
+        timeout(Duration::from_secs(2), wait_started).await??;
+
+        match case {
+            "progress" => {
+                timeout(
+                    Duration::from_secs(2),
+                    sqlx_core::query::query("UPDATE research.authority SET concurrency_limit=2")
+                        .execute(pool),
+                )
+                .await??;
+                let claim = |owner: &'static str| async move {
+                    if let Some(task) = ledger.lock_next(owner, 30_000).await? {
+                        let id = task.task.id.clone();
+                        task.commit("fixture_readback_parallel_claim").await?;
+                        Ok::<_, anyhow::Error>(Some(id))
+                    } else {
+                        Ok(None)
+                    }
+                };
+                let (first, second) = timeout(Duration::from_secs(2), async {
+                    tokio::join!(claim("readback-peer-a"), claim("readback-peer-b"))
+                })
+                .await?;
+                let claims: Vec<_> = [first?, second?].into_iter().flatten().collect();
+                anyhow::ensure!(
+                    claims.len() == 1,
+                    "parallel claims exceeded the one remaining quota slot"
+                );
+                timeout(Duration::from_secs(2), ledger.cancel(&claims[0])).await??;
+                timeout(
+                    Duration::from_secs(2),
+                    sqlx_core::query::query("UPDATE research.authority SET mode='paused'")
+                        .execute(pool),
+                )
+                .await??;
+                assert!(ledger.reacquire_readback(&snapshot).await?.is_none());
+                let active: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.tasks WHERE state IN ('launching','running','stopping')").fetch_one(pool).await?;
+                assert_eq!(
+                    active, 2,
+                    "cancel/pause released an unobserved process slot"
+                );
+            }
+            "cancel" => {
+                timeout(Duration::from_secs(2), ledger.cancel(&ids[0])).await??;
+                assert!(ledger
+                    .renew_readback_lease(&snapshot, 30_000)
+                    .await?
+                    .is_none());
+                assert!(ledger.reacquire_readback(&snapshot).await?.is_none());
+            }
+            "revoke" => {
+                timeout(Duration::from_secs(2), sqlx_core::query::query("INSERT INTO research.revocations(request_sha256,reason_receipt_sha256) VALUES($1,$2)")
+                    .bind(&ids[0]).bind(hash('d')).execute(pool)).await??;
+                assert!(ledger.reacquire_readback(&snapshot).await?.is_none());
+                assert_eq!(
+                    ledger.read(&ids[0]).await?.stopping_as,
+                    Some(State::Cancelled)
+                );
+            }
+            "authority-witness" => {
+                assert!(
+                    timeout(
+                        Duration::from_secs(2),
+                        sqlx_core::query::query(
+                            "UPDATE research.authority SET migration_receipt_sha256=NULL",
+                        )
+                        .execute(pool),
+                    )
+                    .await?
+                    .is_err(),
+                    "enabled authority accepted a missing witness"
+                );
+                timeout(
+                    Duration::from_secs(2),
+                    sqlx_core::query::query(
+                        "UPDATE research.authority SET mode='paused',migration_receipt_sha256=NULL",
+                    )
+                    .execute(pool),
+                )
+                .await??;
+                assert!(ledger.reacquire_readback(&snapshot).await?.is_none());
+                assert_eq!(
+                    ledger.read(&ids[0]).await?.stopping_as,
+                    Some(State::Cancelled)
+                );
+            }
+            "lease" | "deadline" => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(ledger
+                    .renew_readback_lease(&snapshot, 30_000)
+                    .await?
+                    .is_none());
+                assert!(ledger.reacquire_readback(&snapshot).await?.is_none());
+                assert_eq!(ledger.read(&ids[0]).await?.state, State::Stopping);
+            }
+            "admission-wait-expiry" => {
+                let mut blocker = pool.begin().await?;
+                sqlx_core::query::query("SELECT request_sha256 FROM research.admissions WHERE request_sha256=$1 FOR UPDATE")
+                    .bind(&ids[0]).fetch_one(&mut *blocker).await?;
+                let renew = ledger.renew_readback_lease(&snapshot, 30_000);
+                tokio::pin!(renew);
+                assert!(timeout(Duration::from_millis(50), &mut renew)
+                    .await
+                    .is_err());
+                tokio::time::sleep(Duration::from_millis(1050)).await;
+                blocker.rollback().await?;
+                assert!(
+                    renew.await?.is_none(),
+                    "admission lock wait revived an expired lease"
+                );
+                assert_eq!(ledger.read(&ids[0]).await?.state, State::Stopping);
+            }
+            "revision" => {
+                ledger
+                    .reacquire_readback(&snapshot)
+                    .await?
+                    .unwrap()
+                    .commit("fixture_same_document_new_revision")
+                    .await?;
+                assert_eq!(ledger.read(&ids[0]).await?, *snapshot.task());
+                assert!(ledger.reacquire_readback(&snapshot).await?.is_none());
+            }
+            "fence" => {
+                let mut first = ledger.reacquire_readback(&snapshot).await?.unwrap();
+                first.task.stop(State::Failed, true)?;
+                first.task.stopped(first.task.attempt, first.task.fence)?;
+                first.commit("fixture_readback_retry").await?;
+                let next = ledger
+                    .lock_next("readback-replacement", 30_000)
+                    .await?
+                    .unwrap();
+                assert_eq!(next.task.attempt, snapshot.task().attempt + 1);
+                assert_eq!(next.task.fence, snapshot.task().fence + 1);
+                next.commit("fixture_readback_replacement").await?;
+                assert!(ledger.reacquire_readback(&snapshot).await?.is_none());
+            }
+            "reconnect" => {
+                let disconnected =
+                    Ledger::connect(&format!("{url}?application_name=monday_readback_fixture"))
+                        .await?;
+                let closed: Vec<bool> = sqlx_core::query_scalar::query_scalar("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='monday_foundation_test' AND application_name='monday_readback_fixture'")
+                    .fetch_all(pool).await?;
+                assert!(!closed.is_empty() && closed.into_iter().all(|closed| closed));
+                drop(disconnected);
+                let reconnected = Ledger::connect(url).await?;
+                let (first, second) = tokio::join!(
+                    reconnected.renew_readback_lease(&snapshot, 30_000),
+                    ledger.renew_readback_lease(&snapshot, 30_000)
+                );
+                let renewed: Vec<_> = [first?, second?].into_iter().flatten().collect();
+                assert_eq!(renewed.len(), 1, "two readers renewed the same revision");
+                assert_eq!(renewed[0].task().attempt, snapshot.task().attempt);
+                assert_eq!(renewed[0].task().fence, snapshot.task().fence);
+                assert!(reconnected.reacquire_readback(&snapshot).await?.is_none());
+                reconnected
+                    .reacquire_readback(&renewed[0])
+                    .await?
+                    .unwrap()
+                    .commit("fixture_readback_reconnected")
+                    .await?;
+            }
+            _ => unreachable!(),
+        }
+        let _ = release.send(());
+        assert_eq!(&read.await??[..], b"code");
+        server.await??;
+        for id in &ids {
+            ledger.cancel(id).await?;
+        }
+        while let Some(mut task) = ledger.lock_next("readback-fixture-drain", 30_000).await? {
+            anyhow::ensure!(
+                ids.contains(&task.task.id) && task.task.state == State::Stopping,
+                "fixture attempted to drain an unrelated task"
+            );
+            task.task.stopped(task.task.attempt, task.task.fence)?;
+            task.commit("fixture_readback_drained").await?;
+        }
+        println!("PASS detached readback: {case}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "publisher")]
+async fn assert_provider_create_operations<F, A>(
+    ledger: &Ledger,
+    pool: &sqlx_postgres::PgPool,
+    url: &str,
+    template: TaskSpec,
+    admit: A,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+    A: Fn(TaskSpec) -> F,
+{
+    use hft_research_platform::provider_operations::{
+        CreateDecision, CreateKind, ProviderMutation,
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::timeout;
+    let original_run = ledger
+        .run_for_tenant("fixture", &template.run_manifest_sha256)
+        .await?;
+    for (index, case) in [
+        "slow-post-cancel",
+        "crash-before-send",
+        "cancel-before-send",
+        "two-controllers",
+        "rejected-403",
+        "rejected-422",
+        "unknown-500",
+        "expired-before-send",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx_core::query::query("UPDATE research.authority SET mode='postgres',concurrency_limit=1,legacy_quiescence_sha256=$1,migration_receipt_sha256=$2")
+            .bind(hash('a')).bind(hash('b')).execute(pool).await?;
+        let mut spec = template.clone();
+        spec.timeout_ms = 30_000;
+        spec.max_attempts = 1;
+        spec.command.push(format!("provider-{case}"));
+        let mut run = original_run.clone();
+        run.seed = 2000 + index as u64;
+        run.command = spec.command.clone();
+        spec.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
+        admit(spec.clone()).await?;
+        let id = ledger
+            .submit("fixture", &format!("provider-{case}"), spec)
+            .await?;
+        let mut locked = ledger
+            .lock_next("provider-fixture", 30_000)
+            .await?
+            .context("provider fixture not claimed")?;
+        anyhow::ensure!(locked.task.id == id);
+        if case == "expired-before-send" {
+            locked.task.lease.as_mut().unwrap().expires_ms = locked.now_ms - 1;
+        }
+        let task = locked.task.clone();
+        let lease = task.lease.as_ref().unwrap();
+        let body = hft_research_platform::execution::render(
+            &task.spec,
+            lease,
+            &ledger.acceptance(&task.spec).await?,
+        )?;
+        let mut mutation = ProviderMutation::new(ledger.clone(), locked);
+        let decision = if case == "cancel-before-send" {
+            // Queue cancellation behind a deliberately stalled intent write.
+            // Once that write commits, cancellation wins before permit recheck.
+            sqlx_core::raw_sql::raw_sql("CREATE FUNCTION research.fixture_create_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.state='not_started' AND NEW.state='pending' THEN PERFORM pg_advisory_xact_lock(791011); END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_create_barrier BEFORE UPDATE ON research.provider_create_operations FOR EACH ROW EXECUTE FUNCTION research.fixture_create_barrier();").execute(pool).await?;
+            let mut barrier = pool.begin().await?;
+            sqlx_core::query::query("SELECT pg_advisory_xact_lock(791011)")
+                .execute(&mut *barrier)
+                .await?;
+            let result = {
+                let begin = mutation.begin_create(CreateKind::Execution, &body);
+                tokio::pin!(begin);
+                assert!(timeout(Duration::from_millis(60), &mut begin)
+                    .await
+                    .is_err());
+                let cancel = ledger.cancel(&id);
+                tokio::pin!(cancel);
+                assert!(timeout(Duration::from_millis(60), &mut cancel)
+                    .await
+                    .is_err());
+                barrier.rollback().await?;
+                let (decision, cancelled) = tokio::join!(begin, cancel);
+                cancelled?;
+                decision?
+            };
+            sqlx_core::raw_sql::raw_sql("DROP TRIGGER fixture_create_barrier ON research.provider_create_operations; DROP FUNCTION research.fixture_create_barrier();").execute(pool).await?;
+            assert!(matches!(result, CreateDecision::ResolvedAbsent));
+            result
+        } else {
+            mutation.begin_create(CreateKind::Execution, &body).await?
+        };
+
+        let mut response = body.clone();
+        response["metadata"]["uid"] = serde_json::json!(format!("original-{index}"));
+        let resolved_without_object = matches!(
+            case,
+            "cancel-before-send" | "expired-before-send" | "rejected-403" | "rejected-422"
+        );
+        match decision {
+            CreateDecision::FirstSend(permit) => {
+                match case {
+                    "rejected-403" | "rejected-422" => {
+                        mutation
+                            .record_rejection(
+                                permit,
+                                if case == "rejected-403" { 403 } else { 422 },
+                            )
+                            .await?
+                    }
+                    "unknown-500" => assert!(mutation.record_rejection(permit, 500).await.is_err()),
+                    _ => drop(permit), // Crash/lost response cannot recreate this value.
+                }
+            }
+            CreateDecision::ResolvedAbsent => {
+                assert!(matches!(case, "cancel-before-send" | "expired-before-send"))
+            }
+            CreateDecision::ReadbackOnly => anyhow::bail!("new Attempt lost its FirstSend"),
+        }
+        if case == "slow-post-cancel" {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let (started, waiting) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let bytes = serde_json::to_vec(&response)?;
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut buffer = [0; 65536];
+                let count = socket.read(&mut buffer).await?;
+                anyhow::ensure!(std::str::from_utf8(&buffer[..count])?.starts_with("POST /create "));
+                let _ = started.send(());
+                released.await?;
+                socket.write_all(format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).as_bytes()).await?;
+                socket.write_all(&bytes).await?;
+                Ok::<_, anyhow::Error>(())
+            });
+            let request = reqwest::Client::builder()
+                .no_proxy()
+                .retry(reqwest::retry::never())
+                .timeout(Duration::from_secs(5))
+                .build()?
+                .post(format!("http://{address}/create"))
+                .json(&body)
+                .send();
+            let request = tokio::spawn(request);
+            timeout(Duration::from_secs(2), waiting).await??;
+            timeout(Duration::from_millis(500), ledger.cancel(&id))
+                .await
+                .context("slow POST blocked cancellation")??;
+            assert_eq!(ledger.read(&id).await?.state, State::Stopping);
+            assert!(!mutation.permits_absence(CreateKind::Execution).await?);
+            let active: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.tasks WHERE state IN ('launching','running','stopping')").fetch_one(pool).await?;
+            assert_eq!(active, 1, "unknown POST released quota");
+            let _ = release.send(());
+            response = request.await??.json().await?;
+            server.await??;
+        }
+        if matches!(case, "crash-before-send" | "two-controllers") {
+            drop(mutation);
+            let reconnected = Ledger::connect(url).await?;
+            let recovered = reconnected
+                .lock_next("provider-fixture", 30_000)
+                .await?
+                .unwrap();
+            mutation = ProviderMutation::new(reconnected, recovered);
+            // A changed heartbeat/body is never a second request identity.
+            let mut altered = body.clone();
+            altered["spec"]["activeDeadlineSeconds"] = serde_json::json!(1);
+            assert!(matches!(
+                mutation
+                    .begin_create(CreateKind::Execution, &altered)
+                    .await?,
+                CreateDecision::ReadbackOnly
+            ));
+        }
+        ledger.cancel(&id).await?;
+        if !resolved_without_object {
+            assert!(!mutation.permits_absence(CreateKind::Execution).await?);
+            let mut attempted = mutation.into_locked().await?;
+            attempted.task.stopped(task.attempt, task.fence)?;
+            let failure = attempted
+                .commit("fixture_forbidden_absence_refund")
+                .await
+                .unwrap_err();
+            assert!(failure.to_string().contains("unresolved provider create"));
+            assert_eq!(ledger.read(&id).await?.state, State::Stopping);
+            let current = ledger.lock_next("provider-fixture", 30_000).await?.unwrap();
+            mutation = ProviderMutation::new(ledger.clone(), current);
+            let mut foreign = response.clone();
+            foreign["metadata"]["labels"]["monday.io/fence"] = serde_json::json!("999");
+            assert!(mutation
+                .record_observation(CreateKind::Execution, &foreign)
+                .await
+                .is_err());
+            mutation
+                .record_observation(CreateKind::Execution, &response)
+                .await?;
+            // UID is already durable even if the controller dies before DELETE.
+            let stored: String = sqlx_core::query_scalar::query_scalar("SELECT observed_uid FROM research.provider_create_operations WHERE task_id=$1 AND kind='execution'").bind(&id).fetch_one(pool).await?;
+            assert_eq!(stored, response["metadata"]["uid"].as_str().unwrap());
+        }
+        assert!(mutation.permits_absence(CreateKind::Execution).await?);
+        let mut drained = mutation.into_locked().await?;
+        drained.task.stopped(task.attempt, task.fence)?;
+        drained.commit("fixture_original_create_resolved").await?;
+        assert!(ledger.read(&id).await?.state.terminal());
+        let original_hash: String = sqlx_core::query_scalar::query_scalar("SELECT request_sha256 FROM research.provider_create_operations WHERE task_id=$1 AND kind='execution'").bind(&id).fetch_one(pool).await?;
+        assert_eq!(original_hash, identity(&body)?);
+        assert!(sqlx_core::query::query(
+            "UPDATE research.provider_create_operations SET request_sha256=$1 WHERE task_id=$2"
+        )
+        .bind(hash('f'))
+        .bind(&id)
+        .execute(pool)
+        .await
+        .is_err());
+        assert!(sqlx_core::query::query(
+            "DELETE FROM research.provider_create_operations WHERE task_id=$1"
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .is_err());
+        println!("PASS provider create: {case}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "publisher")]
+async fn assert_parallel_maintenance(
+    ledger: &Ledger,
+    pool: &sqlx_postgres::PgPool,
+    first_owner: &str,
+) -> anyhow::Result<()> {
+    sqlx_core::query::query("UPDATE research.authority SET concurrency_limit=2")
+        .execute(pool)
+        .await?;
+    let second_claim = ledger
+        .lock_next("owner-x", 30000)
+        .await?
+        .context("second task was not admitted at concurrency two")?;
+    let second_claimed_id = second_claim.task.id.clone();
+    second_claim.commit("fixture_second_claim").await?;
+    let first_maintenance = ledger
+        .lock_next(first_owner, 30000)
+        .await?
+        .context("first maintenance task was not selected")?;
+    let second_maintenance = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ledger.lock_next("owner-x", 30000),
+    )
+    .await
+    .context("unrelated task serialized behind global authority lock")??
+    .context("second maintenance task was not selected")?;
+    anyhow::ensure!(
+        first_maintenance.task.id != second_maintenance.task.id,
+        "maintenance probes selected the same task"
+    );
+    first_maintenance
+        .commit("fixture_parallel_maintenance")
+        .await?;
+    second_maintenance
+        .commit("fixture_parallel_maintenance")
+        .await?;
+    let mut release_probe = ledger
+        .lock_next("owner-x", 30000)
+        .await?
+        .context("second probe task was not recoverable")?;
+    anyhow::ensure!(release_probe.task.id == second_claimed_id);
+    release_probe.task.stop(State::Failed, true)?;
+    release_probe
+        .task
+        .stopped(release_probe.task.attempt, release_probe.task.fence)?;
+    release_probe
+        .commit("fixture_parallel_probe_requeued")
+        .await?;
+    sqlx_core::query::query("UPDATE research.authority SET concurrency_limit=1")
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[test]
@@ -68,10 +645,25 @@ fn session_host_rejects_resume_without_registered_checkpoint_before_starting_chi
 /// Only the explicitly named disposable test database is permitted. This test
 /// never targets production, imports business data, or connects to Kubernetes.
 #[cfg(feature = "publisher")]
-#[tokio::test]
+#[test]
 #[ignore = "requires disposable MONDAY_TEST_DATABASE_URL ending /monday_foundation_test"]
-async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
-) -> anyhow::Result<()> {
+fn postgres_single_authority_claims_idempotency_and_append_only_evidence() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("postgres-platform-integration".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(postgres_platform_integration_inner())
+        })
+        .context("spawn isolated PG integration thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("PG integration thread panicked"))?
+}
+
+#[cfg(feature = "publisher")]
+async fn postgres_platform_integration_inner() -> anyhow::Result<()> {
     let url = std::env::var("MONDAY_TEST_DATABASE_URL")?;
     anyhow::ensure!(
         url.ends_with("/monday_foundation_test"),
@@ -105,6 +697,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     )
     .execute(&pool)
     .await?;
+    sqlx_core::raw_sql::raw_sql(hft_research_platform::provider_operations::MIGRATION)
+        .execute(&pool)
+        .await?;
     let ledger = Ledger::connect(&url).await?;
     let view = PublishedView {
         prepared_id: hash('a'),
@@ -144,11 +739,12 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         producer_image: view.producer_image.clone(),
         recipe_sql: None,
     };
-    plan.spec.feature_sql_sha256 =
-        hft_research_platform::sha256(hft_research_platform::preparation::PREPARE_SQL.as_bytes());
+    plan.spec.feature_sql_sha256 = hft_research_worker_contracts::sha256(
+        hft_research_platform::preparation::PREPARE_SQL.as_bytes(),
+    );
     assert!(ledger.register_plan(&plan).await.is_err());
     // Test-only activation fixture. No application path performs this UPDATE.
-    sqlx_core::query::query("UPDATE research.authority SET mode='postgres',legacy_quiescence_sha256=$1,migration_receipt_sha256=$2").bind(hash('a')).bind(hash('b')).execute(&pool).await?;
+    sqlx_core::query::query("UPDATE research.authority SET mode='postgres',concurrency_limit=1,legacy_quiescence_sha256=$1,migration_receipt_sha256=$2").bind(hash('a')).bind(hash('b')).execute(&pool).await?;
     // Ledger fixtures do not claim verified object bytes. Production publication
     // enters through reconciler receipt readback and successful stop only.
     let view_sha = identity(&view)?;
@@ -238,7 +834,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         release_receipt_sha256: hash('a'),
         executables: vec![hft_research_platform::build::BuiltExecutable {
             name: "fixture".into(),
-            blob: hft_research_platform::orchestrator::Artifact {
+            blob: hft_research_worker_contracts::task::Artifact {
                 key: format!("research/builds/{build_id}/fixture"),
                 sha256: hash('b'),
                 bytes: 16,
@@ -305,7 +901,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     sqlx_core::query::query("UPDATE research.authority SET mode='postgres'")
         .execute(&pool)
         .await?;
-    let mut run = hft_research_platform::research::Run {
+    let mut run = hft_research_worker_contracts::research::Run {
         schema: 1,
         experiment_sha256: experiment_sha,
         kind: spec.kind,
@@ -325,7 +921,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     assert!(ledger.submit("fixture", "one", spec.clone()).await.is_err());
     // An old row containing plausible receipt hashes remains audit history,
     // but cannot become current native authority without the signed import.
-    let unsigned_admission = hft_research_platform::orchestrator::Admission {
+    let unsigned_admission = hft_research_worker_contracts::task::Admission {
         schema: 1,
         request_sha256: spec.id()?,
         task_spec: spec.clone(),
@@ -345,16 +941,19 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .submit("fixture", "unsigned-native", spec.clone())
         .await
         .is_err());
-    let admit = |spec: hft_research_platform::orchestrator::TaskSpec| {
+    let admit = |spec: hft_research_worker_contracts::task::TaskSpec| {
         let ledger = &ledger;
         let pool = &pool;
         async move {
-            use hft_research_platform::admission::{NativeAdmission, NativeAdmissionTrust};
+            use {
+                hft_research_worker_contracts::admission::NativeAdmission,
+                hft_research_worker_contracts::admission::NativeAdmissionTrust,
+            };
             let run = ledger
                 .run_for_tenant("fixture", &spec.run_manifest_sha256)
                 .await?;
             let build = ledger.build_artifact(&run.build_artifact_sha256).await?;
-            let a = hft_research_platform::orchestrator::Admission {
+            let a = hft_research_worker_contracts::task::Admission {
                 schema: 1,
                 request_sha256: spec.id()?,
                 task_spec: spec.clone(),
@@ -421,7 +1020,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     campaign_spec.profile.acceptance_sha256 = hash('8');
     campaign_spec.profile.worker_secret = Some("static-configuration".into());
     campaign_spec.worker_configuration = Some(
-        hft_research_platform::orchestrator::WorkerConfigurationRef {
+        hft_research_worker_contracts::task::WorkerConfigurationRef {
             schema: "monday.worker_configuration.v1".into(),
             secret_name: "static-configuration".into(),
             secret_uid: "synthetic-source-uid".into(),
@@ -506,7 +1105,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     .bind(spec.id()?)
     .fetch_one(&pool)
     .await?;
-    let mut duplicate: hft_research_platform::admission::SignedNativeAdmission =
+    let mut duplicate: hft_research_worker_contracts::admission::SignedNativeAdmission =
         serde_json::from_value(native_row)?;
     let original_operation = duplicate.evidence.operation_sha256.clone();
     let key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
@@ -516,7 +1115,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let native_trust = hft_research_platform::admission::NativeAdmissionTrust {
+    let native_trust = hft_research_worker_contracts::admission::NativeAdmissionTrust {
         schema: "monday.native_reservation_trust.v1".into(),
         native_reservation_keys: std::collections::BTreeMap::from([(
             "fixture-native-issuer".into(),
@@ -558,6 +1157,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     assert!(ledger.submit("fixture", "one", conflicting).await.is_err());
     let mut second = spec;
     second.command.push("second".into());
+    // Leave one bounded retry for the independent maintenance-lock probe below.
+    // Later result-publication assertions still consume this same task.
+    second.max_attempts = 3;
     run.seed += 1;
     run.command = second.command.clone();
     second.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
@@ -568,7 +1170,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     .bind(second.id()?)
     .fetch_one(&pool)
     .await?;
-    let mut reused: hft_research_platform::admission::SignedNativeAdmission =
+    let mut reused: hft_research_worker_contracts::admission::SignedNativeAdmission =
         serde_json::from_value(second_row)?;
     reused.evidence.operation_sha256 = original_operation;
     let reused = hft_research_platform::admission::sign(
@@ -630,7 +1232,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         "fixture Git commit failed"
     );
     let session_config = hft_research_platform::session::SessionConfig {
-        executable_sha256: hft_research_platform::sha256(&std::fs::read(&fixture_binary)?),
+        executable_sha256: hft_research_worker_contracts::sha256(&std::fs::read(&fixture_binary)?),
         executable: fixture_binary,
         workspace,
         native_home: session_root.join("native"),
@@ -677,8 +1279,17 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         }
     };
     let (a, b) = tokio::join!(claim("owner-a"), claim("owner-b"));
-    assert_eq!(usize::from(a?.is_some()) + usize::from(b?.is_some()), 1);
+    let a = a?;
+    let b = b?;
+    assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
     assert_eq!(ledger.read(&id).await?.state, State::Launching);
+
+    // At the concurrency limit, two live maintenance transactions must not
+    // serialize on the singleton authority row. Hold the first row lock while
+    // the second reconciler acquires the other task.
+    let first_owner = if a.is_some() { "owner-a" } else { "owner-b" };
+    assert_parallel_maintenance(&ledger, &pool, first_owner).await?;
+
     ledger.cancel(&id).await?;
     assert_eq!(ledger.read(&id).await?.state, State::Stopping);
     sqlx_core::query::query("UPDATE research.authority SET mode='paused'")
@@ -757,7 +1368,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
             .unwrap()
             .transcript_manifest_sha256
             .clone(),
-        native_state_manifest_sha256: hft_research_platform::sha256(&native_bytes),
+        native_state_manifest_sha256: hft_research_worker_contracts::sha256(&native_bytes),
     };
     assert!(ledger
         .session_checkpoint_for_resume("fixture", &checkpoint.id()?)
@@ -981,7 +1592,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     lease = result.task.heartbeat(&lease, result.now_ms, 90_000)?;
     result.commit("fixture_heartbeat").await?;
     result = ledger.lock_next("result-owner", 30000).await?.unwrap();
-    let receipt = hft_research_platform::orchestrator::ResultReceipt {
+    let receipt = hft_research_worker_contracts::task::ResultReceipt {
         task_id: result.task.id.clone(),
         attempt: lease.attempt,
         fence: lease.fence,
@@ -989,7 +1600,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         source_sha256: result.task.spec.source_sha256.clone(),
         image: result.task.spec.image.clone(),
         fit_identity_sha256: result.task.spec.fit_identity_sha256.clone(),
-        artifacts: vec![hft_research_platform::orchestrator::Artifact {
+        artifacts: vec![hft_research_worker_contracts::task::Artifact {
             key: format!(
                 "{}/{}/{}/fixture.bin",
                 result.task.spec.output_prefix, result.task.id, lease.attempt
@@ -1104,14 +1715,15 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     let revoke_task = ledger
         .submit("fixture", "source-revoke", revoke_spec.clone())
         .await?;
-    let native: hft_research_platform::admission::SignedNativeAdmission = serde_json::from_value(
-        sqlx_core::query_scalar::query_scalar(
-            "SELECT document FROM research.native_admission_imports WHERE request_sha256=$1",
-        )
-        .bind(&revoke_task)
-        .fetch_one(&pool)
-        .await?,
-    )?;
+    let native: hft_research_worker_contracts::admission::SignedNativeAdmission =
+        serde_json::from_value(
+            sqlx_core::query_scalar::query_scalar(
+                "SELECT document FROM research.native_admission_imports WHERE request_sha256=$1",
+            )
+            .bind(&revoke_task)
+            .fetch_one(&pool)
+            .await?,
+        )?;
     use hft_research_platform::revocation::{
         sign_revocation, NativeRequestRevocation, NATIVE_REQUEST_REVOCATION_SCHEMA,
     };
@@ -1132,7 +1744,10 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         issued_ms: now,
     };
     let witness = |e| {
-        native_trust.verify_revocation(&sign_revocation(e, "fixture-native-issuer".into(), &key)?)
+        hft_research_platform::revocation::verify_revocation(
+            &native_trust,
+            &sign_revocation(e, "fixture-native-issuer".into(), &key)?,
+        )
     };
     // A trusted signature still cannot redirect the original admitted identity.
     for field in 0..5 {
@@ -1386,7 +2001,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     revoked_view.spec = plan.spec.clone();
     revoked_view.prepared_id = identity(&(&revoke_task, revoke_lease.attempt, revoke_lease.fence))?;
     revoked_view.producer_image = completed.task.spec.image.clone();
-    let receipt = hft_research_platform::orchestrator::ResultReceipt {
+    let receipt = hft_research_worker_contracts::task::ResultReceipt {
         task_id: revoke_task.clone(),
         attempt: revoke_lease.attempt,
         fence: revoke_lease.fence,
@@ -1394,7 +2009,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         source_sha256: completed.task.spec.source_sha256.clone(),
         image: completed.task.spec.image.clone(),
         fit_identity_sha256: None,
-        artifacts: vec![hft_research_platform::orchestrator::Artifact {
+        artifacts: vec![hft_research_worker_contracts::task::Artifact {
             key: format!(
                 "{}/{}/{}/{}.mondaybin",
                 completed.task.spec.output_prefix,
@@ -1463,5 +2078,17 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
             .verify(&identity(&view)?)
             .map(|_| identity(&view).unwrap())?
     );
+    // Finish the earlier synthetic revoked task before independent readback cases.
+    ledger.cancel(&revoke_task).await?;
+    let mut drain = ledger
+        .lock_next("readback-fixture-setup", 30_000)
+        .await?
+        .context("revocation fixture missing")?;
+    anyhow::ensure!(drain.task.id == revoke_task && drain.task.state == State::Stopping);
+    drain.task.stopped(drain.task.attempt, drain.task.fence)?;
+    drain.commit("fixture_readback_setup_drained").await?;
+    let template = ledger.read(&result_id).await?.spec;
+    assert_detached_readbacks(&ledger, &pool, &url, template.clone(), &admit).await?;
+    assert_provider_create_operations(&ledger, &pool, &url, template, &admit).await?;
     Ok(())
 }

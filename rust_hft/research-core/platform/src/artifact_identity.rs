@@ -143,8 +143,8 @@ pub struct AttemptIdentityIssuer {
 // test. This factory cannot exist in a production binary.
 #[cfg(test)]
 pub(crate) fn launcher_fixture(
-    spec: &crate::orchestrator::TaskSpec,
-    lease: &crate::orchestrator::Lease,
+    spec: &hft_research_worker_contracts::task::TaskSpec,
+    lease: &hft_research_worker_contracts::task::Lease,
     trust_sha256: String,
 ) -> Result<(
     tempfile::TempDir,
@@ -253,7 +253,10 @@ impl IssuedAttemptIdentity {
     pub fn late_files(&self) -> &BTreeMap<String, Vec<u8>> {
         &self.files
     }
-    pub fn matches_context(&self, context: &crate::orchestrator::AttemptContext) -> Result<()> {
+    pub fn matches_context(
+        &self,
+        context: &hft_research_worker_contracts::task::AttemptContext,
+    ) -> Result<()> {
         context.validate()?;
         ensure!(
             context.lease.task_id == self.record.task_id
@@ -496,9 +499,9 @@ impl AttemptIdentityIssuer {
                 && current.fence == selected.fence,
             "cleanup changed ledger Attempt"
         );
-        let signed: crate::admission::SignedNativeAdmission =
+        let signed: hft_research_worker_contracts::admission::SignedNativeAdmission =
             serde_json::from_value(row.get("native"))?;
-        let trust: crate::admission::NativeAdmissionTrust =
+        let trust: hft_research_worker_contracts::admission::NativeAdmissionTrust =
             serde_json::from_value(row.get("trust_document"))?;
         let verified = trust.verify(&signed)?;
         ensure!(
@@ -619,14 +622,14 @@ impl AttemptIdentityIssuer {
             .fetch_one(&mut **tx)
             .await?;
         let row=query("SELECT n.document,n.trust_document,n.trust_sha256,n.evidence_sha256,a.document AS admission,research.native_request_deadline_ms(n.request_sha256) AS cap,floor(extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms FROM research.native_admission_imports n JOIN research.admissions a USING(request_sha256) WHERE n.request_sha256=$1 AND n.tenant=$2 AND NOT EXISTS(SELECT 1 FROM research.revocations r WHERE r.request_sha256=n.request_sha256)").bind(&current.id).bind(&tenant).fetch_one(&mut **tx).await?;
-        let signed: crate::admission::SignedNativeAdmission =
+        let signed: hft_research_worker_contracts::admission::SignedNativeAdmission =
             serde_json::from_value(row.get("document"))?;
-        let trust: crate::admission::NativeAdmissionTrust =
+        let trust: hft_research_worker_contracts::admission::NativeAdmissionTrust =
             serde_json::from_value(row.get("trust_document"))?;
         let verified = trust.verify(&signed)?;
         let now: i64 = row.get("now_ms");
         verified.evidence().active_at(now)?;
-        let admission: crate::orchestrator::Admission =
+        let admission: hft_research_worker_contracts::task::Admission =
             serde_json::from_value(row.get("admission"))?;
         admission.validate(&current.spec)?;
         ensure!(

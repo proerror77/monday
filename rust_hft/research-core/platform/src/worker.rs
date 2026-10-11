@@ -1,15 +1,15 @@
 //! One bounded preparation worker. It neither claims tasks nor publishes PG
 //! results; the reconciler independently reads artifacts and commits completion.
-use crate::{
-    artifact_io::Writer, clickhouse::ClickHouse, orchestrator::ResultReceipt,
-    postgres::PreparationPermit, sha256,
-};
 use anyhow::{ensure, Context, Result};
 use hft_cex_research_input::{
     data::{self, BlockOrder, BlockRef, Exit, PublishedView, TypedBlock},
     prepared,
 };
 use serde::{Deserialize, Serialize};
+use {
+    crate::clickhouse::ClickHouse, crate::postgres::PreparationPermit, crate::sha256,
+    hft_research_worker_contracts::task::ResultReceipt, hft_research_worker_io::artifact::Writer,
+};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,11 +19,11 @@ pub struct PrepareConfig {
     pub clickhouse_user_file: String,
     pub clickhouse_password_file: String,
     #[serde(default)]
-    pub clickhouse_tls: crate::transport::TlsConfig,
+    pub clickhouse_tls: hft_research_worker_io::transport::TlsConfig,
     pub artifact_gateway: String,
     pub artifact_token_file: String,
     #[serde(default)]
-    pub artifact_tls: crate::transport::TlsConfig,
+    pub artifact_tls: hft_research_worker_io::transport::TlsConfig,
     pub rows_per_block: u16,
     pub max_blocks: u16,
 }

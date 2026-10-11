@@ -1,86 +1,18 @@
 //! Kubernetes/ACS Jobs and AgentSandbox use the same persisted task identity.
 //! No ECS/ACK provisioning, GitHub run, or CI receipt appears in this contract.
+#[cfg(feature = "control")]
+use crate::provider_operations::{CreateDecision, CreateJournal, CreateKind};
 use anyhow::{ensure, Context, Result};
+#[cfg(feature = "control")]
+use hft_research_worker_contracts::execution::valid_dns_label;
+use hft_research_worker_contracts::execution::{Backend, Profile};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{
-    identity,
-    orchestrator::{Lease, TaskSpec},
-    valid_digest,
+use {
+    crate::identity, crate::valid_digest, hft_research_worker_contracts::task::Lease,
+    hft_research_worker_contracts::task::TaskSpec,
 };
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Backend {
-    KubernetesJob,
-    AcsJob,
-    AgentSandbox,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Profile {
-    pub backend: Backend,
-    pub cluster: String,
-    pub namespace: String,
-    pub service_account: String,
-    pub architecture: String,
-    pub cpu_millis: u32,
-    pub memory_mib: u32,
-    pub scratch_mib: u32,
-    pub gpu: u16,
-    /// Profile acceptance binds scheduler, network, identity, cancellation,
-    /// artifact access and (when used) the shared mount, on this exact target.
-    pub acceptance_sha256: String,
-    pub prepared_pvc: Option<String>,
-    /// Operator-owned immutable secret containing scoped worker configuration.
-    pub worker_secret: Option<String>,
-}
-
-fn dns_label(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 63
-        && value
-            .bytes()
-            .all(|v| v.is_ascii_lowercase() || v.is_ascii_digit() || v == b'-')
-        && !value.starts_with('-')
-        && !value.ends_with('-')
-}
-
-impl Profile {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.cluster.is_empty()
-                && dns_label(&self.namespace)
-                && dns_label(&self.service_account),
-            "invalid execution target"
-        );
-        ensure!(
-            matches!(self.architecture.as_str(), "amd64" | "arm64"),
-            "unsupported architecture"
-        );
-        ensure!(
-            self.cpu_millis > 0
-                && self.cpu_millis <= 256_000
-                && self.memory_mib > 0
-                && self.scratch_mib > 0,
-            "invalid resources"
-        );
-        ensure!(self.gpu == 0, "no accepted GPU trainer/provider contract");
-        ensure!(
-            valid_digest(&self.acceptance_sha256),
-            "missing provider acceptance identity"
-        );
-        if let Some(pvc) = &self.prepared_pvc {
-            ensure!(dns_label(pvc), "invalid prepared PVC");
-        }
-        if let Some(secret) = &self.worker_secret {
-            ensure!(dns_label(secret), "invalid worker secret");
-        }
-        Ok(())
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -146,7 +78,7 @@ pub struct AttemptIdentityRef {
 impl AttemptIdentityRef {
     pub fn validate(&self, spec: &TaskSpec, lease: &Lease) -> Result<()> {
         ensure!(
-            spec.kind == crate::orchestrator::TaskKind::CexCampaign
+            spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign
                 && self.secret_name == format!("{}-identity", resource_name(lease))
                 && !self.secret_uid.is_empty()
                 && self.secret_uid.len() <= 128
@@ -209,7 +141,7 @@ fn task_label(task_id: &str) -> String {
 
 pub fn render(spec: &TaskSpec, lease: &Lease, acceptance: &Acceptance) -> Result<Value> {
     acceptance.admit(spec)?;
-    let context = crate::orchestrator::AttemptContext {
+    let context = hft_research_worker_contracts::task::AttemptContext {
         spec: spec.clone(),
         lease: lease.clone(),
     };
@@ -255,7 +187,7 @@ pub fn render(spec: &TaskSpec, lease: &Lease, acceptance: &Acceptance) -> Result
             "volumes": [{"name": "scratch", "emptyDir": {"sizeLimit": format!("{}Mi", spec.profile.scratch_mib)}}]
         }
     });
-    if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+    if spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
         ensure!(
             spec.profile.gpu == 0 && spec.profile.backend != Backend::AgentSandbox,
             "native CEX Campaign requires admitted CPU Job compute"
@@ -293,7 +225,7 @@ pub fn render(spec: &TaskSpec, lease: &Lease, acceptance: &Acceptance) -> Result
             .push(json!({"name":"prepared","mountPath":"/prepared","readOnly":true}));
     }
     if let Some(secret) = &spec.profile.worker_secret {
-        if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+        if spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
             pod["spec"]["volumes"].as_array_mut().unwrap().push(json!({"name":"configuration-inputs","secret":{"secretName":secret,"defaultMode":288}}));
             pod["spec"]["initContainers"] = json!([{
                 "name":"stage-configuration", "image":spec.image, "command":[spec.command[0],"--stage-configuration"],
@@ -343,6 +275,20 @@ pub enum Observation {
     Succeeded,
     Failed,
     Gone,
+}
+
+#[cfg(feature = "control")]
+pub(crate) enum LaunchOutcome {
+    Ready(ExecutionHandle, Option<Box<AttemptIdentityRef>>),
+    AwaitingEvidence,
+    Rejected,
+}
+
+#[cfg(feature = "control")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StopOutcome {
+    Stopped,
+    AwaitingEvidence,
 }
 
 /// Explicit target and token are supplied by the operator, never discovered
@@ -396,7 +342,7 @@ impl Kubernetes {
             let data: std::collections::BTreeMap<String, String> =
                 serde_json::from_value(value["data"].clone())?;
             ensure!(
-                crate::orchestrator::worker_configuration_reference(
+                hft_research_worker_contracts::task::worker_configuration_reference(
                     &spec.profile.namespace,
                     &expected.secret_name,
                     &expected.secret_uid,
@@ -404,13 +350,14 @@ impl Kubernetes {
                 )? == *expected,
                 "worker configuration contents changed"
             );
-            if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
+            if spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
                 use base64::Engine;
                 let bytes = base64::engine::general_purpose::STANDARD.decode(
                     data.get("native-trust.json")
                         .context("Campaign configuration lacks native trust")?,
                 )?;
-                let trust: crate::admission::NativeAdmissionTrust = serde_json::from_slice(&bytes)?;
+                let trust: hft_research_worker_contracts::admission::NativeAdmissionTrust =
+                    serde_json::from_slice(&bytes)?;
                 native_trust_sha256 = Some(identity(&trust)?);
             }
         }
@@ -433,6 +380,7 @@ impl Kubernetes {
         );
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .https_only(true)
             .no_proxy()
@@ -480,15 +428,18 @@ impl Kubernetes {
         Ok(Some(serde_json::from_slice(&bytes)?))
     }
 
-    pub async fn launch(
+    pub(crate) async fn launch<J: CreateJournal>(
         &self,
-        spec: &TaskSpec,
-        lease: &Lease,
+        task: &crate::orchestrator::Task,
         acceptance: &Acceptance,
-        checkpoint: Option<&crate::orchestrator::Checkpoint>,
         remaining_ms: i64,
         identity: Option<&crate::artifact_identity::IssuedAttemptIdentity>,
-    ) -> Result<(ExecutionHandle, Option<AttemptIdentityRef>)> {
+        journal: &mut J,
+    ) -> Result<LaunchOutcome> {
+        journal.release_for_io().await?;
+        let spec = &task.spec;
+        let lease = task.lease.as_ref().context("launch lacks Attempt lease")?;
+        let checkpoint = task.checkpoint.as_ref();
         ensure!(
             self.cluster == spec.profile.cluster,
             "target cluster mismatch"
@@ -498,23 +449,36 @@ impl Kubernetes {
             "invalid remaining deadline"
         );
         let native_trust = self.verify_worker_configuration(spec).await?;
-        let mut attempt_identity = if spec.kind == crate::orchestrator::TaskKind::CexCampaign {
-            let issued = identity.context(
-                "native Campaign launch requires controlled per-Attempt identity issuance",
-            )?;
-            issued.matches_context(&crate::orchestrator::AttemptContext {
-                spec: spec.clone(),
-                lease: lease.clone(),
-            })?;
-            ensure!(
-                native_trust.as_deref() == Some(issued.native_trust_sha256()),
-                "static native trust differs from verified PG admission"
-            );
-            Some(self.prepare_attempt_identity(spec, lease, issued).await?)
-        } else {
-            ensure!(identity.is_none(), "unexpected late Campaign identity");
-            None
-        };
+        let mut attempt_identity =
+            if spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
+                let issued = identity.context(
+                    "native Campaign launch requires controlled per-Attempt identity issuance",
+                )?;
+                issued.matches_context(&hft_research_worker_contracts::task::AttemptContext {
+                    spec: spec.clone(),
+                    lease: lease.clone(),
+                })?;
+                ensure!(
+                    native_trust.as_deref() == Some(issued.native_trust_sha256()),
+                    "static native trust differs from verified PG admission"
+                );
+                match self
+                    .prepare_attempt_identity(spec, lease, issued, journal)
+                    .await?
+                {
+                    Some(reference) => Some(reference),
+                    None => {
+                        return Ok(if journal.absence_resolved(CreateKind::Identity).await? {
+                            LaunchOutcome::Rejected
+                        } else {
+                            LaunchOutcome::AwaitingEvidence
+                        })
+                    }
+                }
+            } else {
+                ensure!(identity.is_none(), "unexpected late Campaign identity");
+                None
+            };
         let mut resource = render(spec, lease, acceptance)?;
         if let Some(reference) = &attempt_identity {
             install_attempt_identity(&mut resource, reference)?;
@@ -534,37 +498,48 @@ impl Kubernetes {
         }
         let collection = Self::path(spec.profile.backend, &spec.profile.namespace);
         let path = format!("{collection}/{}", resource_name(lease));
-        // Recovery uses the same name. A POST timeout is resolved by readback,
-        // never by minting another resource or resetting the original timeout.
+        // Recover the exact first body, including its original launch lease and
+        // deadline. Heartbeats never manufacture a new identity for this POST.
+        let original = journal.original(CreateKind::Execution).await?;
+        if let Some(original) = original {
+            resource = original.public_body;
+        } else if let Some(issued) = identity {
+            let remaining = identity_remaining_ms(issued, lease)?.min(remaining_ms);
+            resource["spec"]["activeDeadlineSeconds"] = json!((remaining + 999) / 1000);
+            resource["spec"]["template"]["spec"]["activeDeadlineSeconds"] =
+                json!((remaining + 999) / 1000);
+        }
         let existing = self.read(&path).await?;
         let object = if let Some(existing) = existing {
             existing
         } else {
-            if let Some(issued) = identity {
-                let remaining = identity_remaining_ms(issued, lease)?.min(remaining_ms);
-                resource["spec"]["activeDeadlineSeconds"] = json!((remaining + 999) / 1000);
-                resource["spec"]["template"]["spec"]["activeDeadlineSeconds"] =
-                    json!((remaining + 999) / 1000);
-            }
-            let response = self
-                .client
-                .post(self.endpoint.join(&collection)?)
-                .bearer_auth(&self.token)
-                .json(&resource)
-                .send()
-                .await;
-            match response {
-                Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::CONFLICT => {
+            match journal.begin(CreateKind::Execution, &resource).await? {
+                CreateDecision::FirstSend(permit) => {
+                    let response = self
+                        .client
+                        .post(self.endpoint.join(&collection)?)
+                        .bearer_auth(&self.token)
+                        .json(&resource)
+                        .send()
+                        .await;
+                    if let Ok(response) = response {
+                        let status = response.status().as_u16();
+                        if crate::provider_operations::definite_rejection(status) {
+                            journal.rejected(permit, status).await?;
+                            return Ok(LaunchOutcome::Rejected);
+                        }
+                    }
                 }
-                Ok(r) => {
-                    r.error_for_status()?;
-                }
-                Err(_) => {}
+                CreateDecision::ReadbackOnly => return Ok(LaunchOutcome::AwaitingEvidence),
+                CreateDecision::ResolvedAbsent => return Ok(LaunchOutcome::Rejected),
             }
-            self.read(&path)
-                .await?
-                .context("launch outcome unresolved; reconcile same resource")?
+            let Some(object) = self.read(&path).await? else {
+                return Ok(LaunchOutcome::AwaitingEvidence);
+            };
+            object
         };
+        // Persist the bound UID before any later deletion can lose this proof.
+        journal.observed(CreateKind::Execution, &object).await?;
         if let Some(reference) = &mut attempt_identity {
             let worker = object["spec"]["template"]["spec"]["containers"]
                 .as_array()
@@ -581,74 +556,22 @@ impl Kubernetes {
             );
             reference.launch_lease = context.lease;
             reference.validate(spec, lease)?;
-            let mut original = render(spec, &reference.launch_lease, acceptance)?;
-            install_attempt_identity(&mut original, reference)?;
-            for pointer in [
-                "/metadata/annotations",
-                "/spec/template/metadata/annotations",
-            ] {
-                ensure!(
-                    object
-                        .pointer(pointer)
-                        .is_some_and(|annotations| annotations["monday.io/identity-secret-uid"]
-                            == reference.secret_uid
-                            && annotations["monday.io/identity-scope-sha256"]
-                                == reference.scope_sha256),
-                    "Job late identity drift"
-                );
-            }
-            ensure!(
-                object["spec"]["template"]["spec"]["volumes"]
-                    == original["spec"]["template"]["spec"]["volumes"],
-                "Job late mount drift"
-            );
-            let actual = object["spec"]["template"]["spec"]["initContainers"]
-                .as_array()
-                .context("Job initializer missing")?;
-            ensure!(actual.len() == 1, "unexpected Job initializer");
-            let expected = &original["spec"]["template"]["spec"]["initContainers"][0];
-            for field in [
-                "name",
-                "image",
-                "command",
-                "env",
-                "securityContext",
-                "volumeMounts",
-            ] {
-                ensure!(actual[0][field] == expected[field], "Job initializer drift");
-            }
-            verify_cpu_resources(worker, &spec.profile)?;
-            verify_cpu_resources(&actual[0], &spec.profile)?;
-            let pod_spec = &object["spec"]["template"]["spec"];
-            ensure!(
-                pod_spec["serviceAccountName"] == spec.profile.service_account
-                    && pod_spec["automountServiceAccountToken"] == false
-                    && pod_spec["nodeSelector"]["kubernetes.io/arch"] == spec.profile.architecture
-                    && pod_spec["nodeSelector"]["workload"] == "backtest"
-                    && object["spec"]["backoffLimit"] == 0,
-                "Job admission resources changed"
-            );
-            for value in [
-                &object["spec"]["activeDeadlineSeconds"],
-                &pod_spec["activeDeadlineSeconds"],
-            ] {
-                ensure!(
-                    value
-                        .as_i64()
-                        .is_some_and(|n| n > 0 && n <= (spec.timeout_ms + 999) / 1000),
-                    "Job deadline drift"
-                );
-            }
+            // The durable create journal verified the complete original Job
+            // body, including this launch lease and the bound Secret UID.
         }
-        Ok((self.handle(&object, spec, lease)?, attempt_identity))
+        Ok(LaunchOutcome::Ready(
+            self.handle(&object, spec, lease)?,
+            attempt_identity.map(Box::new),
+        ))
     }
 
-    async fn prepare_attempt_identity(
+    async fn prepare_attempt_identity<J: CreateJournal>(
         &self,
         spec: &TaskSpec,
         lease: &Lease,
         issued: &crate::artifact_identity::IssuedAttemptIdentity,
-    ) -> Result<AttemptIdentityRef> {
+        journal: &mut J,
+    ) -> Result<Option<AttemptIdentityRef>> {
         use base64::Engine;
         let name = format!("{}-identity", resource_name(lease));
         let data: std::collections::BTreeMap<String, String> = issued
@@ -666,46 +589,56 @@ impl Kubernetes {
         let resource = json!({"apiVersion":"v1","kind":"Secret","type":"Opaque","immutable":true,"metadata":{"name":name,"namespace":spec.profile.namespace,"labels":{"monday.io/task":task_label(&lease.task_id),"monday.io/attempt":lease.attempt.to_string(),"monday.io/fence":lease.fence.to_string()},"annotations":{"monday.io/identity-scope-sha256":issued.scope_id(),"monday.io/native-evidence-sha256":issued.native_evidence_sha256(),"monday.io/identity-deadline-ms":issued.deadline_ms().to_string()}},"data":data});
         if self.read(&path).await?.is_none() {
             identity_remaining_ms(issued, lease)?;
-            match self
-                .client
-                .post(self.endpoint.join(&collection)?)
-                .bearer_auth(&self.token)
-                .json(&resource)
-                .send()
-                .await
-            {
-                Ok(response)
-                    if response.status().is_success()
-                        || response.status() == reqwest::StatusCode::CONFLICT => {}
-                Ok(response) => {
-                    response.error_for_status()?;
+            match journal.begin(CreateKind::Identity, &resource).await? {
+                CreateDecision::FirstSend(permit) => {
+                    let response = self
+                        .client
+                        .post(self.endpoint.join(&collection)?)
+                        .bearer_auth(&self.token)
+                        .json(&resource)
+                        .send()
+                        .await;
+                    if let Ok(response) = response {
+                        let status = response.status().as_u16();
+                        if crate::provider_operations::definite_rejection(status) {
+                            journal.rejected(permit, status).await?;
+                            return Ok(None);
+                        }
+                    }
                 }
-                Err(_) => {} // Private journal and deterministic name arm recovery.
+                CreateDecision::ReadbackOnly | CreateDecision::ResolvedAbsent => return Ok(None),
             }
         }
-        let object = self
-            .read(&path)
-            .await?
-            .context("late identity outcome unresolved; reconcile same Secret")?;
-        identity_reference(&object, spec, lease, issued)
+        let Some(object) = self.read(&path).await? else {
+            return Ok(None);
+        };
+        let reference = identity_reference(&object, spec, lease, issued)?;
+        journal.observed(CreateKind::Identity, &object).await?;
+        Ok(Some(reference))
     }
 
     /// Call only after the original process tree stopped. UID preconditions
     /// protect another writer's resource; absence is read back before cleanup.
-    pub async fn cleanup_attempt_identity(
+    pub(crate) async fn cleanup_attempt_identity<J: CreateJournal>(
         &self,
         spec: &TaskSpec,
         lease: &Lease,
         known: Option<&AttemptIdentityRef>,
         issued: Option<&crate::artifact_identity::IssuedAttemptIdentity>,
-    ) -> Result<bool> {
+        journal: &mut J,
+    ) -> Result<StopOutcome> {
+        journal.release_for_io().await?;
         let path = format!(
             "/api/v1/namespaces/{}/secrets/{}-identity",
             spec.profile.namespace,
             resource_name(lease)
         );
         let Some(object) = self.read(&path).await? else {
-            return Ok(true);
+            return Ok(if journal.absence_resolved(CreateKind::Identity).await? {
+                StopOutcome::Stopped
+            } else {
+                StopOutcome::AwaitingEvidence
+            });
         };
         let mut reference = if let Some(issued) = issued {
             identity_reference(&object, spec, lease, issued)?
@@ -722,8 +655,13 @@ impl Kubernetes {
             ensure!(known == &reference, "late identity cleanup UID drift");
         }
         verify_identity_reference(&object, spec, &reference)?;
+        journal.observed(CreateKind::Identity, &object).await?;
         self.client.delete(self.endpoint.join(&path)?).bearer_auth(&self.token).json(&json!({"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":reference.secret_uid}})).send().await?.error_for_status()?;
-        Ok(self.read(&path).await?.is_none())
+        Ok(if self.read(&path).await?.is_none() {
+            StopOutcome::Stopped
+        } else {
+            StopOutcome::AwaitingEvidence
+        })
     }
 
     fn handle(&self, object: &Value, spec: &TaskSpec, lease: &Lease) -> Result<ExecutionHandle> {
@@ -771,8 +709,8 @@ impl Kubernetes {
     pub async fn observe(&self, handle: &ExecutionHandle) -> Result<Observation> {
         ensure!(
             handle.cluster == self.cluster
-                && dns_label(&handle.namespace)
-                && dns_label(&handle.name),
+                && valid_dns_label(&handle.namespace)
+                && valid_dns_label(&handle.name),
             "invalid handle target"
         );
         let path = format!(
@@ -822,12 +760,14 @@ impl Kubernetes {
 
     /// Retain naturally finished Jobs and Pods for independent terminal audit.
     /// Other attempts use UID-bound deletion and an empty Pod readback.
-    pub async fn stop(
+    pub(crate) async fn stop<J: CreateJournal>(
         &self,
         spec: &TaskSpec,
         lease: &Lease,
         known: Option<&ExecutionHandle>,
-    ) -> Result<bool> {
+        journal: &mut J,
+    ) -> Result<StopOutcome> {
+        journal.release_for_io().await?;
         ensure!(
             self.cluster == spec.profile.cluster,
             "target cluster mismatch"
@@ -842,20 +782,31 @@ impl Kubernetes {
             if let Some(known) = known {
                 ensure!(known == &handle, "deletion UID drift");
             }
+            journal.observed(CreateKind::Execution, &object).await?;
             if spec.profile.backend != Backend::AgentSandbox && job_has_terminal_condition(&object)
             {
-                return retained_job_stopped(
-                    &object,
-                    &self.owned_pods(spec, lease).await?,
-                    &handle,
+                return Ok(
+                    if retained_job_stopped(&object, &self.owned_pods(spec, lease).await?, &handle)?
+                    {
+                        StopOutcome::Stopped
+                    } else {
+                        StopOutcome::AwaitingEvidence
+                    },
                 );
             }
             self.client.delete(self.endpoint.join(&path)?).bearer_auth(&self.token).json(&json!({"apiVersion":"v1","kind":"DeleteOptions","propagationPolicy":"Foreground","preconditions":{"uid":handle.uid}})).send().await?.error_for_status()?;
-            return Ok(false);
+            return Ok(StopOutcome::AwaitingEvidence);
+        }
+        if !journal.absence_resolved(CreateKind::Execution).await? {
+            return Ok(StopOutcome::AwaitingEvidence);
         }
         let list = self.owned_pods(spec, lease).await?;
         let items = list["items"].as_array().context("Pod list missing items")?;
-        Ok(items.is_empty())
+        Ok(if items.is_empty() {
+            StopOutcome::Stopped
+        } else {
+            StopOutcome::AwaitingEvidence
+        })
     }
 
     /// Mechanical retirement requires an opaque PG/archive permit. Unknown
@@ -934,7 +885,7 @@ impl Kubernetes {
         let pod_name = permit.pod()["metadata"]["name"]
             .as_str()
             .context("original Pod name missing")?;
-        ensure!(dns_label(pod_name), "invalid original Pod name");
+        ensure!(valid_dns_label(pod_name), "invalid original Pod name");
         if let Some(pod) = self
             .read(&format!(
                 "/api/v1/namespaces/{}/pods/{pod_name}",
@@ -984,7 +935,9 @@ impl Kubernetes {
 }
 
 #[cfg(feature = "control")]
-fn read_launch_context(worker: &Value) -> Result<crate::orchestrator::AttemptContext> {
+pub(crate) fn read_launch_context(
+    worker: &Value,
+) -> Result<hft_research_worker_contracts::task::AttemptContext> {
     let env = worker["env"]
         .as_array()
         .context("launch environment missing")?;
@@ -997,7 +950,7 @@ fn read_launch_context(worker: &Value) -> Result<crate::orchestrator::AttemptCon
         .as_str()
         .context("launch context missing")?;
     ensure!(value.len() <= 64 * 1024, "launch context exceeds bound");
-    let context: crate::orchestrator::AttemptContext = serde_json::from_str(value)?;
+    let context: hft_research_worker_contracts::task::AttemptContext = serde_json::from_str(value)?;
     context.validate()?;
     Ok(context)
 }
@@ -1344,7 +1297,9 @@ pub(crate) fn verify_retirement_observation(
     ensure!(
         pod["kind"] == "Pod"
             && pod["apiVersion"] == "v1"
-            && pod["metadata"]["name"].as_str().is_some_and(dns_label),
+            && pod["metadata"]["name"]
+                .as_str()
+                .is_some_and(valid_dns_label),
         "invalid original Pod identity"
     );
     for pointer in [
@@ -1409,7 +1364,7 @@ pub(crate) fn verify_retirement_observation(
     let worker = &actual["containers"][0];
     ensure!(
         read_launch_context(worker)?
-            == (crate::orchestrator::AttemptContext {
+            == (hft_research_worker_contracts::task::AttemptContext {
                 spec: spec.clone(),
                 lease: lease.clone()
             }),
@@ -1545,6 +1500,123 @@ fn normalized_container(value: &Value, profile: &Profile) -> Result<Value> {
     Ok(value)
 }
 
+/// Compare the authored request, not a hash of Kubernetes' defaulted response.
+/// Only known inert API defaults are removed; executable additions remain and
+/// fail equality. Original lease/context and both deadlines are compared exactly.
+#[cfg(feature = "control")]
+pub(crate) fn verify_create_observation(
+    original: &Value,
+    actual: &Value,
+    profile: &Profile,
+) -> Result<()> {
+    for key in ["apiVersion", "kind"] {
+        ensure!(
+            actual[key] == original[key],
+            "provider resource kind changed"
+        );
+    }
+    for key in ["name", "namespace"] {
+        ensure!(
+            actual["metadata"][key] == original["metadata"][key],
+            "provider target changed"
+        );
+    }
+    for pointer in [
+        "/metadata/labels",
+        "/metadata/annotations",
+        "/spec/template/metadata/labels",
+        "/spec/template/metadata/annotations",
+    ] {
+        if let Some(expected) = original.pointer(pointer).and_then(Value::as_object) {
+            ensure!(
+                expected.iter().all(|(key, value)| actual
+                    .pointer(pointer)
+                    .is_some_and(|map| map[key] == *value)),
+                "provider scope metadata changed"
+            );
+        }
+    }
+    if original["kind"] == "Secret" {
+        for key in ["immutable", "type", "data"] {
+            ensure!(
+                actual[key] == original[key],
+                "Secret changed original request"
+            );
+        }
+        return Ok(());
+    }
+    fn normalize(body: &Value, profile: &Profile) -> Result<Value> {
+        let mut spec = body["spec"].clone();
+        remove_nulls(&mut spec);
+        if body["kind"] == "Job" {
+            for (key, value) in [
+                ("parallelism", json!(1)),
+                ("completions", json!(1)),
+                ("manualSelector", json!(false)),
+                ("completionMode", json!("NonIndexed")),
+                ("suspend", json!(false)),
+                ("podReplacementPolicy", json!("TerminatingOrFailed")),
+            ] {
+                remove_default(&mut spec, key, &value);
+            }
+            // Kubernetes' generated selector is bound separately to this exact
+            // Job UID. Do not accept an arbitrary selector targeting other Pods.
+            if let Some(selector) = spec.get("selector") {
+                let labels = selector["matchLabels"]
+                    .as_object()
+                    .context("Job selector lacks labels")?;
+                ensure!(
+                    selector.as_object().is_some_and(|map| map.len() == 1)
+                        && !labels.is_empty()
+                        && labels.iter().all(|(key, value)| matches!(
+                            key.as_str(),
+                            "batch.kubernetes.io/controller-uid" | "controller-uid"
+                        ) && value == &body["metadata"]["uid"]),
+                    "Job selector changed UID scope"
+                );
+                spec.as_object_mut().unwrap().remove("selector");
+            }
+        }
+        // Inert generated labels/annotations were compared against all authored
+        // values above. They are not part of the executable Pod specification.
+        spec["template"]
+            .as_object_mut()
+            .context("Pod template absent")?
+            .remove("metadata");
+        let pod = &mut spec["template"]["spec"];
+        for (key, value) in [
+            ("dnsPolicy", json!("ClusterFirst")),
+            ("schedulerName", json!("default-scheduler")),
+            ("enableServiceLinks", json!(true)),
+            ("hostNetwork", json!(false)),
+            ("hostPID", json!(false)),
+            ("hostIPC", json!(false)),
+            ("preemptionPolicy", json!("PreemptLowerPriority")),
+            ("priority", json!(0)),
+        ] {
+            remove_default(pod, key, &value);
+        }
+        if pod.get("serviceAccount") == pod.get("serviceAccountName") {
+            pod.as_object_mut().unwrap().remove("serviceAccount");
+        }
+        pod["securityContext"] = normalized_security(&pod["securityContext"], true);
+        pod["volumes"] = normalized_volumes(&pod["volumes"])?;
+        for section in ["containers", "initContainers"] {
+            if let Some(containers) = pod.get_mut(section).and_then(Value::as_array_mut) {
+                for container in containers {
+                    *container = normalized_container(container, profile)?;
+                }
+            }
+        }
+        Ok(spec)
+    }
+    ensure!(
+        normalize(original, profile)? == normalize(actual, profile)?,
+        "provider executable body changed original request"
+    );
+    Ok(())
+}
+
 #[cfg(all(test, feature = "control"))]
 mod stop_tests {
     use super::*;
@@ -1562,7 +1634,11 @@ mod stop_tests {
     #[derive(Default)]
     struct ApiFixture {
         objects: std::collections::BTreeMap<String, Value>,
+        delayed: std::collections::BTreeMap<String, Value>,
+        defer_kind: Option<String>,
+        reject_status: Option<u16>,
         job_posts: u32,
+        secret_posts: u32,
         deletes: u32,
     }
     async fn fixture_api(
@@ -1577,6 +1653,9 @@ mod stop_tests {
         let mut state = state.lock().await;
         let path = uri.path().to_owned();
         match method {
+            axum::http::Method::GET if path.ends_with("/pods") => {
+                axum::Json(json!({"items":[]})).into_response()
+            }
             axum::http::Method::GET => match state.objects.get(&path) {
                 Some(v) => axum::Json(v.clone()).into_response(),
                 None => axum::http::StatusCode::NOT_FOUND.into_response(),
@@ -1584,15 +1663,28 @@ mod stop_tests {
             axum::http::Method::POST => {
                 let mut value: Value = serde_json::from_slice(&body).unwrap();
                 let name = value["metadata"]["name"].as_str().unwrap().to_owned();
-                let is_job = path.ends_with("/jobs");
+                let is_job = value["kind"] != "Secret";
+                if is_job {
+                    state.job_posts += 1;
+                } else {
+                    state.secret_posts += 1;
+                }
+                if let Some(status) = state.reject_status {
+                    return axum::http::StatusCode::from_u16(status)
+                        .unwrap()
+                        .into_response();
+                }
                 value["metadata"]["uid"] = json!(if is_job {
                     "original-job"
                 } else {
                     "original-late-secret"
                 });
+                if state.defer_kind.as_deref() == value["kind"].as_str() {
+                    state.delayed.insert(format!("{path}/{name}"), value);
+                    return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
                 state.objects.insert(format!("{path}/{name}"), value);
                 if is_job {
-                    state.job_posts += 1;
                     // The first request creates the Job, then reports failure.
                     // A later reconciliation must recover the existing object.
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -1621,7 +1713,7 @@ mod stop_tests {
     async fn launcher_recovers_original_context_and_cleans_only_owned_secret() -> Result<()> {
         use base64::Engine;
         let mut spec = cex_spec();
-        let trust = crate::admission::NativeAdmissionTrust {
+        let trust = hft_research_worker_contracts::admission::NativeAdmissionTrust {
             schema: "transport-fixture".into(),
             native_reservation_keys: Default::default(),
         };
@@ -1634,12 +1726,14 @@ mod stop_tests {
             ),
         ]
         .into();
-        spec.worker_configuration = Some(crate::orchestrator::worker_configuration_reference(
-            "research",
-            "configuration",
-            "configuration-original",
-            &data,
-        )?);
+        spec.worker_configuration = Some(
+            hft_research_worker_contracts::task::worker_configuration_reference(
+                "research",
+                "configuration",
+                "configuration-original",
+                &data,
+            )?,
+        );
         let mut task = crate::orchestrator::Task::new(spec.clone())?;
         let now = i64::try_from(
             std::time::SystemTime::now()
@@ -1672,15 +1766,23 @@ mod stop_tests {
             command_reattach: false,
             artifact_readback: true,
         };
-        assert!(kubernetes
-            .launch(&spec, &lease, &acceptance, None, 5000, Some(&issued))
-            .await
-            .is_err());
+        let mut journal = crate::provider_operations::MemoryJournal::new(task.clone());
+        assert!(matches!(
+            kubernetes
+                .launch(&task, &acceptance, 5000, Some(&issued), &mut journal)
+                .await?,
+            LaunchOutcome::Ready(_, _)
+        ));
         let mut renewed = lease.clone();
         renewed.expires_ms += 4000;
-        let (handle, reference) = kubernetes
-            .launch(&spec, &renewed, &acceptance, None, 4000, Some(&issued))
-            .await?;
+        let mut recovered = task.clone();
+        recovered.lease = Some(renewed.clone());
+        let LaunchOutcome::Ready(handle, reference) = kubernetes
+            .launch(&recovered, &acceptance, 4000, Some(&issued), &mut journal)
+            .await?
+        else {
+            anyhow::bail!("expected recovered original launch");
+        };
         let reference = reference.unwrap();
         assert_eq!(handle.uid, "original-job");
         assert_eq!(reference.launch_lease, lease);
@@ -1693,17 +1795,257 @@ mod stop_tests {
         let original = state.lock().await.objects[&path].clone();
         state.lock().await.objects.get_mut(&path).unwrap()["metadata"]["uid"] = json!("foreign");
         assert!(kubernetes
-            .cleanup_attempt_identity(&spec, &renewed, Some(&reference), Some(&issued))
+            .cleanup_attempt_identity(
+                &spec,
+                &renewed,
+                Some(&reference),
+                Some(&issued),
+                &mut journal
+            )
             .await
             .is_err());
         assert_eq!(state.lock().await.deletes, 0);
         state.lock().await.objects.insert(path.clone(), original);
         assert!(
             kubernetes
-                .cleanup_attempt_identity(&spec, &renewed, Some(&reference), Some(&issued))
+                .cleanup_attempt_identity(
+                    &spec,
+                    &renewed,
+                    Some(&reference),
+                    Some(&issued),
+                    &mut journal
+                )
                 .await?
+                == StopOutcome::Stopped
         );
         assert!(!state.lock().await.objects.contains_key(&path));
+        issuer.cleanup(issued)?;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_create_keeps_original_body_and_cannot_stop_on_absence() -> Result<()> {
+        for backend in [Backend::KubernetesJob, Backend::AgentSandbox] {
+            let mut spec = cex_spec();
+            spec.kind = if backend == Backend::AgentSandbox {
+                hft_research_worker_contracts::task::TaskKind::Explore
+            } else {
+                hft_research_worker_contracts::task::TaskKind::Train
+            };
+            spec.profile.backend = backend;
+            spec.profile.worker_secret = None;
+            spec.worker_configuration = None;
+            let mut task = crate::orchestrator::Task::new(spec.clone())?;
+            let lease = task.claim("owner", 1000, 120_000)?;
+            let acceptance = Acceptance {
+                profile: spec.profile.clone(),
+                ready: true,
+                process_tree_stop: true,
+                immutable_prepared_mount: false,
+                command_reattach: true,
+                artifact_readback: true,
+            };
+            let state = std::sync::Arc::new(tokio::sync::Mutex::new(ApiFixture {
+                defer_kind: Some(
+                    if backend == Backend::AgentSandbox {
+                        "Sandbox"
+                    } else {
+                        "Job"
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let router = axum::Router::new()
+                .fallback(axum::routing::any(fixture_api))
+                .with_state(state.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let kubernetes = Kubernetes::retirement_fixture(&endpoint, &spec.profile.cluster)?;
+            let mut journal = crate::provider_operations::MemoryJournal::new(task.clone());
+            assert!(matches!(
+                kubernetes
+                    .launch(&task, &acceptance, 5000, None, &mut journal)
+                    .await?,
+                LaunchOutcome::AwaitingEvidence
+            ));
+            let original = journal.original(CreateKind::Execution).await?.unwrap();
+            let mut renewed = lease.clone();
+            renewed.expires_ms += 4000;
+            let mut recovered = task.clone();
+            recovered.lease = Some(renewed.clone());
+            // A fresh controller holds only persisted evidence, never FirstSend.
+            journal = journal.clone();
+            assert!(matches!(
+                kubernetes
+                    .launch(&recovered, &acceptance, 1000, None, &mut journal)
+                    .await?,
+                LaunchOutcome::AwaitingEvidence
+            ));
+            assert_eq!(
+                journal
+                    .original(CreateKind::Execution)
+                    .await?
+                    .unwrap()
+                    .sha256,
+                original.sha256
+            );
+            assert_eq!(state.lock().await.job_posts, 1);
+            assert_eq!(
+                kubernetes.stop(&spec, &renewed, None, &mut journal).await?,
+                StopOutcome::AwaitingEvidence
+            );
+            let (path, object) = state.lock().await.delayed.pop_first().unwrap();
+            let mut bad = object.clone();
+            bad["spec"]["template"]["spec"]["activeDeadlineSeconds"] = json!(99);
+            assert!(journal.observed(CreateKind::Execution, &bad).await.is_err());
+            bad = object.clone();
+            bad["metadata"]["labels"]["monday.io/fence"] = json!("999");
+            assert!(journal.observed(CreateKind::Execution, &bad).await.is_err());
+            let mut normalized = object.clone();
+            normalized["metadata"]["resourceVersion"] = json!("77");
+            normalized["status"] = json!({"active":1});
+            normalized["spec"]["template"]["spec"]["dnsPolicy"] = json!("ClusterFirst");
+            normalized["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] =
+                json!("IfNotPresent");
+            normalized["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["cpu"] =
+                json!("1");
+            state.lock().await.objects.insert(path.clone(), normalized);
+            assert_eq!(
+                kubernetes.stop(&spec, &renewed, None, &mut journal).await?,
+                StopOutcome::AwaitingEvidence
+            );
+            assert_eq!(state.lock().await.deletes, 1);
+            assert_eq!(
+                kubernetes.stop(&spec, &renewed, None, &mut journal).await?,
+                StopOutcome::Stopped
+            );
+            let mut substituted = object;
+            substituted["metadata"]["uid"] = json!("replacement");
+            assert!(journal
+                .observed(CreateKind::Execution, &substituted)
+                .await
+                .is_err());
+            assert_eq!(state.lock().await.job_posts, 1);
+            server.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_definite_rejection_allows_absent_create_settlement() -> Result<()> {
+        for status in [403, 422, 500, 408, 409, 429] {
+            let mut spec = cex_spec();
+            spec.kind = hft_research_worker_contracts::task::TaskKind::Train;
+            spec.profile.worker_secret = None;
+            spec.worker_configuration = None;
+            let mut task = crate::orchestrator::Task::new(spec.clone())?;
+            let lease = task.claim("owner", 1000, 120_000)?;
+            let acceptance = Acceptance {
+                profile: spec.profile.clone(),
+                ready: true,
+                process_tree_stop: true,
+                immutable_prepared_mount: false,
+                command_reattach: false,
+                artifact_readback: true,
+            };
+            let state = std::sync::Arc::new(tokio::sync::Mutex::new(ApiFixture {
+                reject_status: Some(status),
+                ..Default::default()
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let router = axum::Router::new()
+                .fallback(axum::routing::any(fixture_api))
+                .with_state(state.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let kubernetes = Kubernetes::retirement_fixture(&endpoint, &spec.profile.cluster)?;
+            let mut journal = crate::provider_operations::MemoryJournal::new(task.clone());
+            let outcome = kubernetes
+                .launch(&task, &acceptance, 5000, None, &mut journal)
+                .await?;
+            let definite = crate::provider_operations::definite_rejection(status);
+            assert_eq!(matches!(outcome, LaunchOutcome::Rejected), definite);
+            assert_eq!(
+                kubernetes.stop(&spec, &lease, None, &mut journal).await? == StopOutcome::Stopped,
+                definite
+            );
+            let _ = kubernetes
+                .launch(&task, &acceptance, 4000, None, &mut journal)
+                .await?;
+            assert_eq!(state.lock().await.job_posts, 1);
+            server.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_secret_unknown_retains_cleanup_and_never_reposts_credentials() -> Result<()> {
+        let spec = cex_spec();
+        let mut task = crate::orchestrator::Task::new(spec.clone())?;
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        let lease = task.claim("owner", now, 120_000)?;
+        let (_files, issuer, issued) =
+            crate::artifact_identity::launcher_fixture(&spec, &lease, "a".repeat(64))?;
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(ApiFixture {
+            defer_kind: Some("Secret".into()),
+            ..Default::default()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let router = axum::Router::new()
+            .fallback(axum::routing::any(fixture_api))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let kubernetes = Kubernetes::retirement_fixture(&endpoint, &spec.profile.cluster)?;
+        let mut journal = crate::provider_operations::MemoryJournal::new(task.clone());
+        assert!(kubernetes
+            .prepare_attempt_identity(&spec, &lease, &issued, &mut journal)
+            .await?
+            .is_none());
+        let original = journal.original(CreateKind::Identity).await?.unwrap();
+        assert!(original.public_body.get("data").is_none());
+        assert!(original.secret_data_sha256.is_some());
+        assert_eq!(
+            kubernetes.stop(&spec, &lease, None, &mut journal).await?,
+            StopOutcome::Stopped
+        );
+        assert_eq!(
+            kubernetes
+                .cleanup_attempt_identity(&spec, &lease, None, Some(&issued), &mut journal)
+                .await?,
+            StopOutcome::AwaitingEvidence
+        );
+        journal = journal.clone();
+        assert!(kubernetes
+            .prepare_attempt_identity(&spec, &lease, &issued, &mut journal)
+            .await?
+            .is_none());
+        assert_eq!(state.lock().await.secret_posts, 1);
+        let (path, object) = state.lock().await.delayed.pop_first().unwrap();
+        let mut bad = object.clone();
+        bad["data"]["artifact.token"] = json!("c3Vic3RpdHV0ZWQ=");
+        state.lock().await.objects.insert(path.clone(), bad);
+        assert!(kubernetes
+            .cleanup_attempt_identity(&spec, &lease, None, Some(&issued), &mut journal)
+            .await
+            .is_err());
+        assert_eq!(state.lock().await.deletes, 0);
+        state.lock().await.objects.insert(path, object);
+        assert_eq!(
+            kubernetes
+                .cleanup_attempt_identity(&spec, &lease, None, Some(&issued), &mut journal)
+                .await?,
+            StopOutcome::Stopped
+        );
+        assert_eq!(state.lock().await.deletes, 1);
+        assert_eq!(state.lock().await.secret_posts, 1);
         issuer.cleanup(issued)?;
         server.abort();
         Ok(())
@@ -1711,7 +2053,7 @@ mod stop_tests {
     fn cex_spec() -> TaskSpec {
         TaskSpec {
             schema: 1,
-            kind: crate::orchestrator::TaskKind::CexCampaign,
+            kind: hft_research_worker_contracts::task::TaskKind::CexCampaign,
             run_manifest_sha256: "a".repeat(64),
             view_manifest_sha256: "b".repeat(64),
             source_sha256: "c".repeat(64),
@@ -1735,12 +2077,14 @@ mod stop_tests {
             max_attempts: 1,
             output_prefix: "research/results".into(),
             fit_identity_sha256: None,
-            worker_configuration: Some(crate::orchestrator::WorkerConfigurationRef {
-                schema: "monday.worker_configuration.v1".into(),
-                secret_name: "configuration".into(),
-                secret_uid: "static-uid".into(),
-                configuration_sha256: "f".repeat(64),
-            }),
+            worker_configuration: Some(
+                hft_research_worker_contracts::task::WorkerConfigurationRef {
+                    schema: "monday.worker_configuration.v1".into(),
+                    secret_name: "configuration".into(),
+                    secret_uid: "static-uid".into(),
+                    configuration_sha256: "f".repeat(64),
+                },
+            ),
         }
     }
 
@@ -1787,7 +2131,7 @@ mod stop_tests {
         let mut changed = object;
         changed["metadata"]["labels"]["monday.io/fence"] = json!("2");
         assert!(verify_identity_reference(&changed, &spec, &reference).is_err());
-        let context = crate::orchestrator::AttemptContext { spec, lease };
+        let context = hft_research_worker_contracts::task::AttemptContext { spec, lease };
         let value = serde_json::to_string(&context).unwrap();
         let mut worker = json!({"env":[{"name":"MONDAY_ATTEMPT_CONTEXT","value":value}]});
         assert_eq!(read_launch_context(&worker).unwrap(), context);

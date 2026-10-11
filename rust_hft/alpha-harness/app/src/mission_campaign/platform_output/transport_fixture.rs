@@ -3,12 +3,6 @@
 use super::*;
 use anyhow::ensure;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use hft_research_platform::{
-    admission::{sign, NativeAdmission, NativeAdmissionTrust},
-    execution::{Backend, Profile},
-    orchestrator::{worker_configuration_reference, Admission, Lease, TaskSpec},
-    research::Run,
-};
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::{
     collections::BTreeMap,
@@ -19,6 +13,17 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+};
+use {
+    hft_research_platform::admission::sign,
+    hft_research_worker_contracts::admission::NativeAdmission,
+    hft_research_worker_contracts::admission::NativeAdmissionTrust,
+    hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::execution::Profile,
+    hft_research_worker_contracts::research::Run,
+    hft_research_worker_contracts::task::worker_configuration_reference,
+    hft_research_worker_contracts::task::Admission, hft_research_worker_contracts::task::Lease,
+    hft_research_worker_contracts::task::TaskSpec,
 };
 
 fn openssl(directory: &Path, args: &[&str]) -> anyhow::Result<()> {

@@ -6,11 +6,9 @@ use anyhow::{ensure, Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    build::{BuildArtifact, BuiltExecutable},
-    identity,
-    orchestrator::Artifact,
-    valid_digest,
+use {
+    crate::build::BuildArtifact, crate::build::BuiltExecutable, crate::identity,
+    crate::valid_digest, hft_research_worker_contracts::task::Artifact,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

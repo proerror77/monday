@@ -12,9 +12,10 @@ use hft_research_agent_contracts::{
     ValidatedMetaStudyV1,
 };
 
-use crate::{
-    execution::Backend, orchestrator::TaskSpec, release::VerifiedBuildRelease, research::Run,
-    sha256, valid_digest,
+use {
+    crate::release::VerifiedBuildRelease, crate::sha256, crate::valid_digest,
+    hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::research::Run, hft_research_worker_contracts::task::TaskSpec,
 };
 
 /// Operator-controlled role configuration, never taken from a receipt's JSON.
@@ -148,7 +149,7 @@ impl<'a> MetaVerificationContext<'a> {
                     .all(|part| !part.is_empty()),
                 "task output prefix contains an empty segment"
             );
-            execution.run.admit_build(artifact)?;
+            crate::research::admit_run_build(execution.run, artifact)?;
             execution.run.admit(execution.task)?;
             let architecture = match artifact.build.target.as_str() {
                 "x86_64-unknown-linux-gnu" => "amd64",
@@ -752,7 +753,7 @@ impl MetaVerificationContext<'_> {
         );
         task.validate()?;
         task.profile.validate()?;
-        run.admit_build(&prepared.build)?;
+        crate::research::admit_run_build(run, &prepared.build)?;
         run.admit(task)?;
         ensure!(
             run.data_manifest_sha256 == prepared.configuration.query.data_view_sha256,
@@ -805,16 +806,6 @@ impl MetaVerificationContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        build::{BuildArtifact, BuildSpec, BuiltExecutable},
-        execution::Profile,
-        identity,
-        orchestrator::{Artifact, TaskKind},
-        release::{
-            BuildReleaseReceipt, BuildReleaseTrust, ReleaseProducer, SignedBuildRelease,
-            SourceArchive,
-        },
-    };
     use ed25519_dalek::{Signer, SigningKey};
     use hft_research_agent_contracts::{
         ContentReferenceV1, ExperienceCorpusReferenceV1, ExperienceRankingOrder,
@@ -824,6 +815,14 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::{Arc, Barrier, Mutex};
+    use {
+        crate::build::BuildArtifact, crate::build::BuildSpec, crate::build::BuiltExecutable,
+        crate::identity, crate::release::BuildReleaseReceipt, crate::release::BuildReleaseTrust,
+        crate::release::ReleaseProducer, crate::release::SignedBuildRelease,
+        crate::release::SourceArchive, hft_research_worker_contracts::execution::Profile,
+        hft_research_worker_contracts::task::Artifact,
+        hft_research_worker_contracts::task::TaskKind,
+    };
 
     fn h(c: char) -> String {
         c.to_string().repeat(64)
@@ -2255,7 +2254,7 @@ mod tests {
         run.command[0] = "/usr/local/bin/other-evaluator".into();
         task.command.clone_from(&run.command);
         task.run_manifest_sha256 = run.id().unwrap();
-        run.admit_build(&artifact).unwrap();
+        crate::research::admit_run_build(&run, &artifact).unwrap();
         run.admit(&task).unwrap();
         assert!(context
             .bind_next_run(&head, &prepared, &run, &task)

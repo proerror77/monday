@@ -1,0 +1,10 @@
+{
+  "schema": "monday.research-release-tools-recipe.v1",
+  "manifest": "rust_hft/research-core/platform/Cargo.toml",
+  "package": "hft-research-platform",
+  "features": "publisher",
+  "default_features": false,
+  "profile": "release",
+  "target": "x86_64-unknown-linux-gnu",
+  "binaries": ["research-release-capability", "research-release-publisher"]
+}

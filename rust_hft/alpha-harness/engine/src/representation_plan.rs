@@ -134,7 +134,8 @@ fn implementation_sources(tool: RepresentationToolV1) -> Vec<(&'static str, &'st
         source!("../../../tools/collector/src/polymarket_upload.rs"),
         source!("../../../tools/collector/src/binance_spot_reference_artifact.rs"),
         source!("../../../tools/collector/src/binance_usdm_reference_artifact.rs"),
-        source!("../../../tools/collector/src/feature_matrix.rs"),
+        source!("../../../research-core/cex-input/src/feature_matrix.rs"),
+        source!("../../../research-core/cex-input/src/ohlcv.rs"),
         source!("../../../research-core/manifest/src/lib.rs"),
         source!("../../../research-core/manifest/src/sequence.rs"),
         source!("../../../research-core/manifest/src/market_encoder.rs"),
@@ -1277,6 +1278,77 @@ mod tests {
                 .find(|entry| entry.tool == tool)
                 .unwrap()
                 .implementation = changed;
+            assert!(validate_representation_plan(&stale, &data, &goal).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_pit_jsonl_contract_bytes_invalidate_registered_implementations() {
+        let tools = [
+            RepresentationToolV1::CapturedBookReplay,
+            RepresentationToolV1::StaticTop5,
+            RepresentationToolV1::LaggedContinuousOfi,
+            RepresentationToolV1::AggregateTradeFlow,
+            RepresentationToolV1::SolSequence,
+            RepresentationToolV1::SolMarketEncoder,
+        ];
+        for (path, body) in [
+            (
+                "../../../research-core/cex-input/src/feature_matrix.rs",
+                include_bytes!("../../../research-core/cex-input/src/feature_matrix.rs").as_slice(),
+            ),
+            (
+                "../../../research-core/cex-input/src/lib.rs",
+                include_bytes!("../../../research-core/cex-input/src/lib.rs").as_slice(),
+            ),
+            (
+                "../../../research-core/cex-input/Cargo.toml",
+                include_bytes!("../../../research-core/cex-input/Cargo.toml").as_slice(),
+            ),
+        ] {
+            assert_registered_dependency_bound(path, body, &tools);
+        }
+    }
+
+    #[test]
+    fn collector_pit_owner_identity_is_rejected_after_shared_input_migration() {
+        let (data, goal) = input();
+        let plan = propose_representation_comparison(&data, &goal).unwrap();
+        let current_path = "../../../research-core/cex-input/src/feature_matrix.rs";
+        let legacy_path = "../../../tools/collector/src/feature_matrix.rs";
+        for entry in &plan.matches {
+            let sources = implementation_sources(entry.tool);
+            assert_eq!(
+                sources
+                    .iter()
+                    .filter(|(path, _)| *path == current_path)
+                    .count(),
+                1
+            );
+            assert!(!sources.iter().any(|(path, _)| *path == legacy_path));
+            // Equal module bytes under the previous owner still have another identity.
+            let legacy_sources = sources
+                .iter()
+                .map(|&(path, body)| {
+                    (
+                        if path == current_path {
+                            legacy_path
+                        } else {
+                            path
+                        },
+                        body,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let legacy = source_reference(&entry.implementation.id, &legacy_sources);
+            assert_ne!(entry.implementation, legacy, "{:?}", entry.tool);
+            let mut stale = plan.clone();
+            stale
+                .matches
+                .iter_mut()
+                .find(|candidate| candidate.tool == entry.tool)
+                .unwrap()
+                .implementation = legacy;
             assert!(validate_representation_plan(&stale, &data, &goal).is_err());
         }
     }

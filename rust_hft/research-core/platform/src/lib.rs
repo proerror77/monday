@@ -7,8 +7,6 @@ pub mod agent_api;
 pub mod artifact_gateway;
 #[cfg(feature = "control")]
 pub mod artifact_identity;
-#[cfg(feature = "artifact-io")]
-pub mod artifact_io;
 #[cfg(feature = "control")]
 pub mod block_objects;
 pub mod build;
@@ -16,7 +14,6 @@ pub mod build;
 pub mod build_objects;
 #[cfg(feature = "native-admission")]
 pub mod campaign;
-pub mod campaign_result;
 #[cfg(feature = "control")]
 pub mod clickhouse;
 pub mod coding_agent;
@@ -25,6 +22,8 @@ pub mod orchestrator;
 #[cfg(feature = "control")]
 pub mod postgres;
 pub mod preparation;
+#[cfg(feature = "control")]
+pub mod provider_operations;
 #[cfg(any(feature = "control", feature = "release-verification"))]
 pub mod release;
 #[cfg(feature = "publisher")]
@@ -46,32 +45,11 @@ pub mod service;
 pub mod session;
 #[cfg(feature = "native-admission")]
 pub mod terminal_audit;
-#[cfg(feature = "artifact-io")]
-pub mod worker_configuration;
 
-use serde::Serialize;
-use sha2::{Digest, Sha256};
-
-pub fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-pub fn identity(value: &impl Serialize) -> anyhow::Result<String> {
-    Ok(sha256(&serde_json::to_vec(value)?))
-}
-
-pub fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-}
+use hft_research_worker_contracts::{identity, sha256, valid_digest};
 
 #[cfg(feature = "control")]
 pub mod worker;
-
-#[cfg(feature = "artifact-io")]
-pub mod transport;
 
 #[cfg(feature = "control")]
 pub mod foundation;

@@ -1,16 +1,19 @@
 use super::*;
-use crate::{
-    admission::{NativeAdmission, NativeAdmissionTrust},
-    execution::{AttemptIdentityRef, Profile},
-    orchestrator::{Admission, Task, TaskSpec, WorkerConfigurationRef},
-    research::{Run, TerminalLedgerEvent},
-    terminal_audit::{
-        sign_terminal_audit, NativeTerminalAuditWitness, NATIVE_TERMINAL_AUDIT_SCHEMA,
-    },
-};
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use {
+    crate::execution::AttemptIdentityRef, crate::orchestrator::Task,
+    crate::research::TerminalLedgerEvent, crate::terminal_audit::sign_terminal_audit,
+    crate::terminal_audit::NativeTerminalAuditWitness,
+    crate::terminal_audit::NATIVE_TERMINAL_AUDIT_SCHEMA,
+    hft_research_worker_contracts::admission::NativeAdmission,
+    hft_research_worker_contracts::admission::NativeAdmissionTrust,
+    hft_research_worker_contracts::execution::Profile,
+    hft_research_worker_contracts::research::Run, hft_research_worker_contracts::task::Admission,
+    hft_research_worker_contracts::task::TaskSpec,
+    hft_research_worker_contracts::task::WorkerConfigurationRef,
+};
 fn h(c: char) -> String {
     c.to_string().repeat(64)
 }

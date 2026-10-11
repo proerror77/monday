@@ -1608,7 +1608,7 @@ fn validate_campaign_receipt(
     {
         bail!("campaign inputs receipt does not match the fresh preparation request");
     }
-    let base = hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
+    let base = hft_research_artifacts::identity::canonical_tokyo_oss_internal_object(
         "campaign inputs output root",
         &receipt.output_object_base_url,
     )?;
@@ -1665,8 +1665,10 @@ fn validate_item_shape(
     {
         bail!("{label} relative path is unsafe");
     }
-    let object =
-        hft_research_dispatch_io::canonical_tokyo_oss_internal_object(label, &item.object_url)?;
+    let object = hft_research_artifacts::identity::canonical_tokyo_oss_internal_object(
+        label,
+        &item.object_url,
+    )?;
     if item.sha256.len() != 64
         || !item
             .sha256
