@@ -131,6 +131,10 @@ Reserve requests and payload bytes before sending. Keep reservations after error
 Source preflight and publication must share that ledger across processes.
 Never upload credentials or the private ledger as workflow artifacts.
 The workflow retains the public allocation and price admission with native Build evidence.
+An `always()` artifact step also retains these public files and the native usage
+summary when preparation or publication fails. It names only those three files;
+the private ledger, signing key and session are never artifact inputs.
+An unreadable or invalid ledger produces `usage_known:false` and fails execution.
 
 The Tokyo model uses the same-account CNY quote observed on 2026-10-11.
 It expires on 2026-11-10. Refresh the quote and reviewed model before further admission.

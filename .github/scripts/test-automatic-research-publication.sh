@@ -152,7 +152,24 @@ abort 'budget gate gained credentials or lost selection' unless budget.fetch('if
   'SOURCE_SHA'=>'${{ needs.selector.outputs.source_sha }}',
   'PRODUCTS'=>'${{ needs.selector.outputs.research_products }}'
 } && budget.fetch('run').include?('research-publication-budget.sh admit')
-comparison=Marshal.load(Marshal.dump(steps-[recheck,budget]))
+consumption_steps=steps.select {|s|s['name']=='Retain public research publication budget consumption'}
+abort 'missing or ambiguous consumption retention' unless consumption_steps.length==1
+consumption=consumption_steps.fetch(0)
+abort 'failed publication consumption is not retained safely' unless consumption=={
+  'name'=>'Retain public research publication budget consumption',
+  'if'=>'${{ always() && matrix.research_artifact }}',
+  'uses'=>'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+  'with'=>{
+    'name'=>'research-publication-budget-${{ needs.selector.outputs.source_sha }}-${{ matrix.product }}',
+    'path'=>["${{ runner.temp }}/research-publication-budget-admission.json", "${{ runner.temp }}/research-publication-native-budget.json", "${{ runner.temp }}/research-publication-budget-usage.json"].join("\n")+"\n",
+    'if-no-files-found'=>'warn', 'retention-days'=>7
+  }
+}
+[pub,ordinary].each do |job|
+  config=job.fetch('steps').find {|s|s['run']=='.github/scripts/publish-research-build-release.sh check-config'}
+  abort 'native budget plan lacks compiled product selection' unless config.fetch('env').fetch('SOFTWARE_PRODUCTS')=='${{ needs.selector.outputs.research_product }}'
+end
+comparison=Marshal.load(Marshal.dump(steps-[recheck,budget,consumption]))
 retention=comparison.find {|s|s['name']=='Retain native Build release projection'}
 paths=retention.fetch('with').fetch('path').lines
 budget_paths=["${{ runner.temp }}/research-publication-budget-admission.json\n", "${{ runner.temp }}/research-publication-native-budget.json\n"]

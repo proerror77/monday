@@ -453,6 +453,7 @@ jobs:
           PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
           IMAGE_REPOSITORY: ${{ matrix.repository }}
           PRODUCT: ${{ matrix.product }}
+          SOFTWARE_PRODUCTS: ${{ needs.selector.outputs.research_product }}
           PUBLISH_IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}
         run: .github/scripts/publish-research-build-release.sh check-config
 
@@ -980,6 +981,18 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Retain public research publication budget consumption
+        if: ${{ always() && matrix.research_artifact }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: research-publication-budget-${{ needs.selector.outputs.source_sha }}-${{ matrix.product }}
+          path: |
+            ${{ runner.temp }}/research-publication-budget-admission.json
+            ${{ runner.temp }}/research-publication-native-budget.json
+            ${{ runner.temp }}/research-publication-budget-usage.json
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Record verified ACR publication
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1105,6 +1118,7 @@ jobs:
           PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
           IMAGE_REPOSITORY: ${{ matrix.repository }}
           PRODUCT: ${{ matrix.product }}
+          SOFTWARE_PRODUCTS: ${{ needs.selector.outputs.research_product }}
           PUBLISH_IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}
         run: .github/scripts/publish-research-build-release.sh check-config
 
