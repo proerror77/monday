@@ -302,7 +302,10 @@ MONDAY_TEST_CARGO_MODE=fail-and-cancel PATH="$fixture/bin:$PATH" RUNNER_TEMP="$f
   bash "$fixture/.github/scripts/build-research-release.sh" all >"$work/cancel.log" 2>&1 || code=$?
 [[ $code == 37 && ! -e $fixture/cancel-output/research-image-release.tar ]]
 for pid_file in "$MONDAY_TEST_COMPILER_PID" "$MONDAY_TEST_FAILED_COMPILER_PID"; do
-  if kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+  compiler_pid=$(cat "$pid_file")
+  # PID 1 may retain an exited orphan as a zombie; it cannot execute anymore.
+  compiler_state=$(ps -o stat= -p "$compiler_pid" 2>/dev/null || true)
+  if kill -0 "$compiler_pid" 2>/dev/null && [[ ${compiler_state//[[:space:]]/} != Z* ]]; then
     echo 'failed or cancelled owner left a compiler alive' >&2; exit 1
   fi
 done
@@ -334,6 +337,8 @@ begin
     rescue Errno::ESRCH
       break
     end
+    state = IO.popen(['ps', '-o', 'stat=', '-p', compiler.to_s]) { |process| process.read(64).to_s.strip }
+    break if state.start_with?('Z')
     abort 'interrupted compiler remained alive' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
     sleep 0.05
   end
