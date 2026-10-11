@@ -90,17 +90,17 @@ impl RiskManager for PriceCaptureRisk {
         intents
     }
 
-    fn review_with_venue_specs(
+    fn review_envelopes_with_risk_context(
         &mut self,
-        intents: Vec<OrderIntent>,
-        _account: &AccountView,
+        envelopes: Vec<ports::OrderIntentEnvelope>,
+        _context: ports::RiskReviewContext<'_>,
         _venue_specs: &HashMap<VenueId, VenueSpec>,
-    ) -> Vec<OrderIntent> {
+    ) -> Vec<ports::OrderIntentEnvelope> {
         self.captured
             .lock()
             .expect("capture lock")
-            .extend(intents.iter().map(|intent| intent.price));
-        intents
+            .extend(envelopes.iter().map(|envelope| envelope.intent.price));
+        envelopes
     }
 
     fn on_execution_event(&mut self, _event: &ExecutionEvent) {}
@@ -664,6 +664,14 @@ fn realtime_quote_drives_production_imbalance_strategy_with_quote_sequence() {
     config.ingestion.stale_threshold_us = 1_000_000;
     config.top_n = 2;
     let mut engine = Engine::new(config);
+    // This routing fixture models a quote-protected adapter; canonical CEX rejects market orders.
+    engine.set_execution_price_protection(HashMap::from([(
+        VenueId::BINANCE,
+        ports::ExecutionPriceProtection::VenueQuote,
+    )]));
+    engine
+        .set_intent_execution_limits(Some(100), Some(Decimal::from(100)), Some(Decimal::ONE))
+        .unwrap();
     let ingester = engine.create_event_ingester_pair();
     let (engine_queues, mut worker_queues) =
         create_execution_queues(ExecutionQueueConfig::default());
@@ -688,7 +696,9 @@ fn realtime_quote_drives_production_imbalance_strategy_with_quote_sequence() {
             asks: vec![level(101.0, 1.0), level(102.0, 1.0)],
             sequence: 20,
             source_venue: Some(VenueId::BINANCE),
-            timestamps: Default::default(),
+            timestamps: hft_core::MarketDataTimestamps::local_only(
+                hft_core::LocalReceiveTimestamp::new(now_micros()),
+            ),
 
             provider_identity: None,
         }))
@@ -706,7 +716,9 @@ fn realtime_quote_drives_production_imbalance_strategy_with_quote_sequence() {
             bid: level(100.0, 10.0),
             ask: level(101.0, 1.0),
             source_venue: Some(VenueId::BINANCE),
-            timestamps: Default::default(),
+            timestamps: hft_core::MarketDataTimestamps::local_only(
+                hft_core::LocalReceiveTimestamp::new(now_micros()),
+            ),
         }))
         .expect("quote accepted");
     engine.tick().expect("quote tick");
@@ -769,6 +781,14 @@ fn rebuilt_lob_delta_drives_production_imbalance_strategy() {
     config.ingestion.stale_threshold_us = 1_000_000;
     config.top_n = 2;
     let mut engine = Engine::new(config);
+    // This routing fixture models a quote-protected adapter; canonical CEX rejects market orders.
+    engine.set_execution_price_protection(HashMap::from([(
+        VenueId::BINANCE,
+        ports::ExecutionPriceProtection::VenueQuote,
+    )]));
+    engine
+        .set_intent_execution_limits(Some(100), Some(Decimal::from(100)), Some(Decimal::ONE))
+        .unwrap();
     let ingester = engine.create_event_ingester_pair();
     let (engine_queues, mut worker_queues) =
         create_execution_queues(ExecutionQueueConfig::default());
@@ -793,7 +813,9 @@ fn rebuilt_lob_delta_drives_production_imbalance_strategy() {
             asks: vec![level(101.0, 2.0), level(102.0, 1.0)],
             sequence: 10,
             source_venue: Some(VenueId::BINANCE),
-            timestamps: Default::default(),
+            timestamps: hft_core::MarketDataTimestamps::local_only(
+                hft_core::LocalReceiveTimestamp::new(now_micros()),
+            ),
 
             provider_identity: None,
         }))
@@ -816,7 +838,9 @@ fn rebuilt_lob_delta_drives_production_imbalance_strategy() {
             sequence: 11,
             is_snapshot: false,
             source_venue: Some(VenueId::BINANCE),
-            timestamps: Default::default(),
+            timestamps: hft_core::MarketDataTimestamps::local_only(
+                hft_core::LocalReceiveTimestamp::new(now_micros()),
+            ),
         }))
         .expect("delta accepted");
     engine.tick().expect("delta tick");
@@ -1001,10 +1025,20 @@ fn batched_deltas_keep_the_lob_state_from_their_own_sequence() {
 }
 
 #[test]
-fn market_order_is_priced_from_event_lob_before_risk_review() {
+fn market_order_risk_uses_slippage_bound_but_execution_keeps_arrival_quote() {
     let mut config = EngineConfig::default();
     config.ingestion.stale_threshold_us = 1_000_000;
     let mut engine = Engine::new(config);
+    // This routing fixture models a quote-protected adapter; canonical CEX rejects market orders.
+    engine.set_execution_price_protection(HashMap::from([(
+        VenueId::BINANCE,
+        ports::ExecutionPriceProtection::VenueQuote,
+    )]));
+    engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+    engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+    engine
+        .set_intent_execution_limits(Some(100), Some(Decimal::from(100)), Some(Decimal::ONE))
+        .unwrap();
     let ingester = engine.create_event_ingester_pair();
     let (engine_queues, mut worker_queues) =
         create_execution_queues(ExecutionQueueConfig::default());
@@ -1025,7 +1059,9 @@ fn market_order_is_priced_from_event_lob_before_risk_review() {
             asks: vec![level(101.0, 1.0)],
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
-            timestamps: Default::default(),
+            timestamps: hft_core::MarketDataTimestamps::local_only(
+                hft_core::LocalReceiveTimestamp::new(now_micros()),
+            ),
 
             provider_identity: None,
         }))
@@ -1034,7 +1070,7 @@ fn market_order_is_priced_from_event_lob_before_risk_review() {
 
     assert_eq!(
         *captured.lock().expect("capture lock"),
-        vec![Some(Price::from_f64(101.0).unwrap())]
+        vec![Some(Price(Decimal::new(10201, 2)))]
     );
     let envelopes = worker_queues.receive_envelopes();
     assert_eq!(envelopes.len(), 1);
@@ -1160,6 +1196,9 @@ fn strategy_order_reaches_worker_with_lifecycle_and_idempotency_key() {
     let mut config = EngineConfig::default();
     config.ingestion.stale_threshold_us = 1_000_000;
     let mut engine = Engine::new(config);
+    engine
+        .set_intent_execution_limits(Some(100), Some(Decimal::from(100)), Some(Decimal::ONE))
+        .unwrap();
     let ingester = engine.create_event_ingester_pair();
     let (engine_queues, mut worker_queues) =
         create_execution_queues(ExecutionQueueConfig::default());
@@ -1176,7 +1215,9 @@ fn strategy_order_reaches_worker_with_lifecycle_and_idempotency_key() {
             asks: vec![level(101.0, 2.0)],
             sequence: 700,
             source_venue: Some(VenueId::BINANCE),
-            timestamps: Default::default(),
+            timestamps: hft_core::MarketDataTimestamps::local_only(
+                hft_core::LocalReceiveTimestamp::new(now_micros()),
+            ),
 
             provider_identity: None,
         }))
