@@ -50,9 +50,9 @@ CEX 与 Prediction Markets 保留不同的科学输入和 evaluator。`hft-cex-r
 
 CI selector 汇总真实 metadata，包括跨域 path dependencies 和 integration/dev edges。`cargo-scoped.sh` 把显式包集合分到各 owner；跨 workspace features 或命名 target 组合拒绝模糊执行。CI 单 runner 可复用自己的 target cache；多个 Cargo invocation 仍各自解析所属 workspace 的 features。共享可写多租户 cache 不属于此合同。
 
-collector 的 `BookSync` 已由纯 `hft-binance-depth` 提供，不再依赖订单循环 `hft-engine`。Alpha Data Mission 对采集实现的依赖，以及 ONNX/formula 跨域兼容测试仍然保留。功能拆分本身不提供编译耗时或加速倍数证据。
+collector 的 `BookSync` 已由纯 `hft-binance-depth` 提供，不再依赖订单循环 `hft-engine`。独立 `monday-cex-prepare` 拥有采集与数据准备；Alpha operator 只消费已验证结果，其普通依赖图不含 collector。ONNX/formula 跨域兼容测试仍然保留。功能拆分本身不提供编译耗时或加速倍数证据。
 
-[发布产品清单](../../.github/scripts/research-release-products.json) 分别选择 CEX runner 七个程序、Prediction runner 五个程序、Campaign controller 五个程序。同一次产品选择按清单合并所需程序；镜像分别消费自己的子集，共用程序不重复构建。
+[发布产品清单](../../.github/scripts/research-release-products.json) 分别选择 CEX runner 八个程序、Prediction runner 五个程序、Campaign controller 一个程序。同一次产品选择按清单合并所需程序；镜像分别消费自己的子集，共用程序不重复构建。CEX runner 暂时包含独立编译的数据准备程序；独立数据镜像及实际迁移仍未启用。
 
 ## Build → Run → Attempt，不在训练 Pod cold build
 
@@ -73,7 +73,9 @@ Run 是固定科学调用：Experiment、BuildArtifact、配置摘要、命令�
 
 计算 Pod 直接调用 `/usr/local/bin/<已发布二进制>`；PG Run admission 拒绝 `cargo` 或任意 shell 作为直接入口。reconciler 每次 launch（包括 retry）读取已注册 Build，并从受控 artifact gateway 流式核验二进制大小/摘要，再检查租期、截止时间和撤销状态。缺失或错误产物不能触发 launch。OCI digest 与内含二进制的绑定来自独立的 trusted release verifier；通用 Agent API 无权出具这个证明。
 
-`.github/scripts/build-research-release.sh` 使用精确 `-p` / `--bin` / `--features`，没有默认 `--workspace` / `--all-features`。一份产品清单绑定已有 runner 与 Campaign controller。controller 资产单改时构建所需程序，包括 owning platform 的 `research-release-publisher`，并验证其 source、依赖和 OCI 可执行字节。不同科学变异的 BuildSpec 可以缩小到实际科学 crate/binary。Cargo 依赖图重建受影响 crate，链接仍有成本。本分支没有编译耗时基准，不承诺加速倍数。
+`.github/scripts/build-research-release.sh` 使用精确 `-p` / `--bin` / `--features`，没有默认 `--workspace` / `--all-features`。一份产品清单绑定已有 runner 与 Campaign controller。controller 资产单改时只构建 `alpha-harness`，并验证其 source、依赖和 OCI 可执行字节。
+
+发行工具 `research-release-capability` 与 `research-release-publisher` 由 `build-research-release-tools.sh` 根据独立 recipe 构建，存入 release-tools artifact；它们不进入 controller OCI。发布工作流下载前验证 producer、source、recipe 与实际可执行字节身份。不同科学变异的 BuildSpec 可以缩小到实际科学 crate/binary。Cargo 依赖图重建受影响 crate，链接仍有成本。本分支没有编译耗时基准，不承诺加速倍数。
 
 发布使用各 owner 的 `release` profile。shared、data、research、control 和 runtime 为 opt-level 3，Prediction 为 opt-level 2；六者均使用 thin LTO、codegen-units 1。前五个 owner 另有显式 `research` profile（opt-level 2、无 LTO、16 codegen units）。Prediction 的 `fast` profile 继承 release，并使用无 LTO、8 codegen units 和 incremental。快速 profile 的产物身份与 release 分开，不能把不同优化产物当同一科学执行。`researchctl plan-build BUILD` 仅输出经过校验的 scoped Cargo 参数，不执行编译或配置云端 builder。
 
