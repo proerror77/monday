@@ -1,0 +1,38 @@
+{
+  "dataset_kind": "point_in_time_feature_matrix",
+  "manifest_id": "dataset-27ee8c360b333cfd74ed2b1b485037da46aee1fd1edeeba0a3836364062dff26",
+  "mission_id": "data-frozen-pit",
+  "symbol": "BTCUSDT",
+  "schema_version": "pit-feature-matrix-v3",
+  "source_revisions": {
+    "fixture": "fixed-pit-regression"
+  },
+  "modalities": [
+    "trade_tick",
+    "lob"
+  ],
+  "feature_names": [
+    "lob_imbalance",
+    "mid_price",
+    "tiny"
+  ],
+  "label_spec": {
+    "horizon_buckets": 1,
+    "observation_frequency_millis": 60000
+  },
+  "series_count": 1,
+  "rows": 3,
+  "time_bounds": {
+    "first_event_time": "2026-09-10T10:00:00Z",
+    "last_event_time": "2026-09-10T10:02:00Z",
+    "first_feature_available_time": "2026-09-10T10:00:01Z",
+    "last_feature_available_time": "2026-09-10T10:02:01Z",
+    "first_label_available_time": "2026-09-10T10:01:00Z",
+    "last_label_available_time": "2026-09-10T10:03:00Z",
+    "first_ingestion_time": "2026-09-10T10:04:00Z",
+    "last_ingestion_time": "2026-09-10T10:04:00Z"
+  },
+  "artifact_path": "27ee8c360b333cfd74ed2b1b485037da46aee1fd1edeeba0a3836364062dff26.jsonl",
+  "artifact_sha256": "27ee8c360b333cfd74ed2b1b485037da46aee1fd1edeeba0a3836364062dff26",
+  "created_at": "2026-09-10T10:05:00Z"
+}

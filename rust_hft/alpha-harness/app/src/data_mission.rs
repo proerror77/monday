@@ -3,10 +3,13 @@ use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
+use hft_cex_research_input::feature_matrix::{
+    import_feature_dataset, read_feature_rows, DataModality, FeatureDatasetManifest,
+};
 use hft_collector::research_inventory::Market;
 use hft_collector::{
-    acquire_dataset, import_feature_dataset, lob_archiver::source_revision, read_feature_rows,
-    DataAcquisitionMission, DataModality, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
+    acquire_dataset, lob_archiver::source_revision, DataAcquisitionMission, DatasetManifest,
+    OhlcvTraceRow,
 };
 use hft_research_artifacts::temporary_output_file;
 #[cfg(test)]
@@ -100,7 +103,7 @@ pub(crate) fn validate_cex_replay_features(
 
 pub(crate) fn validate_imported_cex_replay_features(
     snapshot: &CexReplaySnapshotV5,
-    imported: &hft_collector::ImportedFeatureDataset,
+    imported: &hft_cex_research_input::feature_matrix::ImportedFeatureDataset,
 ) -> anyhow::Result<()> {
     validate_cex_replay_feature_rows(snapshot, imported.manifest(), imported.rows())
 }
@@ -170,7 +173,7 @@ pub(crate) fn validate_cex_replay_feature_metadata(
 fn validate_cex_replay_feature_rows(
     snapshot: &CexReplaySnapshotV5,
     features: &FeatureDatasetManifest,
-    rows: &[hft_collector::PointInTimeFeatureRow],
+    rows: &[hft_cex_research_input::feature_matrix::PointInTimeFeatureRow],
 ) -> anyhow::Result<()> {
     validate_cex_replay_feature_metadata(snapshot, features)?;
     let label_horizon = u64::try_from(snapshot.label_horizon_buckets)
@@ -1041,8 +1044,8 @@ pub fn freeze_research_inventory(args: crate::cli::FreezeInventoryArgs) -> anyho
 mod tests {
     use super::*;
     use chrono::{DateTime, Duration, Utc};
+    use hft_cex_research_input::feature_matrix::{DataModality, PointInTimeFeatureRow};
     use hft_collector::{CandleInterval, DatasetTimeBounds, QualityReport};
-    use hft_collector::{DataModality, PointInTimeFeatureRow};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicU64, Ordering};
 

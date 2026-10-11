@@ -72,6 +72,7 @@ use hft_backtest::engine::{
     TargetPositionReplayTraceEvent, LEGACY_TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
     TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
 };
+use hft_cex_research_input::feature_matrix::FeatureDatasetManifest;
 use hft_research_artifacts::fetch_to_file;
 use hft_research_artifacts::normalized_sha256;
 #[cfg(feature = "scientific")]
@@ -4550,7 +4551,7 @@ pub(crate) fn validate_mission_materialization_binding(
 
 pub(crate) fn validate_mission_dataset_binding(
     mission: &CexResearchMissionArtifactV1,
-    features: &hft_collector::FeatureDatasetManifest,
+    features: &FeatureDatasetManifest,
     dataset: &CexReplayDatasetManifestV5,
 ) -> anyhow::Result<()> {
     if mission.spec.inputs.feature.id != features.manifest_id
@@ -5678,7 +5679,7 @@ fn load_native_archive_input(
         );
     }
     let render = native.render_inputs();
-    let features: hft_collector::FeatureDatasetManifest = read_bundle_json(
+    let features: FeatureDatasetManifest = read_bundle_json(
         archive,
         "results/feature-manifest.json",
         MAX_MATERIALIZATION_BYTES,
@@ -5724,7 +5725,7 @@ fn load_metric_verification_dataset(
     archive: &mut zip::ZipArchive<File>,
     mission: &CexResearchMissionArtifactV1,
 ) -> anyhow::Result<alpha_engine::evaluation::PreparedDataset> {
-    let mut features: hft_collector::FeatureDatasetManifest = read_bundle_json(
+    let mut features: FeatureDatasetManifest = read_bundle_json(
         archive,
         "results/feature-manifest.json",
         MAX_MATERIALIZATION_BYTES,
@@ -6422,7 +6423,7 @@ pub(crate) mod tests {
         }
     }
     use chrono::{Duration as ChronoDuration, Utc};
-    use hft_collector::{DataModality, PointInTimeFeatureRow};
+    use hft_cex_research_input::feature_matrix::{DataModality, PointInTimeFeatureRow};
     use parquet::{
         data_type::{ByteArray, ByteArrayType, Int64Type},
         file::{
@@ -10925,7 +10926,7 @@ message binance_replay {
         override_mission.validate().unwrap();
         let override_mission_id = override_mission.semantic_id().unwrap();
         let store = AlphaStore::open(results_dir.join("alpha.duckdb")).unwrap();
-        let feature_manifest: hft_collector::FeatureDatasetManifest = serde_json::from_slice(
+        let feature_manifest: FeatureDatasetManifest = serde_json::from_slice(
             &std::fs::read(results_dir.join("feature-manifest.json")).unwrap(),
         )
         .unwrap();

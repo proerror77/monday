@@ -3158,6 +3158,7 @@ dependencies = [
  "futures",
  "hex",
  "hft-binance-depth",
+ "hft-cex-research-input",
  "hft-core",
  "hft-data",
  "hft-data-adapter-binance",
