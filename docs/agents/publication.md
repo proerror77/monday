@@ -126,6 +126,12 @@ Compatible manual builds share Prediction's dependency cache and owning-workspac
 targets. Compiler, native packages, profile, flags and recipes remain cache inputs.
 The manual run remains its own producer and uploads its own artifact and timings.
 Dependency reuse does not admit software artifacts from another source or producer.
+Both release producers select the same explicit clang/mold linker. The linker
+script, target linker setting and native tool versions bind compilation inputs.
+Release profiles and admitted recipe features remain unchanged. Timing artifacts
+contain each recipe's Cargo HTML, compiler JSONL, resource use and separate link
+records. Reports retain source, attempt, phase and the actual restored cache key.
+A failed compile or link retains diagnostic timing and still blocks the release.
 Every recovery keeps current-main checks, original attempt identity, native
 signing, OSS admission and image readback requirements.
 

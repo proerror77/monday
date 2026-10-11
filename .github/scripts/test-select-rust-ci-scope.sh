@@ -37,6 +37,8 @@ printf '%s\n' .github/scripts/run-prediction-research-contracts.sh >"$tmp_dir/re
 printf '%s\n' .github/scripts/run-collector-control-contracts.sh >"$tmp_dir/control-scheduling.txt"
 printf '%s\n' .github/scripts/ci-owner-cache.sh >"$tmp_dir/ci-owner-cache.txt"
 printf '%s\n' .github/scripts/test-ci-owner-cache.sh >"$tmp_dir/ci-owner-cache-test.txt"
+printf '%s\n' .github/scripts/research-release-linker.sh >"$tmp_dir/release-linker.txt"
+printf '%s\n' .github/scripts/test-research-release-linker.sh >"$tmp_dir/release-linker-test.txt"
 printf '%s\n' .github/scripts/test-collector-control-scheduling.sh >"$tmp_dir/control-scheduling-test.txt"
 printf '%s\n' .github/scripts/run-collector-control-contracts.py .github/scripts/test-collector-control-scheduling.py >"$tmp_dir/control-scheduling-deletions.txt"
 printf '%s\n' .github/ISSUE_TEMPLATE/engineering-change.yml >"$tmp_dir/governance-template.txt"
@@ -711,6 +713,8 @@ job_cases=(
   'control-scheduling|pull_request|control-scheduling.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'ci-owner-cache|pull_request|ci-owner-cache.txt|ci/rust,ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans,ci/deployment-artifacts'
   'ci-owner-cache-test|pull_request|ci-owner-cache-test.txt|ci/ci-contracts,ploy/workflow-lint'
+  'release-linker|pull_request|release-linker.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans,ci/ci-contracts,ploy/workflow-lint'
+  'release-linker-test|pull_request|release-linker-test.txt|ci/ci-contracts,ploy/workflow-lint'
   'control-scheduling-test|pull_request|control-scheduling-test.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'control-scheduling-deletions|pull_request|control-scheduling-deletions.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'governance-template|pull_request|governance-template.txt|ploy/commit-hygiene,ploy/workflow-lint'

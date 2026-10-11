@@ -261,7 +261,9 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends clang cmake mold pkg-config protobuf-compiler gh jq ruby binutils zstd
+          apt-get install -y --no-install-recommends clang cmake mold pkg-config protobuf-compiler gh jq ruby binutils zstd time
+      - name: Configure release linker
+        run: printf 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=%s/.github/scripts/research-release-linker.sh\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Capture compiler, native environment and scoped recipe
         id: build-inputs
         run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json" "${{ needs.selector.outputs.research_product }}"
@@ -280,6 +282,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MONDAY_CACHE_EXACT_MATCH: ${{ steps.research-cache.outputs.cache-hit || 'unknown' }}
+          MONDAY_CACHE_RESTORED_KEY: ${{ steps.research-cache.outputs.cache-matched-key }}
           MONDAY_BUILD_INPUTS_FILE: ${{ runner.temp }}/research-build-inputs.json
         run: bash .github/scripts/build-research-release.sh "${{ needs.selector.outputs.research_product }}"
       - name: Upload research image release
@@ -295,7 +298,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: research-recipe-timings-${{ needs.selector.outputs.source_sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/research-recipe-probe/timings.jsonl
+          path: ${{ runner.temp }}/research-recipe-probe/
           if-no-files-found: error
           retention-days: 7
 

@@ -23,6 +23,7 @@ pending_since() {
       # Governance/history are not permanent image rebuild inputs.
       git diff --no-renames --name-only "$base" "$head" -- rust_hft/ deployment/aliyun/research/ \
         .github/scripts/build-research-release.sh .github/scripts/build-research-recipes.sh \
+        .github/scripts/research-release-linker.sh \
         .github/scripts/research-cache-layout.sh .github/scripts/vendor/tomlrb/ \
         .github/scripts/research-release-products.sh .github/scripts/research-release-products.json \
         .github/scripts/capture-research-build-inputs.sh .github/scripts/research-image-smoke.sh \
