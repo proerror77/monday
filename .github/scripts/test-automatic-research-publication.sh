@@ -143,7 +143,22 @@ abort 'manual rebuild bypasses environment admission' unless jobs.fetch('researc
 steps=pub.fetch('steps'); recheck=steps.find {|s|s['name']=='Recheck automatic publication before credential use'}
 abort 'recheck is not the first step after checkout' unless steps.index(recheck)==1
 abort 'automatic recheck receives secrets' if recheck.to_s.include?('secrets.')
-abort 'research and ordinary publication checks diverged' unless (steps-[recheck])==ordinary.fetch('steps')
+budgets=steps.select {|s|s['name']=='Admit cumulative research publication budget before cloud use'}
+abort 'missing or ambiguous budget gate' unless budgets.length==1
+budget=budgets.fetch(0)
+abort 'budget gate gained credentials or lost selection' unless budget.fetch('if')=='matrix.research_artifact' && budget.fetch('env')=={
+  'MONDAY_RESEARCH_PUBLICATION_BUDGET'=>'${{ vars.MONDAY_RESEARCH_PUBLICATION_BUDGET }}',
+  'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}',
+  'SOURCE_SHA'=>'${{ needs.selector.outputs.source_sha }}',
+  'PRODUCTS'=>'${{ needs.selector.outputs.research_products }}'
+} && budget.fetch('run').include?('research-publication-budget.sh admit')
+comparison=Marshal.load(Marshal.dump(steps-[recheck,budget]))
+retention=comparison.find {|s|s['name']=='Retain native Build release projection'}
+paths=retention.fetch('with').fetch('path').lines
+budget_paths=["${{ runner.temp }}/research-publication-budget-admission.json\n", "${{ runner.temp }}/research-publication-native-budget.json\n"]
+abort 'native budget evidence paths are missing or duplicated' unless budget_paths.all? {|p|paths.count(p)==1}
+retention.fetch('with')['path']=(paths-budget_paths).join
+abort 'research and ordinary publication checks diverged' unless comparison==ordinary.fetch('steps')
 abort 'manual approval/dispatch entered automatic workflow' if workflow.to_s.match?(/review_source_sha|dispatch-research|prepare-research-publication-review|research-publication-environment-probe|actions:\s*write/)
 selector=jobs.fetch('selector').fetch('steps').find {|s|s['id']=='select'}
 File.write(File.join(ARGV[1],'selector.sh'),selector.fetch('run'))

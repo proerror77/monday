@@ -385,6 +385,18 @@ jobs:
           PRODUCT: ${{ matrix.product }}
         run: .github/scripts/publish-research-build-release.sh check-public-policy
 
+      - name: Admit cumulative research publication budget before cloud use
+        if: matrix.research_artifact
+        env:
+          MONDAY_RESEARCH_PUBLICATION_BUDGET: ${{ vars.MONDAY_RESEARCH_PUBLICATION_BUDGET }}
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          PRODUCTS: ${{ needs.selector.outputs.research_products }}
+        run: |
+          set -euo pipefail
+          storage_hours=$(jq -er '.storage_hours' <<<"$MONDAY_RESEARCH_PUBLICATION_BUDGET")
+          bash .github/scripts/research-publication-budget.sh admit "$SOURCE_SHA" "$PRODUCTS" "$storage_hours" "$RUNNER_TEMP/research-publication-budget-admission.json"
+
       - name: Download authenticated research release
         if: matrix.research_artifact
         env:
@@ -953,6 +965,8 @@ jobs:
             ${{ runner.temp }}/research-build-plan.json
             ${{ runner.temp }}/research-build-artifacts.json
             ${{ runner.temp }}/research-release-context.json
+            ${{ runner.temp }}/research-publication-budget-admission.json
+            ${{ runner.temp }}/research-publication-native-budget.json
           if-no-files-found: error
           retention-days: 7
 

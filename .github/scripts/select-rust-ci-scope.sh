@@ -497,7 +497,10 @@ for path in "${paths[@]}"; do
     .github/scripts/test-release-record.sh|\
     .github/scripts/read-automatic-research-publication.sh|\
     .github/scripts/automatic-research-publication.jq|\
-    .github/scripts/test-automatic-research-publication.sh)
+    .github/scripts/test-automatic-research-publication.sh|\
+    .github/scripts/research-publication-budget.sh|\
+    .github/scripts/research-publication-budget.jq|\
+    .github/scripts/test-research-publication-budget.sh)
       # Release policy changes run source/signature/manifest contracts on both
       # PR and main push. Only actual image/source/dependency inputs rebuild.
       select_job ci/ci-contracts

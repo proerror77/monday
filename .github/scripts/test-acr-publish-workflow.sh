@@ -361,6 +361,15 @@ abort 'public policy check receives private credentials or loses product binding
   'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}',
   'PRODUCT'=>'${{ matrix.product }}'
 } && policy_step.fetch('run')=='.github/scripts/publish-research-build-release.sh check-public-policy'
+budget=steps.index { |s|s.fetch('name','')=='Admit cumulative research publication budget before cloud use' }
+abort 'missing budget can reach credentials or preparation' unless budget && public_policy<budget && budget<download && budget<compile && budget<preflight && budget<login
+budget_step=steps.fetch(budget)
+abort 'budget gate receives credentials or loses whole-run selection' unless budget_step.fetch('if')=='matrix.research_artifact' && budget_step.fetch('env')=={
+  'MONDAY_RESEARCH_PUBLICATION_BUDGET'=>'${{ vars.MONDAY_RESEARCH_PUBLICATION_BUDGET }}',
+  'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}',
+  'SOURCE_SHA'=>'${{ needs.selector.outputs.source_sha }}',
+  'PRODUCTS'=>'${{ needs.selector.outputs.research_products }}'
+} && budget_step.fetch('run').include?('research-publication-budget.sh admit')
 wrapper=File.read(File.join(File.dirname(ARGV[0]),'../scripts/publish-research-build-release.sh'))
 abort 'issuer wrapper compiles while holding release credentials' if wrapper.match?(/\bcargo\s+(?:build|run)\b/)
 abort 'static gateway credential still authorizes publication' if steps.any? { |s| s.fetch('env',{}).values.any? { |v| v.to_s.include?('secrets.MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN') } }
@@ -569,3 +578,4 @@ if jq -e --arg product controller -f "$selector" "$tmp_dir/oss-shared-role.json"
 bash "$script_dir/test-migrate-research-oss-policy.sh"
 
 bash "$script_dir/test-automatic-research-publication.sh"
+bash "$script_dir/test-research-publication-budget.sh"

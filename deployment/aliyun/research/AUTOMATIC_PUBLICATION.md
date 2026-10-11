@@ -93,3 +93,79 @@ while it remains cloud-trusted. Preserve existing immutable published artifacts.
 No cloud writes, new charges, or production transitions are authorized by this
 document. Actual storage, requests, and traffic need the approved account budget.
 No per-run human approval is added by the implementation.
+
+## Publication budget
+
+The offline estimator reads the catalog and source archive from one exact commit.
+It reserves 512 MiB per executable and 1 MiB per metadata object.
+These are native publisher payload bounds, not measured executable sizes.
+Each Build has three metadata objects. Each product also publishes its source archive.
+The request counter also reserves two OIDC and two STS calls for each product.
+Their authentication payload reservations are separate from OSS billing categories.
+Each STS request reserves 128 KiB. Each authentication response reserves 64 KiB.
+PUT and versioning responses reserve 4 KiB. The source probe reserves 1 MiB.
+The estimate counts shared programs and source again for each product.
+This avoids relying on a cache hit or an existing object to reduce the budget.
+
+Run the estimator without cloud access:
+
+```bash
+bash .github/scripts/research-publication-budget.sh estimate \
+  <exact-source-sha> cex-runner,controller,prediction-runner 744 estimate.json
+```
+
+`MONDAY_RESEARCH_PUBLICATION_BUDGET` is a public, single-run spending approval.
+Its schema is `monday.research-publication-budget-policy.v1`.
+It pins repository, source, selected products, workflow, next workflow run number,
+attempt 1, expiry, price model, storage horizon, and four usage limits.
+GitHub assigns a unique run number within this workflow.
+Read the next number before configuration. A race rejects the mismatched run.
+The admission then binds the actual run ID to the native allocation.
+Another run, a rerun, another source, an expired model, or an insufficient limit stops publication.
+It does not renew the approval automatically.
+
+The workflow checks all selected products before its first native OSS or authentication call.
+The native issuer must enforce each allocation with a persistent private ledger.
+Reserve requests and payload bytes before sending. Keep reservations after errors or interruption.
+Source preflight and publication must share that ledger across processes.
+Never upload credentials or the private ledger as workflow artifacts.
+The workflow retains the public allocation and price admission with native Build evidence.
+
+The Tokyo model uses the same-account CNY quote observed on 2026-10-11.
+It expires on 2026-11-10. Refresh the quote and reviewed model before further admission.
+The estimate rounds bytes up to whole decimal GB and uses integer micro-CNY.
+It reserves one complete quoted request unit for every attempt, including failures.
+The model uses 0.01 CNY per request unit, 0.812 CNY per GB of public egress,
+and a conservative 0.000198 CNY per GB-hour of Standard LRS storage.
+It adds 64 KiB per request as an overhead allowance in the price estimate.
+That allowance is not a bound on network or billed bytes.
+Free quotas, account discounts, successful deduplication, and free error responses do not reduce admission.
+
+| Operation | Fee category | Budget treatment |
+| --- | --- | --- |
+| PutObject | OSS PutRequest; new stored bytes | Reserve request, upload body and possible new storage |
+| GetObject/readback | OSS GetRequest; public egress | Reserve request and complete permitted response |
+| GetBucketVersioning/config readback | OSS GetRequest | Reserve request and bounded response |
+| PutBucketVersioning/config write | OSS PutRequest | Separate administrator rollout; outside publisher allocation |
+| OIDC and AssumeRoleWithOIDC | Authentication; RAM has no product fee | Count calls and response payload; no OSS request charge |
+| Existing ACR Personal upload/download | Free within service limits | No instance purchase or upgrade; outside OSS counters |
+| ACK, DB, real data download or research compute | Separate workload | Not authorized or included by this publication budget |
+
+OSS documents chargeable 2xx/3xx requests and free 4xx/5xx requests and traffic.
+Reservations remain consumed regardless of response status.
+See [request classification](https://help.aliyun.com/zh/oss/api-operation-calling-fees),
+[traffic classification](https://help.aliyun.com/zh/oss/traffic-fees),
+[storage billing](https://help.aliyun.com/zh/oss/storage-fees), and
+[ACR billing](https://help.aliyun.com/zh/acr/product-overview/billing-description).
+
+This is an application usage and price admission, not a cloud invoice hard cap.
+HTTP/TLS buffering, provider billing, rounding, tax, and other account users remain outside its counters.
+Objects continue to incur storage charges after the run stops.
+The 744-hour horizon is a cost model. It does not delete or expire objects.
+No deletion, lifecycle rule, or extra bucket permission is installed here.
+
+A first publication can use the single-run approval above.
+Continued publication needs a separately scoped spending decision.
+A per-publication limit alone cannot cap total charges across future sources.
+Set an aggregate period, count and storage decision before claiming a continuing total budget.
+Stopping future writes still leaves the accumulated storage cost.
