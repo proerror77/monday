@@ -22,6 +22,8 @@ pub mod orchestrator;
 #[cfg(feature = "control")]
 pub mod postgres;
 pub mod preparation;
+#[cfg(feature = "control")]
+pub mod provider_operations;
 #[cfg(any(feature = "control", feature = "release-verification"))]
 pub mod release;
 #[cfg(feature = "publisher")]
