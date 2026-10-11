@@ -22,9 +22,10 @@ Each research product references its own existing environment:
 | `prediction-runner` | `monday-research-prediction` |
 
 Each environment permits exactly branch `main`, using a custom branch policy.
-The automatic route has no required reviewer, wait timer, or custom protection.
-If any such protection exists, the guard rejects this route. It never approves,
-removes, or bypasses that protection.
+The guard rejects reviewer, wait timer, and unknown rules in its environment
+readback. GitHub enforces any separately configured App protection rules before
+the job starts. Their absence has not been verified by this reader. The route
+never approves, removes, or bypasses existing protection.
 
 An ordinary repository variable, `MONDAY_RESEARCH_AUTOMATIC_PUBLICATION`, pins
 the repository ID, owner ID, actual default subject prefix, and three immutable
