@@ -18,7 +18,7 @@ jq -n --arg sha "$sha" '
         environment:{id:$config.products[$p].environment_id,name:$names[$p],protection_rules:[{id:201,type:"branch_policy"}],
           deployment_branch_policy:{protected_branches:false,custom_branch_policies:true}},
         branches:{total_count:1,branch_policies:[{name:"main",type:"branch"}]},
-        policy:{oss:{role_arn:("role/"+$p),subject:("repo:fixture/repo:environment:"+$names[$p])}}}]}
+        policy:{oss:{role_arn:("role/"+$p),publication_namespaces:["research/builds/","research/sources/"],subject:("repo:fixture/repo:environment:"+$names[$p])}}}]}
 ' > "$work/valid.json"
 jq -e -f "$script_dir/automatic-research-publication.jq" "$work/valid.json" > "$work/accepted.json"
 jq -e '.products==["cex-runner","controller","prediction-runner"] and (.environments|length)==3' "$work/accepted.json" >/dev/null
