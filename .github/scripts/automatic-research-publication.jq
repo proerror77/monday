@@ -22,7 +22,10 @@ def environment_name($product):
     and $b.run.head_repository.id == $c.repository_id
     and ($b.run.event == "workflow_run" or $b.run.event == "workflow_dispatch");
     "publisher run/source/workflow differs")
-| require($b.oidc.use_default == true and $b.oidc.sub_claim_prefix == $c.subject_prefix;
+| require($b.oidc.use_default == true
+    and $c.subject_prefix == ("repo:" + $b.repository.full_name)
+    and (($b.oidc | has("use_immutable_subject") | not) or $b.oidc.use_immutable_subject == false)
+    and (($b.oidc | has("sub_claim_prefix") | not) or $b.oidc.sub_claim_prefix == $c.subject_prefix);
     "existing OIDC template or subject prefix changed")
 | ($b.products | split(",")) as $products
 | require(($products | length > 0 and length <= 3 and . == (unique | sort)

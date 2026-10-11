@@ -13,7 +13,7 @@ jq -n --arg sha "$sha" '
   | {source_sha:$sha,products:($products|join(",")),repository_name:"fixture/repo",run_id:56,run_attempt:1,config:$config,
       repository:{id:12,full_name:"fixture/repo",owner:{id:34},visibility:"public"},main:{object:{sha:$sha}},
       run:{id:56,run_attempt:1,head_sha:$sha,head_branch:"main",path:".github/workflows/acr-publish.yml",event:"workflow_run",repository:{id:12},head_repository:{id:12}},
-      oidc:{use_default:true,sub_claim_prefix:"repo:fixture/repo"},
+      oidc:{use_default:true,include_claim_keys:[]},
       environments:[$products[] as $p | {product:$p,
         environment:{id:$config.products[$p].environment_id,name:$names[$p],protection_rules:[{id:201,type:"branch_policy"}],
           deployment_branch_policy:{protected_branches:false,custom_branch_policies:true}},
@@ -22,6 +22,11 @@ jq -n --arg sha "$sha" '
 ' > "$work/valid.json"
 jq -e -f "$script_dir/automatic-research-publication.jq" "$work/valid.json" > "$work/accepted.json"
 jq -e '.products==["cex-runner","controller","prediction-runner"] and (.environments|length)==3' "$work/accepted.json" >/dev/null
+for mutation in 'del(.oidc.include_claim_keys)' '.oidc={use_default:true,use_immutable_subject:false,sub_claim_prefix:"repo:fixture/repo"}'; do
+  jq "$mutation" "$work/valid.json" > "$work/compatible.json"
+  jq -e -f "$script_dir/automatic-research-publication.jq" "$work/compatible.json" > "$work/compatible-admission.json"
+  cmp "$work/accepted.json" "$work/compatible-admission.json"
+done
 negative_count=0
 while IFS= read -r mutation; do
   [[ -n $mutation ]] || continue
@@ -51,7 +56,14 @@ done <<'CASES'
 .run.repository.id=999
 .run.head_repository.id=999
 .oidc.use_default=false
+.oidc.use_default=null
+del(.oidc.use_default)
+.config.subject_prefix="repo:foreign/repo"
+.oidc.use_immutable_subject=true
+.oidc.use_immutable_subject=null
+.oidc.use_immutable_subject="false"
 .oidc.sub_claim_prefix="repo:foreign/repo"
+.oidc.sub_claim_prefix=null
 .products="controller,cex-runner"
 .products="cex-runner,cex-runner"
 .products="foreign"

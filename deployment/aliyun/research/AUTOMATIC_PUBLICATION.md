@@ -37,6 +37,9 @@ main, environment rules, and each selected OSS policy subject. It emits an
 environment matrix only after every selected product passes. Missing metadata,
 API errors, recreated environments, or source drift fail without that matrix.
 The publisher repeats these checks before any credential-bearing step.
+Derive the default subject prefix from the pinned repository identity.
+Require the documented `use_default` field; do not require API extension fields.
+If the API reports immutable subjects or a different prefix, reject that drift.
 
 Ordinary image publication uses a separate matrix without an environment or
 OIDC capability. It retains the existing steps and source admission.
