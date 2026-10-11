@@ -11,7 +11,13 @@ feature-jsonl = ["serde_json/float_roundtrip"]
 streaming = ["dep:hft-research-manifest"]
 market-parquet = ["streaming", "dep:hft-prepared-market-io"]
 
+preparation = ["market-parquet", "dep:hft-research-artifacts"]
+preparation-cli = ["preparation", "dep:clap"]
+
 [dependencies]
+hft-research-artifacts = { path = "../artifacts", optional = true }
+clap = { version = "4.0", features = ["derive"], optional = true }
+hex = "0.4"
 hft-research-manifest = { path = "../manifest", optional = true }
 hft-prepared-market-io = { path = "../prepared-market-io", optional = true }
 chrono = { workspace = true, features = ["serde"] }

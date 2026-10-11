@@ -35,7 +35,7 @@ impl Fixture {
         let artifact = directory.path().join(format!("{artifact_sha}.parquet"));
         fs::write(&artifact, artifact_bytes).unwrap();
         let source_sha = "1".repeat(64);
-        let source_revision = data::binance_lob_replay::source_revision([source_sha.as_str()]);
+        let source_revision = hft_research_manifest::source::source_revision([source_sha.as_str()]);
         let success_marker_sha = sha256(format!("{source_sha}\n").as_bytes());
         let manifest_value = json!({
             "dataset_kind": "backtest_canonical_replay_parquet",

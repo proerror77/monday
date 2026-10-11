@@ -36,7 +36,13 @@ case "$1" in
     cidfile=$6
     test ! -e "$cidfile"
     shift 6
-    [[ $1 == --entrypoint && $3 == "$EXPECTED_IMAGE" && $4 == --help ]]
+    [[ $1 == --entrypoint && $3 == "$EXPECTED_IMAGE" ]]
+    if [[ $(basename "$2") == monday-cex-prepare ]]; then
+      [[ $4 == --version ]]
+      printf 'monday-cex-prepare %s\n' "${MOCK_PREP_VERSION_SHA:-$IMAGE_SHA}"
+    else
+      [[ $4 == --help ]]
+    fi
     binary=$(basename "$2")
     [[ $2 == "/usr/local/bin/$binary" && -f "$IMAGE_CONTENT/$binary" ]]
     container="fixture-smoke-$binary"
@@ -118,6 +124,17 @@ for product in cex-runner prediction-runner; do
   test -f "$work/proof-issued"
   test -f "$work/publication-complete"
   assert_cleanup
+
+  if [[ $product == cex-runner ]]; then
+    reset_probe_evidence
+    export MOCK_PREP_VERSION_SHA=2222222222222222222222222222222222222222
+    if verify_publication "$product" >"$work/rejection" 2>&1; then
+      echo 'data preparation with a different compiled source was published' >&2; exit 1
+    fi
+    unset MOCK_PREP_VERSION_SHA
+    assert_cleanup
+    assert_no_publication
+  fi
 
   for failure in first middle; do
     if [[ $failure == first ]]; then

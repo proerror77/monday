@@ -596,7 +596,7 @@ require_tool sed
 require_tool sha256sum
 
 SLICER_BIN=$BINARY_DIR/binance-market-tape-slicer
-ALPHA_BIN=$BINARY_DIR/alpha-harness
+PREP_BIN=$BINARY_DIR/monday-cex-prepare
 PIT_BIN=$BINARY_DIR/lob-pit-materializer
 REPLAY_BIN=$BINARY_DIR/binance-replay-parquet-materializer
 DATA_PLATFORM_BIN=$BINARY_DIR/research-data-service
@@ -815,7 +815,7 @@ if [ "$resume_publish" -eq 1 ]; then
   load_recovery_publish_state
 else
   mkdir -p "$SLICE_ROOT" "$STATE_ROOT"
-  [ -x "$ALPHA_BIN" ] || die "native manifest verifier is not executable: $ALPHA_BIN"
+  [ -x "$PREP_BIN" ] || die "native manifest verifier is not executable: $PREP_BIN"
 
   if [ "$DRY_RUN" -ne 1 ] && [ "$ROLE" != "slice" ]; then
   mkdir -p "$LOCAL_MATERIALIZATION_DIR" "$LOCAL_REPLAY_DIR" "$LOCAL_RECEIPT_DIR"
@@ -855,7 +855,7 @@ verify_raw_range() {
     if [ -n "$window_start_received_at_ns" ]; then
       set -- "$@" --start-received-at-ns "$window_start_received_at_ns" --end-received-at-ns "$window_end_received_at_ns"
     fi
-    "$ALPHA_BIN" data verify-materialization-manifest "$@" >"$STATE_ROOT/raw-segment-$i.metadata.json" \
+    "$PREP_BIN" verify-materialization-manifest "$@" >"$STATE_ROOT/raw-segment-$i.metadata.json" \
       || die "raw segment $i metadata verification failed"
     printf '%s\n' "$data" >"$STATE_ROOT/raw-segment-$i.path"
     printf '%s\n' "$sha" >"$STATE_ROOT/raw-segment-$i.sha256"
@@ -892,7 +892,7 @@ if [ "$ROLE" != "slice" ]; then
     verified=$(verify_triplet "reference batch $i" "$REFERENCE_ROOT" "$rel" "$sha" "$manifest_sha")
     data=$(printf '%s' "$verified" | awk -F'|' '{print $1}')
     manifest=$(printf '%s' "$verified" | awk -F'|' '{print $2}')
-    "$ALPHA_BIN" data verify-materialization-manifest \
+    "$PREP_BIN" verify-materialization-manifest \
       --manifest "$manifest" --manifest-sha256 "$manifest_sha" --kind reference --market "$market" \
       >"$STATE_ROOT/reference-$i.metadata.json" || die "reference batch $i metadata verification failed"
     printf '%s\n' "$data" >"$STATE_ROOT/reference-$i.path"

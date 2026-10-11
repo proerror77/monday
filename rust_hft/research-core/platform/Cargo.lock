@@ -650,6 +650,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "chrono",
+ "hex",
  "serde",
  "serde_json",
  "sha2",

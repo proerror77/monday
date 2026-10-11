@@ -1,13 +1,13 @@
 prediction-policy-dependencies.v6
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:92d7c9f006de898e285c5eb6a7278fc47d83c1b08431680a59c162d0718035d7
+input:Cargo.lock=sha256:e2bac1514576129af8aecb110616e36508ddba5f44dde15ea757735759ee942d
 input:Cargo.toml=sha256:a19d33379eee9a01a9a151f6a7a53997447ae5422895ee846d6b23b43a01be81
-input:crates/ploy-research/Cargo.toml=sha256:17557bb85f60c45baf0aef5cb766eca36934b36725fd6431f8fee0e1dd2cc542
+input:crates/ploy-research/Cargo.toml=sha256:8e05407a5cfc3d7f37bf9af6f275e4163074df02cd346ccd32af76cca4b6d54b
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
 input:crates/ploy-market-data/Cargo.toml=sha256:e6938c0663c42a96546dae42ddfb1751f66bb92ec78f3bd82d4958885429a6e5
-input:../data-pipelines/core/Cargo.toml=sha256:ff885ed60c0381f46c7716a59ca06241143bada5e33eeb925ae6247f493fb813
+input:../data-pipelines/core/Cargo.toml=sha256:610885e339f605ec14ba9274e4510db8addc334d529bc52fca54250b758c77df
 input:../market-core/core/Cargo.toml=sha256:d5abfcb2d47dba6f6cc3a0a9a26dac81e97f5b036d1edd6a4f92aeb521aaeeb4
 input:../market-core/integration/Cargo.toml=sha256:9a8b373fee22ee03b445dec2a882c4b7dcd7082e8fdb48590ce6109dd313848a
 input:../market-core/ports/Cargo.toml=sha256:b4a14d8c0da7c5db8b536228012587959de8f1bb1f3d65b880444e649ee706c4
@@ -15,10 +15,11 @@ input:../market-core/snapshot/Cargo.toml=sha256:2531e664d3e1fb98777215393126c056
 input:../risk-control/oms-core/Cargo.toml=sha256:62ddf714dfdd4870c2dd2b194ebaa61e3a72e01263a1fceea0cef2f50758f7d9
 input:../risk-control/portfolio-core/Cargo.toml=sha256:7aa5c2f8524cf8007bb84733a2d90280915a74f74ba22020a42745360629c2fe
 input:../shared/Cargo.toml=sha256:acc7f47aecfd4f37350958bee832cc13a99ba75431574859ed2fc8b2d5259a0c
-input:../data-pipelines/Cargo.toml=sha256:7771b21350fe2b6fb7ad1588790fa28a4f60a5a0a00874bce897c0f6b4d0442e
+input:../data-pipelines/Cargo.toml=sha256:824f49e94e14686a599537aa7742623795a488079b8883f9ca9ebc3c5ce30177
 input:../research-core/Cargo.toml=sha256:42af47970d26ef34632ca7536648250209b17f8230fa4eb4b8cd6a603c3f5787
 input:../runtime/Cargo.toml=sha256:11b6cae8ef4fe0019c778a0767016b4cfc0c92fb30e0bea5f051e00522a52cbf
 input:../research-core/search-kernel/Cargo.toml=sha256:d5a4731c11fce22c0e358097bd38fb05a674659ac2afbd7c72112285093bdec6
+input:../research-core/manifest/Cargo.toml=sha256:4f363d2986d847f42cf4191bcb0bafe09af97a173a1fea5f81354ae217bcd1dc
 package:allocator-api2@0.2.21|source=registry+https://github.com/rust-lang/crates.io-index|checksum=683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923|features=alloc
 package:anyhow@1.0.103|source=registry+https://github.com/rust-lang/crates.io-index|checksum=2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3|features=default,std
 package:arc-swap@1.9.2|source=registry+https://github.com/rust-lang/crates.io-index|checksum=c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b|features=
@@ -74,6 +75,7 @@ package:hft-integration@0.1.0|source=path|checksum=none|features=default
 package:hft-oms-core@0.1.0|source=path|checksum=none|features=default
 package:hft-portfolio-core@0.1.0|source=path|checksum=none|features=default
 package:hft-ports@0.1.0|source=path|checksum=none|features=default
+package:hft-research-manifest@0.1.0|source=path|checksum=none|features=
 package:hft-search-kernel@0.1.0|source=path|checksum=none|features=
 package:hft-snapshot@0.1.0|source=path|checksum=none|features=
 package:hkdf@0.12.4|source=registry+https://github.com/rust-lang/crates.io-index|checksum=7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7|features=

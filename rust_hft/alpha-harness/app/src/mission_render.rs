@@ -1,10 +1,7 @@
 use crate::{
     cli::ValidationArgs,
     data_mission,
-    mission_runner::{
-        decode_materialization, validate_materialization, MAX_FEATURE_BYTES,
-        MAX_MATERIALIZATION_BYTES,
-    },
+    mission_runner::{validate_materialization, MAX_FEATURE_BYTES, MAX_MATERIALIZATION_BYTES},
 };
 use alpha_domain::representation::{
     campaign_minimum_rows, CAMPAIGN_DEFAULT_EMBARGO_ROWS as EMBARGO_ROWS,
@@ -31,6 +28,7 @@ use anyhow::{bail, Context};
 #[cfg(test)]
 use hft_cex_research_input::feature_matrix::import_feature_dataset;
 use hft_cex_research_input::feature_matrix::FeatureDatasetManifest;
+use hft_cex_research_input::materialization::{decode_materialization, Materialization};
 use hft_factor_dsl::FactorOperator;
 use hft_research_artifacts::normalized_sha256;
 use hft_research_manifest::CexReplayDatasetManifestV5;
@@ -932,7 +930,7 @@ pub(crate) struct RenderedCexMission {
 /// One verified input snapshot, shared by all treatments rendered in this
 /// process. Only the loader can construct it; rendering never reopens inputs.
 pub(crate) struct PreparedCexInputs {
-    materialization: crate::mission_runner::Materialization,
+    materialization: Materialization,
     feature_manifest: FeatureDatasetManifest,
     feature_sha256: String,
     materialization_sha256: String,
@@ -1007,7 +1005,7 @@ impl PreparedCexInputs {
     pub(crate) fn feature_manifest(&self) -> &FeatureDatasetManifest {
         &self.feature_manifest
     }
-    pub(crate) fn materialization(&self) -> &crate::mission_runner::Materialization {
+    pub(crate) fn materialization(&self) -> &Materialization {
         &self.materialization
     }
     pub(crate) fn development_precheck(
@@ -1169,9 +1167,7 @@ struct RenderedHoldoutPolicyV1 {
     state: CexResearchHoldoutStateV1,
 }
 
-fn sealed_holdout_cohort_sha256(
-    materialization: &crate::mission_runner::Materialization,
-) -> anyhow::Result<String> {
+fn sealed_holdout_cohort_sha256(materialization: &Materialization) -> anyhow::Result<String> {
     Ok(canonical_json_hash(&serde_json::json!({
         "venue": materialization.snapshot.venue,
         "market": materialization.market,
@@ -1555,7 +1551,7 @@ fn import_feature_manifest(
 }
 
 pub(crate) fn approved_validation(
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
 ) -> anyhow::Result<ValidationArgs> {
     Ok(ValidationArgs {
         initial_train_rows: INITIAL_TRAIN_ROWS,
@@ -1583,13 +1579,13 @@ pub(crate) fn approved_validation(
 #[cfg(test)]
 #[cfg_attr(all(test, not(feature = "scientific")), allow(dead_code))]
 pub(crate) fn approved_evaluation_protocol(
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
 ) -> anyhow::Result<EvaluationProtocolV1> {
     approved_evaluation_protocol_for_horizon(materialization, None)
 }
 
 pub(crate) fn approved_evaluation_protocol_for_horizon(
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
     expected_horizon: Option<&CampaignLabelHorizonV1>,
 ) -> anyhow::Result<EvaluationProtocolV1> {
     let (labels, purge_rows, embargo_rows) = if let Some(horizon) = expected_horizon {
@@ -1641,7 +1637,7 @@ pub(crate) fn approved_evaluation_protocol_for_horizon(
 }
 
 pub(crate) fn approved_evaluation_protocol_for_plan(
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
     plan: &CexCampaignResearchPlanV1,
 ) -> anyhow::Result<EvaluationProtocolV1> {
     let protocol =
@@ -1672,14 +1668,14 @@ pub(crate) fn approved_evaluation_protocol_for_plan(
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn validate_render_materialization_scope(
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
 ) -> anyhow::Result<()> {
     validate_render_materialization_scope_for_horizon(materialization, None, None)?;
     Ok(())
 }
 
 pub(crate) fn validate_render_materialization_scope_for_horizon(
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
     expected_horizon: Option<&CampaignLabelHorizonV1>,
     calendar: Option<&alpha_domain::EvaluationCalendarBindingV1>,
 ) -> anyhow::Result<()> {
@@ -1718,7 +1714,7 @@ pub(crate) fn validate_render_instrument_scope(market: &str, symbol: &str) -> an
 }
 
 fn rendered_research_market(
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
 ) -> anyhow::Result<CexResearchMarketV1> {
     match materialization.market.as_str() {
         "spot" => Ok(CexResearchMarketV1::Spot),
@@ -1732,7 +1728,7 @@ fn minimum_rows_for_horizon(horizon: &CampaignLabelHorizonV1) -> anyhow::Result<
 }
 
 fn ensure_materialization_scope(
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
     manifest: &FeatureDatasetManifest,
     feature_sha256: &str,
     expected_horizon: Option<&CampaignLabelHorizonV1>,
@@ -3273,7 +3269,7 @@ pub(crate) mod tests {
             let materialization_path = root.path().join("materialization.json");
             let source_content_sha256 = "b".repeat(64);
             let source_revision =
-                data::binance_lob_replay::source_revision([source_content_sha256.as_str()]);
+                hft_research_manifest::source::source_revision([source_content_sha256.as_str()]);
             let feature_source_revision = feature_source_revision
                 .as_deref()
                 .unwrap_or(&source_revision);
@@ -3506,14 +3502,14 @@ pub(crate) mod tests {
             .collect()
     }
 
-    fn load_materialization(path: &Path) -> crate::mission_runner::Materialization {
+    fn load_materialization(path: &Path) -> Materialization {
         decode_materialization(&std::fs::read(path).unwrap()).unwrap()
     }
 
     fn mutate_materialization(
         path: &Path,
         mutate: impl FnOnce(&mut serde_json::Value),
-    ) -> crate::mission_runner::Materialization {
+    ) -> Materialization {
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         mutate(&mut value);

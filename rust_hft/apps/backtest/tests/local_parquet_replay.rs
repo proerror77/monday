@@ -1,6 +1,6 @@
-use data::binance_lob_replay::source_revision;
 use hft_backtest::config::verify_and_replay_canonical_target_positions_with_trace_and_spot_rules;
 use hft_backtest::engine::{TargetPositionDecision, TargetPositionReplayConfig};
+use hft_research_manifest::source::source_revision;
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};

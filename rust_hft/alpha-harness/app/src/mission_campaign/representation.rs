@@ -7,7 +7,6 @@ use crate::{
         with_authorized_prepared_view, NormalizedPlanningColumns, VerifiedPlanningView,
     },
     mission_render::{CexCampaignResearchPlanV1, PreparedCexInputs, RenderedCexMission},
-    mission_runner::Materialization,
 };
 use alpha_domain::{
     campaign_control::VerifiedCampaignRootGrant, canonical_json_hash, representation::*,
@@ -15,6 +14,7 @@ use alpha_domain::{
 };
 use anyhow::{bail, ensure, Context, Result};
 use hft_cex_research_input::campaign::VerifiedCampaignPreparedInputsV1;
+use hft_cex_research_input::materialization::Materialization;
 use std::path::Path;
 
 fn reference(id: &str, value: &impl serde::Serialize) -> Result<CexResearchContentRefV1> {

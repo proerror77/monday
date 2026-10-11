@@ -2914,6 +2914,7 @@ dependencies = [
  "hft-core",
  "hft-integration",
  "hft-ports",
+ "hft-research-manifest",
  "libc",
  "rust_decimal",
  "serde",

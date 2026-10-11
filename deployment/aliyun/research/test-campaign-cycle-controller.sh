@@ -15,6 +15,170 @@ FAKE_REAL_MV="$(command -v mv)"
 mkdir "$bin" "$start_dir" "$start_dir/input" "$FAKE_STATE"
 touch "$start_dir/campaign-inputs.json"
 
+# Explicit test-only data producer. The controller never invokes this writer.
+cat >"$root/fixture-prepare.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+value_after() {
+  local wanted="$1"
+  shift
+  while (($#)); do
+    if [[ "$1" == "$wanted" ]]; then
+      printf '%s' "$2"
+      return
+    fi
+    shift
+  done
+  exit 1
+}
+
+sha_file() {
+  if command -v shasum >/dev/null; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
+increment() {
+  local file="$1"
+  local count=0
+  [[ ! -e "$file" ]] || read -r count <"$file"
+  printf '%s\n' "$((count + 1))" >"$file"
+}
+
+    report="$(value_after --report-out "$@")"
+    campaign_inputs="$(value_after --campaign-inputs-out "$@")"
+    output_root="$(value_after --output-root "$@")"
+    output_prefix="$(value_after --output-prefix "$@")"
+    market="$(value_after --market "$@")"
+    case "$market" in
+      spot|usdm) ;;
+      *) echo "unexpected fresh market: $market" >&2; exit 1 ;;
+    esac
+    printf '%s\n' "$market" >>"$FAKE_STATE/fresh-markets"
+    if [[ " $* " == *" --binary-dir "* ]]; then
+      printf 'binary:%s\n' "$(value_after --binary-dir "$@")" >>"$FAKE_STATE/fresh-binary-dirs"
+    fi
+    symbol="$(value_after --symbol "$@")"
+    mission_id="$(value_after --mission-id "$@")"
+    request_out="$(value_after --request-out "$@")"
+    [[ "$request_out" == "$output_root/.fresh-inputs/$output_prefix/request.json" ]]
+    mkdir -p "$(dirname "$campaign_inputs")" "$(dirname "$report")"
+    mkdir -p "$(dirname "$request_out")"
+    if [[ ! -e "$report" ]]; then
+      increment "$FAKE_STATE/fresh-preparation-count"
+    fi
+    printf '{}\n' >"$campaign_inputs"
+    inventory_out="$(value_after --inventory-out "$@")"
+    printf 'RUN_ID=inventory-fresh\n' >"$inventory_out"
+    printf '{}\n' >"$request_out"
+    campaign_inputs_sha256="$(sha_file "$campaign_inputs")"
+    run_root="$output_root/$output_prefix"
+    jq -n \
+      --arg source_revision "$FAKE_SOURCE_REVISION" \
+      --arg market "$market" \
+      --arg inventory_path "$inventory_out" \
+      --arg image_ref "$(value_after --image-ref "$@")" \
+      --arg symbol "$symbol" \
+      --arg mission_id "$mission_id" \
+      --arg output_prefix "$output_prefix" \
+      --arg run_root "$run_root" \
+      --arg campaign_inputs "$campaign_inputs" \
+      --arg request_path "$request_out" \
+      --arg request_sha256 "$(sha_file "$request_out")" \
+      --arg inventory_sha256 "$(sha_file "$inventory_out")" \
+      --arg campaign_inputs_sha256 "$campaign_inputs_sha256" \
+      '{
+        schema_version:"monday.cex_fresh_inputs_preparation.v1",
+        status:"ready",source_revision:$source_revision,image_ref:$image_ref,
+        market:$market,symbol:$symbol,mission_id:$mission_id,
+        start_received_at_ns:1,end_received_at_ns:2,
+        max_inputs:4,max_input_bytes:1000000,
+        input_root:$run_root,run_root:$run_root,output_prefix:$output_prefix,
+        inventory_path:$inventory_path,request_path:$request_path,
+        request_sha256:$request_sha256,campaign_inputs_path:$campaign_inputs,
+        inventory_sha256:$inventory_sha256,input_fingerprint_sha256:("b" * 64),
+        campaign_inputs_sha256:$campaign_inputs_sha256,
+        materialization_receipt_sha256:("c" * 64),
+        feature_sha256:("d" * 64),materialization_sha256:("e" * 64),
+        replay_artifact_sha256:("f" * 64),replay_manifest_sha256:("0" * 64)
+      }' >"$report"
+    printf '{"status":"ready","reused_existing":true}\n'
+EOF
+
+fixture_value_after() {
+  local wanted="$1"
+  shift
+  while (($#)); do
+    if [[ "$1" == "$wanted" ]]; then printf '%s' "$2"; return; fi
+    shift
+  done
+  return 1
+}
+
+fixture_counter() {
+  local count=0
+  [[ ! -e "$FAKE_STATE/$1" ]] || read -r count <"$FAKE_STATE/$1"
+  printf '%s' "$count"
+}
+
+# Each invocation is explicit fixture setup, before entering the controller.
+seed_fresh_fixture() {
+  local cycle output prefix report inventory request
+  cycle="$(fixture_value_after --work-dir "$@")"
+  output="$(fixture_value_after --fresh-output-root "$@")"
+  prefix="$(fixture_value_after --fresh-output-prefix "$@")"
+  report="$(fixture_value_after --fresh-report-out "$@" || true)"
+  inventory="$(fixture_value_after --fresh-inventory-out "$@" || true)"
+  request="$(fixture_value_after --fresh-request-out "$@" || true)"
+  bash "$root/fixture-prepare.sh" \
+    --report-out "${report:-$cycle/fresh-inputs/preparation.json}" \
+    --campaign-inputs-out "$output/$prefix/receipts/campaign-inputs.json" \
+    --output-root "$output" --output-prefix "$prefix" \
+    --market "$(fixture_value_after --fresh-market "$@")" \
+    --symbol "$(fixture_value_after --fresh-symbol "$@")" \
+    --mission-id "$(fixture_value_after --fresh-mission-id "$@")" \
+    --image-ref "$(fixture_value_after --fresh-image-ref "$@")" \
+    --request-out "${request:-$output/.fresh-inputs/$prefix/request.json}" \
+    --inventory-out "${inventory:-$cycle/fresh-inputs/frozen.env}" \
+    --binary-dir "$(fixture_value_after --fresh-binary-dir "$@")" >/dev/null
+}
+
+# Missing data-owner evidence must stop before any new authority or execution.
+assert_missing_preparation() {
+  local stage="$1" cycle="$2" label="$3"
+  shift 3
+  local before_dispatch before_budget before_signer before_producer before_proposal
+  before_dispatch="$(fixture_counter dispatch-count)"
+  before_budget="$(fixture_counter budget-reservation-count)"
+  before_signer="$(fixture_counter signer-count)"
+  before_producer="$(fixture_counter fresh-preparation-count)"
+  before_proposal="$(fixture_counter study-propose-count)"
+  if FAKE_UNAME=Linux MONDAY_CAMPAIGN_CONTROL="$bin/control" "$controller" "$@" \
+    >"$root/missing-$stage-$label.out" 2>"$root/missing-$stage-$label.err"; then
+    echo "controller accepted missing $stage $label" >&2
+    exit 1
+  fi
+  jq -e --arg stage "$stage" '.status == "needs_preparation" and .stage == $stage
+    and .preparation_started == false and .child_dispatched == false' \
+    "$cycle/needs-preparation.json" >/dev/null
+  test "$(fixture_counter dispatch-count)" == "$before_dispatch"
+  test "$(fixture_counter budget-reservation-count)" == "$before_budget"
+  test "$(fixture_counter signer-count)" == "$before_signer"
+  test "$(fixture_counter fresh-preparation-count)" == "$before_producer"
+  test "$(fixture_counter study-propose-count)" == "$before_proposal"
+  test ! -e "$cycle/generation-0/study-handoff.json"
+  test ! -e "$cycle/generation-1/request.json"
+  if [[ "$stage" == fresh_inputs ]]; then
+    test ! -e "$cycle/controller-inputs.json"
+    test ! -e "$cycle/generation-0"
+  else
+    jq -e '.study.handoff_consumed == false' "$cycle/controller-inputs.json" >/dev/null
+    test ! -e "$cycle/generation-0/generation-complete"
+  fi
+}
+
 cat >"$bin/alpha-harness" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -48,62 +212,33 @@ increment() {
 }
 
 case "$1 $2" in
-  "mission prepare-fresh-inputs")
+  "mission verify-prepared-inputs")
+    [[ ${FAKE_PREPARED_BYTES_INVALID:-false} != true ]] || { echo "fixture: prepared artifact bytes changed" >&2; exit 73; }
     report="$(value_after --report-out "$@")"
     campaign_inputs="$(value_after --campaign-inputs-out "$@")"
+    request_out="$(value_after --request-out "$@")"
+    inventory_out="$(value_after --inventory-out "$@")"
     output_root="$(value_after --output-root "$@")"
     output_prefix="$(value_after --output-prefix "$@")"
-    market="$(value_after --market "$@")"
-    case "$market" in
-      spot|usdm) ;;
-      *) echo "unexpected fresh market: $market" >&2; exit 1 ;;
-    esac
-    printf '%s\n' "$market" >>"$FAKE_STATE/fresh-markets"
-    if [[ " $* " == *" --binary-dir "* ]]; then
-      printf 'binary:%s\n' "$(value_after --binary-dir "$@")" >>"$FAKE_STATE/fresh-binary-dirs"
-    fi
-    symbol="$(value_after --symbol "$@")"
-    mission_id="$(value_after --mission-id "$@")"
-    request_out="$(value_after --request-out "$@")"
-    mkdir -p "$(dirname "$campaign_inputs")" "$(dirname "$report")"
-    mkdir -p "$(dirname "$request_out")"
-    if [[ ! -e "$report" ]]; then
-      increment "$FAKE_STATE/fresh-preparation-count"
-    fi
-    printf '{}\n' >"$campaign_inputs"
-    inventory_out="$(value_after --inventory-out "$@")"
-    printf 'RUN_ID=inventory-fresh\n' >"$inventory_out"
-    printf '{}\n' >"$request_out"
-    campaign_inputs_sha256="$(sha_file "$campaign_inputs")"
-    run_root="$output_root/$output_prefix"
-    jq -n \
-      --arg source_revision "$FAKE_SOURCE_REVISION" \
-      --arg image_ref "$(value_after --image-ref "$@")" \
-      --arg symbol "$symbol" \
-      --arg mission_id "$mission_id" \
-      --arg output_prefix "$output_prefix" \
-      --arg run_root "$run_root" \
-      --arg campaign_inputs "$campaign_inputs" \
-      --arg request_path "$request_out" \
-      --arg request_sha256 "$(sha_file "$request_out")" \
-      --arg inventory_sha256 "$(sha_file "$inventory_out")" \
-      --arg campaign_inputs_sha256 "$campaign_inputs_sha256" \
-      '{
-        schema_version:"monday.cex_fresh_inputs_preparation.v1",
-        status:"ready",source_revision:$source_revision,image_ref:$image_ref,
-        symbol:$symbol,mission_id:$mission_id,
-        start_received_at_ns:1,end_received_at_ns:2,
-        max_inputs:4,max_input_bytes:1000000,
-        input_root:$run_root,run_root:$run_root,output_prefix:$output_prefix,
-        inventory_path:"inventory.env",request_path:$request_path,
-        request_sha256:$request_sha256,campaign_inputs_path:$campaign_inputs,
-        inventory_sha256:$inventory_sha256,input_fingerprint_sha256:("b" * 64),
-        campaign_inputs_sha256:$campaign_inputs_sha256,
-        materialization_receipt_sha256:("c" * 64),
-        feature_sha256:("d" * 64),materialization_sha256:("e" * 64),
-        replay_artifact_sha256:("f" * 64),replay_manifest_sha256:("0" * 64)
-      }' >"$report"
-    printf '{"status":"ready","reused_existing":true}\n'
+    [[ "$request_out" == "$output_root/.fresh-inputs/$output_prefix/request.json" ]]
+    [[ -s "$report" && -s "$campaign_inputs" && -s "$request_out" && -s "$inventory_out" ]]
+    jq -e --arg source "$FAKE_SOURCE_REVISION" \
+      --arg market "$(value_after --market "$@")" \
+      --arg symbol "$(value_after --symbol "$@")" \
+      --arg mission "$(value_after --mission-id "$@")" \
+      --arg image "$(value_after --image-ref "$@")" \
+      --arg prefix "$output_prefix" --arg input "$output_root/$output_prefix" \
+      --arg request "$request_out" --arg request_sha "$(sha_file "$request_out")" \
+      --arg inventory "$inventory_out" --arg inventory_sha "$(sha_file "$inventory_out")" \
+      --arg inputs "$campaign_inputs" --arg inputs_sha "$(sha_file "$campaign_inputs")" \
+      '.schema_version == "monday.cex_fresh_inputs_preparation.v1" and .status == "ready"
+       and .source_revision == $source and .market == $market and .symbol == $symbol
+       and .mission_id == $mission and .image_ref == $image and .output_prefix == $prefix
+       and .input_root == $input and .run_root == $input and .request_path == $request
+       and .request_sha256 == $request_sha and .inventory_path == $inventory
+       and .inventory_sha256 == $inventory_sha and .campaign_inputs_path == $inputs
+       and .campaign_inputs_sha256 == $inputs_sha' "$report" >/dev/null
+    jq '. + {reused_existing:true}' "$report"
     ;;
   "mission campaign-freeze")
     output="$(value_after --output "$@")"
@@ -210,7 +345,7 @@ case "$1 $2" in
       jq -n --arg reason "${FAKE_STUDY_PROPOSAL_REASON:-target_family_is_not_a_predeclared_study_member}" \
         '{schema_version:"monday.campaign_study_proposal_report.v1",status:"needs_authority",reason:$reason}'
     else
-      printf '{"study_proposal":true}\n' >"$output"
+      jq -n --slurpfile horizon "$(value_after --target-horizon "$@")" '{study_proposal:true,target_horizon:$horizon[0]}' >"$output"
       printf '{"schema_version":"cex-campaign-research-plan-v2","generation":1}\n' >"$plan_output"
       jq -n --arg proposal "$output" --arg plan "$plan_output" \
         '{schema_version:"monday.campaign_study_proposal_report.v1",status:"ready",proposal_path:$proposal,research_plan_path:$plan}'
@@ -250,6 +385,7 @@ case "$1 $2" in
     jq -r '.request_sha256' "$submission" >"$FAKE_STATE/request-sha256"
     jq -r '.job_name' "$submission" >"$FAKE_STATE/job-name"
     increment "$FAKE_STATE/dispatch-count"
+    increment "$FAKE_STATE/budget-reservation-count"
     : >"$FAKE_STATE/dispatched-$(jq -r '.job_name' "$submission")"
     printf '{"submitted":true}\n'
     ;;
@@ -1096,6 +1232,18 @@ fresh_args=(
   --seed 7 --seed 11
   --max-follow-ups 1
 )
+assert_missing_preparation fresh_inputs "$fresh_cycle" all "${fresh_args[@]}"
+seed_fresh_fixture "${fresh_args[@]}"
+for missing in report request receipt; do
+  case "$missing" in
+    report) missing_path="$fresh_cycle/fresh-inputs/preparation.json" ;;
+    request) missing_path="$fresh_output/.fresh-inputs/campaign-inputs/fresh-window/request.json" ;;
+    receipt) missing_path="$fresh_output/campaign-inputs/fresh-window/receipts/campaign-inputs.json" ;;
+  esac
+  "$FAKE_REAL_MV" "$missing_path" "$root/initial-missing-$missing.saved"
+  assert_missing_preparation fresh_inputs "$fresh_cycle" "$missing" "${fresh_args[@]}"
+  "$FAKE_REAL_MV" "$root/initial-missing-$missing.saved" "$missing_path"
+done
 fresh_dispatch_before="$(<"$FAKE_STATE/dispatch-count")"
 if ! FAKE_UNAME=Linux "$controller" "${fresh_args[@]}" \
   >"$root/fresh-needs-authority.stdout" 2>"$root/fresh-needs-authority.stderr"; then
@@ -1194,6 +1342,7 @@ fresh_latest_args=(
   --seed 7 --seed 11
   --max-follow-ups 1
 )
+seed_fresh_fixture "${fresh_latest_args[@]}"
 latest_dispatch_before="$(<"$FAKE_STATE/dispatch-count")"
 if ! FAKE_UNAME=Linux "$controller" "${fresh_latest_args[@]}" \
   >"$root/fresh-latest-needs-authority.stdout" 2>"$root/fresh-latest-needs-authority.stderr"; then
@@ -1246,6 +1395,7 @@ fresh_control_args=(
   --seed 7 --seed 11
   --max-follow-ups 1
 )
+seed_fresh_fixture "${fresh_control_args[@]}"
 control_dispatch_before="$(<"$FAKE_STATE/dispatch-count")"
 if ! FAKE_UNAME=Linux "$controller" "${fresh_control_args[@]}" \
   >"$root/fresh-control-needs-authority.stdout" 2>"$root/fresh-control-needs-authority.stderr"; then
@@ -1295,7 +1445,12 @@ for ((study_index = 0; study_index < ${#study_args[@]}; study_index++)); do
     study_args[study_index + 1]="$study_cycle"
   fi
 done
-study_args+=(--max-follow-ups 2)
+study_args+=(--max-follow-ups 2
+  --fresh-inventory-out "$fresh_control_cycle/fresh-inputs/frozen.env"
+  --fresh-request-out "$fresh_control_output/.fresh-inputs/campaign-inputs/fresh-control-window/request.json"
+  --fresh-report-out "$fresh_control_cycle/fresh-inputs/preparation.json"
+  --fresh-materializer-work-dir "$fresh_control_cycle/fresh-inputs/materializer"
+)
 study_args+=(
   --study-id study-test
   --study-target-family-id target-family
@@ -1315,6 +1470,27 @@ study_ack_args=(
   ack-readback --alpha-harness "$bin/alpha-harness" --aliyun "$bin/aliyun" --kubectl "$bin/kubectl"
   --campaign-pod-name pod-g0 --work-dir "$study_cycle"
 )
+assert_missing_preparation study_handoff "$study_cycle" all "${study_ack_args[@]}"
+# The data owner prepares the independent target before its controller handoff.
+study_target_report="$study_cycle/generation-0/study/preparation.json"
+study_target_request="$fresh_control_output/.fresh-inputs/campaign-inputs/study-target/request.json"
+bash "$root/fixture-prepare.sh" \
+  --report-out "$study_target_report" --campaign-inputs-out "$study_target_inputs" \
+  --request-out "$study_target_request" \
+  --inventory-out "$study_cycle/generation-0/study/frozen.env" \
+  --output-root "$fresh_control_output" --output-prefix campaign-inputs/study-target \
+  --market spot --symbol BTCUSDT --mission-id study-target \
+  --image-ref "registry.example/research@sha256:$image_digest" --binary-dir "$bin" >/dev/null
+for missing in report request receipt; do
+  case "$missing" in
+    report) missing_path="$study_target_report" ;;
+    request) missing_path="$study_target_request" ;;
+    receipt) missing_path="$study_target_inputs" ;;
+  esac
+  "$FAKE_REAL_MV" "$missing_path" "$root/study-missing-$missing.saved"
+  assert_missing_preparation study_handoff "$study_cycle" "$missing" "${study_ack_args[@]}"
+  "$FAKE_REAL_MV" "$root/study-missing-$missing.saved" "$missing_path"
+done
 : >"$FAKE_STATE/fail-study-propose-once"
 if MONDAY_CAMPAIGN_CONTROL="$bin/control" FAKE_STUDY_PROPOSAL_STATUS=needs_authority \
   "$controller" "${study_ack_args[@]}" \
@@ -1358,6 +1534,35 @@ jq -e '.outcome == "study_handoff" and .study_handoff_sha256 != ""' \
   "$study_cycle/generation-0/generation-complete" >/dev/null
 journal_count="$(find "$study_cycle/generation-0/study" -name 'proposal-report.needs-authority.*.json' | wc -l | tr -d ' ')"
 test "$journal_count" -eq 2
+# Model a crash before the saved handoff is consumed, then reject changed underlying bytes.
+# The real Rust verifier tests the bytes; this fixture proves the cached controller calls it.
+jq '.study.handoff_consumed=false' "$study_cycle/controller-inputs.json" >"$root/study-unconsumed.json"
+"$FAKE_REAL_MV" "$root/study-unconsumed.json" "$study_cycle/controller-inputs.json"
+cached_dispatch_before="$(fixture_counter dispatch-count)"
+cached_budget_before="$(fixture_counter budget-reservation-count)"
+cached_proposal_before="$(fixture_counter study-propose-count)"
+if MONDAY_CAMPAIGN_CONTROL="$bin/control" FAKE_PREPARED_BYTES_INVALID=true \
+  "$controller" "${study_ack_args[@]}" >"$root/study-cached-invalid.stdout" 2>"$root/study-cached-invalid.stderr"; then
+  echo 'cached Study handoff accepted failed prepared-byte verification' >&2
+  exit 1
+fi
+jq -e '.status=="needs_preparation" and .child_dispatched==false' "$study_cycle/needs-preparation.json" >/dev/null
+jq -e '.study.handoff_consumed==false' "$study_cycle/controller-inputs.json" >/dev/null
+test "$(fixture_counter dispatch-count)" == "$cached_dispatch_before"
+test "$(fixture_counter budget-reservation-count)" == "$cached_budget_before"
+test "$(fixture_counter study-propose-count)" == "$cached_proposal_before"
+# Cached horizon comes from the already SHA-bound proposal, not an operator temporary file.
+"$FAKE_REAL_MV" "$study_horizon" "$root/study-horizon.saved"
+if MONDAY_CAMPAIGN_CONTROL="$bin/control" "$controller" "${study_ack_args[@]}" \
+  >"$root/study-cached-restored.stdout" 2>"$root/study-cached-restored.stderr"; then
+  echo 'cached readback bypassed the undispatched child gate' >&2
+  exit 1
+fi
+grep -Fq 'ACK readback requires an approved, dispatched Campaign generation' "$root/study-cached-restored.stderr"
+jq -e '.study.handoff_consumed==true' "$study_cycle/controller-inputs.json" >/dev/null
+test ! -e "$study_cycle/needs-preparation.json"
+"$FAKE_REAL_MV" "$root/study-horizon.saved" "$study_horizon"
+test "$(fixture_counter study-propose-count)" == "$cached_proposal_before"
 study_propose_before_restart="$(<"$FAKE_STATE/study-propose-count")"
 MONDAY_CAMPAIGN_CONTROL="$bin/control" FAKE_STUDY_PROPOSAL_STATUS=ready \
   "$controller" "${study_args[@]}" \

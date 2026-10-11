@@ -40,7 +40,7 @@ case "$1" in
 esac
 MOCK
 chmod 0755 "$work/bin/docker"
-for binary in research-release-publisher alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
+for binary in research-release-publisher alpha-harness; do
   if [[ $binary == alpha-harness || $binary == research-release-publisher ]]; then
     printf '#!/usr/bin/env bash\nprintf "%s %s\\n"\n' "$binary" "$source_sha" >"$work/release/$binary"
   else
@@ -65,14 +65,12 @@ initialize_image() {
     chmod 0755 "$work/image/usr/local/bin/$tool"
   done
   cp "$work/release/"* "$work/image/usr/local/bin/"
-  cp "$root/deployment/aliyun/research/scripts/cex-materialization-entrypoint.sh" "$work/image/usr/local/bin/"
   cp "$root/deployment/aliyun/research/scripts/campaign-cycle-controller.sh" \
     "$root/deployment/aliyun/research/scripts/campaign-job-watch.sh" \
     "$work/image/opt/monday/deployment/aliyun/research/scripts/"
   cp "$root/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml" \
     "$work/image/opt/monday/deployment/aliyun/research/k8s/"
-  chmod 0755 "$work/image/usr/local/bin/cex-materialization-entrypoint.sh" \
-    "$work/image/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh"
+  chmod 0755 "$work/image/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh"
   printf "fixture CA bundle\n" >"$work/image/etc/ssl/certs/ca-certificates.crt"
   : >"$work/docker.log"
 }
@@ -89,7 +87,7 @@ initialize_image
 verify_image
 grep -Fq 'run --rm --network none --entrypoint /bin/bash' "$work/docker.log"
 grep -Fqx 'rm -f fixture-container ' "$work/docker.log"
-for failure in source entrypoint user tool script-missing script-syntax script-bytes template binary importer importer-version git gh ruby unzip gh-pagination ruby-runtime ruby-tar ca; do
+for failure in source entrypoint user tool script-missing script-syntax script-bytes template binary materializer importer importer-version git gh ruby unzip gh-pagination ruby-runtime ruby-tar ca; do
   initialize_image
   case "$failure" in
     source|entrypoint|user)
@@ -103,8 +101,9 @@ for failure in source entrypoint user tool script-missing script-syntax script-b
     tool) rm "$work/image/usr/bin/jq" ;;
     script-missing) rm "$work/image/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh" ;;
     script-syntax) printf '\nif then\n' >>"$work/image/opt/monday/deployment/aliyun/research/scripts/campaign-job-watch.sh" ;;
-    script-bytes) printf '\n# changed image asset\n' >>"$work/image/usr/local/bin/cex-materialization-entrypoint.sh" ;;
+    script-bytes) printf '\n# changed image asset\n' >>"$work/image/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh" ;;
     template) printf '\n# changed Job template\n' >>"$work/image/opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml" ;;
+    materializer) cp "$work/release/alpha-harness" "$work/image/usr/local/bin/monday-cex-prepare" ;;
     importer) rm "$work/image/usr/local/bin/research-release-publisher" ;;
     importer-version) printf '#!/usr/bin/env bash\nprintf "wrong importer\\n"\n' >"$work/image/usr/local/bin/research-release-publisher" ;;
     git|gh|ruby|unzip) rm "$work/image/usr/bin/$failure" ;;
@@ -112,7 +111,7 @@ for failure in source entrypoint user tool script-missing script-syntax script-b
     ruby-runtime) printf '#!/usr/bin/env bash\nexit 1\n' >"$work/image/usr/bin/ruby" ;;
     ruby-tar) printf '#!/usr/bin/env bash\nfor argument in "$@"; do if [[ $argument == -rrubygems/package ]]; then exit 1; fi; done\nexit 0\n' >"$work/image/usr/bin/ruby" ;;
     ca) rm "$work/image/etc/ssl/certs/ca-certificates.crt" ;;
-    binary) printf '\n# changed executable\n' >>"$work/image/usr/local/bin/lob-pit-materializer" ;;
+    binary) printf '\n# changed executable\n' >>"$work/image/usr/local/bin/alpha-harness" ;;
   esac
   reject_image "$failure"
 done

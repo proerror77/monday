@@ -1,0 +1,27 @@
+[package]
+name = "hft-cex-data-preparation"
+workspace = ".."
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+hft-collector = { path = "../../tools/collector", features = ["collector-binance"] }
+hft-cex-research-input = { path = "../../research-core/cex-input", features = ["preparation-cli"] }
+hft-research-manifest = { path = "../../research-core/manifest" }
+hft-research-artifacts = { path = "../../research-core/artifacts" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "monday-cex-prepare"
+path = "src/main.rs"

@@ -244,11 +244,11 @@ EOF
 # JSON decoding, exact integer bounds, duplicate fields and venue checks are
 # exercised by the collector's native metadata tests. This double checks the
 # shell/native contract and lets this orchestration test run without a build.
-cat >"$BIN_DIR/alpha-harness" <<'EOF'
+cat >"$BIN_DIR/monday-cex-prepare" <<'EOF'
 #!/bin/sh
 set -eu
-[ "$1" = data ] && [ "$2" = verify-materialization-manifest ] || exit 64
-shift 2
+[ "$1" = verify-materialization-manifest ] || exit 64
+shift
 manifest= manifest_sha= kind= market= start= end=
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -279,7 +279,7 @@ printf '{"status":"verified"}\n'
 EOF
 MONDAY_TEST_VERIFY_CALLS=$ROOT/manifest-verifier-calls.log
 export MONDAY_TEST_VERIFY_CALLS
-chmod +x "$BIN_DIR/alpha-harness" "$BIN_DIR/binance-market-tape-slicer" "$BIN_DIR/lob-pit-materializer" "$BIN_DIR/binance-replay-parquet-materializer"
+chmod +x "$BIN_DIR/monday-cex-prepare" "$BIN_DIR/binance-market-tape-slicer" "$BIN_DIR/lob-pit-materializer" "$BIN_DIR/binance-replay-parquet-materializer"
 
 if ! sh "$ENTRYPOINT" \
   --inventory "$ROOT/inventory.env" \

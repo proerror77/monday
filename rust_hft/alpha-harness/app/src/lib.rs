@@ -8,8 +8,6 @@ mod mission;
 mod mission_calendar;
 mod mission_campaign;
 mod mission_dispatch;
-#[cfg(feature = "operator")]
-mod mission_fresh_inputs;
 mod mission_metrics;
 mod mission_objects;
 mod mission_render;

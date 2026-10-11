@@ -73,22 +73,25 @@ use hft_backtest::engine::{
     TARGET_POSITION_REPLAY_IMPLEMENTATION_VERSION,
 };
 use hft_cex_research_input::feature_matrix::FeatureDatasetManifest;
+use hft_cex_research_input::materialization::Materialization;
+#[cfg(feature = "scientific")]
+use hft_cex_research_input::materialization::{decode_materialization, SourceSegment};
 use hft_research_artifacts::fetch_to_file;
 use hft_research_artifacts::normalized_sha256;
 #[cfg(feature = "scientific")]
 use hft_research_artifacts::publish_immutable_file;
 use hft_research_artifacts::sha256_file;
 use hft_research_manifest::CexReplayDatasetManifestV5;
-use hft_research_manifest::CexReplaySnapshotV1;
-use hft_research_manifest::CexReplaySnapshotV2;
-use hft_research_manifest::CexReplaySnapshotV3;
-use hft_research_manifest::CexReplaySnapshotV4;
+#[cfg(all(test, feature = "scientific"))]
 use hft_research_manifest::CexReplaySnapshotV5;
+#[cfg(all(test, feature = "scientific"))]
 use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2;
+#[cfg(all(test, feature = "scientific"))]
 use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3;
+#[cfg(all(test, feature = "scientific"))]
 use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4;
+#[cfg(all(test, feature = "scientific"))]
 use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5;
-use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6;
 use hft_research_manifest::BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7;
 use reqwest::blocking::Client;
 #[cfg(feature = "scientific")]
@@ -101,6 +104,7 @@ use std::io::Read;
 #[cfg(feature = "scientific")]
 use std::io::Write;
 use std::path::Path;
+#[cfg(all(test, feature = "scientific"))]
 use std::path::PathBuf;
 #[cfg(feature = "scientific")]
 use std::time::Duration;
@@ -343,44 +347,6 @@ pub(crate) fn bound_supervised_decision_policy(
         }
     }
     bail!("CEX supervised decision policy is outside the registered policy set")
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct Materialization {
-    dataset_kind: String,
-    schema_version: String,
-    pub(crate) mission_id: String,
-    pub(crate) symbol: String,
-    pub(crate) market: String,
-    pub(crate) source_revision: String,
-    source_segments: Vec<SourceSegment>,
-    pub(crate) artifact_sha256: String,
-    pub(crate) bucket_ms: u64,
-    pub(crate) label_horizon_buckets: usize,
-    pub(crate) top_depth: usize,
-    #[serde(default = "default_series_count")]
-    pub(crate) series_count: usize,
-    pub(crate) rows: usize,
-    first_event_time: chrono::DateTime<Utc>,
-    last_event_time: chrono::DateTime<Utc>,
-    pub(crate) snapshot: CexReplaySnapshotV5,
-    snapshot_sha256: String,
-}
-
-const fn default_series_count() -> usize {
-    1
-}
-
-#[derive(Debug, Deserialize)]
-struct SourceSegment {
-    #[cfg_attr(not(feature = "scientific"), allow(dead_code))]
-    path: PathBuf,
-    sha256: String,
-    collector_manifest_sha256: String,
-    success_marker_sha256: String,
-    start_received_at_ns: u64,
-    end_received_at_ns: u64,
-    events: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2769,75 +2735,6 @@ fn registry_content_reference(
     content_reference(id, &serde_json::to_value(artifact)?)
 }
 
-pub(crate) fn decode_materialization(bytes: &[u8]) -> anyhow::Result<Materialization> {
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).context("materialization manifest is invalid JSON")?;
-    match value
-        .get("schema_version")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V7) => {
-            serde_json::from_value(value).context("V7 materialization manifest is invalid")
-        }
-        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V6) => {
-            let snapshot: CexReplaySnapshotV4 = serde_json::from_value(
-                value
-                    .get("snapshot")
-                    .cloned()
-                    .context("historical V6 materialization has no snapshot")?,
-            )
-            .context("historical V6 materialization snapshot is invalid")?;
-            snapshot.validate().map_err(anyhow::Error::new)?;
-            bail!("historical V6 materialization is read-only and cannot execute")
-        }
-        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V5) => {
-            let snapshot: CexReplaySnapshotV4 = serde_json::from_value(
-                value
-                    .get("snapshot")
-                    .cloned()
-                    .context("historical V5 materialization has no snapshot")?,
-            )
-            .context("historical V5 materialization snapshot is invalid")?;
-            snapshot.validate().map_err(anyhow::Error::new)?;
-            bail!("historical V5 materialization is read-only and cannot execute")
-        }
-        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V2) => {
-            let snapshot: CexReplaySnapshotV1 = serde_json::from_value(
-                value
-                    .get("snapshot")
-                    .cloned()
-                    .context("historical V2 materialization has no snapshot")?,
-            )
-            .context("historical V2 materialization snapshot is invalid")?;
-            snapshot.validate().map_err(anyhow::Error::new)?;
-            bail!("historical V2 materialization is read-only and cannot execute")
-        }
-        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V3) => {
-            let snapshot: CexReplaySnapshotV2 = serde_json::from_value(
-                value
-                    .get("snapshot")
-                    .cloned()
-                    .context("historical V3 materialization has no snapshot")?,
-            )
-            .context("historical V3 materialization snapshot is invalid")?;
-            snapshot.validate().map_err(anyhow::Error::new)?;
-            bail!("historical V3 materialization is read-only and cannot execute")
-        }
-        Some(BINANCE_LOB_PIT_MATERIALIZATION_SCHEMA_V4) => {
-            let snapshot: CexReplaySnapshotV3 = serde_json::from_value(
-                value
-                    .get("snapshot")
-                    .cloned()
-                    .context("historical V4 materialization has no snapshot")?,
-            )
-            .context("historical V4 materialization snapshot is invalid")?;
-            snapshot.validate().map_err(anyhow::Error::new)?;
-            bail!("historical V4 materialization is read-only and cannot execute")
-        }
-        _ => bail!("materialization kind or schema is unsupported"),
-    }
-}
-
 #[cfg(feature = "scientific")]
 fn persist_baseline_evidence(
     store: &mut AlphaStore,
@@ -4643,7 +4540,7 @@ pub(crate) fn validate_materialization(
             bail!("source success marker does not bind its segment");
         }
     }
-    if data::binance_lob_replay::source_revision(source_sha256s.iter().map(String::as_str))
+    if hft_research_manifest::source::source_revision(source_sha256s.iter().map(String::as_str))
         != source_revision
     {
         bail!("materialization source revision does not bind its source segments");
@@ -10258,7 +10155,7 @@ message binance_replay {
         let ingestion_time = Utc::now() - ChronoDuration::seconds(1);
         let source_content_sha256 = "1".repeat(64);
         let source_revision =
-            data::binance_lob_replay::source_revision([source_content_sha256.as_str()]);
+            hft_research_manifest::source::source_revision([source_content_sha256.as_str()]);
         let rows = (0..160)
             .map(|index| {
                 let event_time = ingestion_time - ChronoDuration::seconds(300 - index);

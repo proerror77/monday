@@ -29,3 +29,12 @@ pub fn valid_digest(value: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
+
+#[cfg(feature = "streaming")]
+pub mod inventory;
+#[cfg(feature = "streaming")]
+pub mod market_sources;
+#[cfg(feature = "streaming")]
+pub mod materialization;
+#[cfg(feature = "preparation")]
+pub mod preparation;

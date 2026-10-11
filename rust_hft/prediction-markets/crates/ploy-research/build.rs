@@ -8,7 +8,7 @@ const POLICY_TARGET: &str = "x86_64-unknown-linux-gnu";
 const POLICY_GRAPH_SCHEMA: &str = "prediction-policy-dependencies.v6";
 const POLICY_GRAPH_FILE: &str = "prediction-policy-dependencies.linux.txt";
 const CANONICAL_POLICY_DEPENDENCY_HASH_FILE: &str = "prediction-policy-dependencies.linux.sha256";
-const POLICY_INPUTS: [(&str, &str); 18] = [
+const POLICY_INPUTS: [(&str, &str); 19] = [
     ("Cargo.lock", "Cargo.lock"),
     ("Cargo.toml", "Cargo.toml"),
     (
@@ -65,6 +65,10 @@ const POLICY_INPUTS: [(&str, &str); 18] = [
     (
         "../research-core/search-kernel/Cargo.toml",
         "../research-core/search-kernel/Cargo.toml",
+    ),
+    (
+        "../research-core/manifest/Cargo.toml",
+        "../research-core/manifest/Cargo.toml",
     ),
 ];
 const FORBIDDEN_RUNTIME_PACKAGES: [&str; 8] = [
