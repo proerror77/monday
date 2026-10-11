@@ -49,8 +49,26 @@ capability=${RUNNER_TEMP}/research-release-issuer-target/debug/research-release-
 test -x "$issuer"
 test -x "$capability"
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
 umask 077
+ledger=''
+finish() {
+  result=$?
+  trap - EXIT
+  if [[ -n $ledger ]]; then
+    summary="$RUNNER_TEMP/research-publication-budget-usage.json"
+    if "$issuer" budget-summary "$ledger" >"$work/usage.json" 2>/dev/null; then
+      mv "$work/usage.json" "$summary"
+    else
+      printf '%s\n' '{"schema":"monday.oss-publication-budget-usage.v1","usage_known":false,"reason":"private ledger unavailable or invalid"}' >"$summary"
+      ((result != 0)) || result=1
+    fi
+  fi
+  rm -rf "$work"
+  exit "$result"
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 select_public_policy >"$work/policy.json"
 unset MONDAY_RELEASE_GATEWAY_TOKEN
 context="$RUNNER_TEMP/research-release-context.json"
@@ -73,7 +91,13 @@ case "$mode" in
     : "${GITHUB_REPOSITORY:?repository required}" "${PRODUCT:?image product required}"
     : "${PUBLISH_IMAGE_REPOSITORY:?exact selected OCI repository required}" "${RUNNER_TEMP:?authenticated software directory required}"
     make_context "$PUBLISH_IMAGE_REPOSITORY"
-    "$capability" oss-source "$work/policy.json" "$context" - "$work/session"
+    : "${SOFTWARE_PRODUCTS:?actual software product selection required}"
+    budget_dir="$RUNNER_TEMP/research-oss-budget/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$PRODUCT"
+    mkdir -p -m 700 "$budget_dir"
+    ledger="$budget_dir/ledger.jsonl"
+    "$issuer" budget-plan "$root" "$context" "$SOFTWARE_PRODUCTS" "$work/policy.json" >"$budget_dir/plan.json"
+    "$issuer" budget-init "$work/policy.json" "$context" "$budget_dir/plan.json" "$RUNNER_TEMP/research-publication-native-budget.json" "$ledger" >"$budget_dir/init.json"
+    "$capability" oss-source "$work/policy.json" "$context" - "$ledger" "$work/session"
     "$issuer" oss-check-config "$work/policy.json" "$work/key" "$RUNNER_TEMP/research-release/research-image-release.json" "$GITHUB_REPOSITORY" "$PRODUCT" "$PUBLISH_IMAGE_REPOSITORY" "$SOURCE_REVISION" "$work/session"
     ;;
   publish)
@@ -86,11 +110,12 @@ case "$mode" in
     printf '%s' "$MONDAY_RELEASE_SIGNING_KEY" >"$work/key"
     unset MONDAY_RELEASE_SIGNING_KEY
     make_context "${IMAGE%@sha256:*}"
+    ledger="$RUNNER_TEMP/research-oss-budget/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$PRODUCT/ledger.jsonl"
     jq -n --arg source "$SOURCE_REVISION" --argjson software_run "$PRODUCER_RUN" --arg products "$SOFTWARE_PRODUCTS" --arg product "$PRODUCT" --arg image "$IMAGE" --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" --argjson job "$job" \
       '{source_sha:$source,software_run_id:$software_run,software_products:$products,product:$product,image:$image,publisher_run_id:$run,publisher_run_attempt:$attempt,publisher_job_id:$job}' >"$work/request.json"
     native=("$issuer")
     "${native[@]}" plan "$root" "$work/request.json" "$work/policy.json" >"${RUNNER_TEMP:?}/research-build-plan.json"
-    "$capability" oss-publish "$work/policy.json" "$context" "$RUNNER_TEMP/research-build-plan.json" "$work/session"
+    "$capability" oss-publish "$work/policy.json" "$context" "$RUNNER_TEMP/research-build-plan.json" "$ledger" "$work/session"
     "${native[@]}" oss-publish "$root" "$work/request.json" "$work/policy.json" "$work/key" "$work/session" >"$RUNNER_TEMP/research-build-artifacts.json"
     ;;
   *) exit 2 ;;

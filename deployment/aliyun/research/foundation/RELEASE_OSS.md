@@ -118,9 +118,13 @@ The ACK policy can use the same bucket with its internal HTTPS endpoint.
 The code accepts only bucket/region-bound Alibaba endpoints, without redirects or ambient proxies.
 It does not require GitHub native attestation or ACR OCI 1.1 referrers.
 
-`research-release-capability oss-source POLICY CONTEXT - SESSION_FILE` exchanges job OIDC with RAM STS.
+Initialize the private `BUDGET_LEDGER` with the admitted allocation and measured
+native inventory before either command, as described in the budget contract below.
+Both stages use that same ledger; these commands do not create or renew credit.
+
+`research-release-capability oss-source POLICY CONTEXT - BUDGET_LEDGER SESSION_FILE` exchanges job OIDC with RAM STS.
 It requests read access to only `research/sources/COMMIT/` before ACR login.
-`oss-publish POLICY CONTEXT PLAN SESSION_FILE` requests the native plan's exact sorted source/Build prefixes.
+`research-release-capability oss-publish POLICY CONTEXT PLAN BUDGET_LEDGER SESSION_FILE` requests the native plan's exact sorted source/Build prefixes.
 The fixed configuration accepts only `research/builds/` and `research/sources/`,
 in that order. It rejects `research/`, wildcard strings, exact hash entries,
 duplicate namespaces and scientific output paths. These are base-role boundaries,
@@ -352,3 +356,135 @@ alone cannot authorize a new Run, promoter, holdout access or runtime activation
 Continuous end-to-end publication is not verified until the real workflow, identity,
 OSS readback and ACK acceptance pass. The server-side role has no automatic per-release
 expiry or immediate cancellation revocation. Exact STS sessions expire after fifteen minutes.
+
+## CI publication request and payload budget
+
+This section defines implemented CI reservations. It is not a cloud deployment receipt.
+The workflow must admit one approved source and publisher run before ACR login.
+Its public approval binds the repository, exact workflow, next unique run number, attempt 1 and expiry.
+Native reservations then bind the actual run ID, product job, producer and measured source/Build inventory.
+Another run number, source or rerun needs another financial authorization.
+A per-run envelope does not cap all future automatic publications.
+
+The workflow writes `RUNNER_TEMP/research-publication-native-budget.json` after admission.
+Its mandatory schema is:
+
+```json
+{
+  "schema": "monday.oss-publication-budget.v1",
+  "repository": "REPOSITORY",
+  "source_sha": "EXACT_40_LOWERCASE_HEX",
+  "publisher_run_id": 1,
+  "publisher_run_attempt": 1,
+  "expires_at_ms": 1,
+  "publication_namespaces": ["research/builds/", "research/sources/"],
+  "limits": {"requests": 1, "request_payload_bytes": 1, "response_payload_bytes": 1},
+  "allocations": [
+    {"product": "controller", "limits": {"requests": 1, "request_payload_bytes": 1, "response_payload_bytes": 1}}
+  ]
+}
+```
+
+These values describe fields only. They cannot authorize execution.
+Use positive integer milliseconds below 2^53 for `expires_at_ms`.
+Sort allocations by product and include each selected product once.
+Native code rejects unknown fields, foreign identities, overflow and allocation sums above the envelope.
+`requests` counts attempted HTTP calls. Both payload counters count application octets.
+A rejected provider response or interrupted send consumes its full reservation.
+Native code checks expiry before each stage claim and request reservation.
+Reading historical usage is allowed after expiry; sending is not.
+
+Native `budget-plan` shares the authenticated scope projection with `scope-plan` and active `plan`.
+It measures the actual source archive and each selected producer program's size and hash.
+It retains exact compiler inputs, original producer run/attempt/job and exact Build prefixes.
+It needs no future OCI digest, signing key, OSS session or STS call.
+Publication independently repeats this measurement before its first upload.
+An inventory mismatch stops publication before OSS writes.
+
+```text
+research-release-publisher budget-plan ROOT CONTEXT SOFTWARE_PRODUCTS POLICY
+research-release-publisher budget-init POLICY CONTEXT BUDGET_PLAN ENVELOPE PRIVATE_LEDGER
+research-release-publisher budget-summary PRIVATE_LEDGER
+research-release-capability oss-source POLICY CONTEXT - PRIVATE_LEDGER SESSION
+research-release-capability oss-publish POLICY CONTEXT PLAN PRIVATE_LEDGER SESSION
+```
+
+The old OSS capability argument forms are rejected. No optional unmetered CI route remains.
+Both wrapper modes use the same private path:
+`RUNNER_TEMP/research-oss-budget/RUN_ID/ATTEMPT/PRODUCT/ledger.jsonl`.
+The directory is private. Initialization creates an exclusive permanent marker before the journal.
+An existing marker, missing journal or incomplete journal denies reinitialization.
+Reservations use an exclusive process lock and ordered hash-linked records.
+Each record digest is synced to the permanent marker before syncing the journal and sending.
+Whole-record truncation or interrupted append makes the two files disagree and stops execution.
+Exchange, preflight and publication each have one-time ordered claims.
+Missing, changed, linked, replaced, overdrawn or expired state stops execution.
+Crash recovery never refunds reservations or resumes a consumed exchange.
+A crash can consume the opportunity without sending; this is deliberate fail-closed behavior.
+
+This is a trusted-runner file ledger, not a server-side tamper-proof accounting service.
+A process with the same filesystem identity can destroy all local state.
+The fixed workflow's single job per product, unique run number and attempt-1 approval prevent new-runner reborrowing.
+Do not manually replay the wrapper or restore private ledger backups.
+No code path resets the journal or marker. Future global accounting needs a durable external authority.
+
+For E executable objects and B Builds, N=1+E+3B objects.
+Each object uses one versioning GET, one PUT and one independent GET.
+Preflight adds one versioning GET and one source HEAD.
+Two exchanges add two OIDC GETs and two STS POSTs.
+Total native requests are 3N+6; OSS requests are 3N+2.
+Current catalogue projection yields:
+
+| Product | E / B | Objects | OSS read / write | Native attempts |
+| --- | --- | --- | --- | --- |
+| cex-runner | 7 / 4 | 20 | 42 / 20 | 66 |
+| controller | 5 / 3 | 15 | 32 / 15 | 51 |
+| prediction-runner | 5 / 3 | 15 | 32 / 15 | 51 |
+| All three | 17 / 10 | 50 | 106 / 50 | 168 |
+
+The three independent jobs each reserve their source object; there is no cross-job deduplication claim.
+Source/program limits remain 512 MiB each; each metadata object reserves at most 1 MiB.
+OIDC responses reserve 64 KiB. Each encoded STS form is at most 128 KiB and reserves a 64 KiB response.
+Versioning and PUT responses reserve 4 KiB. Source HEAD reserves zero response payload.
+Artifact GETs reserve the known object size, or 4 KiB if larger error allowance is needed.
+The workflow may allocate a larger conservative response allowance.
+Native initialization rejects a cap that cannot fund the complete measured publication.
+Native publication also verifies remaining funding before its second exchange.
+No automatic HTTP retries or redirects are enabled.
+
+PUT fixes and signs `x-oss-storage-class: Standard` and `x-oss-forbid-overwrite: true`.
+There is no caller storage-class argument.
+A conflict still requires independent byte readback; it does not prove equality.
+Existing object class, bucket redundancy, lifecycle and IAM denial behavior need real deployment verification.
+Standard object selection does not pin these other billing dimensions.
+
+Content-Length above the accepted payload cap fails before body streaming.
+An excessive chunk closes the response instead of extending the reservation.
+HTTP/TLS headers, retransmissions and kernel buffering are outside these counters.
+The estimator's billing overhead remains a model, not a hard billed-wire cap.
+The envelope does not cap continuing storage charges, final invoices, registry traffic or later publications.
+Read-only GitHub metadata/artifact acquisition remains outside the OSS/OIDC/STS counters.
+
+On wrapper exit, `budget-summary` produces `RUNNER_TEMP/research-publication-budget-usage.json`.
+It contains public run/product identity, reserved counters, service counts and consumed stages.
+It omits private paths, cloud identities, policy hashes, STS credentials, JWTs and signing material.
+If the private journal cannot be verified, the wrapper reports `usage_known: false` and fails.
+The workflow must retain this public receipt with `always()`.
+INT and TERM run the exit summary. SIGKILL or runner loss cannot guarantee a receipt.
+A surviving workflow can independently invoke `budget-summary`; destroyed state remains unknown.
+Never retain the private journal, marker or session.
+A missing receipt is not zero expenditure or a successful publication.
+
+ACK uses the explicit independent reader constructor through `oss-import`.
+It cannot use a publisher session or a CI budget session.
+Its existing read-only credential and deployment/fee authority remain separate.
+That constructor cannot run CI preflight or publish; these operations require the CI journal.
+Scientific Run budgets and fenced AttemptWriter remain unchanged.
+
+For migration, install the new wrapper and both matching native executables together.
+Provide the admitted envelope before `check-config`; pass the actual `SOFTWARE_PRODUCTS` in both wrapper modes.
+Retain public usage on success and failure. Do not reuse a previous run's file or private session.
+For rollback, stop publication and retain usage before restoring the matched workflow/binary contract.
+Do not reset a consumed allocation to make rollback run.
+Offline tests verify ledger, payload and authority behavior only.
+Real OIDC/STS, OSS transfer accounting and ACK acceptance remain unexecuted by this change.

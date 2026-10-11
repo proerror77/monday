@@ -68,6 +68,7 @@ impl TlsConfig {
         let mut client = reqwest::Client::builder()
             .timeout(timeout)
             .no_proxy()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none());
         if let Some(path) = &self.ca_file {
             // Explicit private trust replaces public roots for this connection.
@@ -82,6 +83,61 @@ impl TlsConfig {
             client = client.identity(reqwest::Identity::from_pem(&pem(path, true)?)?);
         }
         Ok(client.build()?)
+    }
+}
+/// Bounds accepted application payload. HTTP/TLS buffering can receive extra wire bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BodyReadError {
+    PayloadLimitExceeded,
+    Interrupted,
+}
+impl std::fmt::Display for BodyReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PayloadLimitExceeded => "response payload exceeds reservation",
+            Self::Interrupted => "bounded response interrupted",
+        })
+    }
+}
+impl std::error::Error for BodyReadError {}
+
+pub struct BoundedBody {
+    response: Option<reqwest::Response>,
+    remaining: u64,
+}
+impl BoundedBody {
+    pub fn new(response: reqwest::Response, limit: u64) -> Result<Self> {
+        if response.content_length().is_some_and(|n| n > limit) {
+            return Err(BodyReadError::PayloadLimitExceeded.into());
+        }
+        Ok(Self {
+            response: Some(response),
+            remaining: limit,
+        })
+    }
+    pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        let Some(response) = self.response.as_mut() else {
+            return Ok(None);
+        };
+        let result = response.chunk().await;
+        match result {
+            Ok(Some(chunk)) if chunk.len() as u64 <= self.remaining => {
+                self.remaining -= chunk.len() as u64;
+                Ok(Some(chunk.to_vec()))
+            }
+            Ok(None) => {
+                self.response.take();
+                Ok(None)
+            }
+            Ok(Some(_)) => {
+                self.response.take();
+                Err(BodyReadError::PayloadLimitExceeded.into())
+            }
+            Err(_) => {
+                self.response.take();
+                Err(BodyReadError::Interrupted.into())
+            }
+        }
     }
 }
 #[cfg(test)]
@@ -125,6 +181,103 @@ mod tests {
         }
         .client(Duration::from_secs(1), true)
         .is_err());
+        Ok(())
+    }
+    async fn response(raw: &'static [u8]) -> Result<reqwest::Response> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(raw).await.unwrap();
+        });
+        Ok(TlsConfig::default()
+            .client(Duration::from_secs(2), false)?
+            .get(format!("http://{address}/"))
+            .send()
+            .await?)
+    }
+    #[tokio::test]
+    async fn accepted_payload_rejects_declared_and_chunked_overflow() -> Result<()> {
+        let declared =
+            response(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678")
+                .await?;
+        let error = BoundedBody::new(declared, 4).err().unwrap();
+        assert_eq!(
+            error.downcast_ref::<BodyReadError>(),
+            Some(&BodyReadError::PayloadLimitExceeded)
+        );
+        let chunked=response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\n12345678\r\n0\r\n\r\n").await?;
+        let mut body = BoundedBody::new(chunked, 4)?;
+        let error = body.chunk().await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<BodyReadError>(),
+            Some(&BodyReadError::PayloadLimitExceeded)
+        );
+        assert!(body.chunk().await?.is_none());
+        let valid =
+            response(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n1234")
+                .await?;
+        let mut body = BoundedBody::new(valid, 4)?;
+        assert_eq!(body.chunk().await?, Some(b"1234".to_vec()));
+        assert!(body.chunk().await?.is_none());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn interrupted_body_remains_distinct_from_payload_overflow() -> Result<()> {
+        let response =
+            response(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nshort")
+                .await?;
+        let mut body = BoundedBody::new(response, 8)?;
+        let error = loop {
+            match body.chunk().await {
+                Err(error) => break error,
+                Ok(Some(_)) => {}
+                Ok(None) => anyhow::bail!("truncated HTTP body completed successfully"),
+            }
+        };
+        assert_eq!(
+            error.downcast_ref::<BodyReadError>(),
+            Some(&BodyReadError::Interrupted)
+        );
+        assert!(body.chunk().await?.is_none());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn publication_client_does_not_redirect_or_retry_status_failures() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for code in ["307 Temporary Redirect", "503 Service Unavailable"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let target = format!("http://{address}/unexpected");
+            let task = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(std::str::from_utf8(&buffer[..n])
+                    .unwrap()
+                    .starts_with("GET /initial "));
+                socket.write_all(format!("HTTP/1.1 {code}\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                drop(socket);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let result = TlsConfig::default()
+                .client(Duration::from_secs(2), false)?
+                .get(format!("http://{address}/initial"))
+                .send()
+                .await?;
+            assert_eq!(
+                result.status().as_u16(),
+                if code.starts_with("307") { 307 } else { 503 }
+            );
+            task.await?;
+        }
         Ok(())
     }
 }

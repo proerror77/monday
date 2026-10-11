@@ -143,7 +143,39 @@ abort 'manual rebuild bypasses environment admission' unless jobs.fetch('researc
 steps=pub.fetch('steps'); recheck=steps.find {|s|s['name']=='Recheck automatic publication before credential use'}
 abort 'recheck is not the first step after checkout' unless steps.index(recheck)==1
 abort 'automatic recheck receives secrets' if recheck.to_s.include?('secrets.')
-abort 'research and ordinary publication checks diverged' unless (steps-[recheck])==ordinary.fetch('steps')
+budgets=steps.select {|s|s['name']=='Admit cumulative research publication budget before cloud use'}
+abort 'missing or ambiguous budget gate' unless budgets.length==1
+budget=budgets.fetch(0)
+abort 'budget gate gained credentials or lost selection' unless budget.fetch('if')=='matrix.research_artifact' && budget.fetch('env')=={
+  'MONDAY_RESEARCH_PUBLICATION_BUDGET'=>'${{ vars.MONDAY_RESEARCH_PUBLICATION_BUDGET }}',
+  'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}',
+  'SOURCE_SHA'=>'${{ needs.selector.outputs.source_sha }}',
+  'PRODUCTS'=>'${{ needs.selector.outputs.research_products }}'
+} && budget.fetch('run').include?('research-publication-budget.sh admit')
+consumption_steps=steps.select {|s|s['name']=='Retain public research publication budget consumption'}
+abort 'missing or ambiguous consumption retention' unless consumption_steps.length==1
+consumption=consumption_steps.fetch(0)
+abort 'failed publication consumption is not retained safely' unless consumption=={
+  'name'=>'Retain public research publication budget consumption',
+  'if'=>'${{ always() && matrix.research_artifact }}',
+  'uses'=>'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+  'with'=>{
+    'name'=>'research-publication-budget-${{ needs.selector.outputs.source_sha }}-${{ matrix.product }}',
+    'path'=>["${{ runner.temp }}/research-publication-budget-admission.json", "${{ runner.temp }}/research-publication-native-budget.json", "${{ runner.temp }}/research-publication-budget-usage.json"].join("\n")+"\n",
+    'if-no-files-found'=>'warn', 'retention-days'=>7
+  }
+}
+[pub,ordinary].each do |job|
+  config=job.fetch('steps').find {|s|s['run']=='.github/scripts/publish-research-build-release.sh check-config'}
+  abort 'native budget plan lacks compiled product selection' unless config.fetch('env').fetch('SOFTWARE_PRODUCTS')=='${{ needs.selector.outputs.research_product }}'
+end
+comparison=Marshal.load(Marshal.dump(steps-[recheck,budget,consumption]))
+retention=comparison.find {|s|s['name']=='Retain native Build release projection'}
+paths=retention.fetch('with').fetch('path').lines
+budget_paths=["${{ runner.temp }}/research-publication-budget-admission.json\n", "${{ runner.temp }}/research-publication-native-budget.json\n"]
+abort 'native budget evidence paths are missing or duplicated' unless budget_paths.all? {|p|paths.count(p)==1}
+retention.fetch('with')['path']=(paths-budget_paths).join
+abort 'research and ordinary publication checks diverged' unless comparison==ordinary.fetch('steps')
 abort 'manual approval/dispatch entered automatic workflow' if workflow.to_s.match?(/review_source_sha|dispatch-research|prepare-research-publication-review|research-publication-environment-probe|actions:\s*write/)
 selector=jobs.fetch('selector').fetch('steps').find {|s|s['id']=='select'}
 File.write(File.join(ARGV[1],'selector.sh'),selector.fetch('run'))
