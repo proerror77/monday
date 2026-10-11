@@ -27,6 +27,13 @@ Signed archives retain the original native private ledger and signing rules.
 Archive matrices stay serial because products share a source archive. Release,
 Claude and monitor identities are unchanged.
 
+Automatic `workflow_run` publication restores Docker layer caches without
+exporting to the read-only GitHub cache. Manual main publication may export an
+optional cache with `ignore-error=true`. Cache export failure never cancels
+registry delivery; image push, executable verification and receipts remain
+mandatory. This follows Docker's
+[cache write restrictions](https://docs.docker.com/build/ci/github-actions/cache/#cache-write-restrictions).
+
 ## Completion and retries
 
 A failed overall workflow or OSS stage does not erase a successful per-product

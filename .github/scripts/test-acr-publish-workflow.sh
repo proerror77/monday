@@ -303,6 +303,19 @@ abort 'OCI depends on archive configuration' unless image.fetch('needs')==['sele
 abort 'OCI receives signing, OSS or fee configuration' if image.to_s.match?(/MONDAY_RELEASE_|PUBLICATION_OPERATIONS|PUBLICATION_BUDGET|research-publication-budget|publish-research-build-release/)
 abort 'OCI has no evidence-based retry' unless image.fetch('steps').any? { |step| step.fetch('run','').include?('research-oci-delivery.rb reuse') }
 abort 'OCI receipt is not retained independently' unless image.fetch('steps').any? { |step| step.fetch('name','')=='Retain independent OCI delivery receipt' }
+%w[publish-research-images publish-ordinary].each do |job_id|
+  job=acr.fetch('jobs').fetch(job_id)
+  build=job.fetch('steps').find { |step| step['name']=='Build and push' }
+  abort 'image build or push errors are suppressed' if job.key?('continue-on-error') || build.key?('continue-on-error')
+  options=build.fetch('with')
+  abort 'read-only delivery lost cache restoration' unless options.fetch('cache-from')=='type=gha,scope=acr-${{ matrix.repository }}'
+  expected="${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && format('type=gha,mode=min,scope=acr-{0},ignore-error=true', matrix.repository) || '' }}"
+  abort 'read-only event exports cache or optional export can cancel push' unless options.fetch('cache-to')==expected
+  abort 'cache policy disables registry publication' unless options.fetch('push')==true
+  verify=job.fetch('steps').find { |step| step['name']=='Record verified ACR publication' }
+  abort 'cache policy removed mandatory publication readback' unless verify && !verify.key?('continue-on-error') && !verify.key?('if')
+  abort 'cache policy grants cache write authority' if job.key?('cache-mode') || acr.key?('cache-mode')
+end
 abort 'issuer compilation can access injected release credentials' unless compile && compile<preflight && steps.fetch(compile).fetch('if')=='matrix.research_artifact' && steps.fetch(compile).fetch('env').keys==['CARGO_TARGET_DIR'] && steps.fetch(compile).fetch('run').include?('cargo build')
 abort 'capability exchange was not compiled before secrets' unless steps.fetch(compile).fetch('run').include?('--bin research-release-capability')
 abort 'missing settings can reach expensive publication preparation' unless presence && download && presence<download && presence<compile && steps.fetch(presence).fetch('if')=='matrix.research_artifact' && steps.fetch(presence).fetch('run').include?('publish-research-build-release.sh check-presence')
