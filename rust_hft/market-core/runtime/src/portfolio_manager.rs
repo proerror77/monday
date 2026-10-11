@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hft_core::VenueId;
 use ports::RiskManager;
@@ -13,6 +13,7 @@ use crate::system_builder::{PortfolioSpec, StrategyConfig};
 pub struct PortfolioManager {
     definitions: Vec<PortfolioSpec>,
     strategy_to_portfolio: HashMap<String, Vec<String>>, // strategy -> portfolios
+    known_strategies: HashSet<String>,
 }
 
 impl PortfolioManager {
@@ -36,9 +37,15 @@ impl PortfolioManager {
             }
         }
 
+        let known_strategies = strategies
+            .iter()
+            .map(|strategy| strategy.name.clone())
+            .chain(strategy_to_portfolio.keys().cloned())
+            .collect();
         Self {
             definitions,
             strategy_to_portfolio,
+            known_strategies,
         }
     }
 
@@ -82,6 +89,7 @@ impl PortfolioBudgetRiskManager {
         &self,
         items: Vec<T>,
         account: &ports::AccountView,
+        pending: &[ports::PendingRiskExposure],
         intent_of: impl Fn(&T) -> &ports::OrderIntent,
     ) -> Vec<T> {
         let specs: HashMap<&str, &PortfolioSpec> = self
@@ -109,10 +117,16 @@ impl PortfolioBudgetRiskManager {
                     reject_reason = Some("missing portfolio definition");
                     break;
                 };
-                let mut projector = projectors
-                    .get(portfolio_name)
-                    .cloned()
-                    .unwrap_or_else(|| ExposureProjector::new(account));
+                let mut projector = match projectors.get(portfolio_name) {
+                    Some(projector) => projector.clone(),
+                    None => match self.project_portfolio(account, pending, portfolio_name) {
+                        Ok(projector) => projector,
+                        Err(reason) => {
+                            reject_reason = Some(reason);
+                            break;
+                        }
+                    },
+                };
                 let projected = match projector.project(intent) {
                     Ok(projected) => projected,
                     Err(reason) => {
@@ -150,16 +164,57 @@ impl PortfolioBudgetRiskManager {
         approved
     }
 
+    fn project_portfolio(
+        &self,
+        account: &ports::AccountView,
+        pending: &[ports::PendingRiskExposure],
+        portfolio: &str,
+    ) -> Result<ExposureProjector, &'static str> {
+        let mut projector = ExposureProjector::new(account);
+        for exposure in pending {
+            // A missing/unknown owner cannot prove separation. Charge every portfolio.
+            let belongs = !self
+                .manager
+                .known_strategies
+                .contains(&exposure.strategy_id)
+                || self
+                    .manager
+                    .strategy_to_portfolio
+                    .get(&exposure.strategy_id)
+                    .is_some_and(|names| names.iter().any(|name| name == portfolio));
+            if belongs {
+                projector.reserve_pending(exposure)?;
+            }
+        }
+        Ok(projector)
+    }
+
     fn filter(
         &self,
         intents: Vec<ports::OrderIntent>,
         account: &ports::AccountView,
     ) -> Vec<ports::OrderIntent> {
-        self.filter_items(intents, account, |intent| intent)
+        self.filter_items(intents, account, &[], |intent| intent)
     }
 }
 
 impl RiskManager for PortfolioBudgetRiskManager {
+    fn review_envelopes_with_risk_context(
+        &mut self,
+        envelopes: Vec<ports::OrderIntentEnvelope>,
+        context: ports::RiskReviewContext<'_>,
+        venue_specs: &HashMap<VenueId, ports::VenueSpec>,
+    ) -> Vec<ports::OrderIntentEnvelope> {
+        let filtered = self.filter_items(
+            envelopes,
+            context.account,
+            context.pending_exposure,
+            |envelope| &envelope.intent,
+        );
+        self.base_risk_manager
+            .review_envelopes_with_risk_context(filtered, context, venue_specs)
+    }
+
     fn review_orders(
         &mut self,
         intents: Vec<ports::OrderIntent>,
@@ -198,13 +253,18 @@ impl RiskManager for PortfolioBudgetRiskManager {
         account: &ports::AccountView,
         venue_specs: &HashMap<VenueId, ports::VenueSpec>,
     ) -> Vec<ports::OrderIntentEnvelope> {
-        let filtered = self.filter_items(envelopes, account, |envelope| &envelope.intent);
+        let filtered = self.filter_items(envelopes, account, &[], |envelope| &envelope.intent);
         self.base_risk_manager
             .review_envelopes_with_venue_specs(filtered, account, venue_specs)
     }
 
     fn on_execution_event(&mut self, event: &ports::ExecutionEvent) {
         self.base_risk_manager.on_execution_event(event)
+    }
+
+    fn on_unsent_intent_rejection(&mut self, reason: &str, timestamp: hft_core::Timestamp) {
+        self.base_risk_manager
+            .on_unsent_intent_rejection(reason, timestamp);
     }
 
     fn emergency_stop(&mut self) -> Result<(), hft_core::HftError> {

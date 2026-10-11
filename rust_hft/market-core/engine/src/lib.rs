@@ -12,6 +12,7 @@ pub mod execution_queues;
 pub mod execution_worker;
 pub mod latency_monitor;
 pub mod rate_budget;
+mod risk_reservations;
 
 use aggregation::{AggregationEngine, MarketView, TopNSnapshot};
 use dataflow::{EventConsumer, IngestionConfig};
@@ -43,6 +44,7 @@ pub use execution_queues::{
     create_execution_queues, ExecutionQueueConfig, LifecycleIntentSubmitError, WorkerQueues,
 };
 pub use execution_worker::{spawn_execution_worker, ExecutionWorker, ExecutionWorkerConfig};
+pub use risk_reservations::RiskReservationCheckpoint;
 
 /// 交易狀態模式（由 Sentinel 控制）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -272,6 +274,8 @@ pub struct Engine {
     /// Runtime-owned state awaiting transfer to the single execution worker.
     pending_execution_rate_budget: (rate_budget::RateBudget, HashMap<AccountId, String>),
     execution_price_protection: HashMap<VenueId, ports::ExecutionPriceProtection>,
+    risk_reservations: risk_reservations::RiskReservations,
+    final_cancel_venues: HashSet<VenueId>,
     /// 執行回報流（與 execution_clients 對應）
     #[allow(dead_code)]
     execution_streams: Vec<BoxStream<ExecutionEvent>>,
@@ -281,6 +285,8 @@ pub struct Engine {
     portfolio_manager: Option<Box<dyn PortfolioManager>>,
     /// 执行队列系统 (SPSC)
     execution_queues: Option<EngineQueues>,
+    execution_control_sender:
+        Option<tokio::sync::mpsc::UnboundedSender<execution_worker::ControlCommand>>,
     /// 運行統計
     stats: EngineStats,
     /// 暫存的市場事件（從聚合引擎產生）
@@ -293,7 +299,7 @@ pub struct Engine {
     /// 復用的策略意圖工作緩衝，減少熱路徑 Vec 分配
     intents_work_buf: Vec<ports::OrderIntentEnvelope>,
     /// 復用的執行事件緩衝，避免每 tick 分配
-    execution_events_buf: Vec<ExecutionEvent>,
+    execution_events_buf: Vec<execution_queues::ExecutionReport>,
     /// 事件驱动唤醒通知器
     wakeup_notify: Arc<Notify>,
     /// 訂單提交時間（用於 Ack/Fill 延遲計算）
@@ -367,10 +373,13 @@ impl Engine {
             execution_clients: Vec::new(),
             pending_execution_rate_budget: Default::default(),
             execution_price_protection: HashMap::new(),
+            risk_reservations: Default::default(),
+            final_cancel_venues: HashSet::new(),
             execution_streams: Vec::new(),
             order_manager: None,
             portfolio_manager: None,
             execution_queues: None,
+            execution_control_sender: None,
             stats: EngineStats {
                 cycle_count: 0,
                 is_running: true, // 默認為運行狀態，讓 tick() 可以正常運作
@@ -483,6 +492,83 @@ impl Engine {
         self.execution_price_protection = modes;
     }
 
+    /// Runtime binds only in-process simulated venues whose cancel follows all final fills.
+    /// External venue cancellation has no final cumulative quantity and requires readback.
+    pub fn set_final_cancellation_venues(&mut self, venues: HashSet<VenueId>) {
+        self.final_cancel_venues = venues;
+    }
+
+    pub fn export_risk_reservations(&self) -> RiskReservationCheckpoint {
+        self.risk_reservations.export()
+    }
+
+    /// Restore alongside OMS/Portfolio. A snapshot alone never grants permission to resume.
+    pub fn import_risk_reservations(
+        &mut self,
+        checkpoint: RiskReservationCheckpoint,
+    ) -> HftResult<()> {
+        self.pause_trading();
+        self.risk_reservations.restore(checkpoint)
+    }
+
+    pub(crate) fn ensure_risk_resume_ready(&self) -> HftResult<()> {
+        if self.reconciliation_halt {
+            return Err(HftError::Risk(
+                "canonical execution state requires independent reconciliation".into(),
+            ));
+        }
+        if self.risk_reservations.has_queued() {
+            return Err(HftError::Risk(
+                "queued or unknown submissions must reconcile before resume".into(),
+            ));
+        }
+        self.risk_reservations
+            .view(&self.get_account_view(), self.order_manager.as_deref())?;
+        Ok(())
+    }
+
+    pub(crate) fn confirm_risk_readback(
+        &mut self,
+        snapshot: &execution_worker::WorkerReconcileSnapshot,
+    ) -> HftResult<()> {
+        if self.reconciliation_halt {
+            return Err(HftError::Risk(
+                "unresolved canonical execution exceptions prevent risk confirmation".into(),
+            ));
+        }
+        let account = self.get_account_view();
+        let orders = self.export_oms_state();
+        let mut exchange_order_ids = HashSet::new();
+        let mut exchange_client_ids = HashSet::new();
+        for order in snapshot
+            .clients
+            .iter()
+            .filter_map(|client| client.open_orders.as_ref().ok())
+            .flatten()
+        {
+            exchange_order_ids.insert(&order.order_id);
+            if let Some(client_id) = order.client_order_id.as_deref() {
+                exchange_client_ids.insert(client_id);
+            }
+        }
+        self.risk_reservations.confirm_readback(
+            &account,
+            &orders,
+            &exchange_order_ids,
+            &exchange_client_ids,
+        )
+    }
+
+    pub(crate) fn validate_replacement_risk(
+        &self,
+        order: &ports::OrderRecord,
+        quantity: Option<hft_core::Quantity>,
+        price: Option<Price>,
+    ) -> HftResult<()> {
+        self.risk_reservations
+            .validate_replace(order.into(), quantity, price)
+    }
+
     fn price_protection_for(&self, intent: &ports::OrderIntent) -> ports::ExecutionPriceProtection {
         intent
             .target_venue
@@ -493,6 +579,41 @@ impl Engine {
     /// 设置执行队列系统（Runtime 设置）
     pub fn set_execution_queues(&mut self, queues: EngineQueues) {
         self.execution_queues = Some(queues);
+    }
+
+    /// Runtime binds the same single-worker control queue used by operator pause/resume.
+    pub fn set_execution_control_sender(
+        &mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<execution_worker::ControlCommand>,
+    ) {
+        self.execution_control_sender = Some(sender);
+        if matches!(
+            self.trading_mode(),
+            TradingMode::Paused | TradingMode::Emergency
+        ) {
+            self.request_worker_intake_pause();
+        }
+    }
+
+    fn request_worker_intake_pause(&self) {
+        if let Some(sender) = &self.execution_control_sender {
+            let (reply, _) = tokio::sync::oneshot::channel();
+            if sender
+                .send(execution_worker::ControlCommand::SetIntake {
+                    enabled: false,
+                    reply,
+                })
+                .is_err()
+            {
+                warn!("execution worker control queue is closed while pausing intake");
+            }
+        }
+    }
+
+    fn latch_reconciliation_halt(&mut self) {
+        self.reconciliation_halt = true;
+        self.risk_reservations.require_recovery();
+        self.pause_trading();
     }
 
     fn receive_latency_anchor(
@@ -506,11 +627,21 @@ impl Engine {
 
     /// 設置訂單管理器（依賴注入）
     pub fn set_order_manager(&mut self, manager: Box<dyn OrderManager>) {
+        if self.order_manager.is_some() || !manager.export_state().is_empty() {
+            self.risk_reservations.owners_restored();
+            self.pause_trading();
+        }
         self.order_manager = Some(manager);
     }
 
     /// 設置 Portfolio 管理器（依賴注入）
     pub fn set_portfolio_manager(&mut self, manager: Box<dyn PortfolioManager>) {
+        if self.portfolio_manager.is_some() {
+            self.risk_reservations.owners_restored();
+            self.pause_trading();
+        }
+        // Direct admission can run before the first market tick; bind the actual account now.
+        self.account_snapshots.store(manager.reader().load());
         self.portfolio_manager = Some(manager);
     }
 
@@ -727,6 +858,8 @@ impl Engine {
 
     /// 導入 OMS 狀態（供恢復/持久化使用）
     pub fn import_oms_state(&mut self, state: HashMap<hft_core::OrderId, ports::OrderRecord>) {
+        self.risk_reservations.owners_restored();
+        self.pause_trading();
         self.order_account_map.clear();
         self.order_account_map
             .extend(state.iter().filter_map(|(order_id, record)| {
@@ -741,6 +874,8 @@ impl Engine {
     }
 
     pub fn import_oms_checkpoint(&mut self, checkpoint: ports::OmsCheckpoint) -> HftResult<()> {
+        self.risk_reservations.owners_restored();
+        self.pause_trading();
         self.order_account_map.clear();
         self.order_account_map
             .extend(checkpoint.orders.iter().filter_map(|(order_id, record)| {
@@ -750,7 +885,7 @@ impl Engine {
                     .map(|account_id| (order_id.clone(), account_id.clone()))
             }));
         if !checkpoint.reconciliation_exceptions.is_empty() {
-            self.reconciliation_halt = true;
+            self.latch_reconciliation_halt();
         }
         if let Some(om) = &mut self.order_manager {
             om.import_checkpoint(checkpoint)
@@ -793,11 +928,13 @@ impl Engine {
 
     /// 導入 Portfolio 狀態（供恢復/持久化使用）
     pub fn import_portfolio_state(&mut self, state: ports::PortfolioState) -> HftResult<()> {
+        self.risk_reservations.owners_restored();
+        self.pause_trading();
         let restored_deduper =
             AccountingEventDeduper::from_portfolio_state(&state, ACCOUNTING_EVENT_DEDUP_CAPACITY)?;
         self.applied_accounting_event_ids = restored_deduper;
         if !state.reconciliation_exceptions.is_empty() {
-            self.reconciliation_halt = true;
+            self.latch_reconciliation_halt();
         }
         if let Some(pm) = &mut self.portfolio_manager {
             pm.try_import_state(state).map_err(HftError::Execution)?;
@@ -1184,37 +1321,15 @@ impl Engine {
         if let Some(account_id) = account_id {
             envelope = envelope.with_account_id(account_id);
         }
-        let price_protection = self.price_protection_for(&envelope.intent);
-        if let Some(queues) = &mut self.execution_queues {
-            match queues.send_lifecycle_intent_with_price_protection(
-                envelope,
-                now,
-                None,
-                price_protection,
-            ) {
-                Ok(()) => {
-                    debug!("成功提交訂單意圖到執行隊列");
-                    Ok(())
-                }
-                Err(execution_queues::LifecycleIntentSubmitError::LifecycleRejected {
-                    reason,
-                    ..
-                }) => Err(HftError::Risk(format!(
-                    "intent execution limit rejected order: {reason:?}"
-                ))),
-                Err(execution_queues::LifecycleIntentSubmitError::QueueFull { envelope }) => {
-                    warn!(
-                        "執行隊列滿載，訂單意圖被拒絕: {} {}",
-                        envelope.intent.symbol.as_str(),
-                        envelope.intent.quantity.0
-                    );
-                    Err(HftError::Execution("執行隊列滿載".to_string()))
-                }
-            }
-        } else {
-            warn!("執行隊列未初始化，無法提交訂單意圖");
-            Err(HftError::Execution("執行隊列未初始化".to_string()))
-        }
+        self.validate_intent_queue_gate(&envelope, now, None)
+            .map_err(|reason| {
+                HftError::Risk(format!("intent execution limit rejected order: {reason:?}"))
+            })?;
+        let envelope = self
+            .review_risk_envelopes(vec![envelope])?
+            .pop()
+            .ok_or_else(|| HftError::Risk("risk review rejected order intent".into()))?;
+        self.enqueue_reserved_intent(envelope, now, None)
     }
 
     /// 提交帶生命週期的訂單意圖到執行隊列。
@@ -1243,40 +1358,156 @@ impl Engine {
                 .target_venue
                 .map(|venue| VenueSymbol::new(venue, envelope.intent.symbol.clone()));
         }
-        if let Some(queues) = &mut self.execution_queues {
-            match queues.send_lifecycle_intent_with_price_protection(
-                envelope,
-                now,
-                latest_book_seq,
-                price_protection,
-            ) {
-                Ok(()) => {
-                    debug!("成功提交帶生命週期的訂單意圖到執行隊列");
-                    Ok(())
-                }
-                Err(execution_queues::LifecycleIntentSubmitError::LifecycleRejected {
-                    reason,
-                    ..
-                }) => {
-                    warn!("訂單意圖生命週期 gate 拒絕: {:?}", reason);
-                    Err(HftError::Execution(format!(
-                        "訂單意圖生命週期 gate 拒絕: {:?}",
-                        reason
-                    )))
-                }
-                Err(execution_queues::LifecycleIntentSubmitError::QueueFull { envelope }) => {
-                    warn!(
-                        "執行隊列滿載，訂單意圖被拒絕: {} {}",
-                        envelope.intent.symbol.as_str(),
-                        envelope.intent.quantity.0
-                    );
-                    Err(HftError::Execution("執行隊列滿載".to_string()))
-                }
+        self.validate_intent_queue_gate(&envelope, now, latest_book_seq)
+            .map_err(|reason| {
+                HftError::Execution(format!("intent lifecycle rejected: {reason:?}"))
+            })?;
+        let envelope = self
+            .review_risk_envelopes(vec![envelope])?
+            .pop()
+            .ok_or_else(|| HftError::Risk("risk review rejected order intent".into()))?;
+        self.enqueue_reserved_intent(envelope, now, latest_book_seq)
+    }
+
+    fn validate_intent_queue_gate(
+        &self,
+        envelope: &ports::OrderIntentEnvelope,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), ports::OrderIntentRejectReason> {
+        match self.price_protection_for(&envelope.intent) {
+            ports::ExecutionPriceProtection::CanonicalBook => {
+                envelope.validate_canonical_book_pre_execution(now, latest_book_seq)
             }
-        } else {
-            warn!("執行隊列未初始化，無法提交訂單意圖");
-            Err(HftError::Execution("執行隊列未初始化".to_string()))
+            ports::ExecutionPriceProtection::VenueQuote => {
+                envelope.validate_pre_execution(now, latest_book_seq)
+            }
         }
+    }
+
+    fn review_risk_envelopes(
+        &mut self,
+        envelopes: Vec<ports::OrderIntentEnvelope>,
+    ) -> HftResult<Vec<ports::OrderIntentEnvelope>> {
+        if self.risk_manager.is_none() {
+            return Ok(envelopes);
+        }
+        if self.order_manager.is_none() || self.portfolio_manager.is_none() {
+            return Err(HftError::Risk(
+                "risk admission requires canonical OMS and Portfolio owners".into(),
+            ));
+        }
+        let account = self.get_account_view();
+        let mut risk_view = match self
+            .risk_reservations
+            .view(&account, self.order_manager.as_deref())
+        {
+            Ok(view) => view,
+            Err(error) => {
+                self.risk_reservations.require_recovery();
+                self.pause_trading();
+                return Err(error);
+            }
+        };
+        let mut accepted = Vec::with_capacity(envelopes.len());
+        // Market execution keeps its actual arrival reference; risk reviews the admitted
+        // worst-case price instead. Never value a market reservation from a later quote.
+        for mut envelope in envelopes {
+            let valuation = match risk_reservations::Valuation::from_envelope(&envelope) {
+                Ok(valuation) => valuation,
+                Err(error) => {
+                    warn!(%error, "unpriceable pending order risk rejected");
+                    continue;
+                }
+            };
+            let market_price = (envelope.intent.order_type == OrderType::Market)
+                .then_some((envelope.intent.price, valuation.risk_price()));
+            if let Some((_, bound)) = market_price {
+                let tick = envelope
+                    .intent
+                    .target_venue
+                    .and_then(|venue| self.venue_specs.get(&venue))
+                    .or_else(|| self.venue_specs.values().next())
+                    .map(|spec| spec.tick_size.0)
+                    .filter(|tick| *tick > Decimal::ZERO);
+                let price = match tick {
+                    Some(tick) => bound
+                        .0
+                        .checked_div(tick)
+                        .map(|value| value.ceil())
+                        .and_then(|value| value.checked_mul(tick)),
+                    None => Some(bound.0),
+                };
+                let Some(price) = price else {
+                    continue;
+                };
+                envelope.intent.price = Some(Price(price));
+            }
+            let reviewed = self
+                .risk_manager
+                .as_mut()
+                .expect("risk manager checked")
+                .review_envelopes_with_risk_context(
+                    vec![envelope],
+                    ports::RiskReviewContext {
+                        account: &account,
+                        exposure: &risk_view.account,
+                        pending_exposure: &risk_view.pending,
+                    },
+                    &self.venue_specs,
+                );
+            for mut envelope in reviewed {
+                if let Some((price, bound)) = market_price {
+                    if envelope
+                        .intent
+                        .price
+                        .is_none_or(|reviewed| reviewed.0 < bound.0)
+                    {
+                        continue;
+                    }
+                    envelope.intent.price = price;
+                }
+                // Approved opposite orders remain gross risk until execution proves their fills.
+                risk_reservations::Valuation::from_envelope(&envelope)?
+                    .add_to_view(&mut risk_view)?;
+                accepted.push(envelope);
+            }
+        }
+        Ok(accepted)
+    }
+
+    fn enqueue_reserved_intent(
+        &mut self,
+        envelope: ports::OrderIntentEnvelope,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> HftResult<()> {
+        self.ensure_accepting_new_intents()?;
+        let price_protection = self.price_protection_for(&envelope.intent);
+        let valuation = risk_reservations::Valuation::from_envelope(&envelope)?;
+        let client_id = envelope.client_order_id.clone();
+        let queues = self
+            .execution_queues
+            .as_mut()
+            .ok_or_else(|| HftError::Execution("execution queues are not initialized".into()))?;
+        self.risk_reservations.reserve(valuation)?;
+        let result = queues.send_lifecycle_intent_with_price_protection(
+            envelope,
+            now,
+            latest_book_seq,
+            price_protection,
+        );
+        if result.is_err() {
+            self.risk_reservations.remove_unsent(&client_id);
+        }
+        result.map_err(|error| match error {
+            execution_queues::LifecycleIntentSubmitError::LifecycleRejected { reason, .. } => {
+                HftError::Risk(format!("intent lifecycle rejected: {reason:?}"))
+            }
+            execution_queues::LifecycleIntentSubmitError::QueueFull { .. } => {
+                HftError::Execution("execution intent queue is full".into())
+            }
+        })
     }
 
     /// 單次事件循環
@@ -1448,25 +1679,8 @@ impl Engine {
         }
 
         // 階段 2: 處理執行事件 (來自执行队列) - 非阻塞批量接收
-        let mut exec_processed = 0u32;
-        let mut execution_events_buf = std::mem::take(&mut self.execution_events_buf);
-        execution_events_buf.clear();
-        if let Some(queues) = &mut self.execution_queues {
-            queues.receive_events_into(&mut execution_events_buf);
-        }
-        for ev in &execution_events_buf {
-            self.handle_execution_event(ev)?;
-            exec_processed += 1;
-            self.stats.execution_events_processed += 1;
-            if let ExecutionEvent::ExecutionStreamSynchronized { stream_id, .. } = ev {
-                if let Some(queues) = &self.execution_queues {
-                    queues.acknowledge_applied_execution_stream(*stream_id);
-                }
-            }
-        }
+        let exec_processed = self.drain_execution_reports()?;
         result.execution_events_processed = exec_processed;
-        execution_events_buf.clear();
-        self.execution_events_buf = execution_events_buf;
 
         // 階段 3: 檢查是否需要發佈快照
         if should_flip
@@ -1516,6 +1730,72 @@ impl Engine {
         }
 
         Ok(result)
+    }
+
+    /// Apply one bounded batch through the canonical owners without running strategies.
+    /// Startup bootstrap uses this same path for connection/synchronization markers.
+    pub(crate) fn drain_execution_reports(&mut self) -> HftResult<u32> {
+        let limit = self
+            .execution_queues
+            .as_ref()
+            .map_or(0, |queues| queues.report_batch_size());
+        self.drain_execution_reports_up_to(limit)
+    }
+
+    /// After the worker pause ACK, apply the already-published FIFO prefix before readback.
+    /// The Engine guard keeps the consumer exclusive; new producer appends cannot extend work.
+    pub(crate) fn drain_pause_readback_prefix(&mut self) -> HftResult<u32> {
+        let limit = self
+            .execution_queues
+            .as_ref()
+            .map_or(0, |queues| queues.pending_report_count());
+        self.drain_execution_reports_up_to(limit)
+    }
+
+    fn drain_execution_reports_up_to(&mut self, limit: usize) -> HftResult<u32> {
+        let mut processed = 0u32;
+        let mut events = std::mem::take(&mut self.execution_events_buf);
+        events.clear();
+        if let Some(queues) = &mut self.execution_queues {
+            queues.receive_reports_into(&mut events, limit);
+        }
+        let mut first_error = None;
+        for report in &events {
+            if let Err(error) = self.handle_execution_report(&report.event, report.origin) {
+                self.latch_reconciliation_halt();
+                first_error.get_or_insert(error);
+                // Later reports may contain already-admitted fills. Apply the entire
+                // bounded batch while intake stays closed, retaining the original error.
+                continue;
+            }
+            processed += 1;
+            self.stats.execution_events_processed += 1;
+        }
+        // A marker may precede a failing report in the same batch. Confirm only once
+        // every report has been applied, reusing the batch without another allocation.
+        if first_error.is_none() && !self.reconciliation_halt {
+            for report in &events {
+                if let ExecutionEvent::ExecutionStreamSynchronized { stream_id, .. } = &report.event
+                {
+                    if let Some(queues) = &self.execution_queues {
+                        queues.acknowledge_applied_execution_stream(*stream_id);
+                    }
+                }
+            }
+        }
+        events.clear();
+        self.execution_events_buf = events;
+        // tick() returns early on an error. Publish successfully applied accounting now
+        // so independent reconciliation cannot read a snapshot from before this batch.
+        if processed > 0 {
+            if let Some(manager) = &self.portfolio_manager {
+                self.account_snapshots.store(manager.reader().load());
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(processed),
+        }
     }
 
     // 注意：执行客户端连接和流准备现在由 ExecutionWorker 处理
@@ -1606,9 +1886,49 @@ impl Engine {
         Ok(())
     }
 
+    fn quarantine_execution_event(
+        &mut self,
+        event: &ExecutionEvent,
+        order_id: &hft_core::OrderId,
+        reason: String,
+    ) -> Result<(), HftError> {
+        self.latch_reconciliation_halt();
+        if let Some(manager) = &mut self.order_manager {
+            let mut checkpoint = manager.export_checkpoint();
+            checkpoint
+                .reconciliation_exceptions
+                .push(ports::ReconciliationException {
+                    order_id: Some(order_id.clone()),
+                    reason,
+                    event: Some(event.clone()),
+                });
+            manager
+                .import_checkpoint(checkpoint)
+                .map_err(HftError::Execution)?;
+        }
+        Ok(())
+    }
+
     /// 處理單個執行事件
     fn handle_execution_event(&mut self, event: &ExecutionEvent) -> Result<(), HftError> {
-        if self.reconciliation_halt && matches!(event, ExecutionEvent::OrderNew { .. }) {
+        self.handle_execution_report(
+            event,
+            execution_queues::ExecutionReportOrigin::PrivateOrUnknown,
+        )
+    }
+
+    fn handle_execution_report(
+        &mut self,
+        event: &ExecutionEvent,
+        origin: execution_queues::ExecutionReportOrigin,
+    ) -> Result<(), HftError> {
+        let admitted_inflight = matches!(event,
+            ExecutionEvent::OrderNew { client_order_id: Some(client_id), .. }
+                if self.risk_reservations.has_queued_client(client_id));
+        if self.reconciliation_halt
+            && matches!(event, ExecutionEvent::OrderNew { .. })
+            && !admitted_inflight
+        {
             return Err(HftError::Execution(
                 "canonical execution state is halted pending independent reconciliation; new orders are blocked"
                     .to_string(),
@@ -1630,6 +1950,34 @@ impl Engine {
         {
             debug!("忽略重放的成交/費用會計事件: {:?}", event);
             return Ok(());
+        }
+        if let Err(error) = self.risk_reservations.validate_new(event) {
+            self.latch_reconciliation_halt();
+            return Err(error);
+        }
+        let queued_rejection = origin == execution_queues::ExecutionReportOrigin::UnsubmittedIntent
+            && matches!(event, ExecutionEvent::OrderReject { .. });
+        let has_order = match event {
+            ExecutionEvent::OrderReject { order_id, .. } => self
+                .order_manager
+                .as_ref()
+                .is_some_and(|manager| manager.order_risk_view(order_id).is_some()),
+            _ => false,
+        };
+        if let ExecutionEvent::OrderReject { order_id, .. } = event {
+            if !queued_rejection
+                && has_order
+                && self.risk_reservations.has_queued_client(&order_id.0)
+            {
+                // The legacy reject payload has no namespace discriminator. Preserve both
+                // owners until independent evidence identifies which order was rejected.
+                return self.quarantine_execution_event(
+                    event,
+                    order_id,
+                    "rejection identity matches both a queued client and a canonical venue order"
+                        .into(),
+                );
+            }
         }
         // 0. 先處理 OrderNew：註冊訂單元資料（供 Portfolio/OMS 使用）
         if let ExecutionEvent::OrderNew {
@@ -1658,11 +2006,11 @@ impl Engine {
                 }
                 (Some(account_id), _) | (None, Some(account_id)) => account_id,
                 (None, None) => {
-                    warn!(
-                        order_id = %order_id.0,
-                        "ignoring OrderNew without a canonical account identity"
+                    return self.quarantine_execution_event(
+                        event,
+                        order_id,
+                        "OrderNew lacks a canonical account identity".into(),
                     );
-                    return Ok(());
                 }
             };
             // 註冊到 OMS 與 Portfolio（供後續 Fill 計算倉位/PnL）
@@ -1722,6 +2070,29 @@ impl Engine {
             );
         }
 
+        // Validate against the canonical quantities before applying the venue's modification.
+        // The reported state is still applied to OMS, then any unapproved increase latches intake.
+        let modification_risk_error = if let ExecutionEvent::OrderModified {
+            order_id,
+            new_quantity,
+            new_price,
+            ..
+        } = event
+        {
+            self.order_manager
+                .as_ref()
+                .and_then(|manager| manager.order_risk_view(order_id))
+                .ok_or_else(|| {
+                    HftError::Risk("modified order lacks canonical admission identity".into())
+                })
+                .and_then(|order| {
+                    self.risk_reservations
+                        .validate_replace(order, *new_quantity, *new_price)
+                })
+                .err()
+        } else {
+            None
+        };
         let accounting_event = matches!(
             event,
             ExecutionEvent::Fill { .. } | ExecutionEvent::FeeCharged { .. }
@@ -1747,10 +2118,14 @@ impl Engine {
             .unwrap_or_default();
 
         // 1. 更新 OMS 狀態機
-        let order_update = self
-            .order_manager
-            .as_mut()
-            .and_then(|om| om.on_execution_event(event));
+        // A rejected queued intent was never submitted. It has no OMS order to mutate.
+        let order_update = if queued_rejection {
+            None
+        } else {
+            self.order_manager
+                .as_mut()
+                .and_then(|om| om.on_execution_event(event))
+        };
         if accounting_event
             && self
                 .order_manager
@@ -1760,35 +2135,56 @@ impl Engine {
             if let (Some(om), Some(mut checkpoint)) =
                 (&mut self.order_manager, oms_checkpoint.clone())
             {
-                let mut evidence = om.export_checkpoint().reconciliation_exceptions;
-                checkpoint.reconciliation_exceptions.append(&mut evidence);
+                let evidence = om.export_checkpoint().reconciliation_exceptions;
+                checkpoint
+                    .reconciliation_exceptions
+                    .extend(evidence.into_iter().skip(oms_exception_count));
                 if let Err(reason) = om.import_checkpoint(checkpoint) {
                     error!("canonical OMS rollback failed: {}", reason);
                 }
             }
-            self.reconciliation_halt = true;
+            self.latch_reconciliation_halt();
             return Err(HftError::Execution(
                 "canonical OMS retained an execution event for reconciliation; portfolio was not updated"
                     .to_string(),
             ));
         }
-        // 2. 更新 Portfolio 會計
-        if let Some(pm) = &mut self.portfolio_manager {
+        if !accounting_event
+            && self
+                .order_manager
+                .as_ref()
+                .is_some_and(|om| om.reconciliation_exception_count() > oms_exception_count)
+        {
+            // Quarantined reports are evidence, not accepted lifecycle notifications.
+            // Return only from this event; the bounded batch still applies later valid fills.
+            self.latch_reconciliation_halt();
+            return Ok(());
+        }
+        // An unsent rejection has no submitted order to mutate in either canonical owner.
+        if let Some(pm) = self
+            .portfolio_manager
+            .as_mut()
+            .filter(|_| !queued_rejection)
+        {
             pm.on_execution_event(event);
             if accounting_event
                 && pm.export_state().reconciliation_exceptions.len() > portfolio_exception_count
             {
                 if let (Some(om), Some(mut checkpoint)) = (&mut self.order_manager, oms_checkpoint)
                 {
-                    let mut evidence = om.export_checkpoint().reconciliation_exceptions;
-                    checkpoint.reconciliation_exceptions.append(&mut evidence);
+                    let evidence = om.export_checkpoint().reconciliation_exceptions;
+                    checkpoint
+                        .reconciliation_exceptions
+                        .extend(evidence.into_iter().skip(oms_exception_count));
                     if let Err(reason) = om.import_checkpoint(checkpoint) {
                         error!("canonical OMS rollback failed: {}", reason);
                     }
                 }
                 if let Some(mut checkpoint) = portfolio_checkpoint {
-                    let mut evidence = pm.export_state().reconciliation_exceptions;
-                    checkpoint.reconciliation_exceptions.append(&mut evidence);
+                    let evidence = pm.export_state().reconciliation_exceptions;
+                    checkpoint
+                        .reconciliation_exceptions
+                        .extend(evidence.into_iter().skip(portfolio_exception_count));
                     // The evidence append changes the trusted checkpoint
                     // material; the canonical Portfolio recomputes its digest
                     // on the next export after this verified restore.
@@ -1797,7 +2193,7 @@ impl Engine {
                         error!("canonical Portfolio rollback failed: {}", reason);
                     }
                 }
-                self.reconciliation_halt = true;
+                self.latch_reconciliation_halt();
                 return Err(HftError::Execution(
                     "canonical portfolio retained an execution event for reconciliation; OMS was rolled back"
                         .to_string(),
@@ -1805,9 +2201,44 @@ impl Engine {
             }
         }
 
+        if let Some(error) = modification_risk_error {
+            warn!(%error, "venue order modification exceeded its admitted risk; reconciliation required");
+            if let ExecutionEvent::OrderModified { order_id, .. } = event {
+                self.quarantine_execution_event(event, order_id, error.to_string())?;
+            }
+        } else if self
+            .order_manager
+            .as_ref()
+            .is_some_and(|manager| manager.reconciliation_exception_count() > oms_exception_count)
+        {
+            self.latch_reconciliation_halt();
+        }
+
         // Downstream lifecycle effects become visible only after Portfolio
         // acceptance. This keeps a rejected/rolled-back fill from emitting a
         // false completion, metric, or broadcast.
+        let risk_order_id = match event {
+            ExecutionEvent::OrderNew { order_id, .. }
+            | ExecutionEvent::Fill { order_id, .. }
+            | ExecutionEvent::OrderReject { order_id, .. }
+            | ExecutionEvent::OrderCanceled { order_id, .. }
+            | ExecutionEvent::OrderModified { order_id, .. } => Some(order_id),
+            _ => None,
+        };
+        let risk_order = risk_order_id.and_then(|id| {
+            self.order_manager
+                .as_ref()
+                .and_then(|manager| manager.order_risk_view(id))
+        });
+        self.risk_reservations.observe(
+            event,
+            risk_order,
+            &self.final_cancel_venues,
+            queued_rejection,
+        );
+        if !self.risk_reservations.is_ready() {
+            self.pause_trading();
+        }
         if let Some(order_update) = order_update {
             debug!("訂單狀態更新: {:?}", order_update);
             if order_update.status == ports::OrderStatus::Filled
@@ -1881,6 +2312,23 @@ impl Engine {
             _ => {}
         }
 
+        if queued_rejection {
+            if let ExecutionEvent::OrderReject {
+                order_id,
+                reason,
+                timestamp,
+            } = event
+            {
+                if let Some(risk_manager) = &mut self.risk_manager {
+                    risk_manager.on_unsent_intent_rejection(reason, *timestamp);
+                }
+                for strategy in &mut self.strategies {
+                    strategy.observe_unsent_intent_rejection(&order_id.0);
+                }
+            }
+            // The public venue event stream uses OrderId, never an unsent client ID.
+            return Ok(());
+        }
         let _ = self.broadcasters.exec_event_tx.send(event.clone());
 
         // Commit the event deduplication key only after OMS and Portfolio have
@@ -2215,16 +2663,9 @@ impl Engine {
                 }
             });
             let intents_total_before_risk = intents_work_buf.len();
-            let (mut intents_to_send, risk_completed_mono_us) = if let Some(risk_manager) =
-                &mut self.risk_manager
-            {
+            let (mut intents_to_send, risk_completed_mono_us) = if self.risk_manager.is_some() {
                 let risk_start = now_micros();
-                // 使用新的 venue-specific 風控方法
-                let reviewed = risk_manager.review_envelopes_with_venue_specs(
-                    intents_work_buf,
-                    &account_view,
-                    &self.venue_specs,
-                );
+                let reviewed = self.review_risk_envelopes(intents_work_buf)?;
                 let risk_latency = now_micros().saturating_sub(risk_start);
                 let completed_at = monotonic_micros();
                 event_tracker.record_stage(LatencyStage::Risk);
@@ -2275,9 +2716,8 @@ impl Engine {
             for envelope in &mut intents_to_send {
                 self.apply_intent_execution_limits(&mut envelope.lifecycle);
             }
-            let price_protection_modes = &self.execution_price_protection;
             let mut enqueued_ids = HashSet::new();
-            if let Some(queues) = &mut self.execution_queues {
+            if self.execution_queues.is_some() {
                 let mut dropped = 0usize;
                 for mut envelope in intents_to_send.drain(..) {
                     envelope.lifecycle.source_feature_ts = exchange_timestamp;
@@ -2307,21 +2747,11 @@ impl Engine {
                         .is_receive_latency_cohort()
                         .then_some(received_at);
                     envelope.lifecycle.timing.source_market_capture_boundary = capture_boundary;
-                    let price_protection = envelope
-                        .intent
-                        .target_venue
-                        .and_then(|venue| price_protection_modes.get(&venue).copied())
-                        .unwrap_or_default();
                     let client_order_id = envelope.client_order_id.clone();
-                    if queues
-                        .send_lifecycle_intent_with_price_protection(
-                            envelope,
-                            now_micros(),
-                            latest_book_seq,
-                            price_protection,
-                        )
-                        .is_err()
+                    if let Err(error) =
+                        self.enqueue_reserved_intent(envelope, now_micros(), latest_book_seq)
                     {
+                        warn!(%error, "reviewed intent rejected before execution queue admission");
                         dropped += 1;
                     } else {
                         enqueued_ids.insert(client_order_id);
@@ -2453,7 +2883,7 @@ impl Engine {
     }
 
     fn ensure_accepting_new_intents(&self) -> Result<(), HftError> {
-        if self.reconciliation_halt {
+        if self.reconciliation_halt || !self.risk_reservations.is_ready() {
             return Err(HftError::Risk(
                 "canonical execution state is halted pending independent reconciliation"
                     .to_string(),
@@ -2485,9 +2915,17 @@ impl Engine {
         if self.refuse_emergency_downgrade(mode) {
             return;
         }
+        if matches!(mode, TradingMode::Normal | TradingMode::Degraded)
+            && self.ensure_risk_resume_ready().is_err()
+        {
+            return;
+        }
         if self.stats.trading_mode != mode {
             info!("交易模式變更: {:?} -> {:?}", self.stats.trading_mode, mode);
             self.stats.trading_mode = mode;
+            if matches!(mode, TradingMode::Paused | TradingMode::Emergency) {
+                self.request_worker_intake_pause();
+            }
         }
     }
 
@@ -2496,8 +2934,12 @@ impl Engine {
         if self.refuse_emergency_downgrade(TradingMode::Paused) {
             return;
         }
+        let changed = self.stats.trading_mode != TradingMode::Paused;
         warn!("Sentinel: 暫停交易");
         self.stats.trading_mode = TradingMode::Paused;
+        if changed {
+            self.request_worker_intake_pause();
+        }
     }
 
     /// 恢復正常交易
@@ -2505,13 +2947,31 @@ impl Engine {
         if self.refuse_emergency_downgrade(TradingMode::Normal) {
             return;
         }
+        if let Err(error) = self.ensure_risk_resume_ready() {
+            warn!(%error, "risk reservations block runtime resume");
+            return;
+        }
         info!("Sentinel: 恢復正常交易");
         self.stats.trading_mode = TradingMode::Normal;
+    }
+
+    pub(crate) fn ensure_active_degrade_ready(&self) -> HftResult<()> {
+        self.ensure_accepting_new_intents()?;
+        self.risk_reservations
+            .view(&self.get_account_view(), self.order_manager.as_deref())?;
+        Ok(())
     }
 
     /// 進入降頻模式
     pub fn enter_degrade_mode(&mut self) {
         if self.refuse_emergency_downgrade(TradingMode::Degraded) {
+            return;
+        }
+        if self.stats.trading_mode == TradingMode::Paused {
+            warn!("degraded mode cannot resume paused execution");
+            return;
+        }
+        if self.ensure_active_degrade_ready().is_err() {
             return;
         }
         warn!("Sentinel: 進入降頻模式");
@@ -2522,6 +2982,7 @@ impl Engine {
     pub fn emergency_exit(&mut self) -> Vec<(hft_core::OrderId, hft_core::Symbol)> {
         error!("Sentinel: 緊急平倉觸發！");
         self.stats.trading_mode = TradingMode::Emergency;
+        self.request_worker_intake_pause();
 
         // Export every OMS-open order, including manually submitted or restored
         // orders that are not attached to a currently registered strategy.
@@ -3563,6 +4024,10 @@ mod tests {
             ..EngineConfig::default()
         };
         let mut engine = Engine::new(config);
+        engine.set_execution_price_protection(HashMap::from([(
+            VenueId::MOCK,
+            ports::ExecutionPriceProtection::VenueQuote,
+        )]));
         let (engine_queues, mut worker_queues) =
             create_execution_queues(ExecutionQueueConfig::default());
         engine.set_execution_queues(engine_queues);
@@ -3623,6 +4088,10 @@ mod tests {
             intent_max_latency_us: 100_000,
             ..EngineConfig::default()
         });
+        engine.set_execution_price_protection(HashMap::from([(
+            VenueId::MOCK,
+            ports::ExecutionPriceProtection::VenueQuote,
+        )]));
         let (engine_queues, mut worker_queues) =
             create_execution_queues(ExecutionQueueConfig::default());
         engine.set_execution_queues(engine_queues);
@@ -3730,10 +4199,10 @@ mod tests {
         ) -> Vec<OrderIntent> {
             intents
         }
-        fn review_envelopes_with_venue_specs(
+        fn review_envelopes_with_risk_context(
             &mut self,
             mut envelopes: Vec<OrderIntentEnvelope>,
-            _: &AccountView,
+            _: ports::RiskReviewContext<'_>,
             _: &HashMap<VenueId, VenueSpec>,
         ) -> Vec<OrderIntentEnvelope> {
             for envelope in &mut envelopes {
@@ -3759,6 +4228,8 @@ mod tests {
     #[test]
     fn strategy_hot_path_preserves_risk_tightened_quantity_limit() {
         let mut engine = Engine::new(EngineConfig::default());
+        engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+        engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
         let (engine_queues, mut worker_queues) =
             create_execution_queues(ExecutionQueueConfig::default());
         engine.set_execution_queues(engine_queues);
@@ -4324,5 +4795,15 @@ mod tests {
             engine.submit_order_intent(test_intent()),
             Err(HftError::Risk(_))
         ));
+    }
+
+    #[test]
+    fn paused_mode_cannot_be_changed_to_degraded_locally() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.pause_trading();
+
+        engine.enter_degrade_mode();
+
+        assert_eq!(engine.trading_mode(), TradingMode::Paused);
     }
 }

@@ -855,11 +855,7 @@ impl ExecutionWorker {
 
     async fn reject_intent(&mut self, client_order_id: &str, reason: impl Into<String>) {
         self.queues
-            .send_event_reliable(ExecutionEvent::OrderReject {
-                order_id: OrderId(client_order_id.to_string()),
-                reason: reason.into(),
-                timestamp: now_micros(),
-            })
+            .reject_unsent_intent(client_order_id, reason)
             .await;
         self.stats.orders_failed += 1;
     }
@@ -1202,22 +1198,26 @@ impl ExecutionWorker {
                 }
                 Err(e) => {
                     self.stats.orders_failed += 1;
+                    // This typed adapter error explicitly proves the venue boundary was not crossed.
+                    if matches!(e, HftError::SubmissionNotAttempted(_)) {
+                        self.execution_timelines.remove(&trace_id);
+                        self.queues
+                            .reject_unsent_intent(&envelope.client_order_id, e.to_string())
+                            .await;
+                        continue;
+                    }
                     let outcome_unknown = Self::submission_outcome_may_be_unknown(&e);
+                    let order_id = OrderId(envelope.client_order_id.clone());
+                    let intent = &envelope.intent;
+                    let venue = intent
+                        .target_venue
+                        .or_else(|| self.venue_for_client(client_idx));
+                    if self.latch_duplicate_order_id(&order_id, client_idx) {
+                        continue;
+                    }
                     if outcome_unknown {
                         self.accepting_intents = false;
                         self.emergency_latched = true;
-
-                        // The venue may already own this order. Keep a provisional local record
-                        // under the stable client id so private reports, reconciliation, and
-                        // emergency cancellation cannot lose it.
-                        let order_id = OrderId(envelope.client_order_id.clone());
-                        let intent = &envelope.intent;
-                        let venue = intent
-                            .target_venue
-                            .or_else(|| self.venue_for_client(client_idx));
-                        if self.latch_duplicate_order_id(&order_id, client_idx) {
-                            continue;
-                        }
                         self.order_to_client.insert(order_id.clone(), client_idx);
                         self.tracked_orders.insert(
                             order_id.clone(),
@@ -1240,22 +1240,24 @@ impl ExecutionWorker {
                                 cancel_sent: false,
                             },
                         );
-                        self.queues
-                            .send_event_reliable(ExecutionEvent::OrderNew {
-                                order_id,
-                                client_order_id: Some(envelope.client_order_id.clone()),
-                                account_id,
-                                symbol: intent.symbol.clone(),
-                                side: intent.side,
-                                quantity: intent.quantity,
-                                requested_price: intent.price,
-                                arrival_price: arrival_price(&envelope),
-                                timestamp: now_micros(),
-                                venue,
-                                strategy_id: intent.strategy_id.clone(),
-                            })
-                            .await;
                     }
+                    // Once the adapter has been called, a broad error category is not proof of
+                    // non-submission. Bind risk before forwarding even a definite rejection.
+                    self.queues
+                        .send_event_reliable(ExecutionEvent::OrderNew {
+                            order_id,
+                            client_order_id: Some(envelope.client_order_id.clone()),
+                            account_id,
+                            symbol: intent.symbol.clone(),
+                            side: intent.side,
+                            quantity: intent.quantity,
+                            requested_price: intent.price,
+                            arrival_price: arrival_price(&envelope),
+                            timestamp: now_micros(),
+                            venue,
+                            strategy_id: intent.strategy_id.clone(),
+                        })
+                        .await;
                     warn!(
                         client_order_id = %envelope.client_order_id,
                         outcome_unknown,
@@ -1293,15 +1295,15 @@ impl ExecutionWorker {
     }
 
     async fn reject_for_disabled_intake(&mut self, envelope: &OrderIntentEnvelope) {
-        let reject_event = ExecutionEvent::OrderReject {
-            order_id: OrderId(envelope.client_order_id.clone()),
-            reason: format!(
-                "execution intake disabled by control for {}",
-                envelope.intent.symbol.as_str()
-            ),
-            timestamp: now_micros(),
-        };
-        self.queues.send_event_reliable(reject_event).await;
+        self.queues
+            .reject_unsent_intent(
+                &envelope.client_order_id,
+                format!(
+                    "execution intake disabled by control for {}",
+                    envelope.intent.symbol.as_str()
+                ),
+            )
+            .await;
         self.stats.orders_failed += 1;
     }
 
@@ -3011,14 +3013,22 @@ mod tests {
         ));
     }
 
+    #[derive(Clone, Copy)]
+    enum TestPlacementFailure {
+        NotAttempted,
+        Rejected,
+    }
+
     #[derive(Default)]
     struct MockExecutionState {
         placed: Vec<Symbol>,
+        placement_failure: Option<TestPlacementFailure>,
         placed_accounts: Vec<Option<AccountId>>,
         canceled: Vec<OrderId>,
         open_orders: Vec<OpenOrder>,
         balances: Vec<AccountBalance>,
         balance_reads: usize,
+        authoritative_readback: bool,
         spot_inventory: bool,
         healthy: Option<bool>,
         finite_stream: bool,
@@ -3051,10 +3061,17 @@ mod tests {
                     timestamp: now_micros(),
                 });
             }
-            if self.place_error {
-                Err(HftError::Network("submission outcome unknown".to_string()))
-            } else {
-                Ok(OrderId("placed".to_string()))
+            match self.state.lock().unwrap().placement_failure {
+                Some(TestPlacementFailure::NotAttempted) => Err(HftError::SubmissionNotAttempted(
+                    "adapter rejected before venue submission".into(),
+                )),
+                Some(TestPlacementFailure::Rejected) => Err(HftError::Exchange(
+                    "venue rejected the submitted request".into(),
+                )),
+                None if self.place_error => {
+                    Err(HftError::Network("submission outcome unknown".to_string()))
+                }
+                None => Ok(OrderId("placed".to_string())),
             }
         }
 
@@ -3115,10 +3132,11 @@ mod tests {
         }
 
         fn asset_inventory_capability(&self) -> AssetInventoryCapability {
-            if self.state.lock().unwrap().usdm_capability {
+            let state = self.state.lock().unwrap();
+            if state.usdm_capability || state.authoritative_readback {
                 return AssetInventoryCapability::PositionSnapshotRequired;
             }
-            if self.state.lock().unwrap().spot_inventory {
+            if state.spot_inventory {
                 AssetInventoryCapability::AuthoritativeAssetInventory {
                     product_type: hft_core::ProductType::Spot,
                 }
@@ -3131,6 +3149,32 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.balance_reads += 1;
             Ok(state.balances.clone())
+        }
+
+        fn supports_position_snapshot(&self) -> bool {
+            self.state.lock().unwrap().authoritative_readback
+        }
+
+        async fn get_positions(&self) -> HftResult<Vec<ports::Position>> {
+            if self.state.lock().unwrap().authoritative_readback {
+                Ok(Vec::new())
+            } else {
+                Err(HftError::Execution("position readback unavailable".into()))
+            }
+        }
+
+        fn supports_recent_fills_snapshot(&self) -> bool {
+            self.state.lock().unwrap().authoritative_readback
+        }
+
+        async fn list_recent_fills(&self) -> HftResult<Vec<ports::AccountFill>> {
+            if self.state.lock().unwrap().authoritative_readback {
+                Ok(Vec::new())
+            } else {
+                Err(HftError::Execution(
+                    "recent fill readback unavailable".into(),
+                ))
+            }
         }
 
         async fn connect(&mut self) -> HftResult<()> {
@@ -4361,6 +4405,590 @@ mod tests {
         assert_eq!(worker.stats.orders_failed, 1);
         assert!(!worker.accepting_intents);
         assert!(worker.stream_recovery_pending);
+    }
+
+    #[test]
+    fn pause_readback_prefix_does_not_expand_to_later_reports() {
+        let (mut engine, mut worker) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let empty_prefix = engine.pending_report_count();
+        worker
+            .send_event(ExecutionEvent::ConnectionStatus {
+                connected: true,
+                timestamp: 1,
+            })
+            .unwrap();
+        let mut reports = Vec::new();
+        engine.receive_reports_into(&mut reports, empty_prefix);
+        assert!(reports.is_empty(), "an empty captured prefix stays empty");
+        let prefix = engine.pending_report_count();
+        worker
+            .send_event(ExecutionEvent::ConnectionStatus {
+                connected: true,
+                timestamp: 2,
+            })
+            .unwrap();
+        engine.receive_reports_into(&mut reports, prefix);
+        assert!(matches!(
+            reports.as_slice(),
+            [crate::execution_queues::ExecutionReport {
+                event: ExecutionEvent::ConnectionStatus { timestamp: 1, .. },
+                ..
+            }]
+        ));
+        assert_eq!(engine.pending_report_count(), 1);
+    }
+
+    fn pause_readback_fixture() -> (
+        Arc<tokio::sync::Mutex<crate::Engine>>,
+        ExecutionWorker,
+        Arc<StdMutex<MockExecutionState>>,
+        crate::ExecutionControlHandle,
+    ) {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            simulated: true,
+            authoritative_readback: true,
+            balances: vec![AccountBalance {
+                asset: "USD".into(),
+                available: rust_decimal::Decimal::from(1000),
+                frozen: rust_decimal::Decimal::ZERO,
+                total: rust_decimal::Decimal::from(1000),
+                usd_value: Some(rust_decimal::Decimal::from(1000)),
+            }],
+            ..Default::default()
+        }));
+        // Five rounds to eight ring slots, seven usable. Six reports therefore exceed
+        // both the configured capacity and one batch while fitting before the pause ACK.
+        let (engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig {
+                intent_queue_capacity: 8,
+                event_queue_capacity: 5,
+                batch_size: 2,
+            });
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut engine = crate::Engine::new(crate::EngineConfig {
+            intent_max_latency_us: 60_000_000,
+            ..Default::default()
+        });
+        engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+        engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::with_cash_balance(
+            rust_decimal::Decimal::from(1000),
+        )));
+        engine.set_execution_queues(engine_queues);
+        engine.set_execution_control_sender(control_tx.clone());
+        engine.set_execution_price_protection(HashMap::from([(
+            VenueId::MOCK,
+            ports::ExecutionPriceProtection::VenueQuote,
+        )]));
+        let engine = Arc::new(tokio::sync::Mutex::new(engine));
+        let control = crate::ExecutionControlHandle::new(engine.clone(), Some(control_tx), true);
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(MockExecutionClient {
+                state: state.clone(),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            })],
+            control_rx,
+        );
+        worker.venue_to_client.insert(VenueId::MOCK, 0);
+        worker
+            .account_to_client
+            .insert(AccountId("simulated-venue:99".into()), 0);
+        (engine, worker, state, control)
+    }
+
+    fn pause_readback_intent(client_id: &str) -> OrderIntentEnvelope {
+        let mut intent = create_test_intent("BTCUSDT");
+        intent.order_type = OrderType::Limit;
+        intent.price = Some(Price(rust_decimal::Decimal::from(60)));
+        intent.target_venue = Some(VenueId::MOCK);
+        let mut envelope = OrderIntentEnvelope::new(
+            intent,
+            ports::OrderIntentLifecycle::new(now_micros(), u64::MAX),
+        )
+        .with_account_id(AccountId("simulated-venue:99".into()));
+        envelope.client_order_id = client_id.into();
+        envelope
+    }
+
+    async fn drive_pause_readback_worker(
+        mut worker: ExecutionWorker,
+        engine: Arc<tokio::sync::Mutex<crate::Engine>>,
+        queued_at_snapshot: Arc<std::sync::atomic::AtomicUsize>,
+        mut stop: oneshot::Receiver<()>,
+    ) -> ExecutionWorker {
+        loop {
+            tokio::select! {
+                _ = &mut stop => return worker,
+                command = worker.control_rx.recv() => {
+                    let Some(command) = command else { return worker };
+                    if let ControlCommand::Reconcile {
+                        include_balances, include_positions, include_recent_fills, ..
+                    } = &command {
+                        assert!(*include_balances && *include_positions && *include_recent_fills);
+                        let checkpoint = serde_json::to_value(
+                            engine.lock().await.export_risk_reservations(),
+                        ).unwrap();
+                        queued_at_snapshot.store(
+                            checkpoint["queued"].as_object().unwrap().len(),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                    }
+                    worker.handle_control_command(command).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_readback_prefix_applies_all_unsent_reports_before_snapshot() {
+        for mode in [
+            crate::TradingMode::Normal,
+            crate::TradingMode::Degraded,
+            crate::TradingMode::Paused,
+            crate::TradingMode::Emergency,
+        ] {
+            let (engine, worker, state, control) = pause_readback_fixture();
+            for index in 0..6 {
+                engine
+                    .lock()
+                    .await
+                    .submit_order_intent_envelope(
+                        pause_readback_intent(&format!("pause-{index}")),
+                        now_micros(),
+                        None,
+                    )
+                    .unwrap();
+            }
+            {
+                let mut engine = engine.lock().await;
+                match mode {
+                    crate::TradingMode::Normal => {}
+                    crate::TradingMode::Degraded => engine.enter_degrade_mode(),
+                    crate::TradingMode::Paused => engine.pause_trading(),
+                    crate::TradingMode::Emergency => {
+                        engine.emergency_exit();
+                    }
+                }
+                assert_eq!(engine.trading_mode(), mode);
+            }
+            let queued_at_snapshot = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+            let (stop, stopped) = oneshot::channel();
+            // No background Engine tick: the control barrier must apply the real worker reports.
+            let driver = tokio::spawn(drive_pause_readback_worker(
+                worker,
+                engine.clone(),
+                queued_at_snapshot.clone(),
+                stopped,
+            ));
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), control.reconcile_guarded(true)).await;
+            let _ = stop.send(());
+            let worker = driver.await.unwrap();
+            let report = result.expect("guarded readback is bounded").unwrap();
+            assert_eq!(
+                queued_at_snapshot.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert!(report.healthy);
+            let engine = engine.lock().await;
+            assert!(!engine.risk_reservations.has_queued());
+            assert_eq!(engine.get_statistics().orders_rejected, 6);
+            assert_eq!(engine.trading_mode(), mode);
+            assert_eq!(
+                worker.accepting_intents,
+                matches!(
+                    mode,
+                    crate::TradingMode::Normal | crate::TradingMode::Degraded
+                )
+            );
+            assert!(state.lock().unwrap().placed.is_empty());
+            assert_eq!(state.lock().unwrap().balance_reads, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_readback_prefix_keeps_first_error_and_later_accounting() {
+        let (engine, mut worker, state, control) = pause_readback_fixture();
+        engine
+            .lock()
+            .await
+            .submit_order_intent_envelope(pause_readback_intent("accepted"), now_micros(), None)
+            .unwrap();
+        let mut accepted = worker.queues.receive_envelopes();
+        worker.process_order_intents(&mut accepted).await;
+        engine.lock().await.tick().unwrap();
+        let order_id = OrderId("placed".into());
+        for index in 0..2 {
+            worker
+                .queues
+                .send_event(ExecutionEvent::Fill {
+                    order_id: OrderId(format!("unknown-prefix-{index}")),
+                    price: Price(rust_decimal::Decimal::from(60)),
+                    quantity: Quantity(rust_decimal::Decimal::ONE),
+                    timestamp: now_micros(),
+                    fill_id: format!("unknown-fill-{index}"),
+                })
+                .unwrap();
+        }
+        for index in 0..2 {
+            worker
+                .queues
+                .send_event(ExecutionEvent::FeeCharged {
+                    order_id: order_id.clone(),
+                    amount: -rust_decimal::Decimal::ONE,
+                    timestamp: now_micros(),
+                    fill_id: format!("invalid-negative-fee-{index}"),
+                })
+                .unwrap();
+        }
+        worker
+            .queues
+            .send_event(ExecutionEvent::Fill {
+                order_id: order_id.clone(),
+                price: Price(rust_decimal::Decimal::from(60)),
+                quantity: Quantity(rust_decimal::Decimal::new(5, 1)),
+                timestamp: now_micros(),
+                fill_id: "valid-prefix-fill".into(),
+            })
+            .unwrap();
+        worker
+            .queues
+            .send_event(ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 77,
+                connected: true,
+                timestamp: now_micros(),
+            })
+            .unwrap();
+        let queued_at_snapshot = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let (stop, stopped) = oneshot::channel();
+        let driver = tokio::spawn(drive_pause_readback_worker(
+            worker,
+            engine.clone(),
+            queued_at_snapshot.clone(),
+            stopped,
+        ));
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), control.reconcile_guarded(true)).await;
+        let _ = stop.send(());
+        let mut worker = driver.await.unwrap();
+        let error = result
+            .expect("failed readback is bounded")
+            .expect_err("the first report failed");
+        assert!(error.to_string().contains("canonical OMS retained"));
+        let engine = engine.lock().await;
+        assert_eq!(
+            engine.export_oms_state()[&order_id].cum_qty,
+            Quantity(rust_decimal::Decimal::new(5, 1))
+        );
+        assert_eq!(
+            engine.get_account_view().positions[&Symbol::new("BTCUSDT")].quantity,
+            Quantity(rust_decimal::Decimal::new(5, 1))
+        );
+        assert_eq!(
+            engine
+                .export_oms_checkpoint()
+                .reconciliation_exceptions
+                .len(),
+            2
+        );
+        assert_eq!(
+            engine
+                .export_portfolio_state()
+                .reconciliation_exceptions
+                .len(),
+            2
+        );
+        assert_eq!(engine.trading_mode(), crate::TradingMode::Paused);
+        assert!(engine.reconciliation_halted());
+        assert!(!worker.accepting_intents);
+        assert_eq!(worker.queues.try_receive_applied_execution_stream(), None);
+        assert_eq!(state.lock().unwrap().balance_reads, 0);
+        assert_eq!(
+            queued_at_snapshot.load(std::sync::atomic::Ordering::SeqCst),
+            usize::MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn post_dispatch_rejection_keeps_risk_but_not_worker_open_order_tracking() {
+        for failure in [
+            TestPlacementFailure::NotAttempted,
+            TestPlacementFailure::Rejected,
+        ] {
+            let state = Arc::new(StdMutex::new(MockExecutionState {
+                simulated: true,
+                placement_failure: Some(failure),
+                ..Default::default()
+            }));
+            let client = MockExecutionClient {
+                state: Arc::clone(&state),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            };
+            let (engine_queues, worker_queues) =
+                crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+            let (control_tx, control_rx) = mpsc::unbounded_channel();
+            let mut engine = crate::Engine::new(crate::EngineConfig {
+                intent_max_latency_us: 60_000_000,
+                ..Default::default()
+            });
+            engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+            engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+            engine.set_execution_queues(engine_queues);
+            engine.set_execution_control_sender(control_tx);
+            engine.set_execution_price_protection(HashMap::from([(
+                VenueId::MOCK,
+                ports::ExecutionPriceProtection::VenueQuote,
+            )]));
+            let mut worker = ExecutionWorker::new(
+                ExecutionWorkerConfig::default(),
+                worker_queues,
+                vec![Box::new(client)],
+                control_rx,
+            );
+            worker.venue_to_client.insert(VenueId::MOCK, 0);
+            let mut intent = create_test_intent("BTCUSDT");
+            intent.order_type = OrderType::Limit;
+            intent.target_venue = Some(VenueId::MOCK);
+            let mut envelope = OrderIntentEnvelope::new(
+                intent,
+                ports::OrderIntentLifecycle::new(now_micros(), u64::MAX),
+            )
+            .with_account_id(AccountId("simulated-venue:99".into()));
+            envelope.client_order_id = "post-dispatch".into();
+            engine
+                .submit_order_intent_envelope(envelope, now_micros(), None)
+                .unwrap();
+            let mut pending = worker.queues.receive_envelopes();
+            worker.process_order_intents(&mut pending).await;
+            engine.tick().unwrap();
+            assert_eq!(state.lock().unwrap().placed.len(), 1);
+            assert!(worker.pending_acks.is_empty());
+            assert!(worker.order_to_client.is_empty());
+            assert!(worker.tracked_orders.is_empty());
+            assert!(worker.execution_timelines.is_empty());
+            let risk = serde_json::to_value(engine.export_risk_reservations()).unwrap();
+            assert!(risk["queued"].as_object().unwrap().is_empty());
+            if matches!(failure, TestPlacementFailure::NotAttempted) {
+                assert!(engine.export_oms_state().is_empty());
+                assert!(risk["orders"].as_object().unwrap().is_empty());
+            } else {
+                assert_eq!(
+                    engine.export_oms_state()[&OrderId("post-dispatch".into())].status,
+                    ports::OrderStatus::Rejected
+                );
+                assert!(risk["orders"].get("post-dispatch").is_some());
+                assert_eq!(risk["awaiting_final_readback"].as_array().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_private_rejection_cannot_acknowledge_an_unsent_client_id() {
+        for via_private_stream in [false, true] {
+            // No prior submission, accepted OrderNew not yet applied, and unknown POST outcome.
+            for prior_submission in [None, Some(false), Some(true)] {
+                let state = Arc::new(StdMutex::new(MockExecutionState {
+                    simulated: true,
+                    ..Default::default()
+                }));
+                let client = MockExecutionClient {
+                    state: Arc::clone(&state),
+                    place_error: prior_submission == Some(true),
+                    list_error: false,
+                    cancel_error: false,
+                };
+                let (engine_queues, worker_queues) =
+                    crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+                let (control_tx, control_rx) = mpsc::unbounded_channel();
+                let mut engine = crate::Engine::new(crate::EngineConfig {
+                    intent_max_latency_us: 60_000_000,
+                    ..Default::default()
+                });
+                engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+                engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+                engine.set_execution_queues(engine_queues);
+                engine.set_execution_control_sender(control_tx);
+                engine.set_execution_price_protection(HashMap::from([(
+                    VenueId::MOCK,
+                    ports::ExecutionPriceProtection::VenueQuote,
+                )]));
+                let mut worker = ExecutionWorker::new(
+                    ExecutionWorkerConfig::default(),
+                    worker_queues,
+                    vec![Box::new(client)],
+                    control_rx,
+                );
+                worker.venue_to_client.insert(VenueId::MOCK, 0);
+                let candidate = |client_id: &str| {
+                    let mut intent = create_test_intent("BTCUSDT");
+                    intent.order_type = OrderType::Limit;
+                    intent.target_venue = Some(VenueId::MOCK);
+                    let mut envelope = OrderIntentEnvelope::new(
+                        intent,
+                        ports::OrderIntentLifecycle::new(now_micros(), u64::MAX),
+                    )
+                    .with_account_id(AccountId("simulated-venue:99".into()));
+                    envelope.client_order_id = client_id.into();
+                    envelope
+                };
+                if prior_submission.is_some() {
+                    engine
+                        .submit_order_intent_envelope(candidate("earlier"), now_micros(), None)
+                        .unwrap();
+                    let mut earlier = worker.queues.receive_envelopes();
+                    worker.process_order_intents(&mut earlier).await;
+                }
+                engine
+                    .submit_order_intent_envelope(candidate("collision"), now_micros(), None)
+                    .unwrap();
+                let event = ExecutionEvent::OrderReject {
+                    order_id: OrderId("collision".into()),
+                    reason: "untracked private venue rejection".into(),
+                    timestamp: now_micros(),
+                };
+                if via_private_stream {
+                    worker
+                        .handle_execution_stream_item(Some(IndexedExecutionStreamItem::Event {
+                            client_idx: 0,
+                            result: Ok(event),
+                        }))
+                        .await;
+                } else {
+                    worker.queues.send_event(event).unwrap();
+                }
+                engine.tick().unwrap();
+                let risk = serde_json::to_value(engine.export_risk_reservations()).unwrap();
+                assert!(
+                    risk["queued"].get("collision").is_some(),
+                    "unproven private rejection must retain the queued reservation"
+                );
+                assert_eq!(
+                    risk["orders"].as_object().unwrap().len(),
+                    usize::from(prior_submission.is_some())
+                );
+                assert!(engine.reconciliation_halted());
+                assert_eq!(engine.trading_mode(), crate::TradingMode::Paused);
+                assert!(!engine
+                    .export_oms_state()
+                    .contains_key(&OrderId("collision".into())));
+                let mut pending = worker.queues.receive_envelopes();
+                worker.process_order_intents(&mut pending).await;
+                engine.tick().unwrap();
+                let risk = serde_json::to_value(engine.export_risk_reservations()).unwrap();
+                assert!(
+                    risk["queued"].get("collision").is_none(),
+                    "only the worker's subsequent confirmed unsent rejection can release it"
+                );
+                assert_eq!(
+                    state.lock().unwrap().placed.len(),
+                    usize::from(prior_submission.is_some())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_risk_halt_closes_worker_intake_for_an_already_dequeued_batch() {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            simulated: true,
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut engine = crate::Engine::new(crate::EngineConfig {
+            intent_max_latency_us: 60_000_000,
+            ..Default::default()
+        });
+        engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+        engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+        engine.set_execution_queues(engine_queues);
+        engine.set_execution_control_sender(control_tx);
+        engine.set_execution_price_protection(std::collections::HashMap::from([(
+            VenueId::MOCK,
+            ports::ExecutionPriceProtection::VenueQuote,
+        )]));
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        worker.venue_to_client.insert(VenueId::MOCK, 0);
+        let candidate = |symbol| {
+            let mut intent = create_test_intent(symbol);
+            intent.order_type = OrderType::Limit;
+            intent.target_venue = Some(VenueId::MOCK);
+            OrderIntentEnvelope::new(
+                intent,
+                ports::OrderIntentLifecycle::new(now_micros(), u64::MAX),
+            )
+            .with_account_id(AccountId("simulated-venue:99".into()))
+        };
+        engine
+            .submit_order_intent_envelope(candidate("BTCUSDT"), now_micros(), None)
+            .unwrap();
+        let mut first = worker.queues.receive_envelopes();
+        worker.process_order_intents(&mut first).await;
+        engine.tick().unwrap();
+        assert_eq!(
+            state.lock().unwrap().placed.len(),
+            1,
+            "the adapter path must be viable before the halt"
+        );
+        engine
+            .submit_order_intent_envelope(candidate("ETHUSDT"), now_micros(), None)
+            .unwrap();
+        let mut queued = worker.queues.receive_envelopes();
+        assert_eq!(queued.len(), 1);
+        worker
+            .queues
+            .send_event(ExecutionEvent::OrderModified {
+                order_id: OrderId("placed".into()),
+                new_quantity: Some(Quantity(rust_decimal::Decimal::from(2))),
+                new_price: None,
+                timestamp: now_micros(),
+            })
+            .unwrap();
+        engine.tick().unwrap();
+        assert!(engine.reconciliation_halted());
+        assert_eq!(engine.trading_mode(), crate::TradingMode::Paused);
+        assert!(
+            engine.risk_reservations.has_queued(),
+            "a pause request alone is not rejection evidence"
+        );
+        // The worker consumes the existing control queue before its next submission.
+        worker.process_order_intents(&mut queued).await;
+        assert!(!worker.accepting_intents);
+        assert!(!worker.operator_intake_enabled);
+        assert_eq!(
+            state.lock().unwrap().placed.len(),
+            1,
+            "the dequeued intent must not reach the adapter"
+        );
+        assert!(
+            engine.risk_reservations.has_queued(),
+            "only applying the definite rejection may release queued risk"
+        );
+        engine.tick().unwrap();
+        assert!(!engine.risk_reservations.has_queued());
+        assert_eq!(
+            engine.export_oms_state()[&OrderId("placed".into())].qty,
+            Quantity(rust_decimal::Decimal::from(2))
+        );
+        assert!(engine.reconciliation_halted());
     }
 
     #[tokio::test]

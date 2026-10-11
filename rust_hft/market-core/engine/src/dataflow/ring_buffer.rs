@@ -121,6 +121,13 @@ impl<T> SpscConsumer<T> {
     pub fn is_empty(&self) -> bool {
         self.ring_buffer.is_empty()
     }
+    /// Capture the published FIFO prefix while the caller owns the sole consumer.
+    /// Later producer appends do not extend this prefix.
+    pub(crate) fn pending_len(&self) -> usize {
+        let head = self.ring_buffer.head.load(Ordering::Acquire);
+        let tail = self.ring_buffer.tail.load(Ordering::Relaxed);
+        head.wrapping_sub(tail) & (self.ring_buffer.capacity - 1)
+    }
     pub fn utilization(&self) -> f64 {
         self.ring_buffer.utilization()
     }
@@ -189,6 +196,30 @@ mod tests {
                 "Buffer should be empty after consuming all"
             );
         }
+    }
+
+    #[test]
+    fn pending_len_captures_wrapped_non_power_of_two_queue() {
+        let (producer, consumer) = spsc_ring_buffer(5);
+        for value in 0..7 {
+            producer.send(value).unwrap();
+        }
+        assert_eq!(consumer.pending_len(), 7);
+        for value in 0..4 {
+            assert_eq!(consumer.recv(), Some(value));
+        }
+        assert_eq!(consumer.pending_len(), 3);
+        for value in 7..11 {
+            producer.send(value).unwrap();
+        }
+        assert_eq!(consumer.pending_len(), 7);
+        for value in 4..11 {
+            assert_eq!(consumer.recv(), Some(value));
+        }
+        producer.send(11).unwrap();
+        assert_eq!(consumer.pending_len(), 1);
+        assert_eq!(consumer.recv(), Some(11));
+        assert_eq!(consumer.pending_len(), 0);
     }
 
     #[test]
