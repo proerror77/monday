@@ -1373,6 +1373,7 @@ impl SystemRuntime {
                 eng.set_execution_queues(engine_queues);
                 let clients = eng.take_execution_clients();
                 let mut price_protection = std::collections::HashMap::new();
+                let mut final_cancellation = std::collections::HashMap::new();
                 for (index, client) in clients.iter().enumerate() {
                     let venue = self
                         .execution_client_venues
@@ -1385,6 +1386,12 @@ impl SystemRuntime {
                                 .and_then(|venue| hft_core::VenueId::from_str(&venue.name))
                         });
                     if let Some(venue) = venue {
+                        final_cancellation
+                            .entry(venue)
+                            .and_modify(|final_after_delivery| {
+                                *final_after_delivery &= client.is_simulated_execution()
+                            })
+                            .or_insert_with(|| client.is_simulated_execution());
                         if price_protection
                             .insert(venue, client.price_protection())
                             .is_some_and(|previous| previous != client.price_protection())
@@ -1397,6 +1404,14 @@ impl SystemRuntime {
                     }
                 }
                 eng.set_execution_price_protection(price_protection);
+                eng.set_final_cancellation_venues(
+                    final_cancellation
+                        .into_iter()
+                        .filter_map(|(venue, final_after_delivery)| {
+                            final_after_delivery.then_some(venue)
+                        })
+                        .collect(),
+                );
                 let (rate_budget, account_egress) = eng.take_execution_rate_budget();
                 (
                     clients,
@@ -2327,6 +2342,9 @@ mod tests {
         let egress = "runtime-egress";
         let mut config = SystemConfig::default();
         let mut venue_config = live_venue_config();
+        config.risk.global_position_limit = Decimal::from(10);
+        config.risk.global_notional_limit = Decimal::from(1_000);
+        config.risk.max_orders_per_second = 100;
         venue_config.account_id = Some(account.0.clone());
         venue_config.execution_mode = Some("Testnet".into());
         if product != ProductType::Spot {
@@ -2452,6 +2470,13 @@ mod tests {
                 .unwrap();
             response.await.unwrap();
             let mut engine = runtime.engine.lock().await;
+            engine.add_venue_spec(
+                venue,
+                ports::VenueSpec {
+                    name: "rate-budget-fixture".into(),
+                    ..ports::VenueSpec::default()
+                },
+            );
             // Pass the CEX price and size gates before testing rate admission.
             let now = now_micros();
             let ingester = engine.create_event_ingester_pair();
@@ -2485,6 +2510,8 @@ mod tests {
                 );
                 intent.product_type = product;
                 engine.submit_order_intent(intent).unwrap();
+                // This fixture reaches the worker rate budget after the independent risk cooldown.
+                tokio::time::sleep(Duration::from_millis(110)).await;
             }
             drop(engine);
             let mut reasons = Vec::new();
@@ -2958,6 +2985,9 @@ mod tests {
     #[test]
     fn builder_writes_verified_execution_limits_into_engine() {
         let mut config = SystemConfig::default();
+        config.risk.global_position_limit = Decimal::from(10);
+        config.risk.global_notional_limit = Decimal::from(1_000);
+        config.risk.max_orders_per_second = 100;
         config.engine.queue_capacity = 16;
         config.engine.top_n = 5;
         config.engine.stale_us = 1_000_000;
@@ -2969,6 +2999,7 @@ mod tests {
         let (engine_queues, mut worker_queues) =
             create_execution_queues(ExecutionQueueConfig::default());
         let mut engine = runtime.engine.try_lock().expect("engine lock");
+        engine.add_venue_spec(VenueId::MOCK, ports::VenueSpec::binance_spot());
         engine.set_execution_queues(engine_queues);
 
         let mut intent = ports::OrderIntent::crypto_spot(

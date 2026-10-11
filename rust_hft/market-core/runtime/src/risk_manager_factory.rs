@@ -166,16 +166,18 @@ impl ProjectedExposureRiskManager {
         }
     }
 
-    fn filter(
+    fn filter_items<T>(
         &self,
-        intents: Vec<ports::OrderIntent>,
+        items: Vec<T>,
         account: &ports::AccountView,
-    ) -> Vec<ports::OrderIntent> {
+        intent_of: impl Fn(&T) -> &ports::OrderIntent,
+    ) -> Vec<T> {
         let mut projector = ExposureProjector::new(account);
-        let mut approved = Vec::with_capacity(intents.len());
-        for intent in intents {
+        let mut approved = Vec::with_capacity(items.len());
+        for item in items {
+            let intent = intent_of(&item);
             let mut next_projector = projector.clone();
-            let Ok(projected) = next_projector.project(&intent) else {
+            let Ok(projected) = next_projector.project(intent) else {
                 warn!(symbol = %intent.symbol, "全局敞口无法投影，拒绝订单意图");
                 continue;
             };
@@ -186,13 +188,37 @@ impl ProjectedExposureRiskManager {
                 continue;
             }
             projector = next_projector;
-            approved.push(intent);
+            approved.push(item);
         }
         approved
+    }
+
+    fn filter(
+        &self,
+        intents: Vec<ports::OrderIntent>,
+        account: &ports::AccountView,
+    ) -> Vec<ports::OrderIntent> {
+        self.filter_items(intents, account, |intent| intent)
     }
 }
 
 impl RiskManager for ProjectedExposureRiskManager {
+    fn review_envelopes_with_risk_context(
+        &mut self,
+        envelopes: Vec<ports::OrderIntentEnvelope>,
+        context: ports::RiskReviewContext<'_>,
+        venue_specs: &HashMap<VenueId, ports::VenueSpec>,
+    ) -> Vec<ports::OrderIntentEnvelope> {
+        let filtered = self.filter_items(envelopes, context.exposure, |envelope| &envelope.intent);
+        // Only the exposure gate consumes the gross projection. Equity and loss controls
+        // must use the real Portfolio, even while unresolved orders reserve the whole budget.
+        self.base_risk_manager.review_envelopes_with_venue_specs(
+            filtered,
+            context.account,
+            venue_specs,
+        )
+    }
+
     fn review_orders(
         &mut self,
         intents: Vec<ports::OrderIntent>,
@@ -266,6 +292,68 @@ pub struct TokenizedSecuritiesRiskManager {
 }
 
 impl TokenizedSecuritiesRiskManager {
+    fn filter_envelopes(
+        &self,
+        envelopes: Vec<ports::OrderIntentEnvelope>,
+        account: &ports::AccountView,
+        pending: &[ports::PendingRiskExposure],
+    ) -> Vec<ports::OrderIntentEnvelope> {
+        let mut filtered = Vec::with_capacity(envelopes.len());
+        let mut pending_symbol_notionals = HashMap::new();
+        let mut pending_asset_class_notional = rust_decimal::Decimal::ZERO;
+        for exposure in pending {
+            if matches!(exposure.asset_class, AssetClass::TokenizedSecurity)
+                || matches!(exposure.product_type, ProductType::TokenizedSecuritySpot)
+            {
+                if exposure.notional <= rust_decimal::Decimal::ZERO {
+                    return Vec::new();
+                }
+                let symbol_total = pending_symbol_notionals
+                    .entry(exposure.symbol.clone())
+                    .or_insert(rust_decimal::Decimal::ZERO);
+                let Some(next_symbol) = symbol_total.checked_add(exposure.notional) else {
+                    return Vec::new();
+                };
+                let Some(next_asset_class) =
+                    pending_asset_class_notional.checked_add(exposure.notional)
+                else {
+                    return Vec::new();
+                };
+                *symbol_total = next_symbol;
+                pending_asset_class_notional = next_asset_class;
+            }
+        }
+        let mut account_asset_class_notional = None;
+
+        for mut envelope in envelopes {
+            if !Self::is_tokenized(&envelope.intent) {
+                filtered.push(envelope);
+                continue;
+            }
+
+            let pending_symbol_notional = pending_symbol_notionals
+                .get(&envelope.intent.symbol)
+                .copied()
+                .unwrap_or(rust_decimal::Decimal::ZERO);
+            if let Some((notional, attested_asset_class_notional)) = self.admit_tokenized_intent(
+                &mut envelope.intent,
+                account,
+                pending_symbol_notional,
+                pending_asset_class_notional,
+                account_asset_class_notional,
+            ) {
+                *pending_symbol_notionals
+                    .entry(envelope.intent.symbol.clone())
+                    .or_insert(rust_decimal::Decimal::ZERO) += notional;
+                pending_asset_class_notional += notional;
+                account_asset_class_notional = Some(attested_asset_class_notional);
+                filtered.push(envelope);
+            }
+        }
+
+        filtered
+    }
+
     pub fn new(
         base_risk_manager: Box<dyn RiskManager>,
         config: TokenizedSecuritiesRiskConfig,
@@ -494,9 +582,8 @@ impl TokenizedSecuritiesRiskManager {
         let notional = price * intent.quantity.0;
         let projected_symbol_notional =
             attestation.account_symbol_notional + pending_symbol_notional + notional;
-        let projected_asset_class_notional = attestation.account_asset_class_notional
-            + pending_asset_class_notional
-            + notional;
+        let projected_asset_class_notional =
+            attestation.account_asset_class_notional + pending_asset_class_notional + notional;
         if projected_symbol_notional > self.config.max_notional_per_symbol
             || projected_asset_class_notional > self.config.max_asset_class_notional
         {
@@ -561,39 +648,20 @@ impl RiskManager for TokenizedSecuritiesRiskManager {
         account: &ports::AccountView,
         venue_specs: &HashMap<VenueId, ports::VenueSpec>,
     ) -> Vec<ports::OrderIntentEnvelope> {
-        let mut filtered = Vec::with_capacity(envelopes.len());
-        let mut pending_symbol_notionals = HashMap::new();
-        let mut pending_asset_class_notional = rust_decimal::Decimal::ZERO;
-        let mut account_asset_class_notional = None;
-
-        for mut envelope in envelopes {
-            if !Self::is_tokenized(&envelope.intent) {
-                filtered.push(envelope);
-                continue;
-            }
-
-            let pending_symbol_notional = pending_symbol_notionals
-                .get(&envelope.intent.symbol)
-                .copied()
-                .unwrap_or(rust_decimal::Decimal::ZERO);
-            if let Some((notional, attested_asset_class_notional)) = self.admit_tokenized_intent(
-                &mut envelope.intent,
-                account,
-                pending_symbol_notional,
-                pending_asset_class_notional,
-                account_asset_class_notional,
-            ) {
-                *pending_symbol_notionals
-                    .entry(envelope.intent.symbol.clone())
-                    .or_insert(rust_decimal::Decimal::ZERO) += notional;
-                pending_asset_class_notional += notional;
-                account_asset_class_notional = Some(attested_asset_class_notional);
-                filtered.push(envelope);
-            }
-        }
-
+        let filtered = self.filter_envelopes(envelopes, account, &[]);
         self.base_risk_manager
             .review_envelopes_with_venue_specs(filtered, account, venue_specs)
+    }
+
+    fn review_envelopes_with_risk_context(
+        &mut self,
+        envelopes: Vec<ports::OrderIntentEnvelope>,
+        context: ports::RiskReviewContext<'_>,
+        venue_specs: &HashMap<VenueId, ports::VenueSpec>,
+    ) -> Vec<ports::OrderIntentEnvelope> {
+        let filtered = self.filter_envelopes(envelopes, context.account, context.pending_exposure);
+        self.base_risk_manager
+            .review_envelopes_with_risk_context(filtered, context, venue_specs)
     }
 
     fn on_execution_event(&mut self, event: &ports::ExecutionEvent) {
@@ -690,6 +758,25 @@ impl StrategyAwareRiskManager {
 }
 
 impl RiskManager for StrategyAwareRiskManager {
+    fn review_envelopes_with_risk_context(
+        &mut self,
+        envelopes: Vec<ports::OrderIntentEnvelope>,
+        context: ports::RiskReviewContext<'_>,
+        venue_specs: &HashMap<VenueId, ports::VenueSpec>,
+    ) -> Vec<ports::OrderIntentEnvelope> {
+        let processed = envelopes
+            .into_iter()
+            .filter_map(|mut envelope| {
+                let strategy = envelope.intent.strategy_id.clone();
+                let mut intents = self.apply_strategy_overrides(&strategy, vec![envelope.intent]);
+                envelope.intent = intents.pop()?;
+                Some(envelope)
+            })
+            .collect();
+        self.base_risk_manager
+            .review_envelopes_with_risk_context(processed, context, venue_specs)
+    }
+
     fn review(
         &mut self,
         intents: Vec<ports::OrderIntent>,
@@ -798,6 +885,73 @@ mod tests {
     };
     use rust_decimal::Decimal;
     use std::collections::HashMap;
+
+    #[test]
+    fn pending_gross_exposure_does_not_hide_real_enhanced_drawdown() {
+        let config = SystemRiskConfig {
+            risk_type: "Enhanced".into(),
+            global_position_limit: Decimal::from(1_000),
+            global_notional_limit: Decimal::from(100_000),
+            enhanced: Some(EnhancedRiskSettings {
+                max_position_per_symbol: Decimal::from(1_000),
+                circuit_breaker_enabled: true,
+                cb_daily_loss_threshold: Decimal::from(3_000),
+                cb_drawdown_threshold: 2.0,
+                ..Default::default()
+            }),
+            strategy_overrides: HashMap::from([(
+                "pending-risk".into(),
+                StrategyRiskOverride::default(),
+            )]),
+            ..Default::default()
+        };
+        let account = ports::AccountView {
+            cash_balance: Decimal::from(95_000),
+            ..Default::default()
+        };
+        let mut exposure = account.clone();
+        exposure.positions.insert(
+            Symbol::new("BTCUSDT"),
+            ports::Position {
+                symbol: Symbol::new("BTCUSDT"),
+                quantity: Quantity(Decimal::from(100)),
+                avg_price: Price(Decimal::from(300)),
+                unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
+            },
+        );
+        let envelope = ports::OrderIntentEnvelope::new(
+            ports::OrderIntent::crypto_spot(
+                Symbol::new("ETHUSDT"),
+                Side::Buy,
+                Quantity(Decimal::ONE),
+                OrderType::Limit,
+                Some(Price(Decimal::from(10))),
+                TimeInForce::GTC,
+                "pending-risk".into(),
+                Some(VenueId::BINANCE),
+            ),
+            ports::OrderIntentLifecycle::new(hft_core::now_micros(), u64::MAX),
+        );
+        let specs = ports::VenueSpec::build_default_venue_specs();
+        let mut manager = RiskManagerFactory::create_strategy_aware_risk_manager(&config);
+        let approved = manager.review_envelopes_with_risk_context(
+            vec![envelope],
+            ports::RiskReviewContext {
+                account: &account,
+                exposure: &exposure,
+                pending_exposure: &[],
+            },
+            &specs,
+        );
+        assert!(approved.is_empty());
+        assert!(
+            manager.should_halt_trading(&account),
+            "real equity must trigger the breaker"
+        );
+        assert_eq!(account.equity(), Decimal::from(95_000));
+        assert_eq!(exposure.equity(), Decimal::from(125_000));
+    }
 
     #[test]
     fn test_risk_manager_factory_default() {
@@ -988,6 +1142,38 @@ mod tests {
 
         let approved = review(Some(valid_attestation.clone()));
         assert_eq!(approved.len(), 1);
+        let pending_account = ports::AccountView {
+            account_id: Some(account_id.clone()),
+            tokenized_securities_attestations: HashMap::from([(
+                attestation_key.clone(),
+                valid_attestation.clone(),
+            )]),
+            ..Default::default()
+        };
+        let mut pending_manager =
+            RiskManagerFactory::create_strategy_aware_risk_manager(&risk_config);
+        assert!(
+            pending_manager
+                .review_envelopes_with_risk_context(
+                    vec![ports::OrderIntentEnvelope::new(
+                        intent.clone(),
+                        ports::OrderIntentLifecycle::new(now, u64::MAX)
+                    )],
+                    ports::RiskReviewContext {
+                        account: &pending_account,
+                        exposure: &pending_account,
+                        pending_exposure: &[ports::PendingRiskExposure {
+                            symbol: intent.symbol.clone(),
+                            asset_class: AssetClass::TokenizedSecurity,
+                            product_type: ProductType::TokenizedSecuritySpot,
+                            notional: Decimal::from(950),
+                        }],
+                    },
+                    &specs,
+                )
+                .is_empty(),
+            "pending securities exposure must not reset the securities budget"
+        );
         assert_eq!(
             approved[0].compliance_context.regulatory_profile,
             RegulatoryProfile::None
@@ -1008,7 +1194,10 @@ mod tests {
 
         let mut future_dated = valid_attestation.clone();
         future_dated.observed_at = now.saturating_add(60_000_000);
-        assert!(review(Some(future_dated)).is_empty(), "future-dated attestation");
+        assert!(
+            review(Some(future_dated)).is_empty(),
+            "future-dated attestation"
+        );
 
         let mut wrong_venue = valid_attestation.clone();
         wrong_venue.venue = VenueId::BINANCE;
@@ -1028,7 +1217,10 @@ mod tests {
 
         let mut unapproved_source = valid_attestation.clone();
         unapproved_source.source_id = "unapproved".to_string();
-        assert!(review(Some(unapproved_source)).is_empty(), "unapproved source");
+        assert!(
+            review(Some(unapproved_source)).is_empty(),
+            "unapproved source"
+        );
 
         let mut restricted_jurisdiction = valid_attestation.clone();
         restricted_jurisdiction.jurisdiction = Some("US".to_string());
@@ -1050,9 +1242,7 @@ mod tests {
 
         let mut padded_allowed_jurisdiction = valid_attestation.clone();
         padded_allowed_jurisdiction.jurisdiction = Some(" AE ".to_string());
-        padded_allowed_jurisdiction
-            .account_capability
-            .jurisdiction = Some(" AE ".to_string());
+        padded_allowed_jurisdiction.account_capability.jurisdiction = Some(" AE ".to_string());
         let padded_allowed = review(Some(padded_allowed_jurisdiction));
         assert_eq!(padded_allowed.len(), 1);
         assert_eq!(
@@ -1084,11 +1274,17 @@ mod tests {
 
         let mut corporate_action = valid_attestation.clone();
         corporate_action.corporate_action_active = true;
-        assert!(review(Some(corporate_action)).is_empty(), "corporate action active");
+        assert!(
+            review(Some(corporate_action)).is_empty(),
+            "corporate action active"
+        );
 
         let mut insufficient_depth = valid_attestation.clone();
         insufficient_depth.top_depth_usd = Decimal::from(9_999);
-        assert!(review(Some(insufficient_depth)).is_empty(), "insufficient depth");
+        assert!(
+            review(Some(insufficient_depth)).is_empty(),
+            "insufficient depth"
+        );
 
         let mut wide_spread = valid_attestation.clone();
         wide_spread.spread_bps = Decimal::from(11);
@@ -1124,11 +1320,7 @@ mod tests {
         };
         assert!(
             RiskManagerFactory::create_strategy_aware_risk_manager(&risk_config)
-                .review_with_venue_specs(
-                    vec![unpriced_intent],
-                    &unpriced_account,
-                    &specs,
-                )
+                .review_with_venue_specs(vec![unpriced_intent], &unpriced_account, &specs,)
                 .is_empty(),
             "unpriced tokenized intent"
         );
@@ -1162,11 +1354,7 @@ mod tests {
         };
         assert!(
             RiskManagerFactory::create_strategy_aware_risk_manager(&risk_config)
-                .review_with_venue_specs(
-                    vec![sell_near_limit],
-                    &sell_near_limit_account,
-                    &specs,
-                )
+                .review_with_venue_specs(vec![sell_near_limit], &sell_near_limit_account, &specs,)
                 .is_empty(),
             "attestation-only admission must not infer covered sells"
         );
@@ -1283,10 +1471,7 @@ mod tests {
             ..risk_config.clone()
         };
         assert!(
-            review_with_config(
-                &no_corporate_action_freeze,
-                Some(valid_attestation.clone()),
-            )
+            review_with_config(&no_corporate_action_freeze, Some(valid_attestation.clone()),)
                 .is_empty(),
             "corporate-action freeze must be configured"
         );
@@ -1299,8 +1484,7 @@ mod tests {
             ..risk_config.clone()
         };
         assert!(
-            review_with_config(&unconfigured_limit, Some(valid_attestation.clone()))
-                .is_empty(),
+            review_with_config(&unconfigured_limit, Some(valid_attestation.clone())).is_empty(),
             "all tokenized limits must be configured"
         );
 
@@ -1324,8 +1508,11 @@ mod tests {
         let mut stale_with_fresh_market_data = valid_attestation.clone();
         stale_with_fresh_market_data.observed_at = now.saturating_sub(60_000_001);
         assert!(
-            review_with_config(&independent_evidence_age, Some(stale_with_fresh_market_data))
-                .is_empty(),
+            review_with_config(
+                &independent_evidence_age,
+                Some(stale_with_fresh_market_data)
+            )
+            .is_empty(),
             "market-data staleness must not extend attestation freshness"
         );
 
@@ -1344,7 +1531,7 @@ mod tests {
                     ..valid_attestation
                 }),
             )
-                .is_empty(),
+            .is_empty(),
             "allow_trading remains a fail-closed gate"
         );
     }

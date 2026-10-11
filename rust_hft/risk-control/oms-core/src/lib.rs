@@ -1120,6 +1120,32 @@ pub type QuantityMismatch = ports::QuantityMismatch;
 
 // 實現 OrderManager trait
 impl ports::OrderManager for OmsCore {
+    fn order_risk_view(&self, order_id: &OrderId) -> Option<ports::OrderRiskView<'_>> {
+        let order = self.orders.get(order_id)?;
+        Some(ports::OrderRiskView {
+            order_id: &order.order_id,
+            client_order_id: order.client_order_id.as_deref(),
+            account_id: order.account_id.as_ref(),
+            venue: order.venue,
+            symbol: &order.symbol,
+            side: order.side,
+            qty: order.qty,
+            cum_qty: order.cum_qty,
+            limit_price: order.limit_price,
+            status: match order.status {
+                OrderStatus::Unknown => ports::OrderStatus::Unknown,
+                OrderStatus::New => ports::OrderStatus::New,
+                OrderStatus::Acknowledged => ports::OrderStatus::Acknowledged,
+                OrderStatus::PartiallyFilled => ports::OrderStatus::PartiallyFilled,
+                OrderStatus::Filled => ports::OrderStatus::Filled,
+                OrderStatus::Canceled => ports::OrderStatus::Canceled,
+                OrderStatus::Rejected => ports::OrderStatus::Rejected,
+                OrderStatus::Expired => ports::OrderStatus::Expired,
+                OrderStatus::Replaced => ports::OrderStatus::Replaced,
+            },
+        })
+    }
+
     fn register_order(&mut self, params: ports::RegisterOrderParams) -> bool {
         self.register_order(RegisterOrderParams {
             order_id: params.order_id,

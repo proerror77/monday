@@ -760,6 +760,25 @@ impl VenueSpec {
     }
 }
 
+/// Approval-time classification and conservative remaining value of an unresolved order.
+/// This is exposure evidence, never an account balance or a new execution grant.
+#[derive(Debug, Clone)]
+pub struct PendingRiskExposure {
+    pub symbol: Symbol,
+    pub asset_class: AssetClass,
+    pub product_type: ProductType,
+    pub notional: rust_decimal::Decimal,
+}
+
+/// Admission-only views: account remains the real Portfolio snapshot; exposure includes
+/// gross queued and unresolved orders. Exposure must never drive equity/PnL/drawdown checks.
+#[derive(Clone, Copy)]
+pub struct RiskReviewContext<'a> {
+    pub account: &'a AccountView,
+    pub exposure: &'a AccountView,
+    pub pending_exposure: &'a [PendingRiskExposure],
+}
+
 /// 風控管理器接口
 pub trait RiskManager: Send + Sync {
     /// 審核訂單意圖，返回風控決策（舊版 - 字符串映射）
@@ -846,6 +865,18 @@ pub trait RiskManager: Send + Sync {
         }
 
         approved_intents
+    }
+
+    /// Review Engine admission with both real account and unresolved gross exposure.
+    /// Engine admission requires an explicit implementation; legacy net-position review
+    /// cannot prove the gross exposure of even the first opposite-side pending order.
+    fn review_envelopes_with_risk_context(
+        &mut self,
+        _envelopes: Vec<OrderIntentEnvelope>,
+        _context: RiskReviewContext<'_>,
+        _venue_specs: &std::collections::HashMap<VenueId, VenueSpec>,
+    ) -> Vec<OrderIntentEnvelope> {
+        Vec::new()
     }
 
     /// Review intents without detaching their execution lifecycle metadata.
@@ -1053,6 +1084,38 @@ pub struct OrderRecord {
     pub processed_fill_ids: std::collections::HashSet<String>,
 }
 
+/// Borrowed canonical OMS quantities for risk admission. No lifecycle or accounting write authority.
+#[derive(Debug, Clone, Copy)]
+pub struct OrderRiskView<'a> {
+    pub order_id: &'a OrderId,
+    pub client_order_id: Option<&'a str>,
+    pub account_id: Option<&'a AccountId>,
+    pub venue: Option<VenueId>,
+    pub symbol: &'a Symbol,
+    pub side: Side,
+    pub qty: Quantity,
+    pub cum_qty: Quantity,
+    pub limit_price: Option<Price>,
+    pub status: OrderStatus,
+}
+
+impl<'a> From<&'a OrderRecord> for OrderRiskView<'a> {
+    fn from(order: &'a OrderRecord) -> Self {
+        Self {
+            order_id: &order.order_id,
+            client_order_id: order.client_order_id.as_deref(),
+            account_id: order.account_id.as_ref(),
+            venue: order.venue,
+            symbol: &order.symbol,
+            side: order.side,
+            qty: order.qty,
+            cum_qty: order.cum_qty,
+            limit_price: order.limit_price,
+            status: order.status,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OmsCheckpoint {
     pub orders: std::collections::HashMap<OrderId, OrderRecord>,
@@ -1114,6 +1177,12 @@ pub trait OrderManager: Send + Sync {
 
     /// 導出 OMS 狀態（供恢復/持久化使用）
     fn export_state(&self) -> std::collections::HashMap<OrderId, OrderRecord>;
+
+    /// A hot-path lookup must not export historical orders and fill-deduplication sets.
+    /// Unknown implementations fail closed once a submitted order needs valuation.
+    fn order_risk_view(&self, _order_id: &OrderId) -> Option<OrderRiskView<'_>> {
+        None
+    }
 
     /// 導入 OMS 狀態（供恢復/持久化使用）
     fn import_state(&mut self, state: std::collections::HashMap<OrderId, OrderRecord>);

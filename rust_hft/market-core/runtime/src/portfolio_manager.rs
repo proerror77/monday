@@ -160,6 +160,17 @@ impl PortfolioBudgetRiskManager {
 }
 
 impl RiskManager for PortfolioBudgetRiskManager {
+    fn review_envelopes_with_risk_context(
+        &mut self,
+        envelopes: Vec<ports::OrderIntentEnvelope>,
+        context: ports::RiskReviewContext<'_>,
+        venue_specs: &HashMap<VenueId, ports::VenueSpec>,
+    ) -> Vec<ports::OrderIntentEnvelope> {
+        let filtered = self.filter_items(envelopes, context.exposure, |envelope| &envelope.intent);
+        self.base_risk_manager
+            .review_envelopes_with_risk_context(filtered, context, venue_specs)
+    }
+
     fn review_orders(
         &mut self,
         intents: Vec<ports::OrderIntent>,

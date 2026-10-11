@@ -88,7 +88,7 @@ pub struct FillReconciliationReport {
 
 /// Shared control plane for Sentinel, IPC, and gRPC.
 ///
-/// The engine lock is held only while changing mode or taking an OMS snapshot.
+/// The engine lock covers local state changes and atomic reconciliation comparisons.
 /// All exchange I/O remains exclusively owned by the execution worker.
 #[derive(Clone)]
 pub struct ExecutionControlHandle {
@@ -165,6 +165,7 @@ impl ExecutionControlHandle {
                 "Emergency mode is sticky; restart is required".to_string(),
             ));
         }
+        self.engine.lock().await.ensure_risk_resume_ready()?;
         if self.execution_enabled {
             self.set_intake(true).await?;
         }
@@ -177,6 +178,14 @@ impl ExecutionControlHandle {
             return Err(HftError::Risk(
                 "Emergency mode is sticky; restart is required".to_string(),
             ));
+        }
+        if let Err(error) = engine.ensure_risk_resume_ready() {
+            engine.pause_trading();
+            drop(engine);
+            if self.execution_enabled {
+                self.set_intake(false).await?;
+            }
+            return Err(error);
         }
         match target_mode {
             crate::TradingMode::Normal => engine.resume_trading(),
@@ -378,6 +387,7 @@ impl ExecutionControlHandle {
                     "replacement price must be positive".to_string(),
                 ));
             }
+            engine.validate_replacement_risk(order, new_quantity, new_price)?;
         }
         let worker_tx = self.worker_sender()?;
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -421,13 +431,12 @@ impl ExecutionControlHandle {
             })
             .map_err(|_| HftError::Execution("execution worker control channel closed".into()))?;
         let worker_snapshot = self.await_reply(reply_rx, "reconciliation").await?;
-        let order_report = {
-            let engine = self.engine.lock().await;
-            engine.reconcile_open_orders(&worker_snapshot)
-        };
+        // Network I/O is complete. Compare all local owners and release reservations under
+        // one guard, so a cancellation cannot appear between comparison and confirmation.
+        let mut engine = self.engine.lock().await;
+        let order_report = engine.reconcile_open_orders(&worker_snapshot);
         let (balance_report, asset_inventory_report, position_report, fill_report) =
             if include_balances {
-                let mut engine = self.engine.lock().await;
                 let account_view = engine.get_account_view().as_ref().clone();
                 let mut candidate_account_view = account_view.clone();
                 let (inventory_candidate_ready, inventory_write_error) =
@@ -505,7 +514,7 @@ impl ExecutionControlHandle {
                 .as_ref()
                 .is_none_or(|positions| positions.complete)
             && fill_report.as_ref().is_none_or(|fills| fills.complete);
-        let healthy = complete
+        let mut healthy = complete
             && !order_report.has_discrepancies()
             && balance_report
                 .as_ref()
@@ -518,6 +527,13 @@ impl ExecutionControlHandle {
                 .is_none_or(|positions| positions.healthy)
             && fill_report.as_ref().is_none_or(|fills| fills.healthy);
 
+        if healthy && include_balances {
+            if let Err(error) = engine.confirm_risk_readback() {
+                tracing::warn!(%error, "authoritative readback cannot release unresolved risk reservations");
+                healthy = false;
+            }
+        }
+
         let report = RuntimeReconciliationReport {
             worker_snapshot,
             order_report,
@@ -529,15 +545,12 @@ impl ExecutionControlHandle {
             healthy,
         };
         if include_balances {
-            self.engine
-                .lock()
-                .await
-                .publish_runtime_truth_status(crate::RuntimeTruthStatus {
-                    reconciliation_complete: report.complete,
-                    reconciliation_healthy: report.healthy,
-                    observed_at_us: hft_core::now_micros(),
-                    account_id: report.worker_snapshot.account_id(),
-                });
+            engine.publish_runtime_truth_status(crate::RuntimeTruthStatus {
+                reconciliation_complete: report.complete,
+                reconciliation_healthy: report.healthy,
+                observed_at_us: hft_core::now_micros(),
+                account_id: report.worker_snapshot.account_id(),
+            });
         }
         Ok(report)
     }
@@ -1548,6 +1561,9 @@ mod tests {
     }
 
     impl OrderManager for ReconcileOrderManager {
+        fn order_risk_view(&self, order_id: &OrderId) -> Option<ports::OrderRiskView<'_>> {
+            (self.order.order_id == *order_id).then(|| (&self.order).into())
+        }
         fn register_order(&mut self, _params: RegisterOrderParams) -> bool {
             true
         }
@@ -3171,10 +3187,28 @@ mod tests {
     #[tokio::test]
     async fn replacement_round_trips_through_execution_worker_control() {
         let mut engine = Engine::new(EngineConfig::default());
+        let mut admitted = ports::OrderIntentEnvelope::new(
+            ports::OrderIntent::crypto_spot(
+                Symbol::new("123"),
+                Side::Buy,
+                Quantity(Decimal::from(3)),
+                hft_core::OrderType::Limit,
+                Some(Price(Decimal::new(60, 2))),
+                hft_core::TimeInForce::GTC,
+                "test".into(),
+                Some(VenueId::POLYMARKET),
+            ),
+            ports::OrderIntentLifecycle::new(hft_core::now_micros(), u64::MAX),
+        );
+        admitted.client_order_id = "admitted-client".into();
+        engine
+            .risk_reservations
+            .reserve(crate::risk_reservations::Valuation::from_envelope(&admitted).unwrap())
+            .unwrap();
         engine.set_order_manager(Box::new(ReconcileOrderManager {
             order: OrderRecord {
                 order_id: OrderId("venue-order-1".to_string()),
-                client_order_id: None,
+                client_order_id: Some(admitted.client_order_id.clone()),
                 account_id: None,
                 symbol: Symbol::new("123"),
                 side: Side::Buy,
@@ -3184,7 +3218,7 @@ mod tests {
                 status: OrderStatus::Acknowledged,
                 venue: Some(VenueId::POLYMARKET),
                 strategy_id: Some("test".to_string()),
-                limit_price: None,
+                limit_price: admitted.intent.price,
                 revision: 0,
                 venue_order_id: None,
                 venue_order_history: Vec::new(),
@@ -3194,6 +3228,31 @@ mod tests {
                 processed_fill_ids: std::collections::HashSet::new(),
             },
         }));
+        let known_orders = engine.export_oms_state();
+        engine.risk_reservations.observe(
+            &ExecutionEvent::OrderNew {
+                order_id: OrderId("venue-order-1".into()),
+                client_order_id: Some(admitted.client_order_id),
+                account_id: None,
+                symbol: admitted.intent.symbol,
+                side: admitted.intent.side,
+                quantity: admitted.intent.quantity,
+                requested_price: admitted.intent.price,
+                arrival_price: None,
+                timestamp: hft_core::now_micros(),
+                venue: admitted.intent.target_venue,
+                strategy_id: admitted.intent.strategy_id,
+            },
+            known_orders
+                .get(&OrderId("venue-order-1".into()))
+                .map(Into::into),
+            &std::collections::HashSet::new(),
+        );
+        engine
+            .import_risk_reservations(engine.export_risk_reservations())
+            .unwrap();
+        engine.confirm_risk_readback().unwrap();
+        engine.resume_trading();
         let engine = Arc::new(Mutex::new(engine));
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
         let control = ExecutionControlHandle::new(engine, Some(worker_tx), true);
@@ -3256,6 +3315,7 @@ mod tests {
                 processed_fill_ids: std::collections::HashSet::new(),
             },
         }));
+        admit_replacement_fixture(&mut engine);
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
         let control =
             ExecutionControlHandle::new(Arc::new(Mutex::new(engine)), Some(worker_tx), true);
@@ -3305,6 +3365,7 @@ mod tests {
                 processed_fill_ids: std::collections::HashSet::new(),
             },
         }));
+        admit_replacement_fixture(&mut engine);
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
         let control =
             ExecutionControlHandle::new(Arc::new(Mutex::new(engine)), Some(worker_tx), true);
@@ -3322,6 +3383,62 @@ mod tests {
             worker_rx.try_recv().is_err(),
             "risk-increasing replacement must not reach the worker"
         );
+    }
+
+    // These tests inspect replacement shape guards after the independent restore barrier.
+    fn admit_replacement_fixture(engine: &mut Engine) {
+        let mut orders = engine.export_oms_state();
+        assert_eq!(orders.len(), 1);
+        let mut order = orders.drain().next().unwrap().1;
+        order.client_order_id = Some(format!("admitted-{}", order.order_id.0));
+        order.limit_price = order
+            .limit_price
+            .or(order.avg_price)
+            .or(Some(Price(Decimal::ONE)));
+        let mut envelope = ports::OrderIntentEnvelope::new(
+            ports::OrderIntent::crypto_spot(
+                order.symbol.clone(),
+                order.side,
+                order.qty,
+                hft_core::OrderType::Limit,
+                order.limit_price,
+                hft_core::TimeInForce::GTC,
+                "replacement-fixture".into(),
+                order.venue,
+            ),
+            ports::OrderIntentLifecycle::new(hft_core::now_micros(), u64::MAX),
+        );
+        envelope.client_order_id = order.client_order_id.clone().unwrap();
+        engine
+            .risk_reservations
+            .reserve(crate::risk_reservations::Valuation::from_envelope(&envelope).unwrap())
+            .unwrap();
+        engine.set_order_manager(Box::new(ReconcileOrderManager {
+            order: order.clone(),
+        }));
+        engine.risk_reservations.observe(
+            &ExecutionEvent::OrderNew {
+                order_id: order.order_id.clone(),
+                client_order_id: order.client_order_id.clone(),
+                account_id: order.account_id.clone(),
+                symbol: order.symbol.clone(),
+                side: order.side,
+                quantity: order.qty,
+                requested_price: order.limit_price,
+                arrival_price: None,
+                timestamp: hft_core::now_micros(),
+                venue: order.venue,
+                strategy_id: "replacement-fixture".into(),
+            },
+            Some((&order).into()),
+            &std::collections::HashSet::new(),
+        );
+        engine
+            .import_risk_reservations(engine.export_risk_reservations())
+            .unwrap();
+        engine.confirm_risk_readback().unwrap();
+        engine.resume_trading();
+        assert_eq!(engine.trading_mode(), TradingMode::Normal);
     }
 
     #[tokio::test]
