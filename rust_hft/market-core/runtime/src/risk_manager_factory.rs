@@ -255,6 +255,11 @@ impl RiskManager for ProjectedExposureRiskManager {
         self.base_risk_manager.on_execution_event(event)
     }
 
+    fn on_unsent_intent_rejection(&mut self, reason: &str, timestamp: hft_core::Timestamp) {
+        self.base_risk_manager
+            .on_unsent_intent_rejection(reason, timestamp);
+    }
+
     fn emergency_stop(&mut self) -> Result<(), hft_core::HftError> {
         self.base_risk_manager.emergency_stop()
     }
@@ -668,6 +673,11 @@ impl RiskManager for TokenizedSecuritiesRiskManager {
         self.base_risk_manager.on_execution_event(event)
     }
 
+    fn on_unsent_intent_rejection(&mut self, reason: &str, timestamp: hft_core::Timestamp) {
+        self.base_risk_manager
+            .on_unsent_intent_rejection(reason, timestamp);
+    }
+
     fn emergency_stop(&mut self) -> Result<(), hft_core::HftError> {
         self.base_risk_manager.emergency_stop()
     }
@@ -856,6 +866,11 @@ impl RiskManager for StrategyAwareRiskManager {
 
     fn on_execution_event(&mut self, event: &ports::ExecutionEvent) {
         self.base_risk_manager.on_execution_event(event)
+    }
+
+    fn on_unsent_intent_rejection(&mut self, reason: &str, timestamp: hft_core::Timestamp) {
+        self.base_risk_manager
+            .on_unsent_intent_rejection(reason, timestamp);
     }
 
     fn emergency_stop(&mut self) -> Result<(), hft_core::HftError> {

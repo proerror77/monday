@@ -537,6 +537,12 @@ impl Default for EnhancedRiskConfig {
 }
 
 impl RiskManager for EnhancedRiskManager {
+    fn on_unsent_intent_rejection(&mut self, reason: &str, timestamp: Timestamp) {
+        warn!(%reason, "intent rejected before venue submission");
+        self.record_rejection("not_submitted");
+        self.stats.last_global_order_time = timestamp;
+    }
+
     fn on_execution_event(&mut self, event: &ExecutionEvent) {
         // 根据不同的执行事件类型更新统计
         match event {
@@ -692,7 +698,10 @@ impl RiskManager for EnhancedRiskManager {
     fn update_config(&mut self, update: RiskConfigUpdate) -> Result<(), HftError> {
         if let Some(max_drawdown_pct) = update.max_drawdown_pct {
             self.config.max_drawdown_pct = max_drawdown_pct;
-            info!("風控配置更新: max_drawdown_pct = {}", self.config.max_drawdown_pct);
+            info!(
+                "風控配置更新: max_drawdown_pct = {}",
+                self.config.max_drawdown_pct
+            );
         }
 
         if let Some(max_position_usd) = update.max_position_usd {
@@ -824,6 +833,22 @@ mod tests {
             aggressive_mode: false,
             dry_run_mode: false,
         }
+    }
+
+    #[test]
+    fn unsent_rejection_preserves_rejection_count_and_global_cooldown() {
+        let mut manager = EnhancedRiskManager::new(EnhancedRiskConfig {
+            global_order_cooldown_ms: 10_000,
+            ..create_test_config()
+        });
+        let now = hft_core::now_micros();
+        manager.on_unsent_intent_rejection("worker intake closed", now);
+        assert_eq!(manager.stats.total_rejected_today, 1);
+        assert_eq!(
+            manager.stats.rejection_reasons.get("not_submitted"),
+            Some(&1)
+        );
+        assert!(manager.check_cooldown(&Symbol::new("BTCUSDT")).is_err());
     }
 
     #[test]

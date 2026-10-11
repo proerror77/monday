@@ -424,12 +424,6 @@ impl Strategy for ProbabilityReversalStrategy {
                         }
                     }
                     self.pending.remove(&order.symbol);
-                } else if matches!(event, ExecutionEvent::OrderReject { .. }) {
-                    // Existing worker pre-submission rejects use the original
-                    // envelope client ID as OrderId, without an OrderNew.
-                    self.pending.retain(|_, pending| {
-                        pending.queued_client_id.as_deref() != Some(order_id.0.as_str())
-                    });
                 }
             }
             _ => {}
@@ -438,6 +432,10 @@ impl Strategy for ProbabilityReversalStrategy {
     }
     fn observe_execution_state(&mut self, event: &ExecutionEvent, account: &AccountView) {
         self.on_execution_event(event, account);
+    }
+    fn observe_unsent_intent_rejection(&mut self, client_order_id: &str) {
+        self.pending
+            .retain(|_, pending| pending.queued_client_id.as_deref() != Some(client_order_id));
     }
     fn observe_intent_submission(
         &mut self,

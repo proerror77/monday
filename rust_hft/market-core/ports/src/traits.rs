@@ -565,6 +565,10 @@ pub trait Strategy: Send + Sync {
     /// uses the normal envelope and shared-risk path.
     fn observe_execution_state(&mut self, _event: &ExecutionEvent, _account: &AccountView) {}
 
+    /// Confirmed unsent queue rejection, correlated only by client intent identity.
+    /// This is not a venue OrderId lifecycle event and cannot produce new intents.
+    fn observe_unsent_intent_rejection(&mut self, _client_order_id: &str) {}
+
     /// Known pre-submission rejection/failure is distinct from an enqueued
     /// order whose outcome is still unknown. This cannot return new intents.
     fn observe_intent_submission(
@@ -937,6 +941,9 @@ pub trait RiskManager: Send + Sync {
 
     /// 處理執行事件
     fn on_execution_event(&mut self, event: &ExecutionEvent);
+
+    /// Preserve rejection accounting/cooldown without inventing a venue order identity.
+    fn on_unsent_intent_rejection(&mut self, _reason: &str, _timestamp: Timestamp) {}
 
     /// 緊急停止
     fn emergency_stop(&mut self) -> Result<(), HftError>;

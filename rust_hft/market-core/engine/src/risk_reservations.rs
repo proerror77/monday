@@ -317,11 +317,6 @@ impl RiskReservations {
         self.checkpoint.queued.remove(client_id);
     }
 
-    pub(super) fn queued_rejection(&self, event: &ExecutionEvent, has_order: bool) -> bool {
-        matches!(event, ExecutionEvent::OrderReject { order_id, .. }
-            if self.checkpoint.queued.contains_key(&order_id.0) && !has_order)
-    }
-
     pub(super) fn validate_new(&self, event: &ExecutionEvent) -> HftResult<()> {
         let ExecutionEvent::OrderNew {
             order_id,
@@ -430,8 +425,8 @@ impl RiskReservations {
                 }
             }
             ExecutionEvent::OrderReject { order_id, .. } => {
-                // A venue order ID can equal another intent's client ID. Only the canonical
-                // no-OMS-order decision proves this event rejected a still-queued intent.
+                // Only typed worker provenance proves the intent was never submitted.
+                // A private venue order ID may collide with an unrelated queued client ID.
                 if queued_rejection {
                     self.checkpoint.queued.remove(&order_id.0);
                 } else if order.is_some_and(|order| order.status == OrderStatus::Filled) {

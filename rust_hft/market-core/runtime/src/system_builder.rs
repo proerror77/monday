@@ -1877,7 +1877,7 @@ impl SystemRuntime {
             }
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                let report = control.reconcile(false).await?;
+                let report = control.reconcile(true).await?;
                 if report.healthy {
                     break;
                 }
@@ -2325,6 +2325,60 @@ mod tests {
         }
     }
 
+    struct UnsentRejectionProbe {
+        inner: Box<dyn ports::RiskManager>,
+        notices: tokio::sync::mpsc::Sender<String>,
+    }
+
+    impl ports::RiskManager for UnsentRejectionProbe {
+        fn review_orders(
+            &mut self,
+            intents: Vec<ports::OrderIntent>,
+            account: &AccountView,
+            specs: &HashMap<String, ports::VenueSpec>,
+        ) -> Vec<ports::OrderIntent> {
+            self.inner.review_orders(intents, account, specs)
+        }
+        fn review(
+            &mut self,
+            intents: Vec<ports::OrderIntent>,
+            account: &AccountView,
+            spec: &ports::VenueSpec,
+        ) -> Vec<ports::OrderIntent> {
+            self.inner.review(intents, account, spec)
+        }
+        fn review_envelopes_with_risk_context(
+            &mut self,
+            envelopes: Vec<ports::OrderIntentEnvelope>,
+            context: ports::RiskReviewContext<'_>,
+            specs: &HashMap<VenueId, ports::VenueSpec>,
+        ) -> Vec<ports::OrderIntentEnvelope> {
+            self.inner
+                .review_envelopes_with_risk_context(envelopes, context, specs)
+        }
+        fn on_execution_event(&mut self, event: &ExecutionEvent) {
+            self.inner.on_execution_event(event);
+        }
+        fn on_unsent_intent_rejection(&mut self, reason: &str, timestamp: hft_core::Timestamp) {
+            self.notices
+                .try_send(reason.to_owned())
+                .expect("two expected rejections fit the bounded probe");
+            self.inner.on_unsent_intent_rejection(reason, timestamp);
+        }
+        fn emergency_stop(&mut self) -> HftResult<()> {
+            self.inner.emergency_stop()
+        }
+        fn get_risk_metrics(&self) -> HashMap<String, Decimal> {
+            self.inner.get_risk_metrics()
+        }
+        fn should_halt_trading(&self, account: &AccountView) -> bool {
+            self.inner.should_halt_trading(account)
+        }
+        fn risk_metrics(&self) -> ports::RiskMetrics {
+            self.inner.risk_metrics()
+        }
+    }
+
     async fn check_system_builder_rate_budget(
         product: ProductType,
         routed: bool,
@@ -2457,7 +2511,17 @@ mod tests {
             );
         }
         let mut runtime = builder.build();
-        let mut events = runtime.engine.lock().await.subscribe_execution_events();
+        let (notices, mut rejections) = tokio::sync::mpsc::channel(2);
+        runtime
+            .engine
+            .lock()
+            .await
+            .register_risk_manager_boxed(Box::new(UnsentRejectionProbe {
+                inner: crate::RiskManagerFactory::create_strategy_aware_risk_manager(
+                    &runtime.config.risk,
+                ),
+                notices,
+            }));
         runtime.start().await.unwrap();
         let outcome = tokio::time::timeout(Duration::from_secs(2), async {
             let (reply, response) = tokio::sync::oneshot::channel();
@@ -2520,9 +2584,7 @@ mod tests {
             drop(engine);
             let mut reasons = Vec::new();
             while reasons.len() < 2 {
-                if let ExecutionEvent::OrderReject { reason, .. } = events.recv().await.unwrap() {
-                    reasons.push(reason);
-                }
+                reasons.push(rejections.recv().await.unwrap());
             }
             reasons
         })
@@ -2583,9 +2645,12 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct AuthoritativeBalanceClient {
         equity_usd: Decimal,
         open_orders: Vec<OpenOrder>,
+        recent_fills: Option<Vec<ports::AccountFill>>,
+        fill_reads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[cfg(feature = "infra-ipc")]
@@ -2685,6 +2750,26 @@ mod tests {
 
     #[async_trait]
     impl ExecutionClient for AuthoritativeBalanceClient {
+        fn supports_position_snapshot(&self) -> bool {
+            true
+        }
+
+        async fn get_positions(&self) -> HftResult<Vec<ports::Position>> {
+            Ok(Vec::new())
+        }
+
+        fn supports_recent_fills_snapshot(&self) -> bool {
+            true
+        }
+
+        async fn list_recent_fills(&self) -> HftResult<Vec<ports::AccountFill>> {
+            self.fill_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.recent_fills
+                .clone()
+                .ok_or_else(|| HftError::Network("recent fill readback unavailable".into()))
+        }
+
         async fn place_order(
             &mut self,
             _intent: ports::OrderIntent,
@@ -3075,6 +3160,7 @@ mod tests {
                 AuthoritativeBalanceClient {
                     equity_usd: Decimal::from(100),
                     open_orders: Vec::new(),
+                    ..Default::default()
                 },
                 VenueId::MOCK,
             )
@@ -3097,6 +3183,74 @@ mod tests {
 
     #[tokio::test]
     #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
+    async fn live_shutdown_requires_complete_and_accounted_recent_fills() {
+        for case in [0, 1, 2] {
+            let mut config = SystemConfig {
+                venues: vec![live_venue_config()],
+                ..Default::default()
+            };
+            config.engine.reconcile_interval_ms = 0;
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let recent_fills = match case {
+                0 => None,
+                1 => Some(vec![ports::AccountFill {
+                    fill_id: "late-closed-fill".into(),
+                    order_id: hft_core::OrderId("closed-venue-order".into()),
+                    symbol: Symbol::new("BTCUSDT"),
+                    side: Side::Buy,
+                    price: Price(Decimal::from(60)),
+                    quantity: Quantity(Decimal::ONE),
+                    fee: None,
+                    timestamp: now_micros(),
+                }]),
+                _ => Some(Vec::new()),
+            };
+            let mut runtime = SystemBuilder::new(config)
+                .register_execution_client_with_key(
+                    AuthoritativeBalanceClient {
+                        equity_usd: Decimal::ZERO,
+                        open_orders: Vec::new(),
+                        recent_fills,
+                        fill_reads: Arc::clone(&reads),
+                    },
+                    VenueId::MOCK,
+                    Some(AccountId("shutdown-test".into())),
+                )
+                .build();
+            runtime.start().await.unwrap();
+            let result = runtime.stop().await;
+            if case < 2 {
+                assert!(result.is_err(), "empty open-orders cannot prove missing or unaccounted recent fills are safe to discard");
+                assert!(runtime.engine.lock().await.get_statistics().is_running);
+                assert!(!runtime.execution_worker_tasks.is_empty());
+                assert!(runtime
+                    .execution_worker_tasks
+                    .iter()
+                    .any(|task| !task.is_finished()));
+                runtime.engine.lock().await.stop();
+                if let Some(task) = runtime.ipc_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                for task in runtime.tasks.drain(..) {
+                    task.abort();
+                    let _ = task.await;
+                }
+                runtime.abort_execution_workers().await;
+            } else {
+                result.expect("complete consistent readback permits shutdown");
+                assert!(!runtime.engine.lock().await.get_statistics().is_running);
+                assert!(runtime.execution_worker_tasks.is_empty());
+            }
+            assert!(
+                reads.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "live shutdown must inspect recent closed fills"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
     async fn no_strategy_live_runtime_starts_paused_for_operator_recovery() {
         let mut config = SystemConfig {
             venues: vec![live_venue_config()],
@@ -3106,8 +3260,10 @@ mod tests {
         let mut runtime = SystemBuilder::new(config)
             .register_execution_client_with_venue(
                 AuthoritativeBalanceClient {
-                    equity_usd: Decimal::from(100),
+                    equity_usd: Decimal::ZERO,
                     open_orders: Vec::new(),
+                    recent_fills: Some(Vec::new()),
+                    ..Default::default()
                 },
                 VenueId::MOCK,
             )
@@ -3225,6 +3381,7 @@ mod tests {
                 AuthoritativeBalanceClient {
                     equity_usd: Decimal::from(100),
                     open_orders: vec![external_order],
+                    ..Default::default()
                 },
                 VenueId::POLYMARKET,
             )

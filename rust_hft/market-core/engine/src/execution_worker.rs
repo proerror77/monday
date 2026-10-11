@@ -855,11 +855,7 @@ impl ExecutionWorker {
 
     async fn reject_intent(&mut self, client_order_id: &str, reason: impl Into<String>) {
         self.queues
-            .send_event_reliable(ExecutionEvent::OrderReject {
-                order_id: OrderId(client_order_id.to_string()),
-                reason: reason.into(),
-                timestamp: now_micros(),
-            })
+            .reject_unsent_intent(client_order_id, reason)
             .await;
         self.stats.orders_failed += 1;
     }
@@ -1202,22 +1198,26 @@ impl ExecutionWorker {
                 }
                 Err(e) => {
                     self.stats.orders_failed += 1;
+                    // This typed adapter error explicitly proves the venue boundary was not crossed.
+                    if matches!(e, HftError::SubmissionNotAttempted(_)) {
+                        self.execution_timelines.remove(&trace_id);
+                        self.queues
+                            .reject_unsent_intent(&envelope.client_order_id, e.to_string())
+                            .await;
+                        continue;
+                    }
                     let outcome_unknown = Self::submission_outcome_may_be_unknown(&e);
+                    let order_id = OrderId(envelope.client_order_id.clone());
+                    let intent = &envelope.intent;
+                    let venue = intent
+                        .target_venue
+                        .or_else(|| self.venue_for_client(client_idx));
+                    if self.latch_duplicate_order_id(&order_id, client_idx) {
+                        continue;
+                    }
                     if outcome_unknown {
                         self.accepting_intents = false;
                         self.emergency_latched = true;
-
-                        // The venue may already own this order. Keep a provisional local record
-                        // under the stable client id so private reports, reconciliation, and
-                        // emergency cancellation cannot lose it.
-                        let order_id = OrderId(envelope.client_order_id.clone());
-                        let intent = &envelope.intent;
-                        let venue = intent
-                            .target_venue
-                            .or_else(|| self.venue_for_client(client_idx));
-                        if self.latch_duplicate_order_id(&order_id, client_idx) {
-                            continue;
-                        }
                         self.order_to_client.insert(order_id.clone(), client_idx);
                         self.tracked_orders.insert(
                             order_id.clone(),
@@ -1240,22 +1240,24 @@ impl ExecutionWorker {
                                 cancel_sent: false,
                             },
                         );
-                        self.queues
-                            .send_event_reliable(ExecutionEvent::OrderNew {
-                                order_id,
-                                client_order_id: Some(envelope.client_order_id.clone()),
-                                account_id,
-                                symbol: intent.symbol.clone(),
-                                side: intent.side,
-                                quantity: intent.quantity,
-                                requested_price: intent.price,
-                                arrival_price: arrival_price(&envelope),
-                                timestamp: now_micros(),
-                                venue,
-                                strategy_id: intent.strategy_id.clone(),
-                            })
-                            .await;
                     }
+                    // Once the adapter has been called, a broad error category is not proof of
+                    // non-submission. Bind risk before forwarding even a definite rejection.
+                    self.queues
+                        .send_event_reliable(ExecutionEvent::OrderNew {
+                            order_id,
+                            client_order_id: Some(envelope.client_order_id.clone()),
+                            account_id,
+                            symbol: intent.symbol.clone(),
+                            side: intent.side,
+                            quantity: intent.quantity,
+                            requested_price: intent.price,
+                            arrival_price: arrival_price(&envelope),
+                            timestamp: now_micros(),
+                            venue,
+                            strategy_id: intent.strategy_id.clone(),
+                        })
+                        .await;
                     warn!(
                         client_order_id = %envelope.client_order_id,
                         outcome_unknown,
@@ -1293,15 +1295,15 @@ impl ExecutionWorker {
     }
 
     async fn reject_for_disabled_intake(&mut self, envelope: &OrderIntentEnvelope) {
-        let reject_event = ExecutionEvent::OrderReject {
-            order_id: OrderId(envelope.client_order_id.clone()),
-            reason: format!(
-                "execution intake disabled by control for {}",
-                envelope.intent.symbol.as_str()
-            ),
-            timestamp: now_micros(),
-        };
-        self.queues.send_event_reliable(reject_event).await;
+        self.queues
+            .reject_unsent_intent(
+                &envelope.client_order_id,
+                format!(
+                    "execution intake disabled by control for {}",
+                    envelope.intent.symbol.as_str()
+                ),
+            )
+            .await;
         self.stats.orders_failed += 1;
     }
 
@@ -3011,9 +3013,16 @@ mod tests {
         ));
     }
 
+    #[derive(Clone, Copy)]
+    enum TestPlacementFailure {
+        NotAttempted,
+        Rejected,
+    }
+
     #[derive(Default)]
     struct MockExecutionState {
         placed: Vec<Symbol>,
+        placement_failure: Option<TestPlacementFailure>,
         placed_accounts: Vec<Option<AccountId>>,
         canceled: Vec<OrderId>,
         open_orders: Vec<OpenOrder>,
@@ -3051,10 +3060,17 @@ mod tests {
                     timestamp: now_micros(),
                 });
             }
-            if self.place_error {
-                Err(HftError::Network("submission outcome unknown".to_string()))
-            } else {
-                Ok(OrderId("placed".to_string()))
+            match self.state.lock().unwrap().placement_failure {
+                Some(TestPlacementFailure::NotAttempted) => Err(HftError::SubmissionNotAttempted(
+                    "adapter rejected before venue submission".into(),
+                )),
+                Some(TestPlacementFailure::Rejected) => Err(HftError::Exchange(
+                    "venue rejected the submitted request".into(),
+                )),
+                None if self.place_error => {
+                    Err(HftError::Network("submission outcome unknown".to_string()))
+                }
+                None => Ok(OrderId("placed".to_string())),
             }
         }
 
@@ -4361,6 +4377,186 @@ mod tests {
         assert_eq!(worker.stats.orders_failed, 1);
         assert!(!worker.accepting_intents);
         assert!(worker.stream_recovery_pending);
+    }
+
+    #[tokio::test]
+    async fn post_dispatch_rejection_keeps_risk_but_not_worker_open_order_tracking() {
+        for failure in [
+            TestPlacementFailure::NotAttempted,
+            TestPlacementFailure::Rejected,
+        ] {
+            let state = Arc::new(StdMutex::new(MockExecutionState {
+                simulated: true,
+                placement_failure: Some(failure),
+                ..Default::default()
+            }));
+            let client = MockExecutionClient {
+                state: Arc::clone(&state),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            };
+            let (engine_queues, worker_queues) =
+                crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+            let (control_tx, control_rx) = mpsc::unbounded_channel();
+            let mut engine = crate::Engine::new(crate::EngineConfig {
+                intent_max_latency_us: 60_000_000,
+                ..Default::default()
+            });
+            engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+            engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+            engine.set_execution_queues(engine_queues);
+            engine.set_execution_control_sender(control_tx);
+            engine.set_execution_price_protection(HashMap::from([(
+                VenueId::MOCK,
+                ports::ExecutionPriceProtection::VenueQuote,
+            )]));
+            let mut worker = ExecutionWorker::new(
+                ExecutionWorkerConfig::default(),
+                worker_queues,
+                vec![Box::new(client)],
+                control_rx,
+            );
+            worker.venue_to_client.insert(VenueId::MOCK, 0);
+            let mut intent = create_test_intent("BTCUSDT");
+            intent.order_type = OrderType::Limit;
+            intent.target_venue = Some(VenueId::MOCK);
+            let mut envelope = OrderIntentEnvelope::new(
+                intent,
+                ports::OrderIntentLifecycle::new(now_micros(), u64::MAX),
+            )
+            .with_account_id(AccountId("simulated-venue:99".into()));
+            envelope.client_order_id = "post-dispatch".into();
+            engine
+                .submit_order_intent_envelope(envelope, now_micros(), None)
+                .unwrap();
+            let mut pending = worker.queues.receive_envelopes();
+            worker.process_order_intents(&mut pending).await;
+            engine.tick().unwrap();
+            assert_eq!(state.lock().unwrap().placed.len(), 1);
+            assert!(worker.pending_acks.is_empty());
+            assert!(worker.order_to_client.is_empty());
+            assert!(worker.tracked_orders.is_empty());
+            assert!(worker.execution_timelines.is_empty());
+            let risk = serde_json::to_value(engine.export_risk_reservations()).unwrap();
+            assert!(risk["queued"].as_object().unwrap().is_empty());
+            if matches!(failure, TestPlacementFailure::NotAttempted) {
+                assert!(engine.export_oms_state().is_empty());
+                assert!(risk["orders"].as_object().unwrap().is_empty());
+            } else {
+                assert_eq!(
+                    engine.export_oms_state()[&OrderId("post-dispatch".into())].status,
+                    ports::OrderStatus::Rejected
+                );
+                assert!(risk["orders"].get("post-dispatch").is_some());
+                assert_eq!(risk["awaiting_final_readback"].as_array().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_private_rejection_cannot_acknowledge_an_unsent_client_id() {
+        for via_private_stream in [false, true] {
+            // No prior submission, accepted OrderNew not yet applied, and unknown POST outcome.
+            for prior_submission in [None, Some(false), Some(true)] {
+                let state = Arc::new(StdMutex::new(MockExecutionState {
+                    simulated: true,
+                    ..Default::default()
+                }));
+                let client = MockExecutionClient {
+                    state: Arc::clone(&state),
+                    place_error: prior_submission == Some(true),
+                    list_error: false,
+                    cancel_error: false,
+                };
+                let (engine_queues, worker_queues) =
+                    crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+                let (control_tx, control_rx) = mpsc::unbounded_channel();
+                let mut engine = crate::Engine::new(crate::EngineConfig {
+                    intent_max_latency_us: 60_000_000,
+                    ..Default::default()
+                });
+                engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+                engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+                engine.set_execution_queues(engine_queues);
+                engine.set_execution_control_sender(control_tx);
+                engine.set_execution_price_protection(HashMap::from([(
+                    VenueId::MOCK,
+                    ports::ExecutionPriceProtection::VenueQuote,
+                )]));
+                let mut worker = ExecutionWorker::new(
+                    ExecutionWorkerConfig::default(),
+                    worker_queues,
+                    vec![Box::new(client)],
+                    control_rx,
+                );
+                worker.venue_to_client.insert(VenueId::MOCK, 0);
+                let candidate = |client_id: &str| {
+                    let mut intent = create_test_intent("BTCUSDT");
+                    intent.order_type = OrderType::Limit;
+                    intent.target_venue = Some(VenueId::MOCK);
+                    let mut envelope = OrderIntentEnvelope::new(
+                        intent,
+                        ports::OrderIntentLifecycle::new(now_micros(), u64::MAX),
+                    )
+                    .with_account_id(AccountId("simulated-venue:99".into()));
+                    envelope.client_order_id = client_id.into();
+                    envelope
+                };
+                if prior_submission.is_some() {
+                    engine
+                        .submit_order_intent_envelope(candidate("earlier"), now_micros(), None)
+                        .unwrap();
+                    let mut earlier = worker.queues.receive_envelopes();
+                    worker.process_order_intents(&mut earlier).await;
+                }
+                engine
+                    .submit_order_intent_envelope(candidate("collision"), now_micros(), None)
+                    .unwrap();
+                let event = ExecutionEvent::OrderReject {
+                    order_id: OrderId("collision".into()),
+                    reason: "untracked private venue rejection".into(),
+                    timestamp: now_micros(),
+                };
+                if via_private_stream {
+                    worker
+                        .handle_execution_stream_item(Some(IndexedExecutionStreamItem::Event {
+                            client_idx: 0,
+                            result: Ok(event),
+                        }))
+                        .await;
+                } else {
+                    worker.queues.send_event(event).unwrap();
+                }
+                engine.tick().unwrap();
+                let risk = serde_json::to_value(engine.export_risk_reservations()).unwrap();
+                assert!(
+                    risk["queued"].get("collision").is_some(),
+                    "unproven private rejection must retain the queued reservation"
+                );
+                assert_eq!(
+                    risk["orders"].as_object().unwrap().len(),
+                    usize::from(prior_submission.is_some())
+                );
+                assert!(engine.reconciliation_halted());
+                assert_eq!(engine.trading_mode(), crate::TradingMode::Paused);
+                assert!(!engine
+                    .export_oms_state()
+                    .contains_key(&OrderId("collision".into())));
+                let mut pending = worker.queues.receive_envelopes();
+                worker.process_order_intents(&mut pending).await;
+                engine.tick().unwrap();
+                let risk = serde_json::to_value(engine.export_risk_reservations()).unwrap();
+                assert!(
+                    risk["queued"].get("collision").is_none(),
+                    "only the worker's subsequent confirmed unsent rejection can release it"
+                );
+                assert_eq!(
+                    state.lock().unwrap().placed.len(),
+                    usize::from(prior_submission.is_some())
+                );
+            }
+        }
     }
 
     #[tokio::test]

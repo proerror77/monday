@@ -334,12 +334,10 @@ async fn engine_keeps_queued_exposure_across_ticks_and_releases_definite_rejecti
     h.engine.lock().await.tick().unwrap();
     assert!(h.submit("ETHUSDT", Side::Buy, 60).await.is_err());
     assert_eq!(h.worker.receive_envelopes().len(), 1);
-    h.event(ExecutionEvent::OrderReject {
-        order_id: first,
-        reason: "definitely not submitted".into(),
-        timestamp: now_micros(),
-    })
-    .await;
+    h.worker
+        .reject_unsent_intent(&first.0, "definitely not submitted")
+        .await;
+    h.engine.lock().await.tick().unwrap();
     h.submit("SOLUSDT", Side::Buy, 60).await.unwrap();
     assert!(h
         .engine
@@ -464,12 +462,8 @@ async fn queue_failure_does_not_leak_reservations() {
     let first = h.submit("BTCUSDT", Side::Buy, 30).await.unwrap();
     assert!(h.submit("ETHUSDT", Side::Buy, 30).await.is_err());
     assert_eq!(h.worker.receive_envelopes().len(), 1);
-    h.event(ExecutionEvent::OrderReject {
-        order_id: first,
-        reason: "not sent".into(),
-        timestamp: now_micros(),
-    })
-    .await;
+    h.worker.reject_unsent_intent(&first.0, "not sent").await;
+    h.engine.lock().await.tick().unwrap();
     h.submit("SOLUSDT", Side::Buy, 90).await.unwrap();
 }
 
@@ -1472,4 +1466,47 @@ async fn submitted_rejection_retains_exposure_until_terminal_readback() {
     assert!(!h.reconcile(false).await.healthy);
     assert!(h.reconcile(true).await.healthy);
     h.submit("ADAUSDT", Side::Buy, 60).await.unwrap();
+}
+
+#[tokio::test]
+async fn typed_unsent_rejection_releases_only_the_queued_identity() {
+    let mut h = Harness::new(8);
+    h.submit("BTCUSDT", Side::Buy, 60).await.unwrap();
+    let existing = h.bind_next_as(Some("collision")).await;
+    let now = now_micros();
+    let mut queued = OrderIntentEnvelope::new(
+        OrderIntent::crypto_spot(
+            Symbol::new("ETHUSDT"),
+            Side::Buy,
+            Quantity(Decimal::ONE),
+            OrderType::Limit,
+            Some(Price(Decimal::from(30))),
+            TimeInForce::GTC,
+            "reservation-test".into(),
+            Some(VenueId::BINANCE),
+        ),
+        OrderIntentLifecycle::new(now, u64::MAX),
+    )
+    .with_account_id(AccountId("account".into()));
+    queued.client_order_id = existing.0.clone();
+    h.engine
+        .lock()
+        .await
+        .submit_order_intent_envelope(queued, now, None)
+        .unwrap();
+    let unsent = h.worker.receive_envelopes().pop().unwrap();
+    h.worker
+        .reject_unsent_intent(
+            &unsent.client_order_id,
+            "worker rejected before adapter call",
+        )
+        .await;
+    h.engine.lock().await.tick().unwrap();
+    assert_eq!(
+        h.engine.lock().await.export_oms_state()[&existing].status,
+        OrderStatus::New
+    );
+    assert!(!h.engine.lock().await.reconciliation_halted());
+    assert!(h.submit("SOLUSDT", Side::Buy, 60).await.is_err());
+    h.submit("BNBUSDT", Side::Buy, 40).await.unwrap();
 }

@@ -538,3 +538,234 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
         "actual QueueFull must release only the unsubmitted pending proposal"
     );
 }
+
+struct SharedProbability(
+    std::sync::Arc<std::sync::Mutex<strategy_probability_reversal::ProbabilityReversalStrategy>>,
+);
+
+impl ports::Strategy for SharedProbability {
+    fn name(&self) -> &str {
+        "probability"
+    }
+    fn supported_asset_classes(&self) -> &'static [AssetClass] {
+        &[AssetClass::PredictionMarket]
+    }
+    fn on_market_event(
+        &mut self,
+        event: &MarketEvent,
+        account: &ports::AccountView,
+    ) -> Vec<ports::OrderIntent> {
+        self.0.lock().unwrap().on_market_event(event, account)
+    }
+    fn on_execution_event(
+        &mut self,
+        event: &ports::ExecutionEvent,
+        account: &ports::AccountView,
+    ) -> Vec<ports::OrderIntent> {
+        self.0.lock().unwrap().on_execution_event(event, account)
+    }
+    fn observe_execution_state(
+        &mut self,
+        event: &ports::ExecutionEvent,
+        account: &ports::AccountView,
+    ) {
+        self.0
+            .lock()
+            .unwrap()
+            .observe_execution_state(event, account);
+    }
+    fn observe_unsent_intent_rejection(&mut self, client_order_id: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .observe_unsent_intent_rejection(client_order_id);
+    }
+    fn observe_intent_submission(
+        &mut self,
+        intent: &ports::OrderIntent,
+        result: ports::IntentSubmissionResult<'_>,
+    ) {
+        self.0
+            .lock()
+            .unwrap()
+            .observe_intent_submission(intent, result);
+    }
+}
+
+#[tokio::test]
+async fn rejection_provenance_preserves_real_strategy_pending_and_late_fill_count() {
+    use ports::Strategy;
+    use std::sync::{Arc, Mutex};
+    for colliding_venue_id in [true, false] {
+        let now = now_micros();
+        let mut fixed = spec(now);
+        fixed.max_daily_trades = 1;
+        let mut next = fixed.episodes[0].clone();
+        next.episode_id = "next-episode".into();
+        next.condition_id = "next-condition".into();
+        next.up_token = "789".into();
+        next.down_token = "987".into();
+        fixed.episodes.push(next);
+        let strategy = Arc::new(Mutex::new(
+            strategy_probability_reversal::ProbabilityReversalStrategy::new(
+                strategy_probability_reversal::ProbabilityStrategyConfig {
+                    name: "probability".into(),
+                    spec: fixed,
+                    max_order_notional: Decimal::from(10),
+                    max_order_quantity: Decimal::from(100),
+                },
+            )
+            .unwrap(),
+        ));
+        let mut engine = engine::Engine::new(engine::EngineConfig {
+            intent_max_latency_us: 60_000_000,
+            ..Default::default()
+        });
+        engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+        engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::with_cash_balance(
+            Decimal::from(1000),
+        )));
+        engine.set_execution_price_protection(std::collections::HashMap::from([(
+            VenueId::POLYMARKET,
+            ports::ExecutionPriceProtection::VenueQuote,
+        )]));
+        engine.register_strategy(SharedProbability(Arc::clone(&strategy)));
+        let (queues, mut worker) =
+            engine::create_execution_queues(engine::ExecutionQueueConfig::default());
+        engine.set_execution_queues(queues);
+        let mut venue_reports = engine.subscribe_execution_events();
+        let feed = |token: &str, ask: i64, sequence: u64, account: &ports::AccountView| {
+            let mut event = outcome_snapshot(token, ask, now_micros(), sequence);
+            if token == "789" {
+                if let MarketEvent::Snapshot(snapshot) = &mut event {
+                    snapshot.provider_identity.as_mut().unwrap().market = "next-condition".into();
+                }
+            }
+            strategy.lock().unwrap().on_market_event(&event, account)
+        };
+        let account = engine.get_account_view();
+        assert!(feed("123", 25, 1, &account).is_empty());
+        let first = feed("123", 65, 2, &account).remove(0);
+        let mut first_envelope = ports::OrderIntentEnvelope::new(
+            first.clone(),
+            ports::OrderIntentLifecycle::new(now_micros(), u64::MAX),
+        )
+        .with_account_id(hft_core::AccountId("strategy-account".into()));
+        first_envelope.client_order_id = "client-a".into();
+        engine
+            .submit_order_intent_envelope(first_envelope, now_micros(), None)
+            .unwrap();
+        strategy.lock().unwrap().observe_intent_submission(
+            &first,
+            ports::IntentSubmissionResult::Enqueued {
+                client_order_id: "client-a",
+            },
+        );
+        let accepted = worker.receive_envelopes().pop().unwrap();
+        let venue_id = hft_core::OrderId(
+            if colliding_venue_id {
+                "collision"
+            } else {
+                "venue-a"
+            }
+            .into(),
+        );
+        worker
+            .send_event(ports::ExecutionEvent::OrderNew {
+                order_id: venue_id.clone(),
+                client_order_id: Some(accepted.client_order_id),
+                account_id: accepted.account_id,
+                symbol: first.symbol.clone(),
+                side: first.side,
+                quantity: first.quantity,
+                requested_price: first.price,
+                arrival_price: first.price,
+                timestamp: now_micros(),
+                venue: Some(VenueId::POLYMARKET),
+                strategy_id: "probability".into(),
+            })
+            .unwrap();
+        engine.tick().unwrap();
+        assert!(matches!(
+            venue_reports.try_recv(),
+            Ok(ports::ExecutionEvent::OrderNew { .. })
+        ));
+        feed("123", 75, 3, &account);
+        feed("456", 20, 1, &account);
+        let second = feed("123", 35, 4, &account).remove(0);
+        let mut second_envelope = ports::OrderIntentEnvelope::new(
+            second.clone(),
+            ports::OrderIntentLifecycle::new(now_micros(), u64::MAX),
+        )
+        .with_account_id(hft_core::AccountId("strategy-account".into()));
+        second_envelope.client_order_id = "collision".into();
+        engine
+            .submit_order_intent_envelope(second_envelope, now_micros(), None)
+            .unwrap();
+        strategy.lock().unwrap().observe_intent_submission(
+            &second,
+            ports::IntentSubmissionResult::Enqueued {
+                client_order_id: "collision",
+            },
+        );
+        let unsent = worker.receive_envelopes().pop().unwrap();
+        worker
+            .send_event(ports::ExecutionEvent::OrderReject {
+                order_id: hft_core::OrderId("collision".into()),
+                reason: "unproven private rejection".into(),
+                timestamp: now_micros(),
+            })
+            .unwrap();
+        engine.tick().unwrap();
+        let private_was_published = venue_reports.try_recv().is_ok();
+        feed("123", 75, 5, &account);
+        feed("456", 20, 2, &account);
+        let private_kept_pending = feed("123", 35, 6, &account).is_empty();
+        worker
+            .reject_unsent_intent(&unsent.client_order_id, "definitely not sent")
+            .await;
+        engine.tick().unwrap();
+        let local_was_published = venue_reports.try_recv().is_ok();
+        feed("123", 75, 7, &account);
+        feed("456", 20, 3, &account);
+        let retried = feed("123", 35, 8, &account);
+        let local_released_pending = retried.len() == 1;
+        if let Some(intent) = retried.first() {
+            strategy
+                .lock()
+                .unwrap()
+                .observe_intent_submission(intent, ports::IntentSubmissionResult::NotSubmitted);
+        }
+        worker
+            .send_event(ports::ExecutionEvent::Fill {
+                order_id: venue_id.clone(),
+                price: first.price.unwrap(),
+                quantity: first.quantity,
+                timestamp: now_micros(),
+                fill_id: "late-a-fill".into(),
+            })
+            .unwrap();
+        engine.tick().unwrap();
+        assert_eq!(engine.export_oms_state()[&venue_id].cum_qty, first.quantity);
+        let account = engine.get_account_view();
+        feed("789", 25, 1, &account);
+        assert!(
+            feed("789", 65, 2, &account).is_empty(),
+            "A's late fill must consume the one-entry daily budget despite B's colliding client ID"
+        );
+        assert!(
+            private_kept_pending,
+            "private rejection must not clear B's queued state"
+        );
+        assert!(
+            local_released_pending,
+            "typed unsent rejection must free only B's queued state"
+        );
+        assert!(
+            !private_was_published && !local_was_published,
+            "quarantined and unsent reports must not masquerade as venue order lifecycle events"
+        );
+        assert!(std::iter::from_fn(|| venue_reports.try_recv().ok()).any(|event|
+            matches!(event, ports::ExecutionEvent::Fill { order_id, .. } if order_id == venue_id)));
+    }
+}

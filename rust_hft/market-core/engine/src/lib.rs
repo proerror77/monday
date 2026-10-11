@@ -299,7 +299,7 @@ pub struct Engine {
     /// 復用的策略意圖工作緩衝，減少熱路徑 Vec 分配
     intents_work_buf: Vec<ports::OrderIntentEnvelope>,
     /// 復用的執行事件緩衝，避免每 tick 分配
-    execution_events_buf: Vec<ExecutionEvent>,
+    execution_events_buf: Vec<execution_queues::ExecutionReport>,
     /// 事件驱动唤醒通知器
     wakeup_notify: Arc<Notify>,
     /// 訂單提交時間（用於 Ack/Fill 延遲計算）
@@ -1739,11 +1739,11 @@ impl Engine {
         let mut events = std::mem::take(&mut self.execution_events_buf);
         events.clear();
         if let Some(queues) = &mut self.execution_queues {
-            queues.receive_events_into(&mut events);
+            queues.receive_reports_into(&mut events);
         }
         let mut first_error = None;
-        for event in &events {
-            if let Err(error) = self.handle_execution_event(event) {
+        for report in &events {
+            if let Err(error) = self.handle_execution_report(&report.event, report.origin) {
                 self.latch_reconciliation_halt();
                 first_error.get_or_insert(error);
                 // Later reports may contain already-admitted fills. Apply the entire
@@ -1756,8 +1756,9 @@ impl Engine {
         // A marker may precede a failing report in the same batch. Confirm only once
         // every report has been applied, reusing the batch without another allocation.
         if first_error.is_none() && !self.reconciliation_halt {
-            for event in &events {
-                if let ExecutionEvent::ExecutionStreamSynchronized { stream_id, .. } = event {
+            for report in &events {
+                if let ExecutionEvent::ExecutionStreamSynchronized { stream_id, .. } = &report.event
+                {
                     if let Some(queues) = &self.execution_queues {
                         queues.acknowledge_applied_execution_stream(*stream_id);
                     }
@@ -1892,6 +1893,17 @@ impl Engine {
 
     /// 處理單個執行事件
     fn handle_execution_event(&mut self, event: &ExecutionEvent) -> Result<(), HftError> {
+        self.handle_execution_report(
+            event,
+            execution_queues::ExecutionReportOrigin::PrivateOrUnknown,
+        )
+    }
+
+    fn handle_execution_report(
+        &mut self,
+        event: &ExecutionEvent,
+        origin: execution_queues::ExecutionReportOrigin,
+    ) -> Result<(), HftError> {
         let admitted_inflight = matches!(event,
             ExecutionEvent::OrderNew { client_order_id: Some(client_id), .. }
                 if self.risk_reservations.has_queued_client(client_id));
@@ -1925,6 +1937,8 @@ impl Engine {
             self.latch_reconciliation_halt();
             return Err(error);
         }
+        let queued_rejection = origin == execution_queues::ExecutionReportOrigin::UnsubmittedIntent
+            && matches!(event, ExecutionEvent::OrderReject { .. });
         let has_order = match event {
             ExecutionEvent::OrderReject { order_id, .. } => self
                 .order_manager
@@ -1933,7 +1947,10 @@ impl Engine {
             _ => false,
         };
         if let ExecutionEvent::OrderReject { order_id, .. } = event {
-            if has_order && self.risk_reservations.has_queued_client(&order_id.0) {
+            if !queued_rejection
+                && has_order
+                && self.risk_reservations.has_queued_client(&order_id.0)
+            {
                 // The legacy reject payload has no namespace discriminator. Preserve both
                 // owners until independent evidence identifies which order was rejected.
                 return self.quarantine_execution_event(
@@ -1944,7 +1961,6 @@ impl Engine {
                 );
             }
         }
-        let queued_rejection = self.risk_reservations.queued_rejection(event, has_order);
         // 0. 先處理 OrderNew：註冊訂單元資料（供 Portfolio/OMS 使用）
         if let ExecutionEvent::OrderNew {
             order_id,
@@ -2113,8 +2129,23 @@ impl Engine {
                     .to_string(),
             ));
         }
-        // 2. 更新 Portfolio 會計
-        if let Some(pm) = &mut self.portfolio_manager {
+        if !accounting_event
+            && self
+                .order_manager
+                .as_ref()
+                .is_some_and(|om| om.reconciliation_exception_count() > oms_exception_count)
+        {
+            // Quarantined reports are evidence, not accepted lifecycle notifications.
+            // Return only from this event; the bounded batch still applies later valid fills.
+            self.latch_reconciliation_halt();
+            return Ok(());
+        }
+        // An unsent rejection has no submitted order to mutate in either canonical owner.
+        if let Some(pm) = self
+            .portfolio_manager
+            .as_mut()
+            .filter(|_| !queued_rejection)
+        {
             pm.on_execution_event(event);
             if accounting_event
                 && pm.export_state().reconciliation_exceptions.len() > portfolio_exception_count
@@ -2257,6 +2288,23 @@ impl Engine {
             _ => {}
         }
 
+        if queued_rejection {
+            if let ExecutionEvent::OrderReject {
+                order_id,
+                reason,
+                timestamp,
+            } = event
+            {
+                if let Some(risk_manager) = &mut self.risk_manager {
+                    risk_manager.on_unsent_intent_rejection(reason, *timestamp);
+                }
+                for strategy in &mut self.strategies {
+                    strategy.observe_unsent_intent_rejection(&order_id.0);
+                }
+            }
+            // The public venue event stream uses OrderId, never an unsent client ID.
+            return Ok(());
+        }
         let _ = self.broadcasters.exec_event_tx.send(event.clone());
 
         // Commit the event deduplication key only after OMS and Portfolio have

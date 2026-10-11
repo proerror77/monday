@@ -243,14 +243,7 @@ fn known_not_submitted_recovers_but_enqueued_unknown_requires_the_actual_client_
     assert!(strategy
         .on_market_event(&quote("123", 65, 298_000_000, 6), &account)
         .is_empty());
-    strategy.on_execution_event(
-        &ExecutionEvent::OrderReject {
-            order_id: OrderId("actual-client".into()),
-            reason: "actual worker rejection".into(),
-            timestamp: 298_100_000,
-        },
-        &account,
-    );
+    strategy.observe_unsent_intent_rejection("actual-client");
     strategy.on_market_event(&quote("123", 25, 298_200_000, 7), &account);
     assert_eq!(
         strategy

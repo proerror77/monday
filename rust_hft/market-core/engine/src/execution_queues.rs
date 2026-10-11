@@ -15,6 +15,19 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
 
+/// Provenance belongs to the trusted worker-to-engine queue, never to adapter payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionReportOrigin {
+    PrivateOrUnknown,
+    UnsubmittedIntent,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExecutionReport {
+    pub event: ExecutionEvent,
+    pub origin: ExecutionReportOrigin,
+}
+
 /// 执行队列配置
 #[derive(Debug, Clone)]
 pub struct ExecutionQueueConfig {
@@ -41,7 +54,7 @@ pub struct EngineQueues {
     /// 发送订单意图给执行 worker
     intent_producer: SpscProducer<OrderIntentEnvelope>,
     /// 接收执行回报从执行 worker
-    event_consumer: SpscConsumer<ExecutionEvent>,
+    event_consumer: SpscConsumer<ExecutionReport>,
     config: ExecutionQueueConfig,
     stats: QueueStats,
     intent_notify: Arc<Notify>,
@@ -55,7 +68,7 @@ pub struct WorkerQueues {
     /// 接收订单意图从引擎
     intent_consumer: SpscConsumer<OrderIntentEnvelope>,
     /// 发送执行回报给引擎
-    event_producer: SpscProducer<ExecutionEvent>,
+    event_producer: SpscProducer<ExecutionReport>,
     config: ExecutionQueueConfig,
     stats: QueueStats,
     /// 引擎唤醒通知器
@@ -281,24 +294,31 @@ impl EngineQueues {
         }
     }
 
-    /// 接收执行回报到提供的緩衝 (非阻塞批量)
+    /// Diagnostic event view (non-blocking batch), without internal provenance.
+    /// Canonical Engine processing uses receive_reports_into instead.
     pub fn receive_events_into(&mut self, buffer: &mut Vec<ExecutionEvent>) {
-        let mut count = 0;
+        self.drain_reports(|report| buffer.push(report.event));
+    }
 
+    pub(crate) fn receive_reports_into(&mut self, buffer: &mut Vec<ExecutionReport>) {
+        self.drain_reports(|report| buffer.push(report));
+    }
+
+    fn drain_reports(&mut self, mut receive: impl FnMut(ExecutionReport)) {
+        let mut count = 0;
         while count < self.config.batch_size {
             match self.event_consumer.recv() {
-                Some(event) => {
-                    buffer.push(event);
+                Some(report) => {
+                    receive(report);
                     self.stats.events_received += 1;
                     count += 1;
                 }
                 None => break,
             }
         }
-
         if count > 0 {
             self.event_space_notify.notify_one();
-            debug!("引擎接收到 {} 个执行回报", buffer.len());
+            debug!("引擎接收到 {} 个执行回报", count);
         }
     }
 
@@ -450,7 +470,15 @@ impl WorkerQueues {
 
     /// 发送执行回报到引擎 (非阻塞)
     pub fn send_event(&mut self, event: ExecutionEvent) -> Result<(), Box<ExecutionEvent>> {
-        match self.event_producer.send(event) {
+        self.send_report(ExecutionReport {
+            event,
+            origin: ExecutionReportOrigin::PrivateOrUnknown,
+        })
+        .map_err(|report| Box::new(report.event))
+    }
+
+    fn send_report(&mut self, report: ExecutionReport) -> Result<(), Box<ExecutionReport>> {
+        match self.event_producer.send(report) {
             Ok(()) => {
                 self.stats.events_sent += 1;
                 // 唤醒引擎处理新的执行事件
@@ -468,12 +496,34 @@ impl WorkerQueues {
     }
 
     /// Execution reports are lossless: backpressure waits for the engine to drain the SPSC ring.
-    pub async fn send_event_reliable(&mut self, mut event: ExecutionEvent) {
+    pub async fn send_event_reliable(&mut self, event: ExecutionEvent) {
+        self.send_report_reliable(ExecutionReport {
+            event,
+            origin: ExecutionReportOrigin::PrivateOrUnknown,
+        })
+        .await;
+    }
+
+    /// Only the exclusive worker queue owner may acknowledge an intent proven not submitted.
+    /// Adapter events must use the ordinary send methods, which never carry this authority.
+    pub async fn reject_unsent_intent(&mut self, client_order_id: &str, reason: impl Into<String>) {
+        self.send_report_reliable(ExecutionReport {
+            event: ExecutionEvent::OrderReject {
+                order_id: hft_core::OrderId(client_order_id.to_owned()),
+                reason: reason.into(),
+                timestamp: hft_core::now_micros(),
+            },
+            origin: ExecutionReportOrigin::UnsubmittedIntent,
+        })
+        .await;
+    }
+
+    async fn send_report_reliable(&mut self, mut report: ExecutionReport) {
         loop {
-            match self.send_event(event) {
+            match self.send_report(report) {
                 Ok(()) => return,
                 Err(rejected) => {
-                    event = *rejected;
+                    report = *rejected;
                     self.event_space_notify.notified().await;
                 }
             }
