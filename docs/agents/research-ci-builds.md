@@ -51,6 +51,11 @@ and warmed dependency cache. A first cold run cannot establish a speedup.
 
 Use Prediction Markets CI's existing `workflow_dispatch` input
 `research_cache_probe=true` for a paired measurement on its selected source.
+That diagnostic plan selects only workflow contracts, release binaries and smoke.
+It rejects a probe on another event. Its separate concurrency group cannot cancel
+ordinary CI. Its `Research build A/B diagnostic gate` cannot satisfy the required
+`Prediction Markets CI gate` used by publication. Both gates enforce their full
+selected plan; ordinary PR/main selection remains unchanged.
 The ordinary CI path still builds each selected recipe once.
 The probe first populates dependencies and checks a warm local rebuild. It then
 cleans local outputs with the same cache helper before each measured phase:
