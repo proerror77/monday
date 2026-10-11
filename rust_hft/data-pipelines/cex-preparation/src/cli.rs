@@ -175,6 +175,26 @@ struct AcquireDataArgs {
 mod tests {
     use super::*;
     #[test]
+    fn acquisition_arguments_have_no_registry_authority() {
+        let args = [
+            "monday-cex-prepare",
+            "acquire",
+            "--mission-id",
+            "data-1",
+            "--symbol",
+            "BTCUSDT",
+            "--artifact-dir",
+            "artifacts",
+        ];
+        assert!(matches!(
+            Cli::try_parse_from(args).unwrap().command,
+            Command::Acquire(_)
+        ));
+        let error =
+            Cli::try_parse_from(args.into_iter().chain(["--db", "alpha.duckdb"])).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+    #[test]
     fn preparation_has_no_research_or_dispatch_command() {
         for command in [
             "mission",

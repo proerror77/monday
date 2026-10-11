@@ -919,20 +919,24 @@ mod tests {
             .kind(),
             clap::error::ErrorKind::InvalidSubcommand
         );
-        assert!(Cli::try_parse_from([
-            "alpha-harness",
-            "data",
-            "acquire",
-            "--db",
-            "alpha.duckdb",
-            "--mission-id",
-            "data-1",
-            "--symbol",
-            "BTCUSDT",
-            "--artifact-dir",
-            "artifacts",
-        ])
-        .is_ok());
+        assert_eq!(
+            Cli::try_parse_from([
+                "alpha-harness",
+                "data",
+                "acquire",
+                "--db",
+                "alpha.duckdb",
+                "--mission-id",
+                "data-1",
+                "--symbol",
+                "BTCUSDT",
+                "--artifact-dir",
+                "artifacts",
+            ])
+            .unwrap_err()
+            .kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
         assert_eq!(Cli::try_parse_from([
             "alpha-harness",
             "prediction",
