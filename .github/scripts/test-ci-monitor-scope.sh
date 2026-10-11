@@ -26,6 +26,20 @@ abort 'scope performs verification instead of planning' if scope.fetch('steps').
   abort "#{job} missing from aggregate gate" unless ci.fetch('ci-gate').fetch('needs').include?(job)
   abort "#{job} cannot be cancelled" unless ci.fetch(job).fetch('if').include?('!cancelled()')
 end
+prediction = YAML.safe_load(File.read("#{repo}/.github/workflows/ploy-ci.yml")).fetch('jobs')
+ancestors = lambda do |id|
+  Array(prediction.fetch(id)['needs']).flat_map { |parent| [parent] + ancestors.call(parent) }.uniq
+end
+%w[workflow-lint commit-hygiene rust-format safety-scans audit rust-control-plane rust-runner-lean
+   rust-runner-full rust-market-data rust-research-heavy frontend integration-regressions
+   strategy-config-contracts architecture-contracts].each do |id|
+  abort "#{id} waits for publication history" if ancestors.call(id).include?('research-image-scope')
+end
+%w[research-image-binaries research-image-smoke prediction-markets-gate].each do |id|
+  abort "#{id} bypasses publication recovery" unless ancestors.call(id).include?('research-image-scope')
+end
+abort 'direct selector consults publication history' if prediction.fetch('image-smoke-selector').to_s.include?('select-main-research-scope')
+abort 'gate ignores carried jobs' unless prediction.fetch('prediction-markets-gate').to_s.include?('needs.research-image-scope.outputs.jobs')
 {
   'ci.yml'=>'scope', 'ploy-ci.yml'=>'image-smoke-scope', 'security-enabled.yml'=>'security-scope'
 }.each do |file, job|
@@ -50,6 +64,17 @@ for file in ci.yml ploy-ci.yml security-enabled.yml; do
     if [[ $result == success ]]; then [[ $code == 0 && -s $output ]];
     else [[ $code != 0 && ! -s $output ]]; fi
   done
+done
+
+# Recovery failure blocks the aggregate even when independent lint succeeded.
+for result in success skipped failure cancelled; do
+  payload=$(jq -cn --arg result "$result" '{"image-smoke-selector":{result:"success"},
+    "image-smoke-scope":{result:"success"},"research-image-scope":{result:$result},
+    "workflow-lint":{result:"success"}}')
+  code=0
+  printf '%s' "$payload" | bash "$script_dir/verify-ci-gate.sh" \
+    --job-prefix ploy --expected-jobs ',ploy/workflow-lint,' >"$work/recovery-gate.out" 2>&1 || code=$?
+  if [[ $result == success ]]; then [[ $code == 0 ]]; else [[ $code != 0 ]]; fi
 done
 
 # Selected tasks cannot be acknowledged by skipping, cancellation or absence.
