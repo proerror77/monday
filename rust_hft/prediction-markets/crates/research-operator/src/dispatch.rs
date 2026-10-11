@@ -3,11 +3,11 @@ use crate::cli::{
     PredictionDispatchSubmitArgs,
 };
 use anyhow::{bail, Context};
-use hft_research_artifacts::{configured_binary, fetch_to_file, normalized_sha256};
 use hft_research_artifacts::identity::{
     canonical_https_object, result_object_binds_attempt, sha256_text, validate_dns_label,
     validate_identifier,
 };
+use hft_research_artifacts::{configured_binary, fetch_to_file, normalized_sha256};
 use hft_research_dispatch_io::{
     ensure_kubectl_success, kubectl_binary, kubectl_json, kubectl_with_input,
     validate_cluster_target,

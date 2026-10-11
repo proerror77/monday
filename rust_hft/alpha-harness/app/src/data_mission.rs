@@ -3,15 +3,15 @@ use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
+use data::binance_lob_replay::source_revision;
+#[cfg(feature = "operator")]
+use data::binance_lob_replay::Market;
 use hft_cex_research_input::feature_matrix::{
     import_feature_dataset, read_feature_rows, DataModality, FeatureDatasetManifest,
 };
 use hft_cex_research_input::ohlcv::{DatasetManifest, OhlcvTraceRow};
 #[cfg(feature = "operator")]
 use hft_collector::{acquire_dataset, DataAcquisitionMission};
-use hft_data::binance_lob_replay::source_revision;
-#[cfg(feature = "operator")]
-use hft_data::binance_lob_replay::Market;
 #[cfg(feature = "operator")]
 use hft_research_artifacts::temporary_output_file;
 #[cfg(test)]

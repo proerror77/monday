@@ -4642,7 +4642,7 @@ pub(crate) fn validate_materialization(
             bail!("source success marker does not bind its segment");
         }
     }
-    if hft_data::binance_lob_replay::source_revision(source_sha256s.iter().map(String::as_str))
+    if data::binance_lob_replay::source_revision(source_sha256s.iter().map(String::as_str))
         != source_revision
     {
         bail!("materialization source revision does not bind its source segments");
@@ -10259,7 +10259,7 @@ message binance_replay {
         let ingestion_time = Utc::now() - ChronoDuration::seconds(1);
         let source_content_sha256 = "1".repeat(64);
         let source_revision =
-            hft_data::binance_lob_replay::source_revision([source_content_sha256.as_str()]);
+            data::binance_lob_replay::source_revision([source_content_sha256.as_str()]);
         let rows = (0..160)
             .map(|index| {
                 let event_time = ingestion_time - ChronoDuration::seconds(300 - index);

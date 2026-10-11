@@ -3273,7 +3273,7 @@ pub(crate) mod tests {
             let materialization_path = root.path().join("materialization.json");
             let source_content_sha256 = "b".repeat(64);
             let source_revision =
-                hft_data::binance_lob_replay::source_revision([source_content_sha256.as_str()]);
+                data::binance_lob_replay::source_revision([source_content_sha256.as_str()]);
             let feature_source_revision = feature_source_revision
                 .as_deref()
                 .unwrap_or(&source_revision);
