@@ -1,5 +1,7 @@
 #![cfg(feature = "control")]
 #[cfg(feature = "publisher")]
+use anyhow::Context;
+#[cfg(feature = "publisher")]
 use hft_cex_research_input::data::{BlockRef, DataViewSpec, Exit, PublishedView, Split, Window};
 #[cfg(feature = "publisher")]
 use hft_research_platform::{
@@ -14,6 +16,60 @@ mod common;
 #[cfg(feature = "publisher")]
 fn hash(c: char) -> String {
     c.to_string().repeat(64)
+}
+
+#[cfg(feature = "publisher")]
+async fn assert_parallel_maintenance(
+    ledger: &Ledger,
+    pool: &sqlx_postgres::PgPool,
+    first_owner: &str,
+) -> anyhow::Result<()> {
+    sqlx_core::query::query("UPDATE research.authority SET concurrency_limit=2")
+        .execute(pool)
+        .await?;
+    let second_claim = ledger
+        .lock_next("owner-x", 30000)
+        .await?
+        .context("second task was not admitted at concurrency two")?;
+    let second_claimed_id = second_claim.task.id.clone();
+    second_claim.commit("fixture_second_claim").await?;
+    let first_maintenance = ledger
+        .lock_next(first_owner, 30000)
+        .await?
+        .context("first maintenance task was not selected")?;
+    let second_maintenance = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ledger.lock_next("owner-x", 30000),
+    )
+    .await
+    .context("unrelated task serialized behind global authority lock")??
+    .context("second maintenance task was not selected")?;
+    anyhow::ensure!(
+        first_maintenance.task.id != second_maintenance.task.id,
+        "maintenance probes selected the same task"
+    );
+    first_maintenance
+        .commit("fixture_parallel_maintenance")
+        .await?;
+    second_maintenance
+        .commit("fixture_parallel_maintenance")
+        .await?;
+    let mut release_probe = ledger
+        .lock_next("owner-x", 30000)
+        .await?
+        .context("second probe task was not recoverable")?;
+    anyhow::ensure!(release_probe.task.id == second_claimed_id);
+    release_probe.task.stop(State::Failed, true)?;
+    release_probe
+        .task
+        .stopped(release_probe.task.attempt, release_probe.task.fence)?;
+    release_probe
+        .commit("fixture_parallel_probe_requeued")
+        .await?;
+    sqlx_core::query::query("UPDATE research.authority SET concurrency_limit=1")
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[test]
@@ -68,10 +124,25 @@ fn session_host_rejects_resume_without_registered_checkpoint_before_starting_chi
 /// Only the explicitly named disposable test database is permitted. This test
 /// never targets production, imports business data, or connects to Kubernetes.
 #[cfg(feature = "publisher")]
-#[tokio::test]
+#[test]
 #[ignore = "requires disposable MONDAY_TEST_DATABASE_URL ending /monday_foundation_test"]
-async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
-) -> anyhow::Result<()> {
+fn postgres_single_authority_claims_idempotency_and_append_only_evidence() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("postgres-platform-integration".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(postgres_platform_integration_inner())
+        })
+        .context("spawn isolated PG integration thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("PG integration thread panicked"))?
+}
+
+#[cfg(feature = "publisher")]
+async fn postgres_platform_integration_inner() -> anyhow::Result<()> {
     let url = std::env::var("MONDAY_TEST_DATABASE_URL")?;
     anyhow::ensure!(
         url.ends_with("/monday_foundation_test"),
@@ -148,7 +219,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         hft_research_platform::sha256(hft_research_platform::preparation::PREPARE_SQL.as_bytes());
     assert!(ledger.register_plan(&plan).await.is_err());
     // Test-only activation fixture. No application path performs this UPDATE.
-    sqlx_core::query::query("UPDATE research.authority SET mode='postgres',legacy_quiescence_sha256=$1,migration_receipt_sha256=$2").bind(hash('a')).bind(hash('b')).execute(&pool).await?;
+    sqlx_core::query::query("UPDATE research.authority SET mode='postgres',concurrency_limit=1,legacy_quiescence_sha256=$1,migration_receipt_sha256=$2").bind(hash('a')).bind(hash('b')).execute(&pool).await?;
     // Ledger fixtures do not claim verified object bytes. Production publication
     // enters through reconciler receipt readback and successful stop only.
     let view_sha = identity(&view)?;
@@ -558,6 +629,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     assert!(ledger.submit("fixture", "one", conflicting).await.is_err());
     let mut second = spec;
     second.command.push("second".into());
+    // Leave one bounded retry for the independent maintenance-lock probe below.
+    // Later result-publication assertions still consume this same task.
+    second.max_attempts = 3;
     run.seed += 1;
     run.command = second.command.clone();
     second.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
@@ -677,8 +751,17 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         }
     };
     let (a, b) = tokio::join!(claim("owner-a"), claim("owner-b"));
-    assert_eq!(usize::from(a?.is_some()) + usize::from(b?.is_some()), 1);
+    let a = a?;
+    let b = b?;
+    assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
     assert_eq!(ledger.read(&id).await?.state, State::Launching);
+
+    // At the concurrency limit, two live maintenance transactions must not
+    // serialize on the singleton authority row. Hold the first row lock while
+    // the second reconciler acquires the other task.
+    let first_owner = if a.is_some() { "owner-a" } else { "owner-b" };
+    assert_parallel_maintenance(&ledger, &pool, first_owner).await?;
+
     ledger.cancel(&id).await?;
     assert_eq!(ledger.read(&id).await?.state, State::Stopping);
     sqlx_core::query::query("UPDATE research.authority SET mode='paused'")
