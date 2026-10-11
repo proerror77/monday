@@ -118,9 +118,13 @@ The ACK policy can use the same bucket with its internal HTTPS endpoint.
 The code accepts only bucket/region-bound Alibaba endpoints, without redirects or ambient proxies.
 It does not require GitHub native attestation or ACR OCI 1.1 referrers.
 
-`research-release-capability oss-source POLICY CONTEXT - SESSION_FILE` exchanges job OIDC with RAM STS.
+Initialize the private `BUDGET_LEDGER` with the admitted allocation and measured
+native inventory before either command, as described in the budget contract below.
+Both stages use that same ledger; these commands do not create or renew credit.
+
+`research-release-capability oss-source POLICY CONTEXT - BUDGET_LEDGER SESSION_FILE` exchanges job OIDC with RAM STS.
 It requests read access to only `research/sources/COMMIT/` before ACR login.
-`oss-publish POLICY CONTEXT PLAN SESSION_FILE` requests the native plan's exact sorted source/Build prefixes.
+`research-release-capability oss-publish POLICY CONTEXT PLAN BUDGET_LEDGER SESSION_FILE` requests the native plan's exact sorted source/Build prefixes.
 The fixed configuration accepts only `research/builds/` and `research/sources/`,
 in that order. It rejects `research/`, wildcard strings, exact hash entries,
 duplicate namespaces and scientific output paths. These are base-role boundaries,
