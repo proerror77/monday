@@ -67,8 +67,9 @@ Independent operator evidence is required to resolve historical/crash ambiguity.
 
 The provider client retains a 15-second timeout per HTTP request, not a global
 15-second transaction. The change removes those network waits from ordinary
-reconciler transactions. Kubernetes `activeDeadlineSeconds` is relative to
-provider creation, so GET/POST or server delays can move its wall-clock end.
+reconciler transactions. Kubernetes Job `activeDeadlineSeconds` is relative to
+the Job's `startTime`, so GET/POST or server delays can move its wall-clock end.
+See the [Kubernetes Job API](https://kubernetes.io/docs/reference/kubernetes-api/batch/job-v1/#JobSpec).
 Preserving the original request does not prove an exact absolute process cutoff.
 PG lease/deadline and native credential checks govern their admission/publication
 boundaries; actual process termination still requires independent provider/Pod
