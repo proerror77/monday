@@ -44,8 +44,15 @@ if [[ $mode == check-public-policy ]]; then
   printf 'Public research publication policy structure is valid for %s; native signing, OIDC and TLS validation remain required.\n' "$PRODUCT"
   exit 0
 fi
-issuer=${RUNNER_TEMP:?prebuilt native issuer directory required}/research-release-issuer-target/debug/research-release-publisher
-capability=${RUNNER_TEMP}/research-release-issuer-target/debug/research-release-capability
+tools=${RUNNER_TEMP:?authenticated release tools directory required}/research-release-tools
+: "${SOURCE_REVISION:?source required}" "${PRODUCER_RUN:?software producer required}"
+# The downloader authenticates the producer through GitHub. Recheck the exact
+# manifest and bytes before each credential-bearing invocation.
+manifest="$tools/research-release-tools.json"
+ruby "$root/.github/scripts/research-release-tools-artifact.rb" verify "$tools" "$SOURCE_REVISION" "$PRODUCER_RUN" \
+  "$(jq -er .workflow_run_attempt "$manifest")" "$(jq -er .workflow_job_id "$manifest")" "$(jq -er .workflow_path "$manifest")"
+issuer=$tools/release-tools/research-release-publisher
+capability=$tools/release-tools/research-release-capability
 test -x "$issuer"
 test -x "$capability"
 work=$(mktemp -d)

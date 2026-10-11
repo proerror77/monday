@@ -97,7 +97,7 @@ mod tests {
 
     fn executable(path: &Path, body: &str) -> Result<()> {
         std::fs::write(path, body)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
         Ok(())
     }
     #[test]
@@ -113,14 +113,30 @@ mod tests {
             for name in [
                 "publish-research-build-release.sh",
                 "select-research-oss-policy.jq",
+                "research-release-tools.json",
+                "build-research-release-tools.sh",
+                "research-release-tools-artifact.rb",
+                "research-release-bundle.rb",
+                "research-release-source-sha.sh",
             ] {
                 std::fs::copy(
                     source_root.join(".github/scripts").join(name),
                     scripts.join(name),
                 )?;
             }
+            for name in [
+                ".github/workflows/ploy-ci.yml",
+                "rust_hft/research-core/platform/Cargo.toml",
+                "rust_hft/research-core/platform/Cargo.lock",
+                "rust_hft/.cargo/config.toml",
+            ] {
+                let destination = root.join(name);
+                std::fs::create_dir_all(destination.parent().unwrap())?;
+                std::fs::copy(source_root.join(name), destination)?;
+            }
             let runner = root.join("runner");
-            let issuer_dir = runner.join("research-release-issuer-target/debug");
+            let tools = runner.join("research-release-tools");
+            let issuer_dir = tools.join("release-tools");
             std::fs::create_dir_all(&issuer_dir)?;
             let fakebin = root.join("bin");
             std::fs::create_dir(&fakebin)?;
@@ -133,7 +149,7 @@ printf '%s\n' "$1" >>"$RUNNER_TEMP/calls"
 case "$1" in
 budget-plan) test "$4" = controller; printf '%s\n' '{}' ;;
 budget-init) test "$5" = "$RUNNER_TEMP/research-publication-native-budget.json"; (set -o noclobber; printf '%s\n' burned >"$6"); printf '%s\n' '{}' ;;
-budget-summary) test -f "$2"; [[ $MONDAY_TEST_FAIL != summary ]]; printf '%s\n' '{"schema":"monday.oss-publication-budget-usage.v1","reserved":{"requests":4},"claims":["preflight"]}' ;;
+budget-summary) test -f "$2"; [[ $MONDAY_TEST_FAIL != summary ]] || exit 1; printf '%s\n' '{"schema":"monday.oss-publication-budget-usage.v1","reserved":{"requests":4},"claims":["preflight"]}' ;;
 oss-check-config) case "$MONDAY_TEST_FAIL" in preflight) exit 23;; term) kill -TERM "$PPID";exit 23;; esac ;;
 plan) printf '%s\n' '{}' ;;
 oss-publish) printf '%s\n' '[]' ;;
@@ -152,6 +168,35 @@ printf '%s\n' "$1" >>"$RUNNER_TEMP/calls"
 printf '%s\n' '{}' >"$6"
 "#,
             )?;
+            // Synthetic executables exercise the budget wrapper through the real
+            // artifact verifier. Transport authentication has separate CI fixtures.
+            let evidence = root.join("compiler.json");
+            let compiler_fixture = Command::new("ruby")
+                .args(["-rjson", "-ryaml", "-e", r#"
+workflow, output = ARGV
+builder = YAML.safe_load(File.read(workflow)).fetch('jobs').fetch('research-release-tools').fetch('container').fetch('image')
+File.write(output, JSON.generate({builder_image: builder,
+  compiler: {rustc_version: 'rustc 1.98.1 fixture', cargo_version: 'cargo 1.98.1 fixture',
+    rustc_sha256: 'a'*64, cargo_sha256: 'b'*64, sysroot_sha256: 'c'*64},
+  native_sha256: 'd'*64, flags_sha256: 'e'*64}))
+"#])
+                .arg(root.join(".github/workflows/ploy-ci.yml"))
+                .arg(&evidence)
+                .output()?;
+            assert!(compiler_fixture.status.success());
+            let create = Command::new("ruby")
+                .arg(scripts.join("research-release-tools-artifact.rb"))
+                .arg("create")
+                .arg(&tools)
+                .arg("a".repeat(40))
+                .args(["1", "1", "1", ".github/workflows/ploy-ci.yml"])
+                .arg(&evidence)
+                .output()?;
+            assert!(
+                create.status.success(),
+                "{}",
+                String::from_utf8_lossy(&create.stderr)
+            );
             let policy = json!({"trust":{"schema":1,"producer_workflow_path":".github/workflows/acr-publish.yml","keys":{"ci":"b".repeat(64)}},
                 "key_id":"ci","builder_image":format!("builder@sha256:{}","a".repeat(64)),"image_repositories":{"controller":"registry/controller"},
                 "oss_by_product":{"controller":{"bucket":"fixture","region":"cn-hangzhou","endpoint":"https://fixture.oss-cn-hangzhou.aliyuncs.com/",
@@ -188,8 +233,9 @@ printf '%s\n' '{}' >"$6"
             assert_eq!(
                 output.status.success(),
                 failure == "none",
-                "unexpected wrapper result: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "unexpected wrapper result for {failure}: {}; receipt={}",
+                String::from_utf8_lossy(&output.stderr),
+                std::fs::read_to_string(runner.join("research-publication-budget-usage.json"))?
             );
             let summary: serde_json::Value = serde_json::from_slice(&std::fs::read(
                 runner.join("research-publication-budget-usage.json"),

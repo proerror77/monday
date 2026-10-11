@@ -4,13 +4,23 @@ require 'rubygems/package'
 require 'fileutils'
 require 'json'
 
-CATALOG = JSON.parse(File.read(File.join(__dir__, 'research-release-products.json'))).fetch('products')
-selection = ARGV[3] || 'all'
-PRODUCTS = (selection == 'all' ? CATALOG.keys : selection.split(',', -1)).sort.freeze
-abort 'invalid research release products' unless PRODUCTS.any? && PRODUCTS.uniq == PRODUCTS && PRODUCTS.all? { |name| CATALOG.key?(name) }
-BINARIES = PRODUCTS.flat_map { |name| CATALOG.fetch(name) }.uniq.sort.freeze
-FILES = { 'research-image-release.json' => [0o644, 1024 * 1024] }.merge(
-  BINARIES.to_h { |name| ["research-bin/#{name}", [0o755, 512 * 1024 * 1024]] }
+TOOLS = %w[pack-tools unpack-tools].include?(ARGV[0])
+if TOOLS
+  abort 'expected pack-tools/unpack-tools ARCHIVE DIRECTORY' unless ARGV.length == 3
+  BINARIES = JSON.parse(File.read(File.join(__dir__, 'research-release-tools.json'))).fetch('binaries').freeze
+  BINARY_DIRECTORY = 'release-tools'
+  MANIFEST = 'research-release-tools.json'
+else
+  catalog = JSON.parse(File.read(File.join(__dir__, 'research-release-products.json'))).fetch('products')
+  selection = ARGV[3] || 'all'
+  products = (selection == 'all' ? catalog.keys : selection.split(',', -1)).sort
+  abort 'invalid research release products' unless products.any? && products.uniq == products && products.all? { |name| catalog.key?(name) }
+  BINARIES = products.flat_map { |name| catalog.fetch(name) }.uniq.sort.freeze
+  BINARY_DIRECTORY = 'research-bin'
+  MANIFEST = 'research-image-release.json'
+end
+FILES = { MANIFEST => [0o644, 1024 * 1024] }.merge(
+  BINARIES.to_h { |name| ["#{BINARY_DIRECTORY}/#{name}", [0o755, 512 * 1024 * 1024]] }
 ).freeze
 MAX_BYTES = 1024 * 1024 * 1024
 
@@ -29,7 +39,7 @@ def pack(archive, directory)
     source = File.join(directory, name)
     info = File.lstat(source)
     check(info.file? && info.size.positive? && info.size <= maximum, "invalid release file: #{name}")
-    check(!name.start_with?('research-bin/') || info.mode & 0o777 == mode, "release executable mode is not 0755: #{name}")
+    check(!name.start_with?("#{BINARY_DIRECTORY}/") || info.mode & 0o777 == mode, "release executable mode is not 0755: #{name}")
     total += info.size
   end
   check(total <= MAX_BYTES, 'release bundle exceeds byte budget')
@@ -72,7 +82,7 @@ def unpack(archive, directory)
   end
   check(names.sort == FILES.keys.sort, 'bundle file set is not the exact release manifest')
   FileUtils.mkdir_p(directory, mode: 0o700)
-  Dir.mkdir(File.join(directory, 'research-bin'), 0o700)
+  Dir.mkdir(File.join(directory, BINARY_DIRECTORY), 0o700)
   read_bundle(archive) do |bundle|
     bundle.each do |entry|
       destination = File.join(directory, entry.full_name)
@@ -95,8 +105,8 @@ begin
   mode, archive, directory = ARGV
   check([3, 4].include?(ARGV.length), 'expected pack/unpack ARCHIVE DIRECTORY PRODUCT')
   case mode
-  when 'pack' then pack(archive, directory)
-  when 'unpack' then unpack(archive, directory)
+  when 'pack', 'pack-tools' then pack(archive, directory)
+  when 'unpack', 'unpack-tools' then unpack(archive, directory)
   else raise ArgumentError, 'expected pack or unpack'
   end
 rescue StandardError => error

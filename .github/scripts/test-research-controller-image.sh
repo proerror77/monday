@@ -40,8 +40,8 @@ case "$1" in
 esac
 MOCK
 chmod 0755 "$work/bin/docker"
-for binary in research-release-publisher alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
-  if [[ $binary == alpha-harness || $binary == research-release-publisher ]]; then
+for binary in alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
+  if [[ $binary == alpha-harness ]]; then
     printf '#!/usr/bin/env bash\nprintf "%s %s\\n"\n' "$binary" "$source_sha" >"$work/release/$binary"
   else
     printf '#!/usr/bin/env bash\nexit 0\n' >"$work/release/$binary"
@@ -89,7 +89,7 @@ initialize_image
 verify_image
 grep -Fq 'run --rm --network none --entrypoint /bin/bash' "$work/docker.log"
 grep -Fqx 'rm -f fixture-container ' "$work/docker.log"
-for failure in source entrypoint user tool script-missing script-syntax script-bytes template binary importer importer-version git gh ruby unzip gh-pagination ruby-runtime ruby-tar ca; do
+for failure in source entrypoint user tool script-missing script-syntax script-bytes template binary issuer capability git gh ruby unzip gh-pagination ruby-runtime ruby-tar ca; do
   initialize_image
   case "$failure" in
     source|entrypoint|user)
@@ -105,8 +105,8 @@ for failure in source entrypoint user tool script-missing script-syntax script-b
     script-syntax) printf '\nif then\n' >>"$work/image/opt/monday/deployment/aliyun/research/scripts/campaign-job-watch.sh" ;;
     script-bytes) printf '\n# changed image asset\n' >>"$work/image/usr/local/bin/cex-materialization-entrypoint.sh" ;;
     template) printf '\n# changed Job template\n' >>"$work/image/opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml" ;;
-    importer) rm "$work/image/usr/local/bin/research-release-publisher" ;;
-    importer-version) printf '#!/usr/bin/env bash\nprintf "wrong importer\\n"\n' >"$work/image/usr/local/bin/research-release-publisher" ;;
+    issuer) touch "$work/image/usr/local/bin/research-release-publisher" ;;
+    capability) touch "$work/image/usr/local/bin/research-release-capability" ;;
     git|gh|ruby|unzip) rm "$work/image/usr/bin/$failure" ;;
     gh-pagination) printf '#!/usr/bin/env bash\nexit 0\n' >"$work/image/usr/bin/gh" ;;
     ruby-runtime) printf '#!/usr/bin/env bash\nexit 1\n' >"$work/image/usr/bin/ruby" ;;
