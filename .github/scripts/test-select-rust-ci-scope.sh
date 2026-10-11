@@ -1326,7 +1326,7 @@ if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; t
 grep -Fq 'ci-owner-cache.sh" cleanup' <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
-grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
+grep -Fqx "  group: prediction-markets-\${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'research-cache-probe-' || '' }}\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
 grep -Fqx "  cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" "$ploy_workflow"
 [[ $(grep -Fxc '    branches: [main, develop]' "$ploy_workflow") -eq 2 ]]
 if sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$ploy_workflow" \
@@ -1551,7 +1551,7 @@ grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea186
 grep -Fqx '          EXPECTED_JOBS: ${{ needs.scope.outputs.jobs }}' "$ci_workflow"
 grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh --job-prefix ci --expected-jobs \"\$EXPECTED_JOBS\"" "$ci_workflow"
 grep -Fqx '  prediction-markets-gate:' "$ploy_workflow"
-grep -Fqx '    name: Prediction Markets CI gate' "$ploy_workflow"
+grep -Fqx "    name: \${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'Research build A/B diagnostic gate' || 'Prediction Markets CI gate' }}" "$ploy_workflow"
 grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0' "$ploy_workflow"
 grep -Fqx '          EXPECTED_JOBS: ${{ needs.research-image-scope.outputs.jobs }}' "$ploy_workflow"
 grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh --job-prefix ploy --expected-jobs \"\$EXPECTED_JOBS\"" "$ploy_workflow"
