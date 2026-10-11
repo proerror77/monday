@@ -151,6 +151,14 @@ impl EngineQueues {
         !self.event_consumer.is_empty()
     }
 
+    pub(crate) fn pending_report_count(&self) -> usize {
+        self.event_consumer.pending_len()
+    }
+
+    pub(crate) fn report_batch_size(&self) -> usize {
+        self.config.batch_size
+    }
+
     pub(crate) fn pristine_bootstrap_report_limit(&self) -> usize {
         self.config
             .event_queue_capacity
@@ -297,16 +305,16 @@ impl EngineQueues {
     /// Diagnostic event view (non-blocking batch), without internal provenance.
     /// Canonical Engine processing uses receive_reports_into instead.
     pub fn receive_events_into(&mut self, buffer: &mut Vec<ExecutionEvent>) {
-        self.drain_reports(|report| buffer.push(report.event));
+        self.drain_reports(self.config.batch_size, |report| buffer.push(report.event));
     }
 
-    pub(crate) fn receive_reports_into(&mut self, buffer: &mut Vec<ExecutionReport>) {
-        self.drain_reports(|report| buffer.push(report));
+    pub(crate) fn receive_reports_into(&mut self, buffer: &mut Vec<ExecutionReport>, limit: usize) {
+        self.drain_reports(limit, |report| buffer.push(report));
     }
 
-    fn drain_reports(&mut self, mut receive: impl FnMut(ExecutionReport)) {
+    fn drain_reports(&mut self, limit: usize, mut receive: impl FnMut(ExecutionReport)) {
         let mut count = 0;
-        while count < self.config.batch_size {
+        while count < limit {
             match self.event_consumer.recv() {
                 Some(report) => {
                     receive(report);

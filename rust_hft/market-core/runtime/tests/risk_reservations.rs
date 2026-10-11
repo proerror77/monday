@@ -1054,7 +1054,7 @@ async fn halt_still_accounts_for_a_previously_admitted_inflight_order() {
 #[tokio::test]
 async fn risk_reducing_modification_preserves_remaining_budget_without_halting() {
     let mut h = Harness::new(8);
-    h.submit("BTCUSDT", Side::Buy, 60).await.unwrap();
+    h.submit("BTCUSDT", Side::Sell, 60).await.unwrap();
     let order = h.bind_next().await;
     h.event(ExecutionEvent::OrderModified {
         order_id: order,
@@ -1119,7 +1119,7 @@ async fn ambiguous_unsent_rejection_cannot_release_an_existing_venue_order() {
 #[tokio::test]
 async fn later_amendment_cannot_discount_an_earlier_higher_risk_price() {
     let mut h = Harness::new(8);
-    h.submit("BTCUSDT", Side::Buy, 60).await.unwrap();
+    h.submit("BTCUSDT", Side::Sell, 60).await.unwrap();
     let order = h.bind_next().await;
     h.event(ExecutionEvent::OrderModified {
         order_id: order.clone(),
@@ -1181,7 +1181,7 @@ async fn replacing_portfolio_owner_cannot_erase_existing_exposure() {
 #[tokio::test]
 async fn restored_risk_price_history_must_match_the_exact_oms_revision() {
     let mut source = Harness::new(8);
-    source.submit("BTCUSDT", Side::Buy, 60).await.unwrap();
+    source.submit("BTCUSDT", Side::Sell, 60).await.unwrap();
     let order = source.bind_next().await;
     let old = source.engine.lock().await.export_risk_reservations();
     source
@@ -1509,4 +1509,125 @@ async fn typed_unsent_rejection_releases_only_the_queued_identity() {
     assert!(!h.engine.lock().await.reconciliation_halted());
     assert!(h.submit("SOLUSDT", Side::Buy, 60).await.is_err());
     h.submit("BNBUSDT", Side::Buy, 40).await.unwrap();
+}
+
+async fn assert_stale_terminal_checkpoint_requires_absent_readback(empty_checkpoint: bool) {
+    for rejected in [false, true] {
+        for partial in [false, true] {
+            for changed_venue_id in [false, true] {
+                let mut source = Harness::new(8);
+                let empty = source.engine.lock().await.export_risk_reservations();
+                source.submit("BTCUSDT", Side::Buy, 60).await.unwrap();
+                let order_id = source.bind_next().await;
+                if partial {
+                    source
+                        .event(ExecutionEvent::Fill {
+                            order_id: order_id.clone(),
+                            price: Price(Decimal::from(60)),
+                            quantity: Quantity(Decimal::new(2, 1)),
+                            timestamp: now_micros(),
+                            fill_id: "before-terminal".into(),
+                        })
+                        .await;
+                }
+                let before_terminal = source.engine.lock().await.export_risk_reservations();
+                let mut still_open = source.snapshot(true).await;
+                if changed_venue_id {
+                    still_open.clients[0].open_orders.as_mut().unwrap()[0].order_id =
+                        OrderId("changed-venue-identity".into());
+                }
+                source
+                    .event(if rejected {
+                        ExecutionEvent::OrderReject {
+                            order_id: order_id.clone(),
+                            reason: "venue reject".into(),
+                            timestamp: now_micros(),
+                        }
+                    } else {
+                        ExecutionEvent::OrderCanceled {
+                            order_id: order_id.clone(),
+                            timestamp: now_micros(),
+                        }
+                    })
+                    .await;
+                let absent = source.snapshot(true).await;
+                let owner = source.engine.lock().await;
+                let oms = owner.export_oms_checkpoint();
+                let portfolio = owner.export_portfolio_state();
+                drop(owner);
+                let mut recovered = Harness::new(8);
+                let mut engine = recovered.engine.lock().await;
+                engine.import_oms_checkpoint(oms).unwrap();
+                engine.import_portfolio_state(portfolio).unwrap();
+                engine
+                    .import_risk_reservations(if empty_checkpoint {
+                        empty
+                    } else {
+                        before_terminal
+                    })
+                    .unwrap();
+                drop(engine);
+                assert!(!recovered.reconcile_snapshot(still_open).await.healthy,
+                    "terminal OMS with stale risk checkpoint cannot accept provider-open order: empty={empty_checkpoint}, rejected={rejected}, partial={partial}, alias={changed_venue_id}");
+                recovered.engine.lock().await.resume_trading();
+                assert_eq!(
+                    recovered.engine.lock().await.trading_mode(),
+                    engine::TradingMode::Paused
+                );
+                assert!(recovered.submit("ETHUSDT", Side::Buy, 60).await.is_err());
+                assert!(recovered.reconcile_snapshot(absent).await.healthy,
+                    "complete order absence, holdings and fill evidence can settle terminal exposure");
+                recovered.engine.lock().await.resume_trading();
+                recovered.submit("ETHUSDT", Side::Buy, 60).await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_oms_cannot_use_a_pre_terminal_risk_checkpoint_while_provider_is_open() {
+    assert_stale_terminal_checkpoint_requires_absent_readback(false).await;
+}
+
+#[tokio::test]
+async fn terminal_oms_cannot_use_an_earlier_empty_risk_checkpoint_while_provider_is_open() {
+    assert_stale_terminal_checkpoint_requires_absent_readback(true).await;
+}
+
+#[tokio::test]
+async fn reduced_quantity_cannot_offset_an_adverse_approved_execution_price() {
+    for (side, new_price) in [(Side::Buy, 120), (Side::Sell, 30)] {
+        let mut h = Harness::new(8);
+        h.submit("BTCUSDT", side, 60).await.unwrap();
+        let order_id = h.bind_next().await;
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(h.engine.clone(), Some(worker_tx), true);
+        let error = control
+            .replace_order(
+                order_id.clone(),
+                Symbol::new("BTCUSDT"),
+                Some(Quantity(Decimal::new(5, 1))),
+                Some(Price(Decimal::from(new_price))),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("approved execution price bound"));
+        assert!(
+            worker_rx.try_recv().is_err(),
+            "unapproved replacement must not reach the adapter"
+        );
+        h.event(ExecutionEvent::OrderModified {
+            order_id,
+            new_quantity: Some(Quantity(Decimal::new(5, 1))),
+            new_price: Some(Price(Decimal::from(new_price))),
+            timestamp: now_micros(),
+        })
+        .await;
+        assert_eq!(
+            h.engine.lock().await.trading_mode(),
+            engine::TradingMode::Paused,
+            "an adverse execution price violates approval even with lower total notional"
+        );
+        assert!(h.submit("ETHUSDT", Side::Buy, 40).await.is_err());
+    }
 }

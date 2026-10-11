@@ -27,7 +27,7 @@ pub struct RiskReservationCheckpoint {
 impl Default for RiskReservationCheckpoint {
     fn default() -> Self {
         Self {
-            schema: 2,
+            schema: 3,
             queued: HashMap::new(),
             orders: HashMap::new(),
             awaiting_final_readback: HashSet::new(),
@@ -48,6 +48,8 @@ pub(super) struct Valuation {
     product_type: hft_core::ProductType,
     quantity: Quantity,
     unit_price: Price,
+    // Buy ceiling or sell floor from the original admitted execution contract.
+    execution_price_bound: Price,
     // Preserve every admitted/observed price while delayed fills can still arrive.
     observed_unit_price: Price,
     // Submitted metadata is valid only for this exact canonical amendment history.
@@ -57,8 +59,8 @@ pub(super) struct Valuation {
 impl Valuation {
     pub(super) fn from_envelope(envelope: &OrderIntentEnvelope) -> HftResult<Self> {
         let intent = &envelope.intent;
-        let price = match intent.order_type {
-            OrderType::Limit => intent.price,
+        let (price, execution_price_bound) = match intent.order_type {
+            OrderType::Limit => intent.price.map(|price| (price, price)),
             OrderType::Market => {
                 let reference = envelope.price_reference.as_ref().ok_or_else(|| {
                     risk_error("market reservation requires the admitted price reference")
@@ -78,12 +80,21 @@ impl Valuation {
                 {
                     return Err(risk_error("market reservation reference identity changed"));
                 }
-                reference
-                    .price
-                    .0
-                    .checked_mul(Decimal::from(10_000 + slippage))
-                    .and_then(|value| value.checked_div(Decimal::from(10_000)))
-                    .map(Price)
+                let scaled_price = |bps| {
+                    reference
+                        .price
+                        .0
+                        .checked_mul(Decimal::from(bps))
+                        .and_then(|value| value.checked_div(Decimal::from(10_000)))
+                        .map(Price)
+                };
+                scaled_price(10_000 + slippage).and_then(|gross_price| {
+                    let execution_bound = match intent.side {
+                        Side::Buy => Some(gross_price),
+                        Side::Sell => scaled_price(10_000 - slippage),
+                    };
+                    execution_bound.map(|bound| (gross_price, bound))
+                })
             }
         }
         .ok_or_else(|| risk_error("pending order risk cannot be valued"))?;
@@ -98,6 +109,7 @@ impl Valuation {
             product_type: intent.product_type,
             quantity: intent.quantity,
             unit_price: price,
+            execution_price_bound,
             observed_unit_price: price,
             observed_revision: None,
         };
@@ -110,6 +122,9 @@ impl Valuation {
             || self.strategy_id.trim().is_empty()
             || self.quantity.0 <= Decimal::ZERO
             || self.unit_price.0 <= Decimal::ZERO
+            || self.execution_price_bound.0 < Decimal::ZERO
+            || self.execution_price_bound.0 > self.unit_price.0
+            || (self.side == Side::Buy && self.execution_price_bound != self.unit_price)
             || self.observed_unit_price.0 < self.unit_price.0
             || self
                 .quantity
@@ -120,6 +135,14 @@ impl Valuation {
             return Err(risk_error("invalid pending risk identity or valuation"));
         }
         Ok(())
+    }
+
+    fn permits_execution_price(&self, price: Price) -> bool {
+        price.0 > Decimal::ZERO
+            && match self.side {
+                Side::Buy => price.0 <= self.execution_price_bound.0,
+                Side::Sell => price.0 >= self.execution_price_bound.0,
+            }
     }
 
     pub(super) fn risk_price(&self) -> Price {
@@ -168,6 +191,9 @@ impl Valuation {
             && order.qty.0 > Decimal::ZERO
             && order.qty.0 <= self.quantity.0
             && order.cum_qty.0 >= Decimal::ZERO
+            && order
+                .limit_price
+                .is_none_or(|price| self.permits_execution_price(price))
     }
 
     fn order_exposure(&self, order: OrderRiskView<'_>) -> HftResult<(Quantity, Price)> {
@@ -230,7 +256,7 @@ impl RiskReservations {
                 "restore cannot discard current unresolved risk reservations",
             ));
         }
-        if checkpoint.schema != 2 {
+        if checkpoint.schema != 3 {
             return Err(risk_error("unsupported risk reservation checkpoint"));
         }
         for (id, valuation) in &checkpoint.queued {
@@ -356,7 +382,7 @@ impl RiskReservations {
                 || valuation.side != *side
                 || valuation.quantity != *quantity
                 || requested_price.is_some_and(|price| {
-                    price.0 <= Decimal::ZERO || price.0 > valuation.unit_price.0
+                    !valuation.permits_execution_price(price) || price.0 > valuation.unit_price.0
                 })
             {
                 return Err(risk_error("OrderNew changed its queued risk reservation"));
@@ -513,7 +539,9 @@ impl RiskReservations {
                     ));
                 }
             }
-            if open(order.status) || self.checkpoint.awaiting_final_readback.contains(id) {
+            // Canonical terminal state does not prove no delayed fill. Imported metadata
+            // may precede that state, so a stale auxiliary marker cannot release risk.
+            if open(order.status) || valuation.is_some() {
                 let valuation = valuation
                     .ok_or_else(|| risk_error("OMS order lacks approval-time risk valuation"))?;
                 let (quantity, price) = valuation.order_exposure(order)?;
@@ -551,23 +579,24 @@ impl RiskReservations {
             ));
         }
         self.project(account, orders.values().map(|order| Ok(order.into())))?;
-        for id in &self.checkpoint.awaiting_final_readback {
-            let valuation = self
-                .checkpoint
-                .orders
-                .get(id)
-                .ok_or_else(|| risk_error("terminal order lacks its admitted risk identity"))?;
-            if exchange_order_ids.contains(id)
-                || exchange_client_ids.contains(valuation.client_order_id.as_str())
+        // Inspect canonical terminal records even when an older risk checkpoint is empty.
+        // A changed venue ID remains the same admission when its client ID matches.
+        for order in orders.values().filter(|order| !open(order.status)) {
+            if exchange_order_ids.contains(&order.order_id)
+                || order
+                    .client_order_id
+                    .as_deref()
+                    .is_some_and(|client_id| exchange_client_ids.contains(client_id))
             {
                 return Err(risk_error(
                     "terminal order is still open in authoritative readback",
                 ));
             }
         }
-        for id in self.checkpoint.awaiting_final_readback.drain() {
-            self.checkpoint.orders.remove(&id);
-        }
+        self.checkpoint
+            .orders
+            .retain(|id, _| orders.get(id).is_some_and(|order| open(order.status)));
+        self.checkpoint.awaiting_final_readback.clear();
         self.recovery_required = false;
         Ok(())
     }
@@ -589,6 +618,11 @@ impl RiskReservations {
             || price.is_some_and(|price| price.0 <= Decimal::ZERO)
         {
             return Err(risk_error("replacement has invalid quantity or price"));
+        }
+        if price.is_some_and(|price| !valuation.permits_execution_price(price)) {
+            return Err(risk_error(
+                "replacement violates the approved execution price bound",
+            ));
         }
         let quantity = quantity.map_or(old_quantity, |total| Quantity(total.0 - order.cum_qty.0));
         let price = Price(price.map_or(old_price.0, |price| price.0.max(old_price.0)));
@@ -724,5 +758,53 @@ mod tests {
         );
         envelope.price_reference.as_mut().unwrap().symbol = Symbol::new("ETHUSDT");
         assert!(Valuation::from_envelope(&envelope).is_err());
+    }
+
+    #[test]
+    fn market_execution_direction_bound_survives_checkpoint_roundtrip() {
+        for (side, bad_price, allowed_price) in [(Side::Sell, 56, 57), (Side::Buy, 64, 63)] {
+            let mut envelope = intent(side);
+            envelope.intent.order_type = OrderType::Market;
+            envelope.intent.price = None;
+            envelope.lifecycle.max_slippage_bps = Some(500);
+            envelope.price_reference = Some(ports::ExecutionPriceReference {
+                venue: VenueId::BINANCE,
+                symbol: envelope.intent.symbol.clone(),
+                side,
+                price: Price(Decimal::from(60)),
+                book_sequence: 1,
+                received_at: hft_core::LocalReceiveTimestamp::new(hft_core::now_micros()),
+            });
+            let valuation = Valuation::from_envelope(&envelope).unwrap();
+            assert_eq!(valuation.unit_price, Price(Decimal::from(63)));
+            assert_eq!(
+                valuation.execution_price_bound,
+                Price(Decimal::from(allowed_price))
+            );
+            let mut original = RiskReservations::default();
+            original.reserve(valuation).unwrap();
+            let persisted = serde_json::to_vec(&original.export()).unwrap();
+            let mut restored = RiskReservations::default();
+            restored
+                .restore(serde_json::from_slice(&persisted).unwrap())
+                .unwrap();
+            let event = |price| ExecutionEvent::OrderNew {
+                order_id: OrderId("venue-order".into()),
+                client_order_id: Some(envelope.client_order_id.clone()),
+                account_id: envelope.account_id.clone(),
+                symbol: envelope.intent.symbol.clone(),
+                side,
+                quantity: envelope.intent.quantity,
+                requested_price: Some(Price(Decimal::from(price))),
+                arrival_price: None,
+                timestamp: hft_core::now_micros(),
+                venue: envelope.intent.target_venue,
+                strategy_id: envelope.intent.strategy_id.clone(),
+            };
+            assert!(restored.validate_new(&event(bad_price)).is_err());
+            assert!(restored.validate_new(&event(allowed_price)).is_ok());
+            assert!(restored.validate_new(&event(64)).is_err(),
+                "a favorable sell price still cannot exceed the reserved gross notional at original quantity");
+        }
     }
 }

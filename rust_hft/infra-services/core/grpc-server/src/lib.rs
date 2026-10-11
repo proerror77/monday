@@ -130,13 +130,12 @@ impl HftControl for HftControlService {
     async fn enter_degrade_mode(&self, _request: Request<Empty>) -> Result<Response<Ack>, Status> {
         info!("收到進入降頻模式請求");
 
-        let mut engine = self.engine.lock().await;
-        if engine.trading_mode() == engine::TradingMode::Emergency {
-            return Err(Status::failed_precondition(
-                "Emergency mode is sticky; restart is required",
-            ));
-        }
-        engine.enter_degrade_mode();
+        self.execution_control
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("execution worker control is not configured"))?
+            .enter_degrade_mode()
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
 
         Ok(Response::new(Ack {
             ok: true,
@@ -549,6 +548,65 @@ mod tests {
         assert_eq!(
             engine.lock().await.trading_mode(),
             engine::TradingMode::Emergency
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_degrade_mode_cannot_resume_paused_worker() {
+        let engine = Arc::new(Mutex::new(Engine::new(engine::EngineConfig::default())));
+        let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(engine.clone(), Some(worker_tx), true);
+        let service = HftControlService::new(control);
+        let worker = tokio::spawn(async move {
+            match worker_rx.recv().await.expect("pause command") {
+                ControlCommand::SetIntake {
+                    enabled: false,
+                    reply,
+                } => reply.send(Ok(())).expect("pause acknowledgement"),
+                _ => panic!("pause must disable worker intake"),
+            }
+            worker_rx
+        });
+
+        service.pause_trading(Request::new(Empty {})).await.unwrap();
+        let mut worker_rx = worker.await.unwrap();
+        let error = service
+            .enter_degrade_mode(Request::new(Empty {}))
+            .await
+            .expect_err("degrade must not act as a disabled direct-resume route");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            engine.lock().await.trading_mode(),
+            engine::TradingMode::Paused
+        );
+        assert!(
+            worker_rx.try_recv().is_err(),
+            "degrade must not reopen worker intake"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_degrade_mode_keeps_active_worker_intake() {
+        let engine = Arc::new(Mutex::new(Engine::new(engine::EngineConfig::default())));
+        let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(engine.clone(), Some(worker_tx), true);
+        let service = HftControlService::new(control);
+
+        let response = service
+            .enter_degrade_mode(Request::new(Empty {}))
+            .await
+            .expect("active mode may reduce its trading rate")
+            .into_inner();
+
+        assert!(response.ok);
+        assert_eq!(
+            engine.lock().await.trading_mode(),
+            engine::TradingMode::Degraded
+        );
+        assert!(
+            worker_rx.try_recv().is_err(),
+            "degrade must preserve worker intake"
         );
     }
 

@@ -1735,11 +1735,29 @@ impl Engine {
     /// Apply one bounded batch through the canonical owners without running strategies.
     /// Startup bootstrap uses this same path for connection/synchronization markers.
     pub(crate) fn drain_execution_reports(&mut self) -> HftResult<u32> {
+        let limit = self
+            .execution_queues
+            .as_ref()
+            .map_or(0, |queues| queues.report_batch_size());
+        self.drain_execution_reports_up_to(limit)
+    }
+
+    /// After the worker pause ACK, apply the already-published FIFO prefix before readback.
+    /// The Engine guard keeps the consumer exclusive; new producer appends cannot extend work.
+    pub(crate) fn drain_pause_readback_prefix(&mut self) -> HftResult<u32> {
+        let limit = self
+            .execution_queues
+            .as_ref()
+            .map_or(0, |queues| queues.pending_report_count());
+        self.drain_execution_reports_up_to(limit)
+    }
+
+    fn drain_execution_reports_up_to(&mut self, limit: usize) -> HftResult<u32> {
         let mut processed = 0u32;
         let mut events = std::mem::take(&mut self.execution_events_buf);
         events.clear();
         if let Some(queues) = &mut self.execution_queues {
-            queues.receive_reports_into(&mut events);
+            queues.receive_reports_into(&mut events, limit);
         }
         let mut first_error = None;
         for report in &events {
@@ -2117,8 +2135,10 @@ impl Engine {
             if let (Some(om), Some(mut checkpoint)) =
                 (&mut self.order_manager, oms_checkpoint.clone())
             {
-                let mut evidence = om.export_checkpoint().reconciliation_exceptions;
-                checkpoint.reconciliation_exceptions.append(&mut evidence);
+                let evidence = om.export_checkpoint().reconciliation_exceptions;
+                checkpoint
+                    .reconciliation_exceptions
+                    .extend(evidence.into_iter().skip(oms_exception_count));
                 if let Err(reason) = om.import_checkpoint(checkpoint) {
                     error!("canonical OMS rollback failed: {}", reason);
                 }
@@ -2152,15 +2172,19 @@ impl Engine {
             {
                 if let (Some(om), Some(mut checkpoint)) = (&mut self.order_manager, oms_checkpoint)
                 {
-                    let mut evidence = om.export_checkpoint().reconciliation_exceptions;
-                    checkpoint.reconciliation_exceptions.append(&mut evidence);
+                    let evidence = om.export_checkpoint().reconciliation_exceptions;
+                    checkpoint
+                        .reconciliation_exceptions
+                        .extend(evidence.into_iter().skip(oms_exception_count));
                     if let Err(reason) = om.import_checkpoint(checkpoint) {
                         error!("canonical OMS rollback failed: {}", reason);
                     }
                 }
                 if let Some(mut checkpoint) = portfolio_checkpoint {
-                    let mut evidence = pm.export_state().reconciliation_exceptions;
-                    checkpoint.reconciliation_exceptions.append(&mut evidence);
+                    let evidence = pm.export_state().reconciliation_exceptions;
+                    checkpoint
+                        .reconciliation_exceptions
+                        .extend(evidence.into_iter().skip(portfolio_exception_count));
                     // The evidence append changes the trusted checkpoint
                     // material; the canonical Portfolio recomputes its digest
                     // on the next export after this verified restore.
@@ -2931,12 +2955,23 @@ impl Engine {
         self.stats.trading_mode = TradingMode::Normal;
     }
 
+    pub(crate) fn ensure_active_degrade_ready(&self) -> HftResult<()> {
+        self.ensure_accepting_new_intents()?;
+        self.risk_reservations
+            .view(&self.get_account_view(), self.order_manager.as_deref())?;
+        Ok(())
+    }
+
     /// 進入降頻模式
     pub fn enter_degrade_mode(&mut self) {
         if self.refuse_emergency_downgrade(TradingMode::Degraded) {
             return;
         }
-        if self.ensure_risk_resume_ready().is_err() {
+        if self.stats.trading_mode == TradingMode::Paused {
+            warn!("degraded mode cannot resume paused execution");
+            return;
+        }
+        if self.ensure_active_degrade_ready().is_err() {
             return;
         }
         warn!("Sentinel: 進入降頻模式");
@@ -4760,5 +4795,15 @@ mod tests {
             engine.submit_order_intent(test_intent()),
             Err(HftError::Risk(_))
         ));
+    }
+
+    #[test]
+    fn paused_mode_cannot_be_changed_to_degraded_locally() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.pause_trading();
+
+        engine.enter_degrade_mode();
+
+        assert_eq!(engine.trading_mode(), TradingMode::Paused);
     }
 }

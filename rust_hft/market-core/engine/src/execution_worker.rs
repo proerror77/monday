@@ -3028,6 +3028,7 @@ mod tests {
         open_orders: Vec<OpenOrder>,
         balances: Vec<AccountBalance>,
         balance_reads: usize,
+        authoritative_readback: bool,
         spot_inventory: bool,
         healthy: Option<bool>,
         finite_stream: bool,
@@ -3131,10 +3132,11 @@ mod tests {
         }
 
         fn asset_inventory_capability(&self) -> AssetInventoryCapability {
-            if self.state.lock().unwrap().usdm_capability {
+            let state = self.state.lock().unwrap();
+            if state.usdm_capability || state.authoritative_readback {
                 return AssetInventoryCapability::PositionSnapshotRequired;
             }
-            if self.state.lock().unwrap().spot_inventory {
+            if state.spot_inventory {
                 AssetInventoryCapability::AuthoritativeAssetInventory {
                     product_type: hft_core::ProductType::Spot,
                 }
@@ -3147,6 +3149,32 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.balance_reads += 1;
             Ok(state.balances.clone())
+        }
+
+        fn supports_position_snapshot(&self) -> bool {
+            self.state.lock().unwrap().authoritative_readback
+        }
+
+        async fn get_positions(&self) -> HftResult<Vec<ports::Position>> {
+            if self.state.lock().unwrap().authoritative_readback {
+                Ok(Vec::new())
+            } else {
+                Err(HftError::Execution("position readback unavailable".into()))
+            }
+        }
+
+        fn supports_recent_fills_snapshot(&self) -> bool {
+            self.state.lock().unwrap().authoritative_readback
+        }
+
+        async fn list_recent_fills(&self) -> HftResult<Vec<ports::AccountFill>> {
+            if self.state.lock().unwrap().authoritative_readback {
+                Ok(Vec::new())
+            } else {
+                Err(HftError::Execution(
+                    "recent fill readback unavailable".into(),
+                ))
+            }
         }
 
         async fn connect(&mut self) -> HftResult<()> {
@@ -4377,6 +4405,312 @@ mod tests {
         assert_eq!(worker.stats.orders_failed, 1);
         assert!(!worker.accepting_intents);
         assert!(worker.stream_recovery_pending);
+    }
+
+    #[test]
+    fn pause_readback_prefix_does_not_expand_to_later_reports() {
+        let (mut engine, mut worker) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let empty_prefix = engine.pending_report_count();
+        worker
+            .send_event(ExecutionEvent::ConnectionStatus {
+                connected: true,
+                timestamp: 1,
+            })
+            .unwrap();
+        let mut reports = Vec::new();
+        engine.receive_reports_into(&mut reports, empty_prefix);
+        assert!(reports.is_empty(), "an empty captured prefix stays empty");
+        let prefix = engine.pending_report_count();
+        worker
+            .send_event(ExecutionEvent::ConnectionStatus {
+                connected: true,
+                timestamp: 2,
+            })
+            .unwrap();
+        engine.receive_reports_into(&mut reports, prefix);
+        assert!(matches!(
+            reports.as_slice(),
+            [crate::execution_queues::ExecutionReport {
+                event: ExecutionEvent::ConnectionStatus { timestamp: 1, .. },
+                ..
+            }]
+        ));
+        assert_eq!(engine.pending_report_count(), 1);
+    }
+
+    fn pause_readback_fixture() -> (
+        Arc<tokio::sync::Mutex<crate::Engine>>,
+        ExecutionWorker,
+        Arc<StdMutex<MockExecutionState>>,
+        crate::ExecutionControlHandle,
+    ) {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            simulated: true,
+            authoritative_readback: true,
+            balances: vec![AccountBalance {
+                asset: "USD".into(),
+                available: rust_decimal::Decimal::from(1000),
+                frozen: rust_decimal::Decimal::ZERO,
+                total: rust_decimal::Decimal::from(1000),
+                usd_value: Some(rust_decimal::Decimal::from(1000)),
+            }],
+            ..Default::default()
+        }));
+        // Five rounds to eight ring slots, seven usable. Six reports therefore exceed
+        // both the configured capacity and one batch while fitting before the pause ACK.
+        let (engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig {
+                intent_queue_capacity: 8,
+                event_queue_capacity: 5,
+                batch_size: 2,
+            });
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut engine = crate::Engine::new(crate::EngineConfig {
+            intent_max_latency_us: 60_000_000,
+            ..Default::default()
+        });
+        engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+        engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::with_cash_balance(
+            rust_decimal::Decimal::from(1000),
+        )));
+        engine.set_execution_queues(engine_queues);
+        engine.set_execution_control_sender(control_tx.clone());
+        engine.set_execution_price_protection(HashMap::from([(
+            VenueId::MOCK,
+            ports::ExecutionPriceProtection::VenueQuote,
+        )]));
+        let engine = Arc::new(tokio::sync::Mutex::new(engine));
+        let control = crate::ExecutionControlHandle::new(engine.clone(), Some(control_tx), true);
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(MockExecutionClient {
+                state: state.clone(),
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            })],
+            control_rx,
+        );
+        worker.venue_to_client.insert(VenueId::MOCK, 0);
+        worker
+            .account_to_client
+            .insert(AccountId("simulated-venue:99".into()), 0);
+        (engine, worker, state, control)
+    }
+
+    fn pause_readback_intent(client_id: &str) -> OrderIntentEnvelope {
+        let mut intent = create_test_intent("BTCUSDT");
+        intent.order_type = OrderType::Limit;
+        intent.price = Some(Price(rust_decimal::Decimal::from(60)));
+        intent.target_venue = Some(VenueId::MOCK);
+        let mut envelope = OrderIntentEnvelope::new(
+            intent,
+            ports::OrderIntentLifecycle::new(now_micros(), u64::MAX),
+        )
+        .with_account_id(AccountId("simulated-venue:99".into()));
+        envelope.client_order_id = client_id.into();
+        envelope
+    }
+
+    async fn drive_pause_readback_worker(
+        mut worker: ExecutionWorker,
+        engine: Arc<tokio::sync::Mutex<crate::Engine>>,
+        queued_at_snapshot: Arc<std::sync::atomic::AtomicUsize>,
+        mut stop: oneshot::Receiver<()>,
+    ) -> ExecutionWorker {
+        loop {
+            tokio::select! {
+                _ = &mut stop => return worker,
+                command = worker.control_rx.recv() => {
+                    let Some(command) = command else { return worker };
+                    if let ControlCommand::Reconcile {
+                        include_balances, include_positions, include_recent_fills, ..
+                    } = &command {
+                        assert!(*include_balances && *include_positions && *include_recent_fills);
+                        let checkpoint = serde_json::to_value(
+                            engine.lock().await.export_risk_reservations(),
+                        ).unwrap();
+                        queued_at_snapshot.store(
+                            checkpoint["queued"].as_object().unwrap().len(),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                    }
+                    worker.handle_control_command(command).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_readback_prefix_applies_all_unsent_reports_before_snapshot() {
+        for mode in [
+            crate::TradingMode::Normal,
+            crate::TradingMode::Degraded,
+            crate::TradingMode::Paused,
+            crate::TradingMode::Emergency,
+        ] {
+            let (engine, worker, state, control) = pause_readback_fixture();
+            for index in 0..6 {
+                engine
+                    .lock()
+                    .await
+                    .submit_order_intent_envelope(
+                        pause_readback_intent(&format!("pause-{index}")),
+                        now_micros(),
+                        None,
+                    )
+                    .unwrap();
+            }
+            {
+                let mut engine = engine.lock().await;
+                match mode {
+                    crate::TradingMode::Normal => {}
+                    crate::TradingMode::Degraded => engine.enter_degrade_mode(),
+                    crate::TradingMode::Paused => engine.pause_trading(),
+                    crate::TradingMode::Emergency => {
+                        engine.emergency_exit();
+                    }
+                }
+                assert_eq!(engine.trading_mode(), mode);
+            }
+            let queued_at_snapshot = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+            let (stop, stopped) = oneshot::channel();
+            // No background Engine tick: the control barrier must apply the real worker reports.
+            let driver = tokio::spawn(drive_pause_readback_worker(
+                worker,
+                engine.clone(),
+                queued_at_snapshot.clone(),
+                stopped,
+            ));
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), control.reconcile_guarded(true)).await;
+            let _ = stop.send(());
+            let worker = driver.await.unwrap();
+            let report = result.expect("guarded readback is bounded").unwrap();
+            assert_eq!(
+                queued_at_snapshot.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert!(report.healthy);
+            let engine = engine.lock().await;
+            assert!(!engine.risk_reservations.has_queued());
+            assert_eq!(engine.get_statistics().orders_rejected, 6);
+            assert_eq!(engine.trading_mode(), mode);
+            assert_eq!(
+                worker.accepting_intents,
+                matches!(
+                    mode,
+                    crate::TradingMode::Normal | crate::TradingMode::Degraded
+                )
+            );
+            assert!(state.lock().unwrap().placed.is_empty());
+            assert_eq!(state.lock().unwrap().balance_reads, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_readback_prefix_keeps_first_error_and_later_accounting() {
+        let (engine, mut worker, state, control) = pause_readback_fixture();
+        engine
+            .lock()
+            .await
+            .submit_order_intent_envelope(pause_readback_intent("accepted"), now_micros(), None)
+            .unwrap();
+        let mut accepted = worker.queues.receive_envelopes();
+        worker.process_order_intents(&mut accepted).await;
+        engine.lock().await.tick().unwrap();
+        let order_id = OrderId("placed".into());
+        for index in 0..2 {
+            worker
+                .queues
+                .send_event(ExecutionEvent::Fill {
+                    order_id: OrderId(format!("unknown-prefix-{index}")),
+                    price: Price(rust_decimal::Decimal::from(60)),
+                    quantity: Quantity(rust_decimal::Decimal::ONE),
+                    timestamp: now_micros(),
+                    fill_id: format!("unknown-fill-{index}"),
+                })
+                .unwrap();
+        }
+        for index in 0..2 {
+            worker
+                .queues
+                .send_event(ExecutionEvent::FeeCharged {
+                    order_id: order_id.clone(),
+                    amount: -rust_decimal::Decimal::ONE,
+                    timestamp: now_micros(),
+                    fill_id: format!("invalid-negative-fee-{index}"),
+                })
+                .unwrap();
+        }
+        worker
+            .queues
+            .send_event(ExecutionEvent::Fill {
+                order_id: order_id.clone(),
+                price: Price(rust_decimal::Decimal::from(60)),
+                quantity: Quantity(rust_decimal::Decimal::new(5, 1)),
+                timestamp: now_micros(),
+                fill_id: "valid-prefix-fill".into(),
+            })
+            .unwrap();
+        worker
+            .queues
+            .send_event(ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 77,
+                connected: true,
+                timestamp: now_micros(),
+            })
+            .unwrap();
+        let queued_at_snapshot = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let (stop, stopped) = oneshot::channel();
+        let driver = tokio::spawn(drive_pause_readback_worker(
+            worker,
+            engine.clone(),
+            queued_at_snapshot.clone(),
+            stopped,
+        ));
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), control.reconcile_guarded(true)).await;
+        let _ = stop.send(());
+        let mut worker = driver.await.unwrap();
+        let error = result
+            .expect("failed readback is bounded")
+            .expect_err("the first report failed");
+        assert!(error.to_string().contains("canonical OMS retained"));
+        let engine = engine.lock().await;
+        assert_eq!(
+            engine.export_oms_state()[&order_id].cum_qty,
+            Quantity(rust_decimal::Decimal::new(5, 1))
+        );
+        assert_eq!(
+            engine.get_account_view().positions[&Symbol::new("BTCUSDT")].quantity,
+            Quantity(rust_decimal::Decimal::new(5, 1))
+        );
+        assert_eq!(
+            engine
+                .export_oms_checkpoint()
+                .reconciliation_exceptions
+                .len(),
+            2
+        );
+        assert_eq!(
+            engine
+                .export_portfolio_state()
+                .reconciliation_exceptions
+                .len(),
+            2
+        );
+        assert_eq!(engine.trading_mode(), crate::TradingMode::Paused);
+        assert!(engine.reconciliation_halted());
+        assert!(!worker.accepting_intents);
+        assert_eq!(worker.queues.try_receive_applied_execution_stream(), None);
+        assert_eq!(state.lock().unwrap().balance_reads, 0);
+        assert_eq!(
+            queued_at_snapshot.load(std::sync::atomic::Ordering::SeqCst),
+            usize::MAX
+        );
     }
 
     #[tokio::test]

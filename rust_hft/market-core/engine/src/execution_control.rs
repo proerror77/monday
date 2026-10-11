@@ -159,6 +159,27 @@ impl ExecutionControlHandle {
             .await
     }
 
+    pub async fn enter_degrade_mode(&self) -> HftResult<()> {
+        let _operation = self.operation_gate.lock().await;
+        let mut engine = self.engine.lock().await;
+        match engine.trading_mode() {
+            crate::TradingMode::Emergency => {
+                return Err(HftError::Risk(
+                    "Emergency mode is sticky; restart is required".to_string(),
+                ));
+            }
+            crate::TradingMode::Paused => {
+                return Err(HftError::Risk(
+                    "degraded mode cannot resume paused execution".to_string(),
+                ));
+            }
+            crate::TradingMode::Normal | crate::TradingMode::Degraded => {}
+        }
+        engine.ensure_active_degrade_ready()?;
+        engine.enter_degrade_mode();
+        Ok(())
+    }
+
     async fn resume_trading_unlocked(&self, target_mode: crate::TradingMode) -> HftResult<()> {
         if self.engine.lock().await.trading_mode() == crate::TradingMode::Emergency {
             return Err(HftError::Risk(
@@ -188,8 +209,10 @@ impl ExecutionControlHandle {
             return Err(error);
         }
         match target_mode {
-            crate::TradingMode::Normal => engine.resume_trading(),
-            crate::TradingMode::Degraded => engine.enter_degrade_mode(),
+            crate::TradingMode::Normal | crate::TradingMode::Degraded => {
+                // Enabled execution has acknowledged intake before this controlled restore.
+                engine.set_trading_mode(target_mode);
+            }
             crate::TradingMode::Paused | crate::TradingMode::Emergency => {
                 drop(engine);
                 if self.execution_enabled {
@@ -569,9 +592,13 @@ impl ExecutionControlHandle {
             previous_mode,
             crate::TradingMode::Normal | crate::TradingMode::Degraded
         );
-        if was_active {
-            self.pause_trading_unlocked().await?;
-        }
+        // A prior Engine pause may still have a worker command in flight. Await its
+        // quiescence in every mode; only the eventual restoration depends on was_active.
+        self.pause_trading_unlocked().await?;
+
+        // The worker ACK proves its unsent rejections were enqueued, not yet applied.
+        // Consume that finite prefix canonically, without running strategies, before I/O.
+        self.engine.lock().await.drain_pause_readback_prefix()?;
 
         let report = match self.reconcile(include_balances).await {
             Ok(report) => report,
@@ -2183,52 +2210,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guarded_reconciliation_quiesces_before_snapshot_and_resumes_only_when_healthy() {
-        let engine = Arc::new(Mutex::new(Engine::new(EngineConfig::default())));
+    async fn active_degrade_preserves_known_queued_reservations() {
+        let mut initial = Engine::new(EngineConfig::default());
+        let admitted = ports::OrderIntentEnvelope::new(
+            ports::OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(Decimal::ONE),
+                hft_core::OrderType::Limit,
+                Some(Price(Decimal::from(60))),
+                hft_core::TimeInForce::GTC,
+                "degrade-test".into(),
+                Some(VenueId::MOCK),
+            ),
+            ports::OrderIntentLifecycle::new(hft_core::now_micros(), u64::MAX),
+        );
+        initial
+            .risk_reservations
+            .reserve(crate::risk_reservations::Valuation::from_envelope(&admitted).unwrap())
+            .unwrap();
+        let before = initial.export_risk_reservations();
+        assert!(initial.ensure_risk_resume_ready().is_err());
+        let engine = Arc::new(Mutex::new(initial));
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
         let control = ExecutionControlHandle::new(engine.clone(), Some(worker_tx), true);
-        let worker = tokio::spawn(async move {
-            match worker_rx.recv().await.expect("pause command") {
-                ControlCommand::SetIntake {
-                    enabled: false,
-                    reply,
-                } => reply.send(Ok(())).expect("ack pause barrier"),
-                _ => panic!("snapshot ran before intake pause"),
-            }
-            match worker_rx.recv().await.expect("reconcile command") {
-                ControlCommand::Reconcile { reply, .. } => reply
-                    .send(WorkerReconcileSnapshot {
-                        clients: vec![crate::execution_worker::ClientReconcileSnapshot {
-                            client_index: 0,
-                            venue: Some(VenueId::POLYMARKET),
-                            account_id: None,
-                            open_orders: Ok(Vec::new()),
-                            balances: None,
-                            positions: None,
-                            recent_fills: None,
-                            ..Default::default()
-                        }],
-                    })
-                    .expect("send healthy snapshot"),
-                _ => panic!("unexpected command before reconciliation"),
-            }
-            match worker_rx.recv().await.expect("healthy resume command") {
-                ControlCommand::SetIntake {
-                    enabled: true,
-                    reply,
-                } => reply.send(Ok(())).expect("ack healthy resume"),
-                _ => panic!("healthy reconciliation did not resume intake"),
-            }
-        });
 
-        let report = control
-            .reconcile_guarded(false)
-            .await
-            .expect("healthy guarded reconciliation");
+        control.enter_degrade_mode().await.unwrap();
 
-        assert!(report.healthy);
-        assert_eq!(engine.lock().await.trading_mode(), TradingMode::Normal);
-        worker.await.expect("worker task");
+        let engine = engine.lock().await;
+        assert_eq!(engine.trading_mode(), TradingMode::Degraded);
+        assert_eq!(engine.export_risk_reservations(), before);
+        assert!(engine.ensure_risk_resume_ready().is_err());
+        assert!(
+            worker_rx.try_recv().is_err(),
+            "active degrade must not change intake"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_reconciliation_quiesces_before_snapshot_and_resumes_only_when_healthy() {
+        for previous_mode in [TradingMode::Normal, TradingMode::Degraded] {
+            let mut initial = Engine::new(EngineConfig::default());
+            initial.set_trading_mode(previous_mode);
+            let engine = Arc::new(Mutex::new(initial));
+            let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+            let control = ExecutionControlHandle::new(engine.clone(), Some(worker_tx), true);
+            let worker = tokio::spawn(async move {
+                match worker_rx.recv().await.expect("pause command") {
+                    ControlCommand::SetIntake {
+                        enabled: false,
+                        reply,
+                    } => reply.send(Ok(())).expect("ack pause barrier"),
+                    _ => panic!("snapshot ran before intake pause"),
+                }
+                match worker_rx.recv().await.expect("reconcile command") {
+                    ControlCommand::Reconcile { reply, .. } => reply
+                        .send(WorkerReconcileSnapshot {
+                            clients: vec![crate::execution_worker::ClientReconcileSnapshot {
+                                client_index: 0,
+                                venue: Some(VenueId::POLYMARKET),
+                                account_id: None,
+                                open_orders: Ok(Vec::new()),
+                                balances: None,
+                                positions: None,
+                                recent_fills: None,
+                                ..Default::default()
+                            }],
+                        })
+                        .expect("send healthy snapshot"),
+                    _ => panic!("unexpected command before reconciliation"),
+                }
+                match worker_rx.recv().await.expect("healthy resume command") {
+                    ControlCommand::SetIntake {
+                        enabled: true,
+                        reply,
+                    } => reply.send(Ok(())).expect("ack healthy resume"),
+                    _ => panic!("healthy reconciliation did not resume intake"),
+                }
+            });
+
+            let report = control
+                .reconcile_guarded(false)
+                .await
+                .expect("healthy guarded reconciliation");
+
+            assert!(report.healthy);
+            assert_eq!(engine.lock().await.trading_mode(), previous_mode);
+            worker.await.expect("worker task");
+        }
     }
 
     #[tokio::test]

@@ -1064,6 +1064,17 @@ impl OmsCore {
                     })
             });
             if let Some((local_order_id, local_order)) = local {
+                if !matches!(
+                    local_order.status,
+                    OrderStatus::Unknown
+                        | OrderStatus::New
+                        | OrderStatus::Acknowledged
+                        | OrderStatus::PartiallyFilled
+                ) {
+                    // A terminal local record cannot explain a currently open venue order.
+                    report.exchange_only.push(ex_order.order_id.clone());
+                    continue;
+                }
                 matched_local_ids.insert(local_order_id.clone());
                 // Order exists in both - check for quantity mismatch
                 let exchange_filled = ex_order.filled_quantity;
