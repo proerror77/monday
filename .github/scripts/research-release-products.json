@@ -18,8 +18,7 @@
       "monday-prediction-operator"
     ],
     "controller": [
-      "alpha-harness",
-      "research-release-publisher"
+      "alpha-harness"
     ]
   },
   "recipes": [
@@ -90,14 +89,6 @@
       "features": "",
       "binaries": [
         "monday-prediction-operator"
-      ]
-    },
-    {
-      "manifest": "research-core/platform/Cargo.toml",
-      "package": "hft-research-platform",
-      "features": "publisher",
-      "binaries": [
-        "research-release-publisher"
       ]
     }
   ],

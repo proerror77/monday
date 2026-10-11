@@ -2639,7 +2639,7 @@ mod tests {
         let mut calls = 0;
         for (product, programs, build_count, expected_calls) in [
             ("cex-runner", 7, 4, 66),
-            ("controller", 5, 3, 51),
+            ("controller", 4, 2, 39),
             ("prediction-runner", 5, 3, 51),
         ] {
             let names =
@@ -2667,7 +2667,7 @@ mod tests {
                 assert_eq!(object.sha256, sha256(&bytes));
             }
         }
-        assert_eq!(calls, 168);
+        assert_eq!(calls, 156);
         let names = BTreeSet::from(["alpha-harness".into()]);
         let builds = project_builds(&source(), &manifest.build_inputs, &names)?;
         std::fs::write(

@@ -118,7 +118,8 @@ if grep -nF 'sudo apt-get update' "$ci_workflow" "$ploy_workflow"; then
   echo "host workflow still uses the ambient apt source list" >&2
   exit 1
 fi
-[[ "$(grep -cE '^[[:space:]]+apt-get update$' "$ploy_workflow")" == 1 ]]
+# The two digest-pinned Debian builders install from their container sources.
+[[ "$(grep -cE '^[[:space:]]+apt-get update$' "$ploy_workflow")" == 2 ]]
 grep -F 'install-ubuntu-packages.sh" pkg-config libssl-dev libpq-dev clang lld' "$ploy_workflow" >/dev/null
 grep -F 'install-ubuntu-packages.sh" pkg-config libssl-dev clang lld' "$ploy_workflow" >/dev/null
 grep -F 'install-ubuntu-packages.sh" clang mold protobuf-compiler' "$ci_workflow" >/dev/null

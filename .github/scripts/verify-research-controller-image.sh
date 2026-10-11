@@ -14,7 +14,7 @@ test "$(docker image inspect --format '{{.Config.WorkingDir}}' "$image")" = /wor
 # forward host credentials; even the client version probes have no network.
 docker run --rm --network none --entrypoint /bin/bash "$image" -ceu '
   for tool in bash curl jq tini git gh ruby unzip; do test -x "/usr/bin/$tool"; done
-  for tool in aliyun kubectl research-release-publisher alpha-harness; do
+  for tool in aliyun kubectl alpha-harness; do
     test -x "/usr/local/bin/$tool"
   done
   for forbidden in monday-cex-prepare binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer cex-materialization-entrypoint.sh; do
@@ -26,7 +26,8 @@ docker run --rm --network none --entrypoint /bin/bash "$image" -ceu '
   bash -n /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
   bash -n /opt/monday/deployment/aliyun/research/scripts/campaign-job-watch.sh
   test "$(/usr/local/bin/alpha-harness --version)" = "alpha-harness $1"
-  test "$(/usr/local/bin/research-release-publisher --version)" = "research-release-publisher $1"
+  test ! -e /usr/local/bin/research-release-publisher
+  test ! -e /usr/local/bin/research-release-capability
   git --version
   gh --version
   /usr/bin/gh api --help | grep -Fq -- "--paginate"
@@ -45,7 +46,7 @@ cleanup() {
 }
 trap cleanup EXIT
 container_id=$(docker create "$image")
-for binary in research-release-publisher alpha-harness; do
+for binary in alpha-harness; do
   docker cp "$container_id:/usr/local/bin/$binary" "$readback/$binary"
   cmp "$readback/$binary" "$binaries/$binary"
 done

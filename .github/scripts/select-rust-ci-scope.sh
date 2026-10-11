@@ -99,7 +99,7 @@ select_security_scope() {
 
   case ",$jobs," in
     *",ci/rust,"*|*",ci/market-recorder-contract,"*|*",ci/polymarket-evidence-compiler-image,"*|*",ci/rust-hft-engine-fast-lane,"*|\
-    *",ploy/research-image-"*|*",ploy/rust-"*|*",ploy/audit,"*|*",ploy/integration-regressions,"*)
+    *",ploy/research-image-"*|*",ploy/research-release-tools,"*|*",ploy/rust-"*|*",ploy/audit,"*|*",ploy/integration-regressions,"*)
       rust_relevant=true
       ;;
   esac
@@ -169,6 +169,12 @@ select_research_image_jobs() {
   select_job ploy/safety-scans
 }
 
+select_release_tools_jobs() {
+  select_job ploy/research-release-tools
+  [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+  return 0
+}
+
 select_main_research_image_jobs() {
   if [[ $event == push && $research_image_relevant == true ]]; then
     [[ $research_product != none ]] || research_product=$(bash "$products" normalize all)
@@ -205,6 +211,7 @@ emit() {
     select_job ci/rust
   fi
   if [[ ,$jobs, == *,ploy/research-image-binaries,* && $research_product == none ]]; then research_product=$(bash "$products" normalize all); fi
+  [[ ,$jobs, != *,ploy/research-image-binaries,* ]] || select_job ploy/research-release-tools
   [[ ,$owning_packages, != *",hft-research-platform,"* ]] || select_job ci/research-foundation
   [[ $architecture == true ]] && select_job ploy/architecture-contracts
   [[ $control == true ]] && select_job ci/control-contracts
@@ -328,16 +335,19 @@ begin
     check(features.values.all? { |v| v.is_a?(Array) && v.all? { |f| f.is_a?(String) } })
     check(features.all? { |name, values| name == 'publisher' || !values.include?('publisher') })
     lib = content(revision, 'rust_hft/research-core/platform/src/lib.rs')
-    %w[release_oss release_publisher].each do |name|
+    %w[release_budget release_oss release_publisher].each do |name|
       check(lib.scan(/^#\[cfg\(feature = "publisher"\)\]\n(?:pub )?mod #{name};$/).length == 1)
     end
     recipe = JSON.parse(content(revision, '.github/scripts/research-release-products.json'))
     check(recipe.fetch('schema') == 'monday.research-products.v2')
-    matches = recipe.fetch('recipes').select { |r| r.fetch('package') == 'hft-research-platform' }
-    check(matches.length == 1 && matches[0].fetch('manifest') == 'research-core/platform/Cargo.toml')
-    check(matches[0].fetch('features') == 'publisher' && matches[0].fetch('binaries') == ['research-release-publisher'])
-    check(recipe.fetch('products').select { |_, v| v.include?('research-release-publisher') }.keys == ['controller'])
-    check(recipe.fetch('recipes').all? { |r| r.fetch('package') == 'hft-research-platform' || !r.fetch('features').split(',').include?('publisher') })
+    check(recipe.fetch('recipes').none? { |r| r.fetch('package') == 'hft-research-platform' || r.fetch('features').split(',').include?('publisher') })
+    check(recipe.fetch('products').values.flatten.none? { |name| name.start_with?('research-release-') })
+    tools = JSON.parse(content(revision, '.github/scripts/research-release-tools.json'))
+    check(tools.fetch('schema') == 'monday.research-release-tools-recipe.v1' && tools.fetch('manifest') == platform)
+    check(tools.fetch('package') == 'hft-research-platform' && tools.fetch('features') == 'publisher' && tools.fetch('default_features') == false)
+    check(tools.fetch('binaries') == %w[research-release-capability research-release-publisher])
+    bins = value.fetch('bin').select { |bin| tools.fetch('binaries').include?(bin.fetch('name')) }
+    check(bins.length == 2 && bins.all? { |bin| bin.fetch('required-features') == ['publisher'] && bin.fetch('path') == "src/bin/#{bin.fetch('name')}.rs" })
     paths, status = Open3.capture2('git', 'ls-tree', '-r', '--name-only', '-z', revision)
     check(status.success?)
     consumers = paths.split("\0").select { |path| path.end_with?('/Cargo.toml') && path != platform }.map { |path| manifest(revision, path) }
@@ -358,7 +368,7 @@ begin
       end
     end
   end
-  ['rust_hft/research-core/platform/src/lib.rs', '.github/scripts/research-release-products.json'].each do |path|
+  ['rust_hft/research-core/platform/src/lib.rs', '.github/scripts/research-release-products.json', '.github/scripts/research-release-tools.json'].each do |path|
     check(content(before, path) == content(after, path))
   end
 rescue StandardError
@@ -455,7 +465,7 @@ begin
     check(ca == cb && da.reject { |n, _| changed.include?(n) } == db.reject { |n, _| changed.include?(n) })
     ignored = changed.map { |n| "dep:#{n}" }
     check(pa.reject { |v| ignored.include?(v) } == pb.reject { |v| ignored.include?(v) })
-  elsif ['rust_hft/research-core/platform/src/release_oss.rs', 'rust_hft/research-core/platform/src/release_publisher.rs'].include?(path)
+  elsif %w[release_oss.rs release_publisher.rs release_budget.rs bin/research-release-publisher.rs bin/research-release-capability.rs].map { |name| 'rust_hft/research-core/platform/src/' + name }.include?(path)
     check(!content(before, path).empty? && !content(after, path).empty?)
   else
     raise ArgumentError, 'unknown publisher input'
@@ -468,6 +478,9 @@ RUBY
 
 declare -A publisher_paths=()
 for path in "${paths[@]}"; do
+  case "$path" in
+    .github/workflows/ploy-ci.yml|.github/workflows/acr-publish.yml) select_release_tools_jobs ;;
+  esac
   # workspace_runtime_retirement reads files directly, beyond Cargo's dependency
   # graph. Include the whole prediction tree (also its operational docs), retired
   # roots, canonical adapter manifests, and the external collector contracts.
@@ -573,8 +586,7 @@ for path in "${paths[@]}"; do
       ;;
     rust_hft/Cargo.lock|rust_hft/runtime/Cargo.lock|rust_hft/shared/Cargo.lock|rust_hft/data-pipelines/Cargo.lock|rust_hft/research-core/Cargo.lock|rust_hft/research-core/platform/Cargo.lock|rust_hft/prediction-markets/Cargo.lock)
       if [[ $path == rust_hft/research-core/platform/Cargo.lock ]] && publisher_only_change "$path"; then
-        select_owning_package hft-research-platform
-        select_research_image_jobs controller
+        select_release_tools_jobs
         publisher_paths["$path"]=true
       elif [[ -n $lock_base ]] && narrowed=$(bash "$(dirname "${BASH_SOURCE[0]}")/local-lock-impact.sh" "$lock_base" "$lock_head" "$path"); then
         lock_packages=$(jq -cn --argjson prior "$lock_packages" --argjson names "$narrowed" --arg workspace "${path%/Cargo.lock}" '$prior + [$names[] | {name:.,workspace:$workspace}]')
@@ -598,10 +610,9 @@ for path in "${paths[@]}"; do
       select_job ploy/audit
       needs_metadata=true
       ;;
-    rust_hft/research-core/platform/Cargo.toml|rust_hft/research-core/platform/src/release_oss.rs|rust_hft/research-core/platform/src/release_publisher.rs)
+    rust_hft/research-core/platform/Cargo.toml|rust_hft/research-core/platform/src/release_oss.rs|rust_hft/research-core/platform/src/release_publisher.rs|rust_hft/research-core/platform/src/release_budget.rs|rust_hft/research-core/platform/src/bin/research-release-publisher.rs|rust_hft/research-core/platform/src/bin/research-release-capability.rs)
       if publisher_only_change "$path"; then
-        select_owning_package hft-research-platform
-        select_research_image_jobs controller
+        select_release_tools_jobs
         publisher_paths["$path"]=true
         continue
       fi
@@ -639,6 +650,12 @@ for path in "${paths[@]}"; do
       ;;
     .github/scripts/test-market-import.sh)
       select_job ci/research-foundation
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      continue
+      ;;
+    .github/scripts/research-release-tools.json|.github/scripts/build-research-release-tools.sh|.github/scripts/research-release-tools-artifact.rb|.github/scripts/download-research-release-tools.sh|.github/scripts/test-research-release-tools.sh)
+      select_release_tools_jobs
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
       continue
@@ -1137,9 +1154,9 @@ fi
 if is_production_affected alpha-harness; then
   research_product=$(bash "$products" merge "$research_product" controller)
 fi
-# The controller now directly owns the platform release importer.
+# Shared platform changes still validate the independent release tools.
 if is_production_affected hft-research-platform; then
-  select_research_image_jobs controller
+  select_release_tools_jobs
 fi
 if [[ $event == pull_request ]] && is_production_affected hft-backtest; then
   select_job ploy/research-image-binaries

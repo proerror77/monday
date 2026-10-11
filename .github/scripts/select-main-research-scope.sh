@@ -77,7 +77,7 @@ deferred=none
 pending=$(bash "$script_dir/research-release-products.sh" merge "$accumulated" "$archive_selected")
 product=$(bash "$script_dir/research-release-products.sh" merge "$current" "$pending")
 if [[ $product != none ]]; then
-  for job in ploy/research-image-binaries ploy/research-image-smoke; do
+  for job in ploy/research-image-binaries ploy/research-image-smoke ploy/research-release-tools; do
     if [[ $jobs != *,$job,* ]]; then
       if [[ $jobs == ,, ]]; then jobs=",$job,"; else jobs="${jobs%,},$job,"; fi
     fi

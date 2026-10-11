@@ -288,13 +288,13 @@ acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
 end
 publication=acr.fetch('jobs').fetch('publish')
 abort 'release job cannot obtain its own OIDC identity' unless publication.fetch('permissions')=={'actions'=>'read','checks'=>'read','contents'=>'read','id-token'=>'write','pull-requests'=>'read'}
-abort 'archive predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries','publish-research-images','research-environments']
+abort 'archive predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries','research-release-tools','publish-research-images','research-environments']
 steps=publication.fetch('steps')
 presence=steps.index { |s|s.fetch('name','')=='Require research publication settings before preparation' }
 public_policy=steps.index { |s|s.fetch('name','')=='Validate public research publication policy before preparation' }
 download=steps.index { |s|s.fetch('name','')=='Download authenticated research release' }
 preflight=steps.index { |s|s.fetch('name','')=='Require independent Build signer configuration' }
-compile=steps.index { |s|s.fetch('name','')=='Compile independent release issuer before secret injection' }
+compile=steps.index { |s|s.fetch('name','')=='Download authenticated release tools before secret injection' }
 login=steps.index { |s|s.fetch('name','')=='Log in to ACR' }
 push=steps.index { |s|s.fetch('name','')=='Build and push' }
 abort 'archive mutates a registry or loses issuer preflight' unless preflight && login && push.nil?
@@ -316,8 +316,8 @@ abort 'OCI receipt is not retained independently' unless image.fetch('steps').an
   abort 'cache policy removed mandatory publication readback' unless verify && !verify.key?('continue-on-error') && !verify.key?('if')
   abort 'cache policy grants cache write authority' if job.key?('cache-mode') || acr.key?('cache-mode')
 end
-abort 'issuer compilation can access injected release credentials' unless compile && compile<preflight && steps.fetch(compile).fetch('if')=='matrix.research_artifact' && steps.fetch(compile).fetch('env').keys==['CARGO_TARGET_DIR'] && steps.fetch(compile).fetch('run').include?('cargo build')
-abort 'capability exchange was not compiled before secrets' unless steps.fetch(compile).fetch('run').include?('--bin research-release-capability')
+abort 'issuer compilation can access injected release credentials' unless compile && compile<preflight && steps.fetch(compile).fetch('if')=='matrix.research_artifact' && steps.fetch(compile).fetch('env').keys==['GH_TOKEN','PRODUCER_RUN','SOURCE_SHA'] && steps.fetch(compile).fetch('run').include?('download-research-release-tools.sh')
+abort 'publisher recompiles release tools' if steps.any? { |s| s.fetch('run','').match?(/cargo\s+(?:build|run)/) }
 abort 'missing settings can reach expensive publication preparation' unless presence && download && presence<download && presence<compile && steps.fetch(presence).fetch('if')=='matrix.research_artifact' && steps.fetch(presence).fetch('run').include?('publish-research-build-release.sh check-presence')
 presence_env=steps.fetch(presence).fetch('env')
 expected_presence={

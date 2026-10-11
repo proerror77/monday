@@ -86,7 +86,7 @@ else cp "$RESEARCH_SCOPE_FIXTURE/baselines" "$2"; fi
 MOCK
 printf '%s\n' '{"cex-runner":"BOOTSTRAP","controller":"BOOTSTRAP","prediction-runner":"BOOTSTRAP"}' >"$work/baselines"
 cp "$work/baselines" "$work/baselines-before"
-direct_jobs=,ploy/rust-runner-lean,ploy/architecture-contracts,ploy/research-image-binaries,ploy/research-image-smoke,
+direct_jobs=,ploy/rust-runner-lean,ploy/architecture-contracts,ploy/research-image-binaries,ploy/research-image-smoke,ploy/research-release-tools,
 focused_plan() {
   : >"$work/focused-plan"
   : >"$work/baseline-calls"

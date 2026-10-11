@@ -89,7 +89,14 @@ done
 bash "$compat_helper" cache-paths "$work/full.json" >"$work/cache-paths"
 for product in all cex-runner controller prediction-runner; do
   fixture_inputs "$product" >"$work/changed.json"
-  check_identity_change reuse
+  # Controller programs are now a subset of CEX programs. An identical union
+  # has identical compilation inputs; product identity is bound by its artifact.
+  if cmp -s "$work/full.json" "$work/changed.json"; then
+    bash "$compat_helper" compatibility-inputs "$work/changed.json" >"$work/changed-compat.json"
+    cmp "$work/compat.json" "$work/changed-compat.json"
+  else
+    check_identity_change reuse
+  fi
   bash "$compat_helper" cache-paths "$work/changed.json" >"$work/changed-paths"
   cmp "$work/cache-paths" "$work/changed-paths"
   cmp <(jq -Sc .recipes "$work/changed.json") <(bash "$root/.github/scripts/research-release-products.sh" recipes "$product" | jq -Scs .)
@@ -226,7 +233,7 @@ bash "$helper" workspaces "$work/inputs" >"$work/layout"
 ruby -rpathname - "$root" "$work/layout" <<'RUBY'
 root, file = ARGV
 pairs = File.readlines(file).grep(/ -> /).map { |line| line.strip.split(' -> ') }
-abort 'expected four recipe workspaces' unless pairs.length == 4
+abort 'expected three image recipe workspaces' unless pairs.length == 3
 paths = pairs.map { |source, target| Pathname.new("#{root}/#{source}/#{target}").cleanpath.to_s }
 abort 'shared/nested target could be cleaned twice' unless paths.uniq == paths && paths.none? { |p| paths.any? { |q| p != q && p.start_with?("#{q}/") } }
 RUBY
