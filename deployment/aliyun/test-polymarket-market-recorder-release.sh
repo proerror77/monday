@@ -29,7 +29,7 @@ grep -Fq 'polymarket-market-recorder-release-artifact.sh create' "$WORKFLOW"
 grep -Fq 'polymarket-market-recorder-release-artifact.sh verify' "$WORKFLOW"
 grep -Fq 'new-ploy-runner $source_revision' "$ARTIFACT_HELPER"
 grep -Fq 'monday.polymarket_market_recorder_release.v1' "$ARTIFACT_HELPER"
-grep -Fq 'polymarket-market-recorder-linux-amd64-${{ needs.selector.outputs.source_sha }}' "$WORKFLOW"
+grep -Fq 'polymarket-market-recorder-linux-amd64-${{ needs.ordinary-selector.outputs.source_sha }}' "$WORKFLOW"
 grep -Fq 'tar --format=ustar -cf polymarket-market-recorder-linux-amd64.tar' "$WORKFLOW"
 grep -Fq 'path: polymarket-market-recorder-linux-amd64.tar' "$WORKFLOW"
 
