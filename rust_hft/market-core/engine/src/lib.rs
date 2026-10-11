@@ -524,10 +524,31 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn confirm_risk_readback(&mut self) -> HftResult<()> {
+    pub(crate) fn confirm_risk_readback(
+        &mut self,
+        snapshot: &execution_worker::WorkerReconcileSnapshot,
+    ) -> HftResult<()> {
         let account = self.get_account_view();
         let orders = self.export_oms_state();
-        self.risk_reservations.confirm_readback(&account, &orders)
+        let mut exchange_order_ids = HashSet::new();
+        let mut exchange_client_ids = HashSet::new();
+        for order in snapshot
+            .clients
+            .iter()
+            .filter_map(|client| client.open_orders.as_ref().ok())
+            .flatten()
+        {
+            exchange_order_ids.insert(&order.order_id);
+            if let Some(client_id) = order.client_order_id.as_deref() {
+                exchange_client_ids.insert(client_id);
+            }
+        }
+        self.risk_reservations.confirm_readback(
+            &account,
+            &orders,
+            &exchange_order_ids,
+            &exchange_client_ids,
+        )
     }
 
     pub(crate) fn validate_replacement_risk(

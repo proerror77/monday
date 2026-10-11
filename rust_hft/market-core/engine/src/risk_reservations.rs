@@ -471,6 +471,8 @@ impl RiskReservations {
         &mut self,
         account: &AccountView,
         orders: &HashMap<OrderId, OrderRecord>,
+        exchange_order_ids: &HashSet<&OrderId>,
+        exchange_client_ids: &HashSet<&str>,
     ) -> HftResult<()> {
         if self.recovery_required && !self.checkpoint_supplied {
             return Err(risk_error(
@@ -483,6 +485,19 @@ impl RiskReservations {
             ));
         }
         self.project(account, orders.values().map(|order| Ok(order.into())))?;
+        for id in &self.checkpoint.cancelled {
+            let valuation =
+                self.checkpoint.orders.get(id).ok_or_else(|| {
+                    risk_error("cancelled order lacks its admitted risk identity")
+                })?;
+            if exchange_order_ids.contains(id)
+                || exchange_client_ids.contains(valuation.client_order_id.as_str())
+            {
+                return Err(risk_error(
+                    "cancelled order is still open in authoritative readback",
+                ));
+            }
+        }
         for id in self.checkpoint.cancelled.drain() {
             self.checkpoint.orders.remove(&id);
         }

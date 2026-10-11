@@ -528,7 +528,7 @@ impl ExecutionControlHandle {
             && fill_report.as_ref().is_none_or(|fills| fills.healthy);
 
         if healthy && include_balances {
-            if let Err(error) = engine.confirm_risk_readback() {
+            if let Err(error) = engine.confirm_risk_readback(&worker_snapshot) {
                 tracing::warn!(%error, "authoritative readback cannot release unresolved risk reservations");
                 healthy = false;
             }
@@ -3456,7 +3456,11 @@ mod tests {
         engine
             .import_risk_reservations(engine.export_risk_reservations())
             .unwrap();
-        engine.confirm_risk_readback().unwrap();
+        engine
+            .confirm_risk_readback(&WorkerReconcileSnapshot {
+                clients: Vec::new(),
+            })
+            .unwrap();
         engine.resume_trading();
         let engine = Arc::new(Mutex::new(engine));
         let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
@@ -3642,7 +3646,11 @@ mod tests {
         engine
             .import_risk_reservations(engine.export_risk_reservations())
             .unwrap();
-        engine.confirm_risk_readback().unwrap();
+        engine
+            .confirm_risk_readback(&WorkerReconcileSnapshot {
+                clients: Vec::new(),
+            })
+            .unwrap();
         engine.resume_trading();
         assert_eq!(engine.trading_mode(), TradingMode::Normal);
     }

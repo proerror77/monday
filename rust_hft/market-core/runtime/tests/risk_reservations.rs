@@ -241,6 +241,11 @@ impl Harness {
     }
 
     async fn reconcile(&self, include_fills: bool) -> engine::RuntimeReconciliationReport {
+        self.reconcile_snapshot(self.snapshot(include_fills).await)
+            .await
+    }
+
+    async fn snapshot(&self, include_fills: bool) -> WorkerReconcileSnapshot {
         let engine = self.engine.lock().await;
         let account = engine.get_account_view();
         let orders = engine.export_oms_state();
@@ -292,7 +297,13 @@ impl Harness {
                 ..Default::default()
             }],
         };
-        drop(engine);
+        snapshot
+    }
+
+    async fn reconcile_snapshot(
+        &self,
+        snapshot: WorkerReconcileSnapshot,
+    ) -> engine::RuntimeReconciliationReport {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let control = ExecutionControlHandle::new(self.engine.clone(), Some(tx), true);
         let responder = tokio::spawn(async move {
@@ -806,4 +817,30 @@ async fn foreign_order_without_client_identity_blocks_new_admission() {
     assert!(h.submit("ETHUSDT", Side::Buy, 60).await.is_err(),
         "the foreign open order lacks an admission binding and must not be treated as zero exposure");
     assert!(h.worker.receive_envelopes().is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_order_still_open_at_provider_keeps_its_reservation() {
+    for changed_venue_id in [false, true] {
+        let mut h = Harness::new(8);
+        h.submit("BTCUSDT", Side::Buy, 60).await.unwrap();
+        let order = h.bind_next().await;
+        let mut stale = h.snapshot(true).await;
+        if changed_venue_id {
+            stale.clients[0].open_orders.as_mut().unwrap()[0].order_id =
+                OrderId("venue-renamed-order".into());
+        }
+        h.event(ExecutionEvent::OrderCanceled {
+            order_id: order,
+            timestamp: now_micros(),
+        })
+        .await;
+        assert!(
+            !h.reconcile_snapshot(stale).await.healthy,
+            "a provider snapshot still showing the cancelled order open cannot release its risk"
+        );
+        assert!(h.submit("ETHUSDT", Side::Buy, 60).await.is_err());
+        assert!(h.reconcile(true).await.healthy);
+        h.submit("SOLUSDT", Side::Buy, 60).await.unwrap();
+    }
 }
