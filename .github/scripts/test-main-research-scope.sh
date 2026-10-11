@@ -77,7 +77,9 @@ done
 cat >"$isolated/read-research-publish-baseline.sh" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
+printf '%s\n' "${3:-images}" >>"$RESEARCH_SCOPE_FIXTURE/baseline-calls"
 [[ ! -f $RESEARCH_SCOPE_FIXTURE/baseline-failure ]] || exit 42
+[[ ${3:-images} != builds || ! -f $RESEARCH_SCOPE_FIXTURE/archive-failure ]] || exit 43
 if [[ ${3:-images} == builds && -f $RESEARCH_SCOPE_FIXTURE/archive-baselines ]]; then
   cp "$RESEARCH_SCOPE_FIXTURE/archive-baselines" "$2"
 else cp "$RESEARCH_SCOPE_FIXTURE/baselines" "$2"; fi
@@ -87,6 +89,7 @@ cp "$work/baselines" "$work/baselines-before"
 direct_jobs=,ploy/rust-runner-lean,ploy/architecture-contracts,ploy/research-image-binaries,ploy/research-image-smoke,
 focused_plan() {
   : >"$work/focused-plan"
+  : >"$work/baseline-calls"
   RESEARCH_CARRY_MODE=$1 MONDAY_RELEASE_POLICY_JSON=$2 SELECTED_RESEARCH_PRODUCT=${3:-none} SELECTED_JOBS=${4:-,,} \
     bash "$isolated/select-main-research-scope.sh" "$head" "$work/focused-plan" \
       "$root/.github/scripts/fixtures/rust-ci-scope/metadata.fixture" 2>"$work/focused-log"
@@ -112,7 +115,17 @@ jq -n --arg sha "$head" '{"cex-runner":$sha,"controller":$sha,"prediction-runner
 jq -n --arg sha "$base" '{"cex-runner":$sha,"controller":$sha,"prediction-runner":$sha}' >"$work/archive-baselines"
 focused_plan always '{}'
 grep -Fqx research_product=none "$work/focused-plan"
-grep -Fqx research_archive_pending_product=cex-runner "$work/focused-plan"
+grep -Fqx research_archive_pending_product=not-evaluated "$work/focused-plan"
+grep -Fqx research_archive_base_sha=null "$work/focused-plan"
+[[ $(cat "$work/baseline-calls") == images ]]
+# Missing or invalid authority must not consult archive history.
+touch "$work/archive-failure"
+for allowance in '' '{}' 'broken json'; do
+  MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$allowance focused_plan always '{}'
+  [[ $(cat "$work/baseline-calls") == images ]]
+  grep -Fqx research_archive_pending_product=not-evaluated "$work/focused-plan"
+done
+rm "$work/archive-failure"
 grep -Fqx research_archive_selected_product=none "$work/focused-plan"
 budget="$isolated/research-publication-budget.sh"
 GITHUB_REPOSITORY=fixture/repo bash "$budget" estimate "$head" cex-runner,controller 744 "$work/archive-estimate.json"
@@ -129,6 +142,14 @@ MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$archive_allowance focused_plan al
 grep -Fqx research_image_pending_product=none "$work/focused-plan"
 grep -Fqx research_archive_selected_product=cex-runner "$work/focused-plan"
 grep -Fqx research_archive_carry_policy=approved "$work/focused-plan"
+grep -Fqx research_archive_pending_product=cex-runner "$work/focused-plan"
+[[ $(cat "$work/baseline-calls") == $'images\nbuilds' ]]
+touch "$work/archive-failure"
+if MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$archive_allowance focused_plan always '{}'; then
+  echo 'approved archive history failure was ignored' >&2; exit 1
+fi
+rm "$work/archive-failure"
+MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$archive_allowance focused_plan always '{}'
 grep -Fqx research_pending_product=cex-runner "$work/focused-plan"
 grep -Fqx research_product=cex-runner "$work/focused-plan"
 grep -Fq ',ploy/research-image-binaries,ploy/research-image-smoke,' "$work/focused-plan"

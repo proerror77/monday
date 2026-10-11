@@ -7,7 +7,6 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 bash "$script_dir/read-research-publish-baseline.sh" "$head" "$work/base" images
-bash "$script_dir/read-research-publish-baseline.sh" "$head" "$work/archive-base" builds
 current=${SELECTED_RESEARCH_PRODUCT:-none}
 jobs=${SELECTED_JOBS:-,,}
 [[ $current == none ]] || current=$(bash "$script_dir/research-release-products.sh" normalize "$current")
@@ -43,20 +42,26 @@ pending_since() {
   printf '%s\n' "$accumulated"
 }
 accumulated=$(pending_since "$work/base")
-archive_pending=$(pending_since "$work/archive-base")
+archive_base=null
+archive_pending=not-evaluated
 archive_selected=none
 archive_policy=unapproved
 # Only an approved, unexpired fixed source allocation can schedule extra
 # current-main software for a missing signed Build. This read is offline and
 # supplies no native budget or credentials; publisher readiness still owns all
 # environment/history/signing admission. Image carry is always independent.
-if [[ $archive_pending != none && -n ${MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY:-} ]]; then
+if [[ -n ${MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY:-} ]]; then
   allowed=$(jq -er '.products | if type=="array" then join(",") else error("products required") end' \
     <<<"$MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY") || allowed=none
   storage_hours=$(jq -er '.storage_hours' <<<"$MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY") || storage_hours=0
   if [[ $allowed != none ]] && bash "$script_dir/research-publication-budget.sh" check-operations-scope \
       "$head" "$allowed" "$storage_hours" "$work/archive-scope.json"; then
     archive_policy=approved
+    # Unapproved archive history cannot schedule software. Read it only after
+    # offline authority validation; an unread baseline is not a completed Build.
+    bash "$script_dir/read-research-publish-baseline.sh" "$head" "$work/archive-base" builds
+    archive_base=$(jq -c . "$work/archive-base")
+    archive_pending=$(pending_since "$work/archive-base")
     for target in cex-runner controller prediction-runner; do
       if bash "$script_dir/research-release-products.sh" contains "$allowed" "$target" &&
          bash "$script_dir/research-release-products.sh" contains "$archive_pending" "$target"; then
@@ -79,5 +84,5 @@ if [[ $product != none ]]; then
   done
 fi
 printf 'research_base_sha=%s\nresearch_archive_base_sha=%s\nresearch_product=%s\nresearch_pending_product=%s\nresearch_image_pending_product=%s\nresearch_archive_pending_product=%s\nresearch_archive_selected_product=%s\nresearch_archive_carry_policy=%s\nresearch_deferred_product=%s\nresearch_carry_policy=%s\njobs=%s\n' \
-  "$(jq -c . "$work/base")" "$(jq -c . "$work/archive-base")" "$product" "$pending" "$accumulated" \
+  "$(jq -c . "$work/base")" "$archive_base" "$product" "$pending" "$accumulated" \
   "$archive_pending" "$archive_selected" "$archive_policy" "$deferred" "$policy_state" "$jobs" >>"$output"

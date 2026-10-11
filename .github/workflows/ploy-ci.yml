@@ -37,13 +37,9 @@ jobs:
       contents: read
       actions: read
     outputs:
-      jobs: ${{ steps.cumulative.outputs.jobs || steps.scope.outputs.jobs }}
+      jobs: ${{ steps.scope.outputs.jobs }}
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
-      research_product: ${{ steps.cumulative.outputs.research_product || steps.scope.outputs.research_product }}
-      research_pending_product: ${{ steps.cumulative.outputs.research_pending_product }}
-      research_archive_pending_product: ${{ steps.cumulative.outputs.research_archive_pending_product }}
-      research_archive_selected_product: ${{ steps.cumulative.outputs.research_archive_selected_product }}
-      research_deferred_product: ${{ steps.cumulative.outputs.research_deferred_product }}
+      research_product: ${{ steps.scope.outputs.research_product }}
     steps:
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -61,18 +57,6 @@ jobs:
           --event "${GITHUB_EVENT_NAME}"
           --base "${BASE_SHA}"
           --head "${HEAD_SHA}"
-
-      - name: Carry image delivery and approved signed archive impact
-        id: cumulative
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        working-directory: .
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
-          SELECTED_RESEARCH_PRODUCT: ${{ steps.scope.outputs.research_product }}
-          RESEARCH_CARRY_MODE: always
-          MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY: ${{ vars.MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY }}
-        run: bash .github/scripts/select-main-research-scope.sh "$GITHUB_SHA" "$GITHUB_OUTPUT"
 
   image-smoke-scope:
     name: Research image smoke scope
@@ -99,6 +83,39 @@ jobs:
             echo 'CI selection failed or returned an invalid plan; no work is dispatched' >&2
             exit 1
           fi >> "$GITHUB_OUTPUT"
+
+  research-image-scope:
+    name: Research delivery scope
+    needs: image-smoke-scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      jobs: ${{ steps.cumulative.outputs.jobs || needs.image-smoke-scope.outputs.jobs }}
+      research_product: ${{ steps.cumulative.outputs.research_product || needs.image-smoke-scope.outputs.research_product }}
+      research_pending_product: ${{ steps.cumulative.outputs.research_pending_product }}
+      research_archive_pending_product: ${{ steps.cumulative.outputs.research_archive_pending_product }}
+      research_archive_selected_product: ${{ steps.cumulative.outputs.research_archive_selected_product }}
+      research_deferred_product: ${{ steps.cumulative.outputs.research_deferred_product }}
+    steps:
+      - name: Checkout publication history
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Carry image delivery and approved signed archive impact
+        id: cumulative
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELECTED_JOBS: ${{ needs.image-smoke-scope.outputs.jobs }}
+          SELECTED_RESEARCH_PRODUCT: ${{ needs.image-smoke-scope.outputs.research_product }}
+          RESEARCH_CARRY_MODE: always
+          MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY: ${{ vars.MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY }}
+        run: bash .github/scripts/select-main-research-scope.sh "$GITHUB_SHA" "$GITHUB_OUTPUT"
 
   commit-hygiene:
     name: Commit hygiene
@@ -234,8 +251,8 @@ jobs:
 
   research-image-binaries:
     name: Research image binaries
-    needs: image-smoke-scope
-    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/research-image-binaries,') }}
+    needs: research-image-scope
+    if: ${{ contains(needs.research-image-scope.outputs.jobs, ',ploy/research-image-binaries,') }}
     permissions:
       contents: read
       actions: read
@@ -260,7 +277,7 @@ jobs:
       - name: Capture compiler, native environment and scoped recipe
         id: build-inputs
         working-directory: .
-        run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json" "${{ needs.image-smoke-scope.outputs.research_product }}"
+        run: .github/scripts/capture-research-build-inputs.sh "${RUNNER_TEMP}/research-build-inputs.json" "${{ needs.research-image-scope.outputs.research_product }}"
       - name: Select owning-workspace cache targets
         id: research-cache-layout
         working-directory: .
@@ -279,11 +296,11 @@ jobs:
           MONDAY_CACHE_EXACT_MATCH: ${{ steps.research-cache.outputs.cache-hit || 'unknown' }}
           MONDAY_RESEARCH_CACHE_PROBE: ${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && '1' || '0' }}
           MONDAY_BUILD_INPUTS_FILE: ${{ runner.temp }}/research-build-inputs.json
-        run: bash .github/scripts/build-research-release.sh "${{ needs.image-smoke-scope.outputs.research_product }}"
+        run: bash .github/scripts/build-research-release.sh "${{ needs.research-image-scope.outputs.research_product }}"
       - name: Upload research image release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: research-image-release-${{ github.sha }}-${{ needs.image-smoke-scope.outputs.research_product }}
+          name: research-image-release-${{ github.sha }}-${{ needs.research-image-scope.outputs.research_product }}
           path: ${{ runner.temp }}/research-image-release.tar
           if-no-files-found: error
           retention-days: 7
@@ -311,21 +328,21 @@ jobs:
 
   research-image-smoke:
     name: Research image smoke
-    needs: [image-smoke-scope, research-image-binaries]
-    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/research-image-smoke,') }}
+    needs: [research-image-scope, research-image-binaries]
+    if: ${{ contains(needs.research-image-scope.outputs.jobs, ',ploy/research-image-smoke,') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: research-image-release-${{ github.sha }}-${{ needs.image-smoke-scope.outputs.research_product }}
+          name: research-image-release-${{ github.sha }}-${{ needs.research-image-scope.outputs.research_product }}
           path: ${{ runner.temp }}/research-release-download
       - name: Smoke the same release binaries without network
         working-directory: .
         run: |
-          ruby .github/scripts/research-release-bundle.rb unpack "${RUNNER_TEMP}/research-release-download/research-image-release.tar" "${RUNNER_TEMP}/research-release" "${{ needs.image-smoke-scope.outputs.research_product }}"
-          bash .github/scripts/research-image-smoke.sh "${RUNNER_TEMP}/research-release" "${{ needs.image-smoke-scope.outputs.research_product }}"
+          ruby .github/scripts/research-release-bundle.rb unpack "${RUNNER_TEMP}/research-release-download/research-image-release.tar" "${RUNNER_TEMP}/research-release" "${{ needs.research-image-scope.outputs.research_product }}"
+          bash .github/scripts/research-image-smoke.sh "${RUNNER_TEMP}/research-release" "${{ needs.research-image-scope.outputs.research_product }}"
 
   rust-format:
     name: Rust formatting
@@ -972,6 +989,7 @@ jobs:
     needs:
       - image-smoke-selector
       - image-smoke-scope
+      - research-image-scope
       - commit-hygiene
       - workflow-lint
       - research-image-binaries
@@ -996,5 +1014,5 @@ jobs:
         working-directory: .
         env:
           GATE_NEEDS: ${{ toJson(needs) }}
-          EXPECTED_JOBS: ${{ needs.image-smoke-scope.outputs.jobs }}
+          EXPECTED_JOBS: ${{ needs.research-image-scope.outputs.jobs }}
         run: printf '%s' "$GATE_NEEDS" | bash .github/scripts/verify-ci-gate.sh --job-prefix ploy --expected-jobs "$EXPECTED_JOBS"

@@ -1544,7 +1544,7 @@ grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/veri
 grep -Fqx '  prediction-markets-gate:' "$ploy_workflow"
 grep -Fqx '    name: Prediction Markets CI gate' "$ploy_workflow"
 grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0' "$ploy_workflow"
-grep -Fqx '          EXPECTED_JOBS: ${{ needs.image-smoke-scope.outputs.jobs }}' "$ploy_workflow"
+grep -Fqx '          EXPECTED_JOBS: ${{ needs.research-image-scope.outputs.jobs }}' "$ploy_workflow"
 grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh --job-prefix ploy --expected-jobs \"\$EXPECTED_JOBS\"" "$ploy_workflow"
 
 security_workflow="$script_dir/../workflows/security-enabled.yml"

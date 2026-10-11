@@ -124,13 +124,13 @@ if [[ ${1:-} == --public-policy ]]; then exit 0; fi
 ruby -ryaml - "$workflow" "$ploy_workflow" "$ci_workflow" "$script_dir/../workflows/security-enabled.yml" <<'RUBY'
 acr, ploy, ci, security = ARGV.map { |path| YAML.safe_load(File.read(path)) }
 abort 'ACR queue changed' unless acr.fetch('concurrency') == {'group'=>'acr-publish-${{ github.ref }}','queue'=>'max','cancel-in-progress'=>false}
-selector = ploy.fetch('jobs').fetch('image-smoke-selector')
+selector = ploy.fetch('jobs').fetch('research-image-scope')
 carry = selector.fetch('steps').find { |step| step['id']=='cumulative' }
 abort 'carry deferral escaped main pushes' unless carry.fetch('if') == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
 expected_carry = {
   'GH_TOKEN'=>'${{ github.token }}',
-  'SELECTED_JOBS'=>'${{ steps.scope.outputs.jobs }}',
-  'SELECTED_RESEARCH_PRODUCT'=>'${{ steps.scope.outputs.research_product }}',
+  'SELECTED_JOBS'=>'${{ needs.image-smoke-scope.outputs.jobs }}',
+  'SELECTED_RESEARCH_PRODUCT'=>'${{ needs.image-smoke-scope.outputs.research_product }}',
   'RESEARCH_CARRY_MODE'=>'always',
   'MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY'=>'${{ vars.MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY }}'
 }
@@ -265,7 +265,7 @@ ruby -ryaml - "$workflow" "$ploy_workflow" <<'RUBY'
 acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
 [[ploy,'research-image-binaries','github.sha'],[acr,'research-runner-binaries','needs.selector.outputs.source_sha']].each do |doc,id,sha|
   steps=doc.fetch('jobs').fetch(id).fetch('steps')
-  expected="research-image-release-${{ #{sha} }}-${{ #{id=='research-image-binaries' ? 'needs.image-smoke-scope' : 'needs.selector'}.outputs.research_product }}"
+  expected="research-image-release-${{ #{sha} }}-${{ #{id=='research-image-binaries' ? 'needs.research-image-scope' : 'needs.selector'}.outputs.research_product }}"
   validate = lambda do |entries|
     uploads=entries.select { |step| step.fetch('uses','').include?('actions/upload-artifact@') && step.fetch('with',{}).fetch('name','')==expected }
     raise 'missing or duplicate immutable software upload' unless uploads.length==1
