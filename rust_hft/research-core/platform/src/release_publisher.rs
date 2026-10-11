@@ -7,6 +7,7 @@ use crate::{
     release::{
         BuildReleaseReceipt, BuildReleaseTrust, ReleaseProducer, SignedBuildRelease, SourceArchive,
     },
+    release_budget::{Binding, Envelope, Inventory, Ledger},
     sha256, valid_digest,
 };
 use anyhow::{ensure, Context, Result};
@@ -513,6 +514,12 @@ impl ReleaseGateway {
         transport.oss = Some(crate::release_oss::Oss::from_file(config, session)?);
         Ok(transport)
     }
+    /// ACK readers retain their separate deployment and fee authority.
+    pub fn oss_reader(config: &crate::release_oss::OssConfig, session: &Path) -> Result<Self> {
+        let mut transport = Self::new(&config.endpoint, "unused".into())?;
+        transport.oss = Some(crate::release_oss::Oss::from_reader_file(config, session)?);
+        Ok(transport)
+    }
     pub async fn check_oss(&self, source: &str) -> Result<()> {
         self.oss
             .as_ref()
@@ -520,18 +527,20 @@ impl ReleaseGateway {
             .check(source)
             .await
     }
-    async fn get(&self, key: &str) -> Result<reqwest::Response> {
+    async fn get(&self, key: &str, limit: u64) -> Result<crate::transport::BoundedBody> {
         if let Some(oss) = &self.oss {
-            return oss.get(key, None).await;
+            return oss.get(key, None, limit).await;
         }
-        self.client
+        let response = self
+            .client
             .get(self.url(key)?)
             .bearer_auth(&self.token)
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("release read unavailable"))?
             .error_for_status()
-            .map_err(|_| anyhow::anyhow!("release evidence missing"))
+            .map_err(|_| anyhow::anyhow!("release evidence missing"))?;
+        crate::transport::BoundedBody::new(response, limit)
     }
 
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
@@ -592,7 +601,7 @@ impl ReleaseGateway {
         Ok(self.base.join(key)?)
     }
     async fn get_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<T> {
-        let mut response = self.get(key).await?;
+        let mut response = self.get(key, MAX_JSON).await?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -608,7 +617,7 @@ impl ReleaseGateway {
         Ok(serde_json::from_slice(&bytes)?)
     }
     async fn verify(&self, artifact: &Artifact) -> Result<()> {
-        let mut response = self.get(&artifact.key).await?;
+        let mut response = self.get(&artifact.key, artifact.bytes).await?;
         let mut digest = Sha256::new();
         let mut size = 0;
         while let Some(chunk) = response
@@ -627,16 +636,11 @@ impl ReleaseGateway {
         Ok(())
     }
     async fn publish_file(&self, path: &Path, artifact: &Artifact) -> Result<()> {
-        let file = tokio::fs::File::open(path).await?;
         if let Some(oss) = &self.oss {
-            oss.put(
-                &artifact.key,
-                reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file)),
-                artifact.bytes,
-            )
-            .await?;
+            oss.put_file(&artifact.key, path, artifact.bytes).await?;
             return self.verify(artifact).await;
         }
+        let file = tokio::fs::File::open(path).await?;
         let response = self
             .client
             .put(self.url(&artifact.key)?)
@@ -669,7 +673,7 @@ impl ReleaseGateway {
             bytes: bytes.len() as u64,
         };
         if let Some(oss) = &self.oss {
-            oss.put(&artifact.key, bytes.into(), artifact.bytes).await?;
+            oss.put_bytes(&artifact.key, bytes).await?;
             self.verify(&artifact).await?;
             return Ok(artifact);
         }
@@ -849,6 +853,16 @@ pub async fn publish(
     let builds = project_builds(&source, &manifest.build_inputs, &names)?;
     if let Some(oss) = &gateway.oss {
         oss.require_publisher_scope(&publication_prefixes(&source, &builds)?)?;
+        let inventory = measure_inventory(
+            &source,
+            &builds,
+            &manifest,
+            &software,
+            &request.product,
+            repository,
+            software_workflow,
+        )?;
+        oss.begin_publication(&inventory)?;
     }
     gateway.publish_file(&source_path, &source.archive).await?;
     // Independently pull the immutable OCI identity and compare contained bytes.
@@ -1003,6 +1017,9 @@ pub async fn publish(
             publication_proof_sha256,
             artifact,
         });
+    }
+    if let Some(oss) = &gateway.oss {
+        oss.complete_publication()?;
     }
     Ok(artifacts)
 }
@@ -1169,12 +1186,15 @@ pub struct ReleasePlan {
     pub publisher_prefixes: Vec<String>,
 }
 /// Public approval material, without a future publisher identity or OCI digest.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseScopePlan {
     pub schema: u32,
     pub source: SourceArchive,
     pub builds: Vec<BuildSpec>,
     pub publisher_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<Inventory>,
 }
 #[allow(clippy::too_many_arguments)]
 fn validate_scope_software(
@@ -1365,7 +1385,17 @@ fn materialize_scope_plan(
             format!("research/sources/{source_sha}/source.tar"),
         )?,
     };
-    project_scope_plan(source, &manifest.build_inputs, &names)
+    let mut scope = project_scope_plan(source, &manifest.build_inputs, &names)?;
+    scope.inventory = Some(measure_inventory(
+        &scope.source,
+        &scope.builds,
+        &manifest,
+        &software,
+        product,
+        repository,
+        &producer_workflow(&run)?,
+    )?);
+    Ok(scope)
 }
 fn project_scope_plan(
     source: SourceArchive,
@@ -1379,7 +1409,180 @@ fn project_scope_plan(
         source,
         builds,
         publisher_prefixes,
+        inventory: None,
     })
+}
+fn producer_workflow(run: &Value) -> Result<String> {
+    run["path"]
+        .as_str()
+        .map(str::to_owned)
+        .context("software workflow missing")
+}
+fn measure_inventory(
+    source: &SourceArchive,
+    builds: &[BuildSpec],
+    manifest: &SoftwareRelease,
+    software: &Path,
+    product: &str,
+    repository: &str,
+    workflow: &str,
+) -> Result<Inventory> {
+    let mut program_objects = Vec::new();
+    for build in builds {
+        for name in &build.binaries {
+            let expected: Vec<_> = manifest
+                .binaries
+                .iter()
+                .filter(|b| b.file == *name)
+                .collect();
+            ensure!(
+                expected.len() == 1 && valid_digest(&expected[0].sha256),
+                "budget producer program identity missing"
+            );
+            let object = measure(
+                &software.join("research-bin").join(name),
+                format!("research/builds/{}/{name}", build.id()?),
+            )?;
+            ensure!(
+                object.sha256 == expected[0].sha256,
+                "budget program differs from original producer bytes"
+            );
+            program_objects.push(object);
+        }
+    }
+    program_objects.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(Inventory {
+        schema: 1,
+        repository: repository.into(),
+        product: product.into(),
+        source: source.clone(),
+        software_producer: ReleaseProducer {
+            repository: repository.into(),
+            workflow_path: workflow.into(),
+            source_sha: source.code_commit.clone(),
+            run_id: manifest.workflow_run_id.parse()?,
+            run_attempt: manifest.workflow_run_attempt,
+            job_id: manifest.workflow_job_id,
+        },
+        publisher_prefixes: publication_prefixes(source, builds)?,
+        program_objects,
+        build_count: builds.len() as u64,
+    })
+}
+fn authenticate_budget_context(
+    root: &Path,
+    binding: &Binding,
+    policy: &PublisherPolicy,
+) -> Result<()> {
+    ensure!(
+        binding.repository == policy.trust.repository
+            && binding.publisher_run_attempt == 1
+            && policy.trust.producer_workflow_path == ".github/workflows/acr-publish.yml"
+            && policy.image_repositories.get(&binding.product) == Some(&binding.image_repository),
+        "budget context is outside exact publication policy"
+    );
+    check_source_authority(root, &binding.repository, &binding.source_sha)?;
+    validate_run(
+        &api(
+            root,
+            &binding.repository,
+            &format!("actions/runs/{}", binding.publisher_run_id),
+            false,
+        )?,
+        &binding.repository,
+        &binding.source_sha,
+        binding.publisher_run_id,
+        binding.publisher_run_attempt,
+        &policy.trust.producer_workflow_path,
+    )?;
+    let job = api(
+        root,
+        &binding.repository,
+        &format!("actions/jobs/{}", binding.publisher_job_id),
+        false,
+    )?;
+    validate_job(
+        &job,
+        binding.publisher_run_id,
+        binding.publisher_run_attempt,
+        &binding.source_sha,
+        true,
+    )?;
+    ensure!(
+        job["id"] == binding.publisher_job_id
+            && job["conclusion"].is_null()
+            && job["name"]
+                == format!(
+                    "Publish {}",
+                    binding
+                        .image_repository
+                        .rsplit('/')
+                        .next()
+                        .context("budget image repository missing")?
+                ),
+        "budget job does not own the actual product"
+    );
+    Ok(())
+}
+/// Actual source and producer program inventory before OIDC or registry calls.
+pub fn budget_plan(
+    root: &Path,
+    binding: &Binding,
+    software_products: &str,
+    policy: &PublisherPolicy,
+) -> Result<ReleaseScopePlan> {
+    authenticate_budget_context(root, binding, policy)?;
+    let scope = materialize_scope_plan(
+        root,
+        &binding.source_sha,
+        binding.software_run_id,
+        software_products,
+        &binding.product,
+        policy,
+        false,
+    )?;
+    scope
+        .inventory
+        .as_ref()
+        .context("native budget inventory missing")?
+        .validate(binding)?;
+    authenticate_budget_context(root, binding, policy)?;
+    Ok(scope)
+}
+pub fn initialize_budget(
+    root: &Path,
+    policy: &PublisherPolicy,
+    binding: Binding,
+    scope: ReleaseScopePlan,
+    envelope: Envelope,
+    path: &Path,
+) -> Result<Ledger> {
+    authenticate_budget_context(root, &binding, policy)?;
+    let inventory = scope
+        .inventory
+        .context("actual native budget inventory required")?;
+    let source_identity = identity(&scope.source)?;
+    ensure!(
+        scope.schema == 1
+            && scope.source == inventory.source
+            && scope.publisher_prefixes == inventory.publisher_prefixes
+            && publication_prefixes(&scope.source, &scope.builds)? == inventory.publisher_prefixes
+            && scope.builds.len() as u64 == inventory.build_count
+            && scope
+                .builds
+                .iter()
+                .all(|b| b.code_commit == binding.source_sha
+                    && b.source_manifest_sha256 == source_identity
+                    && b.builder_image == policy.builder_image),
+        "budget scope does not bind the native Build inputs"
+    );
+    Ledger::create(
+        path,
+        envelope,
+        binding,
+        inventory,
+        identity(policy.oss.as_ref().context("OSS policy required")?)?,
+    )
 }
 fn publication_prefixes(source: &SourceArchive, builds: &[BuildSpec]) -> Result<Vec<String>> {
     let mut publisher_prefixes = vec![format!("research/sources/{}/", source.code_commit)];
@@ -2331,6 +2534,111 @@ mod tests {
         }
         let value = serde_json::to_value(scope).unwrap();
         assert!(value.get("image").is_none() && value.get("publisher_run_id").is_none());
+    }
+    #[test]
+    fn native_budget_measures_current_catalogue_builds_and_original_program_bytes() -> Result<()> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()?;
+        let catalog: Value =
+            read_json(&root.join(".github/scripts/research-release-products.json"))?;
+        let mut compilation = inputs();
+        compilation.recipes = serde_json::from_value(catalog["recipes"].clone())?;
+        for workspace in ["prediction-markets", "research-core/platform"] {
+            compilation
+                .locks
+                .insert(format!("{workspace}/Cargo.lock"), "e".repeat(64));
+            compilation
+                .workspace_profiles
+                .insert(format!("{workspace}/Cargo.toml"), "f".repeat(64));
+        }
+        let temporary = tempfile::tempdir()?;
+        std::fs::create_dir(temporary.path().join("research-bin"))?;
+        let mut binaries = Vec::new();
+        let all: BTreeSet<String> = catalog["products"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|v| {
+                v.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| n.as_str().unwrap().to_owned())
+            })
+            .collect();
+        for name in all {
+            let bytes = format!("original producer executable for {name}").into_bytes();
+            std::fs::write(temporary.path().join("research-bin").join(&name), &bytes)?;
+            binaries.push(SoftwareBinary {
+                file: name,
+                sha256: sha256(&bytes),
+            });
+        }
+        let manifest = SoftwareRelease {
+            schema: "monday.research-image-release.v6".into(),
+            products: vec![
+                "cex-runner".into(),
+                "controller".into(),
+                "prediction-runner".into(),
+            ],
+            source_sha: source().code_commit.clone(),
+            workflow_run_id: "1".into(),
+            workflow_run_attempt: 2,
+            workflow_job_id: 4,
+            target: compilation.target.clone(),
+            cargo_locks: compilation.locks.clone(),
+            build_inputs: compilation,
+            binaries,
+        };
+        let mut calls = 0;
+        for (product, programs, build_count, expected_calls) in [
+            ("cex-runner", 7, 4, 66),
+            ("controller", 5, 3, 51),
+            ("prediction-runner", 5, 3, 51),
+        ] {
+            let names =
+                serde_json::from_value::<BTreeSet<String>>(catalog["products"][product].clone())?;
+            let builds = project_builds(&source(), &manifest.build_inputs, &names)?;
+            assert_eq!(builds.len(), build_count);
+            let inventory = measure_inventory(
+                &source(),
+                &builds,
+                &manifest,
+                temporary.path(),
+                product,
+                "owner/repo",
+                ".github/workflows/ploy-ci.yml",
+            )?;
+            assert_eq!(inventory.program_objects.len(), programs);
+            assert_eq!(inventory.publication_limits()?.requests, expected_calls);
+            calls += expected_calls;
+            let (binding, _, _) = crate::release_budget::tests::fixture(product, 1, 1);
+            inventory.validate(&binding)?;
+            for object in &inventory.program_objects {
+                let name = object.key.rsplit('/').next().unwrap();
+                let bytes = std::fs::read(temporary.path().join("research-bin").join(name))?;
+                assert_eq!(object.bytes, bytes.len() as u64);
+                assert_eq!(object.sha256, sha256(&bytes));
+            }
+        }
+        assert_eq!(calls, 168);
+        let names = BTreeSet::from(["alpha-harness".into()]);
+        let builds = project_builds(&source(), &manifest.build_inputs, &names)?;
+        std::fs::write(
+            temporary.path().join("research-bin/alpha-harness"),
+            b"changed",
+        )?;
+        assert!(measure_inventory(
+            &source(),
+            &builds,
+            &manifest,
+            temporary.path(),
+            "controller",
+            "owner/repo",
+            ".github/workflows/ploy-ci.yml"
+        )
+        .is_err());
+        Ok(())
     }
     #[test]
     fn scope_plan_rejects_dirty_tracked_scripts_before_any_software_or_cloud_read() {

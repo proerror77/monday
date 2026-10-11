@@ -6,8 +6,8 @@ The HTTPS commands below remain for the existing gateway integration; ordinary C
 
 `research-release-publisher` is a separate native CI publisher and importer.
 Research services only verify releases using operator public trust. They do not
-load the issuer's private key. Issuance and import do not issue scientific grants,
-charge budgets, submit tasks, enable providers, open holdout or activate runtime.
+load the issuer's private key. Issuance and import do not issue scientific grants, submit tasks, enable providers, open holdout or activate runtime.
+CI OSS issuance consumes its separate publication request and payload budget.
 
 The `release-verification` feature exposes only existing public trust and opaque
 `VerifiedBuildRelease` verification. It adds no issuer, PG or HTTP dependencies.
@@ -103,3 +103,15 @@ Base RAM grants cover both publication namespaces; they do not isolate product/h
 Default environment subjects are accepted when they exactly match configured `subject`.
 Native claim checks still bind main, workflow, immutable IDs and the active publisher.
 The workflow owner's main-only environment guard and real cloud acceptance remain separate.
+
+
+CI OSS sessions now require the cumulative private publication ledger.
+`budget-plan` authenticates the actual producer and measures its source/program inventory before credential exchange.
+`budget-init` requires the admitted envelope and creates the ledger once.
+Both OSS capability commands require that ledger argument; the old shapes fail.
+Each request burns a durable reservation before sending, including failures and interruptions.
+Required `expires_at_ms` is checked at every claim and reservation.
+`budget-summary` can report historical usage after expiry and exposes no private session or cloud configuration.
+See the [exact schema, caps, stages and accounting limits](../../../deployment/aliyun/research/foundation/RELEASE_OSS.md#ci-publication-request-and-payload-budget).
+Independent ACK reads keep their separate existing authority through `oss-import`.
+That explicit reader route cannot enter CI preflight or publication.
