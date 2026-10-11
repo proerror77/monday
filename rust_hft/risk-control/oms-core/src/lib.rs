@@ -1123,6 +1123,7 @@ impl ports::OrderManager for OmsCore {
     fn order_risk_view(&self, order_id: &OrderId) -> Option<ports::OrderRiskView<'_>> {
         let order = self.orders.get(order_id)?;
         Some(ports::OrderRiskView {
+            revision: order.revision,
             order_id: &order.order_id,
             strategy_id: order.strategy_id.as_deref(),
             client_order_id: order.client_order_id.as_deref(),

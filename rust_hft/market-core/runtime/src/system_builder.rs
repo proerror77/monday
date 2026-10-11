@@ -1589,6 +1589,10 @@ impl SystemRuntime {
                 )
             };
             self.execution_worker_tasks.push(worker_handle);
+            self.engine
+                .lock()
+                .await
+                .set_execution_control_sender(control_tx.clone());
             self.exec_control_tx = Some(control_tx);
             info!("已启动执行 worker (客户端数量: {})", client_count);
         }

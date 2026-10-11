@@ -1,6 +1,6 @@
 //! Engine-owned admission metadata. OMS remains the only submitted-order lifecycle writer.
 //! A queue entry is retained until OrderNew binds it to OMS. Quantities then come from OMS;
-//! cancellation without final-fill evidence retains its remainder until full reconciliation.
+//! cancellation or rejection without final-fill evidence retains its remainder until reconciliation.
 use hft_core::{
     AccountId, HftError, HftResult, OrderId, OrderType, Price, Quantity, Side, Symbol, VenueId,
 };
@@ -21,16 +21,16 @@ pub struct RiskReservationCheckpoint {
     schema: u32,
     queued: HashMap<String, Valuation>,
     orders: HashMap<OrderId, Valuation>,
-    cancelled: HashSet<OrderId>,
+    awaiting_final_readback: HashSet<OrderId>,
 }
 
 impl Default for RiskReservationCheckpoint {
     fn default() -> Self {
         Self {
-            schema: 1,
+            schema: 2,
             queued: HashMap::new(),
             orders: HashMap::new(),
-            cancelled: HashSet::new(),
+            awaiting_final_readback: HashSet::new(),
         }
     }
 }
@@ -48,6 +48,10 @@ pub(super) struct Valuation {
     product_type: hft_core::ProductType,
     quantity: Quantity,
     unit_price: Price,
+    // Preserve every admitted/observed price while delayed fills can still arrive.
+    observed_unit_price: Price,
+    // Submitted metadata is valid only for this exact canonical amendment history.
+    observed_revision: Option<u32>,
 }
 
 impl Valuation {
@@ -94,6 +98,8 @@ impl Valuation {
             product_type: intent.product_type,
             quantity: intent.quantity,
             unit_price: price,
+            observed_unit_price: price,
+            observed_revision: None,
         };
         valuation.validate()?;
         Ok(valuation)
@@ -104,7 +110,12 @@ impl Valuation {
             || self.strategy_id.trim().is_empty()
             || self.quantity.0 <= Decimal::ZERO
             || self.unit_price.0 <= Decimal::ZERO
-            || self.quantity.0.checked_mul(self.unit_price.0).is_none()
+            || self.observed_unit_price.0 < self.unit_price.0
+            || self
+                .quantity
+                .0
+                .checked_mul(self.observed_unit_price.0)
+                .is_none()
         {
             return Err(risk_error("invalid pending risk identity or valuation"));
         }
@@ -143,7 +154,9 @@ impl Valuation {
     }
 
     fn matches_record(&self, order: OrderRiskView<'_>) -> bool {
-        order.client_order_id == Some(self.client_order_id.as_str())
+        order.revision < u32::MAX
+            && self.observed_revision == Some(order.revision)
+            && order.client_order_id == Some(self.client_order_id.as_str())
             && order.strategy_id == Some(self.strategy_id.as_str())
             && self
                 .account_id
@@ -168,7 +181,9 @@ impl Valuation {
         let price = Price(
             order
                 .limit_price
-                .map_or(self.unit_price.0, |price| price.0.max(self.unit_price.0)),
+                .map_or(self.observed_unit_price.0, |price| {
+                    price.0.max(self.observed_unit_price.0)
+                }),
         );
         Ok((quantity, price))
     }
@@ -215,34 +230,46 @@ impl RiskReservations {
                 "restore cannot discard current unresolved risk reservations",
             ));
         }
-        if checkpoint.schema != 1 {
+        if checkpoint.schema != 2 {
             return Err(risk_error("unsupported risk reservation checkpoint"));
         }
         for (id, valuation) in &checkpoint.queued {
             valuation.validate()?;
-            if id != &valuation.client_order_id {
+            if id != &valuation.client_order_id || valuation.observed_revision.is_some() {
                 return Err(risk_error("queued risk identity changed"));
             }
         }
         let mut clients: HashSet<_> = checkpoint.queued.keys().map(String::as_str).collect();
         for (id, valuation) in &checkpoint.orders {
             valuation.validate()?;
-            if id.0.is_empty() || !clients.insert(&valuation.client_order_id) {
+            if id.0.is_empty()
+                || valuation.observed_revision.is_none()
+                || !clients.insert(&valuation.client_order_id)
+            {
                 return Err(risk_error("duplicate restored risk identity"));
             }
         }
         if checkpoint
-            .cancelled
+            .awaiting_final_readback
             .iter()
             .any(|id| !checkpoint.orders.contains_key(id))
         {
             return Err(risk_error(
-                "cancelled risk hold lacks its admitted valuation",
+                "terminal risk hold lacks its admitted valuation",
             ));
         }
         self.checkpoint = checkpoint;
         self.checkpoint_supplied = true;
         Ok(())
+    }
+
+    pub(super) fn owners_restored(&mut self) {
+        self.recovery_required = true;
+        self.checkpoint_supplied = false;
+    }
+
+    pub(super) fn has_queued_client(&self, client_id: &str) -> bool {
+        self.checkpoint.queued.contains_key(client_id)
     }
 
     pub(super) fn require_recovery(&mut self) {
@@ -254,7 +281,7 @@ impl RiskReservations {
             && !self.checkpoint_supplied
             && self.checkpoint.queued.is_empty()
             && self.checkpoint.orders.is_empty()
-            && self.checkpoint.cancelled.is_empty()
+            && self.checkpoint.awaiting_final_readback.is_empty()
     }
 
     pub(super) fn is_ready(&self) -> bool {
@@ -348,6 +375,7 @@ impl RiskReservations {
         event: &ExecutionEvent,
         order: Option<OrderRiskView<'_>>,
         final_cancel_venues: &HashSet<VenueId>,
+        queued_rejection: bool,
     ) {
         match event {
             ExecutionEvent::OrderNew {
@@ -355,8 +383,15 @@ impl RiskReservations {
                 client_order_id: Some(id),
                 ..
             } => {
-                if let Some(valuation) = self.checkpoint.queued.remove(id) {
-                    self.checkpoint.orders.insert(order_id.clone(), valuation);
+                if self.checkpoint.queued.contains_key(id) {
+                    // A fresh queue admission cannot reconstruct earlier amendments.
+                    if let Some(order) = order.filter(|order| order.revision == 0) {
+                        let mut valuation = self.checkpoint.queued.remove(id).unwrap();
+                        valuation.observed_revision = Some(order.revision);
+                        self.checkpoint.orders.insert(order_id.clone(), valuation);
+                    } else {
+                        self.recovery_required = true;
+                    }
                 } else if !self.checkpoint.orders.contains_key(order_id)
                     && order.is_none_or(|order| open(order.status))
                 {
@@ -371,13 +406,46 @@ impl RiskReservations {
                 // Keep any queued reservations and reject further admission until recovery.
                 self.recovery_required = true;
             }
+            ExecutionEvent::OrderModified { order_id, .. } => {
+                if let (Some(valuation), Some(order)) =
+                    (self.checkpoint.orders.get_mut(order_id), order)
+                {
+                    if let Some(price) = order.limit_price {
+                        valuation.observed_unit_price.0 =
+                            valuation.observed_unit_price.0.max(price.0);
+                    }
+                    // A newer event cannot fill a gap in the imported price history.
+                    if order.revision < u32::MAX
+                        && valuation
+                            .observed_revision
+                            .and_then(|revision| revision.checked_add(1))
+                            == Some(order.revision)
+                    {
+                        valuation.observed_revision = Some(order.revision);
+                    } else {
+                        self.recovery_required = true;
+                    }
+                } else {
+                    self.recovery_required = true;
+                }
+            }
             ExecutionEvent::OrderReject { order_id, .. } => {
-                self.checkpoint.queued.remove(&order_id.0);
-                if order.is_none_or(|order| {
-                    order.status == OrderStatus::Rejected || order.status == OrderStatus::Filled
-                }) {
+                // A venue order ID can equal another intent's client ID. Only the canonical
+                // no-OMS-order decision proves this event rejected a still-queued intent.
+                if queued_rejection {
+                    self.checkpoint.queued.remove(&order_id.0);
+                } else if order.is_some_and(|order| order.status == OrderStatus::Filled) {
                     self.checkpoint.orders.remove(order_id);
-                    self.checkpoint.cancelled.remove(order_id);
+                    self.checkpoint.awaiting_final_readback.remove(order_id);
+                } else if self.checkpoint.orders.contains_key(order_id)
+                    && order.is_some_and(|order| order.status == OrderStatus::Rejected)
+                {
+                    // Submitted rejection and fills can arrive on different private topics.
+                    self.checkpoint
+                        .awaiting_final_readback
+                        .insert(order_id.clone());
+                } else if order.is_none() {
+                    self.recovery_required = true;
                 }
             }
             ExecutionEvent::OrderCanceled { order_id, .. } => {
@@ -387,8 +455,11 @@ impl RiskReservations {
                         .is_some_and(|venue| final_cancel_venues.contains(&venue))
                     {
                         self.checkpoint.orders.remove(order_id);
+                        self.checkpoint.awaiting_final_readback.remove(order_id);
                     } else {
-                        self.checkpoint.cancelled.insert(order_id.clone());
+                        self.checkpoint
+                            .awaiting_final_readback
+                            .insert(order_id.clone());
                     }
                 }
             }
@@ -396,7 +467,7 @@ impl RiskReservations {
                 if order.is_some_and(|order| order.cum_qty.0 >= order.qty.0) =>
             {
                 self.checkpoint.orders.remove(order_id);
-                self.checkpoint.cancelled.remove(order_id);
+                self.checkpoint.awaiting_final_readback.remove(order_id);
             }
             _ => {}
         }
@@ -447,7 +518,7 @@ impl RiskReservations {
                     ));
                 }
             }
-            if open(order.status) || self.checkpoint.cancelled.contains(id) {
+            if open(order.status) || self.checkpoint.awaiting_final_readback.contains(id) {
                 let valuation = valuation
                     .ok_or_else(|| risk_error("OMS order lacks approval-time risk valuation"))?;
                 let (quantity, price) = valuation.order_exposure(order)?;
@@ -485,20 +556,21 @@ impl RiskReservations {
             ));
         }
         self.project(account, orders.values().map(|order| Ok(order.into())))?;
-        for id in &self.checkpoint.cancelled {
-            let valuation =
-                self.checkpoint.orders.get(id).ok_or_else(|| {
-                    risk_error("cancelled order lacks its admitted risk identity")
-                })?;
+        for id in &self.checkpoint.awaiting_final_readback {
+            let valuation = self
+                .checkpoint
+                .orders
+                .get(id)
+                .ok_or_else(|| risk_error("terminal order lacks its admitted risk identity"))?;
             if exchange_order_ids.contains(id)
                 || exchange_client_ids.contains(valuation.client_order_id.as_str())
             {
                 return Err(risk_error(
-                    "cancelled order is still open in authoritative readback",
+                    "terminal order is still open in authoritative readback",
                 ));
             }
         }
-        for id in self.checkpoint.cancelled.drain() {
+        for id in self.checkpoint.awaiting_final_readback.drain() {
             self.checkpoint.orders.remove(&id);
         }
         self.recovery_required = false;
@@ -517,7 +589,13 @@ impl RiskReservations {
             .get(order.order_id)
             .ok_or_else(|| risk_error("replacement lacks approval-time risk valuation"))?;
         let (old_quantity, old_price) = valuation.order_exposure(order)?;
-        let quantity = quantity.unwrap_or(old_quantity);
+        if quantity
+            .is_some_and(|quantity| quantity.0 <= Decimal::ZERO || quantity.0 < order.cum_qty.0)
+            || price.is_some_and(|price| price.0 <= Decimal::ZERO)
+        {
+            return Err(risk_error("replacement has invalid quantity or price"));
+        }
+        let quantity = quantity.map_or(old_quantity, |total| Quantity(total.0 - order.cum_qty.0));
         let price = Price(price.map_or(old_price.0, |price| price.0.max(old_price.0)));
         let previous = old_quantity
             .0

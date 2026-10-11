@@ -4364,6 +4364,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_risk_halt_closes_worker_intake_for_an_already_dequeued_batch() {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            simulated: true,
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut engine = crate::Engine::new(crate::EngineConfig {
+            intent_max_latency_us: 60_000_000,
+            ..Default::default()
+        });
+        engine.set_order_manager(Box::new(oms_core::OmsCore::new()));
+        engine.set_portfolio_manager(Box::new(portfolio_core::Portfolio::new()));
+        engine.set_execution_queues(engine_queues);
+        engine.set_execution_control_sender(control_tx);
+        engine.set_execution_price_protection(std::collections::HashMap::from([(
+            VenueId::MOCK,
+            ports::ExecutionPriceProtection::VenueQuote,
+        )]));
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        worker.venue_to_client.insert(VenueId::MOCK, 0);
+        let candidate = |symbol| {
+            let mut intent = create_test_intent(symbol);
+            intent.order_type = OrderType::Limit;
+            intent.target_venue = Some(VenueId::MOCK);
+            OrderIntentEnvelope::new(
+                intent,
+                ports::OrderIntentLifecycle::new(now_micros(), u64::MAX),
+            )
+            .with_account_id(AccountId("simulated-venue:99".into()))
+        };
+        engine
+            .submit_order_intent_envelope(candidate("BTCUSDT"), now_micros(), None)
+            .unwrap();
+        let mut first = worker.queues.receive_envelopes();
+        worker.process_order_intents(&mut first).await;
+        engine.tick().unwrap();
+        assert_eq!(
+            state.lock().unwrap().placed.len(),
+            1,
+            "the adapter path must be viable before the halt"
+        );
+        engine
+            .submit_order_intent_envelope(candidate("ETHUSDT"), now_micros(), None)
+            .unwrap();
+        let mut queued = worker.queues.receive_envelopes();
+        assert_eq!(queued.len(), 1);
+        worker
+            .queues
+            .send_event(ExecutionEvent::OrderModified {
+                order_id: OrderId("placed".into()),
+                new_quantity: Some(Quantity(rust_decimal::Decimal::from(2))),
+                new_price: None,
+                timestamp: now_micros(),
+            })
+            .unwrap();
+        engine.tick().unwrap();
+        assert!(engine.reconciliation_halted());
+        assert_eq!(engine.trading_mode(), crate::TradingMode::Paused);
+        assert!(
+            engine.risk_reservations.has_queued(),
+            "a pause request alone is not rejection evidence"
+        );
+        // The worker consumes the existing control queue before its next submission.
+        worker.process_order_intents(&mut queued).await;
+        assert!(!worker.accepting_intents);
+        assert!(!worker.operator_intake_enabled);
+        assert_eq!(
+            state.lock().unwrap().placed.len(),
+            1,
+            "the dequeued intent must not reach the adapter"
+        );
+        assert!(
+            engine.risk_reservations.has_queued(),
+            "only applying the definite rejection may release queued risk"
+        );
+        engine.tick().unwrap();
+        assert!(!engine.risk_reservations.has_queued());
+        assert_eq!(
+            engine.export_oms_state()[&OrderId("placed".into())].qty,
+            Quantity(rust_decimal::Decimal::from(2))
+        );
+        assert!(engine.reconciliation_halted());
+    }
+
+    #[tokio::test]
     async fn automatic_stream_recovery_does_not_override_operator_pause() {
         let client = MockExecutionClient {
             state: Arc::new(StdMutex::new(MockExecutionState::default())),

@@ -3452,6 +3452,7 @@ mod tests {
                 .get(&OrderId("venue-order-1".into()))
                 .map(Into::into),
             &std::collections::HashSet::new(),
+            false,
         );
         engine
             .import_risk_reservations(engine.export_risk_reservations())
@@ -3642,6 +3643,7 @@ mod tests {
             },
             Some((&order).into()),
             &std::collections::HashSet::new(),
+            false,
         );
         engine
             .import_risk_reservations(engine.export_risk_reservations())

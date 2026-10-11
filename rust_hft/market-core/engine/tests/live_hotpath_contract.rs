@@ -1026,7 +1026,11 @@ fn batched_deltas_keep_the_lob_state_from_their_own_sequence() {
 
 #[test]
 fn market_order_risk_uses_slippage_bound_but_execution_keeps_arrival_quote() {
-    let mut config = EngineConfig::default();
+    // This fixture checks price transformation, independently of scheduler latency.
+    let mut config = EngineConfig {
+        intent_max_latency_us: 1_000_000,
+        ..EngineConfig::default()
+    };
     config.ingestion.stale_threshold_us = 1_000_000;
     let mut engine = Engine::new(config);
     // This routing fixture models a quote-protected adapter; canonical CEX rejects market orders.

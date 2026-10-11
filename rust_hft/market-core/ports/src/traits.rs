@@ -1089,6 +1089,7 @@ pub struct OrderRecord {
 /// Borrowed canonical OMS quantities for risk admission. No lifecycle or accounting write authority.
 #[derive(Debug, Clone, Copy)]
 pub struct OrderRiskView<'a> {
+    pub revision: u32,
     pub order_id: &'a OrderId,
     pub strategy_id: Option<&'a str>,
     pub client_order_id: Option<&'a str>,
@@ -1105,6 +1106,7 @@ pub struct OrderRiskView<'a> {
 impl<'a> From<&'a OrderRecord> for OrderRiskView<'a> {
     fn from(order: &'a OrderRecord) -> Self {
         Self {
+            revision: order.revision,
             order_id: &order.order_id,
             strategy_id: order.strategy_id.as_deref(),
             client_order_id: order.client_order_id.as_deref(),
