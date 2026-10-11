@@ -196,20 +196,15 @@ impl ExecutionControlHandle {
 
     pub async fn emergency_stop(&self, cancel_orders: bool) -> HftResult<CancelDispatchReport> {
         let _operation = self.operation_gate.lock().await;
-        let targets = {
-            let mut engine = self.engine.lock().await;
-            if cancel_orders {
-                engine.emergency_exit();
-                collect_open_targets(&engine, None, None, None)
-            } else {
-                engine.pause_trading();
-                Vec::new()
-            }
-        };
-
         if !cancel_orders {
+            self.pause_trading_unlocked().await?;
             return Ok(CancelDispatchReport::default());
         }
+        let targets = {
+            let mut engine = self.engine.lock().await;
+            engine.emergency_exit();
+            collect_open_targets(&engine, None, None, None)
+        };
 
         self.dispatch_cancellations(targets, true, CancelScope::All)
             .await
@@ -1617,6 +1612,175 @@ mod tests {
         let report = control.emergency_stop(true).await.expect("emergency stop");
         assert!(report.is_complete());
         worker.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn emergency_without_cancellation_drains_and_closes_worker_intake() {
+        struct RecordingClient(Arc<std::sync::Mutex<(usize, usize)>>);
+
+        #[async_trait::async_trait]
+        impl ports::ExecutionClient for RecordingClient {
+            fn price_protection(&self) -> ports::ExecutionPriceProtection {
+                ports::ExecutionPriceProtection::VenueQuote
+            }
+
+            fn is_simulated_execution(&self) -> bool {
+                true
+            }
+
+            async fn place_order(&mut self, _: ports::OrderIntent) -> HftResult<OrderId> {
+                self.0.lock().unwrap().0 += 1;
+                Ok(OrderId("unexpected-placement".into()))
+            }
+
+            async fn cancel_order(&mut self, _: &OrderId) -> HftResult<()> {
+                self.0.lock().unwrap().1 += 1;
+                Ok(())
+            }
+
+            async fn modify_order(
+                &mut self,
+                _: &OrderId,
+                _: Option<Quantity>,
+                _: Option<Price>,
+            ) -> HftResult<OrderId> {
+                unreachable!("stop must not modify existing orders")
+            }
+
+            async fn execution_stream(&self) -> HftResult<ports::BoxStream<ExecutionEvent>> {
+                Ok(Box::pin(futures::stream::pending()))
+            }
+
+            async fn list_open_orders(&self) -> HftResult<Vec<ports::OpenOrder>> {
+                Ok(Vec::new())
+            }
+
+            async fn connect(&mut self) -> HftResult<()> {
+                Ok(())
+            }
+
+            async fn disconnect(&mut self) -> HftResult<()> {
+                Ok(())
+            }
+
+            async fn health(&self) -> ports::ConnectionHealth {
+                ports::ConnectionHealth {
+                    connected: true,
+                    latency_ms: None,
+                    last_heartbeat: hft_core::now_micros(),
+                }
+            }
+        }
+
+        let existing_order = OrderId("existing-open-order".into());
+        let mut oms = OmsCore::new();
+        oms.register_order(oms_core::RegisterOrderParams {
+            order_id: existing_order.clone(),
+            client_order_id: None,
+            account_id: Some(AccountId("paper".into())),
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: Some(VenueId::MOCK),
+            strategy_id: None,
+        });
+        let mut engine_value = Engine::new(EngineConfig::default());
+        engine_value.set_order_manager(Box::new(oms));
+        let engine = Arc::new(Mutex::new(engine_value));
+        let (mut queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let envelope = || {
+            ports::OrderIntentEnvelope::new(
+                ports::OrderIntent {
+                    symbol: Symbol::new("BTCUSDT"),
+                    asset_class: hft_core::AssetClass::Crypto,
+                    product_type: ProductType::Spot,
+                    compliance_context: hft_core::ComplianceContext::default(),
+                    side: Side::Buy,
+                    quantity: Quantity::from_f64(1.0).unwrap(),
+                    order_type: hft_core::OrderType::Limit,
+                    price: Some(Price::from_f64(100.0).unwrap()),
+                    time_in_force: hft_core::TimeInForce::GTC,
+                    strategy_id: "stop-test".into(),
+                    target_venue: Some(VenueId::MOCK),
+                },
+                ports::OrderIntentLifecycle::new(hft_core::now_micros(), u64::MAX),
+            )
+            .with_account_id(AccountId("paper".into()))
+        };
+        let queued = envelope();
+        let queued_id = OrderId(queued.client_order_id.clone());
+        queues.send_envelope(queued).unwrap();
+        let calls = Arc::new(std::sync::Mutex::new((0, 0)));
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(engine.clone(), Some(worker_tx), true);
+
+        // Stopping must wait for the real worker to reject every queued intent.
+        let mut stopping = Box::pin(control.emergency_stop(false));
+        assert!(futures::poll!(stopping.as_mut()).is_pending());
+        let worker = crate::execution_worker::ExecutionWorker::new(
+            crate::ExecutionWorkerConfig {
+                ack_timeout_ms: 0,
+                reconcile_interval_ms: 0,
+                ..Default::default()
+            },
+            worker_queues,
+            vec![Box::new(RecordingClient(calls.clone()))],
+            worker_rx,
+        );
+        let worker = tokio::spawn(worker.run());
+        let report = tokio::time::timeout(Duration::from_secs(1), stopping)
+            .await
+            .expect("worker stop acknowledgement")
+            .expect("stop without cancellation");
+        assert_eq!(report.requested, 0);
+        let mut events = Vec::new();
+        queues.receive_events_into(&mut events);
+        assert!(events.iter().any(|event| matches!(event,
+            ExecutionEvent::OrderReject { order_id, reason, .. }
+                if order_id == &queued_id && reason.contains("intake disabled by control")
+        )));
+
+        // Intake remains closed after the acknowledgement, including late producers.
+        let late = envelope();
+        let late_id = OrderId(late.client_order_id.clone());
+        queues.send_envelope(late).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                queues.receive_events_into(&mut events);
+                if events.iter().any(|event| {
+                    matches!(event,
+                        ExecutionEvent::OrderReject { order_id, reason, .. }
+                            if order_id == &late_id && reason.contains("intake disabled by control")
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late intent rejected");
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert_eq!(*calls.lock().unwrap(), (0, 0));
+        let engine = engine.lock().await;
+        assert_eq!(engine.trading_mode(), TradingMode::Paused);
+        assert_eq!(
+            engine.export_oms_state()[&existing_order].status,
+            OrderStatus::New
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_without_cancellation_requires_worker_acknowledgement() {
+        let engine = Arc::new(Mutex::new(Engine::new(EngineConfig::default())));
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        drop(worker_rx);
+        let control = ExecutionControlHandle::new(engine.clone(), Some(worker_tx), true);
+
+        assert!(control.emergency_stop(false).await.is_err());
+        assert_eq!(engine.lock().await.trading_mode(), TradingMode::Paused);
     }
 
     #[tokio::test]

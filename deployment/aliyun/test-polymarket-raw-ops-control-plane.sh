@@ -30,7 +30,7 @@ if command -v gsha256sum >/dev/null 2>&1; then
 fi
 
 for command in cargo chmod cp grep jq ln mkdir mktemp mv rm sed sha256sum \
-  shellcheck sort sync wc zstd; do
+  ruby shellcheck sort sync wc zstd; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'missing control-plane test dependency: %s\n' "$command" >&2
     exit 2
@@ -1214,9 +1214,54 @@ CARGO_TARGET_DIR="$SCRIPT_DIR/../../rust_hft/target" cargo build --quiet --manif
   printf 'missing Polymarket evidence compiler Dockerfile\n' >&2
   exit 1
 }
-grep -Fq 'polymarket-evidence-compiler' "$WORKFLOW"
-grep -Fq 'Dockerfile.polymarket-evidence-compiler' "$WORKFLOW"
-grep -Fq 'org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}' "$WORKFLOW"
+# The ordinary publisher obtains its Dockerfile from the executable matrix
+# selector. Verify that route and its source binding, not a stale YAML literal.
+compiler_publication_contract() {
+  local workflow=$1 selector=$2 output=$3 matrix
+  : >"$output"
+  TARGET=polymarket-evidence-compiler PUBLISHED_PRODUCTS=none GITHUB_OUTPUT="$output" \
+    bash "$selector" || return 1
+  matrix=$(sed -n 's/^ordinary_matrix=//p' "$output")
+  jq -e '.include == [{repository:"polymarket-evidence-compiler",context:"rust_hft",
+    file:"rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler",
+    target:"runtime",research_artifact:false}]' <<<"$matrix" >/dev/null || return 1
+  ruby -ryaml - "$workflow" <<'RUBY'
+jobs = YAML.safe_load(File.read(ARGV[0])).fetch('jobs')
+selector = jobs.fetch('ordinary-selector')
+abort 'ordinary matrix output changed' unless selector.dig('outputs', 'matrix') == '${{ steps.select.outputs.ordinary_matrix }}'
+publish = jobs.fetch('publish-ordinary')
+abort 'compiler publisher bypasses source selection' unless Array(publish['needs']).include?('ordinary-selector')
+abort 'compiler publisher bypasses selected matrix' unless publish.dig('strategy', 'matrix') == '${{ fromJSON(needs.ordinary-selector.outputs.matrix) }}'
+builds = publish.fetch('steps').select { |step| step['id'] == 'build' }
+abort 'missing or duplicate ordinary image builder' unless builds.length == 1
+build = builds.fetch(0)
+abort 'ordinary image builder does not use selected file' unless build.dig('with', 'file') == '${{ matrix.file }}'
+abort 'ordinary image builder does not use selected context' unless build.dig('with', 'context') == '${{ matrix.context }}'
+abort 'ordinary image builder does not use selected target' unless build.dig('with', 'target') == '${{ matrix.target }}'
+source = '${{ needs.ordinary-selector.outputs.source_sha }}'
+abort 'compiler image revision is not source-bound' unless build.dig('with', 'labels').to_s.include?("org.opencontainers.image.revision=#{source}")
+abort 'compiler binary source is not bound' unless build.dig('with', 'build-args').to_s.include?("SOURCE_REVISION=#{source}")
+RUBY
+}
+compiler_contract_tmp=$(mktemp -d)
+trap 'rm -rf "$compiler_contract_tmp"' EXIT
+compiler_selector="$SCRIPT_DIR/../../.github/scripts/select-acr-image-matrix.sh"
+compiler_publication_contract "$WORKFLOW" "$compiler_selector" "$compiler_contract_tmp/matrix"
+sed 's|Dockerfile.polymarket-evidence-compiler|Dockerfile.trading|g' \
+  "$compiler_selector" >"$compiler_contract_tmp/wrong-selector.sh"
+if compiler_publication_contract "$WORKFLOW" "$compiler_contract_tmp/wrong-selector.sh" \
+  "$compiler_contract_tmp/matrix" >/dev/null 2>&1; then
+  printf 'compiler publication accepted another product Dockerfile\n' >&2; exit 1
+fi
+sed 's|file: ${{ matrix.file }}|file: wrong-dockerfile|g' \
+  "$WORKFLOW" >"$compiler_contract_tmp/wrong-workflow.yml"
+if compiler_publication_contract "$compiler_contract_tmp/wrong-workflow.yml" "$compiler_selector" \
+  "$compiler_contract_tmp/matrix" >/dev/null 2>&1; then
+  printf 'compiler publication ignored its selected Dockerfile\n' >&2; exit 1
+fi
+rm -rf "$compiler_contract_tmp"
+trap - EXIT
+grep -Fq 'org.opencontainers.image.revision=${{ needs.ordinary-selector.outputs.source_sha }}' "$WORKFLOW"
 grep -Fq 'Verify Polymarket compiler source binding' "$WORKFLOW"
 grep -Fq '/usr/local/bin/polymarket-raw-ops' "$POLYMARKET_COMPILER_DOCKERFILE"
 if grep -Fq '/usr/local/bin/binance-lob-archiver' "$POLYMARKET_COMPILER_DOCKERFILE"; then
