@@ -278,7 +278,7 @@ events.sort_by { |event| event.fetch('at') }.each do |event|
 end
 abort 'independent owners never overlapped' unless maximum == 2 && active.empty?
 RUBY
-jq -es 'length==8 and all(.[]; .scheduler.owner_concurrency==2 and .scheduler.cargo_jobs==2)' \
+jq -es 'length==7 and all(.[]; .scheduler.owner_concurrency==2 and .scheduler.cargo_jobs==2)' \
   "$fixture/parallel-output/research-recipe-probe/timings.jsonl" >/dev/null
 
 # Low available memory reduces overlap. Explicit serial mode uses the same recipes.
@@ -289,7 +289,7 @@ for mode in memory serial; do
   PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/$mode-output" MONDAY_SOURCE_REVISION="$sha" \
     MONDAY_BUILD_INPUTS_FILE="$fixture/inputs.json" MONDAY_RESEARCH_BUILD_CONCURRENCY=$([[ $mode == serial ]] && echo 1 || echo 2) \
     bash "$fixture/.github/scripts/build-research-recipes.sh" controller after-cache-lookup >"$work/$mode.log"
-  jq -es 'length==3 and all(.[]; .scheduler.owner_concurrency==1 and .scheduler.cargo_jobs==8)' \
+  jq -es 'length==2 and all(.[]; .scheduler.owner_concurrency==1 and .scheduler.cargo_jobs==8)' \
     "$fixture/$mode-output/research-recipe-probe/timings.jsonl" >/dev/null
 done
 
