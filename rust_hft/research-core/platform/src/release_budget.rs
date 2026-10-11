@@ -938,8 +938,8 @@ pub(crate) mod tests {
         let mut aggregate = Limits::default();
         let mut alloc = Vec::new();
         for (p, b, e, calls) in [
-            ("cex-runner", 4, 7, 66),
-            ("controller", 3, 5, 51),
+            ("cex-runner", 5, 8, 78),
+            ("controller", 1, 1, 21),
             ("prediction-runner", 3, 5, 51),
         ] {
             let (binding, inventory, envelope) = fixture(p, b, e);
@@ -956,7 +956,7 @@ pub(crate) mod tests {
         let (binding, _, mut envelope) = fixture("controller", 1, 1);
         envelope.allocations = alloc;
         envelope.limits = aggregate;
-        assert_eq!(aggregate.requests, 168);
+        assert_eq!(aggregate.requests, 150);
         envelope.validate(&binding, now()?)?;
         envelope.limits.requests -= 1;
         assert!(envelope.validate(&binding, now()?).is_err());
