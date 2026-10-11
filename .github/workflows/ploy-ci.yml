@@ -41,6 +41,8 @@ jobs:
       selection_complete: ${{ steps.scope.outputs.selection_complete }}
       research_product: ${{ steps.cumulative.outputs.research_product || steps.scope.outputs.research_product }}
       research_pending_product: ${{ steps.cumulative.outputs.research_pending_product }}
+      research_archive_pending_product: ${{ steps.cumulative.outputs.research_archive_pending_product }}
+      research_archive_selected_product: ${{ steps.cumulative.outputs.research_archive_selected_product }}
       research_deferred_product: ${{ steps.cumulative.outputs.research_deferred_product }}
     steps:
       - name: Checkout code
@@ -60,7 +62,7 @@ jobs:
           --base "${BASE_SHA}"
           --head "${HEAD_SHA}"
 
-      - name: Carry unpublished research image impact
+      - name: Carry image delivery and approved signed archive impact
         id: cumulative
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: .
@@ -68,8 +70,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
           SELECTED_RESEARCH_PRODUCT: ${{ steps.scope.outputs.research_product }}
-          RESEARCH_CARRY_MODE: defer-unconfigured
-          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          RESEARCH_CARRY_MODE: always
+          MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY: ${{ vars.MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY }}
         run: bash .github/scripts/select-main-research-scope.sh "$GITHUB_SHA" "$GITHUB_OUTPUT"
 
   image-smoke-scope:

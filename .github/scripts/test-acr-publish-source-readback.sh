@@ -63,14 +63,23 @@ reject() {
 # baseline authentication remains covered by test-main-research-scope.sh.
 scope_repo="$work/scope-repo"
 mkdir -p "$scope_repo/.github/scripts"
-for script in read-acr-publish-source.sh read-release-required-checks.sh select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json; do
+for script in read-acr-publish-source.sh read-release-required-checks.sh select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json research-publication-budget.sh research-publication-budget.jq; do
   cp "$script_dir/$script" "$scope_repo/.github/scripts/$script"
 done
+mkdir -p "$scope_repo/rust_hft/scripts"
+cp "$script_dir/fixtures/rust-ci-scope/metadata.fixture" "$scope_repo/rust_hft/scripts/metadata.fixture"
+cat >"$scope_repo/rust_hft/scripts/workspace-metadata.sh" <<'MOCK'
+#!/usr/bin/env bash
+cat "$(dirname "$0")/metadata.fixture"
+MOCK
+chmod +x "$scope_repo/rust_hft/scripts/workspace-metadata.sh"
 cat >"$scope_repo/.github/scripts/read-research-publish-baseline.sh" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ ! -f $FAKE_ACR_STATE/baseline-failure ]] || exit 42
-cp "$FAKE_ACR_STATE/pending-base" "$2"
+if [[ ${3:-images} == builds && -f $FAKE_ACR_STATE/archive-base ]]; then
+  cp "$FAKE_ACR_STATE/archive-base" "$2"
+else cp "$FAKE_ACR_STATE/pending-base" "$2"; fi
 MOCK
 git -C "$scope_repo" init -q
 git -C "$scope_repo" add .
@@ -106,6 +115,59 @@ fi
 jq -n --arg source "$source_sha" '{"cex-runner":$source,"controller":$source,"prediction-runner":$source}' >"$work/pending-base"
 (cd "$scope_repo" && bash "$scope_reader" "$source_sha" 200 "$work/out")
 grep -Fqx automation_state=out_of_scope "$work/out"
+# Delivered images cannot hide an authorized missing signed Build. Use the
+# production reader/planner and a docs-only current-main B: skipped software
+# rejects pending archive; a successful exact-B producer admits B, never A.
+jq -n --arg source "$source_sha" '{"cex-runner":$source,"controller":$source,"prediction-runner":$source}' >"$work/archive-base"
+mkdir -p "$scope_repo/rust_hft/apps/backtest/src"
+printf 'new software inputs A\n' >"$scope_repo/rust_hft/apps/backtest/src/example.rs"
+git -C "$scope_repo" add .
+git -C "$scope_repo" -c user.name='CI contract' -c user.email=ci@example.invalid commit -qm 'archive fixture software A'
+delivered_source=$(git -C "$scope_repo" rev-parse HEAD)
+jq -n --arg source "$delivered_source" '{"cex-runner":$source,"controller":$source,"prediction-runner":$source}' >"$work/pending-base"
+printf 'docs B\n' >"$scope_repo/README.md"
+git -C "$scope_repo" add .
+git -C "$scope_repo" -c user.name='CI contract' -c user.email=ci@example.invalid commit -qm 'archive fixture docs B'
+source_sha=$(git -C "$scope_repo" rev-parse HEAD)
+(cd "$scope_repo" && bash .github/scripts/research-publication-budget.sh estimate "$source_sha" cex-runner 744 "$work/archive-estimate.json")
+now=$(date -u +%s)
+source_time=$(git -C "$scope_repo" show -s --format=%ct "$source_sha")
+archive_allowance=$(jq -c --argjson now "$now" --argjson source_time "$source_time" '
+ {schema:"monday.research-publication-operations-policy.v1",repository,publisher_workflow:".github/workflows/acr-publish.yml",
+ products,not_before:($source_time-60),expires_at:($now+3600),history_anchor_run_id:99,history_anchor_run_number:1,
+ history_retention_required:true,currency:"CNY",price_model:.pricing.model,storage_hours:.pricing.storage_hours,
+ max_estimated_micro_cny:.pricing.estimated_micro_cny,max_oss_requests:.total.oss_requests,
+ max_request_body_bytes:.total.request_body_bytes,max_response_body_bytes:.total.response_body_bytes,
+ max_new_storage_bytes:.total.new_storage_bytes}' "$work/archive-estimate.json")
+reset_fixtures
+edit_fixture jobs '.[0].jobs |= map(.conclusion="skipped")'
+if (cd "$scope_repo" && MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$archive_allowance \
+    bash "$scope_reader" "$source_sha" 200 "$work/out") >"$work/pending-archive-log" 2>&1; then
+  echo 'authorized pending Build became out of scope after OCI success' >&2
+  cat "$work/pending-archive-log" >&2
+  exit 1
+fi
+grep -Fq 'pending research products cex-runner' "$work/pending-archive-log"
+# An unavailable planner dependency fails closed; command substitution must
+# not turn a selector error into an empty pending set.
+mv "$scope_repo/rust_hft/scripts/workspace-metadata.sh" "$work/metadata-helper"
+reset_fixtures
+edit_fixture jobs '.[0].jobs |= map(.conclusion="skipped")'
+if (cd "$scope_repo" && MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$archive_allowance \
+    bash "$scope_reader" "$source_sha" 200 "$work/out") >"$work/missing-metadata-log" 2>&1; then
+  echo 'failed archive planner became out of scope' >&2; exit 1
+fi
+test ! -e "$work/out"
+mv "$work/metadata-helper" "$scope_repo/rust_hft/scripts/workspace-metadata.sh"
+reset_fixtures
+edit_fixture artifacts '.[0].artifacts[0].name |= sub("cex-runner,controller,prediction-runner$";"cex-runner")'
+(cd "$scope_repo" && MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$archive_allowance \
+  bash "$scope_reader" "$source_sha" 200 "$work/out")
+grep -Fqx automation_state=ready "$work/out"
+grep -Fqx "main_sha=$source_sha" "$work/out"
+grep -Fqx research_product=cex-runner "$work/out"
+jq -e --arg source "$delivered_source" 'all(.[]; .==$source)' "$work/pending-base" >/dev/null
+rm "$work/archive-base"
 # Recovery can rerun all jobs of the same current-main push when its previous
 # attempt had no artifact. Authenticate the new attempt, never an old job.
 reset_fixtures

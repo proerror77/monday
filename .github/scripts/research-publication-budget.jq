@@ -1,12 +1,12 @@
 # Catalog and native payload limits define a conservative source-local inventory.
 def integer($min; $max): type == "number" and floor == . and . >= $min and . <= $max;
 def require($condition; $message): if $condition then . else error($message) end;
-def inventory:
+def inventory($selection):
   . as $catalog |
   require(.schema == "monday.research-products.v2" and (.products|type)=="object" and
     (.products|keys)==["cex-runner","controller","prediction-runner"] and
     (.recipes|type)=="array"; "unrecognized research catalog") |
-  [$products|split(",")[]] as $selected |
+  [$selection|split(",")[]] as $selected |
   require(($selected|length)>0 and ($selected|sort|unique)==$selected and
     all($selected[]; . as $p | $catalog.products|has($p)); "invalid product selection") |
   [$selected[] as $p |
@@ -27,6 +27,7 @@ def inventory:
      new_storage_bytes:$upload, recipes:$recipes}] as $allocations |
   {schema:"monday.research-publication-estimate.v1", repository:$repository,
    source_sha:$source_sha, source_archive:{bytes:$source_bytes,sha256:$source_digest},
+   source_committed_at:$source_committed_at,
    products:$selected, basis:"catalog-static-upper-bound", executable_bound_bytes:536870912,
    metadata_bound_bytes:1048576, small_response_bound_bytes:4096,
    allocations:$allocations,
@@ -37,8 +38,10 @@ def inventory:
 def price:
   # Whole decimal GB and integer micro-CNY avoid underestimating or float money.
   .total as $t |
-  (($t.response_body_bytes + $t.oss_requests*65536)/1000000000|ceil) as $egress_gb |
-  ($t.new_storage_bytes/1000000000|ceil) as $storage_gb |
+  # Round each fixed product allocation separately: later subset publications
+  # must fit the same source allowance even when they pay separate GB rounds.
+  ([.allocations[] | ((.response_body_bytes + .oss_requests*65536)/1000000000|ceil)]|add) as $egress_gb |
+  ([.allocations[] | (.new_storage_bytes/1000000000|ceil)]|add) as $storage_gb |
   ($t.oss_requests*10000) as $request |
   ($egress_gb*812000) as $egress |
   ($storage_gb*$storage_hours*198) as $storage |
@@ -51,8 +54,20 @@ def price:
     continued_storage_micro_cny_per_hour:($storage_gb*198),
     free_quota_assumed:false, invoice_hard_cap:false,
     response_overhead_model_bytes_per_request:65536}};
-def admit:
-  . as $estimate | $policy as $p |
+def within_budget($p):
+  require(($p.max_estimated_micro_cny|integer(1;1000000000)) and
+    ($p.max_oss_requests|integer(1;1000)) and
+    ($p.max_request_body_bytes|integer(1;107374182400)) and
+    ($p.max_response_body_bytes|integer(1;107374182400)) and
+    ($p.max_new_storage_bytes|integer(1;107374182400)); "invalid budget limits") |
+  require(.pricing.estimated_micro_cny<=$p.max_estimated_micro_cny and
+    .total.oss_requests<=$p.max_oss_requests and
+    .total.request_body_bytes<=$p.max_request_body_bytes and
+    .total.response_body_bytes<=$p.max_response_body_bytes and
+    .total.new_storage_bytes<=$p.max_new_storage_bytes;
+    "publication budget insufficient before cloud requests");
+def admit_policy($p):
+  . as $estimate |
   require(($p|type)=="object" and
     ($p|keys)==["currency","expires_at","max_estimated_micro_cny","max_new_storage_bytes",
       "max_oss_requests","max_request_body_bytes","max_response_body_bytes","price_model",
@@ -69,17 +84,7 @@ def admit:
   require(($p.expires_at|integer(1;1794268800)) and $p.expires_at>$now and
     $p.expires_at<=($now+604800) and $now<1794268800;
     "budget approval or price model expired") |
-  require(($p.max_estimated_micro_cny|integer(1;1000000000)) and
-    ($p.max_oss_requests|integer(1;1000)) and
-    ($p.max_request_body_bytes|integer(1;107374182400)) and
-    ($p.max_response_body_bytes|integer(1;107374182400)) and
-    ($p.max_new_storage_bytes|integer(1;107374182400)); "invalid budget limits") |
-  require(.pricing.estimated_micro_cny<=$p.max_estimated_micro_cny and
-    .total.oss_requests<=$p.max_oss_requests and
-    .total.request_body_bytes<=$p.max_request_body_bytes and
-    .total.response_body_bytes<=$p.max_response_body_bytes and
-    .total.new_storage_bytes<=$p.max_new_storage_bytes;
-    "publication budget insufficient before cloud requests") |
+  within_budget($p) |
   . + {admission:{schema:"monday.research-publication-budget-admission.v1",
       publisher_run_id:$run_id,publisher_run_number:$run_number,publisher_run_attempt:$attempt,expires_at:$p.expires_at,
       single_run:true,invoice_hard_cap:false,approved_limits:$p}};
@@ -92,7 +97,61 @@ def native_budget:
      response_payload_bytes:.total.response_body_bytes},
    allocations:[.allocations[]|{product,limits:{requests:.native_requests,
      request_payload_bytes:.request_body_bytes,response_payload_bytes:.response_body_bytes}}]};
-if $mode=="estimate" then inventory | price
-elif $mode=="admit" then admit
+def operating_allocation:
+  # Ongoing software operating authorization has no human-guessed SHA/run IDs.
+  # It is a bound per new source, not a global account or research/trading cap.
+  . as $estimate | $policy as $p |
+  require(($p|type)=="object" and ($p|keys)==["currency","expires_at","history_anchor_run_id",
+    "history_anchor_run_number","history_retention_required","max_estimated_micro_cny",
+    "max_new_storage_bytes","max_oss_requests","max_request_body_bytes","max_response_body_bytes",
+    "not_before","price_model","products","publisher_workflow","repository","schema","storage_hours"];
+    "one software operating allowance required") |
+  require($p.schema=="monday.research-publication-operations-policy.v1" and $p.repository==$repository and
+    $p.publisher_workflow==".github/workflows/acr-publish.yml" and $p.currency=="CNY" and
+    $p.price_model==.pricing.model and $p.storage_hours==$storage_hours and
+    ($p.products|type)=="array" and ($p.products|sort|unique)==$p.products and
+    ($p.products|length)>0 and all($p.products[]; .=="cex-runner" or .=="controller" or .=="prediction-runner") and
+    all(.products[]; . as $product | $p.products|index($product)); "operating scope or price model differs") |
+  require(($p.history_anchor_run_id|integer(1;9007199254740991)) and
+    ($p.history_anchor_run_number|integer(1;9007199254740991)) and $p.history_retention_required==true;
+    "retained publication history anchor required") |
+  require(($p.not_before|integer(1;1794268800)) and ($p.expires_at|integer(1;1794268800)) and
+    $p.not_before<=$now and $p.expires_at>$now and $p.expires_at>$p.not_before and
+    $p.expires_at-$p.not_before<=604800 and $now<1794268800; "operating allowance or price model expired") |
+  require((.source_committed_at|integer(1;1794268800)) and
+    .source_committed_at>=$p.not_before and .source_committed_at<=$now;
+    "pre-window or future source requires manual reconciliation") |
+  # Reserve the complete approved product set, regardless of this run's subset.
+  # History permits each product at most once for this source (including failed
+  # attempts). Its fixed inventory cannot be transferred to another product.
+  $catalog[0] | inventory(($p.products|join(","))) | price | within_budget($p);
+def admit_operations:
+  . as $estimate | $policy as $p |
+  operating_allocation as $reserved |
+  ($p + {schema:"monday.research-publication-budget-policy.v1",source_sha:$source_sha,
+    publisher_run_number:$run_number,publisher_run_attempt:$attempt}
+    | del(.not_before,.history_anchor_run_id,.history_anchor_run_number,.history_retention_required)) as $bound |
+  ($reserved | admit_policy($bound)) as $bound_reservation |
+  # Bind only the selected fixed allocations into the unchanged native budget.
+  # A subset never receives the full source maxima or an unused sibling share.
+  $estimate | admit_policy($bound + {products:$estimate.products,
+    max_estimated_micro_cny:$estimate.pricing.estimated_micro_cny,
+    max_oss_requests:$estimate.total.oss_requests,
+    max_request_body_bytes:$estimate.total.request_body_bytes,
+    max_response_body_bytes:$estimate.total.response_body_bytes,
+    max_new_storage_bytes:$estimate.total.new_storage_bytes}) |
+  .admission.approval_kind="software-operating-allowance" |
+  .admission.operating_policy=$p |
+  .admission.source_allocation=($bound_reservation | {products,total,pricing}) |
+  .admission.allocation_basis="fixed-approved-products-per-source" |
+  .admission.aggregate_invoice_cap=false |
+  .admission.retry_reconciliation_basis="retained-monotonic-github-history";
+if $mode=="estimate" then inventory($products) | price
+elif $mode=="admit" then admit_policy($policy)
+elif $mode=="admit-operations" then admit_operations
+elif $mode=="check-operations-scope" then
+  . as $estimate | operating_allocation as $reserved |
+  $estimate + {archive_scope:{products:$policy.products,allocation_basis:"fixed-approved-products-per-source",
+    source_allocation:($reserved|{products,total,pricing}),scheduling_only:true}}
 elif $mode=="native" then native_budget
 else error("invalid budget mode") end

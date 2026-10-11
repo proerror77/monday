@@ -58,13 +58,21 @@ ruby -ryaml - "$(cd "$script_dir/../.." && pwd)" <<'RUBY'
 root = ARGV.fetch(0)
 %w[docker-publish.yml acr-publish.yml].each do |name|
   doc = YAML.safe_load(File.read(File.join(root,'.github/workflows',name)))
-  job = doc.fetch('jobs').fetch(name=='docker-publish.yml' ? 'build-and-push' : 'publish')
-  abort 'publication cannot read PR provenance' unless job.dig('permissions','pull-requests')=='read'
-  steps=job.fetch('steps')
-  record=steps.find { |s| s.fetch('run','').include?('write-release-record.sh') }
-  abort 'publication has no source record' unless record
-  abort 'publication does not retain its record' unless steps.any? { |s| s.fetch('with',{}).fetch('path','').end_with?('release-record.json') }
-  promotion=steps.find { |s| s.fetch('name','').include?('without rebuilding') || s.fetch('id','')=='promote' }
-  abort 'promotion issues a signature' if promotion.fetch('run').match?(/cosign|oss-publish|publish-research-build-release/)
+  delivered_jobs = name=='docker-publish.yml' ? ['build-and-push'] : ['publish-research-images','publish-ordinary']
+  delivered_jobs.each do |job_name|
+    job = doc.fetch('jobs').fetch(job_name)
+    abort 'publication cannot read PR provenance' unless job.dig('permissions','pull-requests')=='read'
+    steps=job.fetch('steps')
+    record=steps.find { |s| s.fetch('run','').include?('write-release-record.sh') }
+    abort 'publication has no source record' unless record
+    abort 'publication does not retain its record' unless steps.any? { |s| s.fetch('with',{}).fetch('path','').end_with?('release-record.json') }
+    promotion=steps.find { |s| s.fetch('name','').include?('without rebuilding') || s.fetch('id','')=='promote' }
+    if job_name=='publish-research-images'
+      abort 'OCI delivery issues a signature' if steps.any? { |s| s.fetch('run','').match?(/cosign|oss-publish|publish-research-build-release/) }
+    else
+      abort 'publication has no promotion check' unless promotion
+      abort 'promotion issues a signature' if promotion.fetch('run').match?(/cosign|oss-publish|publish-research-build-release/)
+    end
+  end
 end
 RUBY

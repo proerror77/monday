@@ -13,7 +13,10 @@ set -euo pipefail
 case "${!#}" in
   */workflows/acr-publish.yml/runs\?*) fixture=runs ;;
   */runs/100/attempts/2/jobs\?*) fixture=pair ;;
-  */runs/101/attempts/2/jobs\?*) fixture=empty ;;
+  */runs/100/attempts/1/jobs\?*) if [[ -f $RESEARCH_SCOPE_FIXTURE/prior-attempt ]]; then fixture=prior-attempt; else fixture=empty; fi ;;
+  */runs/*/attempts/1/jobs\?*) fixture=empty ;;
+  */runs/400/attempts/2/jobs\?*) fixture=empty ;;
+  */runs/101/attempts/*/jobs\?*) fixture=empty ;;
   */runs/200/attempts/2/jobs\?*) fixture=controller ;;
   */runs/300/attempts/2/jobs\?*) fixture=cex ;;
   *) exit 91 ;;
@@ -68,14 +71,16 @@ plan() {
 # reader. The complete tests below still exercise that reader through gh.
 isolated="$work/isolated/.github/scripts"
 mkdir -p "$isolated"
-for script in select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json; do
+for script in select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json research-publication-budget.sh research-publication-budget.jq; do
   cp "$root/.github/scripts/$script" "$isolated/$script"
 done
 cat >"$isolated/read-research-publish-baseline.sh" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ ! -f $RESEARCH_SCOPE_FIXTURE/baseline-failure ]] || exit 42
-cp "$RESEARCH_SCOPE_FIXTURE/baselines" "$2"
+if [[ ${3:-images} == builds && -f $RESEARCH_SCOPE_FIXTURE/archive-baselines ]]; then
+  cp "$RESEARCH_SCOPE_FIXTURE/archive-baselines" "$2"
+else cp "$RESEARCH_SCOPE_FIXTURE/baselines" "$2"; fi
 MOCK
 printf '%s\n' '{"cex-runner":"BOOTSTRAP","controller":"BOOTSTRAP","prediction-runner":"BOOTSTRAP"}' >"$work/baselines"
 cp "$work/baselines" "$work/baselines-before"
@@ -86,60 +91,61 @@ focused_plan() {
     bash "$isolated/select-main-research-scope.sh" "$head" "$work/focused-plan" \
       "$root/.github/scripts/fixtures/rust-ci-scope/metadata.fixture" 2>"$work/focused-log"
 }
-for policy in '' '{}' '{"oss_by_product":null}' '{"oss_by_product":{}}'; do
-  focused_plan defer-unconfigured "$policy"
-  grep -Fqx research_product=none "$work/focused-plan"
-  grep -Fqx jobs=,, "$work/focused-plan"
-  grep -Fqx research_pending_product=cex-runner,controller,prediction-runner "$work/focused-plan"
-  grep -Fqx research_deferred_product=cex-runner,controller,prediction-runner "$work/focused-plan"
-  grep -Fqx research_carry_policy=unconfigured "$work/focused-plan"
-  focused_plan defer-unconfigured "$policy" prediction-runner "$direct_jobs"
-  grep -Fqx research_product=prediction-runner "$work/focused-plan"
-  grep -Fqx "jobs=$direct_jobs" "$work/focused-plan"
-  grep -Fqx research_deferred_product=cex-runner,controller "$work/focused-plan"
+# Both old and new mode spellings now carry images independently of all OSS
+# policy states. Configuration still belongs to the later signed archive.
+for mode in always defer-unconfigured; do
+  for policy in '' '{}' '{"oss_by_product":null}' '{"oss_by_product":{}}' 'broken json' '[]' '{"oss_by_product":false}'; do
+    focused_plan "$mode" "$policy"
+    grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+    grep -Fqx research_deferred_product=none "$work/focused-plan"
+    grep -Fqx research_carry_policy=unchecked "$work/focused-plan"
+    focused_plan "$mode" "$policy" prediction-runner "$direct_jobs"
+    grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+    grep -Fqx "jobs=$direct_jobs" "$work/focused-plan"
+  done
 done
-config_jobs=,ploy/strategy-config-contracts,ploy/architecture-contracts,
-focused_plan defer-unconfigured '{}' none "$config_jobs"
-grep -Fqx research_product=none "$work/focused-plan"
-grep -Fqx "jobs=$config_jobs" "$work/focused-plan"
-focused_plan defer-unconfigured '{}' all "$direct_jobs"
-grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
-grep -Fqx research_deferred_product=none "$work/focused-plan"
-# Any nonempty map restores the whole pending selection. It grants no product
-# permission, including when only one product or an unknown product is present.
-for policy in '{"oss_by_product":{"controller":{}}}' '{"oss_by_product":{"unknown":false}}'; do
-  focused_plan defer-unconfigured "$policy"
-  grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
-  grep -Fqx research_deferred_product=none "$work/focused-plan"
-  grep -Fqx research_carry_policy=configured "$work/focused-plan"
-done
-for policy in 'broken json' '{} {}' 'null' '[]' ' ' '{"oss_by_product":false}' '{"oss_by_product":[]}' '{"oss_by_product":""}'; do
-  focused_plan defer-unconfigured "$policy"
-  grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
-  grep -Fqx research_carry_policy=invalid "$work/focused-plan"
-done
-focused_plan always 'broken json'
-grep -Fqx research_carry_policy=unchecked "$work/focused-plan"
-grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
-: >"$work/default-plan"
-env -u RESEARCH_CARRY_MODE MONDAY_RELEASE_POLICY_JSON='broken json' SELECTED_RESEARCH_PRODUCT=none SELECTED_JOBS=,, \
-  bash "$isolated/select-main-research-scope.sh" "$head" "$work/default-plan"
-grep -Fqx research_carry_policy=unchecked "$work/default-plan"
-grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/default-plan"
 cmp "$work/baselines-before" "$work/baselines"
-# A real unpublished source change remains pending while a later docs change
-# defers its build; repairing configuration restores it from the same baseline.
-jq -n --arg base "$base" '{"cex-runner":$base,"controller":$base,"prediction-runner":$base}' >"$work/baselines"
-focused_plan defer-unconfigured '{}'
+# A delivered images, but no signed Build. After authority recovers, docs-only
+# B schedules its own verified software and archive from the Build baseline.
+# The image baseline stays at A and no A source is relabeled as current main B.
+jq -n --arg sha "$head" '{"cex-runner":$sha,"controller":$sha,"prediction-runner":$sha}' >"$work/baselines"
+jq -n --arg sha "$base" '{"cex-runner":$sha,"controller":$sha,"prediction-runner":$sha}' >"$work/archive-baselines"
+focused_plan always '{}'
+grep -Fqx research_product=none "$work/focused-plan"
+grep -Fqx research_archive_pending_product=cex-runner "$work/focused-plan"
+grep -Fqx research_archive_selected_product=none "$work/focused-plan"
+budget="$isolated/research-publication-budget.sh"
+GITHUB_REPOSITORY=fixture/repo bash "$budget" estimate "$head" cex-runner,controller 744 "$work/archive-estimate.json"
+now=$(date -u +%s)
+source_time=$(git show -s --format=%ct "$head")
+archive_allowance=$(jq -c --argjson now "$now" --argjson source_time "$source_time" '
+ {schema:"monday.research-publication-operations-policy.v1",repository,publisher_workflow:".github/workflows/acr-publish.yml",
+ products,not_before:($source_time-60),expires_at:($now+3600),history_anchor_run_id:99,history_anchor_run_number:1,
+ history_retention_required:true,currency:"CNY",price_model:.pricing.model,storage_hours:.pricing.storage_hours,
+ max_estimated_micro_cny:.pricing.estimated_micro_cny,max_oss_requests:.total.oss_requests,
+ max_request_body_bytes:.total.request_body_bytes,max_response_body_bytes:.total.response_body_bytes,
+ max_new_storage_bytes:.total.new_storage_bytes}' "$work/archive-estimate.json")
+MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$archive_allowance focused_plan always '{}'
+grep -Fqx research_image_pending_product=none "$work/focused-plan"
+grep -Fqx research_archive_selected_product=cex-runner "$work/focused-plan"
+grep -Fqx research_archive_carry_policy=approved "$work/focused-plan"
 grep -Fqx research_pending_product=cex-runner "$work/focused-plan"
-grep -Fqx research_deferred_product=cex-runner "$work/focused-plan"
-focused_plan defer-unconfigured '{"oss_by_product":{"cex-runner":{}}}'
+grep -Fqx research_product=cex-runner "$work/focused-plan"
+grep -Fq ',ploy/research-image-binaries,ploy/research-image-smoke,' "$work/focused-plan"
+# Once the Build baseline covers A's inputs, B no longer schedules this work.
+cp "$work/baselines" "$work/archive-baselines"
+MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$archive_allowance focused_plan always '{}'
+grep -Fqx research_product=none "$work/focused-plan"
+rm "$work/archive-baselines"
+jq -n --arg base "$base" '{"cex-runner":$base,"controller":$base,"prediction-runner":$base}' >"$work/baselines"
+focused_plan always '{}'
+grep -Fqx research_pending_product=cex-runner "$work/focused-plan"
 grep -Fqx research_product=cex-runner "$work/focused-plan"
 touch "$work/baseline-failure"
-if focused_plan defer-unconfigured '{}'; then echo 'baseline failure hidden by deferral' >&2; exit 1; fi
+if focused_plan always '{}'; then echo 'baseline failure hidden by configuration' >&2; exit 1; fi
 rm "$work/baseline-failure"
 printf '{}\n' >"$work/baselines"
-if focused_plan defer-unconfigured '{}'; then echo 'missing baseline hidden by deferral' >&2; exit 1; fi
+if focused_plan always '{}'; then echo 'missing baseline hidden by configuration' >&2; exit 1; fi
 # A parser change remains an unpublished input after a later docs-only push.
 previous_head=$head
 mkdir -p .github/scripts/vendor/tomlrb
@@ -154,10 +160,10 @@ focused_plan always '{}'
 grep -Fqx research_product=cex-runner,controller,prediction-runner "$work/focused-plan"
 focused_plan defer-unconfigured '{}'
 grep -Fqx research_pending_product=cex-runner,controller,prediction-runner "$work/focused-plan"
-grep -Fqx research_deferred_product=cex-runner,controller,prediction-runner "$work/focused-plan"
+grep -Fqx research_deferred_product=none "$work/focused-plan"
 git checkout -q --detach "$previous_head"
 head=$previous_head
-printf 'PASS: carry deferral preserves direct products/jobs, original baselines and conservative policy classification\n'
+printf 'PASS: image carry is independent of OSS approval and preserves source/product scope\n'
 [[ ${1:-} != --deferred-carry ]] || exit 0
 publisher "$base"
 plan
@@ -239,6 +245,31 @@ plan
 grep -Fqx research_product=none "$work/plan"
 [[ $helper_base != "$head" ]]
 printf 'PASS: unpublished A survives docs B; separate product readbacks suppress completed work; malformed or ambiguous baselines fail\n'
+
+# Delivery advances on its original successful job even if OSS or a sibling
+# product failed. Full signed Build completion remains a separate baseline.
+publisher "$head"
+jq '.[0].workflow_runs[0].conclusion="failure"' "$work/runs" >"$work/edit"
+mv "$work/edit" "$work/runs"
+jq -n --arg sha "$head" '[{total_count:3,jobs:[
+ {id:7,run_id:100,run_attempt:2,head_sha:$sha,name:"Publish OCI research-runner",status:"completed",conclusion:"success"},
+ {id:8,run_id:100,run_attempt:2,head_sha:$sha,name:"Publish OCI campaign-cycle-controller",status:"completed",conclusion:"success"},
+ {id:9,run_id:100,run_attempt:2,head_sha:$sha,name:"Publish OCI prediction-research-runner",status:"completed",conclusion:"success"}]}]' >"$work/pair"
+bash "$root/.github/scripts/read-research-publish-baseline.sh" "$head" "$work/image-baseline" images
+jq -e --arg sha "$head" 'all(.[]; .==$sha)' "$work/image-baseline" >/dev/null
+bash "$root/.github/scripts/read-research-publish-baseline.sh" "$head" "$work/build-baseline" builds
+jq -e 'all(.[]; .=="BOOTSTRAP")' "$work/build-baseline" >/dev/null
+jq '.[0].total_count=2 | .[0].jobs=.[0].jobs[0:2] | .[0].jobs[1].conclusion="failure"' "$work/pair" >"$work/edit"
+mv "$work/edit" "$work/pair"
+bash "$root/.github/scripts/read-research-publish-baseline.sh" "$head" "$work/image-baseline" images
+jq -e --arg sha "$head" '."cex-runner"==$sha and .controller=="BOOTSTRAP" and ."prediction-runner"=="BOOTSTRAP"' "$work/image-baseline" >/dev/null
+jq '.[0].total_count=1 | .[0].jobs=.[0].jobs[0:1] | .[0].jobs[0].run_attempt=1' "$work/pair" >"$work/prior-attempt"
+printf '[{"total_count":0,"jobs":[]}]\n' >"$work/pair"
+bash "$root/.github/scripts/read-research-publish-baseline.sh" "$head" "$work/image-baseline" images
+jq -e --arg sha "$head" '."cex-runner"==$sha and .controller=="BOOTSTRAP"' "$work/image-baseline" >/dev/null
+rm "$work/prior-attempt"
+publisher "$head"
+printf 'PASS: failed OSS/sibling jobs retain only delivered products; reruns retain original image attempt; images never imply signed Builds\n'
 
 # Partial failed responses must be discarded before a bounded GET retry.
 reader="$root/.github/scripts/read-research-publish-baseline.sh"
