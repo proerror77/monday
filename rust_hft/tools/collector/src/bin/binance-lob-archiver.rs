@@ -889,6 +889,122 @@ enum ProducerWait<T> {
     Stopped,
 }
 
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum RotationPhase {
+    Idle,
+    Connect,
+    ProofWrite,
+    ProofRead,
+    MarketRead,
+    EventSend,
+    RateLock,
+    RateTick,
+    SnapshotFetch,
+    SnapshotIdle,
+    BarrierSend,
+    Resume,
+}
+
+impl RotationPhase {
+    fn name(value: u8) -> &'static str {
+        match value {
+            1 => "connect",
+            2 => "proof_write",
+            3 => "proof_read",
+            4 => "market_read",
+            5 => "event_send",
+            6 => "rate_lock",
+            7 => "rate_tick",
+            8 => "snapshot_fetch",
+            9 => "snapshot_idle",
+            10 => "barrier_send",
+            11 => "resume",
+            _ => "idle",
+        }
+    }
+}
+
+struct RotationProducer {
+    id: usize,
+    role: &'static str,
+    phase: AtomicU8,
+    requested_epoch: AtomicU64,
+    enqueued_epoch: AtomicU64,
+    observed_epoch: AtomicU64,
+}
+
+impl RotationProducer {
+    fn shared(id: usize, role: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            role,
+            phase: AtomicU8::new(RotationPhase::Idle as u8),
+            requested_epoch: AtomicU64::new(0),
+            enqueued_epoch: AtomicU64::new(0),
+            observed_epoch: AtomicU64::new(0),
+        })
+    }
+
+    fn snapshot(&self) -> Value {
+        json!({
+            "id": self.id,
+            "role": self.role,
+            "phase": RotationPhase::name(self.phase.load(Ordering::Relaxed)),
+            "requested_epoch": self.requested_epoch.load(Ordering::Relaxed),
+            "enqueued_epoch": self.enqueued_epoch.load(Ordering::Relaxed),
+            "observed_epoch": self.observed_epoch.load(Ordering::Relaxed),
+        })
+    }
+}
+
+// Each top-level producer owns this diagnostic context. It never controls FIFO or readiness.
+tokio::task_local! {
+    static ROTATION_PRODUCER: Arc<RotationProducer>;
+}
+
+struct RotationPhaseGuard {
+    producer: Arc<RotationProducer>,
+    previous: u8,
+}
+
+impl Drop for RotationPhaseGuard {
+    fn drop(&mut self) {
+        self.producer.phase.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+fn rotation_phase(phase: RotationPhase) -> Option<RotationPhaseGuard> {
+    ROTATION_PRODUCER
+        .try_with(|producer| RotationPhaseGuard {
+            producer: producer.clone(),
+            previous: producer.phase.swap(phase as u8, Ordering::Relaxed),
+        })
+        .ok()
+}
+
+async fn in_rotation_phase<T>(phase: RotationPhase, operation: impl Future<Output = T>) -> T {
+    let _phase = rotation_phase(phase);
+    operation.await
+}
+
+fn rotation_timeout_details(
+    expected: usize,
+    acknowledged: &BTreeSet<usize>,
+    producers: &[Arc<RotationProducer>],
+) -> Value {
+    let missing = (0..expected)
+        .filter(|id| !acknowledged.contains(id))
+        .collect::<Vec<_>>();
+    // Retain every missing ID; bound the detailed records and omit URLs and stream lists.
+    let details = missing
+        .iter()
+        .take(8)
+        .filter_map(|id| producers.get(*id).map(|producer| producer.snapshot()))
+        .collect::<Vec<_>>();
+    json!({"acknowledged": acknowledged, "missing": missing, "producers": details})
+}
+
 #[derive(Debug, Default)]
 struct ProcessState {
     sequence_gaps: u64,
@@ -1361,8 +1477,14 @@ async fn refresh_catalog_loop(
             config.with_catalog(catalog.clone())?;
             Ok(catalog)
         }) {
-            Ok(catalog) => { if updates.send(Some(catalog)).is_err() { break; } }
-            Err(error) => warn!(error = %error, "catalog refresh failed; current capture continues"),
+            Ok(catalog) => {
+                if updates.send(Some(catalog)).is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "catalog refresh failed; current capture continues")
+            }
         }
     }
 }
@@ -2207,6 +2329,18 @@ async fn run_session(
     let expected_rotation_producers = expected_shards
         .checked_add(snapshot_producers)
         .context("rotation producer count overflow")?;
+    let rotation_producers = (0..expected_rotation_producers)
+        .map(|id| {
+            RotationProducer::shared(
+                id,
+                if id < expected_shards {
+                    "websocket"
+                } else {
+                    "snapshot"
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     let expected_streams = stream_shards
         .iter()
         .map(|shard| shard.streams.len())
@@ -2227,19 +2361,22 @@ async fn run_session(
     let snapshot_rate_limiter = snapshot_rate_limiter(config.snapshot_requests_per_second);
     for (producer_id, shard) in stream_shards.into_iter().enumerate() {
         let stall_timeout = shard.stall_timeout(config.stall_timeout);
-        tasks.spawn(receive_url(
-            config.market,
-            shard,
-            sender.clone(),
-            stream_connected_tx.clone(),
-            session_stop_rx.clone(),
-            stall_timeout,
-            config.stall_timeout,
-            SUBSCRIPTION_PROOF_TIMEOUT,
-            watchdog.clone(),
-            producer_id,
-            rotation_pause_rx.clone(),
-            rotation_resume_rx.clone(),
+        tasks.spawn(ROTATION_PRODUCER.scope(
+            rotation_producers[producer_id].clone(),
+            receive_url(
+                config.market,
+                shard,
+                sender.clone(),
+                stream_connected_tx.clone(),
+                session_stop_rx.clone(),
+                stall_timeout,
+                config.stall_timeout,
+                SUBSCRIPTION_PROOF_TIMEOUT,
+                watchdog.clone(),
+                producer_id,
+                rotation_pause_rx.clone(),
+                rotation_resume_rx.clone(),
+            ),
         ));
     }
     for (index, (symbols, subscription)) in snapshot_shards
@@ -2256,19 +2393,22 @@ async fn run_session(
                 "snapshot producer catalog contains duplicate symbol {symbol}"
             );
         }
-        tasks.spawn(produce_snapshots_after_streams_connect(
-            config.clone(),
-            sender.clone(),
-            session_stop_rx.clone(),
-            subscription,
-            expected_shards,
-            expected_shards + index,
-            rotation_pause_rx.clone(),
-            rotation_resume_rx.clone(),
-            symbols,
-            resync_rx,
-            index == 0,
-            snapshot_rate_limiter.clone(),
+        tasks.spawn(ROTATION_PRODUCER.scope(
+            rotation_producers[expected_shards + index].clone(),
+            produce_snapshots_after_streams_connect(
+                config.clone(),
+                sender.clone(),
+                session_stop_rx.clone(),
+                subscription,
+                expected_shards,
+                expected_shards + index,
+                rotation_pause_rx.clone(),
+                rotation_resume_rx.clone(),
+                symbols,
+                resync_rx,
+                index == 0,
+                snapshot_rate_limiter.clone(),
+            ),
         ));
     }
     let mut states = active_symbols
@@ -2449,6 +2589,11 @@ async fn run_session(
                     break;
                 }
             };
+            for producer in &rotation_producers {
+                producer
+                    .requested_epoch
+                    .store(rotation_epoch, Ordering::Relaxed);
+            }
             if rotation_pause_tx.send(rotation_epoch).is_err() {
                 failure = Some(SessionFailure::new(anyhow::anyhow!(
                     "collector producers stopped before segment rotation"
@@ -2468,6 +2613,7 @@ async fn run_session(
                 expected_rotation_producers,
                 rotation_epoch,
                 Some(&watchdog),
+                &rotation_producers,
             )
             .await
             {
@@ -3280,11 +3426,16 @@ async fn await_rotation_barriers(
     expected_producers: usize,
     epoch: u64,
     watchdog: Option<&ProcessWatchdog>,
+    rotation_producers: &[Arc<RotationProducer>],
 ) -> anyhow::Result<RotationBarrierResult> {
     let acknowledgement_timeout = config
         .stall_timeout
         .max(SUBSCRIPTION_PROOF_TIMEOUT.saturating_add(Duration::from_secs(1)));
-    let deadline = tokio::time::Instant::now() + acknowledgement_timeout;
+    let started = tokio::time::Instant::now();
+    let deadline = started + acknowledgement_timeout;
+    let queue_at_pause = receiver.len();
+    let mut drained_events = 0_u64;
+    let mut processing_elapsed = Duration::ZERO;
     let mut acknowledged = BTreeSet::new();
     let mut initial_snapshots_complete = 0_usize;
     let mut resync_requested = false;
@@ -3326,8 +3477,14 @@ async fn await_rotation_barriers(
             }
             _ = tokio::time::sleep_until(deadline) => {
                 return Err(anyhow::anyhow!(
-                    "collector producers did not acknowledge segment rotation epoch {epoch} within {}s",
-                    acknowledgement_timeout.as_secs()
+                    "collector producers did not acknowledge segment rotation epoch {epoch} within {}s; elapsed_ms={} queue_at_pause={} queue_remaining={} drained_events={} processing_elapsed_ms={} details={}",
+                    acknowledgement_timeout.as_secs(),
+                    started.elapsed().as_millis(),
+                    queue_at_pause,
+                    receiver.len(),
+                    drained_events,
+                    processing_elapsed.as_millis(),
+                    rotation_timeout_details(expected_producers, &acknowledged, rotation_producers)
                 ));
             }
         };
@@ -3348,11 +3505,15 @@ async fn await_rotation_barriers(
                     acknowledged.insert(producer_id),
                     "duplicate rotation barrier from producer {producer_id} for epoch {epoch}"
                 );
+                if let Some(producer) = rotation_producers.get(producer_id) {
+                    producer.observed_epoch.store(epoch, Ordering::Relaxed);
+                }
                 if let Some(watchdog) = watchdog {
                     watchdog.mark_processed();
                 }
             }
             event => {
+                let processing_started = Instant::now();
                 let action = process_event(
                     config,
                     segment,
@@ -3362,6 +3523,8 @@ async fn await_rotation_barriers(
                     event,
                     process_state,
                 )?;
+                drained_events += 1;
+                processing_elapsed += processing_started.elapsed();
                 if let Some(watchdog) = watchdog {
                     watchdog.mark_processed();
                 }
@@ -3800,10 +3963,44 @@ async fn send_stream_event(
     event: Event,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<Option<TaskExit>> {
-    match send_or_shutdown(sender, event, shutdown).await? {
+    match send_producer_event(sender, event, shutdown).await? {
         SendOutcome::Sent => Ok(None),
         SendOutcome::Shutdown(event) => Ok(Some(TaskExit::Stopped(Some(event)))),
     }
+}
+
+async fn send_producer_event(
+    sender: &mpsc::Sender<Event>,
+    event: Event,
+    shutdown: &mut watch::Receiver<bool>,
+) -> anyhow::Result<SendOutcome<Event>> {
+    in_rotation_phase(
+        RotationPhase::EventSend,
+        send_or_shutdown(sender, event, shutdown),
+    )
+    .await
+}
+
+async fn write_subscription_proof<E>(
+    write: impl Future<Output = Result<(), E>>,
+    deadline: tokio::time::Instant,
+    shutdown: &mut watch::Receiver<bool>,
+    rotation_pause: &mut watch::Receiver<u64>,
+) -> anyhow::Result<ProducerWait<anyhow::Result<()>>>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    wait_for_rotation_or_shutdown(
+        in_rotation_phase(RotationPhase::ProofWrite, async {
+            tokio::time::timeout_at(deadline, write)
+                .await
+                .context("websocket subscription proof request timed out")?
+                .map_err(anyhow::Error::from)
+        }),
+        shutdown,
+        rotation_pause,
+    )
+    .await
 }
 
 async fn acknowledge_rotation_pause(
@@ -3819,6 +4016,7 @@ async fn acknowledge_rotation_pause(
         return Ok(None);
     }
     *last_pause_epoch = epoch;
+    let _phase = rotation_phase(RotationPhase::BarrierSend);
     // The controller waits for every marker before setting the next boundary.
     match send_or_shutdown(
         sender,
@@ -3830,6 +4028,10 @@ async fn acknowledge_rotation_pause(
         SendOutcome::Sent => {}
         SendOutcome::Shutdown(event) => return Ok(Some(TaskExit::Stopped(Some(event)))),
     }
+    let _ = ROTATION_PRODUCER.try_with(|producer| {
+        producer.enqueued_epoch.store(epoch, Ordering::Relaxed);
+    });
+    let _phase = rotation_phase(RotationPhase::Resume);
     loop {
         if *rotation_resume.borrow_and_update() >= epoch {
             return Ok(None);
@@ -3890,8 +4092,24 @@ async fn wait_for_snapshot_rate_slot(
     shutdown: &mut watch::Receiver<bool>,
     rotation_pause: &mut watch::Receiver<u64>,
 ) -> anyhow::Result<ProducerWait<()>> {
-    let mut limiter = rate_limiter.lock().await;
-    match wait_for_rotation_or_shutdown(limiter.tick(), shutdown, rotation_pause).await? {
+    let mut limiter = match wait_for_rotation_or_shutdown(
+        in_rotation_phase(RotationPhase::RateLock, rate_limiter.lock()),
+        shutdown,
+        rotation_pause,
+    )
+    .await?
+    {
+        ProducerWait::Ready(limiter) => limiter,
+        ProducerWait::PauseRequested => return Ok(ProducerWait::PauseRequested),
+        ProducerWait::Stopped => return Ok(ProducerWait::Stopped),
+    };
+    match wait_for_rotation_or_shutdown(
+        in_rotation_phase(RotationPhase::RateTick, limiter.tick()),
+        shutdown,
+        rotation_pause,
+    )
+    .await?
+    {
         ProducerWait::Ready(_) => Ok(ProducerWait::Ready(())),
         ProducerWait::PauseRequested => Ok(ProducerWait::PauseRequested),
         ProducerWait::Stopped => Ok(ProducerWait::Stopped),
@@ -3979,7 +4197,10 @@ async fn receive_url(
             return Ok(exit);
         }
         let connection = match wait_for_rotation_or_shutdown(
-            tokio::time::timeout(Duration::from_secs(20), connect_async(&shard.url)),
+            in_rotation_phase(
+                RotationPhase::Connect,
+                tokio::time::timeout(Duration::from_secs(20), connect_async(&shard.url)),
+            ),
             &mut shutdown,
             &mut rotation_pause,
         )
@@ -4056,45 +4277,73 @@ async fn receive_url(
             return Ok(exit);
         }
 
-        if let Err(error) = websocket
-            .send(Message::Text(
+        let mut subscription_proof_deadline =
+            tokio::time::Instant::now() + subscription_proof_timeout;
+        let proof_write = write_subscription_proof(
+            websocket.send(Message::Text(
                 json!({"method":"LIST_SUBSCRIPTIONS","id":SUBSCRIPTION_PROOF_ID})
                     .to_string()
                     .into(),
-            ))
-            .await
-        {
-            if !coverage_announced {
-                return Err(error.into());
+            )),
+            subscription_proof_deadline,
+            &mut shutdown,
+            &mut rotation_pause,
+        )
+        .await?;
+        match proof_write {
+            ProducerWait::Ready(Ok(())) => {}
+            ProducerWait::Ready(Err(error)) => {
+                if !coverage_announced {
+                    return Err(error);
+                }
+                warn!(error = %bounded_log_error(&error), "websocket subscription proof request failed");
+                if let Some(exit) = wait_for_stream_reconnect(
+                    &sender,
+                    producer_id,
+                    &mut rotation_pause,
+                    &mut rotation_resume,
+                    &mut last_pause_epoch,
+                    &mut shutdown,
+                    &mut reconnect_backoff,
+                )
+                .await?
+                {
+                    return Ok(exit);
+                }
+                continue;
             }
-            warn!(error = %error, "websocket subscription proof request failed");
-            if let Some(exit) = wait_for_stream_reconnect(
-                &sender,
-                producer_id,
-                &mut rotation_pause,
-                &mut rotation_resume,
-                &mut last_pause_epoch,
-                &mut shutdown,
-                &mut reconnect_backoff,
-            )
-            .await?
-            {
-                return Ok(exit);
+            ProducerWait::PauseRequested => {
+                // A canceled Sink send can leave a partial frame. Never reuse this socket.
+                drop(websocket);
+                if let Some(exit) = acknowledge_rotation_pause(
+                    producer_id,
+                    &sender,
+                    &mut rotation_pause,
+                    &mut rotation_resume,
+                    &mut last_pause_epoch,
+                    &mut shutdown,
+                )
+                .await?
+                {
+                    return Ok(exit);
+                }
+                continue;
             }
-            continue;
+            ProducerWait::Stopped => return Ok(TaskExit::Stopped(None)),
         }
 
         let reconnecting = coverage_announced;
         let mut reconnect_confirmed = !reconnecting;
-        let mut subscription_proof_deadline =
-            tokio::time::Instant::now() + subscription_proof_timeout;
         let mut proof_failure = None;
         let mut proof_events = Vec::new();
         loop {
             let message = match wait_for_rotation_or_shutdown(
-                receive_before_subscription_proof_deadline(
-                    subscription_proof_deadline,
-                    websocket.next(),
+                in_rotation_phase(
+                    RotationPhase::ProofRead,
+                    receive_before_subscription_proof_deadline(
+                        subscription_proof_deadline,
+                        websocket.next(),
+                    ),
                 ),
                 &mut shutdown,
                 &mut rotation_pause,
@@ -4177,7 +4426,7 @@ async fn receive_url(
                     }
                     for event in proof_events.drain(..) {
                         watchdog.record_queue_health(QueueHealth::from_sender(&sender));
-                        match send_or_shutdown(&sender, event, &mut shutdown).await? {
+                        match send_producer_event(&sender, event, &mut shutdown).await? {
                             SendOutcome::Sent => {
                                 watchdog.mark_enqueued_for(producer_id);
                                 watchdog.record_queue_health(QueueHealth::from_sender(&sender));
@@ -4205,7 +4454,7 @@ async fn receive_url(
                     watchdog.record_queue_health(QueueHealth::from_sender(&sender));
                     match receive_before_subscription_proof_deadline(
                         subscription_proof_deadline,
-                        send_or_shutdown(&sender, event, &mut shutdown),
+                        send_producer_event(&sender, event, &mut shutdown),
                     )
                     .await??
                     {
@@ -4286,12 +4535,12 @@ async fn receive_url(
                     changed.context("segment rotation controller stopped before producer pause")?;
                     continue;
                 }
-                message = async {
+                message = in_rotation_phase(RotationPhase::MarketRead, async {
                     match reconnect_frame_deadline {
                         Some(deadline) => tokio::time::timeout_at(deadline, websocket.next()).await,
                         None => tokio::time::timeout(stall_timeout, websocket.next()).await,
                     }
-                } => match message {
+                }) => match message {
                     Ok(Some(Ok(message))) => message,
                     Ok(Some(Err(error))) => break format!("websocket receive failed: {error}"),
                     Ok(None) => break "websocket closed".into(),
@@ -4329,7 +4578,7 @@ async fn receive_url(
                     reconnect_frame_deadline = None;
                 }
                 watchdog.record_queue_health(QueueHealth::from_sender(&sender));
-                match send_or_shutdown(&sender, event, &mut shutdown).await? {
+                match send_producer_event(&sender, event, &mut shutdown).await? {
                     SendOutcome::Sent => {
                         watchdog.mark_enqueued_for(producer_id);
                         watchdog.record_queue_health(QueueHealth::from_sender(&sender));
@@ -4433,7 +4682,7 @@ async fn produce_snapshots_after_streams_connect(
             changed = rotation_pause.changed() => {
                 changed.context("segment rotation controller stopped before snapshot producer pause")?;
             }
-            connected = stream_connected.recv() => {
+            connected = in_rotation_phase(RotationPhase::SnapshotIdle, stream_connected.recv()) => {
                 shards.push(connected.context("websocket producer stopped before connecting")?);
             }
         }
@@ -4442,7 +4691,7 @@ async fn produce_snapshots_after_streams_connect(
     // only wait on the same connection notifications before pulling snapshots.
     if announce_coverage {
         shards.sort();
-        match send_or_shutdown(
+        match send_producer_event(
             &sender,
             Event::StreamCoverageVerified { shards },
             &mut shutdown,
@@ -4746,7 +4995,10 @@ async fn send_snapshot_request(
             ProducerWait::PauseRequested => continue,
         }
         match wait_for_rotation_or_shutdown(
-            fetch_snapshot_attempt(client, config, &request.symbol, attempt),
+            in_rotation_phase(
+                RotationPhase::SnapshotFetch,
+                fetch_snapshot_attempt(client, config, &request.symbol, attempt),
+            ),
             shutdown,
             rotation_pause,
         )
@@ -4765,7 +5017,7 @@ async fn send_snapshot_request(
                         symbol: request.symbol.clone(),
                         reason: error.to_string(),
                     };
-                    return match send_or_shutdown(sender, event, shutdown).await? {
+                    return match send_producer_event(sender, event, shutdown).await? {
                         SendOutcome::Sent => Ok(None),
                         SendOutcome::Shutdown(event) => Ok(Some(TaskExit::Stopped(Some(event)))),
                     };
@@ -4784,7 +5036,7 @@ async fn send_snapshot_request(
             symbol: request.symbol.clone(),
             reason: "one-sided initial snapshot is not replay-complete".to_owned(),
         };
-        return match send_or_shutdown(sender, event, shutdown).await? {
+        return match send_producer_event(sender, event, shutdown).await? {
             SendOutcome::Sent => Ok(None),
             SendOutcome::Shutdown(event) => Ok(Some(TaskExit::Stopped(Some(event)))),
         };
@@ -4797,7 +5049,7 @@ async fn send_snapshot_request(
         request_started_at_ns: started,
         snapshot,
     };
-    match send_or_shutdown(sender, event, shutdown).await? {
+    match send_producer_event(sender, event, shutdown).await? {
         SendOutcome::Sent => Ok(None),
         SendOutcome::Shutdown(event) => Ok(Some(TaskExit::Stopped(Some(event)))),
     }
@@ -4840,7 +5092,7 @@ async fn produce_snapshots(
             return Ok(exit);
         }
     }
-    match send_or_shutdown(&sender, Event::InitialSnapshotsComplete, &mut shutdown).await? {
+    match send_producer_event(&sender, Event::InitialSnapshotsComplete, &mut shutdown).await? {
         SendOutcome::Sent => {}
         SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
     }
@@ -4866,7 +5118,7 @@ async fn produce_snapshots(
             changed = rotation_pause.changed() => {
                 changed.context("segment rotation controller stopped before snapshot producer pause")?;
             }
-            requests = resync_requests.recv() => {
+            requests = in_rotation_phase(RotationPhase::SnapshotIdle, resync_requests.recv()) => {
                 for request in requests? {
                     if let Some(exit) = send_snapshot_request(
                         &client,
@@ -7055,11 +7307,13 @@ mod tests {
         let manifest_sha256 = sha256_file(&fixture.manifest).unwrap();
         let mut fake = FakeOss::default();
 
-        let segment =
-            upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
-                fake.run(&dirs.bucket, command, timeout)
-            })
-            .unwrap();
+        let segment = upload_one_with(
+            &dirs.config(),
+            &fixture.manifest,
+            false,
+            &mut |command, timeout| fake.run(&dirs.bucket, command, timeout),
+        )
+        .unwrap();
 
         assert!(!segment.retried);
         assert_eq!(fake.uploads, 3);
@@ -7133,9 +7387,12 @@ mod tests {
             corrupt_segment: Some("1700000000000000000".into()),
         };
 
-        let error = upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
-            fake.run(&dirs.bucket, command, timeout)
-        })
+        let error = upload_one_with(
+            &dirs.config(),
+            &fixture.manifest,
+            false,
+            &mut |command, timeout| fake.run(&dirs.bucket, command, timeout),
+        )
         .unwrap_err();
 
         assert!(error.to_string().contains("readback verification"));
@@ -7152,9 +7409,12 @@ mod tests {
         fixture.seed_remote(&dirs.bucket, b"different-remote-bytes");
         let mut fake = FakeOss::default();
 
-        let error = upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
-            fake.run(&dirs.bucket, command, timeout)
-        })
+        let error = upload_one_with(
+            &dirs.config(),
+            &fixture.manifest,
+            false,
+            &mut |command, timeout| fake.run(&dirs.bucket, command, timeout),
+        )
         .unwrap_err();
 
         assert!(error.to_string().contains("conflicts"));
@@ -7174,11 +7434,13 @@ mod tests {
         fixture.seed_remote(&dirs.bucket, b"segment-bytes");
         let mut fake = FakeOss::default();
 
-        let segment =
-            upload_one_with(&dirs.config(), &fixture.manifest, false, &mut |command, timeout| {
-                fake.run(&dirs.bucket, command, timeout)
-            })
-            .unwrap();
+        let segment = upload_one_with(
+            &dirs.config(),
+            &fixture.manifest,
+            false,
+            &mut |command, timeout| fake.run(&dirs.bucket, command, timeout),
+        )
+        .unwrap();
 
         assert!(segment.retried);
         assert_eq!(fake.uploads, 0);
@@ -7594,12 +7856,17 @@ mod tests {
         usdm_config.ws_shard_size = 25;
         let usdm = usdm_config.stream_shards();
         assert_eq!(usdm.len(), 4);
-        assert!(usdm
-            .iter()
-            .all(|shard| shard.url.starts_with("wss://fstream.binance.com/public/stream")));
-        assert_eq!(usdm.iter().map(|shard| shard.streams.len()).sum::<usize>(), 100);
+        assert!(usdm.iter().all(|shard| shard
+            .url
+            .starts_with("wss://fstream.binance.com/public/stream")));
         assert_eq!(
-            usdm.iter().map(|shard| shard.streams.len()).collect::<Vec<_>>(),
+            usdm.iter().map(|shard| shard.streams.len()).sum::<usize>(),
+            100
+        );
+        assert_eq!(
+            usdm.iter()
+                .map(|shard| shard.streams.len())
+                .collect::<Vec<_>>(),
             [25, 25, 25, 25]
         );
         assert!(usdm.iter().all(|shard| {
@@ -13121,6 +13388,7 @@ mod tests {
                 1,
                 1,
                 None,
+                &[],
             )
             .await
             .unwrap(),
@@ -13214,6 +13482,7 @@ mod tests {
                 1,
                 1,
                 None,
+                &[],
             ),
         )
         .await
@@ -13282,6 +13551,7 @@ mod tests {
                 1,
                 1,
                 None,
+                &[],
             ),
         )
         .await
@@ -13469,9 +13739,8 @@ mod tests {
 
     #[tokio::test]
     async fn scheduled_finalizer_error_is_fail_closed() {
-        let finalizer = spawn_segment_finalizer(|| {
-            Err(anyhow::anyhow!("scheduled finalizer test failure"))
-        });
+        let finalizer =
+            spawn_segment_finalizer(|| Err(anyhow::anyhow!("scheduled finalizer test failure")));
         let error = collect_segment_finalizer(finalizer)
             .await
             .expect_err("scheduled finalizer errors must fail closed");
@@ -13548,5 +13817,305 @@ mod tests {
             !segment_due_at(50 * minute_ns, 59 * minute_ns + 58 * 1_000_000_000, 600).unwrap()
         );
         assert!(segment_due_at(50 * minute_ns, 60 * minute_ns, 600).unwrap());
+    }
+    async fn wait_for_rotation_phase(producer: &RotationProducer, phase: RotationPhase) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while producer.phase.load(Ordering::Relaxed) != phase as u8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer never entered the blocking operation");
+    }
+
+    #[tokio::test]
+    async fn rotation_pause_and_shutdown_interrupt_contended_rate_lock_without_consuming_tick() {
+        for shutdown_requested in [false, true] {
+            let limiter = snapshot_rate_limiter(0.1);
+            let mut held = limiter.lock().await;
+            held.tick().await;
+            let (stop_tx, mut stop_rx) = watch::channel(false);
+            let (pause_tx, mut pause_rx) = watch::channel(0_u64);
+            let producer = RotationProducer::shared(0, "snapshot");
+            let task_limiter = limiter.clone();
+            let task = tokio::spawn(ROTATION_PRODUCER.scope(producer.clone(), async move {
+                wait_for_snapshot_rate_slot(&task_limiter, &mut stop_rx, &mut pause_rx).await
+            }));
+            wait_for_rotation_phase(&producer, RotationPhase::RateLock).await;
+            if shutdown_requested {
+                stop_tx.send(true).unwrap();
+            } else {
+                pause_tx.send(1).unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("lock waiter ignored pause or shutdown while another task held the lock")
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result, ProducerWait::Stopped) == shutdown_requested);
+            assert!(matches!(result, ProducerWait::PauseRequested) == !shutdown_requested);
+            // The holder still owns the lock. Cancellation neither takes it nor consumes its next slot.
+            assert!(tokio::time::timeout(Duration::from_millis(20), held.tick())
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_pause_and_shutdown_interrupt_partial_subscription_write() {
+        use tokio::io::AsyncReadExt;
+        for shutdown_requested in [false, true] {
+            let (client, mut peer) = tokio::io::duplex(1);
+            let mut websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                client,
+                tokio_tungstenite::tungstenite::protocol::Role::Client,
+                None,
+            )
+            .await;
+            let (stop_tx, mut stop_rx) = watch::channel(false);
+            let (pause_tx, mut pause_rx) = watch::channel(0_u64);
+            let producer = RotationProducer::shared(0, "websocket");
+            let task = tokio::spawn(ROTATION_PRODUCER.scope(producer.clone(), async move {
+                let result = write_subscription_proof(
+                    websocket.send(Message::Text("subscription-proof".into())),
+                    tokio::time::Instant::now() + Duration::from_secs(20),
+                    &mut stop_rx,
+                    &mut pause_rx,
+                )
+                .await;
+                // Match receive_url: discard a socket whose frame was only partly written.
+                drop(websocket);
+                result
+            }));
+            wait_for_rotation_phase(&producer, RotationPhase::ProofWrite).await;
+            if shutdown_requested {
+                stop_tx.send(true).unwrap();
+            } else {
+                pause_tx.send(1).unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("blocked socket write ignored pause or shutdown")
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result, ProducerWait::Stopped) == shutdown_requested);
+            assert!(matches!(result, ProducerWait::PauseRequested) == !shutdown_requested);
+            let mut partial_frame = Vec::new();
+            tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut partial_frame))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                partial_frame.len(),
+                1,
+                "test must interrupt a real partial frame"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_subscription_write_obeys_existing_absolute_proof_deadline() {
+        let (client, _peer) = tokio::io::duplex(1);
+        let mut websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        let (_pause_tx, mut pause_rx) = watch::channel(0_u64);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            write_subscription_proof(
+                websocket.send(Message::Text("subscription-proof".into())),
+                tokio::time::Instant::now() + Duration::from_millis(20),
+                &mut stop_rx,
+                &mut pause_rx,
+            ),
+        )
+        .await
+        .expect("proof write escaped its existing deadline")
+        .unwrap();
+        match result {
+            ProducerWait::Ready(Err(error)) => {
+                assert!(error.to_string().contains("proof request timed out"))
+            }
+            _ => panic!("blocked proof write must fail within its deadline"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_partial_write_pause_drains_full_queue_before_barrier_and_keeps_raw_input() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let received_at_ns = now_ns().unwrap();
+        let event_time_ms = received_at_ns / 1_000_000;
+        let event = event_from_frame(
+            json!({"stream":"btcusdt@aggTrade", "data": {
+                "e":"aggTrade", "E":event_time_ms, "T":event_time_ms, "s":"BTCUSDT",
+                "a":42, "f":100, "l":101, "p":"100", "q":"1", "m":false,
+            }}),
+            received_at_ns,
+        )
+        .unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(event).await.unwrap();
+        let (client, _peer) = tokio::io::duplex(1);
+        let mut websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let (pause_tx, mut pause_rx) = watch::channel(0_u64);
+        let (_resume_tx, mut resume_rx) = watch::channel(0_u64);
+        let producer = RotationProducer::shared(0, "websocket");
+        let task = tokio::spawn(ROTATION_PRODUCER.scope(producer.clone(), async move {
+            assert!(matches!(
+                write_subscription_proof(
+                    websocket.send(Message::Text("subscription-proof".into())),
+                    tokio::time::Instant::now() + Duration::from_secs(20),
+                    &mut stop_rx,
+                    &mut pause_rx,
+                )
+                .await?,
+                ProducerWait::PauseRequested
+            ));
+            drop(websocket);
+            acknowledge_rotation_pause(
+                0,
+                &sender,
+                &mut pause_rx,
+                &mut resume_rx,
+                &mut 0,
+                &mut stop_rx,
+            )
+            .await
+        }));
+        wait_for_rotation_phase(&producer, RotationPhase::ProofWrite).await;
+        pause_tx.send(1).unwrap();
+        wait_for_rotation_phase(&producer, RotationPhase::BarrierSend).await;
+        assert!(
+            !task.is_finished(),
+            "barrier must wait behind captured data in the full queue"
+        );
+        let captured = receiver.recv().await.unwrap();
+        assert!(matches!(captured, Event::AggregateTrade { .. }));
+        archive_only(&mut segment, "rotation-retention", config.market, captured).unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1
+            })
+        ));
+        wait_for_rotation_phase(&producer, RotationPhase::Resume).await;
+        assert_eq!(producer.enqueued_epoch.load(Ordering::Relaxed), 1);
+        stop_tx.send(true).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            Some(TaskExit::Stopped(None))
+        ));
+        // BufWriter flushes on drop; retain the actual captured row as a raw recovery input.
+        drop(segment);
+        let parts = files_with_suffix(&config.spool_dir, ".jsonl.part").unwrap();
+        assert_eq!(parts.len(), 1);
+        let contents = std::fs::read_to_string(&parts[0]).unwrap();
+        let row: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(row["received_at_ns"], received_at_ns);
+        assert_eq!(row["frame"]["data"]["a"], 42);
+        assert_eq!(row["session_id"], "rotation-retention");
+        assert_eq!(contents.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rotation_timeout_identifies_missing_producer_and_logs_primary_before_teardown() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.path().to_path_buf();
+        config.stall_timeout = Duration::from_secs(1);
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", config.market),
+        )]);
+        let mut budget = PendingBudget::new(config.max_pending_diffs);
+        let mut process_state = ProcessState::new(false);
+        let producers = vec![
+            RotationProducer::shared(0, "websocket"),
+            RotationProducer::shared(1, "snapshot"),
+        ];
+        for producer in &producers {
+            producer.requested_epoch.store(1, Ordering::Relaxed);
+        }
+        let limiter = snapshot_rate_limiter(1.0);
+        let held = limiter.lock().await;
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        let (_pause_tx, mut pause_rx) = watch::channel(0_u64);
+        let task_limiter = limiter.clone();
+        let task = tokio::spawn(ROTATION_PRODUCER.scope(producers[1].clone(), async move {
+            wait_for_snapshot_rate_slot(&task_limiter, &mut stop_rx, &mut pause_rx).await
+        }));
+        wait_for_rotation_phase(&producers[1], RotationPhase::RateLock).await;
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Event::RotationBarrier {
+                producer_id: 0,
+                epoch: 1,
+            })
+            .await
+            .unwrap();
+        producers[0].enqueued_epoch.store(1, Ordering::Relaxed);
+        let timeout = SUBSCRIPTION_PROOF_TIMEOUT + Duration::from_secs(1);
+        let error = tokio::time::timeout(
+            timeout + Duration::from_secs(2),
+            await_rotation_barriers(
+                &config,
+                &mut receiver,
+                &mut JoinSet::new(),
+                &mut segment,
+                &mut states,
+                &mut budget,
+                "missing-producer",
+                &mut process_state,
+                &HashMap::new(),
+                2,
+                1,
+                None,
+                &producers,
+            ),
+        )
+        .await
+        .expect("barrier escaped its existing acknowledgement deadline")
+        .unwrap_err();
+        let detail = error.to_string();
+        assert!(detail.contains("\"acknowledged\":[0]"), "{detail}");
+        assert!(detail.contains("\"missing\":[1]"), "{detail}");
+        assert!(detail.contains("\"role\":\"snapshot\""), "{detail}");
+        assert!(detail.contains("\"phase\":\"rate_lock\""), "{detail}");
+        assert!(detail.contains("\"enqueued_epoch\":0"), "{detail}");
+        assert_eq!(producers[0].observed_epoch.load(Ordering::Relaxed), 1);
+        let log = root.path().join("primary.log");
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(std::fs::File::create(&log).unwrap())
+            .finish();
+        let (session_stop_tx, session_stop_rx) = watch::channel(false);
+        tracing::subscriber::with_default(subscriber, || {
+            let failure = SessionFailure::new(error, "rotation_barrier");
+            begin_session_teardown("missing-producer", Some(&failure), &session_stop_tx, sender);
+        });
+        assert!(*session_stop_rx.borrow());
+        let trace = std::fs::read_to_string(log).unwrap();
+        assert!(trace.contains("phase=\"rotation_barrier\""), "{trace}");
+        assert!(trace.contains("failure_role=\"primary\""), "{trace}");
+        assert!(trace.contains("\"missing\":[1]"), "{trace}");
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        drop(held);
     }
 }
