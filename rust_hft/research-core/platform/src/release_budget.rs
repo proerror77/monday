@@ -3,6 +3,7 @@
 use crate::{
     orchestrator::Artifact,
     release::{ReleaseProducer, SourceArchive},
+    release_oss::BudgetReference as Reference,
 };
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -260,16 +261,6 @@ impl Inventory {
                 .context("response budget overflow")?,
         })
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Reference {
-    pub ledger_path: PathBuf,
-    pub envelope_sha256: String,
-    pub binding_sha256: String,
-    pub device: u64,
-    pub inode: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

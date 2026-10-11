@@ -1,4 +1,5 @@
-//! Release-only OSS transport. Scientific AttemptWriter remains PG fenced.
+//! Scoped OSS transport for immutable software. Scientific outputs remain PG fenced.
+#[cfg(feature = "publisher")]
 use crate::release_budget::{self as budget, Ledger, Phase, Service};
 use anyhow::{ensure, Result};
 use chrono::Utc;
@@ -6,28 +7,25 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+#[cfg(feature = "publisher")]
 const VERSIONING_RESPONSE_LIMIT: usize = 4096;
+#[cfg(feature = "publisher")]
 const VERSIONING_NODE_LIMIT: u32 = 32;
+#[cfg(feature = "publisher")]
 const OSS_XML_NAMESPACE: &str = "http://doc.oss-cn-hangzhou.aliyuncs.com";
 const PUBLICATION_NAMESPACES: [&str; 2] = ["research/builds/", "research/sources/"];
 
-#[derive(Clone, Serialize, Deserialize)]
+/// The object location grants no publication or research authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct OssConfig {
+pub struct OssLocation {
     pub bucket: String,
     pub region: String,
     pub endpoint: String,
-    pub role_arn: String,
-    pub oidc_provider_arn: String,
-    pub audience: String,
-    pub subject: String,
-    pub publication_namespaces: Vec<String>,
-    pub repository_id: u64,
-    pub owner_id: u64,
 }
-impl OssConfig {
+impl OssLocation {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             (3..=63).contains(&self.bucket.len())
@@ -54,6 +52,38 @@ impl OssConfig {
             self.endpoint == expected || self.endpoint == internal,
             "OSS endpoint must bind bucket and region over HTTPS"
         );
+        Ok(())
+    }
+}
+
+/// Publication-only budget identity. Read-only controller sessions reject it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetReference {
+    pub ledger_path: PathBuf,
+    pub envelope_sha256: String,
+    pub binding_sha256: String,
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OssConfig {
+    pub bucket: String,
+    pub region: String,
+    pub endpoint: String,
+    pub role_arn: String,
+    pub oidc_provider_arn: String,
+    pub audience: String,
+    pub subject: String,
+    pub publication_namespaces: Vec<String>,
+    pub repository_id: u64,
+    pub owner_id: u64,
+}
+impl OssConfig {
+    pub fn validate(&self) -> Result<()> {
+        self.location().validate()?;
         ensure!(
             self.role_arn.starts_with("acs:ram::")
                 && self.role_arn.contains(":role/")
@@ -71,6 +101,14 @@ impl OssConfig {
         );
         Ok(())
     }
+    fn location(&self) -> OssLocation {
+        OssLocation {
+            bucket: self.bucket.clone(),
+            region: self.region.clone(),
+            endpoint: self.endpoint.clone(),
+        }
+    }
+    #[cfg(feature = "publisher")]
     fn admits_prefix(&self, prefix: &str) -> bool {
         exact_prefix(prefix)
             && self
@@ -91,7 +129,7 @@ pub struct Session {
     #[serde(default)]
     pub versions: BTreeMap<String, String>,
     #[serde(default)]
-    pub budget: Option<budget::Reference>,
+    pub budget: Option<BudgetReference>,
 }
 impl Session {
     pub fn validate(&self, now: i64) -> Result<()> {
@@ -160,18 +198,48 @@ fn encode(s: &str) -> String {
         .collect()
 }
 pub struct Oss {
-    config: OssConfig,
+    config: OssLocation,
     session: Session,
     client: reqwest::Client,
+    #[cfg(feature = "publisher")]
     budget: Option<Ledger>,
 }
 impl Oss {
+    /// Reload a private reader projection for each verification. The broker can
+    /// rotate short-lived credentials without restarting the reconciler.
+    pub fn build_reader(config: &OssLocation, path: &Path) -> Result<Self> {
+        config.validate()?;
+        let session: Session = serde_json::from_slice(&crate::transport::read_private_file(path)?)
+            .map_err(|_| anyhow::anyhow!("invalid private OSS reader session"))?;
+        session.validate(Utc::now().timestamp_millis())?;
+        ensure!(
+            !session.publisher
+                && session.budget.is_none()
+                && session
+                    .prefixes
+                    .iter()
+                    .all(|prefix| prefix.starts_with("research/builds/")),
+            "Build readback requires separate read-only OSS credentials"
+        );
+        Ok(Self {
+            config: config.clone(),
+            session,
+            client: crate::transport::TlsConfig::default()
+                .client(std::time::Duration::from_secs(15), true)?,
+            #[cfg(feature = "publisher")]
+            budget: None,
+        })
+    }
+
+    #[cfg(feature = "publisher")]
     pub fn from_file(config: &OssConfig, path: &Path) -> Result<Self> {
         Self::load(config, path, false)
     }
+    #[cfg(feature = "publisher")]
     pub fn from_reader_file(config: &OssConfig, path: &Path) -> Result<Self> {
         Self::load(config, path, true)
     }
+    #[cfg(feature = "publisher")]
     fn load(config: &OssConfig, path: &Path, independent_reader: bool) -> Result<Self> {
         config.validate()?;
         let session: Session = serde_json::from_slice(&crate::transport::read_private_file(path)?)
@@ -202,7 +270,7 @@ impl Oss {
             "CI requires a private budget; independent import requires a reader session"
         );
         Ok(Self {
-            config: config.clone(),
+            config: config.location(),
             session,
             budget,
             client: crate::transport::TlsConfig::default()
@@ -293,30 +361,35 @@ impl Oss {
         Ok(())
     }
     /// Bind the private session to the publisher's independently recomputed plan.
+    #[cfg(feature = "publisher")]
     pub fn require_publisher_scope(&self, prefixes: &[String]) -> Result<()> {
         self.session.validate(Utc::now().timestamp_millis())?;
         ensure!(
             self.session.publisher
                 && !prefixes.is_empty()
-                && prefixes.iter().all(|p| self.config.admits_prefix(p))
+                && prefixes.iter().all(|p| exact_prefix(p))
                 && prefixes.windows(2).all(|w| w[0] < w[1])
                 && self.session.prefixes == prefixes,
             "publisher session must equal the actual native source/Build plan"
         );
         Ok(())
     }
+    #[cfg(feature = "publisher")]
     fn ledger(&self) -> Result<&Ledger> {
         self.budget.as_ref().ok_or_else(|| {
             anyhow::anyhow!("OSS request requires a cumulative private budget ledger")
         })
     }
+    #[cfg(feature = "publisher")]
     pub fn begin_publication(&self, inventory: &budget::Inventory) -> Result<()> {
         self.ledger()?.require_inventory(inventory)?;
         self.ledger()?.claim("publication")
     }
+    #[cfg(feature = "publisher")]
     pub fn complete_publication(&self) -> Result<()> {
         self.ledger()?.claim("publication_ready")
     }
+    #[cfg(feature = "publisher")]
     fn reserve(&self, service: Service, key: &str, request: u64, response: u64) -> Result<()> {
         self.session.validate(Utc::now().timestamp_millis())?;
         self.ledger()?.reserve(
@@ -346,6 +419,7 @@ impl Oss {
             key,
             version.or_else(|| self.session.versions.get(key).map(String::as_str)),
         )?;
+        #[cfg(feature = "publisher")]
         if self.budget.is_some() {
             self.reserve(
                 Service::OssRead,
@@ -356,6 +430,8 @@ impl Oss {
         } else {
             self.require_reader()?;
         }
+        #[cfg(not(feature = "publisher"))]
+        self.require_reader()?;
         let response = request
             .send()
             .await
@@ -366,6 +442,32 @@ impl Oss {
         );
         crate::transport::BoundedBody::new(response, limit)
     }
+    /// Read the same immutable software objects verified by the OSS importer.
+    /// This does not inspect scientific result objects or authorize a launch.
+    pub async fn verify_build(&self, build: &crate::build::BuildArtifact) -> Result<()> {
+        use sha2::Digest;
+        self.require_reader()?;
+        build.id()?;
+        for executable in &build.executables {
+            let artifact = &executable.blob;
+            let mut response = self.get(&artifact.key, None, artifact.bytes).await?;
+            let mut hash = Sha256::new();
+            let mut count = 0_u64;
+            while let Some(chunk) = response.chunk().await? {
+                count = count
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| anyhow::anyhow!("Build object size overflow"))?;
+                hash.update(&chunk);
+            }
+            ensure!(
+                count == artifact.bytes && format!("{:x}", hash.finalize()) == artifact.sha256,
+                "Build object integrity failure"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "publisher")]
     async fn require_unversioned_bucket(&self) -> Result<()> {
         let request = self.request(reqwest::Method::GET, "", None)?;
         self.reserve(Service::OssRead, "", 0, VERSIONING_RESPONSE_LIMIT as u64)?;
@@ -390,6 +492,7 @@ impl Oss {
         }
         require_unversioned_response(&bytes)
     }
+    #[cfg(feature = "publisher")]
     pub async fn put_file(&self, key: &str, path: &Path, size: u64) -> Result<()> {
         use tokio::io::AsyncReadExt;
         ensure!(
@@ -407,6 +510,7 @@ impl Oss {
         ));
         self.put(key, body, size).await
     }
+    #[cfg(feature = "publisher")]
     pub async fn put_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
         ensure!(
             !bytes.is_empty() && bytes.len() as u64 <= budget::JSON_LIMIT,
@@ -415,6 +519,7 @@ impl Oss {
         let size = bytes.len() as u64;
         self.put(key, bytes.into(), size).await
     }
+    #[cfg(feature = "publisher")]
     async fn put(&self, key: &str, body: reqwest::Body, size: u64) -> Result<()> {
         self.require_unversioned_bucket().await?;
         let request = self
@@ -436,6 +541,7 @@ impl Oss {
         while response.chunk().await?.is_some() {}
         Ok(())
     }
+    #[cfg(feature = "publisher")]
     pub async fn check(&self, source: &str) -> Result<()> {
         ensure!(
             !self.session.publisher,
@@ -459,6 +565,7 @@ impl Oss {
     }
 }
 
+#[cfg(feature = "publisher")]
 fn require_unversioned_response(bytes: &[u8]) -> Result<()> {
     ensure!(
         bytes.len() <= VERSIONING_RESPONSE_LIMIT,
@@ -516,6 +623,7 @@ fn require_unversioned_response(bytes: &[u8]) -> Result<()> {
 }
 
 /// RAM intersects this policy with the operator role. It never grants Run authority.
+#[cfg(feature = "publisher")]
 pub fn session_policy(config: &OssConfig, prefixes: &[String], publisher: bool) -> Result<String> {
     config.validate()?;
     ensure!(
@@ -538,7 +646,7 @@ pub fn session_policy(config: &OssConfig, prefixes: &[String], publisher: bool) 
     )?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "publisher"))]
 mod tests {
     use super::*;
     #[test]
@@ -828,7 +936,7 @@ mod tests {
     fn release_oss_requests_bind_scope_role_version_and_overwrite_header() {
         let prefix = format!("research/builds/{}/", "a".repeat(64));
         let mut oss = Oss {
-            config: config(),
+            config: config().location(),
             session: Session {
                 access_key_id: "fixture".into(),
                 access_key_secret: "fixture".into(),
@@ -895,5 +1003,160 @@ mod tests {
             hex,
             "8a01ff4efcc65ca2cbc75375045c61ab5f3fa8b9a2d84f0add27ef16a25feb3c"
         );
+    }
+}
+
+#[cfg(test)]
+mod build_reader_tests {
+    use super::*;
+    use crate::build::{BuildArtifact, BuildSpec, BuiltExecutable};
+    use crate::orchestrator::Artifact;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn build() -> BuildArtifact {
+        let digest = "a".repeat(64);
+        let spec = BuildSpec {
+            schema: 2,
+            code_commit: "a".repeat(40),
+            workspace_manifest: "research-core/Cargo.toml".into(),
+            source_manifest_sha256: digest.clone(),
+            cargo_lock_sha256: digest.clone(),
+            toolchain_manifest_sha256: digest.clone(),
+            target: "x86_64-unknown-linux-gnu".into(),
+            packages: vec!["fixture".into()],
+            binaries: vec!["worker".into()],
+            features: vec![],
+            default_features: false,
+            profile: "release".into(),
+            profile_manifest_sha256: digest.clone(),
+            rustflags_sha256: digest.clone(),
+            native_environment_sha256: digest.clone(),
+            builder_image: format!("builder@sha256:{digest}"),
+        };
+        let key = format!("research/builds/{}/worker", spec.id().unwrap());
+        BuildArtifact {
+            schema: 1,
+            build: spec,
+            image: format!("worker@sha256:{digest}"),
+            executables: vec![BuiltExecutable {
+                name: "worker".into(),
+                blob: Artifact {
+                    key,
+                    sha256: crate::sha256(b"code"),
+                    bytes: 4,
+                },
+            }],
+            release_receipt_sha256: digest,
+        }
+    }
+    fn location() -> OssLocation {
+        OssLocation {
+            bucket: "fixture".into(),
+            region: "ap-northeast-1".into(),
+            endpoint: "https://fixture.oss-ap-northeast-1.aliyuncs.com/".into(),
+        }
+    }
+    fn session(build: &BuildArtifact) -> Session {
+        Session {
+            access_key_id: "fixture-id".into(),
+            access_key_secret: "fixture-key".into(),
+            security_token: "fixture-token".into(),
+            expires_ms: Utc::now().timestamp_millis() + 60_000,
+            publisher: false,
+            prefixes: vec![format!("research/builds/{}/", build.build.id().unwrap())],
+            versions: BTreeMap::new(),
+            budget: None,
+        }
+    }
+
+    #[test]
+    fn build_reader_requires_current_private_readonly_projection() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        let path = dir.path().canonicalize()?.join("reader.json");
+        let mut value = session(&build());
+        let save = |value: &Session| -> Result<()> {
+            std::fs::write(&path, serde_json::to_vec(value)?)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            Ok(())
+        };
+        save(&value)?;
+        let reader = Oss::build_reader(&location(), &path)?;
+        assert!(reader
+            .request(reqwest::Method::PUT, &build().executables[0].blob.key, None)
+            .is_err());
+        assert!(reader
+            .request(reqwest::Method::GET, "research/tasks/other/result", None)
+            .is_err());
+        value.prefixes = vec![format!("research/sources/{}/", "a".repeat(40))];
+        save(&value)?;
+        assert!(Oss::build_reader(&location(), &path).is_err());
+        value.prefixes = session(&build()).prefixes;
+        value.publisher = true;
+        save(&value)?;
+        assert!(Oss::build_reader(&location(), &path).is_err());
+        value.publisher = false;
+        value.budget = Some(BudgetReference {
+            ledger_path: dir.path().join("not-a-runtime-budget"),
+            envelope_sha256: "a".repeat(64),
+            binding_sha256: "b".repeat(64),
+            device: 0,
+            inode: 0,
+        });
+        save(&value)?;
+        assert!(Oss::build_reader(&location(), &path).is_err());
+        value.budget = None;
+        value.expires_ms = Utc::now().timestamp_millis() - 1;
+        save(&value)?;
+        assert!(Oss::build_reader(&location(), &path).is_err());
+        value.expires_ms = Utc::now().timestamp_millis() + 60_000;
+        save(&value)?;
+        assert!(Oss::build_reader(&location(), &path).is_ok());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        assert!(Oss::build_reader(&location(), &path).is_err());
+        let mut wrong = location();
+        wrong.endpoint = "https://foreign.example/".into();
+        assert!(wrong.validate().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_readback_uses_scoped_oss_and_rejects_changed_or_missing_bytes() -> Result<()> {
+        // A loopback OSS stand-in; no local artifact gateway is created or seeded.
+        // Public constructors still admit only the bucket-bound HTTPS endpoint.
+        for (wire, succeeds) in [
+            ("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ncode", true),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nevil", false),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ncodes", false),
+            ("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ncut", false),
+            ("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", false),
+            ("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", false),
+            ("HTTP/1.1 302 Found\r\nLocation: https://foreign.example/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let build = build();
+            let expected = format!("GET /{} HTTP/1.1", build.executables[0].blob.key);
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let count = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(request.starts_with(&expected));
+                assert!(request.to_ascii_lowercase().contains("authorization: oss4-hmac-sha256"));
+                socket.write_all(wire.as_bytes()).await.unwrap();
+            });
+            let reader = Oss {
+                config: OssLocation { endpoint: format!("http://{address}/"), ..location() },
+                session: session(&build),
+                client: crate::transport::TlsConfig::default().client(std::time::Duration::from_secs(2), false)?,
+                #[cfg(feature = "publisher")]
+                budget: None,
+            };
+            assert_eq!(reader.verify_build(&build).await.is_ok(), succeeds);
+            server.await?;
+        }
+        Ok(())
     }
 }

@@ -158,3 +158,22 @@ revision，因此不能重定向身份或授予执行。真实清理还必须核
 
 CI 的角色测试使用独立 `monday_foundation_roles_test`。终态清理测试保留自己的
 `monday_foundation_retirement_test`。它们按顺序执行，不共用 migration schema。
+
+## 发行程序的读取路径
+
+`inventory` 必须提供 `build_oss`（既有发行 bucket、region、HTTPS endpoint）和
+`build_oss_ips`（经核对的 endpoint 地址）。renderer 为 control Pod 单独生成
+`build-oss-network.json`，仅开放这些地址的 TCP 443。它不开放 Session 或科学 worker
+的对象存储权限，也不发现 endpoint 或创建 bucket。安装时应连同 control 网络资产
+审查这份策略，并独立验证 DNS、地址和 TLS；renderer 不证明真实连通性。
+
+现有私有 broker 卷应提供 mode0600 的 `private/build-reader.json`，父目录保持
+mode0700。它使用 OSS importer 的短期 reader session 格式：`publisher=false`、
+`budget=null`，只允许明确的 `research/builds/<Build SHA>/` 前缀。控制器每次
+校验 Build 都重新读取投影，因此可以由原受信 owner 更新到期 session。
+发布者身份、CI publication budget 或宽泛前缀不能代替这个 reader。
+
+调度器从同一 OSS 发行对象逐字节验证 Build 的程序摘要和大小。科学结果、checkpoint
+与 AttemptWriter 仍使用原 artifact Gateway。空 Gateway PVC 不再要求另行转存
+发行程序。OSS 校验失败仍阻止 launch；它不改变 PG 登记、原生 grant、撤销、
+预算或 holdout 准入。离线测试使用本地 OSS 替身，生产启用仍需实际 OSS/网络读回。
