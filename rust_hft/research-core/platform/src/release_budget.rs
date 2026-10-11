@@ -1,9 +1,9 @@
 //! Publication request and application payload reservations. These are not billable wire bytes.
 //! A durable reservation precedes each send. Failures never refund it.
 use crate::{
+    build_objects::BudgetReference as Reference,
     orchestrator::Artifact,
     release::{ReleaseProducer, SourceArchive},
-    release_oss::BudgetReference as Reference,
 };
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -178,7 +178,7 @@ impl Inventory {
                 && self
                     .publisher_prefixes
                     .iter()
-                    .all(|p| crate::release_oss::exact_prefix(p))
+                    .all(|p| crate::build_objects::exact_prefix(p))
                 && self
                     .publisher_prefixes
                     .contains(&format!("research/sources/{}/", binding.source_sha))

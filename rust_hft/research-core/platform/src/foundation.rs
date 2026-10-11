@@ -26,7 +26,7 @@ pub struct Inventory {
     pub session_checkpoint_sha256: Option<String>,
     pub cluster: String,
     pub kube_api_ip: std::net::IpAddr,
-    pub build_oss: crate::release_oss::OssLocation,
+    pub build_oss: crate::build_objects::OssLocation,
     pub build_oss_ips: Vec<std::net::IpAddr>,
     pub tenant: String,
     pub codex_sha256: String,
@@ -278,7 +278,7 @@ mod tests {
             session_checkpoint_sha256: None,
             cluster: "fixture".into(),
             kube_api_ip: "127.0.0.1".parse()?,
-            build_oss: crate::release_oss::OssLocation {
+            build_oss: crate::build_objects::OssLocation {
                 bucket: "fixture".into(),
                 region: "ap-northeast-1".into(),
                 endpoint: "https://fixture.oss-ap-northeast-1-internal.aliyuncs.com/".into(),

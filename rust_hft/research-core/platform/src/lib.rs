@@ -12,6 +12,8 @@ pub mod artifact_io;
 #[cfg(feature = "control")]
 pub mod block_objects;
 pub mod build;
+#[cfg(feature = "control")]
+pub mod build_objects;
 #[cfg(feature = "native-admission")]
 pub mod campaign;
 pub mod campaign_result;
@@ -27,7 +29,7 @@ pub mod preparation;
 pub mod release;
 #[cfg(feature = "publisher")]
 pub mod release_budget;
-#[cfg(feature = "control")]
+#[cfg(feature = "publisher")]
 pub mod release_oss;
 #[cfg(feature = "publisher")]
 pub mod release_publisher;

@@ -336,7 +336,7 @@ async fn oss_exchange(
     config: &hft_research_platform::release_oss::OssConfig,
     ledger: &Ledger,
 ) -> Result<String> {
-    use hft_research_platform::release_oss::{session_policy, Session};
+    use hft_research_platform::{build_objects::Session, release_oss::session_policy};
     let publisher = request.phase == Phase::Publish;
     let binding: budget::Binding = serde_json::from_value(serde_json::to_value(&request.context)?)?;
     ledger.require_binding(&binding, &identity(config)?)?;
