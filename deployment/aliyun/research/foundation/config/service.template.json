@@ -10,6 +10,12 @@
     "ca_file": "/run/broker/private/ca.crt",
     "identity_file": "/run/private/credentials/artifact-reader.pem"
   },
+  "build_oss": {
+    "bucket": "__BUILD_OSS_BUCKET__",
+    "region": "__BUILD_OSS_REGION__",
+    "endpoint": "__BUILD_OSS_ENDPOINT__"
+  },
+  "build_oss_session_file": "/run/broker/private/build-reader.json",
   "lease_ms": 120000,
   "agent_api": {
     "bind": "127.0.0.1:7081",

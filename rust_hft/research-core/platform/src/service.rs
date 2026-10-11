@@ -20,6 +20,8 @@ pub struct ServiceConfig {
     pub kubernetes_token_file: String,
     pub artifact_gateway: String,
     pub artifact_token_file: String,
+    pub build_oss: crate::build_objects::OssLocation,
+    pub build_oss_session_file: std::path::PathBuf,
     #[serde(default)]
     pub artifact_tls: crate::transport::TlsConfig,
     pub lease_ms: i64,
@@ -245,14 +247,6 @@ impl ArtifactGateway {
         Ok(Some(checkpoint))
     }
 
-    pub async fn verify_build(&self, build: &crate::build::BuildArtifact) -> Result<()> {
-        build.id()?;
-        for executable in &build.executables {
-            self.verify_artifact(&executable.blob).await?;
-        }
-        Ok(())
-    }
-
     pub(crate) async fn verify_artifact(
         &self,
         artifact: &crate::orchestrator::Artifact,
@@ -336,6 +330,8 @@ pub struct Reconciler {
     pub ledger: Ledger,
     pub kubernetes: Kubernetes,
     pub artifacts: ArtifactGateway,
+    pub build_oss: crate::build_objects::OssLocation,
+    pub build_oss_session_file: std::path::PathBuf,
     pub owner: String,
     pub lease_ms: i64,
     pub issuer: Option<crate::artifact_identity::AttemptIdentityIssuer>,
@@ -412,7 +408,12 @@ impl Reconciler {
             .clone();
         if locked.task.state == State::Launching {
             let build = self.ledger.build_for_task(&locked.task).await?;
-            self.artifacts.verify_build(&build).await?;
+            crate::build_objects::BuildReader::from_file(
+                &self.build_oss,
+                &self.build_oss_session_file,
+            )?
+            .verify_build(&build)
+            .await?;
             let now = locked.refresh_clock().await?;
             if locked.task.expire(now)? {
                 locked.commit("build_readback_expired").await?;

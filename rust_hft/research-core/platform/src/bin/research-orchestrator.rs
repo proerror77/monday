@@ -24,6 +24,11 @@ async fn main() -> Result<()> {
         (60_000..=300_000).contains(&config.lease_ms),
         "lease must cover bounded provider I/O"
     );
+    config.build_oss.validate()?;
+    anyhow::ensure!(
+        config.build_oss_session_file.is_absolute(),
+        "OSS session requires an absolute private path"
+    );
     let database =
         std::env::var("MONDAY_RESEARCH_DATABASE_URL").context("PG database URL is required")?;
     let reconciler = Reconciler {
@@ -39,6 +44,8 @@ async fn main() -> Result<()> {
             read_secret(&config.artifact_token_file)?,
             &config.artifact_tls,
         )?,
+        build_oss: config.build_oss,
+        build_oss_session_file: config.build_oss_session_file,
         owner: config.owner,
         lease_ms: config.lease_ms,
         issuer: config
