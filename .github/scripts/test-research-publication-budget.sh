@@ -86,12 +86,18 @@ for selection in none controller,cex-runner cex-runner,cex-runner foreign; do
     >"$work/out" 2>"$work/err"; then echo 'unsafe catalog selection admitted' >&2; exit 1; fi
 done
 workflow=$root/.github/workflows/acr-publish.yml
-ruby -ryaml - "$workflow" >"$work/workflow-budget.sh" <<'RUBY'
+ruby -ryaml - "$workflow" "$work" <<'RUBY'
 w=YAML.safe_load(File.read(ARGV.fetch(0)))
 steps=w.fetch('jobs').fetch('publish').fetch('steps')
 selected=steps.select { |s|s['name']=='Admit cumulative research publication budget before cloud use' }
 abort 'missing or duplicate workflow budget gate' unless selected.length==1
-puts selected.fetch(0).fetch('run')
+publication=selected.fetch(0)
+File.write(File.join(ARGV.fetch(1),'workflow-budget.sh'),publication.fetch('run'))
+gate_steps=w.fetch('jobs').fetch('research-environments').fetch('steps')
+early=gate_steps.select {|s|s['name']=='Admit publication budget before manual binary preparation'}
+abort 'missing or duplicate preparation budget gate' unless early.length==1 && gate_steps.index(early.fetch(0))==1
+abort 'preparation budget gate differs or gained conditional bypass' unless early.fetch(0).fetch('env')==publication.fetch('env') && early.fetch(0).fetch('run')==publication.fetch('run') && !early.fetch(0).key?('if')
+File.write(File.join(ARGV.fetch(1),'preparation-budget.sh'),early.fetch(0).fetch('run'))
 RUBY
 run_workflow() {
   (
@@ -101,10 +107,11 @@ run_workflow() {
       GITHUB_WORKFLOW_REF=proerror77/monday/.github/workflows/acr-publish.yml@refs/heads/main \
       MONDAY_RESEARCH_PUBLICATION_BUDGET="$(cat "$1")" \
       MONDAY_RELEASE_POLICY_JSON="$(cat "$work/oss-policy.json")" \
-      bash "$work/workflow-budget.sh" >"$work/out" 2>"$work/err"
+      bash "${2:-$work/workflow-budget.sh}" >"$work/out" 2>"$work/err"
   )
 }
 run_workflow "$work/policy.json"
+run_workflow "$work/policy.json" "$work/preparation-budget.sh"
 test -s "$work/research-publication-budget-admission.json"
 for expression in 'null' '.max_estimated_micro_cny=1' '.publisher_run_number=124'; do
   jq "$expression" "$work/policy.json" >"$work/invalid.json"
@@ -112,6 +119,8 @@ for expression in 'null' '.max_estimated_micro_cny=1' '.publisher_run_number=124
   if run_workflow "$work/invalid.json"; then echo 'workflow budget gate was bypassed' >&2; exit 1; fi
   test ! -e "$work/research-publication-budget-admission.json"
   test ! -e "$work/research-publication-native-budget.json"
+  if run_workflow "$work/invalid.json" "$work/preparation-budget.sh"; then echo 'preparation budget gate was bypassed' >&2; exit 1; fi
+  test ! -e "$work/research-publication-budget-admission.json"
 done
 cp "$work/oss-policy.json" "$work/valid-oss-policy.json"
 for expression in '.oss_by_product.controller.region="cn-hangzhou"' \
@@ -120,6 +129,10 @@ for expression in '.oss_by_product.controller.region="cn-hangzhou"' \
   jq "$expression" "$work/valid-oss-policy.json" >"$work/oss-policy.json"
   reject "$work/policy.json"
 done
+cat "$work/valid-oss-policy.json" "$work/valid-oss-policy.json" >"$work/oss-policy.json"
+reject "$work/policy.json"
+printf '{invalid\n' >"$work/oss-policy.json"
+reject "$work/policy.json"
 printf 'Budget: same-source static inventory, exact-boundary admission and %s negative approvals passed\n' "$((negatives+5))"
-printf 'Actual workflow gate: one admitted boundary and three denied configurations passed\n'
-printf 'Three foreign region/accelerated endpoint price targets rejected\n'
+printf 'Both actual workflow gates: admitted boundaries and three denied configurations each passed\n'
+printf 'Foreign regions, accelerated endpoints, malformed and multiple price targets rejected\n'

@@ -221,6 +221,16 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ needs.selector.outputs.source_sha }}
+      - name: Admit publication budget before manual binary preparation
+        env:
+          MONDAY_RESEARCH_PUBLICATION_BUDGET: ${{ vars.MONDAY_RESEARCH_PUBLICATION_BUDGET }}
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          PRODUCTS: ${{ needs.selector.outputs.research_products }}
+        run: |
+          set -euo pipefail
+          storage_hours=$(jq -er '.storage_hours' <<<"$MONDAY_RESEARCH_PUBLICATION_BUDGET")
+          bash .github/scripts/research-publication-budget.sh admit "$SOURCE_SHA" "$PRODUCTS" "$storage_hours" "$RUNNER_TEMP/research-publication-budget-admission.json"
       - name: Read existing automatic publication environments
         id: environments
         env:

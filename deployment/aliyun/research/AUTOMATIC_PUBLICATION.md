@@ -125,6 +125,7 @@ Another run, a rerun, another source, an expired model, or an insufficient limit
 It does not renew the approval automatically.
 
 The workflow checks all selected products before its first native OSS or authentication call.
+It also checks the budget before an explicit manual union build can start.
 The native issuer must enforce each allocation with a persistent private ledger.
 Reserve requests and payload bytes before sending. Keep reservations after errors or interruption.
 Source preflight and publication must share that ledger across processes.
@@ -146,7 +147,8 @@ Free quotas, account discounts, successful deduplication, and free error respons
 | PutObject | OSS PutRequest; new stored bytes | Reserve request, upload body and possible new storage |
 | GetObject/readback | OSS GetRequest; public egress | Reserve request and complete permitted response |
 | GetBucketVersioning/config readback | OSS GetRequest | Reserve request and bounded response |
-| PutBucketVersioning/config write | OSS PutRequest | Separate administrator rollout; outside publisher allocation |
+| GetBucketOverwriteConfig | Management read; exact billing code unverified | Separate rollout; reserve one full request unit |
+| PutBucketOverwriteConfig | Management write; exact billing code unverified | Separate rollout; reserve one full request unit |
 | OIDC and AssumeRoleWithOIDC | Authentication; RAM has no product fee | Count calls and response payload; no OSS request charge |
 | Existing ACR Personal upload/download | Free within service limits | No instance purchase or upgrade; outside OSS counters |
 | ACK, DB, real data download or research compute | Separate workload | Not authorized or included by this publication budget |

@@ -31,7 +31,8 @@ if [[ $mode == admit ]]; then
   : "${GITHUB_RUN_ID:?publisher run required}" "${GITHUB_RUN_NUMBER:?publisher sequence required}" "${GITHUB_RUN_ATTEMPT:?publisher attempt required}"
   [[ $GITHUB_RUN_ID =~ ^[1-9][0-9]{0,15}$ && $GITHUB_RUN_NUMBER =~ ^[1-9][0-9]{0,15}$ && $GITHUB_RUN_ATTEMPT == 1 ]]
   [[ ${GITHUB_WORKFLOW_REF:-} == "$repository/.github/workflows/acr-publish.yml@refs/heads/main" ]]
-  printf '%s' "$MONDAY_RELEASE_POLICY_JSON" | jq -e --arg products "$products" '
+  printf '%s' "$MONDAY_RELEASE_POLICY_JSON" | jq -es --arg products "$products" '
+    if length==1 and (.[0]|type)=="object" then .[0] else error("one OSS price target required") end |
     .oss_by_product as $map | all($products|split(",")[];
       $map[.] | .region=="ap-northeast-1" and (.bucket|type)=="string" and
       (.bucket|test("^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")) and
