@@ -18,7 +18,7 @@ cex_graph_failure() {
   printf 'CEX dependency assertion failed: %s\n' "$assertion" >&2
   printf 'Actual related package features from %s:\n' "${graph##*/}" >&2
   awk -F'|' '
-    $1 ~ /^(alpha-(harness|engine|onnx-evaluator)|hft-(cex-research-worker|research-ml|infer-onnx)|burn[^ ]*|ort) / {
+    $1 ~ /^(alpha-(harness|engine|onnx-evaluator)|hft-(cex-research-worker|research-ml|infer-onnx|collector|binance-depth|data-adapter-[a-z-]+)|burn[^ ]*|clickhouse|ort) / {
       print; found=1
     }
     END {if (!found) print "<no related package rows>"}
@@ -55,6 +55,9 @@ check_cex_products() {
   cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
     -p hft-cex-research-worker --locked --edges normal --prefix none --color never \
     --format '{p}|{f}|' >"$work/cex-worker.tree"
+  if grep -Eq '^(hft-collector |clickhouse |hft-data-adapter-|hft-binance-depth )' "$work/cex-worker.tree"; then
+    cex_graph_failure 'worker must exclude acquisition, ClickHouse and venue adapters' "$work/cex-worker.tree"
+  fi
   if ! grep -q '^hft-research-ml ' "$work/cex-worker.tree"; then
     cex_graph_failure 'worker must include hft-research-ml' "$work/cex-worker.tree"
   fi

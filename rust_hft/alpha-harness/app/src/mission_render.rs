@@ -29,8 +29,8 @@ use alpha_domain::{
 use alpha_engine::baselines::CexSupervisedDecisionPolicyV2;
 use anyhow::{bail, Context};
 #[cfg(test)]
-use hft_collector::import_feature_dataset;
-use hft_collector::FeatureDatasetManifest;
+use hft_cex_research_input::feature_matrix::import_feature_dataset;
+use hft_cex_research_input::feature_matrix::FeatureDatasetManifest;
 use hft_factor_dsl::FactorOperator;
 use hft_research_artifacts::normalized_sha256;
 use hft_research_manifest::CexReplayDatasetManifestV5;
@@ -1119,7 +1119,7 @@ impl PreparedCexInputs {
             tempfile::tempdir().context("create feature validation directory")?;
         // The importer hashes the exact bytes it parses. Reuse that hash rather
         // than performing another full read before or after the import.
-        let imported = hft_collector::import_feature_dataset_for_reuse(
+        let imported = hft_cex_research_input::feature_matrix::import_feature_dataset_for_reuse(
             materialization.mission_id.clone(),
             feature,
             feature_artifacts.path(),
@@ -1779,7 +1779,7 @@ fn ensure_materialization_scope(
 pub(crate) mod tests {
     use super::*;
     use chrono::{Duration as ChronoDuration, Utc};
-    use hft_collector::{DataModality, PointInTimeFeatureRow};
+    use hft_cex_research_input::feature_matrix::{DataModality, PointInTimeFeatureRow};
     use sha2::{Digest, Sha256};
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -3273,7 +3273,7 @@ pub(crate) mod tests {
             let materialization_path = root.path().join("materialization.json");
             let source_content_sha256 = "b".repeat(64);
             let source_revision =
-                hft_collector::lob_archiver::source_revision([source_content_sha256.as_str()]);
+                hft_data::binance_lob_replay::source_revision([source_content_sha256.as_str()]);
             let feature_source_revision = feature_source_revision
                 .as_deref()
                 .unwrap_or(&source_revision);

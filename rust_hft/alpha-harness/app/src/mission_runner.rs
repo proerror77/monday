@@ -192,7 +192,7 @@ fn research_event_value(
         "component": component,
         "event": event,
         "details": details,
-        "memory": hft_collector::research_memory::observe_research_memory(),
+        "memory": hft_research_artifacts::memory::observe_research_memory(),
     })
 }
 
@@ -4550,7 +4550,7 @@ pub(crate) fn validate_mission_materialization_binding(
 
 pub(crate) fn validate_mission_dataset_binding(
     mission: &CexResearchMissionArtifactV1,
-    features: &hft_collector::FeatureDatasetManifest,
+    features: &hft_cex_research_input::feature_matrix::FeatureDatasetManifest,
     dataset: &CexReplayDatasetManifestV5,
 ) -> anyhow::Result<()> {
     if mission.spec.inputs.feature.id != features.manifest_id
@@ -4642,7 +4642,7 @@ pub(crate) fn validate_materialization(
             bail!("source success marker does not bind its segment");
         }
     }
-    if hft_collector::lob_archiver::source_revision(source_sha256s.iter().map(String::as_str))
+    if hft_data::binance_lob_replay::source_revision(source_sha256s.iter().map(String::as_str))
         != source_revision
     {
         bail!("materialization source revision does not bind its source segments");
@@ -5678,12 +5678,13 @@ fn load_native_archive_input(
         );
     }
     let render = native.render_inputs();
-    let features: hft_collector::FeatureDatasetManifest = read_bundle_json(
-        archive,
-        "results/feature-manifest.json",
-        MAX_MATERIALIZATION_BYTES,
-    )?
-    .context("native archive is missing original feature lineage metadata")?;
+    let features: hft_cex_research_input::feature_matrix::FeatureDatasetManifest =
+        read_bundle_json(
+            archive,
+            "results/feature-manifest.json",
+            MAX_MATERIALIZATION_BYTES,
+        )?
+        .context("native archive is missing original feature lineage metadata")?;
     let materialization = read_bundle_bytes(
         archive,
         "results/materialization.json",
@@ -5724,12 +5725,13 @@ fn load_metric_verification_dataset(
     archive: &mut zip::ZipArchive<File>,
     mission: &CexResearchMissionArtifactV1,
 ) -> anyhow::Result<alpha_engine::evaluation::PreparedDataset> {
-    let mut features: hft_collector::FeatureDatasetManifest = read_bundle_json(
-        archive,
-        "results/feature-manifest.json",
-        MAX_MATERIALIZATION_BYTES,
-    )?
-    .context("published model metrics lack the admitted feature manifest")?;
+    let mut features: hft_cex_research_input::feature_matrix::FeatureDatasetManifest =
+        read_bundle_json(
+            archive,
+            "results/feature-manifest.json",
+            MAX_MATERIALIZATION_BYTES,
+        )?
+        .context("published model metrics lack the admitted feature manifest")?;
     let feature_sha = &mission.spec.inputs.feature.content_sha256;
     if features.artifact_sha256 != *feature_sha
         || features.manifest_id != mission.spec.inputs.feature.id
@@ -6422,7 +6424,7 @@ pub(crate) mod tests {
         }
     }
     use chrono::{Duration as ChronoDuration, Utc};
-    use hft_collector::{DataModality, PointInTimeFeatureRow};
+    use hft_cex_research_input::feature_matrix::{DataModality, PointInTimeFeatureRow};
     use parquet::{
         data_type::{ByteArray, ByteArrayType, Int64Type},
         file::{
@@ -10257,7 +10259,7 @@ message binance_replay {
         let ingestion_time = Utc::now() - ChronoDuration::seconds(1);
         let source_content_sha256 = "1".repeat(64);
         let source_revision =
-            hft_collector::lob_archiver::source_revision([source_content_sha256.as_str()]);
+            hft_data::binance_lob_replay::source_revision([source_content_sha256.as_str()]);
         let rows = (0..160)
             .map(|index| {
                 let event_time = ingestion_time - ChronoDuration::seconds(300 - index);
@@ -10925,10 +10927,11 @@ message binance_replay {
         override_mission.validate().unwrap();
         let override_mission_id = override_mission.semantic_id().unwrap();
         let store = AlphaStore::open(results_dir.join("alpha.duckdb")).unwrap();
-        let feature_manifest: hft_collector::FeatureDatasetManifest = serde_json::from_slice(
-            &std::fs::read(results_dir.join("feature-manifest.json")).unwrap(),
-        )
-        .unwrap();
+        let feature_manifest: hft_cex_research_input::feature_matrix::FeatureDatasetManifest =
+            serde_json::from_slice(
+                &std::fs::read(results_dir.join("feature-manifest.json")).unwrap(),
+            )
+            .unwrap();
         let feature_decision_clocks =
             data_mission::feature_decision_clocks(&feature_manifest).unwrap();
         let dataset_manifest = data_mission::read_registered_research_dataset(

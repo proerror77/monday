@@ -3,8 +3,10 @@
 //! Prediction-market event and settlement inputs remain in their own contracts.
 pub mod campaign;
 pub mod data;
+pub mod feature_matrix;
 #[cfg(feature = "streaming")]
 pub mod market_encoder;
+pub mod ohlcv;
 pub mod prepared;
 #[cfg(feature = "streaming")]
 pub mod sequence;

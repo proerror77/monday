@@ -3,11 +3,16 @@ use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
-use hft_collector::research_inventory::Market;
-use hft_collector::{
-    acquire_dataset, import_feature_dataset, lob_archiver::source_revision, read_feature_rows,
-    DataAcquisitionMission, DataModality, DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
+use hft_cex_research_input::feature_matrix::{
+    import_feature_dataset, read_feature_rows, DataModality, FeatureDatasetManifest,
 };
+use hft_cex_research_input::ohlcv::{DatasetManifest, OhlcvTraceRow};
+#[cfg(feature = "operator")]
+use hft_collector::{acquire_dataset, DataAcquisitionMission};
+use hft_data::binance_lob_replay::source_revision;
+#[cfg(feature = "operator")]
+use hft_data::binance_lob_replay::Market;
+#[cfg(feature = "operator")]
 use hft_research_artifacts::temporary_output_file;
 #[cfg(test)]
 use hft_research_artifacts::{write_json_atomic, write_json_atomic_bounded};
@@ -20,11 +25,9 @@ use hft_research_manifest::{
     CEX_REPLAY_DATASET_SCHEMA_V5, CEX_REPLAY_SNAPSHOT_SCHEMA_V3, CEX_REPLAY_SNAPSHOT_SCHEMA_V4,
 };
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeSet,
-    io::{BufRead, Write},
-    path::Path,
-};
+#[cfg(feature = "operator")]
+use std::io::Write;
+use std::{collections::BTreeSet, io::BufRead, path::Path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FeatureDecisionClock {
@@ -33,6 +36,7 @@ pub(crate) struct FeatureDecisionClock {
     pub(crate) series_close_time: DateTime<Utc>,
 }
 
+#[cfg(feature = "operator")]
 pub async fn acquire_and_register(
     store: &mut AlphaStore,
     mission: &DataAcquisitionMission,
@@ -100,7 +104,7 @@ pub(crate) fn validate_cex_replay_features(
 
 pub(crate) fn validate_imported_cex_replay_features(
     snapshot: &CexReplaySnapshotV5,
-    imported: &hft_collector::ImportedFeatureDataset,
+    imported: &hft_cex_research_input::feature_matrix::ImportedFeatureDataset,
 ) -> anyhow::Result<()> {
     validate_cex_replay_feature_rows(snapshot, imported.manifest(), imported.rows())
 }
@@ -170,7 +174,7 @@ pub(crate) fn validate_cex_replay_feature_metadata(
 fn validate_cex_replay_feature_rows(
     snapshot: &CexReplaySnapshotV5,
     features: &FeatureDatasetManifest,
-    rows: &[hft_collector::PointInTimeFeatureRow],
+    rows: &[hft_cex_research_input::feature_matrix::PointInTimeFeatureRow],
 ) -> anyhow::Result<()> {
     validate_cex_replay_feature_metadata(snapshot, features)?;
     let label_horizon = u64::try_from(snapshot.label_horizon_buckets)
@@ -966,6 +970,7 @@ pub fn default_manifest_path(manifest: &DatasetManifest) -> std::path::PathBuf {
 }
 
 /// Prepare immutable input selection for the existing materialization entrypoint.
+#[cfg(feature = "operator")]
 pub(crate) fn freeze_research_inventory_request(
     args: &crate::cli::FreezeInventoryArgs,
 ) -> anyhow::Result<hft_collector::research_inventory::FrozenInventory> {
@@ -990,6 +995,7 @@ pub(crate) fn freeze_research_inventory_request(
     hft_collector::research_inventory::freeze_inventory(&request)
 }
 
+#[cfg(feature = "operator")]
 pub fn verify_materialization_manifest(
     args: crate::cli::VerifyMaterializationManifestArgs,
 ) -> anyhow::Result<()> {
@@ -1021,6 +1027,7 @@ pub fn verify_materialization_manifest(
 }
 
 /// Prepare immutable input selection for the existing materialization entrypoint.
+#[cfg(feature = "operator")]
 pub fn freeze_research_inventory(args: crate::cli::FreezeInventoryArgs) -> anyhow::Result<()> {
     let inventory = freeze_research_inventory_request(&args)?;
     let mut output = temporary_output_file(&args.output, ".frozen-inventory-")?;
@@ -1041,8 +1048,8 @@ pub fn freeze_research_inventory(args: crate::cli::FreezeInventoryArgs) -> anyho
 mod tests {
     use super::*;
     use chrono::{DateTime, Duration, Utc};
-    use hft_collector::{CandleInterval, DatasetTimeBounds, QualityReport};
-    use hft_collector::{DataModality, PointInTimeFeatureRow};
+    use hft_cex_research_input::feature_matrix::{DataModality, PointInTimeFeatureRow};
+    use hft_cex_research_input::ohlcv::{CandleInterval, DatasetTimeBounds, QualityReport};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicU64, Ordering};
 

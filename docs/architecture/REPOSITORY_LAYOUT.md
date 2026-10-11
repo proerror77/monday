@@ -124,6 +124,10 @@ The shared owner includes `hft-cex-research-input`: immutable CEX DataView contr
 bounded binary decoding, and verified batch reuse. Backtest and control consume
 this crate directly. SQL plans and HTTPS acquisition remain in the control
 implementation; the input crate has no database or provider dependency.
+Frozen feature-matrix and OHLCV trace contracts, their point-in-time validation,
+and content-addressed feature import also belong to this input crate. Collector
+and scientific workers use that single implementation. Network acquisition and
+inventory discovery remain in collector and the operator feature.
 Prediction event/settlement inputs remain in their prediction owner. A shared
 Cargo owner does not make CEX time-horizon labels valid for event settlement.
 
@@ -180,8 +184,9 @@ operator CLI, legacy loop controller, data preparation and approval commands.
 It retains `kernel` and `fitting`, frozen input checks, native Campaign execution,
 independent final evaluation and result readback. Governance handoff helpers
 remain available to scientific tests, without entering the worker's normal graph.
-The worker still consumes shared application, collector, store and control code;
+The worker still consumes shared application, store and control code;
 this feature boundary is one step toward separating the scientific application.
+Its normal graph excludes collector, ClickHouse and venue acquisition adapters.
 The published operator and worker use separate build recipes. A combined Cargo
 package selection unifies their features and does not verify this boundary.
 

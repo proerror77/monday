@@ -691,7 +691,7 @@ pub(crate) fn verify_feature_sources(
         .iter()
         .map(|s| s["sha256"].as_str().context("feature source has no digest"))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let revision = hft_collector::lob_archiver::source_revision(hashes);
+    let revision = hft_data::binance_lob_replay::source_revision(hashes);
     let first_source = sources
         .source_segments
         .iter()
