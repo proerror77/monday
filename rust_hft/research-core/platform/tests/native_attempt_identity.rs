@@ -53,6 +53,7 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
             BUILD_IMPORT_ADMISSION_MIGRATION,
             NATIVE_ADMISSION_MIGRATION,
             NATIVE_REQUEST_REVOCATION_MIGRATION,
+            hft_research_platform::provider_operations::MIGRATION,
         ] {
             sqlx_core::raw_sql::raw_sql(migration)
                 .execute(&pool)
@@ -374,6 +375,31 @@ async fn admitted_attempt_issuer_binds_current_pg_lease_and_native_cap() -> Resu
         .await?
         .is_none());
     cleanup_tx.rollback().await?;
+    // This fixture inserted its active Task directly, without the new atomic
+    // claim journal. Such a legacy Attempt cannot invent never-sent evidence.
+    let mut legacy = ledger
+        .lock_next("identity-fixture-controller", 30_000)
+        .await?
+        .unwrap();
+    assert_eq!(legacy.task.id, task_id);
+    legacy.task.stop(State::Cancelled, false)?;
+    let mut mutation =
+        hft_research_platform::provider_operations::ProviderMutation::new(ledger.clone(), legacy);
+    assert!(mutation
+        .permits_absence(hft_research_platform::provider_operations::CreateKind::Execution)
+        .await
+        .is_err());
+    let mut legacy = mutation.into_locked().await?;
+    legacy
+        .task
+        .stopped(legacy.task.attempt, legacy.task.fence)?;
+    assert!(legacy
+        .commit("fixture_forbidden_legacy_refund")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("unresolved provider create"));
+    assert_eq!(ledger.read(&task_id).await?.state, State::Stopping);
     pool.close().await;
     Ok(())
 }
