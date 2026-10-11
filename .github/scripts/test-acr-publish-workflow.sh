@@ -40,7 +40,7 @@ jq -n '
     bucket:"fixture-bucket", region:"fixture-region", endpoint:"https://fixture.invalid/",
     role_arn:("fixture-role/" + $product), oidc_provider_arn:"fixture-provider",
     audience:"fixture-audience", subject:"fixture-subject", repository_id:1, owner_id:2,
-    role_prefixes:[("research/builds/" + ("b" * 64) + "/"), ("research/sources/" + ("a" * 40) + "/")]
+    publication_namespaces:["research/builds/","research/sources/"]
   };
   {trust:{schema:1,repository:"fixture/repo",producer_workflow_path:".github/workflows/acr-publish.yml",keys:{fixture:("a" * 64)}},
    key_id:"fixture",builder_image:("fixture/builder@sha256:" + ("b" * 64)),
@@ -558,10 +558,10 @@ printf 'ACR native build, fixed domain tests and release metadata contracts pass
 
 # Exercise the exact policy selector used by CI, including multiple products.
 selector="$script_dir/select-research-oss-policy.jq"
-jq -n '{trust:{schema:1},oss_by_product:{"cex-runner":{role_arn:"role/cex",role_prefixes:["cex-exact"]},"prediction-runner":{role_arn:"role/prediction",role_prefixes:["prediction-exact"]},controller:{role_arn:"role/controller",role_prefixes:["controller-exact"]}}}' >"$tmp_dir/oss-products.json"
+jq -n '{trust:{schema:1},oss_by_product:{"cex-runner":{role_arn:"role/cex",publication_namespaces:["research/builds/","research/sources/"]},"prediction-runner":{role_arn:"role/prediction",publication_namespaces:["research/builds/","research/sources/"]},controller:{role_arn:"role/controller",publication_namespaces:["research/builds/","research/sources/"]}}}' >"$tmp_dir/oss-products.json"
 for product in cex-runner prediction-runner controller; do
   jq -e --arg product "$product" -f "$selector" "$tmp_dir/oss-products.json" >"$tmp_dir/oss-selected.json"
-  jq -e --arg product "$product" --slurpfile approved "$tmp_dir/oss-products.json" '.oss==$approved[0].oss_by_product[$product] and (.oss.role_prefixes|length)==1 and (has("oss_by_product")|not) and .trust.schema==1' "$tmp_dir/oss-selected.json" >/dev/null
+  jq -e --arg product "$product" --slurpfile approved "$tmp_dir/oss-products.json" '.oss==$approved[0].oss_by_product[$product] and .oss.publication_namespaces==["research/builds/","research/sources/"] and (has("oss_by_product")|not) and .trust.schema==1' "$tmp_dir/oss-selected.json" >/dev/null
 done
 if jq -e --arg product foreign -f "$selector" "$tmp_dir/oss-products.json" >/dev/null 2>&1; then exit 1; fi
 jq '.oss_by_product.controller.role_arn=.oss_by_product["cex-runner"].role_arn' "$tmp_dir/oss-products.json" >"$tmp_dir/oss-shared-role.json"

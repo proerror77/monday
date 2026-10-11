@@ -90,4 +90,16 @@ The OSS commands are `oss-check-config`, `oss-publish` and `oss-import`.
 Their actual argument forms are documented in the ACK/OSS contract above.
 Retained Gateway code still supports runtime AttemptWriter and existing integration tests.
 STS has a fifteen-minute minimum and cannot reproduce the old Broker's two-minute revocation lease.
-Deployment remains blocked without independent RAM exact-prefix base-role and denial tests, trusted read-only ACK mounts, and a never-versioned existing OSS bucket. Versioning refusal is a constraint of this adapter.
+Deployment remains unverified without approved static publication namespace grants and actual RAM/OSS denial tests, trusted read-only ACK mounts, and a never-versioned existing OSS bucket. Versioning refusal is a constraint of this adapter.
+
+The native OSS configuration uses `publication_namespaces`, exactly
+`["research/builds/", "research/sources/"]`. It rejects the obsolete `role_prefixes`.
+The offline migration requires an explicit flag to convert an installed legacy map.
+Stable configuration does not change for new commits or Build IDs. `scope-plan`,
+active `plan` and `publish` share the same actual source/Build scope projection.
+The capability exchanges only that plan's exact prefixes. Before upload, native
+publication requires the private publisher session to equal its recomputed scope.
+Base RAM grants cover both publication namespaces; they do not isolate product/hash.
+Default environment subjects are accepted when they exactly match configured `subject`.
+Native claim checks still bind main, workflow, immutable IDs and the active publisher.
+The workflow owner's main-only environment guard and real cloud acceptance remain separate.

@@ -10,6 +10,7 @@ use std::path::Path;
 const VERSIONING_RESPONSE_LIMIT: usize = 4096;
 const VERSIONING_NODE_LIMIT: u32 = 32;
 const OSS_XML_NAMESPACE: &str = "http://doc.oss-cn-hangzhou.aliyuncs.com";
+const PUBLICATION_NAMESPACES: [&str; 2] = ["research/builds/", "research/sources/"];
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,7 +22,7 @@ pub struct OssConfig {
     pub oidc_provider_arn: String,
     pub audience: String,
     pub subject: String,
-    pub role_prefixes: Vec<String>,
+    pub publication_namespaces: Vec<String>,
     pub repository_id: u64,
     pub owner_id: u64,
 }
@@ -60,13 +61,21 @@ impl OssConfig {
                 && !self.audience.is_empty()
                 && self.repository_id > 0
                 && self.owner_id > 0
-                && !self.subject.is_empty()
-                && !self.role_prefixes.is_empty()
-                && self.role_prefixes.iter().all(|p| exact_prefix(p))
-                && self.role_prefixes.windows(2).all(|w| w[0] < w[1]),
+                && !self.subject.is_empty(),
             "approved RAM OIDC configuration required"
         );
+        ensure!(
+            self.publication_namespaces == PUBLICATION_NAMESPACES,
+            "publication_namespaces must be exactly research/builds/ and research/sources/ in that order"
+        );
         Ok(())
+    }
+    fn admits_prefix(&self, prefix: &str) -> bool {
+        exact_prefix(prefix)
+            && self
+                .publication_namespaces
+                .iter()
+                .any(|namespace| prefix.starts_with(namespace))
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -159,18 +168,9 @@ impl Oss {
             .map_err(|_| anyhow::anyhow!("invalid private OSS session file"))?;
         session.validate(Utc::now().timestamp_millis())?;
         ensure!(
-            session
-                .prefixes
-                .iter()
-                .all(|p| config.role_prefixes.contains(p)),
-            "session exceeds operator-approved RAM role scope"
+            session.prefixes.iter().all(|p| config.admits_prefix(p)),
+            "session exceeds publication namespaces"
         );
-        if session.publisher {
-            ensure!(
-                session.prefixes == config.role_prefixes,
-                "publisher requires the exact approved RAM role scope"
-            );
-        }
         Ok(Self {
             config: config.clone(),
             session,
@@ -257,6 +257,19 @@ impl Oss {
         ensure!(
             !self.session.publisher,
             "ACK import requires separate readonly OSS credentials"
+        );
+        Ok(())
+    }
+    /// Bind the private session to the publisher's independently recomputed plan.
+    pub fn require_publisher_scope(&self, prefixes: &[String]) -> Result<()> {
+        self.session.validate(Utc::now().timestamp_millis())?;
+        ensure!(
+            self.session.publisher
+                && !prefixes.is_empty()
+                && prefixes.iter().all(|p| self.config.admits_prefix(p))
+                && prefixes.windows(2).all(|w| w[0] < w[1])
+                && self.session.prefixes == prefixes,
+            "publisher session must equal the actual native source/Build plan"
         );
         Ok(())
     }
@@ -395,15 +408,9 @@ pub fn session_policy(config: &OssConfig, prefixes: &[String], publisher: bool) 
         "invalid OSS session prefixes"
     );
     ensure!(
-        prefixes.iter().all(|p| config.role_prefixes.contains(p)),
-        "requested prefix outside approved RAM role scope"
+        prefixes.iter().all(|p| config.admits_prefix(p)),
+        "requested prefix outside publication namespaces"
     );
-    if publisher {
-        ensure!(
-            prefixes == config.role_prefixes,
-            "native plan must equal approved RAM role prefixes"
-        );
-    }
     let actions = if publisher {
         vec!["oss:GetObject", "oss:GetObjectVersion", "oss:PutObject"]
     } else {
@@ -543,10 +550,141 @@ mod tests {
             oidc_provider_arn: "acs:ram::123:oidc-provider/test".into(),
             audience: "test".into(),
             subject: "operator-approved-subject".into(),
-            role_prefixes: vec![format!("research/builds/{}/", "a".repeat(64))],
+            publication_namespaces: PUBLICATION_NAMESPACES.map(str::to_owned).to_vec(),
             repository_id: 1,
             owner_id: 2,
         }
+    }
+    #[test]
+    fn release_oss_stable_configuration_rejects_legacy_or_expanded_namespaces() {
+        let original = serde_json::to_value(config()).unwrap();
+        let mut legacy = original.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("publication_namespaces");
+        legacy["role_prefixes"] =
+            serde_json::json!([format!("research/builds/{}/", "a".repeat(64))]);
+        assert!(serde_json::from_value::<OssConfig>(legacy).is_err());
+        let mut mixed = original;
+        mixed["role_prefixes"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<OssConfig>(mixed).is_err());
+        for namespaces in [
+            vec![],
+            vec!["research/"],
+            vec!["research/builds/*", "research/sources/*"],
+            vec!["research/builds/"],
+            vec!["research/sources/", "research/builds/"],
+            vec!["research/builds/", "research/builds/", "research/sources/"],
+            vec![
+                "research/builds/",
+                "research/sources/",
+                "research/attempts/",
+            ],
+        ] {
+            let mut invalid = config();
+            invalid.publication_namespaces = namespaces.into_iter().map(str::to_owned).collect();
+            assert!(invalid.validate().is_err());
+        }
+    }
+    #[test]
+    fn release_oss_unchanged_config_narrows_each_release_and_reader_phase() {
+        let config = config();
+        for hex in ["a", "b"] {
+            let prefixes = vec![
+                format!("research/builds/{}/", hex.repeat(64)),
+                format!("research/sources/{}/", hex.repeat(40)),
+            ];
+            let policy: serde_json::Value =
+                serde_json::from_str(&session_policy(&config, &prefixes, true).unwrap()).unwrap();
+            assert_eq!(
+                policy["Statement"][0]["Resource"],
+                serde_json::json!(prefixes
+                    .iter()
+                    .map(|p| format!("acs:oss:*:*:test-bucket/{p}*"))
+                    .collect::<Vec<_>>())
+            );
+            assert_eq!(
+                policy["Statement"][0]["Action"],
+                serde_json::json!(["oss:GetObject", "oss:GetObjectVersion", "oss:PutObject"])
+            );
+            let source_only = session_policy(&config, &prefixes[1..], false).unwrap();
+            assert!(
+                !source_only.contains("PutObject") && !source_only.contains("research/builds/")
+            );
+        }
+        for prefixes in [
+            config.publication_namespaces.clone(),
+            vec!["research/attempts/1/".into()],
+            vec!["research/builds/../".into()],
+            vec![format!("research/builds/{}/", "A".repeat(64))],
+            vec![format!("research/builds/{}/", "a".repeat(64)); 2],
+            vec![
+                format!("research/sources/{}/", "a".repeat(40)),
+                format!("research/builds/{}/", "a".repeat(64)),
+            ],
+        ] {
+            assert!(session_policy(&config, &prefixes, true).is_err());
+            assert!(session_policy(&config, &prefixes, false).is_err());
+        }
+    }
+    #[test]
+    fn release_oss_private_session_must_match_recomputed_publication_plan() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().canonicalize().unwrap().join("session");
+        let expected = vec![
+            format!("research/builds/{}/", "a".repeat(64)),
+            format!("research/sources/{}/", "a".repeat(40)),
+        ];
+        let mut session = Session {
+            access_key_id: "fixture".into(),
+            access_key_secret: "fixture".into(),
+            security_token: "fixture".into(),
+            expires_ms: Utc::now().timestamp_millis() + 60_000,
+            publisher: true,
+            prefixes: expected.clone(),
+            versions: BTreeMap::new(),
+        };
+        let save = |session: &Session| {
+            std::fs::write(&path, serde_json::to_vec(session).unwrap()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        save(&session);
+        let oss = Oss::from_file(&config(), &path).unwrap();
+        assert!(oss.require_publisher_scope(&expected).is_ok());
+        assert!(oss.require_reader().is_err());
+        for prefixes in [
+            vec![expected[0].clone()],
+            vec![
+                format!("research/builds/{}/", "b".repeat(64)),
+                expected[1].clone(),
+            ],
+            vec![
+                expected[0].clone(),
+                format!("research/builds/{}/", "b".repeat(64)),
+                expected[1].clone(),
+            ],
+        ] {
+            session.prefixes = prefixes;
+            save(&session);
+            let oss = Oss::from_file(&config(), &path).unwrap();
+            assert!(oss.require_publisher_scope(&expected).is_err());
+        }
+        session.prefixes = expected.clone();
+        session.publisher = false;
+        save(&session);
+        let oss = Oss::from_file(&config(), &path).unwrap();
+        assert!(oss.require_publisher_scope(&expected).is_err());
+        assert!(oss.require_reader().is_ok());
+        session.prefixes = config().publication_namespaces;
+        save(&session);
+        assert!(Oss::from_file(&config(), &path).is_err());
+        session.prefixes = expected;
+        session.expires_ms = Utc::now().timestamp_millis() - 1;
+        save(&session);
+        assert!(Oss::from_file(&config(), &path).is_err());
     }
     #[test]
     fn release_oss_requests_bind_scope_role_version_and_overwrite_header() {
@@ -598,14 +736,8 @@ mod tests {
         );
         oss.session.expires_ms = Utc::now().timestamp_millis() - 1;
         assert!(oss.request(reqwest::Method::GET, &key, None).is_err());
-        assert!(session_policy(
-            &config(),
-            &[format!("research/builds/{}/", "b".repeat(64))],
-            true
-        )
-        .is_err());
         let mut empty = config();
-        empty.role_prefixes.clear();
+        empty.publication_namespaces.clear();
         assert!(empty.validate().is_err());
         let mut invalid = config();
         invalid.endpoint = "https://foreign/".into();

@@ -1,5 +1,15 @@
 # Per-job release capabilities
 
+Direct OSS uses the stable `publication_namespaces` contract in
+[RELEASE_OSS.md](../../../deployment/aliyun/research/foundation/RELEASE_OSS.md).
+The only configured namespaces are `research/builds/` and `research/sources/`.
+Each session still receives exact source/Build prefixes from the verified native plan.
+An environment's default subject is accepted only when it exactly matches configured `subject`.
+Main, workflow, immutable IDs, source, attempt and active-job checks still apply.
+Environment configuration/guard enforcement belongs to the workflow owner.
+Static RAM grants authorize both publication namespaces, without product/hash isolation.
+The retained Broker contract below has different lease, renewal and replay guarantees.
+
 Ordinary CI now uses `oss-source` and `oss-publish` through RAM OIDC/STS.
 See [the OSS authorization contract](../../../deployment/aliyun/research/foundation/RELEASE_OSS.md).
 The remainder describes the retained legacy release Broker integration.
