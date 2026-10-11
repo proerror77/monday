@@ -20,7 +20,7 @@ pub struct ServiceConfig {
     pub kubernetes_token_file: String,
     pub artifact_gateway: String,
     pub artifact_token_file: String,
-    pub build_oss: crate::release_oss::OssLocation,
+    pub build_oss: crate::build_objects::OssLocation,
     pub build_oss_session_file: std::path::PathBuf,
     #[serde(default)]
     pub artifact_tls: crate::transport::TlsConfig,
@@ -330,7 +330,7 @@ pub struct Reconciler {
     pub ledger: Ledger,
     pub kubernetes: Kubernetes,
     pub artifacts: ArtifactGateway,
-    pub build_oss: crate::release_oss::OssLocation,
+    pub build_oss: crate::build_objects::OssLocation,
     pub build_oss_session_file: std::path::PathBuf,
     pub owner: String,
     pub lease_ms: i64,
@@ -408,9 +408,12 @@ impl Reconciler {
             .clone();
         if locked.task.state == State::Launching {
             let build = self.ledger.build_for_task(&locked.task).await?;
-            crate::release_oss::Oss::build_reader(&self.build_oss, &self.build_oss_session_file)?
-                .verify_build(&build)
-                .await?;
+            crate::build_objects::BuildReader::from_file(
+                &self.build_oss,
+                &self.build_oss_session_file,
+            )?
+            .verify_build(&build)
+            .await?;
             let now = locked.refresh_clock().await?;
             if locked.task.expire(now)? {
                 locked.commit("build_readback_expired").await?;
