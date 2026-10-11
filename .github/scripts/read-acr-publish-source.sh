@@ -71,8 +71,8 @@ binaries_conclusion=$(job_state 'Research image binaries')
 smoke_conclusion=$(job_state 'Research image smoke')
 case "$binaries_conclusion/$smoke_conclusion" in
   skipped/skipped)
-    # CI may defer historical carry while public publisher settings are absent.
-    # Recompute real pending products, independent of that CI scheduling choice.
+    # Recompute both independent baselines. Approved missing signed Builds must
+    # retain pending current-main software work even after images were delivered.
     RESEARCH_CARRY_MODE=always SELECTED_JOBS=,, SELECTED_RESEARCH_PRODUCT=none \
       bash "$script_dir/select-main-research-scope.sh" "$source_sha" "$work/pending"
     pending_products=$(sed -n 's/^research_pending_product=//p' "$work/pending")

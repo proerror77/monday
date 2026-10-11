@@ -100,7 +100,7 @@ run_operations() {
     GITHUB_WORKFLOW_REF=proerror77/monday/.github/workflows/acr-publish.yml@refs/heads/main \
     MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY="$(cat "$1")" \
     MONDAY_RELEASE_POLICY_JSON="$(cat "$work/oss-policy.json")" \
-    bash "$script_dir/research-publication-budget.sh" admit-operations "$source_sha" "$products" 744 "$work/operations-admission.json" \
+    bash "$script_dir/research-publication-budget.sh" admit-operations "$source_sha" "${5:-$products}" 744 "$work/operations-admission.json" \
     >"$work/out" 2>"$work/err"
 }
 run_operations "$work/operations.json"
@@ -108,6 +108,68 @@ jq -e '.admission.approval_kind=="software-operating-allowance" and .admission.p
  .admission.aggregate_invoice_cap==false' "$work/operations-admission.json" >/dev/null
 run_operations "$work/operations.json" 987 654
 jq -e '.publisher_run_id==987 and .publisher_run_attempt==1' "$work/research-publication-native-budget.json" >/dev/null
+# Each source reserves the whole authorized set, even when different runs
+# publish one product at a time. The fixed shares sum to the same caps in either
+# order, including separate per-product currency/storage rounding.
+pair=cex-runner,controller
+bash "$script_dir/research-publication-budget.sh" estimate "$source_sha" "$pair" 744 "$work/pair-estimate.json"
+jq --slurpfile estimate "$work/pair-estimate.json" '
+ .products=$estimate[0].products | .max_estimated_micro_cny=$estimate[0].pricing.estimated_micro_cny |
+ .max_oss_requests=$estimate[0].total.oss_requests |
+ .max_request_body_bytes=$estimate[0].total.request_body_bytes |
+ .max_response_body_bytes=$estimate[0].total.response_body_bytes |
+ .max_new_storage_bytes=$estimate[0].total.new_storage_bytes' "$work/operations.json" >"$work/pair-policy.json"
+jq -e '.total.oss_requests==109' "$work/pair-estimate.json" >/dev/null
+for order in 'cex-runner controller' 'controller cex-runner'; do
+  run=500
+  for product in $order; do
+    run_operations "$work/pair-policy.json" "$run" "$run" 1 "$product"
+    cp "$work/operations-admission.json" "$work/$product-admission.json"
+    cp "$work/research-publication-native-budget.json" "$work/$product-native.json"
+    jq -e --arg product "$product" '.products==[$product] and
+      .admission.allocation_basis=="fixed-approved-products-per-source" and
+      .admission.source_allocation.products==["cex-runner","controller"] and
+      .admission.approved_limits.max_oss_requests==.total.oss_requests and
+      .admission.approved_limits.max_estimated_micro_cny==.pricing.estimated_micro_cny' \
+      "$work/$product-admission.json" >/dev/null
+    run=$((run+1))
+  done
+  jq -es --slurpfile estimate "$work/pair-estimate.json" '
+    (map(.total.oss_requests)|add)==$estimate[0].total.oss_requests and
+    (map(.total.request_body_bytes)|add)==$estimate[0].total.request_body_bytes and
+    (map(.total.response_body_bytes)|add)==$estimate[0].total.response_body_bytes and
+    (map(.total.new_storage_bytes)|add)==$estimate[0].total.new_storage_bytes and
+    (map(.pricing.estimated_micro_cny)|add)==$estimate[0].pricing.estimated_micro_cny' \
+    "$work/cex-runner-admission.json" "$work/controller-admission.json" >/dev/null
+  jq -es --slurpfile estimate "$work/pair-estimate.json" '
+    all(.[]; (.allocations|length)==1) and
+    (map(.limits.requests)|add)==$estimate[0].total.native_requests and
+    (map(.limits.request_payload_bytes)|add)==$estimate[0].total.request_body_bytes and
+    (map(.limits.response_payload_bytes)|add)==$estimate[0].total.response_body_bytes' \
+    "$work/cex-runner-native.json" "$work/controller-native.json" >/dev/null
+done
+# Both single-product estimates individually fit these underfunded source caps;
+# neither may spend until the complete fixed set fits. A failed sibling does not
+# return its reserved share to the other product.
+for expression in '.max_oss_requests=100' '.max_estimated_micro_cny-=1' \
+ '.max_request_body_bytes-=1' '.max_response_body_bytes-=1' '.max_new_storage_bytes-=1'; do
+  jq "$expression" "$work/pair-policy.json" >"$work/undersized-pair-policy.json"
+  for product in cex-runner controller; do
+    rm -f "$work/operations-admission.json" "$work/research-publication-native-budget.json"
+    if run_operations "$work/undersized-pair-policy.json" 600 600 1 "$product"; then
+      echo 'subset acquired a fresh full-source budget' >&2; exit 1
+    fi
+    test ! -e "$work/operations-admission.json"
+    test ! -e "$work/research-publication-native-budget.json"
+  done
+done
+# CI scheduling proves the full source allocation without any publisher
+# identity, native budget or OSS credentials. It is not native admission.
+PATH="$work/tools:$PATH" OPERATIONS_TEST_NOW="$operations_now" GITHUB_REPOSITORY=proerror77/monday \
+  MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY="$(cat "$work/pair-policy.json")" \
+  bash "$script_dir/research-publication-budget.sh" check-operations-scope "$source_sha" "$pair" 744 "$work/scope.json"
+jq -e '.archive_scope.scheduling_only and (has("admission")|not)' "$work/scope.json" >/dev/null
+test ! -e "$work/research-publication-native-budget.json"
 for expression in 'null' '.unexpected=true' '.not_before=1794268800' '.expires_at=1791680400' \
  '.history_anchor_run_id=0' '.history_anchor_run_number="1"' '.history_retention_required=false' \
  '.expires_at=.not_before+604801' '.not_before+=61' '.products=["cex-runner"]' '.schema="foreign"' \

@@ -164,6 +164,18 @@ class ResearchOciDeliveryTest < Minitest::Test
     @reader.responses[@history_path]=[{'total_count'=>3,'workflow_runs'=>[anchor,@run,current]}]
   end
 
+  def test_partial_failed_archive_reserves_only_its_fixed_product_share
+    archive_history
+    [['research-runner','cex-runner','controller'],
+     ['campaign-cycle-controller','controller','cex-runner']].each do |repository,spent,unused|
+      %w[failure cancelled success].each do |conclusion|
+        jobs([@job,@job.merge('id'=>201,'name'=>"Publish #{repository}",'conclusion'=>conclusion)])
+        assert @reader.archive_started?(SOURCE,spent)
+        refute @reader.archive_started?(SOURCE,unused)
+      end
+    end
+  end
+
   def test_archive_unknown_or_in_progress_prior_job_reserves_authority
     archive_history
     %w[queued in_progress unknown].each do |status|

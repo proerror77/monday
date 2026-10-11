@@ -131,10 +131,11 @@ expected_carry = {
   'GH_TOKEN'=>'${{ github.token }}',
   'SELECTED_JOBS'=>'${{ steps.scope.outputs.jobs }}',
   'SELECTED_RESEARCH_PRODUCT'=>'${{ steps.scope.outputs.research_product }}',
-  'RESEARCH_CARRY_MODE'=>'always'
+  'RESEARCH_CARRY_MODE'=>'always',
+  'MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY'=>'${{ vars.MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY }}'
 }
-abort 'image carry depends on OSS configuration' unless carry.fetch('env') == expected_carry
-%w[research_pending_product research_deferred_product].each do |name|
+abort 'carry lost independent archive scheduling authorization' unless carry.fetch('env') == expected_carry
+%w[research_pending_product research_deferred_product research_archive_pending_product research_archive_selected_product].each do |name|
   abort 'carry scheduling evidence is missing' unless selector.fetch('outputs').fetch(name) == "${{ steps.cumulative.outputs.#{name} }}"
 end
 acr_selector = acr.fetch('jobs').fetch('selector')

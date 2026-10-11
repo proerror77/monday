@@ -37,6 +37,18 @@ signed Build baseline still requires a successful native run and the
 produce that marker. It names exactly `archive_products`; a successful subset
 advances only those Builds and cannot claim the full requested product set.
 
+Main CI reads both baselines. Image input impact always carries forward. Missing
+Build impact schedules additional current-main binaries and smoke only when the
+public operating allowance passes an offline full-allocation check. The ACR
+source reader recomputes that same combined pending set; a skipped producer
+cannot become `out_of_scope` while approved Build work remains. With images
+delivered at A and archives pending, restoring allowance before a docs-only B
+therefore produces and verifies B's software, delivers B's exact-source image,
+and archives B. It never republishes A or presents A's software as B. A later
+Build baseline covering those inputs suppresses the extra work. Changing a
+variable alone does not generate a push event; the next main push or an explicit
+current-main rebuild provides the wakeup.
+
 Each OCI job retains `monday.research-oci-delivery.v1` for 90 days. It records
 source, product, actual delivery run/attempt/job, immutable repository/digest,
 OCI config digest and the authenticated software producer/manifest hash. A retry
@@ -181,7 +193,7 @@ bash .github/scripts/research-publication-budget.sh estimate \
 for software evidence archival. Its schema is
 `monday.research-publication-operations-policy.v1`. It specifies repository,
 workflow, allowed products, a fixed approved time window (at most seven days),
-currency, reviewed price model, storage horizon and per-publication cost/usage
+currency, reviewed price model, storage horizon and per-source cost/usage
 limits, an existing history anchor and `history_retention_required:true`. It does
 not ask the user to guess a source SHA or future workflow number.
 The estimator binds the actual source, run ID, run number and attempt into the
@@ -190,6 +202,17 @@ The scope is new software-source archival; it is separate from experiment,
 scientific grant, ACK activation and trading budgets. The repository variable is
 not installed or authorized by this document.
 
+Every source reserves the full policy `products` set before any subset can be
+admitted. Each product receives its catalog-derived fixed requests, body bytes,
+storage and estimated cost; a subset's bound approval contains only its fixed
+shares. Per-product GB rounding is summed before comparing money/storage cost
+to the full source limits. Publishing CEX and controller in either order cannot
+give each the full `max_*` allowance. For example their 62 and 47 OSS request
+bounds require at least 109 in total: a 100-request source policy rejects both
+single-product attempts before authentication. The same full-set check applies
+to money, request/response bytes and new storage. A failed product keeps its
+share reserved through the history gate; another product cannot use that share.
+
 The older `monday.research-publication-budget-policy.v1` single-run CLI remains
 available for offline compatibility. The automated workflow uses the operating
 allowance. It never treats that allowance as a global cumulative invoice cap.
@@ -197,7 +220,7 @@ A fixed time window and a per-source limit do not bound the number of future
 sources or the aggregate storage bill. No shared cross-run counter/database,
 finite run-number slot protocol or new service is introduced.
 
-The workflow estimates all selected products offline before exposing an archive
+The workflow estimates all authorized products offline before exposing an archive
 environment. Invalid approvals stop before OIDC, STS or OSS. Image preparation,
 image CI carry and ACR delivery have no OSS budget dependency. Archive jobs
 repeat admission and preserve the no-refill history/attempt checks.

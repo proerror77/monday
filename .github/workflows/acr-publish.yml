@@ -95,6 +95,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || steps.release-source.outputs.source_sha }}
           SOURCE_MODE: ${{ github.event_name == 'workflow_dispatch' && 'reuse' || 'automatic' }}
+          MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY: ${{ vars.MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY }}
         run: |
           .github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID" "$GITHUB_OUTPUT" "$SOURCE_MODE"
 

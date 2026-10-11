@@ -71,14 +71,16 @@ plan() {
 # reader. The complete tests below still exercise that reader through gh.
 isolated="$work/isolated/.github/scripts"
 mkdir -p "$isolated"
-for script in select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json; do
+for script in select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json research-publication-budget.sh research-publication-budget.jq; do
   cp "$root/.github/scripts/$script" "$isolated/$script"
 done
 cat >"$isolated/read-research-publish-baseline.sh" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ ! -f $RESEARCH_SCOPE_FIXTURE/baseline-failure ]] || exit 42
-cp "$RESEARCH_SCOPE_FIXTURE/baselines" "$2"
+if [[ ${3:-images} == builds && -f $RESEARCH_SCOPE_FIXTURE/archive-baselines ]]; then
+  cp "$RESEARCH_SCOPE_FIXTURE/archive-baselines" "$2"
+else cp "$RESEARCH_SCOPE_FIXTURE/baselines" "$2"; fi
 MOCK
 printf '%s\n' '{"cex-runner":"BOOTSTRAP","controller":"BOOTSTRAP","prediction-runner":"BOOTSTRAP"}' >"$work/baselines"
 cp "$work/baselines" "$work/baselines-before"
@@ -103,6 +105,38 @@ for mode in always defer-unconfigured; do
   done
 done
 cmp "$work/baselines-before" "$work/baselines"
+# A delivered images, but no signed Build. After authority recovers, docs-only
+# B schedules its own verified software and archive from the Build baseline.
+# The image baseline stays at A and no A source is relabeled as current main B.
+jq -n --arg sha "$head" '{"cex-runner":$sha,"controller":$sha,"prediction-runner":$sha}' >"$work/baselines"
+jq -n --arg sha "$base" '{"cex-runner":$sha,"controller":$sha,"prediction-runner":$sha}' >"$work/archive-baselines"
+focused_plan always '{}'
+grep -Fqx research_product=none "$work/focused-plan"
+grep -Fqx research_archive_pending_product=cex-runner "$work/focused-plan"
+grep -Fqx research_archive_selected_product=none "$work/focused-plan"
+budget="$isolated/research-publication-budget.sh"
+GITHUB_REPOSITORY=fixture/repo bash "$budget" estimate "$head" cex-runner,controller 744 "$work/archive-estimate.json"
+now=$(date -u +%s)
+source_time=$(git show -s --format=%ct "$head")
+archive_allowance=$(jq -c --argjson now "$now" --argjson source_time "$source_time" '
+ {schema:"monday.research-publication-operations-policy.v1",repository,publisher_workflow:".github/workflows/acr-publish.yml",
+ products,not_before:($source_time-60),expires_at:($now+3600),history_anchor_run_id:99,history_anchor_run_number:1,
+ history_retention_required:true,currency:"CNY",price_model:.pricing.model,storage_hours:.pricing.storage_hours,
+ max_estimated_micro_cny:.pricing.estimated_micro_cny,max_oss_requests:.total.oss_requests,
+ max_request_body_bytes:.total.request_body_bytes,max_response_body_bytes:.total.response_body_bytes,
+ max_new_storage_bytes:.total.new_storage_bytes}' "$work/archive-estimate.json")
+MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$archive_allowance focused_plan always '{}'
+grep -Fqx research_image_pending_product=none "$work/focused-plan"
+grep -Fqx research_archive_selected_product=cex-runner "$work/focused-plan"
+grep -Fqx research_archive_carry_policy=approved "$work/focused-plan"
+grep -Fqx research_pending_product=cex-runner "$work/focused-plan"
+grep -Fqx research_product=cex-runner "$work/focused-plan"
+grep -Fq ',ploy/research-image-binaries,ploy/research-image-smoke,' "$work/focused-plan"
+# Once the Build baseline covers A's inputs, B no longer schedules this work.
+cp "$work/baselines" "$work/archive-baselines"
+MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY=$archive_allowance focused_plan always '{}'
+grep -Fqx research_product=none "$work/focused-plan"
+rm "$work/archive-baselines"
 jq -n --arg base "$base" '{"cex-runner":$base,"controller":$base,"prediction-runner":$base}' >"$work/baselines"
 focused_plan always '{}'
 grep -Fqx research_pending_product=cex-runner "$work/focused-plan"
