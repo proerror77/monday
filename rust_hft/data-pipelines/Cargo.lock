@@ -2960,12 +2960,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-cex-data-preparation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "hex",
+ "hft-cex-research-input",
+ "hft-collector",
+ "hft-research-artifacts",
+ "hft-research-manifest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "hft-cex-research-input"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
  "chrono",
+ "clap",
+ "hex",
+ "hft-prepared-market-io",
+ "hft-research-artifacts",
+ "hft-research-manifest",
  "serde",
  "serde_json",
  "sha2",
@@ -3042,6 +3066,7 @@ dependencies = [
  "hft-core",
  "hft-integration",
  "hft-ports",
+ "hft-research-manifest",
  "libc",
  "parquet",
  "rust_decimal",

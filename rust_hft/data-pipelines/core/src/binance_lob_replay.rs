@@ -7,48 +7,10 @@
 use std::{collections::HashMap, str::FromStr};
 
 use anyhow::Result;
+use hft_research_manifest::binance::Market;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Market {
-    Spot,
-    Usdm,
-}
-
-impl FromStr for Market {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "spot" => Ok(Self::Spot),
-            "usdm" => Ok(Self::Usdm),
-            other => Err(format!("unsupported MARKET={other}")),
-        }
-    }
-}
-
-impl Market {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Spot => "spot",
-            Self::Usdm => "usdm",
-        }
-    }
-}
-
-/// Hash the ordered raw-segment digests that form a replay artifact.
-pub fn source_revision<'a>(segment_hashes: impl IntoIterator<Item = &'a str>) -> String {
-    let mut digest = Sha256::new();
-    for hash in segment_hashes {
-        digest.update(hash.as_bytes());
-        digest.update(b"\n");
-    }
-    hex::encode(digest.finalize())
-}
 
 #[derive(Debug)]
 pub struct ReplaySequenceValidator {

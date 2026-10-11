@@ -37,7 +37,6 @@ use crate::mission_render::CexCampaignResearchPlanV1;
 use crate::mission_render::CexCampaignSearchPolicyRevisionV1;
 use crate::mission_render::PreparedCexInputs;
 use crate::mission_render::MAX_RESEARCH_PLAN_GENERATION;
-use crate::mission_runner::decode_materialization;
 use crate::mission_runner::recover_execution_report_from_cached_result;
 use crate::mission_runner::recover_execution_report_from_published_result;
 use crate::mission_runner::research_event;
@@ -61,6 +60,7 @@ use alpha_domain::{
 use alpha_engine::{baselines::CexSupervisedModelCandidateV2, engines::CexFactorBankMctsResultV1};
 use anyhow::{bail, Context};
 use hft_backtest::config::verify_canonical_replay_artifact_streaming;
+use hft_cex_research_input::materialization::decode_materialization;
 #[cfg(feature = "scientific")]
 use reqwest::StatusCode;
 use reqwest::{blocking::Client, redirect::Policy};
@@ -4056,8 +4056,7 @@ pub(crate) fn valid_request_for_tests() -> CampaignRequest {
 #[cfg(test)]
 pub(crate) fn request_for_materialization_for_tests(path: &Path) -> CampaignRequest {
     let base = valid_request_for_tests();
-    let materialization =
-        crate::mission_runner::decode_materialization(&std::fs::read(path).unwrap()).unwrap();
+    let materialization = decode_materialization(&std::fs::read(path).unwrap()).unwrap();
     build_request_from_parts(
         &base.feature_url,
         &materialization.artifact_sha256,
@@ -8500,7 +8499,7 @@ pub(crate) mod tests {
         prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
-        let materialization = crate::mission_runner::decode_materialization(
+        let materialization = decode_materialization(
             &std::fs::read(&fixture._render_fixture.materialization_path).unwrap(),
         )
         .unwrap();
@@ -8637,7 +8636,7 @@ pub(crate) mod tests {
         assert!(result["finalization"].is_null());
         assert!(!fixture.global_claim_path.exists());
         let loaded = load_request(&fixture.args.request).unwrap();
-        let materialization = crate::mission_runner::decode_materialization(
+        let materialization = decode_materialization(
             &std::fs::read(&fixture._render_fixture.materialization_path).unwrap(),
         )
         .unwrap();
@@ -8905,7 +8904,7 @@ pub(crate) mod tests {
         prepare_fixture_for_execute(&mut fixture).unwrap();
         execute(fixture.args.clone()).unwrap();
         let loaded = load_request(&fixture.args.request).unwrap();
-        let materialization = crate::mission_runner::decode_materialization(
+        let materialization = decode_materialization(
             &std::fs::read(&fixture._render_fixture.materialization_path).unwrap(),
         )
         .unwrap();
@@ -9335,7 +9334,7 @@ pub(crate) mod tests {
         assert!(result["finalization"].is_null());
         assert!(!fixture.global_claim_path.exists());
         let loaded = load_request(&fixture.args.request).unwrap();
-        let materialization = crate::mission_runner::decode_materialization(
+        let materialization = decode_materialization(
             &std::fs::read(&fixture._render_fixture.materialization_path).unwrap(),
         )
         .unwrap();
@@ -9853,7 +9852,7 @@ pub(crate) mod tests {
             }
         }
         if rejected_holdout {
-            let materialization = crate::mission_runner::decode_materialization(
+            let materialization = decode_materialization(
                 &std::fs::read(&render_fixture.materialization_path).unwrap(),
             )
             .unwrap();

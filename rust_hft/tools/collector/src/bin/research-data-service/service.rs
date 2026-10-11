@@ -432,7 +432,7 @@ impl FeatureSources {
                 .max()
                 .is_none_or(|t| t < self.last_dependency_received_at_ns)
             || self.source_revision
-                != data::binance_lob_replay::source_revision(
+                != hft_research_manifest::source::source_revision(
                     self.source_segments.iter().map(|s| s.sha256.as_str()),
                 )
         {
@@ -2812,7 +2812,9 @@ mod tests {
             market: "usdm".into(),
             symbol: "SOLUSDT".into(),
             replay_clock: "received_at_ns".into(),
-            source_revision: data::binance_lob_replay::source_revision([segment_hash.as_str()]),
+            source_revision: hft_research_manifest::source::source_revision(
+                [segment_hash.as_str()],
+            ),
             source_segments: vec![segment],
             feature_start_received_at_ns: None,
             feature_end_received_at_ns: None,
@@ -2829,7 +2831,7 @@ mod tests {
         source
             .source_segments
             .push(source.source_segments[0].clone());
-        source.source_revision = data::binance_lob_replay::source_revision(
+        source.source_revision = hft_research_manifest::source::source_revision(
             source.source_segments.iter().map(|s| s.sha256.as_str()),
         );
         assert!(source.validate(&features).is_err());

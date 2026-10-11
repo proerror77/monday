@@ -502,7 +502,7 @@ jobs:
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy -p hft-data-adapter-ondo-perps -p hft-execution-adapter-ondo-perps --all-targets --no-deps --locked -- -D warnings
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" check -p hft-live --features ondo-perps --locked
 
-      - name: Verify governed data collector
+      - name: Verify governed collector and data preparation
         id: collector
         if: ${{ (needs.scope.outputs.collector == 'true') }}
         run: |
@@ -510,6 +510,8 @@ jobs:
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" check -p hft-collector --locked
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy -p hft-collector --all-targets --features collector-binance --no-deps --locked -- -D warnings
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-collector --features collector-binance --locked
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" clippy -p hft-cex-data-preparation --all-targets --no-deps --locked -- -D warnings
+          "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-cex-data-preparation --locked
 
       - name: Verify collector release control plane
         id: control

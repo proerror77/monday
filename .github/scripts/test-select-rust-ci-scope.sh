@@ -900,7 +900,8 @@ for event in pull_request push; do
   if [[ $event == pull_request ]]; then expected+=',ploy/commit-hygiene';
   else expected+=',ploy/research-image-binaries,ploy/research-image-smoke'; fi
   assert_jobs "$ack_flow_mixed" "$expected"
-  for flag in loop collector control toolchain; do assert_flag "$ack_flow_mixed" "$flag" true; done
+  for flag in collector control toolchain; do assert_flag "$ack_flow_mixed" "$flag" true; done
+  assert_flag "$ack_flow_mixed" loop false
   cat "$fixtures/ack-flow-pr-1266.txt" "$fixtures/research-dockerfile.txt" >"$tmp_dir/ack-flow-pr-with-image.txt"
   ack_flow_image=$(run_case "ack-flow-image-$event" "$event" ack-flow-pr-with-image.txt)
   expected='ci/ci-contracts,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
@@ -984,7 +985,8 @@ printf '%s\n' .github/scripts/wait-ack-research-receipt.sh >"$tmp_dir/ack-with-c
 cat "$fixtures/collector.txt" >>"$tmp_dir/ack-with-collector.txt"
 mixed_ack=$(run_case ack-with-collector pull_request ack-with-collector.txt)
 assert_jobs "$mixed_ack" 'ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
-for flag in loop collector control toolchain; do assert_flag "$mixed_ack" "$flag" true; done
+for flag in collector control toolchain; do assert_flag "$mixed_ack" "$flag" true; done
+assert_flag "$mixed_ack" loop false
 # Unknown infrastructure is an incomplete plan, even alongside known source.
 # It must emit no successful selection or compiler dispatch plan.
 for unknown in .github/scripts/future-ack-unreviewed.sh .github/workflows/security.yml .github/actions/future/action.yml; do
@@ -1182,7 +1184,7 @@ GITHUB_REF=refs/heads/develop "$selector" --event push \
   --metadata "$fixtures/metadata.fixture" --output "$security_workflow_develop"
 assert_jobs "$security_workflow_develop" 'ci/ci-contracts,ploy/workflow-lint'
 assert_security_jobs "$security_workflow_develop" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
-assert_security_jobs "$tmp_dir/collector.out" "$all_security_jobs"
+assert_security_jobs "$tmp_dir/collector.out" "${all_security_jobs/,security\/clippy-strict/}"
 assert_security_jobs "$tmp_dir/unknown-root.out" "$all_security_jobs"
 security_schedule="$tmp_dir/security-schedule.out"
 "$selector" --event schedule --output "$security_schedule"
@@ -1193,7 +1195,8 @@ security_manual="$tmp_dir/security-manual.out"
 assert_security_jobs "$security_manual" "$all_security_jobs"
 
 collector="$tmp_dir/collector.out"
-for flag in loop collector control toolchain; do assert_flag "$collector" "$flag" true; done
+for flag in collector control toolchain; do assert_flag "$collector" "$flag" true; done
+assert_flag "$collector" loop false
 for flag in handoff json ondo focused; do assert_flag "$collector" "$flag" false; done
 
 rust_deploy_collector="$tmp_dir/rust-deploy-collector.out"
@@ -1215,7 +1218,8 @@ for flag in loop handoff json ondo collector control focused toolchain; do
 done
 
 full="$tmp_dir/full.out"
-for flag in loop collector control toolchain; do assert_flag "$full" "$flag" true; done
+for flag in collector control toolchain; do assert_flag "$full" "$flag" true; done
+assert_flag "$full" loop false
 for flag in handoff json ondo focused; do assert_flag "$full" "$flag" false; done
 
 ci_workflow="$script_dir/../workflows/ci.yml"
@@ -1471,7 +1475,8 @@ git -C "$deletion_repo" -c user.name=CI -c user.email=ci@example.invalid commit 
 deletion="$tmp_dir/deletion.out"
 (cd "$deletion_repo" && "$selector" --event pull_request --base "$deletion_base" \
   --head HEAD --metadata "$fixtures/metadata.fixture" --output "$deletion")
-for flag in loop collector control toolchain; do assert_flag "$deletion" "$flag" true; done
+for flag in collector control toolchain; do assert_flag "$deletion" "$flag" true; done
+assert_flag "$deletion" loop false
 
 rename_repo="$tmp_dir/rename-repo"
 mkdir -p "$rename_repo/rust_hft/tools/collector/src" "$rename_repo/docs"
@@ -1485,7 +1490,8 @@ git -C "$rename_repo" -c user.name=CI -c user.email=ci@example.invalid commit -q
 rename="$tmp_dir/rename.out"
 (cd "$rename_repo" && "$selector" --event pull_request --base "$rename_base" \
   --head HEAD --metadata "$fixtures/metadata.fixture" --output "$rename")
-for flag in loop collector control toolchain; do assert_flag "$rename" "$flag" true; done
+for flag in collector control toolchain; do assert_flag "$rename" "$flag" true; done
+assert_flag "$rename" loop false
 
 gate="$script_dir/verify-ci-gate.sh"
 printf '%s' '{"selector":{"result":"success"},"rust":{"result":"skipped"}}' | \
@@ -1630,7 +1636,7 @@ assert_flag "$security_schedule" clippy_loop true
 assert_flag "$security_schedule" clippy_handoff true
 assert_flag "$live" clippy_loop false
 assert_flag "$live" clippy_handoff true
-assert_flag "$collector" clippy_loop true
+assert_flag "$collector" clippy_loop false
 
 # Leaf research changes select the affected package, while shared-domain changes
 # retain reverse-dependency coverage. The same list feeds tests and Clippy.
@@ -1640,3 +1646,14 @@ assert_flag "$output" loop_packages ',alpha-harness,hft-cex-research-worker,'
 assert_flag "$output" clippy_loop true
 output=$(run_case schedule schedule alpha-leaf.txt)
 assert_flag "$output" loop_packages ',alpha-domain,alpha-store,alpha-engine,alpha-onnx-evaluator,alpha-harness,hft-cex-research-worker,hft-harnessctl,hft-research-ml,'
+
+# The data CLI has its own source boundary and reuses only the existing CEX image wrapper.
+printf '%s\n' rust_hft/data-pipelines/cex-preparation/src/prepare.rs >"$tmp_dir/cex-preparation.txt"
+data_preparation_scope=$(run_case cex-preparation push cex-preparation.txt)
+assert_flag "$data_preparation_scope" collector true
+assert_flag "$data_preparation_scope" loop false
+assert_flag "$data_preparation_scope" production_collector_image false
+grep -Fqx research_product=cex-runner "$data_preparation_scope"
+grep -Fq ',ci/rust,' "$data_preparation_scope"
+grep -Fq ',ploy/research-image-binaries,' "$data_preparation_scope"
+printf 'PASS: isolated preparation selects data validation and the existing CEX image only\n'

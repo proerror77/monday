@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, Utc};
-use data::binance_lob_replay::{Market, ReplaySequenceEvent};
+use data::binance_lob_replay::ReplaySequenceEvent;
 use data::binance_market_tape::AggregateTrade;
 use data::binance_market_tape_artifact::{
     ReplayedBinanceBookEvent, VerifiedBinanceLobObservation, VerifiedBinanceMarketTape,
 };
+use hft_research_manifest::binance::Market;
 use ploy_market_contracts::{BinanceSourceClock, BinanceSourceKind, MarketUpdate};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;

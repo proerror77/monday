@@ -996,13 +996,13 @@ fn validate_target_replay_inputs(
 ) -> Result<()> {
     let market = config
         .market
-        .parse::<data::binance_lob_replay::Market>()
+        .parse::<hft_research_manifest::binance::Market>()
         .map_err(anyhow::Error::msg)?;
     if config.market != market.as_str() {
         anyhow::bail!("target-position replay market must be canonical lowercase");
     }
     match (market, spot_instrument_rules) {
-        (data::binance_lob_replay::Market::Spot, Some(rules)) => {
+        (hft_research_manifest::binance::Market::Spot, Some(rules)) => {
             rules
                 .validate()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -1014,13 +1014,13 @@ fn validate_target_replay_inputs(
                 );
             }
         }
-        (data::binance_lob_replay::Market::Spot, None) => {
+        (hft_research_manifest::binance::Market::Spot, None) => {
             anyhow::bail!("Spot target-position replay requires full instrument rules");
         }
-        (data::binance_lob_replay::Market::Usdm, Some(_)) => {
+        (hft_research_manifest::binance::Market::Usdm, Some(_)) => {
             anyhow::bail!("USD-M target-position replay cannot carry Spot instrument rules");
         }
-        (data::binance_lob_replay::Market::Usdm, None) => {}
+        (hft_research_manifest::binance::Market::Usdm, None) => {}
     }
     let costs = [
         config.position_notional_usd,
@@ -1044,7 +1044,7 @@ fn validate_target_replay_inputs(
         || !config.position_notional_usd.is_finite()
         || config.position_notional_usd <= 0.0
         || config.capacity_depth_levels > config.max_depth_levels
-        || (market == data::binance_lob_replay::Market::Spot
+        || (market == hft_research_manifest::binance::Market::Spot
             && (config.position_notional_usd <= 0.0
                 || config.funding_bps != 0.0
                 || decisions
@@ -2235,7 +2235,7 @@ impl FlowTracker {
 struct ExecutionManager {
     cfg: ExecutionConfig,
     risk: RiskConfig,
-    market: data::binance_lob_replay::Market,
+    market: hft_research_manifest::binance::Market,
     tick_size: f64,
     position: PositionState,
     cash: f64,
@@ -2301,7 +2301,7 @@ impl ExecutionManager {
         cfg: ExecutionConfig,
         risk: RiskConfig,
         tick_size: f64,
-        market: data::binance_lob_replay::Market,
+        market: hft_research_manifest::binance::Market,
     ) -> Self {
         let initial_cash = cfg.initial_cash;
         let initial_inventory = cfg.initial_inventory;
@@ -2329,14 +2329,16 @@ impl ExecutionManager {
         if self.disabled {
             return false;
         }
-        if self.market == data::binance_lob_replay::Market::Spot && side == PositionSide::Short {
+        if self.market == hft_research_manifest::binance::Market::Spot
+            && side == PositionSide::Short
+        {
             return false;
         }
         let projected = self.position.qty.abs() + qty.abs();
         if projected > self.risk.inventory_limit + 1e-9 {
             return false;
         }
-        if self.market == data::binance_lob_replay::Market::Spot {
+        if self.market == hft_research_manifest::binance::Market::Spot {
             let fee = price * qty * self.cfg.fee_bps.max(0.0) / BPS;
             self.cash >= price * qty + fee - 1e-9
                 && self.inventory + qty <= self.risk.inventory_limit + 1e-9
@@ -2421,7 +2423,7 @@ impl ExecutionManager {
         reference_depth: f64,
         stats: &mut BacktestStats,
     ) {
-        if qty <= 0.0 || self.market == data::binance_lob_replay::Market::Spot {
+        if qty <= 0.0 || self.market == hft_research_manifest::binance::Market::Spot {
             return;
         }
         if self.position.side == Some(PositionSide::Short) {
@@ -2461,12 +2463,12 @@ impl ExecutionManager {
         if qty <= 0.0 {
             return;
         }
-        let entry_fee = if self.market == data::binance_lob_replay::Market::Spot {
+        let entry_fee = if self.market == hft_research_manifest::binance::Market::Spot {
             price * qty * self.cfg.fee_bps.max(0.0) / BPS
         } else {
             0.0
         };
-        if self.market == data::binance_lob_replay::Market::Spot {
+        if self.market == hft_research_manifest::binance::Market::Spot {
             let required_cash = price * qty + entry_fee;
             if self.cash + 1e-9 < required_cash {
                 return;
@@ -2589,7 +2591,7 @@ impl ExecutionManager {
         }
         let entry_price = self.position.entry_price;
         let side = self.position.side.unwrap();
-        let entry_fee_for_exit = if self.market == data::binance_lob_replay::Market::Spot {
+        let entry_fee_for_exit = if self.market == hft_research_manifest::binance::Market::Spot {
             self.position.entry_fee * (qty / self.position.qty)
         } else {
             0.0
@@ -2599,7 +2601,7 @@ impl ExecutionManager {
             PositionSide::Long => (price - entry_price) * qty,
         };
         let exit_fee = price * qty.abs() * self.cfg.fee_bps.max(0.0) / BPS;
-        let fees = if self.market == data::binance_lob_replay::Market::Spot {
+        let fees = if self.market == hft_research_manifest::binance::Market::Spot {
             if side != PositionSide::Long || self.inventory + 1e-9 < qty {
                 return;
             }
@@ -4426,7 +4428,7 @@ mod tests {
                 ..RiskConfig::default()
             },
             0.1,
-            data::binance_lob_replay::Market::Usdm,
+            hft_research_manifest::binance::Market::Usdm,
         );
         execution.position.side = Some(PositionSide::Short);
         execution.position.qty = 2.0;
@@ -4461,7 +4463,7 @@ mod tests {
             },
             RiskConfig::default(),
             0.01,
-            data::binance_lob_replay::Market::Usdm,
+            hft_research_manifest::binance::Market::Usdm,
         );
         let mut stats = BacktestStats::default();
         execution.enter_long(1.0, 100.0, 1.0, 100.0, 10.0, &mut stats);
@@ -4486,7 +4488,7 @@ mod tests {
                 ..RiskConfig::default()
             },
             0.01,
-            data::binance_lob_replay::Market::Spot,
+            hft_research_manifest::binance::Market::Spot,
         );
         let mut stats = BacktestStats::default();
 
@@ -4507,7 +4509,7 @@ mod tests {
             ExecutionConfig::default(),
             RiskConfig::default(),
             0.01,
-            data::binance_lob_replay::Market::Spot,
+            hft_research_manifest::binance::Market::Spot,
         );
         let mut stats = BacktestStats::default();
 
@@ -4530,7 +4532,7 @@ mod tests {
                 ..RiskConfig::default()
             },
             0.01,
-            data::binance_lob_replay::Market::Spot,
+            hft_research_manifest::binance::Market::Spot,
         );
         let mut stats = BacktestStats::default();
         execution.enter_long(1.0, 100.0, 2.0, 100.0, 1.0, &mut stats);
@@ -4553,7 +4555,7 @@ mod tests {
             },
             RiskConfig::default(),
             0.01,
-            data::binance_lob_replay::Market::Usdm,
+            hft_research_manifest::binance::Market::Usdm,
         );
         let mut stats = BacktestStats::default();
         execution.enter_long(1.0, 100.0, 2.0, 100.0, 10.0, &mut stats);
@@ -4630,7 +4632,7 @@ mod tests {
             },
             RiskConfig::default(),
             0.01,
-            data::binance_lob_replay::Market::Usdm,
+            hft_research_manifest::binance::Market::Usdm,
         );
         let mut stats = BacktestStats::default();
         execution.enter_long(1.0, 100.0, 1.0, 100.0, 10.0, &mut stats);

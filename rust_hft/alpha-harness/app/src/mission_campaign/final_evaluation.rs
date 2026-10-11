@@ -1,6 +1,8 @@
 //! The final phase of the canonical Campaign seam; never a search/root-grant mode.
 use super::*;
 use alpha_domain::campaign_finalization::SignedCampaignFinalEvaluationGrantV1;
+#[cfg(feature = "scientific")]
+use hft_cex_research_input::materialization::{decode_materialization, Materialization};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const REQUEST_SCHEMA: &str = "monday.campaign_final_request.v1";
@@ -717,8 +719,7 @@ pub(crate) fn execute(args: CampaignExecuteArgs) -> anyhow::Result<()> {
         &request,
         &materialization_path,
     )?;
-    let materialization =
-        crate::mission_runner::decode_materialization(&std::fs::read(&materialization_path)?)?;
+    let materialization = decode_materialization(&std::fs::read(&materialization_path)?)?;
     let family = collect_sources(&client, &request, &work)?;
     let mission = family.first_mission().clone();
     crate::mission_runner::validate_mission_materialization_binding(
@@ -885,7 +886,7 @@ fn finalize_supervised_family(
     dataset: &alpha_engine::evaluation::PreparedDataset,
     clocks: &[crate::data_mission::FeatureDecisionClock],
     results: &Path,
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
     first: &CampaignRequest,
     replay_path: &Path,
     replay_manifest_path: &Path,

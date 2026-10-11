@@ -263,10 +263,16 @@ unknown response is not terminal-stop evidence.
 
 ### Canonical operating sequence
 
-The command names below follow `alpha-harness`. Supply exact source/image
-identities, approved budgets, real input hashes and task-specific control files. This is an ordering
-guide, not a prefilled grant or a runnable set of credentials. Ledger registration
-and inspection require Linux with `MONDAY_EXECUTION_HOST=ack`.
+The admitted data Job uses `monday-cex-prepare`; other commands below use
+`alpha-harness`. Supply exact source/image identities, approved budgets, real
+input hashes and task-specific control files. This is an ordering guide, not a
+prefilled grant or a runnable set of credentials. Ledger registration and
+inspection require Linux with `MONDAY_EXECUTION_HOST=ack`.
+
+Follow the [data preparation handoff](../../rust_hft/data-pipelines/cex-preparation/README.md#handoff).
+Pass identical preparation arguments to the producer and read-only verifier,
+including `--market-encoder-output` and `--report-out`. Both programs must bind
+the same verified source revision.
 
 The Study also requires real independent-selection and sealed artifact hashes.
 Prepare and bind those identities separately under their isolation and exposure
@@ -275,7 +281,7 @@ placeholder hashes for these required identities.
 
 | Order | Boundary and command | Required result |
 | --- | --- | --- |
-| 1 | ACK: `mission prepare-fresh-inputs --market-encoder-output`, then `mission prepare-sequence-cohort` | Verified native receipts, bounded non-overlapping feature partitions, common training anchors, a complete validation decision grid and matching replay. Prepare train and development validation only. |
+| 1 | ACK data Job: `monday-cex-prepare prepare-fresh-inputs --market-encoder-output`; then operator: `mission verify-prepared-inputs` and `mission prepare-sequence-cohort` | Verified native receipts, bounded non-overlapping feature partitions, common training anchors, a complete validation decision grid and matching replay. Prepare train and development validation only. |
 | 2 | ACK: `mission dispatch init-stage-authority` | Public stage authority bound to the real work PVC UID; its private key remains in the controller's private area. |
 | 3 | Each fold in ACK: `mission campaign-freeze --stage-authority …` | Frozen typed request and its signing plan after source/cohort checks. |
 | 4 | Operator signing boundary: sign the frozen transport actions | Exactly result PUT/GET and bundle PUT/GET for the frozen objects. PUT capabilities must preserve `x-oss-forbid-overwrite:true`. Do not publish signed URLs. |

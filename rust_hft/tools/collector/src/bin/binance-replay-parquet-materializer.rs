@@ -1,13 +1,13 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use data::binance_lob_replay::{
-    source_revision as governed_source_revision, Market as LobMarket, ReplaySequenceEvent,
-};
+use data::binance_lob_replay::ReplaySequenceEvent;
 use data::binance_market_tape_artifact::{
     seal_binance_market_tape_triplet,
     verify_binance_market_tape_series_with_required_lob_continuity, BinanceMarketTapeTriplet,
     BinanceMarketTapeTrustAnchor, ReplayedBinanceBookEvent, VerifiedBinanceMarketTapeSeries,
 };
+use hft_research_manifest::binance::Market as LobMarket;
+use hft_research_manifest::source::source_revision as governed_source_revision;
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};

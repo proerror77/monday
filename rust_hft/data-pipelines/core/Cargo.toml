@@ -6,6 +6,7 @@ edition = "2021"
 description = "公共行情：統一 MarketStream；多交易所 adapters"
 
 [dependencies]
+hft-research-manifest = { path = "../../research-core/manifest" }
 hft-core = { package = "hft-core", path = "../../market-core/core" }
 ports = { package = "hft-ports", path = "../../market-core/ports" }
 integration = { package = "hft-integration", path = "../../market-core/integration" }

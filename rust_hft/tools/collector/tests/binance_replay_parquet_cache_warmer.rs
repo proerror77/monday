@@ -1,4 +1,4 @@
-use data::binance_lob_replay::source_revision;
+use hft_research_manifest::source::source_revision;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;

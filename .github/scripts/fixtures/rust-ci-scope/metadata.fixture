@@ -4,10 +4,11 @@
     { "name": "hft-ports", "manifest_path": "rust_hft/market-core/ports/Cargo.toml", "dependencies": [{ "name": "hft-core", "path": "../core" }] },
     { "name": "hft-engine", "manifest_path": "rust_hft/market-core/engine/Cargo.toml", "dependencies": [{ "name": "hft-ports", "path": "../ports" }] },
     { "name": "hft-collector", "manifest_path": "rust_hft/tools/collector/Cargo.toml", "dependencies": [] },
+    { "name": "hft-cex-data-preparation", "manifest_path": "rust_hft/data-pipelines/cex-preparation/Cargo.toml", "dependencies": [{ "name": "hft-collector", "path": "rust_hft/tools/collector" }] },
     {
       "name": "alpha-harness",
       "manifest_path": "rust_hft/alpha-harness/app/Cargo.toml",
-      "dependencies": [{ "name": "hft-collector", "path": "rust_hft/tools/collector" }]
+      "dependencies": []
     },
     {
       "name": "hft-cex-research-worker",

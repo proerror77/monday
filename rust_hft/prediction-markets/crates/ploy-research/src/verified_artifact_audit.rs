@@ -1,7 +1,7 @@
 use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use data::binance_lob_replay::Market;
 use data::binance_market_tape_artifact::VerifiedBinanceMarketTape;
+use hft_research_manifest::binance::Market;
 use ploy_market_data::diagnostics::{
     assemble_prediction_market_data_audit, evaluate_event_completeness,
     evaluate_time_series_coverage, EventCompletenessObservation, PredictionMarketDataAuditReport,

@@ -3,12 +3,12 @@ use super::*;
 use crate::mission_runner;
 use crate::{
     data_mission, governance, loop_control, mission, mission_campaign, mission_dispatch,
-    mission_fresh_inputs, mission_metrics,
+    mission_metrics,
 };
 use alpha_store::AlphaStore;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use hft_collector::{source_catalog, DataAcquisitionMission, QualityRequirements};
+use hft_cex_research_input::preparation::{verify_prepared_inputs, PreparationArgs};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -100,7 +100,7 @@ enum MissionCommand {
     CampaignId(CampaignIdArgs),
     /// Summarize completed model evidence without training or submitting research.
     ModelMetrics(ModelMetricsArgs),
-    PrepareFreshInputs(Box<PrepareFreshInputsArgs>),
+    VerifyPreparedInputs(Box<PreparationArgs>),
     /// Assemble an immutable SOL sequence cohort from prepared PIT receipts.
     PrepareSequenceCohort(PrepareSequenceCohortArgs),
     Dispatch {
@@ -127,11 +127,8 @@ enum LoopCommand {
 
 #[derive(Debug, Subcommand)]
 enum DataCommand {
-    Sources,
-    Acquire(AcquireDataArgs),
+    RegisterDataset(RegisterDatasetArgs),
     ImportFeatures(ImportFeatureDataArgs),
-    FreezeInventory(FreezeInventoryArgs),
-    VerifyMaterializationManifest(VerifyMaterializationManifestArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -201,29 +198,11 @@ struct CreateMissionArgs {
 }
 
 #[derive(Debug, Args)]
-struct AcquireDataArgs {
+struct RegisterDatasetArgs {
     #[arg(long)]
     db: PathBuf,
     #[arg(long)]
-    mission_id: String,
-    #[arg(long, default_value = "binance-public")]
-    source_id: String,
-    #[arg(long)]
-    symbol: String,
-    #[arg(long, default_value = "1m")]
-    interval: String,
-    #[arg(long, default_value_t = 500)]
-    limit: usize,
-    #[arg(long)]
-    artifact_dir: PathBuf,
-    #[arg(long)]
-    manifest_out: Option<PathBuf>,
-    #[arg(long, default_value_t = 0)]
-    max_parse_failures: usize,
-    #[arg(long, default_value_t = 0)]
-    max_non_monotonic_events: usize,
-    #[arg(long, default_value_t = 0)]
-    max_non_finite_values: usize,
+    manifest: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -283,11 +262,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     .await
                     .context("model metrics reporting worker failed")?
             }
-            MissionCommand::PrepareFreshInputs(args) => {
+            MissionCommand::VerifyPreparedInputs(mut args) => {
                 require_cloud_data_host(std::env::consts::OS)?;
-                tokio::task::spawn_blocking(move || mission_fresh_inputs::prepare(*args))
+                args.source_revision = BUILD_SOURCE_REVISION.into();
+                let verified = tokio::task::spawn_blocking(move || verify_prepared_inputs(&args))
                     .await
-                    .context("fresh Campaign input preparation worker failed")?
+                    .context("prepared Campaign input verification worker failed")??;
+                print_json(&verified)
             }
             MissionCommand::PrepareSequenceCohort(args) => {
                 require_cloud_data_host(std::env::consts::OS)?;
@@ -412,44 +393,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             LoopCommand::Status(args) => loop_control::loop_status(args),
         },
         Command::Data { command } => match command {
-            DataCommand::Sources => print_json(&source_catalog()),
-            DataCommand::FreezeInventory(args) => {
-                tokio::task::spawn_blocking(move || data_mission::freeze_research_inventory(args))
-                    .await
-                    .context("inventory freezer worker failed")?
-            }
-            DataCommand::VerifyMaterializationManifest(args) => {
-                tokio::task::spawn_blocking(move || {
-                    data_mission::verify_materialization_manifest(args)
-                })
-                .await
-                .context("materialization manifest verifier worker failed")?
-            }
-            DataCommand::Acquire(args) => {
+            DataCommand::RegisterDataset(args) => {
                 let mut store = AlphaStore::open(&args.db)?;
-                let data_mission = DataAcquisitionMission {
-                    mission_id: args.mission_id,
-                    source_id: args.source_id,
-                    symbol: args.symbol,
-                    interval: args.interval,
-                    limit: args.limit,
-                    artifact_dir: args.artifact_dir,
-                    quality_requirements: QualityRequirements {
-                        max_parse_failures: args.max_parse_failures,
-                        max_non_monotonic_events: args.max_non_monotonic_events,
-                        max_non_finite_values: args.max_non_finite_values,
-                    },
-                };
-                let manifest =
-                    data_mission::acquire_and_register(&mut store, &data_mission).await?;
-                let output = args
-                    .manifest_out
-                    .unwrap_or_else(|| data_mission::default_manifest_path(&manifest));
-                hft_research_artifacts::write_json_atomic(&output, &manifest)?;
-                print_json(&serde_json::json!({
-                    "manifest": manifest,
-                    "manifest_path": output,
-                }))
+                let manifest = data_mission::register_dataset(&mut store, &args.manifest)?;
+                print_json(&manifest)
             }
             DataCommand::ImportFeatures(args) => {
                 let mut store = AlphaStore::open(&args.db)?;
@@ -582,7 +529,7 @@ mod tests {
             "campaign-freeze",
             "campaign-finalize",
             "campaign-id",
-            "prepare-fresh-inputs",
+            "verify-prepared-inputs",
             "dispatch",
         ] {
             assert!(listed(command), "{command} must stay on the Campaign path");
@@ -762,7 +709,7 @@ mod tests {
         let args = [
             "alpha-harness",
             "mission",
-            "prepare-fresh-inputs",
+            "verify-prepared-inputs",
             "--raw-root",
             "/archive/raw",
             "--reference-root",
@@ -803,13 +750,15 @@ mod tests {
             "/usr/local/bin/cex-materialization-entrypoint.sh",
             "--materializer-work-dir",
             "/work/materializer",
+            "--report-out",
+            "/work/preparation.json",
         ];
         assert!(Cli::try_parse_from(args).is_ok());
     }
 
     #[test]
     fn parses_latest_bounded_fresh_input_preparation() {
-        let args = "alpha-harness mission prepare-fresh-inputs \
+        let args = "alpha-harness mission verify-prepared-inputs \
             --raw-root /archive/raw \
             --reference-root /archive/reference \
             --market usdm \
@@ -830,7 +779,7 @@ mod tests {
             --campaign-inputs-out /output/campaigns/fresh-window/receipts/campaign-inputs.json \
             --output-root /output \
             --materializer /usr/local/bin/cex-materialization-entrypoint.sh \
-            --materializer-work-dir /work/materializer";
+            --materializer-work-dir /work/materializer --report-out /work/preparation.json";
         assert!(Cli::try_parse_from(args.split_whitespace()).is_ok());
     }
 
@@ -876,7 +825,17 @@ mod tests {
             "--mission-id", "data-test", "--output-prefix", "runs/test", "--bucket-ms", "1000",
             "--label-horizon-buckets", "5", "--top-depth", "5", "--max-input-bytes", "1000000",
             "--output", "frozen.env",
-        ]).is_ok());
+        ]).is_err());
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "data",
+            "register-dataset",
+            "--db",
+            "alpha.duckdb",
+            "--manifest",
+            "dataset.json"
+        ])
+        .is_ok());
         let handoff_args = [
             "alpha-harness",
             "mission",
@@ -960,20 +919,24 @@ mod tests {
             .kind(),
             clap::error::ErrorKind::InvalidSubcommand
         );
-        assert!(Cli::try_parse_from([
-            "alpha-harness",
-            "data",
-            "acquire",
-            "--db",
-            "alpha.duckdb",
-            "--mission-id",
-            "data-1",
-            "--symbol",
-            "BTCUSDT",
-            "--artifact-dir",
-            "artifacts",
-        ])
-        .is_ok());
+        assert_eq!(
+            Cli::try_parse_from([
+                "alpha-harness",
+                "data",
+                "acquire",
+                "--db",
+                "alpha.duckdb",
+                "--mission-id",
+                "data-1",
+                "--symbol",
+                "BTCUSDT",
+                "--artifact-dir",
+                "artifacts",
+            ])
+            .unwrap_err()
+            .kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
         assert_eq!(Cli::try_parse_from([
             "alpha-harness",
             "prediction",

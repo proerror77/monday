@@ -303,7 +303,8 @@ mod tests {
     }
     #[test]
     fn archive_index_requires_raw_triplets_and_keeps_calendar_pending() {
-        use crate::lob_archiver::{Market, Segment, SegmentConfig};
+        use crate::lob_archiver::{Segment, SegmentConfig};
+        use hft_research_manifest::binance::Market;
         let root = tempfile::tempdir().unwrap();
         let start = 1_789_430_400_000_000_000_u64;
         let mut segment = Segment::create(

@@ -24,8 +24,8 @@ validation and content-addressed IO used by materializers and the harness.
 It preserves v2 historical reads and v3 writes, raw-byte hashes, float parsing,
 series boundaries and point-in-time clocks. Its default contract enables no
 JSONL IO. The worker uses the shared app, store, data protocols, worker
-verification contracts and scoped artifact IO. Acquisition and dispatch remain
-operator-only dependencies.
+verification contracts and scoped artifact IO. The separate data preparation
+program owns acquisition. Dispatch remains an operator-only dependency.
 
 `alpha-harness` is the operator. Its default graph excludes Burn, ML fitting
 and ONNX. It owns freeze, finalization, dispatch, stopping and independent
@@ -138,19 +138,36 @@ owns independent selection and sealed evaluation under separate authority.
 
 ## Local Data Diagnostics
 
-```bash
-cargo run -p alpha-harness -- data sources
+Run these commands from the repository root:
 
-cargo run -p alpha-harness -- data acquire \
-  --db var/alpha.duckdb \
+```bash
+cargo run --manifest-path rust_hft/data-pipelines/Cargo.toml -p hft-cex-data-preparation -- sources
+
+cargo run --manifest-path rust_hft/data-pipelines/Cargo.toml -p hft-cex-data-preparation -- acquire \
   --mission-id data-btc-1 \
   --symbol BTCUSDT \
   --interval 1m \
   --limit 500 \
-  --artifact-dir var/datasets
+  --artifact-dir var/datasets \
+  --manifest-out var/datasets/btc.manifest.json
+
+cargo run --manifest-path rust_hft/research-core/Cargo.toml -p alpha-harness -- data register-dataset \
+  --db var/alpha.duckdb --manifest var/datasets/btc.manifest.json
 ```
 
-This diagnostic command calls the registered public connector, writes a content-addressed JSONL trace and manifest, persists the full manifest as an immutable DuckDB registry revision, and writes a failure artifact on acquisition failure. It is not the production CEX admission path. Research commands reject a disk manifest that does not exactly match that revision. The acquisition path never substitutes fixtures.
+The data program calls the registered public connector and writes a
+content-addressed trace and manifest. It retains the acquisition failure
+artifact behavior. The operator validates the actual trace, then registers
+its immutable metadata in DuckDB. Neither step substitutes fixtures or grants
+production CEX admission. Research reads still require the exact registered
+manifest.
+
+Cloud preparation uses the independent data program before the controller's
+readonly `mission verify-prepared-inputs` command. See the
+[preparation handoff](../data-pipelines/cex-preparation/README.md). The operator
+normal graph excludes acquisition. The temporary shared `research-runner`
+image still couples scientific and data image rebuilds; independent data OCI
+publication and deployment migration remain held.
 
 ## CEX Campaign
 

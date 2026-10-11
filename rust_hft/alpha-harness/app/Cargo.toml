@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = ["operator"]
-operator = ["alpha-engine/llm", "dep:hft-collector", "dep:hft-research-dispatch-io", "dep:hft-research-platform"]
+operator = ["hft-cex-research-input/preparation-cli", "alpha-engine/llm", "dep:hft-research-dispatch-io", "dep:hft-research-platform"]
 scientific = ["alpha-engine/fitting", "dep:hft-cex-search-driver"]
 onnx-compatibility = ["operator", "dep:alpha-onnx-evaluator"]
 
@@ -31,7 +31,6 @@ clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 governance = { package = "hft-governance-contracts", path = "../../governance-contracts" }
 hex = { workspace = true }
-hft-collector = { path = "../../tools/collector", optional = true, features = ["collector-binance"] }
 hft-data = { path = "../../data-pipelines/core" }
 hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 hft-backtest = { path = "../../apps/backtest" }

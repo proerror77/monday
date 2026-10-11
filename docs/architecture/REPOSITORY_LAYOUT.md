@@ -198,7 +198,7 @@ can select `kernel` without including the LLM client in their normal dependency
 graph. Build tools retain their own transport dependencies.
 
 The harness's default `operator` feature includes that LLM client and the
-operator CLI, legacy loop controller, data preparation and approval commands.
+operator CLI, legacy loop controller, prepared-input verification and approval commands.
 `hft-cex-research-worker` disables defaults and selects only `scientific`.
 It retains `kernel` and `fitting`, frozen input checks, native Campaign execution,
 independent final evaluation and result readback. Governance handoff helpers
@@ -213,6 +213,25 @@ binding verification, while its normal graph excludes cluster IO.
 Representation identities still bind their input algorithms and materializer
 sources. Removing unrelated application dependencies does not remove that
 scientific provenance or prevent those inputs from invalidating a build.
+`hft-cex-data-preparation` belongs to the data workspace and builds
+`monday-cex-prepare`. It owns archive selection, frozen inventory creation,
+materializer process limits, and immutable preparation output. Its normal graph
+excludes the research engine, dispatch and control platform. The operator normal
+graph excludes collector, ClickHouse and venue acquisition adapters.
+
+Shared `cex-input` inventory and preparation modules verify the original request,
+selection, inventory, receipt and output bytes. They do not acquire data or launch
+processes. Materialization codecs and market source verification also live there.
+`research-manifest` owns the canonical Binance market and ordered source digest.
+The producer and controller use these single implementations.
+
+Controller `start` and Study handoff consume independently completed preparation.
+Missing or invalid evidence produces `needs_preparation` before child dispatch.
+The controller image excludes materializers and their entrypoint. Existing data
+Jobs temporarily use `research-runner`, which includes a separately compiled
+preparation program. An independent data OCI product and actual deployment
+migration remain held. The shared legacy image still couples product rebuilds.
+
 The published operator and worker use separate build recipes. A combined Cargo
 package selection unifies their features and does not verify this boundary.
 

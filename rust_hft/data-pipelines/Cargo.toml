@@ -1,7 +1,7 @@
 # data workspace; source paths and runtime behavior are preserved.
 [workspace]
 resolver = "2"
-members = ["adapters/adapter-bitget", "adapters-common", "adapters/adapter-asterdex", "adapters/adapter-binance", "adapters/adapter-binance-prediction", "adapters/adapter-bybit", "adapters/adapter-grvt", "adapters/adapter-mock", "adapters/adapter-ondo-perps", "adapters/adapter-polymarket", "core", "adapters/adapter-predict-fun", "adapters/adapter-deribit-reference", "../tools/collector", "../apps/binance-md", "../tools/ws_test", "../tools/listing-monitor", "market-pipeline"]
+members = ["cex-preparation", "adapters/adapter-bitget", "adapters-common", "adapters/adapter-asterdex", "adapters/adapter-binance", "adapters/adapter-binance-prediction", "adapters/adapter-bybit", "adapters/adapter-grvt", "adapters/adapter-mock", "adapters/adapter-ondo-perps", "adapters/adapter-polymarket", "core", "adapters/adapter-predict-fun", "adapters/adapter-deribit-reference", "../tools/collector", "../apps/binance-md", "../tools/ws_test", "../tools/listing-monitor", "market-pipeline"]
 default-members = ["core"]
 
 [workspace.dependencies]

@@ -1,5 +1,8 @@
 //! Manifest contracts for reproducible research, evaluation, promotion, and live rollout.
 
+pub mod binance;
+pub mod source;
+
 pub mod market_encoder;
 pub mod mlp_training;
 pub mod model;

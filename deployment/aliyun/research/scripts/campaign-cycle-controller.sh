@@ -21,6 +21,23 @@ die() {
   exit 1
 }
 
+# Consume completed data-owner evidence. This path never acquires data or starts a worker.
+verify_completed_preparation() {
+  local stage="$1" stdout="$2" report="$3" request="$4" inputs="$5"
+  shift 5
+  local pending="$work_dir/needs-preparation.json"
+  if [[ ! -s "$report" || ! -s "$request" || ! -s "$inputs" ]] ||     ! "$alpha_harness" "$@" >"$stdout"; then
+    jq -n --arg stage "$stage" --arg report "$report" --arg request "$request"       --arg inputs "$inputs" '{schema_version:"monday.campaign_cycle_needs_preparation.v1",
+      status:"needs_preparation",stage:$stage,preparation_report:$report,
+      request:$request,campaign_inputs:$inputs,preparation_started:false,child_dispatched:false}' >"$pending.partial"
+    mv -f -- "$pending.partial" "$pending"
+    log_event needs_preparation "stage=$stage" "artifact=$pending"
+    cat "$pending"
+    die "completed independent preparation is missing or failed verification"
+  fi
+  rm -f -- "$pending"
+}
+
 usage() {
   cat <<'EOF'
 Usage: campaign-cycle-controller.sh [start] \
@@ -61,6 +78,9 @@ Usage: campaign-cycle-controller.sh [start] \
   [--alpha-harness EXECUTABLE] [--aliyun EXECUTABLE] [--kubectl EXECUTABLE]
 
        campaign-cycle-controller.sh status --work-dir DIR
+
+Fresh and Study inputs must already be produced by monday-cex-prepare.
+The controller verifies completed evidence; missing evidence returns needs_preparation.
 
 The signer is a separate trust boundary. It is invoked as:
   SIGNER --freeze FREEZE_JSON --output SIGNED_REQUEST_JSON
@@ -927,9 +947,8 @@ if [[ ! ("$mode" == "start" && "$fresh_mode" == true && -z "$signer") ]]; then
   command -v "$kubectl_cli" >/dev/null || die "kubectl executable not found"
 fi
 
-# Fresh preparation can publish to an external output prefix. Verify an
-# existing controller state before creating the work directory, logging a
-# preparation stage, or invoking that materializer.
+# Verify existing controller ownership before reading independently prepared inputs.
+# This controller does not run acquisition or materialization.
 validate_initial_research_plan
 if [[ -n "$preparation_ledger" ]]; then
   preparation_ledger="$(cd "$(dirname "$preparation_ledger")" && pwd -P)/$(basename "$preparation_ledger")"
@@ -1070,6 +1089,53 @@ oss_publish_readback() {
   mv -f -- "$partial" "$readback"
 }
 
+# Recheck the data bytes for both a new and an already cached Study handoff.
+verify_study_preparation() {
+  local study_dir="$1" target_horizon_buckets="$2"
+  local target_output_root target_input_root target_campaign_inputs target_report target_request
+  local target_inventory target_materializer_work
+  local -a target_prepare_args
+  target_output_root="$(cd "$study_target_output_root" && pwd -P)" \
+    || die "Study target output root does not exist"
+  target_input_root="$target_output_root/$study_target_output_prefix"
+  target_campaign_inputs="$target_input_root/receipts/campaign-inputs.json"
+  target_report="$study_dir/preparation.json"
+  target_request="$target_output_root/.fresh-inputs/$study_target_output_prefix/request.json"
+  target_inventory="$study_dir/frozen.env"
+  target_materializer_work="$study_dir/materializer"
+  target_prepare_args=(
+    mission verify-prepared-inputs
+    --raw-root "$fresh_raw_root" \
+    --reference-root "$fresh_reference_root" \
+    --market "$fresh_market" \
+    --symbol "$fresh_symbol" \
+    --image-ref "$fresh_image_ref" \
+    --mission-id "$study_target_mission_id" \
+    --start-received-at-ns "$study_target_start_received_at_ns" \
+    --end-received-at-ns "$study_target_end_received_at_ns" \
+    --output-prefix "$study_target_output_prefix" \
+    --bucket-ms "$study_target_bucket_ms" \
+    --label-horizon-buckets "$target_horizon_buckets" \
+    --top-depth "$study_target_top_depth" \
+    --max-scan-entries "$fresh_max_scan_entries" \
+    --max-inputs "$fresh_max_inputs" \
+    --max-input-bytes "$fresh_max_input_bytes" \
+    --inventory-out "$target_inventory" \
+    --request-out "$target_request" \
+    --campaign-inputs-out "$target_campaign_inputs" \
+    --output-root "$target_output_root" \
+    --materializer "$fresh_materializer" \
+    --materializer-work-dir "$target_materializer_work" \
+    --materializer-timeout-seconds "$fresh_materializer_timeout_seconds" \
+    --max-materializer-output-bytes "$fresh_max_materializer_output_bytes" \
+    --report-out "$target_report"
+  )
+  if [[ -n "$fresh_binary_dir" ]]; then
+    target_prepare_args+=(--binary-dir "$fresh_binary_dir")
+  fi
+  verify_completed_preparation study_handoff "$study_dir/preparation.stdout" "$target_report" "$target_request" "$target_campaign_inputs" "${target_prepare_args[@]}"
+}
+
 study_handoff() {
   local generation_dir="$1" dispatch_control="$2"
   local handoff="$generation_dir/study-handoff.json"
@@ -1118,6 +1184,12 @@ study_handoff() {
       || die "saved Study handoff target control is missing"
     [[ "$(sha256_file "$study_target_control")" == "$(jq -er '.target_control_sha256' "$handoff")" ]] \
       || die "saved Study handoff target control changed"
+    # The pinned proposal retains the original typed horizon after its input file is retired.
+    target_horizon_buckets="$(jq -er '.target_horizon.labels.horizon_buckets' "$study_proposal_path")"
+    target_bucket_ms="$(jq -er '.target_horizon.labels.observation_frequency_millis' "$study_proposal_path")"
+    [[ "$target_bucket_ms" == "$study_target_bucket_ms" ]] \
+      || die "saved Study horizon differs from its controller contract"
+    verify_study_preparation "$study_dir" "$target_horizon_buckets"
     return 0
   fi
   [[ -n "$study_id" ]] || die "Study handoff requires --study-id"
@@ -1135,42 +1207,10 @@ study_handoff() {
   target_input_root="$target_output_root/$study_target_output_prefix"
   target_campaign_inputs="$target_input_root/receipts/campaign-inputs.json"
   target_report="$preparation"
-  target_request="$study_dir/fresh-request.json"
+  target_request="$target_output_root/.fresh-inputs/$study_target_output_prefix/request.json"
   target_inventory="$study_dir/frozen.env"
   target_materializer_work="$study_dir/materializer"
-  if [[ ! -s "$target_report" ]]; then
-    target_prepare_args=(
-      mission prepare-fresh-inputs
-      --raw-root "$fresh_raw_root" \
-      --reference-root "$fresh_reference_root" \
-      --market "$fresh_market" \
-      --symbol "$fresh_symbol" \
-      --image-ref "$fresh_image_ref" \
-      --mission-id "$study_target_mission_id" \
-      --start-received-at-ns "$study_target_start_received_at_ns" \
-      --end-received-at-ns "$study_target_end_received_at_ns" \
-      --output-prefix "$study_target_output_prefix" \
-      --bucket-ms "$study_target_bucket_ms" \
-      --label-horizon-buckets "$target_horizon_buckets" \
-      --top-depth "$study_target_top_depth" \
-      --max-scan-entries "$fresh_max_scan_entries" \
-      --max-inputs "$fresh_max_inputs" \
-      --max-input-bytes "$fresh_max_input_bytes" \
-      --inventory-out "$target_inventory" \
-      --request-out "$target_request" \
-      --campaign-inputs-out "$target_campaign_inputs" \
-      --output-root "$target_output_root" \
-      --materializer "$fresh_materializer" \
-      --materializer-work-dir "$target_materializer_work" \
-      --materializer-timeout-seconds "$fresh_materializer_timeout_seconds" \
-      --max-materializer-output-bytes "$fresh_max_materializer_output_bytes" \
-      --report-out "$target_report"
-    )
-    if [[ -n "$fresh_binary_dir" ]]; then
-      target_prepare_args+=(--binary-dir "$fresh_binary_dir")
-    fi
-    "$alpha_harness" "${target_prepare_args[@]}" >"$study_dir/preparation.stdout"
-  fi
+  verify_study_preparation "$study_dir" "$target_horizon_buckets"
   [[ -s "$target_report" && -s "$target_campaign_inputs" ]] \
     || die "Study target materialization did not produce complete evidence"
   jq -e \
@@ -1342,7 +1382,7 @@ if [[ "$mode" == "start" && "$fresh_mode" == true ]]; then
   mkdir -p "$fresh_preparation_dir"
   fresh_preparation_stdout="$fresh_preparation_dir/preparation.stdout"
   fresh_prepare_args=(
-    mission prepare-fresh-inputs
+    mission verify-prepared-inputs
     --raw-root "$fresh_raw_root"
     --reference-root "$fresh_reference_root"
     --market "$fresh_market"
@@ -1384,7 +1424,7 @@ if [[ "$mode" == "start" && "$fresh_mode" == true ]]; then
     "window_start_received_at_ns=$fresh_start_received_at_ns" \
     "window_end_received_at_ns=$fresh_end_received_at_ns" \
     "output_prefix=$fresh_output_prefix"
-  "$alpha_harness" "${fresh_prepare_args[@]}" >"$fresh_preparation_stdout"
+  verify_completed_preparation fresh_inputs "$fresh_preparation_stdout" "$fresh_report_out" "$fresh_request_out" "$campaign_inputs" "${fresh_prepare_args[@]}"
   [[ -s "$fresh_report_out" && -s "$campaign_inputs" ]] \
     || die "fresh input preparation did not produce complete evidence"
   fresh_report_campaign_inputs="$(jq -er '.campaign_inputs_path' "$fresh_report_out")"

@@ -4,9 +4,7 @@ mod market_encoder;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
-use data::binance_lob_replay::{
-    source_revision as governed_source_revision, Market as LobMarket, ReplaySequenceEvent,
-};
+use data::binance_lob_replay::ReplaySequenceEvent;
 use data::binance_market_tape::AggregateTrade;
 use data::binance_market_tape_artifact::{
     seal_binance_market_tape_triplet, verify_binance_market_tape_series_for_strict_gate,
@@ -22,10 +20,12 @@ use hft_collector::binance_usdm_reference_artifact::{
     verify_reference_artifact_read_only_current_batch, PublishedReferenceArtifact,
 };
 use hft_core::{top5_book_features, TOP5_DEPTH};
+use hft_research_manifest::binance::Market as LobMarket;
 use hft_research_manifest::sequence::{
     SequenceDatasetV1, SequenceFrameV1, SequenceInputSpecV1, SequenceShardV1,
     SEQUENCE_DATASET_SCHEMA, SEQUENCE_HORIZONS_MS,
 };
+use hft_research_manifest::source::source_revision as governed_source_revision;
 use hft_research_manifest::{
     CexArtifactTripletV2, CexInstrumentRulesV2, CexPitSeriesEvidenceV2, CexReplaySegmentIdentity,
     CexReplaySeriesV1, CexReplaySnapshotV5, CexSpotInstrumentRulesV1, CexSpotNotionalFilterV1,

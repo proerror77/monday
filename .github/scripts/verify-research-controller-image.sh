@@ -14,14 +14,15 @@ test "$(docker image inspect --format '{{.Config.WorkingDir}}' "$image")" = /wor
 # forward host credentials; even the client version probes have no network.
 docker run --rm --network none --entrypoint /bin/bash "$image" -ceu '
   for tool in bash curl jq tini git gh ruby unzip; do test -x "/usr/bin/$tool"; done
-  for tool in aliyun kubectl alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
+  for tool in aliyun kubectl alpha-harness; do
     test -x "/usr/local/bin/$tool"
   done
-  test -x /usr/local/bin/cex-materialization-entrypoint.sh
+  for forbidden in monday-cex-prepare binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer cex-materialization-entrypoint.sh; do
+    test ! -e "/usr/local/bin/$forbidden"
+  done
   test -x /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
   test -r /opt/monday/deployment/aliyun/research/scripts/campaign-job-watch.sh
   test -r /opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml
-  bash -n /usr/local/bin/cex-materialization-entrypoint.sh
   bash -n /opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh
   bash -n /opt/monday/deployment/aliyun/research/scripts/campaign-job-watch.sh
   test "$(/usr/local/bin/alpha-harness --version)" = "alpha-harness $1"
@@ -45,12 +46,11 @@ cleanup() {
 }
 trap cleanup EXIT
 container_id=$(docker create "$image")
-for binary in alpha-harness binance-market-tape-slicer lob-pit-materializer binance-replay-parquet-materializer; do
+for binary in alpha-harness; do
   docker cp "$container_id:/usr/local/bin/$binary" "$readback/$binary"
   cmp "$readback/$binary" "$binaries/$binary"
 done
 for asset in \
-  'scripts/cex-materialization-entrypoint.sh|/usr/local/bin/cex-materialization-entrypoint.sh' \
   'scripts/campaign-cycle-controller.sh|/opt/monday/deployment/aliyun/research/scripts/campaign-cycle-controller.sh' \
   'scripts/campaign-job-watch.sh|/opt/monday/deployment/aliyun/research/scripts/campaign-job-watch.sh' \
   'k8s/campaign-cycle-controller-job.example.yaml|/opt/monday/deployment/aliyun/research/k8s/campaign-cycle-controller-job.example.yaml'; do

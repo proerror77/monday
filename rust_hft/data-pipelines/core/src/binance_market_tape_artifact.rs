@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::binance_lob_replay::{
-    Market, ReplayBookSnapshot, ReplaySequenceEvent, ReplaySequenceValidator, SourceRowIdentity,
+    ReplayBookSnapshot, ReplaySequenceEvent, ReplaySequenceValidator, SourceRowIdentity,
 };
 use crate::binance_market_tape::{
     event_type_allowed, market_tape_schema, AggregateTrade, AggregateTradeSequenceValidator,
@@ -25,6 +25,7 @@ use crate::binance_market_tape::{
     AGGREGATE_TRADE_SUMMARY_CONTRACT, LOB_CONTINUITY_SUMMARY_CONTRACT, MARKET_TAPE_SCHEMA,
     MARKET_TAPE_SCHEMA_V2, MAX_SOURCE_DELAY_MS,
 };
+use hft_research_manifest::binance::Market;
 
 const REPLAY_SCOPE: &str =
     "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs";

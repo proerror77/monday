@@ -7,7 +7,8 @@
       "lob-pit-materializer",
       "binance-market-tape-slicer",
       "binance-replay-parquet-materializer",
-      "clickhouse-analytics-materializer"
+      "clickhouse-analytics-materializer",
+      "monday-cex-prepare"
     ],
     "prediction-runner": [
       "monday-prediction-research",
@@ -17,10 +18,7 @@
       "monday-prediction-operator"
     ],
     "controller": [
-      "alpha-harness",
-      "lob-pit-materializer",
-      "binance-market-tape-slicer",
-      "binance-replay-parquet-materializer"
+      "alpha-harness"
     ]
   },
   "recipes": [
@@ -57,6 +55,14 @@
         "binance-market-tape-slicer",
         "binance-replay-parquet-materializer",
         "clickhouse-analytics-materializer"
+      ]
+    },
+    {
+      "manifest": "data-pipelines/Cargo.toml",
+      "package": "hft-cex-data-preparation",
+      "features": "",
+      "binaries": [
+        "monday-cex-prepare"
       ]
     },
     {

@@ -3,7 +3,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-# This mode validates only the two independently built CEX products.
+# This mode validates the separate CEX operator, scientific worker and data preparation graphs.
 mode=all
 if (($#)); then
   if [[ $# != 1 || $1 != --cex-products ]]; then
@@ -50,7 +50,16 @@ check_cex_products() {
   if grep -Eq '^(burn|ort |alpha-onnx-evaluator |hft-(infer-onnx|research-ml) )' "$work/cex-operator.tree"; then
     cex_graph_failure 'operator must exclude training and ONNX implementations' "$work/cex-operator.tree"
   fi
+  if grep -Eq '^(hft-collector |clickhouse |hft-data-adapter-|hft-binance-depth )' "$work/cex-operator.tree"; then
+    cex_graph_failure 'operator must exclude acquisition, ClickHouse and venue adapters' "$work/cex-operator.tree"
+  fi
   check_cex_feature operator "$work/cex-operator.tree" alpha-engine llm enabled
+  cargo tree --manifest-path "$root/rust_hft/data-pipelines/Cargo.toml" \
+    -p hft-cex-data-preparation --locked --edges normal --prefix none --color never \
+    --format '{p}|{f}|' >"$work/cex-preparation.tree"
+  if grep -Eq '^(alpha-|burn |ort |hft-(research-platform|research-dispatch-io|research-ml|cex-research-worker|execution-adapter-[a-z-]+) )' "$work/cex-preparation.tree"; then
+    cex_graph_failure 'data preparation must exclude research execution, scheduling and trading' "$work/cex-preparation.tree"
+  fi
 
   cargo tree --manifest-path "$root/rust_hft/research-core/Cargo.toml" \
     -p hft-cex-research-worker --locked --edges normal --prefix none --color never \
@@ -73,7 +82,7 @@ check_cex_products() {
   check_cex_feature worker "$work/cex-worker.tree" alpha-harness default disabled
   check_cex_feature worker "$work/cex-worker.tree" alpha-harness operator disabled
   check_cex_feature worker "$work/cex-worker.tree" alpha-engine llm disabled
-  printf 'CEX operator and scientific worker dependency contracts passed\n'
+  printf 'CEX operator, scientific worker and data preparation dependency contracts passed\n'
 }
 
 if [[ $mode == cex-products ]]; then

@@ -12,11 +12,12 @@ use data::binance_market_tape_artifact::{
     BinanceMarketTapeTrustAnchor, BinanceRawTradeContinuityVerifier,
 };
 use futures::{SinkExt, StreamExt};
+use hft_research_manifest::binance::Market;
 use hft_collector::lob_archiver::{
     bounded_log_error, checkpoint_event, command_status_with_timeout, files_with_suffix,
     read_upload_status,
     recover_parts_from_paths, segment_partition, send_or_shutdown, sha256_file, write_health,
-    write_success_marker, write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget,
+    write_success_marker, write_upload_status, DepthDiff, OrderBookState, PendingBudget,
     QueueHealth, Segment, SegmentArtifacts, SegmentConfig, SendOutcome, SequenceGap, UploadStatus,
     MAX_RECOVERY_ROW_BYTES, RAW_SCHEMA,
 };

@@ -8,7 +8,7 @@ use crate::{
         approved_evaluation_protocol_for_plan, approved_validation,
         validate_render_materialization_scope_for_horizon,
     },
-    mission_runner::{decode_materialization, validate_materialization, MAX_MATERIALIZATION_BYTES},
+    mission_runner::{validate_materialization, MAX_MATERIALIZATION_BYTES},
 };
 use alpha_domain::{
     campaign_control::{
@@ -30,6 +30,7 @@ use alpha_store::{
 use anyhow::{bail, Context};
 use chrono::Utc;
 use ed25519_dalek::VerifyingKey;
+use hft_cex_research_input::materialization::{decode_materialization, Materialization};
 use hft_research_artifacts::identity::canonical_tokyo_oss_internal_object;
 use reqwest::blocking::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -146,7 +147,7 @@ pub(super) fn inspect_binding(
 /// this function alone is never authority to reserve or submit another Job.
 pub(super) fn evaluation_views_for_materialization(
     request: &crate::mission_campaign::CampaignRequest,
-    materialization: &crate::mission_runner::Materialization,
+    materialization: &Materialization,
 ) -> anyhow::Result<(
     alpha_domain::EvaluationProtocolV1,
     CampaignEvaluationViewsV1,

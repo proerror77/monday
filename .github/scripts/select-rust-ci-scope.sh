@@ -1099,7 +1099,7 @@ select_if_affected loop alpha-domain alpha-store alpha-engine alpha-onnx-evaluat
 select_if_affected handoff hft-live
 select_if_affected json hft-integration hft-data-adapter-binance hft-infra-redis hft-live
 select_if_affected ondo hft-data-adapter-ondo-perps hft-execution-adapter-ondo-perps hft-live
-select_if_affected collector hft-collector
+select_if_affected collector hft-collector hft-cex-data-preparation
 select_if_affected focused hft-live hft-paper hft-all-in-one
 if [[ $focused == true && -z $focused_packages ]]; then
   for package in hft-live hft-paper hft-all-in-one alpha-harness hft-harnessctl; do
@@ -1147,11 +1147,11 @@ if is_production_affected ploy-research || is_production_affected hft-prediction
   research_product=$(bash "$products" merge "$research_product" prediction-runner)
   research_image_relevant=true
 fi
-if is_production_affected hft-collector || is_production_affected alpha-harness || is_production_affected hft-cex-research-worker || is_production_affected hft-backtest; then
+if is_production_affected hft-cex-data-preparation || is_production_affected hft-collector || is_production_affected alpha-harness || is_production_affected hft-cex-research-worker || is_production_affected hft-backtest; then
   research_product=$(bash "$products" merge "$research_product" cex-runner)
   research_image_relevant=true
 fi
-if is_production_affected hft-collector || is_production_affected alpha-harness; then
+if is_production_affected alpha-harness; then
   research_product=$(bash "$products" merge "$research_product" controller)
 fi
 # Shared platform changes still validate the independent release tools.

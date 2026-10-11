@@ -183,6 +183,19 @@ symbol/time partitions required by the current run.
 
 ## ACK CEX materialization
 
+Data preparation now runs through the data-owned `monday-cex-prepare` program.
+The controller only verifies completed inputs with
+`alpha-harness mission verify-prepared-inputs`. It never invokes materialization.
+See [the preparation handoff contract](../../../rust_hft/data-pipelines/cex-preparation/README.md)
+for the exact order and retained request paths.
+
+The existing paused data Job templates temporarily use `research-runner`, which
+contains the independently compiled preparation program. No independent data OCI
+product, new archive admission, RAM permission or ACK deployment is activated here.
+The shared image still causes data and scientific software to rebuild together.
+Existing deployed immutable images are unchanged until their own verified cutover.
+
+
 `k8s/cex-materialization-job.example.yaml` is the bounded cloud materialization
 entrypoint for one frozen CEX run identity. It does not enumerate OSS, mutate
 old YAML, or compile Rust in-cluster. The Job:
@@ -333,7 +346,7 @@ deployment/aliyun/research/test-cex-materialization-entrypoint.sh
 ```
 
 Collector manifests may use compact or pretty-printed JSON. The entrypoint uses
-the runner's `alpha-harness data verify-materialization-manifest` command to
+the runner's `monday-cex-prepare verify-materialization-manifest` command to
 check the exact manifest SHA, root market/venue and optional receive-time bounds.
 Nanoseconds remain unsigned integers; duplicate gate fields, wrong types,
 checksum drift and out-of-window raw segments fail before slicing. This metadata
@@ -643,13 +656,16 @@ minimum duration. The materializer still owns checkpoint, stream, sequence,
 and PIT admission; the selection receipt keeps
 `materialized_pit_admitted: false` until that stage succeeds.
 
-The native mission prepare-fresh-inputs step calls the existing collector
+The independent `monday-cex-prepare prepare-fresh-inputs` step calls the collector
 freezer and materializer, then verifies the create-once inventory, campaign
 request identity, campaign receipt, materialization receipt, and local
 feature/materialization/replay hashes. The request identity binds the archive
 roots, receive-time window, output paths, producer image, and all preparation
 limits. A completed preparation is reused on restart, so later archive
-appends cannot change the frozen snapshot or rematerialize it. If a signer is
+appends cannot change the frozen snapshot or rematerialize it. The controller
+verifies those completed inputs through `mission verify-prepared-inputs`. Missing
+or invalid preparation yields `needs_preparation` before signing or dispatch.
+If a signer is
 not supplied, the controller emits needs_authority with the preparation
 identity and stops before signing or dispatch. Supplying the signer and
 matching dispatch control through approve resumes the original
@@ -680,8 +696,11 @@ deployment/aliyun/research/scripts/campaign-cycle-controller.sh start \
   ...
 ```
 
-After the parent ledger settlement, the controller materializes the target
-window and reads back its campaign-inputs receipt, feature, and materialization.
+After the parent ledger settlement, the controller verifies the independently
+prepared target window. The data program must already have produced its request,
+selection, inventory, campaign-inputs receipt, report and output objects. Missing
+or invalid preparation produces `needs_preparation` without consuming the handoff
+or reserving the child family. The controller never materializes this window.
 The proposal binds the receipt hash, mission/output prefix, source segment
 start/end, typed horizon, purge/embargo protocol, and predeclared member
 execution. A missing member, target control, or exact binding produces a
@@ -898,13 +917,13 @@ the target position rather than implicitly creating another full-size trade.
 
 #### Discover and freeze existing collector inputs
 
-`alpha-harness data freeze-inventory` prepares the existing materialization
+`monday-cex-prepare freeze-inventory` prepares the existing materialization
 entrypoint's `frozen.env` from read-only collector archive roots. Supply an
 explicit settled receive-time window, symbol, paired runner image digest,
 materialization policy, output prefix and source-byte budget:
 
 ```bash
-alpha-harness data freeze-inventory \
+monday-cex-prepare freeze-inventory \
   --raw-root /archive/raw --reference-root /archive/usdm-reference \
   --start-received-at-ns 1788739200000000000 \
   --end-received-at-ns 1788825600000000000 \
