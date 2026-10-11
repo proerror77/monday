@@ -166,9 +166,11 @@ command belongs to `hft-prediction-research-operator`. Its independently built
 existing cluster client and explicit context; scientific Jobs do not receive
 cluster credentials.
 
-`hft-research-dispatch-io` owns shared cluster operations and immutable object URL
-identity. It imports no venue, scientific model, scheduler, database, risk or
-execution crate. CEX Campaign and holdout object bindings remain CEX-owned.
+`hft-research-dispatch-io` owns shared cluster operations. Pure immutable object
+URL identity belongs to `hft-research-artifacts`, so workers can validate object
+bindings without importing cluster operations. Dispatch imports no venue,
+scientific model, scheduler, database, risk or execution crate. CEX Campaign and
+holdout object bindings remain CEX-owned.
 The CEX harness contains no Prediction command or Prediction-owned dependency.
 
 `alpha-engine` selects the persistent search kernel and LLM proposals separately.
@@ -187,6 +189,9 @@ remain available to scientific tests, without entering the worker's normal graph
 The worker still consumes shared application, store and control code;
 this feature boundary is one step toward separating the scientific application.
 Its normal graph excludes collector, ClickHouse and venue acquisition adapters.
+Cluster submission, controller and operator entrypoints compile only for the
+operator or its tests. The worker retains pure Job rendering and execution
+binding verification, while its normal graph excludes cluster IO.
 The published operator and worker use separate build recipes. A combined Cargo
 package selection unifies their features and does not verify this boundary.
 

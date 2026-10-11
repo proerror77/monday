@@ -119,7 +119,7 @@ pub(super) fn read(
             512 * 1024 * 1024,
         )?;
         let mission = rounds.join(format!("round-{index}-mission.json"));
-        let url = hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
+        let url = hft_research_artifacts::identity::canonical_tokyo_oss_internal_object(
             "native terminal Mission",
             &planned.mission_readback_url,
         )?;

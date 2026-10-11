@@ -4344,11 +4344,11 @@ fn validate_holdout_claim_binding(
         bail!("CEX result and holdout claim transports must match");
     }
     if put_is_remote {
-        let claim_object = hft_research_dispatch_io::canonical_https_object(
+        let claim_object = hft_research_artifacts::identity::canonical_https_object(
             "CEX holdout claim",
             &args.holdout_claim_put_url,
         )?;
-        let claim_readback_object = hft_research_dispatch_io::canonical_https_object(
+        let claim_readback_object = hft_research_artifacts::identity::canonical_https_object(
             "CEX holdout claim readback",
             &args.holdout_claim_readback_url,
         )?;
@@ -4487,8 +4487,8 @@ fn validate_result_readback_binding(
         result_readback_url.starts_with("http://") || result_readback_url.starts_with("https://");
     let same_object = match (put_is_remote, readback_is_remote) {
         (true, true) => {
-            hft_research_dispatch_io::canonical_https_object("CEX result", result_put_url)?
-                == hft_research_dispatch_io::canonical_https_object(
+            hft_research_artifacts::identity::canonical_https_object("CEX result", result_put_url)?
+                == hft_research_artifacts::identity::canonical_https_object(
                     "CEX result readback",
                     result_readback_url,
                 )?

@@ -390,7 +390,7 @@ pub(crate) fn validate_identity(
     {
         bail!("invalid SOL market encoder cohort identity");
     }
-    hft_research_dispatch_io::validate_dns_label("market encoder input PVC", pvc_name)
+    hft_research_artifacts::identity::validate_dns_label("market encoder input PVC", pvc_name)
 }
 
 pub(crate) fn read_source_index(

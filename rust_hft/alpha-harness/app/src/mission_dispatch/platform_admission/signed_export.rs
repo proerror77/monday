@@ -393,7 +393,7 @@ pub(super) fn transfer_after_export_preflight<T>(
     readback_url: &str,
     transfer: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let result = hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
+    let result = hft_research_artifacts::identity::canonical_tokyo_oss_internal_object(
         "native result",
         native_result_url,
     )?;
@@ -407,7 +407,7 @@ pub(super) fn transfer_after_export_preflight<T>(
     );
     for url in [put_url, readback_url] {
         ensure!(
-            hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
+            hft_research_artifacts::identity::canonical_tokyo_oss_internal_object(
                 "native admission export",
                 url
             )? == expected,

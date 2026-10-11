@@ -267,7 +267,7 @@ pub(super) fn audit(args: PlatformTerminalArgs) -> anyhow::Result<()> {
     // A durable append precedes publication. Retries recover this exact audit
     // and its complete retained content instead of replacing observation time.
     let origin = reqwest::Url::parse(
-        &hft_research_dispatch_io::canonical_tokyo_oss_internal_object(
+        &hft_research_artifacts::identity::canonical_tokyo_oss_internal_object(
             "Campaign result",
             &validated.submission.request.campaign_result_readback_url,
         )?,

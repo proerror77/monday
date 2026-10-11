@@ -1,5 +1,6 @@
 //! Bounded research artifact transport shared by CEX and Prediction workers.
 //! This crate owns no data acquisition, model, market task, or execution adapter.
+pub mod identity;
 pub mod memory;
 
 use anyhow::{bail, Context};

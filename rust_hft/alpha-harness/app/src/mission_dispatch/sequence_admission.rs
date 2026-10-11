@@ -719,6 +719,7 @@ pub(super) fn inspection(
     })
 }
 
+#[cfg(any(feature = "operator", test))]
 fn verify_pvc(request: &StudyRequest, context: &str, namespace: &str) -> anyhow::Result<()> {
     let pvc = kubectl_json(
         &kubectl_binary(),
@@ -761,12 +762,14 @@ fn verify_pvc(request: &StudyRequest, context: &str, namespace: &str) -> anyhow:
     Ok(())
 }
 
+#[cfg(any(feature = "operator", test))]
 struct StudyAdmission<'a> {
     inner: admission::Admission,
     request: &'a StudyRequest,
     context: &'a str,
     namespace: &'a str,
 }
+#[cfg(any(feature = "operator", test))]
 impl DispatchAdmission for StudyAdmission<'_> {
     fn prepare(&mut self) -> anyhow::Result<()> {
         verify_pvc(self.request, self.context, self.namespace)?;
@@ -832,6 +835,7 @@ pub(crate) fn inspect(args: MissionDispatchInspectArgs) -> anyhow::Result<()> {
     print_json(&inspection(&validated, &control, &manifest)?)
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     validate_cluster_target(&args.context, &args.namespace)?;
     let validated = validate(admission::read_json(&args.submission)?)?;
@@ -931,6 +935,7 @@ pub(crate) fn status_report(args: &crate::cli::MissionDispatchStatusArgs) -> any
     )
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(crate) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     validate_cluster_target(&args.context, &args.namespace)?;
     let cache = args
