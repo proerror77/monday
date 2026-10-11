@@ -150,13 +150,15 @@ impl SignedTransport {
         timeout: std::time::Duration,
     ) -> Result<Self> {
         config.validate()?;
-        let session: Session = serde_json::from_slice(&crate::transport::read_private_file(path)?)
-            .map_err(|_| anyhow::anyhow!("invalid private OSS session file"))?;
+        let session: Session =
+            serde_json::from_slice(&hft_research_worker_io::transport::read_private_file(path)?)
+                .map_err(|_| anyhow::anyhow!("invalid private OSS session file"))?;
         session.validate(Utc::now().timestamp_millis())?;
         Ok(Self {
             config: config.clone(),
             session,
-            client: crate::transport::TlsConfig::default().client(timeout, true)?,
+            client: hft_research_worker_io::transport::TlsConfig::default()
+                .client(timeout, true)?,
         })
     }
     fn request(
@@ -270,7 +272,7 @@ impl SignedTransport {
     pub(crate) async fn read(
         request: reqwest::RequestBuilder,
         limit: u64,
-    ) -> Result<crate::transport::BoundedBody> {
+    ) -> Result<hft_research_worker_io::transport::BoundedBody> {
         let response = request
             .send()
             .await
@@ -279,7 +281,7 @@ impl SignedTransport {
             response.status().is_success(),
             "OSS evidence missing or rejected"
         );
-        crate::transport::BoundedBody::new(response, limit)
+        hft_research_worker_io::transport::BoundedBody::new(response, limit)
     }
 }
 
@@ -339,7 +341,7 @@ impl BuildReader {
 mod build_reader_tests {
     use super::*;
     use crate::build::{BuildArtifact, BuildSpec, BuiltExecutable};
-    use crate::orchestrator::Artifact;
+    use hft_research_worker_contracts::task::Artifact;
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -586,7 +588,7 @@ mod build_reader_tests {
             let reader = BuildReader { transport: SignedTransport {
                 config: OssLocation { endpoint: format!("http://{address}/"), ..location() },
                 session: session(&build),
-                client: crate::transport::TlsConfig::default().client(std::time::Duration::from_secs(2), false)?,
+                client: hft_research_worker_io::transport::TlsConfig::default().client(std::time::Duration::from_secs(2), false)?,
             }};
             assert_eq!(reader.verify_build(&build).await.is_ok(), succeeds);
             server.await?;

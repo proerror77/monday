@@ -414,6 +414,7 @@ impl DispatchAdmission for FinalAdmission {
     }
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(super) fn submit(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     validate_cluster_target(&args.context, &args.namespace)?;
     let validated = validate(read_bounded_json(&args.submission)?)?;
@@ -520,6 +521,7 @@ pub(crate) fn validate_worker_dataset_binding(
     Ok(())
 }
 
+#[cfg(any(feature = "operator", test))]
 pub(super) fn settle(args: MissionDispatchSubmitArgs) -> anyhow::Result<()> {
     validate_cluster_target(&args.context, &args.namespace)?;
     let validated = validate(read_bounded_json(&args.submission)?)?;

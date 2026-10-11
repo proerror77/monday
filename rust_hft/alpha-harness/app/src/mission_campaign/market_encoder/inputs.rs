@@ -390,7 +390,7 @@ pub(crate) fn validate_identity(
     {
         bail!("invalid SOL market encoder cohort identity");
     }
-    hft_research_dispatch_io::validate_dns_label("market encoder input PVC", pvc_name)
+    hft_research_artifacts::identity::validate_dns_label("market encoder input PVC", pvc_name)
 }
 
 pub(crate) fn read_source_index(
@@ -691,7 +691,7 @@ pub(crate) fn verify_feature_sources(
         .iter()
         .map(|s| s["sha256"].as_str().context("feature source has no digest"))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let revision = hft_collector::lob_archiver::source_revision(hashes);
+    let revision = data::binance_lob_replay::source_revision(hashes);
     let first_source = sources
         .source_segments
         .iter()

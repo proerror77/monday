@@ -5,14 +5,14 @@ use alpha_domain::campaign_control::*;
 use alpha_store::{AlphaStore, ApprovalRecord};
 use chrono::{TimeDelta, Utc};
 use ed25519_dalek::{Signer, SigningKey};
-use hft_research_platform::{
-    build::*,
-    execution::{Backend, Profile},
-    orchestrator::Artifact,
-    release::*,
-};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use {
+    hft_research_platform::build::*, hft_research_platform::release::*,
+    hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::execution::Profile,
+    hft_research_worker_contracts::task::Artifact,
+};
 
 fn encode(bytes: &[u8]) -> String {
     use std::io::Write;
@@ -32,7 +32,7 @@ fn software(source: &str, image: &str) -> super::released_build::ReadbackBuildRe
     let key = SigningKey::from_bytes(&[20; 32]);
     let blob = |key: String, bytes: &[u8]| Artifact {
         key,
-        sha256: hft_research_platform::sha256(bytes),
+        sha256: hft_research_worker_contracts::sha256(bytes),
         bytes: bytes.len() as u64,
     };
     let source_archive = SourceArchive {
@@ -47,7 +47,7 @@ fn software(source: &str, image: &str) -> super::released_build::ReadbackBuildRe
         schema: 2,
         code_commit: source.into(),
         workspace_manifest: "research-core/Cargo.toml".into(),
-        source_manifest_sha256: hft_research_platform::identity(&source_archive).unwrap(),
+        source_manifest_sha256: hft_research_worker_contracts::identity(&source_archive).unwrap(),
         cargo_lock_sha256: h('a'),
         toolchain_manifest_sha256: h('b'),
         target: "x86_64-unknown-linux-gnu".into(),
@@ -96,7 +96,7 @@ fn software(source: &str, image: &str) -> super::released_build::ReadbackBuildRe
         build,
         image: image.into(),
         executables: vec![executable.clone()],
-        release_receipt_sha256: hft_research_platform::identity(&signed).unwrap(),
+        release_receipt_sha256: hft_research_worker_contracts::identity(&signed).unwrap(),
     };
     let trust = BuildReleaseTrust {
         schema: 1,
@@ -311,7 +311,7 @@ fn exercise_exact_native_task(represented: bool) {
                 &reservation.family_id,
                 entry.receipt.sequence,
                 &entry.object_key(),
-                &hft_research_platform::sha256(&bytes),
+                &hft_research_worker_contracts::sha256(&bytes),
             )
             .unwrap();
     }
@@ -347,7 +347,7 @@ fn exercise_exact_native_task(represented: bool) {
         .unwrap();
     assert!(result.status.success());
     let config = serde_json::to_vec(&json!({"schema_version":"monday.cex_campaign_artifact_io.v1","artifact_gateway":"https://gateway.invalid/","artifact_token_file":"/identity/artifact.token","artifact_tls":{"ca_file":"/config/ca.pem","identity_file":"/identity/tls.pem"}})).unwrap();
-    let native_trust = hft_research_platform::admission::NativeAdmissionTrust {
+    let native_trust = hft_research_worker_contracts::admission::NativeAdmissionTrust {
         schema: "monday.native_reservation_trust.v1".into(),
         native_reservation_keys: [(
             "host-witness".into(),
@@ -526,7 +526,7 @@ fn exercise_exact_native_task(represented: bool) {
         &witness,
     )
     .unwrap();
-    native_trust.verify_revocation(&signed).unwrap();
+    hft_research_platform::revocation::verify_revocation(&native_trust, &signed).unwrap();
     let source = store
         .campaign_platform_terminal_source(&reservation.family_id, &transfer.operation_id)
         .unwrap();
@@ -616,7 +616,9 @@ fn representation_https_canonical_freeze_finalize_binds_exact_request() {
     .unwrap();
     assert_ne!(bound.campaign_id, request.campaign_id);
     assert_ne!(
-        hft_research_platform::sha256(&crate::mission_campaign::serialize_request(&bound).unwrap()),
+        hft_research_worker_contracts::sha256(
+            &crate::mission_campaign::serialize_request(&bound).unwrap()
+        ),
         validated.request_sha256
     );
     assert_eq!(

@@ -1,4 +1,5 @@
-use hft_collector::{acquire_dataset, CandleInterval, DataAcquisitionMission, QualityRequirements};
+use hft_cex_research_input::ohlcv::CandleInterval;
+use hft_collector::{acquire_dataset, DataAcquisitionMission, QualityRequirements};
 use sha2::{Digest, Sha256};
 
 #[tokio::test]

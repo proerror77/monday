@@ -6,10 +6,11 @@ use super::{
 use crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs;
 use alpha_store::campaign_ledger::VerifiedCampaignPlatformBudget;
 use anyhow::{ensure, Context};
-use hft_research_platform::{
-    execution::{Backend, Profile},
-    orchestrator::{TaskKind, TaskSpec},
-    research::{Experiment, Run},
+use {
+    hft_research_platform::research::Experiment, hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::execution::Profile,
+    hft_research_worker_contracts::research::Run, hft_research_worker_contracts::task::TaskKind,
+    hft_research_worker_contracts::task::TaskSpec,
 };
 
 pub(super) struct FixedCampaign {
@@ -175,7 +176,7 @@ pub(super) fn construct(inputs: Inputs<'_>) -> anyhow::Result<FixedCampaign> {
         worker_configuration: Some(configuration.reference().clone()),
     };
     spec.validate()?;
-    run.admit_build(artifact)?;
+    hft_research_platform::research::admit_run_build(&run, artifact)?;
     run.admit(&spec)?;
     Ok(FixedCampaign {
         experiment,

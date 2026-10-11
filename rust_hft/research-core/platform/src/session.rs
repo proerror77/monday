@@ -1712,9 +1712,11 @@ impl ClientToken {
     fn read(&self) -> Result<String> {
         let token = match self {
             Self::Inline(token) => token.clone(),
-            Self::File(path) => String::from_utf8(crate::transport::read_private_file(path)?)?
-                .trim()
-                .to_owned(),
+            Self::File(path) => {
+                String::from_utf8(hft_research_worker_io::transport::read_private_file(path)?)?
+                    .trim()
+                    .to_owned()
+            }
         };
         ensure!(
             (32..=4096).contains(&token.len()),
@@ -1728,14 +1730,14 @@ impl ResearchClient {
         Self::connect(
             endpoint,
             ClientToken::Inline(token),
-            &crate::transport::TlsConfig::default(),
+            &hft_research_worker_io::transport::TlsConfig::default(),
         )
     }
     /// Reload the broker's host-only token on each call, including renewal.
     pub fn from_file(
         endpoint: &str,
         token_file: PathBuf,
-        tls: &crate::transport::TlsConfig,
+        tls: &hft_research_worker_io::transport::TlsConfig,
     ) -> Result<Self> {
         ensure!(
             token_file.is_absolute(),
@@ -1746,7 +1748,7 @@ impl ResearchClient {
     fn connect(
         endpoint: &str,
         token: ClientToken,
-        tls: &crate::transport::TlsConfig,
+        tls: &hft_research_worker_io::transport::TlsConfig,
     ) -> Result<Self> {
         let endpoint = reqwest::Url::parse(endpoint)?;
         ensure!(

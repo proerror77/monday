@@ -1,12 +1,23 @@
 //! Fixed-path private staging for the admitted scientific worker's init container.
-use crate::orchestrator::{worker_configuration_reference, AttemptContext, TaskKind};
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use hft_research_worker_contracts::task::{
+    worker_configuration_reference, AttemptContext, TaskKind,
+};
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
     path::Path,
 };
+
+pub fn attempt_context_from_environment() -> Result<AttemptContext> {
+    let value =
+        std::env::var("MONDAY_ATTEMPT_CONTEXT").context("admitted Attempt context is required")?;
+    ensure!(value.len() <= 64 * 1024, "Attempt context exceeds bound");
+    let context: AttemptContext = serde_json::from_str(&value)?;
+    context.validate()?;
+    Ok(context)
+}
 
 const STATIC_KEYS: [&str; 4] = [
     "campaign.json",
@@ -143,9 +154,9 @@ fn stage_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use hft_research_worker_contracts::{
         execution::{Backend, Profile},
-        orchestrator::{Task, TaskSpec},
+        task::{Lease, TaskSpec},
     };
     use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -203,10 +214,15 @@ mod tests {
             fit_identity_sha256: None,
             worker_configuration: Some(reference.clone()),
         };
-        let mut task = Task::new(spec.clone())?;
         let context = AttemptContext {
+            lease: Lease {
+                task_id: spec.id()?,
+                attempt: 1,
+                fence: 1,
+                owner: "fixture-owner".into(),
+                expires_ms: 2000,
+            },
             spec,
-            lease: task.claim("fixture-owner", 1000, 1000)?,
         };
         stage_at(&context, &source, &late, &destination)?;
         assert_eq!(

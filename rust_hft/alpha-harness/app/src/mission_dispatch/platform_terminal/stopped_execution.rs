@@ -3,12 +3,12 @@
 use anyhow::{ensure, Context};
 use chrono::{DateTime, Utc};
 use hft_research_dispatch_io::{kubectl_binary, kubectl_json};
-use hft_research_platform::{
-    execution::ExecutionHandle,
-    orchestrator::{Lease, TaskSpec},
-};
 use serde_json::Value;
 use std::path::Path;
+use {
+    hft_research_platform::execution::ExecutionHandle, hft_research_worker_contracts::task::Lease,
+    hft_research_worker_contracts::task::TaskSpec,
+};
 
 pub(super) struct VerifiedStoppedExecution {
     pub(super) handle: ExecutionHandle,
@@ -99,7 +99,7 @@ fn verify(
     spec.validate()?;
     handle.validate(lease, spec)?;
     ensure!(
-        spec.kind == hft_research_platform::orchestrator::TaskKind::CexCampaign
+        spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign
             && spec.max_attempts == 1,
         "terminal observer requires exact native Campaign attempt"
     );
@@ -177,7 +177,7 @@ fn verify(
         contexts.len() == 1,
         "terminal Job has ambiguous platform context"
     );
-    let context: hft_research_platform::orchestrator::AttemptContext = serde_json::from_str(
+    let context: hft_research_worker_contracts::task::AttemptContext = serde_json::from_str(
         contexts[0]["value"]
             .as_str()
             .context("terminal context is not text")?,

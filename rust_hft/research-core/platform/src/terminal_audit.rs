@@ -2,10 +2,13 @@
 //! retirement only. It grants no execution, refund, budget or admission.
 //! A receiver must separately verify the fixed PG terminal/native/source/Run,
 //! attempt, fence, UIDs and actual receipt/archive readback before retirement.
-use crate::{admission::NativeAdmissionTrust, identity, valid_digest};
 use anyhow::{ensure, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
+use {
+    crate::identity, crate::valid_digest,
+    hft_research_worker_contracts::admission::NativeAdmissionTrust,
+};
 
 pub const NATIVE_TERMINAL_AUDIT_SCHEMA: &str = "monday.native_terminal_audit_witness.v1";
 
@@ -92,7 +95,7 @@ impl SignedNativeTerminalAuditWitness {
             self.evidence.id()? == self.evidence_sha256,
             "native terminal audit evidence changed"
         );
-        crate::admission::native_signing_bytes(
+        hft_research_worker_contracts::admission::native_signing_bytes(
             NATIVE_TERMINAL_AUDIT_SCHEMA,
             &self.key_id,
             &self.evidence_sha256,
@@ -140,26 +143,24 @@ impl VerifiedNativeTerminalAuditWitness {
         &self.trust_sha256
     }
 }
-impl NativeAdmissionTrust {
-    pub fn verify_terminal_audit(
-        &self,
-        signed: &SignedNativeTerminalAuditWitness,
-    ) -> Result<VerifiedNativeTerminalAuditWitness> {
-        ensure!(
-            signed.evidence.id()? == signed.evidence_sha256,
-            "native terminal audit evidence changed"
-        );
-        let trust_sha256 = self.verify_native_signature(
-            NATIVE_TERMINAL_AUDIT_SCHEMA,
-            &signed.key_id,
-            &signed.evidence_sha256,
-            &signed.signature_hex,
-        )?;
-        Ok(VerifiedNativeTerminalAuditWitness {
-            signed: signed.clone(),
-            trust_sha256,
-        })
-    }
+pub fn verify_terminal_audit(
+    trust: &NativeAdmissionTrust,
+    signed: &SignedNativeTerminalAuditWitness,
+) -> Result<VerifiedNativeTerminalAuditWitness> {
+    ensure!(
+        signed.evidence.id()? == signed.evidence_sha256,
+        "native terminal audit evidence changed"
+    );
+    let trust_sha256 = trust.verify_native_signature(
+        NATIVE_TERMINAL_AUDIT_SCHEMA,
+        &signed.key_id,
+        &signed.evidence_sha256,
+        &signed.signature_hex,
+    )?;
+    Ok(VerifiedNativeTerminalAuditWitness {
+        signed: signed.clone(),
+        trust_sha256,
+    })
 }
 
 #[cfg(test)]
@@ -208,7 +209,7 @@ mod tests {
         let signed = sign_terminal_audit(witness(), "host|audit".into(), &key).unwrap();
         let bytes = serde_json::to_vec(&signed).unwrap();
         let read: SignedNativeTerminalAuditWitness = serde_json::from_slice(&bytes).unwrap();
-        let verified = trust.verify_terminal_audit(&read).unwrap();
+        let verified = crate::terminal_audit::verify_terminal_audit(&trust, &read).unwrap();
         assert_eq!(verified.evidence(), &witness());
         assert_eq!(verified.signed(), &signed);
         assert_eq!(verified.trust_sha256(), identity(&trust).unwrap());
@@ -225,12 +226,12 @@ mod tests {
         let signed = sign_terminal_audit(witness(), "host|audit".into(), &key).unwrap();
         let mut changed = signed.clone();
         changed.evidence.fence += 1;
-        assert!(trust.verify_terminal_audit(&changed).is_err());
+        assert!(crate::terminal_audit::verify_terminal_audit(&trust, &changed).is_err());
         changed.evidence_sha256 = changed.evidence.id().unwrap();
-        assert!(trust.verify_terminal_audit(&changed).is_err());
+        assert!(crate::terminal_audit::verify_terminal_audit(&trust, &changed).is_err());
         let mut alias = signed;
         alias.key_id = "alias".into();
-        assert!(trust.verify_terminal_audit(&alias).is_err());
+        assert!(crate::terminal_audit::verify_terminal_audit(&trust, &alias).is_err());
     }
     #[test]
     fn other_native_purpose_signature_cannot_authorize_terminal_audit() {
@@ -239,7 +240,7 @@ mod tests {
         let mut signed = sign_terminal_audit(witness(), "host|audit".into(), &key).unwrap();
         signed.signature_hex = key
             .sign(
-                &crate::admission::native_signing_bytes(
+                &hft_research_worker_contracts::admission::native_signing_bytes(
                     crate::revocation::NATIVE_REQUEST_REVOCATION_SCHEMA,
                     &signed.key_id,
                     &signed.evidence_sha256,
@@ -250,7 +251,7 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        assert!(trust.verify_terminal_audit(&signed).is_err());
+        assert!(crate::terminal_audit::verify_terminal_audit(&trust, &signed).is_err());
     }
     #[test]
     fn invalid_scope_identity_and_units_cannot_be_signed() {
@@ -285,12 +286,12 @@ mod tests {
         let signed = sign_terminal_audit(witness(), "host|audit".into(), &key).unwrap();
         let mut malformed = signed.clone();
         malformed.signature_hex = "A".repeat(128);
-        assert!(trust.verify_terminal_audit(&malformed).is_err());
+        assert!(crate::terminal_audit::verify_terminal_audit(&trust, &malformed).is_err());
         let mut weak = trust;
         weak.native_reservation_keys
             .insert("host|audit".into(), format!("01{}", "00".repeat(31)));
         malformed = signed;
         malformed.signature_hex = format!("01{}", "00".repeat(63));
-        assert!(weak.verify_terminal_audit(&malformed).is_err());
+        assert!(crate::terminal_audit::verify_terminal_audit(&weak, &malformed).is_err());
     }
 }

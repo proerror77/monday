@@ -2,11 +2,15 @@
 #[cfg(feature = "publisher")]
 use hft_cex_research_input::data::{BlockRef, DataViewSpec, Exit, PublishedView, Split, Window};
 #[cfg(feature = "publisher")]
-use hft_research_platform::{
-    execution::{Acceptance, Backend, Profile},
-    identity,
-    orchestrator::{State, TaskKind, TaskSpec},
-    postgres::{Ledger, BUILD_RELEASE_MIGRATION, MIGRATION, SESSION_DELIVERY_MIGRATION},
+use {
+    hft_research_platform::execution::Acceptance, hft_research_platform::orchestrator::State,
+    hft_research_platform::postgres::Ledger,
+    hft_research_platform::postgres::BUILD_RELEASE_MIGRATION,
+    hft_research_platform::postgres::MIGRATION,
+    hft_research_platform::postgres::SESSION_DELIVERY_MIGRATION,
+    hft_research_worker_contracts::execution::Backend,
+    hft_research_worker_contracts::execution::Profile, hft_research_worker_contracts::identity,
+    hft_research_worker_contracts::task::TaskKind, hft_research_worker_contracts::task::TaskSpec,
 };
 #[cfg(feature = "publisher")]
 mod common;
@@ -144,8 +148,9 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         producer_image: view.producer_image.clone(),
         recipe_sql: None,
     };
-    plan.spec.feature_sql_sha256 =
-        hft_research_platform::sha256(hft_research_platform::preparation::PREPARE_SQL.as_bytes());
+    plan.spec.feature_sql_sha256 = hft_research_worker_contracts::sha256(
+        hft_research_platform::preparation::PREPARE_SQL.as_bytes(),
+    );
     assert!(ledger.register_plan(&plan).await.is_err());
     // Test-only activation fixture. No application path performs this UPDATE.
     sqlx_core::query::query("UPDATE research.authority SET mode='postgres',legacy_quiescence_sha256=$1,migration_receipt_sha256=$2").bind(hash('a')).bind(hash('b')).execute(&pool).await?;
@@ -238,7 +243,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         release_receipt_sha256: hash('a'),
         executables: vec![hft_research_platform::build::BuiltExecutable {
             name: "fixture".into(),
-            blob: hft_research_platform::orchestrator::Artifact {
+            blob: hft_research_worker_contracts::task::Artifact {
                 key: format!("research/builds/{build_id}/fixture"),
                 sha256: hash('b'),
                 bytes: 16,
@@ -305,7 +310,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     sqlx_core::query::query("UPDATE research.authority SET mode='postgres'")
         .execute(&pool)
         .await?;
-    let mut run = hft_research_platform::research::Run {
+    let mut run = hft_research_worker_contracts::research::Run {
         schema: 1,
         experiment_sha256: experiment_sha,
         kind: spec.kind,
@@ -325,7 +330,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     assert!(ledger.submit("fixture", "one", spec.clone()).await.is_err());
     // An old row containing plausible receipt hashes remains audit history,
     // but cannot become current native authority without the signed import.
-    let unsigned_admission = hft_research_platform::orchestrator::Admission {
+    let unsigned_admission = hft_research_worker_contracts::task::Admission {
         schema: 1,
         request_sha256: spec.id()?,
         task_spec: spec.clone(),
@@ -345,16 +350,19 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .submit("fixture", "unsigned-native", spec.clone())
         .await
         .is_err());
-    let admit = |spec: hft_research_platform::orchestrator::TaskSpec| {
+    let admit = |spec: hft_research_worker_contracts::task::TaskSpec| {
         let ledger = &ledger;
         let pool = &pool;
         async move {
-            use hft_research_platform::admission::{NativeAdmission, NativeAdmissionTrust};
+            use {
+                hft_research_worker_contracts::admission::NativeAdmission,
+                hft_research_worker_contracts::admission::NativeAdmissionTrust,
+            };
             let run = ledger
                 .run_for_tenant("fixture", &spec.run_manifest_sha256)
                 .await?;
             let build = ledger.build_artifact(&run.build_artifact_sha256).await?;
-            let a = hft_research_platform::orchestrator::Admission {
+            let a = hft_research_worker_contracts::task::Admission {
                 schema: 1,
                 request_sha256: spec.id()?,
                 task_spec: spec.clone(),
@@ -421,7 +429,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     campaign_spec.profile.acceptance_sha256 = hash('8');
     campaign_spec.profile.worker_secret = Some("static-configuration".into());
     campaign_spec.worker_configuration = Some(
-        hft_research_platform::orchestrator::WorkerConfigurationRef {
+        hft_research_worker_contracts::task::WorkerConfigurationRef {
             schema: "monday.worker_configuration.v1".into(),
             secret_name: "static-configuration".into(),
             secret_uid: "synthetic-source-uid".into(),
@@ -506,7 +514,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     .bind(spec.id()?)
     .fetch_one(&pool)
     .await?;
-    let mut duplicate: hft_research_platform::admission::SignedNativeAdmission =
+    let mut duplicate: hft_research_worker_contracts::admission::SignedNativeAdmission =
         serde_json::from_value(native_row)?;
     let original_operation = duplicate.evidence.operation_sha256.clone();
     let key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
@@ -516,7 +524,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let native_trust = hft_research_platform::admission::NativeAdmissionTrust {
+    let native_trust = hft_research_worker_contracts::admission::NativeAdmissionTrust {
         schema: "monday.native_reservation_trust.v1".into(),
         native_reservation_keys: std::collections::BTreeMap::from([(
             "fixture-native-issuer".into(),
@@ -568,7 +576,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     .bind(second.id()?)
     .fetch_one(&pool)
     .await?;
-    let mut reused: hft_research_platform::admission::SignedNativeAdmission =
+    let mut reused: hft_research_worker_contracts::admission::SignedNativeAdmission =
         serde_json::from_value(second_row)?;
     reused.evidence.operation_sha256 = original_operation;
     let reused = hft_research_platform::admission::sign(
@@ -630,7 +638,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         "fixture Git commit failed"
     );
     let session_config = hft_research_platform::session::SessionConfig {
-        executable_sha256: hft_research_platform::sha256(&std::fs::read(&fixture_binary)?),
+        executable_sha256: hft_research_worker_contracts::sha256(&std::fs::read(&fixture_binary)?),
         executable: fixture_binary,
         workspace,
         native_home: session_root.join("native"),
@@ -757,7 +765,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
             .unwrap()
             .transcript_manifest_sha256
             .clone(),
-        native_state_manifest_sha256: hft_research_platform::sha256(&native_bytes),
+        native_state_manifest_sha256: hft_research_worker_contracts::sha256(&native_bytes),
     };
     assert!(ledger
         .session_checkpoint_for_resume("fixture", &checkpoint.id()?)
@@ -981,7 +989,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     lease = result.task.heartbeat(&lease, result.now_ms, 90_000)?;
     result.commit("fixture_heartbeat").await?;
     result = ledger.lock_next("result-owner", 30000).await?.unwrap();
-    let receipt = hft_research_platform::orchestrator::ResultReceipt {
+    let receipt = hft_research_worker_contracts::task::ResultReceipt {
         task_id: result.task.id.clone(),
         attempt: lease.attempt,
         fence: lease.fence,
@@ -989,7 +997,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         source_sha256: result.task.spec.source_sha256.clone(),
         image: result.task.spec.image.clone(),
         fit_identity_sha256: result.task.spec.fit_identity_sha256.clone(),
-        artifacts: vec![hft_research_platform::orchestrator::Artifact {
+        artifacts: vec![hft_research_worker_contracts::task::Artifact {
             key: format!(
                 "{}/{}/{}/fixture.bin",
                 result.task.spec.output_prefix, result.task.id, lease.attempt
@@ -1104,14 +1112,15 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     let revoke_task = ledger
         .submit("fixture", "source-revoke", revoke_spec.clone())
         .await?;
-    let native: hft_research_platform::admission::SignedNativeAdmission = serde_json::from_value(
-        sqlx_core::query_scalar::query_scalar(
-            "SELECT document FROM research.native_admission_imports WHERE request_sha256=$1",
-        )
-        .bind(&revoke_task)
-        .fetch_one(&pool)
-        .await?,
-    )?;
+    let native: hft_research_worker_contracts::admission::SignedNativeAdmission =
+        serde_json::from_value(
+            sqlx_core::query_scalar::query_scalar(
+                "SELECT document FROM research.native_admission_imports WHERE request_sha256=$1",
+            )
+            .bind(&revoke_task)
+            .fetch_one(&pool)
+            .await?,
+        )?;
     use hft_research_platform::revocation::{
         sign_revocation, NativeRequestRevocation, NATIVE_REQUEST_REVOCATION_SCHEMA,
     };
@@ -1132,7 +1141,10 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         issued_ms: now,
     };
     let witness = |e| {
-        native_trust.verify_revocation(&sign_revocation(e, "fixture-native-issuer".into(), &key)?)
+        hft_research_platform::revocation::verify_revocation(
+            &native_trust,
+            &sign_revocation(e, "fixture-native-issuer".into(), &key)?,
+        )
     };
     // A trusted signature still cannot redirect the original admitted identity.
     for field in 0..5 {
@@ -1386,7 +1398,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
     revoked_view.spec = plan.spec.clone();
     revoked_view.prepared_id = identity(&(&revoke_task, revoke_lease.attempt, revoke_lease.fence))?;
     revoked_view.producer_image = completed.task.spec.image.clone();
-    let receipt = hft_research_platform::orchestrator::ResultReceipt {
+    let receipt = hft_research_worker_contracts::task::ResultReceipt {
         task_id: revoke_task.clone(),
         attempt: revoke_lease.attempt,
         fence: revoke_lease.fence,
@@ -1394,7 +1406,7 @@ async fn postgres_single_authority_claims_idempotency_and_append_only_evidence(
         source_sha256: completed.task.spec.source_sha256.clone(),
         image: completed.task.spec.image.clone(),
         fit_identity_sha256: None,
-        artifacts: vec![hft_research_platform::orchestrator::Artifact {
+        artifacts: vec![hft_research_worker_contracts::task::Artifact {
             key: format!(
                 "{}/{}/{}/{}.mondaybin",
                 completed.task.spec.output_prefix,

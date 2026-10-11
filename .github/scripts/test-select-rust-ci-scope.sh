@@ -242,7 +242,9 @@ end
   shared_base = commit.call
   plan.call('lock-existing-shared-leaf', shared_base, {lock => shared_lock.sub(xml_checksum, 'f' * 64)}, 'broad', event: event)
   plan.call('gate-change', full, {source => current[source] + "// edit\n", lib => ungated_lib}, 'broad', event: event, selected_paths: [source])
-  plan.call('consumer-publisher', full, {source => current[source] + "// edit\n", consumer => current[consumer].sub('features = ["artifact-io",', 'features = ["publisher", "artifact-io",')}, 'broad', event: event, selected_paths: [source])
+  publisher_consumer = current[consumer].sub('features = ["native-admission",', 'features = ["publisher", "native-admission",')
+  raise 'publisher consumer fixture did not change the active dependency' if publisher_consumer == current[consumer]
+  plan.call('consumer-publisher', full, {source => current[source] + "// edit\n", consumer => publisher_consumer}, 'broad', event: event, selected_paths: [source])
   plan.call('consumer-feature-publisher', full, {source => current[source] + "// edit\n", consumer => current[consumer].sub("[features]\n", "[features]\npublisher-client = [\"hft-research-platform/publisher\"]\n")}, 'broad', event: event, selected_paths: [source])
   plan.call('consumer-alias-publisher', full, {source => current[source] + "// edit\n", consumer => current[consumer].sub('hft-research-platform = { path', 'platform-client = { package = "hft-research-platform", path').sub("[features]\n", "[features]\npublisher-client = [\"platform-client?/publisher\"]\n")}, 'broad', event: event, selected_paths: [source])
   workspace_alias = "[workspace]\n[workspace.dependencies]\nplatform-client = { package = \"hft-research-platform\", path = \"research-core/platform\" }\n"

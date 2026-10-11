@@ -124,8 +124,20 @@ The shared owner includes `hft-cex-research-input`: immutable CEX DataView contr
 bounded binary decoding, and verified batch reuse. Backtest and control consume
 this crate directly. SQL plans and HTTPS acquisition remain in the control
 implementation; the input crate has no database or provider dependency.
+Frozen feature-matrix and OHLCV trace contracts, their point-in-time validation,
+and content-addressed feature import also belong to this input crate. Collector
+and scientific workers use that single implementation. Network acquisition and
+inventory discovery remain in collector and the operator feature.
 Prediction event/settlement inputs remain in their prediction owner. A shared
 Cargo owner does not make CEX time-horizon labels valid for event settlement.
+
+The explicit `feature-jsonl` input feature owns the existing PIT JSONL types,
+validation and IO. Materializers and CEX consumers use this single implementation.
+It preserves historical v2 reads, v3 writes, byte identity and PIT clocks.
+The feature does not include acquisition, providers or database dependencies.
+The CEX worker retains the shared app, store, data protocols and worker
+verification/IO crates. Its normal graph excludes collector telemetry,
+acquisition adapters, the control application and cluster dispatch.
 
 `hft-prepared-market-io` is the shared owner of bounded numerical Parquet IO.
 Its feature/target shard writers and `FeatureParquetReader`/`TargetParquetReader`
@@ -162,10 +174,21 @@ command belongs to `hft-prediction-research-operator`. Its independently built
 existing cluster client and explicit context; scientific Jobs do not receive
 cluster credentials.
 
-`hft-research-dispatch-io` owns shared cluster operations and immutable object URL
-identity. It imports no venue, scientific model, scheduler, database, risk or
-execution crate. CEX Campaign and holdout object bindings remain CEX-owned.
+`hft-research-dispatch-io` owns shared cluster operations. Pure immutable object
+URL identity belongs to `hft-research-artifacts`, so workers can validate object
+bindings without importing cluster operations. Dispatch imports no venue,
+scientific model, scheduler, database, risk or execution crate. CEX Campaign and
+holdout object bindings remain CEX-owned.
 The CEX harness contains no Prediction command or Prediction-owned dependency.
+
+`hft-research-worker-contracts` owns the shared task, lease, Run, native admission
+and result wire identities, including their strict receiver validation. It has
+no transport, database or scheduler dependency. `hft-research-worker-io` owns
+bounded archive verification, private configuration staging and the existing
+Attempt-scoped HTTPS artifact writer. It consumes those contracts directly.
+The control platform owns signature issuance, PG import, Task state transitions,
+checkpoint staging and provider clients. Both consumers use the single contract
+implementation; the platform does not export compatibility aliases.
 
 `alpha-engine` selects the persistent search kernel and LLM proposals separately.
 The `kernel` feature includes the original budgeted search implementation. The
@@ -180,8 +203,16 @@ operator CLI, legacy loop controller, data preparation and approval commands.
 It retains `kernel` and `fitting`, frozen input checks, native Campaign execution,
 independent final evaluation and result readback. Governance handoff helpers
 remain available to scientific tests, without entering the worker's normal graph.
-The worker still consumes shared application, collector, store and control code;
-this feature boundary is one step toward separating the scientific application.
+The worker still consumes shared application and scientific store code.
+Its normal graph excludes collector, ClickHouse, venue acquisition adapters and
+the control platform application. Native signature, lease, budget and result
+bindings are verified through the shared worker contracts and IO.
+Cluster submission, controller and operator entrypoints compile only for the
+operator or its tests. The worker retains pure Job rendering and execution
+binding verification, while its normal graph excludes cluster IO.
+Representation identities still bind their input algorithms and materializer
+sources. Removing unrelated application dependencies does not remove that
+scientific provenance or prevent those inputs from invalidating a build.
 The published operator and worker use separate build recipes. A combined Cargo
 package selection unifies their features and does not verify this boundary.
 
