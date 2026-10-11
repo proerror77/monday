@@ -86,16 +86,30 @@ impl TlsConfig {
     }
 }
 /// Bounds accepted application payload. HTTP/TLS buffering can receive extra wire bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BodyReadError {
+    PayloadLimitExceeded,
+    Interrupted,
+}
+impl std::fmt::Display for BodyReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PayloadLimitExceeded => "response payload exceeds reservation",
+            Self::Interrupted => "bounded response interrupted",
+        })
+    }
+}
+impl std::error::Error for BodyReadError {}
+
 pub struct BoundedBody {
     response: Option<reqwest::Response>,
     remaining: u64,
 }
 impl BoundedBody {
     pub fn new(response: reqwest::Response, limit: u64) -> Result<Self> {
-        ensure!(
-            response.content_length().is_none_or(|n| n <= limit),
-            "response content length exceeds payload reservation"
-        );
+        if response.content_length().is_some_and(|n| n > limit) {
+            return Err(BodyReadError::PayloadLimitExceeded.into());
+        }
         Ok(Self {
             response: Some(response),
             remaining: limit,
@@ -117,11 +131,11 @@ impl BoundedBody {
             }
             Ok(Some(_)) => {
                 self.response.take();
-                anyhow::bail!("response payload exceeds reservation")
+                Err(BodyReadError::PayloadLimitExceeded.into())
             }
             Err(_) => {
                 self.response.take();
-                anyhow::bail!("bounded response interrupted")
+                Err(BodyReadError::Interrupted.into())
             }
         }
     }
@@ -190,16 +204,44 @@ mod tests {
         let declared =
             response(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678")
                 .await?;
-        assert!(BoundedBody::new(declared, 4).is_err());
+        let error = BoundedBody::new(declared, 4).err().unwrap();
+        assert_eq!(
+            error.downcast_ref::<BodyReadError>(),
+            Some(&BodyReadError::PayloadLimitExceeded)
+        );
         let chunked=response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\n12345678\r\n0\r\n\r\n").await?;
         let mut body = BoundedBody::new(chunked, 4)?;
-        assert!(body.chunk().await.is_err());
+        let error = body.chunk().await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<BodyReadError>(),
+            Some(&BodyReadError::PayloadLimitExceeded)
+        );
         assert!(body.chunk().await?.is_none());
         let valid =
             response(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n1234")
                 .await?;
         let mut body = BoundedBody::new(valid, 4)?;
         assert_eq!(body.chunk().await?, Some(b"1234".to_vec()));
+        assert!(body.chunk().await?.is_none());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn interrupted_body_remains_distinct_from_payload_overflow() -> Result<()> {
+        let response =
+            response(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nshort")
+                .await?;
+        let mut body = BoundedBody::new(response, 8)?;
+        let error = loop {
+            match body.chunk().await {
+                Err(error) => break error,
+                Ok(Some(_)) => {}
+                Ok(None) => anyhow::bail!("truncated HTTP body completed successfully"),
+            }
+        };
+        assert_eq!(
+            error.downcast_ref::<BodyReadError>(),
+            Some(&BodyReadError::Interrupted)
+        );
         assert!(body.chunk().await?.is_none());
         Ok(())
     }
