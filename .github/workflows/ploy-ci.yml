@@ -8,12 +8,12 @@ on:
   workflow_dispatch:
     inputs:
       research_cache_probe:
-        description: Re-run the exact research recipes in the same ephemeral target
+        description: Compare serial and bounded-parallel recipes with the same warmed dependencies
         type: boolean
         default: false
 
 concurrency:
-  group: prediction-markets-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  group: prediction-markets-${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'research-cache-probe-' || '' }}${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -52,11 +52,24 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: >-
-          ../../.github/scripts/select-rust-ci-scope.sh
-          --event "${GITHUB_EVENT_NAME}"
-          --base "${BASE_SHA}"
-          --head "${HEAD_SHA}"
+          RESEARCH_CACHE_PROBE: ${{ inputs.research_cache_probe }}
+        run: |
+          set -euo pipefail
+          case "${RESEARCH_CACHE_PROBE:-}" in
+            true)
+              [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || {
+                echo 'Research cache probes require workflow_dispatch' >&2; exit 2;
+              }
+              product=$(bash ../../.github/scripts/research-release-products.sh normalize all)
+              printf '%s\n' 'jobs=,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,' \
+                "research_product=$product" 'selection_complete=true' >> "$GITHUB_OUTPUT"
+              ;;
+            false|'')
+              ../../.github/scripts/select-rust-ci-scope.sh \
+                --event "${GITHUB_EVENT_NAME}" --base "${BASE_SHA}" --head "${HEAD_SHA}"
+              ;;
+            *) echo 'Invalid research cache probe input' >&2; exit 2 ;;
+          esac
 
   image-smoke-scope:
     name: Research image smoke scope
@@ -1029,7 +1042,7 @@ jobs:
 
 
   prediction-markets-gate:
-    name: Prediction Markets CI gate
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'Research build A/B diagnostic gate' || 'Prediction Markets CI gate' }}
     needs:
       - image-smoke-selector
       - image-smoke-scope
