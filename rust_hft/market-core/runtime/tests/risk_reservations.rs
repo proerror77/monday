@@ -780,3 +780,30 @@ async fn unknown_strategy_cannot_be_assumed_outside_a_portfolio_budget() {
         .is_err());
     assert!(h.worker.receive_envelopes().is_empty());
 }
+
+#[tokio::test]
+async fn foreign_order_without_client_identity_blocks_new_admission() {
+    let mut h = Harness::new(8);
+    let foreign = OrderId("foreign-without-client-id".into());
+    h.event(ExecutionEvent::OrderNew {
+        order_id: foreign.clone(),
+        client_order_id: None,
+        account_id: Some(AccountId("account".into())),
+        symbol: Symbol::new("BTCUSDT"),
+        side: Side::Buy,
+        quantity: Quantity(Decimal::ONE),
+        requested_price: Some(Price(Decimal::from(60))),
+        arrival_price: None,
+        timestamp: now_micros(),
+        venue: Some(VenueId::BINANCE),
+        strategy_id: "foreign".into(),
+    })
+    .await;
+    assert_eq!(
+        h.engine.lock().await.export_oms_state()[&foreign].status,
+        OrderStatus::New
+    );
+    assert!(h.submit("ETHUSDT", Side::Buy, 60).await.is_err(),
+        "the foreign open order lacks an admission binding and must not be treated as zero exposure");
+    assert!(h.worker.receive_envelopes().is_empty());
+}

@@ -363,6 +363,14 @@ impl RiskReservations {
                     self.recovery_required = true;
                 }
             }
+            ExecutionEvent::OrderNew {
+                client_order_id: None,
+                ..
+            } => {
+                // OMS accepted a submitted order, but no admission identity can bind it.
+                // Keep any queued reservations and reject further admission until recovery.
+                self.recovery_required = true;
+            }
             ExecutionEvent::OrderReject { order_id, .. } => {
                 self.checkpoint.queued.remove(&order_id.0);
                 if order.is_none_or(|order| {
