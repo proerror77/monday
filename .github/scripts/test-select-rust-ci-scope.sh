@@ -131,6 +131,7 @@ platform = 'rust_hft/research-core/platform/Cargo.toml'
 lock = 'rust_hft/research-core/platform/Cargo.lock'
 lib = 'rust_hft/research-core/platform/src/lib.rs'
 source = 'rust_hft/research-core/platform/src/release_oss.rs'
+shared_source = 'rust_hft/research-core/platform/src/build_objects.rs'
 consumer = 'rust_hft/alpha-harness/app/Cargo.toml'
 recipe = '.github/scripts/research-release-products.json'
 def check(value, message)
@@ -156,6 +157,11 @@ git('config', 'user.name', 'CI scope contract')
 git('config', 'user.email', 'ci@example.invalid')
 current = [platform, lock, lib, consumer, recipe].map { |p| [p, File.read(File.join(root, p))] }.to_h
 current[source] = "// publisher source fixture\n"
+current[shared_source] = "// shared OSS transport and Build reader fixture\n"
+publisher_gate = "#[cfg(feature = \"publisher\")]\npub mod release_oss;"
+check(current[lib].include?(publisher_gate), 'publisher gate fixture no longer matches the real module boundary')
+ungated_lib = current[lib].sub(publisher_gate, 'pub mod release_oss;')
+check(ungated_lib != current[lib], 'publisher gate removal fixture made no change')
 dependency = Tomlrb.parse(current[platform]).fetch('dependencies').fetch('roxmltree')
 next_version = dependency.fetch('version').sub(/\d+\z/) { |v| (v.to_i + 1).to_s }
 xml_package = Tomlrb.parse(current[lock]).fetch('package').find { |p| p.fetch('name') == 'roxmltree' }
@@ -206,6 +212,7 @@ end
 %w[pull_request push].each do |event|
   plan.call('xml-addition', base, current.select { |p, _| [platform, lock, source].include?(p) }, 'publisher', event: event)
   plan.call('source-only', full, {source => current[source] + "// XML parser edit\n"}, 'publisher', event: event)
+  plan.call('shared-oss-reader', full, {shared_source => current[shared_source] + "// signed read change\n"}, 'broad', event: event)
   plan.call('manifest-only', full, {platform => changed_manifest}, 'publisher', event: event)
   plan.call('lock-only', full, {lock => current[lock].sub(xml_checksum, 'f' * 64)}, 'publisher', event: event)
   {
@@ -234,7 +241,7 @@ end
   write.call(lock, shared_lock)
   shared_base = commit.call
   plan.call('lock-existing-shared-leaf', shared_base, {lock => shared_lock.sub(xml_checksum, 'f' * 64)}, 'broad', event: event)
-  plan.call('gate-change', full, {source => current[source] + "// edit\n", lib => current[lib].sub("#[cfg(feature = \"publisher\")]\npub mod release_oss;", 'pub mod release_oss;')}, 'broad', event: event, selected_paths: [source])
+  plan.call('gate-change', full, {source => current[source] + "// edit\n", lib => ungated_lib}, 'broad', event: event, selected_paths: [source])
   plan.call('consumer-publisher', full, {source => current[source] + "// edit\n", consumer => current[consumer].sub('features = ["artifact-io",', 'features = ["publisher", "artifact-io",')}, 'broad', event: event, selected_paths: [source])
   plan.call('consumer-feature-publisher', full, {source => current[source] + "// edit\n", consumer => current[consumer].sub("[features]\n", "[features]\npublisher-client = [\"hft-research-platform/publisher\"]\n")}, 'broad', event: event, selected_paths: [source])
   plan.call('consumer-alias-publisher', full, {source => current[source] + "// edit\n", consumer => current[consumer].sub('hft-research-platform = { path', 'platform-client = { package = "hft-research-platform", path').sub("[features]\n", "[features]\npublisher-client = [\"platform-client?/publisher\"]\n")}, 'broad', event: event, selected_paths: [source])
@@ -1317,7 +1324,7 @@ if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; t
 grep -Fq 'ci-owner-cache.sh" cleanup' <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
-grep -Fqx "  group: prediction-markets-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
+grep -Fqx "  group: prediction-markets-\${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'research-cache-probe-' || '' }}\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
 grep -Fqx "  cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" "$ploy_workflow"
 [[ $(grep -Fxc '    branches: [main, develop]' "$ploy_workflow") -eq 2 ]]
 if sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$ploy_workflow" \
@@ -1542,7 +1549,7 @@ grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea186
 grep -Fqx '          EXPECTED_JOBS: ${{ needs.scope.outputs.jobs }}' "$ci_workflow"
 grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh --job-prefix ci --expected-jobs \"\$EXPECTED_JOBS\"" "$ci_workflow"
 grep -Fqx '  prediction-markets-gate:' "$ploy_workflow"
-grep -Fqx '    name: Prediction Markets CI gate' "$ploy_workflow"
+grep -Fqx "    name: \${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'Research build A/B diagnostic gate' || 'Prediction Markets CI gate' }}" "$ploy_workflow"
 grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0' "$ploy_workflow"
 grep -Fqx '          EXPECTED_JOBS: ${{ needs.research-image-scope.outputs.jobs }}' "$ploy_workflow"
 grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh --job-prefix ploy --expected-jobs \"\$EXPECTED_JOBS\"" "$ploy_workflow"
