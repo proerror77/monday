@@ -183,15 +183,40 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     let ingester = engine.create_event_ingester_pair();
     let received = now_micros();
     let cex = hft_core::OrderId("unrelated-cex".into());
+    // Build the unrelated position through the same approval and queue boundary.
+    // An unbound OrderNew is unknown submission evidence and must halt admission.
+    engine.set_execution_price_protection(std::collections::HashMap::from([(
+        VenueId::BYBIT,
+        ports::ExecutionPriceProtection::VenueQuote,
+    )]));
+    let cex_envelope = ports::OrderIntentEnvelope::new(
+        ports::OrderIntent::crypto_spot(
+            Symbol::new("BTCUSDT"),
+            hft_core::Side::Buy,
+            Quantity(Decimal::ONE),
+            hft_core::OrderType::Limit,
+            Some(Price(Decimal::from(10))),
+            hft_core::TimeInForce::GTC,
+            "unrelated-cex".into(),
+            Some(VenueId::BYBIT),
+        ),
+        ports::OrderIntentLifecycle::new(received, u64::MAX),
+    )
+    .with_account_id(hft_core::AccountId("paper-account".into()));
+    engine
+        .submit_order_intent_envelope(cex_envelope, received, None)
+        .unwrap();
+    let cex_admitted = reader.receive_envelopes();
+    assert_eq!(cex_admitted.len(), 1);
     reader
         .send_event(ports::ExecutionEvent::OrderNew {
             order_id: cex.clone(),
-            client_order_id: Some("existing-cex-client".into()),
+            client_order_id: Some(cex_admitted[0].client_order_id.clone()),
             account_id: Some(hft_core::AccountId("paper-account".into())),
             symbol: Symbol::new("BTCUSDT"),
             side: hft_core::Side::Buy,
             quantity: Quantity(Decimal::ONE),
-            requested_price: Some(Price(Decimal::from(100))),
+            requested_price: cex_admitted[0].intent.price,
             arrival_price: None,
             timestamp: received,
             venue: Some(VenueId::BYBIT),
@@ -201,7 +226,7 @@ async fn configured_probability_runs_through_shared_engine_risk_oms_and_queue() 
     reader
         .send_event(ports::ExecutionEvent::Fill {
             order_id: cex.clone(),
-            price: Price(Decimal::from(100)),
+            price: cex_admitted[0].intent.price.unwrap(),
             quantity: Quantity(Decimal::ONE),
             timestamp: received,
             fill_id: "existing-cex-fill".into(),
