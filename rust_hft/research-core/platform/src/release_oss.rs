@@ -1,4 +1,5 @@
 //! Release-only OSS transport. Scientific AttemptWriter remains PG fenced.
+use crate::release_budget::{self as budget, Ledger, Phase, Service};
 use anyhow::{ensure, Result};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -89,6 +90,8 @@ pub struct Session {
     pub prefixes: Vec<String>,
     #[serde(default)]
     pub versions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub budget: Option<budget::Reference>,
 }
 impl Session {
     pub fn validate(&self, now: i64) -> Result<()> {
@@ -119,7 +122,7 @@ impl Session {
         Ok(())
     }
 }
-fn exact_prefix(p: &str) -> bool {
+pub(crate) fn exact_prefix(p: &str) -> bool {
     p.strip_prefix("research/sources/")
         .and_then(|s| s.strip_suffix('/'))
         .is_some_and(|s| {
@@ -160,9 +163,16 @@ pub struct Oss {
     config: OssConfig,
     session: Session,
     client: reqwest::Client,
+    budget: Option<Ledger>,
 }
 impl Oss {
     pub fn from_file(config: &OssConfig, path: &Path) -> Result<Self> {
+        Self::load(config, path, false)
+    }
+    pub fn from_reader_file(config: &OssConfig, path: &Path) -> Result<Self> {
+        Self::load(config, path, true)
+    }
+    fn load(config: &OssConfig, path: &Path, independent_reader: bool) -> Result<Self> {
         config.validate()?;
         let session: Session = serde_json::from_slice(&crate::transport::read_private_file(path)?)
             .map_err(|_| anyhow::anyhow!("invalid private OSS session file"))?;
@@ -171,9 +181,30 @@ impl Oss {
             session.prefixes.iter().all(|p| config.admits_prefix(p)),
             "session exceeds publication namespaces"
         );
+        let budget = session
+            .budget
+            .as_ref()
+            .map(Ledger::from_reference)
+            .transpose()?;
+        if let Some(budget) = &budget {
+            budget.require_session(
+                session.publisher,
+                &session.prefixes,
+                &crate::identity(config)?,
+            )?;
+        }
+        ensure!(
+            if independent_reader {
+                !session.publisher && budget.is_none()
+            } else {
+                budget.is_some()
+            },
+            "CI requires a private budget; independent import requires a reader session"
+        );
         Ok(Self {
             config: config.clone(),
             session,
+            budget,
             client: crate::transport::TlsConfig::default()
                 .client(std::time::Duration::from_secs(120), true)?,
         })
@@ -211,6 +242,7 @@ impl Oss {
         ]);
         if method == reqwest::Method::PUT {
             headers.insert("x-oss-forbid-overwrite", "true".into());
+            headers.insert("x-oss-storage-class", "Standard".into());
         }
         let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
         let canonical = format!(
@@ -273,26 +305,77 @@ impl Oss {
         );
         Ok(())
     }
-    pub async fn get(&self, key: &str, version: Option<&str>) -> Result<reqwest::Response> {
-        self.request(
+    fn ledger(&self) -> Result<&Ledger> {
+        self.budget.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("OSS request requires a cumulative private budget ledger")
+        })
+    }
+    pub fn begin_publication(&self, inventory: &budget::Inventory) -> Result<()> {
+        self.ledger()?.require_inventory(inventory)?;
+        self.ledger()?.claim("publication")
+    }
+    pub fn complete_publication(&self) -> Result<()> {
+        self.ledger()?.claim("publication_ready")
+    }
+    fn reserve(&self, service: Service, key: &str, request: u64, response: u64) -> Result<()> {
+        self.session.validate(Utc::now().timestamp_millis())?;
+        self.ledger()?.reserve(
+            if self.session.publisher {
+                Phase::Publish
+            } else {
+                Phase::Source
+            },
+            service,
+            key,
+            request,
+            response,
+        )
+    }
+    pub async fn get(
+        &self,
+        key: &str,
+        version: Option<&str>,
+        limit: u64,
+    ) -> Result<crate::transport::BoundedBody> {
+        ensure!(
+            limit > 0 && limit <= 512 * 1024 * 1024,
+            "OSS read payload bound required"
+        );
+        let request = self.request(
             reqwest::Method::GET,
             key,
             version.or_else(|| self.session.versions.get(key).map(String::as_str)),
-        )?
-        .send()
-        .await
-        .map_err(|_| anyhow::anyhow!("OSS read unavailable"))?
-        .error_for_status()
-        .map_err(|_| anyhow::anyhow!("OSS evidence missing or rejected"))
-    }
-    async fn require_unversioned_bucket(&self) -> Result<()> {
-        let mut response = self
-            .request(reqwest::Method::GET, "", None)?
+        )?;
+        if self.budget.is_some() {
+            self.reserve(
+                Service::OssRead,
+                key,
+                0,
+                limit.max(budget::SMALL_RESPONSE_LIMIT),
+            )?;
+        } else {
+            self.require_reader()?;
+        }
+        let response = request
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("OSS versioning read unavailable"))?
-            .error_for_status()
-            .map_err(|_| anyhow::anyhow!("OSS versioning read denied"))?;
+            .map_err(|_| anyhow::anyhow!("OSS read unavailable"))?;
+        ensure!(
+            response.status().is_success(),
+            "OSS evidence missing or rejected"
+        );
+        crate::transport::BoundedBody::new(response, limit)
+    }
+    async fn require_unversioned_bucket(&self) -> Result<()> {
+        let request = self.request(reqwest::Method::GET, "", None)?;
+        self.reserve(Service::OssRead, "", 0, VERSIONING_RESPONSE_LIMIT as u64)?;
+        let response = request
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("OSS versioning read unavailable"))?;
+        ensure!(response.status().is_success(), "OSS versioning read denied");
+        let mut response =
+            crate::transport::BoundedBody::new(response, VERSIONING_RESPONSE_LIMIT as u64)?;
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -307,12 +390,39 @@ impl Oss {
         }
         require_unversioned_response(&bytes)
     }
-    pub async fn put(&self, key: &str, body: reqwest::Body, size: u64) -> Result<()> {
+    pub async fn put_file(&self, key: &str, path: &Path, size: u64) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        ensure!(
+            (1..=512 * 1024 * 1024).contains(&size),
+            "OSS upload payload exceeds object bound"
+        );
+        let file = tokio::fs::File::open(path).await?;
+        ensure!(
+            file.metadata().await?.is_file() && file.metadata().await?.len() == size,
+            "OSS upload file changed before send"
+        );
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(
+            file.take(size),
+            64 * 1024,
+        ));
+        self.put(key, body, size).await
+    }
+    pub async fn put_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        ensure!(
+            !bytes.is_empty() && bytes.len() as u64 <= budget::JSON_LIMIT,
+            "OSS metadata exceeds payload bound"
+        );
+        let size = bytes.len() as u64;
+        self.put(key, bytes.into(), size).await
+    }
+    async fn put(&self, key: &str, body: reqwest::Body, size: u64) -> Result<()> {
         self.require_unversioned_bucket().await?;
-        let response = self
+        let request = self
             .request(reqwest::Method::PUT, key, None)?
             .header(reqwest::header::CONTENT_LENGTH, size)
-            .body(body)
+            .body(body);
+        self.reserve(Service::OssWrite, key, size, budget::SMALL_RESPONSE_LIMIT)?;
+        let response = request
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("OSS upload unavailable"))?;
@@ -321,16 +431,22 @@ impl Oss {
             response.status().is_success() || response.status() == reqwest::StatusCode::CONFLICT,
             "OSS upload rejected"
         );
+        let mut response =
+            crate::transport::BoundedBody::new(response, budget::SMALL_RESPONSE_LIMIT)?;
+        while response.chunk().await?.is_some() {}
         Ok(())
     }
     pub async fn check(&self, source: &str) -> Result<()> {
+        ensure!(
+            !self.session.publisher,
+            "OSS preflight requires source-reader session"
+        );
+        self.ledger()?.claim("preflight")?;
         self.require_unversioned_bucket().await?;
-        let response = self
-            .request(
-                reqwest::Method::HEAD,
-                &format!("research/sources/{source}/source.tar"),
-                None,
-            )?
+        let key = format!("research/sources/{source}/source.tar");
+        let request = self.request(reqwest::Method::HEAD, &key, None)?;
+        self.reserve(Service::OssRead, &key, 0, 0)?;
+        let response = request
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("OSS TLS unavailable"))?;
@@ -338,6 +454,7 @@ impl Oss {
             response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND,
             "OSS authenticated preflight rejected"
         );
+        self.ledger()?.claim("preflight_ready")?;
         Ok(())
     }
 }
@@ -449,6 +566,7 @@ mod tests {
             expires_ms: 1001,
             publisher: false,
             versions: BTreeMap::new(),
+            budget: None,
             prefixes: vec![format!("research/builds/{}/", "a".repeat(64))],
         };
         assert!(session.validate(1000).is_ok());
@@ -646,11 +764,30 @@ mod tests {
             publisher: true,
             prefixes: expected.clone(),
             versions: BTreeMap::new(),
+            budget: None,
         };
         let save = |session: &Session| {
             std::fs::write(&path, serde_json::to_vec(session).unwrap()).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         };
+        save(&session);
+        assert!(Oss::from_file(&config(), &path).is_err());
+        assert!(Oss::from_reader_file(&config(), &path).is_err());
+        let (binding, mut inventory, mut envelope) =
+            crate::release_budget::tests::fixture("controller", 1, 1);
+        inventory.publisher_prefixes = expected.clone();
+        inventory.program_objects[0].key = format!("{}program", expected[0]);
+        envelope.limits = inventory.publication_limits().unwrap();
+        envelope.allocations[0].limits = envelope.limits;
+        let ledger = Ledger::create(
+            &path.with_file_name("ledger"),
+            envelope,
+            binding,
+            inventory,
+            crate::identity(&config()).unwrap(),
+        )
+        .unwrap();
+        session.budget = Some(ledger.reference());
         save(&session);
         let oss = Oss::from_file(&config(), &path).unwrap();
         assert!(oss.require_publisher_scope(&expected).is_ok());
@@ -669,13 +806,14 @@ mod tests {
         ] {
             session.prefixes = prefixes;
             save(&session);
-            let oss = Oss::from_file(&config(), &path).unwrap();
-            assert!(oss.require_publisher_scope(&expected).is_err());
+            assert!(Oss::from_file(&config(), &path).is_err());
         }
         session.prefixes = expected.clone();
         session.publisher = false;
+        session.budget = None;
         save(&session);
-        let oss = Oss::from_file(&config(), &path).unwrap();
+        assert!(Oss::from_file(&config(), &path).is_err());
+        let oss = Oss::from_reader_file(&config(), &path).unwrap();
         assert!(oss.require_publisher_scope(&expected).is_err());
         assert!(oss.require_reader().is_ok());
         session.prefixes = config().publication_namespaces;
@@ -699,8 +837,10 @@ mod tests {
                 publisher: false,
                 prefixes: vec![prefix.clone()],
                 versions: BTreeMap::new(),
+                budget: None,
             },
             client: reqwest::Client::new(),
+            budget: None,
         };
         let key = format!("{prefix}program");
         assert!(oss.request(reqwest::Method::PUT, &key, None).is_err());
@@ -724,6 +864,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(put.headers()["x-oss-forbid-overwrite"], "true");
+        assert_eq!(put.headers()["x-oss-storage-class"], "Standard");
         assert!(put.headers()["authorization"]
             .to_str()
             .unwrap()

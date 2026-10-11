@@ -3,6 +3,7 @@ use anyhow::{bail, ensure, Context, Result};
 use hft_research_platform::{
     build::pinned_image,
     identity,
+    release_budget::{self as budget, Ledger},
     release_publisher::{read_json, PublisherPolicy},
     transport::TlsConfig,
 };
@@ -152,11 +153,13 @@ fn validate_response(bytes: &[u8], request: &Request, now: u64) -> Result<String
     Ok(response.token)
 }
 
-async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
+async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>> {
     ensure!(
         response.status().is_success(),
         "capability exchange rejected"
     );
+    let mut response =
+        hft_research_platform::transport::BoundedBody::new(response, MAX_RESPONSE as u64)?;
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -172,7 +175,7 @@ async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn github_oidc(audience: &str) -> Result<String> {
+async fn github_oidc(audience: &str, budget: Option<(&Ledger, budget::Phase)>) -> Result<String> {
     let mut oidc = reqwest::Url::parse(
         &std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL")
             .context("GitHub job OIDC request URL required")?,
@@ -200,6 +203,15 @@ async fn github_oidc(audience: &str) -> Result<String> {
     let job_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
         .context("GitHub job id-token permission required")?;
     let client = TlsConfig::default().client(Duration::from_secs(30), true)?;
+    if let Some((ledger, phase)) = budget {
+        ledger.reserve(
+            phase,
+            budget::Service::Oidc,
+            "oidc",
+            0,
+            budget::CONTROL_RESPONSE_LIMIT,
+        )?;
+    }
     let response = client
         .get(oidc)
         .bearer_auth(job_token)
@@ -216,7 +228,7 @@ async fn github_oidc(audience: &str) -> Result<String> {
     Ok(oidc_token.to_owned())
 }
 async fn exchange(request: &Request, broker: &reqwest::Url, tls: &TlsConfig) -> Result<String> {
-    let oidc_token = github_oidc(broker.as_str()).await?;
+    let oidc_token = github_oidc(broker.as_str(), None).await?;
     let client = tls.client(Duration::from_secs(180), true)?;
     let github_read_token =
         std::env::var("GH_TOKEN").context("job read-only GitHub token required")?;
@@ -322,12 +334,29 @@ fn oss_identity(
 async fn oss_exchange(
     request: &Request,
     config: &hft_research_platform::release_oss::OssConfig,
+    ledger: &Ledger,
 ) -> Result<String> {
     use hft_research_platform::release_oss::{session_policy, Session};
     let publisher = request.phase == Phase::Publish;
+    let binding: budget::Binding = serde_json::from_value(serde_json::to_value(&request.context)?)?;
+    ledger.require_binding(&binding, &identity(config)?)?;
+    ledger.require_session(publisher, &request.publisher_prefixes, &identity(config)?)?;
+    let phase = if publisher {
+        budget::Phase::Publish
+    } else {
+        budget::Phase::Source
+    };
+    if publisher {
+        ledger.require_publish_funding()?;
+    }
+    ledger.claim(if publisher {
+        "publish_exchange"
+    } else {
+        "source_exchange"
+    })?;
     let policy = session_policy(config, &request.publisher_prefixes, publisher)?;
     ensure!(policy.len() <= 2048, "STS session policy exceeds RAM bound");
-    let oidc = github_oidc(&config.audience).await?;
+    let oidc = github_oidc(&config.audience, Some((ledger, phase))).await?;
     let output = std::process::Command::new("gh")
         .args([
             "api",
@@ -365,6 +394,17 @@ async fn oss_exchange(
         .query()
         .context("STS request missing")?
         .to_owned();
+    ensure!(
+        form.len() as u64 <= budget::STS_REQUEST_LIMIT,
+        "STS request payload exceeds reservation bound"
+    );
+    ledger.reserve(
+        phase,
+        budget::Service::Sts,
+        "sts",
+        form.len() as u64,
+        budget::CONTROL_RESPONSE_LIMIT,
+    )?;
     let response = client
         .post("https://sts.aliyuncs.com/")
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -400,8 +440,14 @@ async fn oss_exchange(
         publisher,
         prefixes: request.publisher_prefixes.clone(),
         versions: Default::default(),
+        budget: Some(ledger.reference()),
     };
     session.validate(i64::try_from(now_ms()?)?)?;
+    ledger.claim(if publisher {
+        "publisher_ready"
+    } else {
+        "source_ready"
+    })?;
     Ok(serde_json::to_string(&session)?)
 }
 
@@ -415,7 +461,8 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<_>>()?;
     let words: Vec<_> = args.iter().map(String::as_str).collect();
-    if let [mode @ ("oss-source" | "oss-publish"), policy, context, plan, output] = words.as_slice()
+    if let [mode @ ("oss-source" | "oss-publish"), policy, context, plan, ledger, output] =
+        words.as_slice()
     {
         let policy: PublisherPolicy = read_json(Path::new(policy))?;
         let phase = if *mode == "oss-source" {
@@ -436,11 +483,13 @@ async fn main() -> Result<()> {
             plan,
             now_ms()?,
         )?;
+        let ledger = Ledger::from_path(Path::new(ledger))?;
         return write_token(
             Path::new(output),
             &oss_exchange(
                 &request,
                 policy.oss.as_ref().context("OSS policy required")?,
+                &ledger,
             )
             .await?,
         );
@@ -449,7 +498,7 @@ async fn main() -> Result<()> {
         ["source", policy, context, broker, gateway, output] => (Phase::Source, *policy, *context, None, *broker, *gateway, *output),
         ["publish", policy, context, plan, broker, gateway, output] => (Phase::Publish, *policy, *context, Some(*plan), *broker, *gateway, *output),
         ["read", policy, context, plan, broker, gateway, output] => (Phase::Read, *policy, *context, Some(*plan), *broker, *gateway, *output),
-        _ => bail!("usage: research-release-capability oss-source POLICY CONTEXT - SESSION_FILE | oss-publish POLICY CONTEXT PLAN SESSION_FILE | source POLICY CONTEXT HTTPS_BROKER HTTPS_GATEWAY TOKEN_FILE | publish|read POLICY CONTEXT PLAN HTTPS_BROKER HTTPS_GATEWAY TOKEN_FILE"),
+        _ => bail!("usage: research-release-capability oss-source POLICY CONTEXT - BUDGET_LEDGER SESSION_FILE | oss-publish POLICY CONTEXT PLAN BUDGET_LEDGER SESSION_FILE | source POLICY CONTEXT HTTPS_BROKER HTTPS_GATEWAY TOKEN_FILE | publish|read POLICY CONTEXT PLAN HTTPS_BROKER HTTPS_GATEWAY TOKEN_FILE"),
     };
     let policy: PublisherPolicy = read_json(Path::new(policy))?;
     let broker = endpoint(broker)?;
