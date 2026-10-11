@@ -506,8 +506,8 @@ mod tests {
             role_arn: "acs:ram::1:role/test".into(),
             oidc_provider_arn: "acs:ram::1:oidc-provider/test".into(),
             audience: "test".into(),
-            subject: "operator-approved-subject".into(),
-            role_prefixes: vec![format!("research/sources/{}/", "a".repeat(40))],
+            subject: "repo:owner/repo:environment:research-controller".into(),
+            publication_namespaces: vec!["research/builds/".into(), "research/sources/".into()],
             repository_id: 1,
             owner_id: 2,
         };
@@ -530,6 +530,12 @@ mod tests {
             )
         };
         assert!(oss_identity(&token(&claims), &request, &config, &job).is_ok());
+        let mut immutable = config.clone();
+        immutable.subject = "repo:owner@2/repo@1:environment:research-controller".into();
+        let mut immutable_claims = claims.clone();
+        immutable_claims["sub"] = json!(immutable.subject);
+        assert!(oss_identity(&token(&immutable_claims), &request, &immutable, &job).is_ok());
+        assert!(oss_identity(&token(&immutable_claims), &request, &config, &job).is_err());
         for (key, value) in [
             ("iss", json!("https://foreign")),
             ("aud", json!("foreign")),
@@ -635,6 +641,44 @@ mod tests {
         let before = request(&policy, source().context, Phase::Source, None, 10_000).unwrap();
         assert_eq!(before.publisher_prefixes, source().publisher_prefixes);
         assert!(before.image.is_none() && before.plan_sha256.is_none());
+    }
+    #[test]
+    fn consecutive_native_releases_do_not_reuse_previous_session_prefixes() {
+        let first = request(
+            &policy(),
+            source().context,
+            Phase::Publish,
+            Some(plan()),
+            10_000,
+        )
+        .unwrap();
+        let mut next_plan = plan();
+        next_plan.source.code_commit = "b".repeat(40);
+        next_plan.source.archive.key = format!("research/sources/{}/source.tar", "b".repeat(40));
+        next_plan.builds[0].code_commit = next_plan.source.code_commit.clone();
+        next_plan.builds[0].source_manifest_sha256 = identity(&next_plan.source).unwrap();
+        next_plan.publisher_prefixes = vec![
+            format!("research/builds/{}/", next_plan.builds[0].id().unwrap()),
+            format!("research/sources/{}/", next_plan.source.code_commit),
+        ];
+        let mut context = source().context;
+        context.source_sha = next_plan.source.code_commit.clone();
+        let mut stale_plan: Plan =
+            serde_json::from_value(serde_json::to_value(&next_plan).unwrap()).unwrap();
+        let next = request(
+            &policy(),
+            context.clone(),
+            Phase::Publish,
+            Some(next_plan),
+            10_000,
+        )
+        .unwrap();
+        assert!(next
+            .publisher_prefixes
+            .iter()
+            .all(|p| !first.publisher_prefixes.contains(p)));
+        stale_plan.publisher_prefixes = first.publisher_prefixes;
+        assert!(request(&policy(), context, Phase::Publish, Some(stale_plan), 10_000).is_err());
     }
     #[test]
     fn untrusted_plan_cannot_expand_scope_or_substitute_source_and_builder() {

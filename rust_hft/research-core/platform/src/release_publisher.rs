@@ -847,6 +847,9 @@ pub async fn publish(
         archive: measure(&source_path, format!("research/sources/{sha}/source.tar"))?,
     };
     let builds = project_builds(&source, &manifest.build_inputs, &names)?;
+    if let Some(oss) = &gateway.oss {
+        oss.require_publisher_scope(&publication_prefixes(&source, &builds)?)?;
+    }
     gateway.publish_file(&source_path, &source.archive).await?;
     // Independently pull the immutable OCI identity and compare contained bytes.
     command(root, "docker", &["pull", &request.image], repository)?;
@@ -1370,17 +1373,25 @@ fn project_scope_plan(
     names: &BTreeSet<String>,
 ) -> Result<ReleaseScopePlan> {
     let builds = project_builds(&source, inputs, names)?;
-    let mut publisher_prefixes = vec![format!("research/sources/{}/", source.code_commit)];
-    for build in &builds {
-        publisher_prefixes.push(format!("research/builds/{}/", build.id()?));
-    }
-    publisher_prefixes.sort();
+    let publisher_prefixes = publication_prefixes(&source, &builds)?;
     Ok(ReleaseScopePlan {
         schema: 1,
         source,
         builds,
         publisher_prefixes,
     })
+}
+fn publication_prefixes(source: &SourceArchive, builds: &[BuildSpec]) -> Result<Vec<String>> {
+    let mut publisher_prefixes = vec![format!("research/sources/{}/", source.code_commit)];
+    for build in builds {
+        publisher_prefixes.push(format!("research/builds/{}/", build.id()?));
+    }
+    publisher_prefixes.sort();
+    ensure!(
+        !builds.is_empty() && publisher_prefixes.windows(2).all(|w| w[0] < w[1]),
+        "publication requires distinct actual source/Build prefixes"
+    );
+    Ok(publisher_prefixes)
 }
 /// Read-only pre-approval planning: no storage session, signing key or publisher.
 pub fn scope_plan(

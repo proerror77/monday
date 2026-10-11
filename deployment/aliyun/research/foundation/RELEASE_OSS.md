@@ -35,7 +35,7 @@ Remove the ordinary workflow's Gateway, Broker and optional PG import settings.
 Retain existing ACR configuration and publisher job `id-token:write`.
 The issuer compiles before any private signing credential enters its environment.
 
-For CI, add `oss_by_product` to the repository public policy, keyed by `cex-runner`, `prediction-runner` and/or `controller`. Each selected product needs its own independently approved existing RAM role and exact source/Build prefix list. CI projects only that product’s entry into the native PublisherPolicy `oss` field using `select-research-oss-policy.jq`. Missing products, unknown keys and shared role ARNs fail closed; no union role scope is used. ACK receives a separately pinned native policy with a single `oss` entry.
+For CI, add `oss_by_product` to the repository public policy, keyed by `cex-runner`, `prediction-runner` and/or `controller`. Each selected product needs its own approved existing RAM role and the fixed publication namespaces below. New source or Build hashes require no map update. CI projects only that product’s entry into the native PublisherPolicy `oss` field using `select-research-oss-policy.jq`. Missing products, unknown keys and shared role ARNs fail closed; no union role scope is used. ACK receives a separately pinned native policy with a single `oss` entry.
 
 Each OSS entry contains:
 
@@ -47,7 +47,7 @@ role_arn: approved CI publication RAM role ARN
 oidc_provider_arn: approved GitHub RAM OIDC provider ARN
 audience: operator-selected registered GitHub/RAM audience
 subject: exact operator-approved GitHub OIDC sub (including any customization)
-role_prefixes: sorted exact source/Build prefixes already enforced by the RAM base role
+publication_namespaces: ["research/builds/", "research/sources/"] in this exact order
 repository_id: verified immutable GitHub repository ID
 owner_id: verified immutable GitHub owner ID
 ```
@@ -64,10 +64,10 @@ settings and resources remain reusable. Do not rebuild them to fix this error.
 
 Read the existing public policy through the approved operator surface and ask
 the read-only inventory owner to compare existing role trust/actions/resources
-with the exact native scope plan. Prepare a public role-map JSON object keyed by
-the selected products, with the complete fields above, using only verified
+with the fixed namespaces and the current native scope plan.
+Prepare a public role-map JSON object keyed by the selected products, with the complete fields above, using only verified
 existing values. Each product must retain its independently reviewed distinct
-role and exact sorted prefixes. Whether existing roles qualify, or any specific
+role and the two fixed namespaces. Whether existing roles qualify, or any specific
 IAM delta is needed, is an inventory result, not inferred from this error.
 
 ```bash
@@ -76,10 +76,29 @@ bash .github/scripts/migrate-research-oss-policy.sh \
 ```
 
 This offline command preserves every existing policy field and only adds the
-explicit mapping. It rejects unknown products, shared roles, wildcard prefixes,
-missing fields, duplicate JSON documents and a different already-installed map;
-an identical repeat is idempotent. If a map already exists, reconcile it and
-include all previously approved entries rather than silently replacing them.
+explicit mapping. It rejects unknown products or fields, shared roles, other
+namespaces, missing fields, unbound endpoints and duplicate JSON documents.
+An identical repeat is idempotent. A new product can be added only when every
+previously approved entry is included unchanged. Removal or identity replacement fails.
+
+The obsolete `role_prefixes` field is rejected by native Rust and the CI selector.
+Do not keep both fields. For a previously installed exact-prefix map, prepare a
+reviewed map with only that field replaced by the fixed `publication_namespaces`.
+Keep each bucket, endpoint, role, provider, audience, subject and immutable ID unchanged.
+Use this explicit offline conversion:
+
+```bash
+bash .github/scripts/migrate-research-oss-policy.sh --migrate-exact-prefixes \
+  EXISTING_PUBLIC_POLICY_JSON REVIEWED_NAMESPACE_ROLE_MAP_JSON > CANDIDATE_POLICY_JSON
+```
+
+The flag permits only that conversion and preserves all existing product identities.
+It rejects malformed legacy scopes, deletions and mixed old/new fields.
+It does not authorize or change RAM permissions. Moving an installed exact-prefix
+base role to namespace resources needs a separately reviewed security diff.
+Migrate ACK's pinned native `oss` entry separately before deploying the new binary.
+There is no runtime compatibility fallback to the old field.
+
 Its structural checks do not prove actual RAM permissions, endpoint trust or
 native signing policy acceptance. It performs no API calls, key creation, role
 creation, IAM writes or repository-variable updates. Review the public JSON diff
@@ -102,7 +121,18 @@ It does not require GitHub native attestation or ACR OCI 1.1 referrers.
 `research-release-capability oss-source POLICY CONTEXT - SESSION_FILE` exchanges job OIDC with RAM STS.
 It requests read access to only `research/sources/COMMIT/` before ACR login.
 `oss-publish POLICY CONTEXT PLAN SESSION_FILE` requests the native plan's exact sorted source/Build prefixes.
-The requested prefixes must be a subset of the configured approved role prefixes; publication must equal that complete list. The session policy intersects with the operator role and grants no deletes, ACL changes, listing or scientific output writes. This client configuration is a consistency check, not proof of the actual RAM policy.
+The fixed configuration accepts only `research/builds/` and `research/sources/`,
+in that order. It rejects `research/`, wildcard strings, exact hash entries,
+duplicate namespaces and scientific output paths. These are base-role boundaries,
+not session prefixes. Every session still contains sorted exact commit/Build paths.
+The capability client recomputes those paths from the validated native plan.
+Before its first upload, the publisher recomputes the actual source/Build projection
+and requires its private publisher session to match that exact set.
+An extra hash, missing Build, old source or reader session fails before upload.
+
+RAM intersects the exact inline session policy with the operator's base role.
+The policy grants no deletes, ACL changes, listing or scientific output writes.
+This client configuration is a consistency check, not proof of actual RAM permissions.
 Both phases also need `oss:GetBucketVersioning` on this exact bucket.
 The client checks exact issuer/audience/subject, repository/owner IDs, main, workflow, source, run, attempt and the job's authenticated check-run URL. It also requires STS to return the same verified OIDC subject/issuer/audience.
 RAM, rather than the client, verifies the OIDC signature.
@@ -126,21 +156,57 @@ A residual object write provides no PG, scientific Run, promotion or trading aut
 Reimport of the same exact valid release is idempotent in PG; a foreign proof/OCI/Build is rejected.
 This does not consume a scientific admission nonce or create another Run.
 
-Actual IAM remains an independently approved deployment prerequisite:
+Actual IAM and GitHub environment configuration remain deployment prerequisites:
 
-1. RAM must trust the GitHub issuer, registered audience and exact repository/main/publisher workflow subject.
-2. Bind immutable IDs where the available RAM conditions support them.
-3. Verify the actual subject customization and supported claims before enabling publication.
-4. The base CI role itself must restrict read/create to the exact preapproved native source/Build prefixes in the existing bucket. A broad `research/sources/*` or `research/builds/*` role with only caller-supplied inline Policy is insufficient.
-5. The public `role_prefixes` list must match those trusted base-role resources. Updating that per-release scope is a separately approved IAM operation, not performed by CI or this branch. This initial model does not supply a low-interaction RSI publication loop: every new release needs independently approved scope or a separately reviewed trusted updater. An isolated fixed release namespace would be a different authorization model, requiring explicit parent approval and real overwrite/delete/negative tests; it is not implemented or treated as equivalent here. The caller-supplied session Policy adds restriction; it is not the trusted scope boundary.
-6. Deny delete, ACL changes, bucket mutations and overwrite-header bypass through the reviewed bucket/role policy.
-7. ACK gets separate read-only OSS permissions and the dedicated PG importer role.
+1. RAM trusts the existing GitHub provider, registered audience and exact product environment subject.
+2. RAM documents `oidc:iss`, `oidc:aud` and `oidc:sub` trust conditions. Do not invent workflow or repository-ID conditions.
+3. Keep the repository's default subject template. Verify the actual product job token and its exact subject.
+   A default environment subject omits branch and workflow. GitHub must enforce main-only deployment branches for each product environment.
+   The workflow owner's guard must reject missing or changed environment IDs, branch restrictions and repository/owner IDs before credential use.
+   This branch neither implements that guard nor configures environments. Native Rust still checks main, workflow, immutable IDs, source and active job.
+   RAM subject matching alone does not independently isolate workflows sharing that environment.
+   Restrict environment/workflow administration and review every workflow that can reference that environment.
+   Do not change the global subject template or collector trust to enable research publication.
+4. Each product's base role permits only `oss:GetObject`, `oss:GetObjectVersion` and `oss:PutObject`
+   on the existing bucket's `research/builds/*` and `research/sources/*` resources.
+   It also permits `oss:GetBucketVersioning` on that exact bucket. It grants no `research/*` or scientific output access.
+5. These static grants authorize system publication. The current object layout does not give RAM product/hash isolation.
+   Product roles have distinct trust identities but share these two object namespaces.
+   Native verification and exact session Policy narrow ordinary publication; they cannot constrain a caller that bypasses the client.
+   An exchange with omitted or expanded inline Policy can obtain the base role's publication namespace authority.
+   Access to another hash inside those namespaces is therefore not a promised RAM denial.
+6. Deny delete, ACL changes, bucket mutations and overwrite-header bypass through independently reviewed server policy.
+   The signed client header alone does not prove server denial of a bypass writer. Verify supported controls; do not invent condition keys.
+7. ACK uses separate read-only OSS permissions and the dedicated PG importer role.
 8. Promotion signing and scientific AttemptWriter credentials remain separate.
 
-An untrusted workflow can request its own STS policy if the RAM trust permits it.
-Client validation alone cannot constrain such a caller. **Deployment is blocked** until real RAM tests show that sessions obtained with omitted or expanded Policy still reject object access outside the base role’s exact prefixes; tests must also reject another source/Build prefix, wrong/missing subject, wrong workflow and repository IDs, replay after expiry, delete and overwrite-header bypass. RAM may validly allow an exchange without Policy; the resulting base-role permissions must remain narrowly scoped. No offline fixture or configuration list establishes these denials. If the current RAM integration cannot enforce the exact dynamic scope independently, retain publication blocked and review a supported authorization alternative.
-Do not copy a static account key into CI or reuse the collector credentials.
-No IAM change is authorized by this code task.
+**Deployment remains unverified** until actual tests establish the approved boundaries.
+Test omitted and expanded session Policy against paths outside both publication namespaces.
+Test an ordinary exact session against another source/Build hash, expanded prefixes and scientific paths.
+Test wrong/missing subject, audience and issuer, wrong environment, non-main issuance, and repository/owner drift.
+Verify wrong workflow is blocked by the GitHub/native contract; do not call it an independent RAM claim check.
+Test expired OIDC/session use, delete, overwrite-header bypass, bucket mutations, missing evidence and tampered bytes/signatures.
+Cancellation tests must demonstrate failed release acceptance and no ACK import; residual STS writes can persist until expiry.
+Document valid-token replay during its lifetime as a residual capability, not a passed single-use guarantee.
+No offline fixture, public map or guard-only test establishes actual RAM/OSS denials.
+Do not copy a static account key into CI or reuse collector credentials.
+This code task performs no IAM or cloud configuration writes.
+
+### Configuration and cost boundaries
+
+No new bucket, role, provider, Pod or paid attestation/referrer service is required by this code.
+Reuse only existing resources after verifying their actual state and approved permission differences.
+GitHub documents default environment subjects and newer immutable-ID subject formats.
+Read the actual token format; default-template selection alone does not prove the exact subject string.
+Private-repository environment branch protection depends on the existing GitHub plan.
+Verify eligibility before enabling the workflow guard; this branch does not purchase or change a plan.
+OSS object storage, requests and applicable transfer can incur charges.
+No account-specific price, usage estimate or zero-cost result has been verified here.
+Use the existing workload budget; any newly required paid range needs a concrete separate review.
+
+References: [GitHub OIDC subjects](https://docs.github.com/en/actions/reference/security/oidc),
+[GitHub environment availability](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments),
+[OSS billable items](https://www.alibabacloud.com/help/en/oss/billable-item-overview).
 
 ## OSS identity and versioning
 
@@ -165,7 +231,9 @@ No code enables versioning, retention, WORM or an irreversible object lock.
 
 References: [OSS V4 signing](https://www.alibabacloud.com/help/en/oss/developer-reference/recommend-to-use-signature-version-4),
 [PutObject overwrite/versioning behavior](https://www.alibabacloud.com/help/en/oss/developer-reference/putobject),
-[RAM AssumeRoleWithOIDC](https://www.alibabacloud.com/help/en/ram/developer-reference/api-sts-2015-04-01-assumerolewithoidc).
+[RAM AssumeRoleWithOIDC](https://www.alibabacloud.com/help/en/ram/developer-reference/api-sts-2015-04-01-assumerolewithoidc),
+[RAM OIDC condition keys](https://www.alibabacloud.com/help/en/ram/user-guide/create-a-ram-role-for-a-trusted-idp),
+[GitHub subject customization](https://docs.github.com/en/actions/reference/security/oidc#customizing-the-subject-claims-for-an-organization-or-repository).
 
 ## ACK execution using existing capacity
 
@@ -245,14 +313,24 @@ The existing native research admission and task checks remain mandatory.
 6. Keep research paused until its separate runtime admission/readback succeeds.
 
 On failure, stop research publication/import and retain all evidence.
+For namespace migration rollback, restore the matching binary and policy together while publication stays stopped.
+An older binary rejects the new field; a new binary rejects legacy `role_prefixes`.
+Never widen scope or revert RAM/bucket settings automatically to make an old configuration pass.
+Keep the pre-migration public policy and exact binary/source identities as recovery evidence.
 Restore prior publication workflow only if its already-approved Gateway/Broker exists; otherwise keep publication blocked. Retain the additive approval migration and audit history. An older importer cannot supply the new mandatory approval context, so it fails closed; never remove the approval trigger or grant broad rights as rollback.
 Do not delete objects, reverse migrations, reset immutable PG records or restart collectors.
 No new persistent infrastructure needs removal.
 Real GitHub/RAM/OSS/ACR/ACK acceptance has not been performed by offline tests.
 
-## Controlled issuance and RSI boundary
+## Continuous publication and RSI boundary
 
-The executable first-release sequence is: consume the final-main authenticated compiler artifact; invoke the read-only native `scope-plan` with its real completed software run and public policy to obtain exact source/Build prefixes before any publisher/STSes exist; present the base-role resources and unchanged trust/actions as a concrete IAM diff to the independent owner; approve and verify that diff before CI OIDC exchange; publish one controller release; sign and install its independent PG approval; import with separate read-only ACK identity and read back the immutable Build. These commands exist; unknown native plan/digest/role values must be filled from actual final-main artifacts rather than PR fixtures. No IAM write is performed by these tools.
+The first-release sequence consumes a final-main authenticated compiler artifact.
+Use read-only native `scope-plan` to inspect actual source/Build prefixes without a session.
+Review the existing base role against the two stable namespaces, then verify real trust and denial tests.
+The workflow owner integrates main-only product environments and its pre-credential guard separately.
+After these prerequisites, ordinary CI derives each new release's exact STS scope automatically.
+Publish one authorized release, install its independent PG approval, import it and read back the Build.
+These stages have not been executed by this code change. Never use fixture hashes as deployment selectors.
 On the existing independent operator host, use the authenticated final-main compiler artifact's verified native CLI (not a guessed host build) and a clean exact source checkout:
 
 ```bash
@@ -260,7 +338,17 @@ research-release-publisher scope-plan SOURCE_ROOT FINAL_MAIN_SHA SOFTWARE_RUN_ID
   ACTUAL_SOFTWARE_PRODUCTS controller PUBLIC_POLICY_FILE > RELEASE_SCOPE_PLAN
 ```
 
-The software product list is normalized by the existing catalog and must match the actual producer manifest exactly. The command verifies current main and three authentic required gates before and after downloading real producer bytes, the completed original software run/attempt/job, target/locks/builder/product bindings and exact source archive; it shares Build projection with issuance `plan`. Tracked source/script changes fail. Output contains source, BuildSpecs and sorted exact publisher prefixes; it contains no fabricated OCI digest, future publisher identity, signature, session or grant. It needs read-only GitHub access only and neither requires configured/approved OSS role prefixes nor exchanges STS. Actual issuer `plan` still requires active publisher authority and checks its real OCI identity elsewhere. A manual rebuild's completed software job may be consumed during that active publisher workflow; independent pre-approval `scope-plan` instead requires its entire software producer run to be completed successfully.
-The owner approves only this independently computed exact prefix delta after reading actual existing base-role actions/trust/resources. Update the public product policy to the approved exact prefixes and verify real denial cases, then execute the ordinary authorized publication. This closes the planning bootstrap without letting CI self-approve IAM. The output is approval material, not proof that RAM has those permissions. A new source or compiler Build invalidates this planning input and requires a new exact plan/approval.
+The software product list is normalized by the existing catalog and must match the actual producer manifest exactly. The command verifies current main and three authentic required gates before and after downloading real producer bytes, the completed original software run/attempt/job, target/locks/builder/product bindings and exact source archive; it shares Build projection with issuance `plan`. Tracked source/script changes fail. Output contains source, BuildSpecs and sorted exact publisher prefixes; it contains no fabricated OCI digest, future publisher identity, signature, session or grant. It needs read-only GitHub access only and neither requires an OSS session nor exchanges STS. Actual issuer `plan` still requires active publisher authority and checks its real OCI identity elsewhere. A manual rebuild's completed software job may be consumed during that active publisher workflow; independent pre-approval `scope-plan` instead requires its entire software producer run to be completed successfully.
+The output provides exact session scope and review evidence. It does not prove RAM permissions.
+Once the stable namespace contract and base grants are approved and independently verified,
+a new source or Build needs no per-release RAM or map update. Active issuer `plan` and
+publication still authenticate current main, the real producer and its exact OCI bytes.
+Previous plans or private sessions cannot substitute for a new release.
 
-A scientific loop can reuse an already verified Build under distinct native task grants, leases, budgets and AttemptWriter scopes; it does not require new release IAM scope for each candidate. A loop that edits software and creates a new Build needs a new independently approved exact prefix. Automatic new-Build RSI publication is therefore not implemented or accepted as complete. Its supported next implementation must put a trusted updater on an existing approved operator execution surface, verify final-main/native plan independently, obtain an explicit bounded release grant, apply only that exact role-policy delta and journal/read back it. The updater must not share CI/Agent authority, cannot mint grants, and must prove expiry/cancel/replay/negative IAM behavior before enablement. This requires a separately reviewed authorization contract and concrete credential/policy approval; neither a broad wildcard base role nor CI-authored session Policy can substitute.
+Scientific loops remain separately admitted. Reusing a verified Build still needs native
+Run grants, deadlines, leases, budgets and fenced AttemptWriter scopes. Editing software
+can produce another verified Build through this stable publication interface. Publication
+alone cannot authorize a new Run, promoter, holdout access or runtime activation.
+Continuous end-to-end publication is not verified until the real workflow, identity,
+OSS readback and ACK acceptance pass. The server-side role has no automatic per-release
+expiry or immediate cancellation revocation. Exact STS sessions expire after fifteen minutes.
