@@ -103,60 +103,22 @@ for mode in check-config publish; do
 done
 printf 'Public policy structure, product mapping and pre-issuer failure contracts passed\n'
 
-# Execute the workflow's pre-build check with no compiler, network tool or issuer.
-awk '
-  /^      - name: Validate research publication settings before rebuild$/ { in_step=1; next }
-  in_step && /^      - / { exit }
-  in_step && /^        run: \|$/ { in_run=1; next }
-  in_run { sub(/^          /, ""); print }
-' "$workflow" >"$tmp_dir/pre-rebuild.sh"
-test -s "$tmp_dir/pre-rebuild.sh"
-run_rebuild_preflight() {
-  (
-    cd "$script_dir/../.."
-    PATH="$policy_tools" TMPDIR="$policy_state" RUNNER_TEMP="$policy_state" \
-      RESEARCH_PRODUCTS="$2" MONDAY_RELEASE_POLICY_JSON="$(<"$1")" \
-      MONDAY_RELEASE_POLICY_PRESENT="${3:-true}" \
-      MONDAY_RELEASE_SIGNING_KEY_PRESENT="${4:-true}" \
-      MONDAY_RELEASE_OSS_PRESENT="${5:-true}" \
-      MONDAY_RELEASE_SIGNING_KEY=EXAMPLE_private-key-must-not-appear \
-      MONDAY_RELEASE_GATEWAY_TOKEN=EXAMPLE_private-token-must-not-appear \
-      "$bash_command" "$tmp_dir/pre-rebuild.sh" \
-        >"$tmp_dir/public-policy.out" 2>"$tmp_dir/public-policy.err"
-  )
-}
-all_products=cex-runner,controller,prediction-runner
-run_rebuild_preflight "$tmp_dir/public-policy.json" "$all_products"
-[[ $(grep -Fc 'Public research publication policy structure is valid for' "$tmp_dir/public-policy.out") == 3 ]]
-assert_public_policy_is_offline
-for presence in 'false true true' 'true false true' 'true true false'; do
-  read -r policy_present key_present oss_present <<< "$presence"
-  if run_rebuild_preflight "$tmp_dir/public-policy.json" "$all_products" "$policy_present" "$key_present" "$oss_present"; then
-    echo 'missing configuration reached the manual producer' >&2; exit 1
-  fi
-  test ! -s "$tmp_dir/public-policy.out"
-  assert_public_policy_is_offline
-done
-for expression in 'del(.oss_by_product)' \
-  'del(.oss_by_product["cex-runner"])' 'del(.oss_by_product.controller)' \
-  'del(.oss_by_product["prediction-runner"])' \
-  '.oss_by_product.controller.role_arn=.oss_by_product["cex-runner"].role_arn'; do
-  jq "$expression" "$tmp_dir/public-policy.json" >"$tmp_dir/invalid-public-policy.json"
-  if run_rebuild_preflight "$tmp_dir/invalid-public-policy.json" "$all_products"; then
-    echo 'invalid selected product policy reached the manual producer' >&2; exit 1
-  fi
-  assert_public_policy_is_offline
-done
-printf '{invalid JSON\n' >"$tmp_dir/invalid-public-policy.json"
-if run_rebuild_preflight "$tmp_dir/invalid-public-policy.json" "$all_products"; then exit 1; fi
-assert_public_policy_is_offline
-# A single-product rebuild requires only its own publication mapping.
-jq 'del(.oss_by_product.controller, .oss_by_product["prediction-runner"])' \
-  "$tmp_dir/public-policy.json" >"$tmp_dir/cex-public-policy.json"
-run_rebuild_preflight "$tmp_dir/cex-public-policy.json" cex-runner
-[[ $(grep -Fc 'Public research publication policy structure is valid for' "$tmp_dir/public-policy.out") == 1 ]]
-assert_public_policy_is_offline
-printf 'Manual rebuild checks all selected products before any compilation or preparation\n'
+# Missing archive configuration does not call GitHub/OSS or affect an image job.
+readonly_tools="$tmp_dir/readiness-tools"
+mkdir "$readonly_tools"
+cat >"$readonly_tools/gh" <<'MOCK'
+#!/usr/bin/env bash
+printf 'unexpected GitHub call\n' >&2
+exit 91
+MOCK
+chmod +x "$readonly_tools/gh"
+: >"$tmp_dir/readiness-output"
+PATH="$readonly_tools:$PATH" MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY='' \
+  bash "$script_dir/research-archive-readiness.sh" "$(printf 'a%.0s' {1..40})" controller \
+  '{"include":[]}' "$tmp_dir/readiness-output"
+grep -Fqx ready=false "$tmp_dir/readiness-output"
+grep -Fqx 'matrix={"include":[]}' "$tmp_dir/readiness-output"
+printf 'Unapproved archive remains pending before network or credential use\n'
 if [[ ${1:-} == --public-policy ]]; then exit 0; fi
 
 ruby -ryaml - "$workflow" "$ploy_workflow" "$ci_workflow" "$script_dir/../workflows/security-enabled.yml" <<'RUBY'
@@ -169,10 +131,9 @@ expected_carry = {
   'GH_TOKEN'=>'${{ github.token }}',
   'SELECTED_JOBS'=>'${{ steps.scope.outputs.jobs }}',
   'SELECTED_RESEARCH_PRODUCT'=>'${{ steps.scope.outputs.research_product }}',
-  'RESEARCH_CARRY_MODE'=>'defer-unconfigured',
-  'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}'
+  'RESEARCH_CARRY_MODE'=>'always'
 }
-abort 'carry deferral lost direct scope or public-only policy input' unless carry.fetch('env') == expected_carry
+abort 'image carry depends on OSS configuration' unless carry.fetch('env') == expected_carry
 %w[research_pending_product research_deferred_product].each do |name|
   abort 'carry scheduling evidence is missing' unless selector.fetch('outputs').fetch(name) == "${{ steps.cumulative.outputs.#{name} }}"
 end
@@ -184,18 +145,9 @@ dispatch = (acr['on'] || acr[true]).fetch('workflow_dispatch').fetch('inputs')
 abort 'manual union target is unavailable' unless dispatch.fetch('target').fetch('options').include?('research-products')
 selector_steps = acr_selector.fetch('steps')
 source_index = selector_steps.index { |step| step['id']=='source' }
-prebuild_index = selector_steps.index { |step| step['name']=='Validate research publication settings before rebuild' }
 matrix_index = selector_steps.index { |step| step['id']=='select' }
-abort 'manual compilation can start before source/configuration validation' unless source_index && prebuild_index && matrix_index && source_index<prebuild_index && prebuild_index<matrix_index && acr.fetch('jobs').fetch('research-runner-binaries').fetch('needs')==['selector','research-environments']
-prebuild = selector_steps.fetch(prebuild_index)
-abort 'configuration preflight is not scoped to explicit rebuilds' unless prebuild.fetch('if')=="steps.source.outputs.research_mode == 'rebuild'"
-abort 'prebuild check receives credentials or loses selected products' unless prebuild.fetch('env')=={
-  'RESEARCH_PRODUCTS'=>'${{ steps.source.outputs.published_products }}',
-  'MONDAY_RELEASE_POLICY_PRESENT'=>"${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}",
-  'MONDAY_RELEASE_SIGNING_KEY_PRESENT'=>"${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}",
-  'MONDAY_RELEASE_OSS_PRESENT'=>"${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}",
-  'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}'
-}
+abort 'manual binary source ordering changed' unless source_index && matrix_index && source_index<matrix_index && acr.fetch('jobs').fetch('research-runner-binaries').fetch('needs')=='selector'
+abort 'image source selector consults OSS authorization' if selector_steps.any? { |step| step.fetch('env',{}).keys.any? { |key| key.match?(/RELEASE_POLICY|SIGNING_KEY|PUBLICATION_BUDGET/) } }
 [acr,ploy,ci,security].each do |doc|
   doc.fetch('jobs').each do |id,job|
     abort "public ACK runner exposure: #{id}" if job.fetch('runs-on','').to_s.match?(/self-hosted|monday-ack-research/)
@@ -266,7 +218,7 @@ abort 'manual timing evidence lost source, attempt or recipe measurements' unles
   'if-no-files-found'=>'error', 'retention-days'=>7
 }
 abort 'cross-run source readback missing' unless acr.fetch('jobs').fetch('publish').fetch('steps').any? { |s|s.fetch('run','').include?('download-research-release.sh') }
-abort 'release relationship changed' unless acr.fetch('jobs').fetch('research-release-complete').fetch('needs') == ['selector','publish']
+abort 'release relationship changed' unless acr.fetch('jobs').fetch('research-release-complete').fetch('needs') == ['selector','publish','research-environments']
 RUBY
 bash "$script_dir/test-research-runtime-abi.sh"
 bash "$script_dir/test-research-checkout-ownership.sh"
@@ -335,7 +287,7 @@ acr,ploy=ARGV.map { |path| YAML.safe_load(File.read(path)) }
 end
 publication=acr.fetch('jobs').fetch('publish')
 abort 'release job cannot obtain its own OIDC identity' unless publication.fetch('permissions')=={'actions'=>'read','checks'=>'read','contents'=>'read','id-token'=>'write','pull-requests'=>'read'}
-abort 'binary or environment predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries','research-environments']
+abort 'archive predecessor removed' unless publication.fetch('needs')==['selector','research-runner-binaries','publish-research-images','research-environments']
 steps=publication.fetch('steps')
 presence=steps.index { |s|s.fetch('name','')=='Require research publication settings before preparation' }
 public_policy=steps.index { |s|s.fetch('name','')=='Validate public research publication policy before preparation' }
@@ -344,7 +296,12 @@ preflight=steps.index { |s|s.fetch('name','')=='Require independent Build signer
 compile=steps.index { |s|s.fetch('name','')=='Compile independent release issuer before secret injection' }
 login=steps.index { |s|s.fetch('name','')=='Log in to ACR' }
 push=steps.index { |s|s.fetch('name','')=='Build and push' }
-abort 'issuer policy/TLS validation occurs after registry mutation' unless preflight && login && push && preflight<login && preflight<push
+abort 'archive mutates a registry or loses issuer preflight' unless preflight && login && push.nil?
+image=acr.fetch('jobs').fetch('publish-research-images')
+abort 'OCI depends on archive configuration' unless image.fetch('needs')==['selector','research-runner-binaries'] && !image.key?('environment') && !image.fetch('permissions').key?('id-token')
+abort 'OCI receives signing, OSS or fee configuration' if image.to_s.match?(/MONDAY_RELEASE_|PUBLICATION_OPERATIONS|PUBLICATION_BUDGET|research-publication-budget|publish-research-build-release/)
+abort 'OCI has no evidence-based retry' unless image.fetch('steps').any? { |step| step.fetch('run','').include?('research-oci-delivery.rb reuse') }
+abort 'OCI receipt is not retained independently' unless image.fetch('steps').any? { |step| step.fetch('name','')=='Retain independent OCI delivery receipt' }
 abort 'issuer compilation can access injected release credentials' unless compile && compile<preflight && steps.fetch(compile).fetch('if')=='matrix.research_artifact' && steps.fetch(compile).fetch('env').keys==['CARGO_TARGET_DIR'] && steps.fetch(compile).fetch('run').include?('cargo build')
 abort 'capability exchange was not compiled before secrets' unless steps.fetch(compile).fetch('run').include?('--bin research-release-capability')
 abort 'missing settings can reach expensive publication preparation' unless presence && download && presence<download && presence<compile && steps.fetch(presence).fetch('if')=='matrix.research_artifact' && steps.fetch(presence).fetch('run').include?('publish-research-build-release.sh check-presence')
@@ -361,15 +318,15 @@ abort 'public policy check receives private credentials or loses product binding
   'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}',
   'PRODUCT'=>'${{ matrix.product }}'
 } && policy_step.fetch('run')=='.github/scripts/publish-research-build-release.sh check-public-policy'
-budget=steps.index { |s|s.fetch('name','')=='Admit cumulative research publication budget before cloud use' }
+budget=steps.index { |s|s.fetch('name','')=='Admit OSS operating allowance before cloud use' }
 abort 'missing budget can reach credentials or preparation' unless budget && public_policy<budget && budget<download && budget<compile && budget<preflight && budget<login
 budget_step=steps.fetch(budget)
 abort 'budget gate receives credentials or loses whole-run selection' unless budget_step.fetch('if')=='matrix.research_artifact' && budget_step.fetch('env')=={
-  'MONDAY_RESEARCH_PUBLICATION_BUDGET'=>'${{ vars.MONDAY_RESEARCH_PUBLICATION_BUDGET }}',
+  'MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY'=>'${{ vars.MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY }}',
   'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}',
   'SOURCE_SHA'=>'${{ needs.selector.outputs.source_sha }}',
-  'PRODUCTS'=>'${{ needs.selector.outputs.research_products }}'
-} && budget_step.fetch('run').include?('research-publication-budget.sh admit')
+  'PRODUCTS'=>'${{ needs.research-environments.outputs.archive_products }}'
+} && budget_step.fetch('run').include?('research-publication-budget.sh admit-operations')
 wrapper=File.read(File.join(File.dirname(ARGV[0]),'../scripts/publish-research-build-release.sh'))
 abort 'issuer wrapper compiles while holding release credentials' if wrapper.match?(/\bcargo\s+(?:build|run)\b/)
 abort 'static gateway credential still authorizes publication' if steps.any? { |s| s.fetch('env',{}).values.any? { |v| v.to_s.include?('secrets.MONDAY_RESEARCH_RELEASE_GATEWAY_TOKEN') } }
@@ -423,8 +380,8 @@ RUBY
 ruby -ryaml - "$workflow" "$tmp_dir" <<'RUBY'
 acr=YAML.safe_load(File.read(ARGV[0]))
 selector=acr.fetch('jobs').fetch('selector').fetch('steps').find { |s|s['id']=='select' }
-File.write(File.join(ARGV[1],'select-matrix.sh'),selector.fetch('run'))
-controller=acr.fetch('jobs').fetch('publish').fetch('steps').find { |s|s['name']=='Verify Campaign cycle controller image' }
+File.write(File.join(ARGV[1],'select-matrix.sh'),File.read(File.join(File.dirname(ARGV[0]),'../scripts/select-acr-image-matrix.sh')))
+controller=acr.fetch('jobs').fetch('publish-research-images').fetch('steps').find { |s|s['name']=='Verify Campaign cycle controller image' }
 File.write(File.join(ARGV[1],'controller-condition.txt'),controller.fetch('if'))
 abort 'controller verifier is not used by publication' unless controller.fetch('run').include?('verify-research-controller-image.sh')
 complete=acr.fetch('jobs').fetch('research-release-complete')
@@ -579,3 +536,5 @@ bash "$script_dir/test-migrate-research-oss-policy.sh"
 
 bash "$script_dir/test-automatic-research-publication.sh"
 bash "$script_dir/test-research-publication-budget.sh"
+
+ruby "$script_dir/test-research-oci-delivery.rb"

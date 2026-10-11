@@ -139,19 +139,22 @@ abort 'publisher can start without infrastructure gate' unless pub.fetch('needs'
 abort 'publisher uses a constant/unvalidated environment' unless pub.fetch('environment')=={'name'=>'${{ matrix.environment_name }}'} && pub.fetch('strategy').fetch('matrix')=='${{ fromJSON(needs.research-environments.outputs.matrix) }}'
 abort 'shared source first writes can run concurrently' unless pub.fetch('strategy').fetch('max-parallel')==1
 abort 'ordinary publications acquired an environment or OIDC' if ordinary.key?('environment') || ordinary.fetch('permissions').key?('id-token')
-abort 'manual rebuild bypasses environment admission' unless jobs.fetch('research-runner-binaries').fetch('needs')==['selector','research-environments']
+abort 'binary rebuild depends on OSS configuration' unless jobs.fetch('research-runner-binaries').fetch('needs')=='selector'
+image=jobs.fetch('publish-research-images')
+abort 'image delivery depends on an archive environment' if image.key?('environment') || image.fetch('permissions').key?('id-token')
+abort 'ordinary delivery depends on research source readback' unless ordinary.fetch('needs')=='ordinary-selector' && jobs.fetch('ordinary-selector').fetch('steps').none? {|step|step.to_s.include?('download-research-release')}
 steps=pub.fetch('steps'); recheck=steps.find {|s|s['name']=='Recheck automatic publication before credential use'}
 abort 'recheck is not the first step after checkout' unless steps.index(recheck)==1
 abort 'automatic recheck receives secrets' if recheck.to_s.include?('secrets.')
-budgets=steps.select {|s|s['name']=='Admit cumulative research publication budget before cloud use'}
+budgets=steps.select {|s|s['name']=='Admit OSS operating allowance before cloud use'}
 abort 'missing or ambiguous budget gate' unless budgets.length==1
 budget=budgets.fetch(0)
 abort 'budget gate gained credentials or lost selection' unless budget.fetch('if')=='matrix.research_artifact' && budget.fetch('env')=={
-  'MONDAY_RESEARCH_PUBLICATION_BUDGET'=>'${{ vars.MONDAY_RESEARCH_PUBLICATION_BUDGET }}',
+  'MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY'=>'${{ vars.MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY }}',
   'MONDAY_RELEASE_POLICY_JSON'=>'${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}',
   'SOURCE_SHA'=>'${{ needs.selector.outputs.source_sha }}',
-  'PRODUCTS'=>'${{ needs.selector.outputs.research_products }}'
-} && budget.fetch('run').include?('research-publication-budget.sh admit')
+  'PRODUCTS'=>'${{ needs.research-environments.outputs.archive_products }}'
+} && budget.fetch('run').include?('research-publication-budget.sh admit-operations')
 consumption_steps=steps.select {|s|s['name']=='Retain public research publication budget consumption'}
 abort 'missing or ambiguous consumption retention' unless consumption_steps.length==1
 consumption=consumption_steps.fetch(0)
@@ -165,21 +168,22 @@ abort 'failed publication consumption is not retained safely' unless consumption
     'if-no-files-found'=>'warn', 'retention-days'=>7
   }
 }
-[pub,ordinary].each do |job|
-  config=job.fetch('steps').find {|s|s['run']=='.github/scripts/publish-research-build-release.sh check-config'}
-  abort 'native budget plan lacks compiled product selection' unless config.fetch('env').fetch('SOFTWARE_PRODUCTS')=='${{ needs.selector.outputs.research_product }}'
-end
-comparison=Marshal.load(Marshal.dump(steps-[recheck,budget,consumption]))
-retention=comparison.find {|s|s['name']=='Retain native Build release projection'}
+config=pub.fetch('steps').find {|step|step['run']=='.github/scripts/publish-research-build-release.sh check-config'}
+abort 'native budget plan lacks compiled product selection' unless config.fetch('env').fetch('SOFTWARE_PRODUCTS')=='${{ needs.selector.outputs.research_product }}'
+retention=steps.find {|step|step['name']=='Retain native Build release projection'}
 paths=retention.fetch('with').fetch('path').lines
 budget_paths=["${{ runner.temp }}/research-publication-budget-admission.json\n", "${{ runner.temp }}/research-publication-native-budget.json\n"]
-abort 'native budget evidence paths are missing or duplicated' unless budget_paths.all? {|p|paths.count(p)==1}
-retention.fetch('with')['path']=(paths-budget_paths).join
-abort 'research and ordinary publication checks diverged' unless comparison==ordinary.fetch('steps')
+abort 'native budget evidence paths are missing or duplicated' unless budget_paths.all? {|path|paths.count(path)==1}
 abort 'manual approval/dispatch entered automatic workflow' if workflow.to_s.match?(/review_source_sha|dispatch-research|prepare-research-publication-review|research-publication-environment-probe|actions:\s*write/)
 selector=jobs.fetch('selector').fetch('steps').find {|s|s['id']=='select'}
-File.write(File.join(ARGV[1],'selector.sh'),selector.fetch('run'))
-File.write(File.join(ARGV[1],'gate.sh'),gate.fetch('steps').find {|s|s['id']=='environments'}.fetch('run'))
+File.write(File.join(ARGV[1],'selector.sh'),File.read(File.join(File.dirname(ARGV[0]),'../scripts/select-acr-image-matrix.sh')))
+readiness_step=gate.fetch('steps').find {|step|step['id']=='environments'}
+abort 'workflow bypasses archive readiness' unless readiness_step.fetch('run').include?('research-archive-readiness.sh')
+# Exercise the original environment identity stage, after separate offline fee
+# admission. Fee pending/no-network cases are in the operating allowance tests.
+readiness=File.read(File.join(File.dirname(ARGV[0]),'../scripts/research-archive-readiness.sh'))
+stage=readiness[readiness.index('bash "$script_dir/read-automatic-research-publication.sh"')..]
+File.write(File.join(ARGV[1],'gate.sh'),"set -euo pipefail\nscript_dir=.github/scripts\nwork=$RUNNER_TEMP\nsource=$SOURCE_SHA\nmatrix=$SOURCE_MATRIX\noutput=$GITHUB_OUTPUT\narchive_products=$PRODUCTS\nIFS=, read -r -a eligible <<<\"$PRODUCTS\"\n"+stage.gsub('"$work/admission.json"','"$work/automatic-publication-admission.json"'))
 File.write(File.join(ARGV[1],'recheck.sh'),recheck.fetch('run'))
 RUBY
 cd "$repo"

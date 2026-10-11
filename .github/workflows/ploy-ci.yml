@@ -68,8 +68,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SELECTED_JOBS: ${{ steps.scope.outputs.jobs }}
           SELECTED_RESEARCH_PRODUCT: ${{ steps.scope.outputs.research_product }}
-          RESEARCH_CARRY_MODE: defer-unconfigured
-          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          RESEARCH_CARRY_MODE: always
         run: bash .github/scripts/select-main-research-scope.sh "$GITHUB_SHA" "$GITHUB_OUTPUT"
 
   image-smoke-scope:

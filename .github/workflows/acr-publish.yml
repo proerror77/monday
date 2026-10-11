@@ -64,6 +64,7 @@ jobs:
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       ordinary_matrix: ${{ steps.select.outputs.ordinary_matrix }}
+      research_image_matrix: ${{ steps.select.outputs.research_image_matrix }}
       research_products: ${{ steps.select.outputs.research_products }}
       publish_target: ${{ steps.source.outputs.publish_target }}
       research_mode: ${{ steps.source.outputs.research_mode }}
@@ -168,45 +169,43 @@ jobs:
             --prediction-conclusion "$PREDICTION_CONCLUSION" \
             --security-conclusion "$SECURITY_CONCLUSION"
 
-      - name: Validate research publication settings before rebuild
-        if: steps.source.outputs.research_mode == 'rebuild'
-        env:
-          RESEARCH_PRODUCTS: ${{ steps.source.outputs.published_products }}
-          MONDAY_RELEASE_POLICY_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
-          MONDAY_RELEASE_SIGNING_KEY_PRESENT: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}
-          MONDAY_RELEASE_OSS_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
-          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
-        run: |
-          set -euo pipefail
-          .github/scripts/publish-research-build-release.sh check-presence
-          IFS=, read -r -a products <<< "$RESEARCH_PRODUCTS"
-          for product in "${products[@]}"; do
-            PRODUCT="$product" .github/scripts/publish-research-build-release.sh check-public-policy
-          done
-
       - name: Select publish targets
         id: select
         env:
           TARGET: ${{ steps.source.outputs.publish_target }}
           PUBLISHED_PRODUCTS: ${{ steps.source.outputs.published_products }}
         run: |
-          matrix=$(jq -cn --arg target "$TARGET" --arg products "$PUBLISHED_PRODUCTS" '
-            [{repository:"research-runner",product:"cex-runner",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.research",target:"prebuilt",research_artifact:true},
-             {repository:"prediction-research-runner",product:"prediction-runner",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.prediction-research",target:"prebuilt",research_artifact:true},
-             {repository:"campaign-cycle-controller",product:"controller",context:".",file:"deployment/aliyun/research/Dockerfile.campaign-cycle-controller",target:"prebuilt",research_artifact:true},
-             {repository:"hft-trading",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.trading",target:"runtime",research_artifact:false},
-             {repository:"binance-lob-archiver",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.binance-lob-archiver",target:"runtime",research_artifact:false},
-             {repository:"polymarket-evidence-compiler",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler",target:"runtime",research_artifact:false},
-             {repository:"polymarket-market-recorder",context:"rust_hft",file:"rust_hft/deployment/docker/Dockerfile.polymarket-market-recorder",target:"runtime",research_artifact:false}]
-            | {include: map(select(
-                $target == "all" or .repository == $target
-                or ($target == "research-products" and .research_artifact and (.product as $product | $products | split(",") | index($product)))
-              ))}')
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          ordinary=$(jq -c '{include:[.include[] | select(.research_artifact == false)]}' <<< "$matrix")
-          products=$(jq -r '[.include[] | select(.research_artifact == true) | .product] | unique | sort | join(",")' <<< "$matrix")
-          echo "ordinary_matrix=$ordinary" >> "$GITHUB_OUTPUT"
-          echo "research_products=$products" >> "$GITHUB_OUTPUT"
+          bash .github/scripts/select-acr-image-matrix.sh
+
+  ordinary-selector:
+    if: github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == 'hft-trading' || inputs.target == 'binance-lob-archiver' || inputs.target == 'polymarket-raw-ops' || inputs.target == 'polymarket-evidence-compiler' || inputs.target == 'polymarket-market-recorder')
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.ordinary_matrix }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Checkout ordinary image source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+      - name: Admit ordinary images independently of research artifacts
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          test "$GITHUB_SHA" = "$main_sha"
+          bash .github/scripts/wait-release-required-checks.sh "$GITHUB_SHA" current-main
+          echo "source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - name: Select ordinary image targets
+        id: select
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          if [[ "$TARGET" == polymarket-raw-ops ]]; then export TARGET=binance-lob-archiver; fi
+          bash .github/scripts/select-acr-image-matrix.sh
 
   research-environments:
     needs: selector
@@ -217,44 +216,30 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.environments.outputs.matrix }}
+      ready: ${{ steps.environments.outputs.ready }}
+      archive_products: ${{ steps.environments.outputs.archive_products }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ needs.selector.outputs.source_sha }}
-      - name: Admit publication budget before manual binary preparation
-        env:
-          MONDAY_RESEARCH_PUBLICATION_BUDGET: ${{ vars.MONDAY_RESEARCH_PUBLICATION_BUDGET }}
-          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
-          PRODUCTS: ${{ needs.selector.outputs.research_products }}
-        run: |
-          set -euo pipefail
-          storage_hours=$(jq -er '.storage_hours' <<<"$MONDAY_RESEARCH_PUBLICATION_BUDGET")
-          bash .github/scripts/research-publication-budget.sh admit "$SOURCE_SHA" "$PRODUCTS" "$storage_hours" "$RUNNER_TEMP/research-publication-budget-admission.json"
-      - name: Read existing automatic publication environments
+          fetch-depth: 0
+      - name: Read signed archive readiness independently of images
         id: environments
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
           PRODUCTS: ${{ needs.selector.outputs.research_products }}
           SOURCE_MATRIX: ${{ needs.selector.outputs.matrix }}
+          MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY: ${{ vars.MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY }}
           MONDAY_RESEARCH_AUTOMATIC_PUBLICATION: ${{ vars.MONDAY_RESEARCH_AUTOMATIC_PUBLICATION }}
           MONDAY_RESEARCH_RELEASE_POLICY: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
-        run: |
-          set -euo pipefail
-          admission="$RUNNER_TEMP/automatic-publication-admission.json"
-          bash .github/scripts/read-automatic-research-publication.sh "$PRODUCTS" "$SOURCE_SHA" "$admission"
-          matrix=$(jq -cn --argjson source "$SOURCE_MATRIX" --slurpfile admission "$admission" '
-            {include:[$source.include[] | select(.research_artifact == true) | . as $row
-              | $admission[0].environments[] | select(.product == $row.product)
-              | $row + {environment_name:.name,environment_id:.environment_id}]}')
-          [[ $(jq '.include | length' <<< "$matrix") -gt 0 ]]
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          MONDAY_RELEASE_SIGNING_KEY_PRESENT: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}
+        run: bash .github/scripts/research-archive-readiness.sh "$SOURCE_SHA" "$PRODUCTS" "$SOURCE_MATRIX" "$GITHUB_OUTPUT"
 
   research-runner-binaries:
     name: Research release binaries
-    needs: [selector, research-environments]
-    if: needs.research-environments.result == 'success' && needs.selector.outputs.research_mode == 'rebuild'
+    needs: selector
+    if: needs.selector.outputs.research_mode == 'rebuild'
     runs-on: ubuntu-latest
     container:
       image: rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
@@ -325,47 +310,25 @@ jobs:
           path: ${{ steps.research-cache-layout.outputs.cache_paths }}
           key: ${{ steps.research-cache.outputs.cache-primary-key }}
 
-  publish:
-    name: Publish ${{ matrix.repository }}
+  publish-research-images:
+    name: Publish OCI ${{ matrix.repository }}
     permissions:
       actions: read
       checks: read
       contents: read
-      id-token: write
       pull-requests: read
-    needs: [selector, research-runner-binaries, research-environments]
-    if: always() && needs.selector.result == 'success' && needs.research-environments.result == 'success' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'
+    needs: [selector, research-runner-binaries]
+    if: always() && needs.selector.result == 'success' && needs.selector.outputs.research_products != '' && (needs.selector.outputs.research_mode == 'artifact' || needs.research-runner-binaries.result == 'success')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      # Products can share the source archive. Keep first writes serial.
-      max-parallel: 1
-      matrix: ${{ fromJSON(needs.research-environments.outputs.matrix) }}
-
-    # Names are emitted only after the GET-only environment gate succeeds.
-    environment:
-      name: ${{ matrix.environment_name }}
-
+      matrix: ${{ fromJSON(needs.selector.outputs.research_image_matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ needs.selector.outputs.source_sha }}
-
-      - name: Recheck automatic publication before credential use
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
-          PRODUCTS: ${{ needs.selector.outputs.research_products }}
-          EXPECTED_PRODUCT: ${{ matrix.product }}
-          EXPECTED_ENVIRONMENT_ID: ${{ matrix.environment_id }}
-          MONDAY_RESEARCH_AUTOMATIC_PUBLICATION: ${{ vars.MONDAY_RESEARCH_AUTOMATIC_PUBLICATION }}
-          MONDAY_RESEARCH_RELEASE_POLICY: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
-        run: |
-          set -euo pipefail
-          admission="$RUNNER_TEMP/automatic-publication-recheck.json"
-          bash .github/scripts/read-automatic-research-publication.sh "$PRODUCTS" "$SOURCE_SHA" "$admission"
-          jq -e --arg product "$EXPECTED_PRODUCT" --argjson id "$EXPECTED_ENVIRONMENT_ID"             'any(.environments[]; .product == $product and .environment_id == $id)' "$admission"
+          fetch-depth: 0
 
       - name: Require selected research release source
         if: matrix.research_artifact
@@ -375,37 +338,6 @@ jobs:
         run: |
           [[ "$RESEARCH_MODE" == artifact ]] || \
             [[ "$RESEARCH_MODE" == rebuild && "$REBUILD_RESULT" == success ]]
-
-      - name: Verify Binance fee release contract
-        if: ${{ (matrix.repository == 'binance-lob-archiver') && !matrix.research_artifact }}
-        run: deployment/aliyun/test-binance-fee-release-contract.sh
-
-      - name: Require research publication settings before preparation
-        if: matrix.research_artifact
-        env:
-          MONDAY_RELEASE_POLICY_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
-          MONDAY_RELEASE_SIGNING_KEY_PRESENT: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}
-          MONDAY_RELEASE_OSS_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
-        run: .github/scripts/publish-research-build-release.sh check-presence
-
-      - name: Validate public research publication policy before preparation
-        if: matrix.research_artifact
-        env:
-          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
-          PRODUCT: ${{ matrix.product }}
-        run: .github/scripts/publish-research-build-release.sh check-public-policy
-
-      - name: Admit cumulative research publication budget before cloud use
-        if: matrix.research_artifact
-        env:
-          MONDAY_RESEARCH_PUBLICATION_BUDGET: ${{ vars.MONDAY_RESEARCH_PUBLICATION_BUDGET }}
-          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
-          PRODUCTS: ${{ needs.selector.outputs.research_products }}
-        run: |
-          set -euo pipefail
-          storage_hours=$(jq -er '.storage_hours' <<<"$MONDAY_RESEARCH_PUBLICATION_BUDGET")
-          bash .github/scripts/research-publication-budget.sh admit "$SOURCE_SHA" "$PRODUCTS" "$storage_hours" "$RUNNER_TEMP/research-publication-budget-admission.json"
 
       - name: Download authenticated research release
         if: matrix.research_artifact
@@ -421,41 +353,17 @@ jobs:
             install -m 0755 "${RUNNER_TEMP}/research-release/research-bin/$binary" "rust_hft/research-bin/$binary"
           done < <(bash .github/scripts/research-release-products.sh binaries "${{ matrix.product }}")
 
-      - name: Download verified collector image
-        if: matrix.repository == 'binance-lob-archiver'
+      - name: Read authenticated prior OCI delivery
+        id: prior-image
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
-        run: bash .github/scripts/read-tested-image.sh "$SOURCE_SHA" "${RUNNER_TEMP}/tested-collector" required binance-lob-archiver
+          PRODUCT: ${{ matrix.product }}
+          IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}
+        run: ruby .github/scripts/research-oci-delivery.rb reuse "$SOURCE_SHA" "$PRODUCT" "$IMAGE_REPOSITORY" "$RUNNER_TEMP/research-oci-prior.json" "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - name: Install independent release issuer toolchain
-        if: matrix.research_artifact
-        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
-        with:
-          toolchain: 1.98.1
-
-      - name: Compile independent release issuer before secret injection
-        if: matrix.research_artifact
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/research-release-issuer-target
-        run: cargo build --manifest-path rust_hft/research-core/platform/Cargo.toml --locked --features publisher --bin research-release-publisher --bin research-release-capability
-
-      - name: Require independent Build signer configuration
-        if: matrix.research_artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
-          MONDAY_RELEASE_SIGNING_KEY: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-          PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
-          IMAGE_REPOSITORY: ${{ matrix.repository }}
-          PRODUCT: ${{ matrix.product }}
-          SOFTWARE_PRODUCTS: ${{ needs.selector.outputs.research_product }}
-          PUBLISH_IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}
-        run: .github/scripts/publish-research-build-release.sh check-config
 
       - name: Log in to ACR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -474,24 +382,8 @@ jobs:
           test "$SOURCE_REVISION" = "$current_main"
           .github/scripts/wait-release-required-checks.sh "$SOURCE_REVISION" current-main
 
-      - name: Promote the tested collector image
-        if: matrix.repository == 'binance-lob-archiver'
-        id: promote
-        env:
-          IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/binance-lob-archiver
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
-        run: |
-          image_id=$(cat "${RUNNER_TEMP}/tested-collector/image-id.txt")
-          docker tag "$image_id" "$IMAGE_REPOSITORY:$SOURCE_SHA"
-          docker tag "$image_id" "$IMAGE_REPOSITORY:run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          docker push "$IMAGE_REPOSITORY:$SOURCE_SHA"
-          docker push "$IMAGE_REPOSITORY:run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          digest=$(docker buildx imagetools inspect "$IMAGE_REPOSITORY:$SOURCE_SHA" --format '{{.Manifest.Digest}}')
-          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
       - name: Build and push
-        if: matrix.repository != 'binance-lob-archiver'
+        if: steps.prior-image.outputs.image == ''
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
@@ -514,88 +406,14 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}
 
-      - name: Read back the tested collector image
-        if: matrix.repository == 'binance-lob-archiver'
-        env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/binance-lob-archiver@${{ steps.promote.outputs.digest }}
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
-        run: |
-          docker pull "$IMAGE"
-          test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$(cat "${RUNNER_TEMP}/tested-collector/image-id.txt")"
-          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")" = "$SOURCE_SHA"
-          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")" = linux/amd64
-
       - name: Record immutable image
         run: |
-          echo '${{ matrix.repository }}=${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Verify Polymarket compiler source binding
-        if: ${{ (matrix.repository == 'polymarket-evidence-compiler') && !matrix.research_artifact }}
-        env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-        run: |
-          docker pull "$IMAGE"
-          actual_source_revision=$(docker image inspect \
-            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
-            "$IMAGE")
-          test "$actual_source_revision" = "$SOURCE_REVISION"
-          docker run --rm --entrypoint /usr/local/bin/polymarket-raw-ops "$IMAGE" \
-            --version | grep -Fqx "polymarket-raw-ops $SOURCE_REVISION"
-
-      - name: Verify Polymarket market recorder image
-        if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
-        env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-        run: |
-          docker pull "$IMAGE"
-          actual_source_revision=$(docker image inspect \
-            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
-            "$IMAGE")
-          test "$actual_source_revision" = "$SOURCE_REVISION"
-          if output=$(docker run --rm "$IMAGE" --config /nonexistent 2>&1); then
-            echo "recorder accepted an invocation without --dry-run" >&2
-            exit 1
-          fi
-          grep -Fq 'requires --dry-run' <<<"$output"
-          docker run --rm "$IMAGE" --dry-run --help 2>&1 \
-            | grep -Fq -- '--dry-run'
-
-      - name: Extract bare-metal Polymarket market recorder
-        if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
-        env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          mkdir -p polymarket-market-recorder-artifact
-          container_id=$(docker create "$IMAGE")
-          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
-          docker cp "$container_id:/usr/local/bin/new-ploy-runner" \
-            polymarket-market-recorder-artifact/new-ploy-runner
-          chmod 0755 polymarket-market-recorder-artifact/new-ploy-runner
-          .github/scripts/polymarket-market-recorder-release-artifact.sh create \
-            polymarket-market-recorder-artifact "$SOURCE_REVISION" "$IMAGE_DIGEST"
-          .github/scripts/polymarket-market-recorder-release-artifact.sh verify \
-            polymarket-market-recorder-artifact "$SOURCE_REVISION" "$IMAGE_DIGEST"
-          tar --format=ustar -cf polymarket-market-recorder-linux-amd64.tar \
-            -C polymarket-market-recorder-artifact .
-
-      - name: Upload bare-metal Polymarket market recorder
-        if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: polymarket-market-recorder-linux-amd64-${{ needs.selector.outputs.source_sha }}
-          path: polymarket-market-recorder-linux-amd64.tar
-          if-no-files-found: error
-          retention-days: 90
+          echo '${{ matrix.repository }}=${{ steps.prior-image.outputs.image || format('{0}/wildcard0923/{1}@{2}', vars.ACR_REGISTRY, matrix.repository, steps.build.outputs.digest) }}' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify Campaign cycle controller image
         if: matrix.repository == 'campaign-cycle-controller'
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.prior-image.outputs.image || format('{0}/wildcard0923/{1}@{2}', vars.ACR_REGISTRY, matrix.repository, steps.build.outputs.digest) }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
         run: |
           set -euo pipefail
@@ -603,355 +421,216 @@ jobs:
           bash .github/scripts/verify-research-controller-image.sh \
             "$IMAGE" "$SOURCE_REVISION" "${RUNNER_TEMP}/research-release/research-bin"
 
-      - name: Package bare-metal trading host contract
-        if: ${{ (matrix.repository == 'hft-trading') && !matrix.research_artifact }}
-        env:
-          IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/hft-trading
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          mkdir -p trading-host-artifact
-          trading_control_assets=(
-            hft-trading-ecs.service
-            trading-ecs-hostctl.sh
-            trading-ecs-paper-shadow-policy.jq
-            trading-ecs-runtime.sh
-          )
-          (
-            cd deployment/aliyun
-            sha256sum "${trading_control_assets[@]}" \
-              > ../../trading-host-artifact/trading-ecs-control-assets.sha256
-            tar --sort=name --mtime='UTC 1970-01-01' \
-              --owner=0 --group=0 --numeric-owner \
-              -czf ../../trading-host-artifact/trading-ecs-control.tar.gz \
-              "${trading_control_assets[@]}"
-          )
-          (
-            cd trading-host-artifact
-            published_registry=${IMAGE_REPOSITORY%%/*}
-            repository_path=${IMAGE_REPOSITORY#*/}
-            case "$published_registry" in
-              *-vpc.ap-northeast-1.personal.cr.aliyuncs.com)
-                vpc_registry=$published_registry
-                published_registry=${published_registry/-vpc.ap-northeast-1.personal.cr.aliyuncs.com/.ap-northeast-1.personal.cr.aliyuncs.com}
-                ;;
-              *.ap-northeast-1.personal.cr.aliyuncs.com)
-                vpc_registry=${published_registry/.ap-northeast-1.personal.cr.aliyuncs.com/-vpc.ap-northeast-1.personal.cr.aliyuncs.com}
-                ;;
-              *)
-                echo "ACR_REGISTRY must be a Tokyo Personal Edition endpoint" >&2
-                exit 1
-                ;;
-            esac
-            published_repository="$published_registry/$repository_path"
-            vpc_repository="$vpc_registry/$repository_path"
-            control_manifest_sha=$(sha256sum trading-ecs-control-assets.sha256 \
-              | awk '{print $1}')
-            control_archive_sha=$(sha256sum trading-ecs-control.tar.gz \
-              | awk '{print $1}')
-            jq -S -n \
-              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
-              --arg published_repository "$published_repository" \
-              --arg image_repository "$vpc_repository" \
-              --arg image_digest "$IMAGE_DIGEST" \
-              --arg image_reference "$vpc_repository@$IMAGE_DIGEST" \
-              --arg control_manifest_sha256 "$control_manifest_sha" \
-              --arg control_archive_sha256 "$control_archive_sha" \
-              '{schema:"monday.hft_trading_ecs_release.v1",
-                source_revision:$source_revision,
-                image:{published_repository:$published_repository,
-                  repository:$image_repository,digest:$image_digest,
-                  reference:$image_reference},
-                control_manifest:{file:"trading-ecs-control-assets.sha256",
-                  sha256:$control_manifest_sha256},
-                control_archive:{file:"trading-ecs-control.tar.gz",
-                  sha256:$control_archive_sha256},
-                platform:{region:"ap-northeast-1",host_os:"ubuntu",
-                  host_version:"26.04",architecture:"amd64",
-                  orchestrator:"none"}}' \
-              > hft-trading-ecs-release.json
-            sha256sum hft-trading-ecs-release.json \
-              > hft-trading-ecs-release.json.sha256
-          )
-
-      - name: Upload bare-metal trading host contract
-        if: ${{ (matrix.repository == 'hft-trading') && !matrix.research_artifact }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: hft-trading-ecs-linux-amd64-${{ github.sha }}
-          path: trading-host-artifact/
-          if-no-files-found: error
-          retention-days: 90
-
-      - name: Extract collector binaries for bare-metal ECS
-        if: ${{ (matrix.repository == 'binance-lob-archiver') && !matrix.research_artifact }}
-        env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
-        run: |
-          mkdir -p artifact
-          docker pull "$IMAGE"
-          container_id=$(docker create "$IMAGE")
-          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
-          docker cp "$container_id:/usr/local/bin/binance-lob-archiver" artifact/binance-lob-archiver
-          docker cp "$container_id:/usr/local/bin/binance-usdm-account-archiver" artifact/binance-usdm-account-archiver
-          docker cp "$container_id:/usr/local/bin/polymarket-raw-ops" artifact/polymarket-raw-ops
-          docker cp "$container_id:/usr/local/bin/bybit-options-archiver" artifact/bybit-options-archiver
-          docker cp "$container_id:/usr/local/bin/binance-usdm-reference-collector" artifact/binance-usdm-reference-collector
-          docker cp "$container_id:/usr/local/bin/binance-usdm-reference-artifact-verifier" artifact/binance-usdm-reference-artifact-verifier
-          docker cp "$container_id:/usr/local/bin/binance-usdm-reference-upload" artifact/binance-usdm-reference-upload
-          docker cp "$container_id:/usr/local/bin/binance-fee-snapshot" artifact/binance-fee-snapshot
-          docker cp "$container_id:/usr/local/bin/binance-fee-snapshot-upload" artifact/binance-fee-snapshot-upload
-          chmod 0755 artifact/binance-lob-archiver
-          chmod 0755 artifact/binance-usdm-account-archiver
-          chmod 0755 artifact/polymarket-raw-ops
-          chmod 0755 artifact/bybit-options-archiver
-          chmod 0755 artifact/binance-usdm-reference-collector
-          chmod 0755 artifact/binance-usdm-reference-artifact-verifier
-          chmod 0755 artifact/binance-usdm-reference-upload
-          chmod 0755 artifact/binance-fee-snapshot
-          chmod 0755 artifact/binance-fee-snapshot-upload
-          artifact/binance-lob-archiver --version \
-            | grep -Fqx 'binance-lob-archiver ${{ needs.selector.outputs.source_sha }}'
-          artifact/binance-usdm-account-archiver --version \
-            | grep -Fqx 'binance-usdm-account-archiver ${{ needs.selector.outputs.source_sha }}'
-          artifact/polymarket-raw-ops --version \
-            | grep -Fqx 'polymarket-raw-ops ${{ needs.selector.outputs.source_sha }}'
-          artifact/bybit-options-archiver --version \
-            | grep -Fqx 'bybit-options-archiver ${{ needs.selector.outputs.source_sha }}'
-          (
-            cd artifact
-            sha256sum binance-lob-archiver | tee binance-lob-archiver.sha256
-            sha256sum binance-usdm-account-archiver \
-              | tee binance-usdm-account-archiver.sha256
-            sha256sum polymarket-raw-ops | tee polymarket-raw-ops.sha256
-            sha256sum bybit-options-archiver | tee bybit-options-archiver.sha256
-            sha256sum binance-usdm-reference-collector \
-              | tee binance-usdm-reference-collector.sha256
-            sha256sum binance-usdm-reference-artifact-verifier \
-              | tee binance-usdm-reference-artifact-verifier.sha256
-            sha256sum binance-usdm-reference-upload \
-              | tee binance-usdm-reference-upload.sha256
-            sha256sum binance-fee-snapshot \
-              | tee binance-fee-snapshot.sha256
-            sha256sum binance-fee-snapshot-upload \
-              | tee binance-fee-snapshot-upload.sha256
-          )
-          control_assets=(
-            polymarket-raw-ops-gate-control.sh
-            polymarket-raw-ops-gate@.service
-            polymarket-raw-ops-shadow-gate.sh
-            polymarket-raw-ops-cutover.sh
-            polymarket-shadow-gate-policy.jq
-            polymarket-legacy-health-policy.jq
-            polymarket-rust-health-policy.jq
-            polymarket-reference-collector-shadow@.service
-            polymarket-reference-collector.service
-            polymarket-reference-upload.service
-            polymarket-reference-upload.timer
-            polymarket-market-tape-upload.service
-            polymarket-market-tape-upload.timer
-            polymarket-market-tape-upload-watchdog.sh
-            polymarket-market-tape-upload-watchdog.service
-            polymarket-market-tape-upload-watchdog.timer
-          )
-          (
-            cd deployment/aliyun
-            sha256sum "${control_assets[@]}" > ../../artifact/polymarket-raw-ops-control-assets.sha256
-            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-              -czf ../../artifact/polymarket-raw-ops-control.tar.gz "${control_assets[@]}"
-          )
-          reference_control_assets=(
-            binance-usdm-reference-collector-shadow@.service
-            binance-usdm-reference-shadow-gate.sh
-            binance-usdm-reference-shadow-gate-policy.jq
-          )
-          (
-            cd deployment/aliyun
-            sha256sum "${reference_control_assets[@]}" \
-              > ../../artifact/binance-usdm-reference-control-assets.sha256
-            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-              -czf ../../artifact/binance-usdm-reference-control.tar.gz \
-              "${reference_control_assets[@]}"
-          )
-          reference_production_assets=(
-            binance-usdm-reference-collector.service
-            binance-usdm-reference-upload.service
-            binance-usdm-reference-upload.timer
-            binance-usdm-reference-upload.env
-            binance-usdm-reference-cutover.sh
-          )
-          (
-            cd deployment/aliyun
-            sha256sum "${reference_production_assets[@]}" \
-              > ../../artifact/binance-usdm-reference-production-control-assets.sha256
-            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-              -czf ../../artifact/binance-usdm-reference-production-control.tar.gz \
-              "${reference_production_assets[@]}"
-          )
-          fee_production_assets=(
-            binance-fee-cutover.sh
-            binance-fee-snapshot-spot.service
-            binance-fee-snapshot-spot.timer
-            binance-fee-snapshot-usdm.service
-            binance-fee-snapshot-usdm.timer
-            binance-fee-upload.service
-            binance-fee-upload.timer
-            binance-fee-upload.env
-            binance-fee.conf
-            monday-collector-health.sh
-          )
-          (
-            cd deployment/aliyun
-            sha256sum "${fee_production_assets[@]}" \
-              > ../../artifact/binance-fee-production-control-assets.sha256
-            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-              -czf ../../artifact/binance-fee-production-control.tar.gz \
-              "${fee_production_assets[@]}"
-          )
-          account_production_assets=(
-            binance-usdm-account-archiver.service
-          )
-          (
-            cd deployment/aliyun
-            sha256sum "${account_production_assets[@]}" \
-              > ../../artifact/binance-usdm-account-production-control-assets.sha256
-            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-              -czf ../../artifact/binance-usdm-account-production-control.tar.gz \
-              "${account_production_assets[@]}"
-          )
-          (
-            cd artifact
-            candidate_sha=$(awk 'NR == 1 {print $1}' polymarket-raw-ops.sha256)
-            control_manifest_sha=$(sha256sum polymarket-raw-ops-control-assets.sha256 \
-              | awk '{print $1}')
-            control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz \
-              | awk '{print $1}')
-            reference_candidate_sha=$(awk 'NR == 1 {print $1}' \
-              binance-usdm-reference-collector.sha256)
-            reference_verifier_sha=$(awk 'NR == 1 {print $1}' \
-              binance-usdm-reference-artifact-verifier.sha256)
-            reference_control_manifest_sha=$(sha256sum \
-              binance-usdm-reference-control-assets.sha256 | awk '{print $1}')
-            reference_control_archive_sha=$(sha256sum \
-              binance-usdm-reference-control.tar.gz | awk '{print $1}')
-            jq -S -n \
-              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
-              --arg candidate_sha256 "$reference_candidate_sha" \
-              --arg verifier_sha256 "$reference_verifier_sha" \
-              --arg control_manifest_sha256 "$reference_control_manifest_sha" \
-              --arg control_archive_sha256 "$reference_control_archive_sha" \
-              '{schema:"monday.binance_usdm_reference_release.v1",
-                source_revision:$source_revision,
-                candidate:{file:"binance-usdm-reference-collector",sha256:$candidate_sha256},
-                verifier:{file:"binance-usdm-reference-artifact-verifier",sha256:$verifier_sha256},
-                control_manifest:{file:"binance-usdm-reference-control-assets.sha256",
-                  sha256:$control_manifest_sha256},
-                control_archive:{file:"binance-usdm-reference-control.tar.gz",
-                  sha256:$control_archive_sha256}}' \
-              > binance-usdm-reference-release.json
-            sha256sum binance-usdm-reference-release.json \
-              > binance-usdm-reference-release.json.sha256
-            printf '%s  %s\n' "$reference_control_archive_sha" \
-              binance-usdm-reference-control.tar.gz \
-              > binance-usdm-reference-control.tar.gz.sha256
-            reference_production_control_archive_sha=$(sha256sum \
-              binance-usdm-reference-production-control.tar.gz | awk '{print $1}')
-            printf '%s  %s\n' "$reference_production_control_archive_sha" \
-              binance-usdm-reference-production-control.tar.gz \
-              > binance-usdm-reference-production-control.tar.gz.sha256
-            fee_candidate_sha=$(awk 'NR == 1 {print $1}' binance-fee-snapshot.sha256)
-            fee_uploader_sha=$(awk 'NR == 1 {print $1}' binance-fee-snapshot-upload.sha256)
-            fee_control_manifest_sha=$(sha256sum \
-              binance-fee-production-control-assets.sha256 | awk '{print $1}')
-            fee_control_archive_sha=$(sha256sum \
-              binance-fee-production-control.tar.gz | awk '{print $1}')
-            printf '%s  %s\n' "$fee_control_archive_sha" \
-              binance-fee-production-control.tar.gz \
-              > binance-fee-production-control.tar.gz.sha256
-            account_candidate_sha=$(awk 'NR == 1 {print $1}' \
-              binance-usdm-account-archiver.sha256)
-            account_control_manifest_sha=$(sha256sum \
-              binance-usdm-account-production-control-assets.sha256 | awk '{print $1}')
-            account_control_archive_sha=$(sha256sum \
-              binance-usdm-account-production-control.tar.gz | awk '{print $1}')
-            printf '%s  %s\n' "$account_control_archive_sha" \
-              binance-usdm-account-production-control.tar.gz \
-              > binance-usdm-account-production-control.tar.gz.sha256
-            jq -S -n \
-              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
-              --arg candidate_sha256 "$account_candidate_sha" \
-              --arg control_manifest_sha256 "$account_control_manifest_sha" \
-              --arg control_archive_sha256 "$account_control_archive_sha" \
-              '{schema:"monday.binance_usdm_account_release.v1",
-                source_revision:$source_revision,
-                candidate:{file:"binance-usdm-account-archiver",sha256:$candidate_sha256},
-                control_manifest:{file:"binance-usdm-account-production-control-assets.sha256",
-                  sha256:$control_manifest_sha256},
-                control_archive:{file:"binance-usdm-account-production-control.tar.gz",
-                  sha256:$control_archive_sha256}}' \
-              > binance-usdm-account-release.json
-            sha256sum binance-usdm-account-release.json \
-              > binance-usdm-account-release.json.sha256
-            jq -S -n \
-              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
-              --arg candidate_sha256 "$fee_candidate_sha" \
-              --arg uploader_sha256 "$fee_uploader_sha" \
-              --arg control_manifest_sha256 "$fee_control_manifest_sha" \
-              --arg control_archive_sha256 "$fee_control_archive_sha" \
-              '{schema:"monday.binance_fee_release.v1",
-                source_revision:$source_revision,
-                candidate:{file:"binance-fee-snapshot",sha256:$candidate_sha256},
-                uploader:{file:"binance-fee-snapshot-upload",sha256:$uploader_sha256},
-                control_manifest:{file:"binance-fee-production-control-assets.sha256",
-                  sha256:$control_manifest_sha256},
-                control_archive:{file:"binance-fee-production-control.tar.gz",
-                  sha256:$control_archive_sha256}}' \
-              > binance-fee-release.json
-            sha256sum binance-fee-release.json > binance-fee-release.json.sha256
-            jq -S -n \
-              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
-              --arg candidate_sha256 "$candidate_sha" \
-              --arg control_manifest_sha256 "$control_manifest_sha" \
-              --arg control_archive_sha256 "$control_archive_sha" \
-              '{schema:"monday.polymarket_raw_ops_release.v1",
-                source_revision:$source_revision,
-                candidate:{file:"polymarket-raw-ops",sha256:$candidate_sha256},
-                control_manifest:{file:"polymarket-raw-ops-control-assets.sha256",
-                  sha256:$control_manifest_sha256},
-                control_archive:{file:"polymarket-raw-ops-control.tar.gz",
-                  sha256:$control_archive_sha256}}' \
-              > polymarket-raw-ops-release.json
-            sha256sum polymarket-raw-ops-release.json \
-              > polymarket-raw-ops-release.json.sha256
-            jq -er '.source_revision' polymarket-raw-ops-release.json \
-              > source-revision.txt
-            jq -er '.control_manifest.sha256' polymarket-raw-ops-release.json \
-              > deployment-bundle.sha256
-            printf '%s  %s\n' \
-              "$(jq -er '.control_archive.sha256' polymarket-raw-ops-release.json)" \
-              polymarket-raw-ops-control.tar.gz \
-              > polymarket-raw-ops-control.tar.gz.sha256
-          )
-
-      - name: Upload collector binary artifact bundle
-        if: ${{ (matrix.repository == 'binance-lob-archiver') && !matrix.research_artifact }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: binance-lob-archiver-linux-amd64-${{ github.sha }}
-          path: artifact/
-          if-no-files-found: error
-          retention-days: 7
-
       - name: Read back research image source and executable bytes
         if: matrix.research_artifact
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.prior-image.outputs.image || format('{0}/wildcard0923/{1}@{2}', vars.ACR_REGISTRY, matrix.repository, steps.build.outputs.digest) }}
           SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
           IMAGE_REPOSITORY: ${{ matrix.repository }}
         run: |
           docker pull "$IMAGE"
           bash .github/scripts/verify-research-product-image.sh "$IMAGE" "$SOURCE_REVISION" \
             "${RUNNER_TEMP}/research-release/research-bin" "${{ matrix.product }}"
+
+      - name: Record verified ACR publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          IMAGE: ${{ steps.prior-image.outputs.image || format('{0}/wildcard0923/{1}@{2}', vars.ACR_REGISTRY, matrix.repository, steps.build.outputs.digest) }}
+        run: |
+          docker pull "$IMAGE"
+          base_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE")
+          .github/scripts/write-release-record.sh "$SOURCE_SHA" "$base_digest" "$IMAGE" "$RUNNER_TEMP/acr-release-record.json"
+
+      - name: Record independent OCI delivery receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          PRODUCT: ${{ matrix.product }}
+          IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}
+        run: ruby .github/scripts/research-oci-delivery.rb record "$SOURCE_SHA" "$PRODUCT" "$IMAGE_REPOSITORY" "$RUNNER_TEMP/research-oci-delivery.json"
+
+      - name: Retain independent OCI delivery receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: research-oci-delivery-${{ matrix.product }}-${{ needs.selector.outputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/research-oci-delivery.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Retain verified ACR publication record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: acr-release-record-${{ matrix.repository }}-${{ needs.selector.outputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/acr-release-record.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Remove ACR credentials
+        if: always()
+        env:
+          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+        run: |
+          docker logout "$ACR_REGISTRY" >/dev/null 2>&1 || true
+          docker_config_root=${DOCKER_CONFIG:-$HOME/.docker}
+          rm -f -- "$docker_config_root/config.json"
+
+
+
+  publish:
+    name: Publish ${{ matrix.repository }}
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      id-token: write
+      pull-requests: read
+    needs: [selector, research-runner-binaries, publish-research-images, research-environments]
+    if: always() && needs.selector.result == 'success' && needs.research-environments.result == 'success' && needs.research-environments.outputs.ready == 'true' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Products can share the source archive. Keep first writes serial.
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.research-environments.outputs.matrix) }}
+
+    # Names are emitted only after the GET-only environment gate succeeds.
+    environment:
+      name: ${{ matrix.environment_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.selector.outputs.source_sha }}
+
+      - name: Recheck automatic publication before credential use
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          PRODUCTS: ${{ needs.research-environments.outputs.archive_products }}
+          EXPECTED_PRODUCT: ${{ matrix.product }}
+          EXPECTED_ENVIRONMENT_ID: ${{ matrix.environment_id }}
+          MONDAY_RESEARCH_AUTOMATIC_PUBLICATION: ${{ vars.MONDAY_RESEARCH_AUTOMATIC_PUBLICATION }}
+          MONDAY_RESEARCH_RELEASE_POLICY: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+        run: |
+          set -euo pipefail
+          admission="$RUNNER_TEMP/automatic-publication-recheck.json"
+          bash .github/scripts/read-automatic-research-publication.sh "$PRODUCTS" "$SOURCE_SHA" "$admission"
+          jq -e --arg product "$EXPECTED_PRODUCT" --argjson id "$EXPECTED_ENVIRONMENT_ID"             'any(.environments[]; .product == $product and .environment_id == $id)' "$admission"
+
+      - name: Require selected research release source
+        if: matrix.research_artifact
+        env:
+          RESEARCH_MODE: ${{ needs.selector.outputs.research_mode }}
+          REBUILD_RESULT: ${{ needs.research-runner-binaries.result }}
+        run: |
+          [[ "$RESEARCH_MODE" == artifact ]] || \
+            [[ "$RESEARCH_MODE" == rebuild && "$REBUILD_RESULT" == success ]]
+
+      - name: Require research publication settings before preparation
+        if: matrix.research_artifact
+        env:
+          MONDAY_RELEASE_POLICY_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
+          MONDAY_RELEASE_SIGNING_KEY_PRESENT: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}
+          MONDAY_RELEASE_OSS_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
+        run: .github/scripts/publish-research-build-release.sh check-presence
+
+      - name: Validate public research publication policy before preparation
+        if: matrix.research_artifact
+        env:
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          PRODUCT: ${{ matrix.product }}
+        run: .github/scripts/publish-research-build-release.sh check-public-policy
+
+      - name: Admit OSS operating allowance before cloud use
+        if: matrix.research_artifact
+        env:
+          MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY: ${{ vars.MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY }}
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          PRODUCTS: ${{ needs.research-environments.outputs.archive_products }}
+        run: |
+          set -euo pipefail
+          storage_hours=$(jq -er '.storage_hours' <<<"$MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY")
+          bash .github/scripts/research-publication-budget.sh admit-operations "$SOURCE_SHA" "$PRODUCTS" "$storage_hours" "$RUNNER_TEMP/research-publication-budget-admission.json"
+
+      - name: Download authenticated research release
+        if: matrix.research_artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+        run: |
+          .github/scripts/download-research-release.sh "$PRODUCER_RUN" "$SOURCE_SHA" "${RUNNER_TEMP}/research-release" "${{ needs.selector.outputs.research_product }}"
+          test ! -e rust_hft/research-bin
+          mkdir -p rust_hft/research-bin
+          while IFS= read -r binary; do
+            install -m 0755 "${RUNNER_TEMP}/research-release/research-bin/$binary" "rust_hft/research-bin/$binary"
+          done < <(bash .github/scripts/research-release-products.sh binaries "${{ matrix.product }}")
+
+      - name: Install independent release issuer toolchain
+        if: matrix.research_artifact
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: 1.98.1
+
+      - name: Compile independent release issuer before secret injection
+        if: matrix.research_artifact
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/research-release-issuer-target
+        run: cargo build --manifest-path rust_hft/research-core/platform/Cargo.toml --locked --features publisher --bin research-release-publisher --bin research-release-capability
+
+      - name: Read this run's independent OCI delivery
+        id: delivered-image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          PRODUCT: ${{ matrix.product }}
+          IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}
+        run: ruby .github/scripts/research-oci-delivery.rb current "$SOURCE_SHA" "$PRODUCT" "$IMAGE_REPOSITORY" "$RUNNER_TEMP/research-oci-delivery.json" "$GITHUB_OUTPUT"
+
+      - name: Log in to ACR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ vars.ACR_REGISTRY }}
+          username: ${{ vars.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Revalidate current main before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHECK_TIMEOUT_SECONDS: "0"
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+        run: |
+          current_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          test "$SOURCE_REVISION" = "$current_main"
+          .github/scripts/wait-release-required-checks.sh "$SOURCE_REVISION" current-main
+
+      - name: Read back research image source and executable bytes
+        if: matrix.research_artifact
+        env:
+          IMAGE: ${{ steps.delivered-image.outputs.image }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          IMAGE_REPOSITORY: ${{ matrix.repository }}
+        run: |
+          docker pull "$IMAGE"
+          bash .github/scripts/verify-research-product-image.sh "$IMAGE" "$SOURCE_REVISION" \
+            "${RUNNER_TEMP}/research-release/research-bin" "${{ matrix.product }}"
+
+      - name: Require independent Build signer configuration
+        if: matrix.research_artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
+          MONDAY_RELEASE_SIGNING_KEY: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY }}
+          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
+          IMAGE_REPOSITORY: ${{ matrix.repository }}
+          PRODUCT: ${{ matrix.product }}
+          SOFTWARE_PRODUCTS: ${{ needs.selector.outputs.research_product }}
+          PUBLISH_IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}
+        run: .github/scripts/publish-research-build-release.sh check-config
 
       - name: Issue verified native Build release proofs
         if: matrix.research_artifact
@@ -963,7 +642,7 @@ jobs:
           PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
           SOFTWARE_PRODUCTS: ${{ needs.selector.outputs.research_product }}
           PRODUCT: ${{ matrix.product }}
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.delivered-image.outputs.image }}
           IMAGE_REPOSITORY: ${{ matrix.repository }}
         run: .github/scripts/publish-research-build-release.sh publish
 
@@ -993,27 +672,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Record verified ACR publication
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
-        run: |
-          docker pull "$IMAGE"
-          base_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE")
-          if [[ '${{ matrix.repository }}' == binance-lob-archiver ]]; then
-            test "$base_digest" = "$(cat "$RUNNER_TEMP/tested-collector/image-id.txt")"
-          fi
-          .github/scripts/write-release-record.sh "$SOURCE_SHA" "$base_digest" "$IMAGE" "$RUNNER_TEMP/acr-release-record.json"
-
-      - name: Retain verified ACR publication record
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: acr-release-record-${{ matrix.repository }}-${{ needs.selector.outputs.source_sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/acr-release-record.json
-          if-no-files-found: error
-          retention-days: 90
-
       - name: Remove ACR credentials
         if: always()
         env:
@@ -1024,6 +682,7 @@ jobs:
           rm -f -- "$docker_config_root/config.json"
 
 
+
   publish-ordinary:
     name: Publish ${{ matrix.repository }}
     permissions:
@@ -1031,96 +690,32 @@ jobs:
       checks: read
       contents: read
       pull-requests: read
-    needs: [selector, research-runner-binaries]
-    if: always() && needs.selector.result == 'success' && needs.selector.outputs.ordinary_matrix != '{"include":[]}' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'
+    needs: ordinary-selector
+    if: always() && needs.ordinary-selector.result == 'success' && needs.ordinary-selector.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.selector.outputs.ordinary_matrix) }}
+      matrix: ${{ fromJSON(needs.ordinary-selector.outputs.matrix) }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ needs.selector.outputs.source_sha }}
-
-      - name: Require selected research release source
-        if: matrix.research_artifact
-        env:
-          RESEARCH_MODE: ${{ needs.selector.outputs.research_mode }}
-          REBUILD_RESULT: ${{ needs.research-runner-binaries.result }}
-        run: |
-          [[ "$RESEARCH_MODE" == artifact ]] || \
-            [[ "$RESEARCH_MODE" == rebuild && "$REBUILD_RESULT" == success ]]
+          ref: ${{ needs.ordinary-selector.outputs.source_sha }}
 
       - name: Verify Binance fee release contract
         if: ${{ (matrix.repository == 'binance-lob-archiver') && !matrix.research_artifact }}
         run: deployment/aliyun/test-binance-fee-release-contract.sh
 
-      - name: Require research publication settings before preparation
-        if: matrix.research_artifact
-        env:
-          MONDAY_RELEASE_POLICY_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
-          MONDAY_RELEASE_SIGNING_KEY_PRESENT: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY != '' }}
-          MONDAY_RELEASE_OSS_PRESENT: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY != '' }}
-        run: .github/scripts/publish-research-build-release.sh check-presence
-
-      - name: Validate public research publication policy before preparation
-        if: matrix.research_artifact
-        env:
-          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
-          PRODUCT: ${{ matrix.product }}
-        run: .github/scripts/publish-research-build-release.sh check-public-policy
-
-      - name: Download authenticated research release
-        if: matrix.research_artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
-        run: |
-          .github/scripts/download-research-release.sh "$PRODUCER_RUN" "$SOURCE_SHA" "${RUNNER_TEMP}/research-release" "${{ needs.selector.outputs.research_product }}"
-          test ! -e rust_hft/research-bin
-          mkdir -p rust_hft/research-bin
-          while IFS= read -r binary; do
-            install -m 0755 "${RUNNER_TEMP}/research-release/research-bin/$binary" "rust_hft/research-bin/$binary"
-          done < <(bash .github/scripts/research-release-products.sh binaries "${{ matrix.product }}")
-
       - name: Download verified collector image
         if: matrix.repository == 'binance-lob-archiver'
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.ordinary-selector.outputs.source_sha }}
         run: bash .github/scripts/read-tested-image.sh "$SOURCE_SHA" "${RUNNER_TEMP}/tested-collector" required binance-lob-archiver
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - name: Install independent release issuer toolchain
-        if: matrix.research_artifact
-        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
-        with:
-          toolchain: 1.98.1
-
-      - name: Compile independent release issuer before secret injection
-        if: matrix.research_artifact
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/research-release-issuer-target
-        run: cargo build --manifest-path rust_hft/research-core/platform/Cargo.toml --locked --features publisher --bin research-release-publisher --bin research-release-capability
-
-      - name: Require independent Build signer configuration
-        if: matrix.research_artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
-          MONDAY_RELEASE_SIGNING_KEY: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-          PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
-          IMAGE_REPOSITORY: ${{ matrix.repository }}
-          PRODUCT: ${{ matrix.product }}
-          SOFTWARE_PRODUCTS: ${{ needs.selector.outputs.research_product }}
-          PUBLISH_IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}
-        run: .github/scripts/publish-research-build-release.sh check-config
 
       - name: Log in to ACR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -1133,7 +728,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_CHECK_TIMEOUT_SECONDS: "0"
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          SOURCE_REVISION: ${{ needs.ordinary-selector.outputs.source_sha }}
         run: |
           current_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
           test "$SOURCE_REVISION" = "$current_main"
@@ -1144,7 +739,7 @@ jobs:
         id: promote
         env:
           IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/binance-lob-archiver
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.ordinary-selector.outputs.source_sha }}
         run: |
           image_id=$(cat "${RUNNER_TEMP}/tested-collector/image-id.txt")
           docker tag "$image_id" "$IMAGE_REPOSITORY:$SOURCE_SHA"
@@ -1166,9 +761,9 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
-            SOURCE_REVISION=${{ needs.selector.outputs.source_sha }}
+            SOURCE_REVISION=${{ needs.ordinary-selector.outputs.source_sha }}
           tags: |
-            ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ needs.selector.outputs.source_sha }}
+            ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ needs.ordinary-selector.outputs.source_sha }}
             ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:run-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=acr-${{ matrix.repository }}
           cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=min,scope=acr-{0}', matrix.repository) || '' }}
@@ -1177,13 +772,13 @@ jobs:
           provenance: false
           sbom: false
           labels: |
-            org.opencontainers.image.revision=${{ needs.selector.outputs.source_sha }}
+            org.opencontainers.image.revision=${{ needs.ordinary-selector.outputs.source_sha }}
 
       - name: Read back the tested collector image
         if: matrix.repository == 'binance-lob-archiver'
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/binance-lob-archiver@${{ steps.promote.outputs.digest }}
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.ordinary-selector.outputs.source_sha }}
         run: |
           docker pull "$IMAGE"
           test "$(docker image inspect --format '{{.Id}}' "$IMAGE")" = "$(cat "${RUNNER_TEMP}/tested-collector/image-id.txt")"
@@ -1198,7 +793,7 @@ jobs:
         if: ${{ (matrix.repository == 'polymarket-evidence-compiler') && !matrix.research_artifact }}
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          SOURCE_REVISION: ${{ needs.ordinary-selector.outputs.source_sha }}
         run: |
           docker pull "$IMAGE"
           actual_source_revision=$(docker image inspect \
@@ -1212,7 +807,7 @@ jobs:
         if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          SOURCE_REVISION: ${{ needs.ordinary-selector.outputs.source_sha }}
         run: |
           docker pull "$IMAGE"
           actual_source_revision=$(docker image inspect \
@@ -1231,7 +826,7 @@ jobs:
         if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          SOURCE_REVISION: ${{ needs.ordinary-selector.outputs.source_sha }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
@@ -1252,7 +847,7 @@ jobs:
         if: ${{ (matrix.repository == 'polymarket-market-recorder') && !matrix.research_artifact }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: polymarket-market-recorder-linux-amd64-${{ needs.selector.outputs.source_sha }}
+          name: polymarket-market-recorder-linux-amd64-${{ needs.ordinary-selector.outputs.source_sha }}
           path: polymarket-market-recorder-linux-amd64.tar
           if-no-files-found: error
           retention-days: 90
@@ -1261,7 +856,7 @@ jobs:
         if: matrix.repository == 'campaign-cycle-controller'
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
+          SOURCE_REVISION: ${{ needs.ordinary-selector.outputs.source_sha }}
         run: |
           set -euo pipefail
           docker pull "$IMAGE"
@@ -1315,7 +910,7 @@ jobs:
             control_archive_sha=$(sha256sum trading-ecs-control.tar.gz \
               | awk '{print $1}')
             jq -S -n \
-              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
+              --arg source_revision '${{ needs.ordinary-selector.outputs.source_sha }}' \
               --arg published_repository "$published_repository" \
               --arg image_repository "$vpc_repository" \
               --arg image_digest "$IMAGE_DIGEST" \
@@ -1376,13 +971,13 @@ jobs:
           chmod 0755 artifact/binance-fee-snapshot
           chmod 0755 artifact/binance-fee-snapshot-upload
           artifact/binance-lob-archiver --version \
-            | grep -Fqx 'binance-lob-archiver ${{ needs.selector.outputs.source_sha }}'
+            | grep -Fqx 'binance-lob-archiver ${{ needs.ordinary-selector.outputs.source_sha }}'
           artifact/binance-usdm-account-archiver --version \
-            | grep -Fqx 'binance-usdm-account-archiver ${{ needs.selector.outputs.source_sha }}'
+            | grep -Fqx 'binance-usdm-account-archiver ${{ needs.ordinary-selector.outputs.source_sha }}'
           artifact/polymarket-raw-ops --version \
-            | grep -Fqx 'polymarket-raw-ops ${{ needs.selector.outputs.source_sha }}'
+            | grep -Fqx 'polymarket-raw-ops ${{ needs.ordinary-selector.outputs.source_sha }}'
           artifact/bybit-options-archiver --version \
-            | grep -Fqx 'bybit-options-archiver ${{ needs.selector.outputs.source_sha }}'
+            | grep -Fqx 'bybit-options-archiver ${{ needs.ordinary-selector.outputs.source_sha }}'
           (
             cd artifact
             sha256sum binance-lob-archiver | tee binance-lob-archiver.sha256
@@ -1500,7 +1095,7 @@ jobs:
             reference_control_archive_sha=$(sha256sum \
               binance-usdm-reference-control.tar.gz | awk '{print $1}')
             jq -S -n \
-              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
+              --arg source_revision '${{ needs.ordinary-selector.outputs.source_sha }}' \
               --arg candidate_sha256 "$reference_candidate_sha" \
               --arg verifier_sha256 "$reference_verifier_sha" \
               --arg control_manifest_sha256 "$reference_control_manifest_sha" \
@@ -1543,7 +1138,7 @@ jobs:
               binance-usdm-account-production-control.tar.gz \
               > binance-usdm-account-production-control.tar.gz.sha256
             jq -S -n \
-              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
+              --arg source_revision '${{ needs.ordinary-selector.outputs.source_sha }}' \
               --arg candidate_sha256 "$account_candidate_sha" \
               --arg control_manifest_sha256 "$account_control_manifest_sha" \
               --arg control_archive_sha256 "$account_control_archive_sha" \
@@ -1558,7 +1153,7 @@ jobs:
             sha256sum binance-usdm-account-release.json \
               > binance-usdm-account-release.json.sha256
             jq -S -n \
-              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
+              --arg source_revision '${{ needs.ordinary-selector.outputs.source_sha }}' \
               --arg candidate_sha256 "$fee_candidate_sha" \
               --arg uploader_sha256 "$fee_uploader_sha" \
               --arg control_manifest_sha256 "$fee_control_manifest_sha" \
@@ -1574,7 +1169,7 @@ jobs:
               > binance-fee-release.json
             sha256sum binance-fee-release.json > binance-fee-release.json.sha256
             jq -S -n \
-              --arg source_revision '${{ needs.selector.outputs.source_sha }}' \
+              --arg source_revision '${{ needs.ordinary-selector.outputs.source_sha }}' \
               --arg candidate_sha256 "$candidate_sha" \
               --arg control_manifest_sha256 "$control_manifest_sha" \
               --arg control_archive_sha256 "$control_archive_sha" \
@@ -1607,47 +1202,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Read back research image source and executable bytes
-        if: matrix.research_artifact
-        env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-          IMAGE_REPOSITORY: ${{ matrix.repository }}
-        run: |
-          docker pull "$IMAGE"
-          bash .github/scripts/verify-research-product-image.sh "$IMAGE" "$SOURCE_REVISION" \
-            "${RUNNER_TEMP}/research-release/research-bin" "${{ matrix.product }}"
-
-      - name: Issue verified native Build release proofs
-        if: matrix.research_artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MONDAY_RELEASE_POLICY_JSON: ${{ vars.MONDAY_RESEARCH_RELEASE_POLICY }}
-          MONDAY_RELEASE_SIGNING_KEY: ${{ secrets.MONDAY_RESEARCH_RELEASE_SIGNING_KEY }}
-          SOURCE_REVISION: ${{ needs.selector.outputs.source_sha }}
-          PRODUCER_RUN: ${{ needs.selector.outputs.artifact_run_id }}
-          SOFTWARE_PRODUCTS: ${{ needs.selector.outputs.research_product }}
-          PRODUCT: ${{ matrix.product }}
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
-          IMAGE_REPOSITORY: ${{ matrix.repository }}
-        run: .github/scripts/publish-research-build-release.sh publish
-
-      - name: Retain native Build release projection
-        if: matrix.research_artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: research-build-release-${{ needs.selector.outputs.source_sha }}-${{ matrix.product }}
-          path: |
-            ${{ runner.temp }}/research-build-plan.json
-            ${{ runner.temp }}/research-build-artifacts.json
-            ${{ runner.temp }}/research-release-context.json
-          if-no-files-found: error
-          retention-days: 7
-
       - name: Record verified ACR publication
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.ordinary-selector.outputs.source_sha }}
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.promote.outputs.digest || steps.build.outputs.digest }}
         run: |
           docker pull "$IMAGE"
@@ -1660,7 +1218,7 @@ jobs:
       - name: Retain verified ACR publication record
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: acr-release-record-${{ matrix.repository }}-${{ needs.selector.outputs.source_sha }}-${{ github.run_attempt }}
+          name: acr-release-record-${{ matrix.repository }}-${{ needs.ordinary-selector.outputs.source_sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/acr-release-record.json
           if-no-files-found: error
           retention-days: 90
@@ -1676,15 +1234,15 @@ jobs:
 
 
   research-release-complete:
-    name: Research products published [${{ needs.selector.outputs.published_products }}] (${{ needs.selector.outputs.source_sha }})
-    needs: [selector, publish]
-    if: always() && needs.selector.result == 'success' && needs.publish.result == 'success' && needs.selector.outputs.published_products != 'none'
+    name: Research products published [${{ needs.research-environments.outputs.archive_products }}] (${{ needs.selector.outputs.source_sha }})
+    needs: [selector, publish, research-environments]
+    if: always() && needs.selector.result == 'success' && needs.publish.result == 'success' && needs.research-environments.outputs.archive_products != ''
     runs-on: ubuntu-latest
     steps:
       - name: Record verified product publication
         env:
           SOURCE_SHA: ${{ needs.selector.outputs.source_sha }}
-          PRODUCT: ${{ needs.selector.outputs.published_products }}
+          PRODUCT: ${{ needs.research-environments.outputs.archive_products }}
           ARTIFACT_RUN_ID: ${{ needs.selector.outputs.artifact_run_id }}
         run: |
           test "$SOURCE_SHA" = "$GITHUB_SHA"

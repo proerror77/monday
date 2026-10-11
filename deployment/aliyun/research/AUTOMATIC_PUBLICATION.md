@@ -1,15 +1,78 @@
 # Automatic research publication
 
-Monday publishes admitted artifacts automatically. Publication does not start
-research, resume collection, change risk, or enable trading.
+Monday delivers software images and archives signed Build evidence in separate
+stages. Neither stage starts research, resumes collection, changes trading risk,
+or enables trading. `cex-runner` is the research worker image; `controller` is
+research orchestration software. These software products are not strategy results.
 
-Keep the native `acr-publish.yml` workflow and existing research job names.
-Keep all three authenticated checks, current main, original producer identity,
-binary smoke, immutable software downloads, signed Build proofs, OCI executable
-readback, publication completion, and credential cleanup.
-Keep research matrix publication serial because products share a source archive.
-Keep Release, both Claude workflows, and the monitor OIDC template unchanged.
-Do not install the historical human probe or its global Release hold.
+| State | Evidence and meaning |
+| --- | --- |
+| CI software accepted | Exact main/SHA, three authenticated checks, original binary producer and offline smoke |
+| OCI image delivered | `Publish OCI <repository>` succeeded, immutable digest pulled, source and actual executable bytes checked, retained per-product receipt |
+| Signed Build archived | Original `Publish <repository>` signed and read back every required OSS object; the complete native publisher run must succeed |
+| ACK import accepted | Independent verification of producer, publisher, signatures and artifact identities |
+| Experiment completed | A separately authorized real-data run has models, cost-aware backtests and a reproducible manifest |
+
+The OCI lane has ACR access and no OSS environment, OIDC permission, signing key,
+or archive fee gate. Missing, invalid, expired or insufficient OSS operating
+approval leaves the archive pending while images retain their independent state.
+Manual reuse, explicit rebuild and main CI image carry use the same separation.
+An ordinary-image selector authenticates main and the three checks independently;
+`all` can deliver ordinary images even if a research artifact is unavailable.
+
+Keep native `acr-publish.yml` and the exact signed publisher job names. Keep the
+three checks, current main, original producer identity and attempt/job, build
+inputs, binary smoke, authenticated downloads and OCI executable readback.
+Signed archives retain the original native private ledger and signing rules.
+Archive matrices stay serial because products share a source archive. Release,
+Claude and monitor identities are unchanged.
+
+## Completion and retries
+
+A failed overall workflow or OSS stage does not erase a successful per-product
+OCI job. The image baseline reads completed runs of all conclusions and each
+original attempt. Controller, CEX and prediction advance independently. The
+signed Build baseline still requires a successful native run and the
+`Research products published [...] (SHA)` completion marker. Image jobs cannot
+produce that marker. It names exactly `archive_products`; a successful subset
+advances only those Builds and cannot claim the full requested product set.
+
+Each OCI job retains `monday.research-oci-delivery.v1` for 90 days. It records
+source, product, actual delivery run/attempt/job, immutable repository/digest,
+OCI config digest and the authenticated software producer/manifest hash. A retry
+reads the exact successful native job and its artifact, checks both before and
+after the download, then pulls and verifies the digest against the currently
+admitted binary artifact. The new delivery receipt records its own identity and
+the original reused delivery. A registry tag alone is never delivery evidence.
+
+Incomplete GitHub pagination, unreadable/expired/deleted positive receipts,
+ambiguous producers and source/product/repository/attempt/job drift reject
+reuse. Only a complete history with no successful delivery allows a first build.
+Partial product success is retained even if another product fails.
+
+OSS is stricter. Attempts after attempt 1 receive no new native allowance. A
+previous successful, failed or cancelled signed archive job for the same source
+and product requires reconciliation; automatic dispatch cannot refill its spent
+allowance. Skipped archives consumed no allowance. Eligible products can archive
+independently, but a failed publisher run remains inadmissible to ACK under the
+unchanged native contract. Operating approval pins an existing history anchor
+(past run ID and ordinal). The reader checks the complete ordinal sequence to
+the current run and rejects missing/deleted visible runs, unknown job state and
+an older queued run when a newer run is visible. Sources must follow the anchor
+commit and have a commit time within the approved UTC window. Pre-window or
+future-dated sources require reconciliation. Earlier retained same-source
+archive jobs remain counted even before the anchor. No future run number is
+predicted by the user.
+
+This cross-run reconciliation requires administrators to retain monotonically
+visible Actions history throughout the approved window. Actions is not a
+permanent spending ledger: a deleted higher ordinal that ran before an older
+queued run is not detectable from the remaining list. Stop archival and reconcile
+if history is cleaned or this retention premise cannot be maintained. The
+operating approval explicitly requires that premise; the public admission names
+`retained-monotonic-github-history` as its basis. This does not provide an
+unconditional cumulative cost guarantee or resumable cross-run private-ledger
+recovery. No private ledger or session is uploaded.
 
 ## Identity and admission
 
@@ -44,7 +107,7 @@ If the API reports immutable subjects or a different prefix, reject that drift.
 Ordinary image publication uses a separate matrix without an environment or
 OIDC capability. It retains the existing steps and source admission.
 Manual recovery retains its existing required checks and producer rules.
-An explicit research rebuild also waits for the environment gate.
+An explicit research rebuild waits for authenticated source admission; only signing and OSS archival wait for the environment gate.
 
 ## Trust boundary
 
@@ -114,18 +177,30 @@ bash .github/scripts/research-publication-budget.sh estimate \
   <exact-source-sha> cex-runner,controller,prediction-runner 744 estimate.json
 ```
 
-`MONDAY_RESEARCH_PUBLICATION_BUDGET` is a public, single-run spending approval.
-Its schema is `monday.research-publication-budget-policy.v1`.
-It pins repository, source, selected products, workflow, next workflow run number,
-attempt 1, expiry, price model, storage horizon, and four usage limits.
-GitHub assigns a unique run number within this workflow.
-Read the next number before configuration. A race rejects the mismatched run.
-The admission then binds the actual run ID to the native allocation.
-Another run, a rerun, another source, an expired model, or an insufficient limit stops publication.
-It does not renew the approval automatically.
+`MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY` is a public operating allowance
+for software evidence archival. Its schema is
+`monday.research-publication-operations-policy.v1`. It specifies repository,
+workflow, allowed products, a fixed approved time window (at most seven days),
+currency, reviewed price model, storage horizon and per-publication cost/usage
+limits, an existing history anchor and `history_retention_required:true`. It does
+not ask the user to guess a source SHA or future workflow number.
+The estimator binds the actual source, run ID, run number and attempt into the
+existing `monday.oss-publication-budget.v1` native envelope before authentication.
+The scope is new software-source archival; it is separate from experiment,
+scientific grant, ACK activation and trading budgets. The repository variable is
+not installed or authorized by this document.
 
-The workflow checks all selected products before its first native OSS or authentication call.
-It also checks the budget before an explicit manual union build can start.
+The older `monday.research-publication-budget-policy.v1` single-run CLI remains
+available for offline compatibility. The automated workflow uses the operating
+allowance. It never treats that allowance as a global cumulative invoice cap.
+A fixed time window and a per-source limit do not bound the number of future
+sources or the aggregate storage bill. No shared cross-run counter/database,
+finite run-number slot protocol or new service is introduced.
+
+The workflow estimates all selected products offline before exposing an archive
+environment. Invalid approvals stop before OIDC, STS or OSS. Image preparation,
+image CI carry and ACR delivery have no OSS budget dependency. Archive jobs
+repeat admission and preserve the no-refill history/attempt checks.
 The native issuer must enforce each allocation with a persistent private ledger.
 Reserve requests and payload bytes before sending. Keep reservations after errors or interruption.
 Source preflight and publication must share that ledger across processes.

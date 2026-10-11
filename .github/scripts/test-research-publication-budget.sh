@@ -22,7 +22,7 @@ mkdir "$work/tools"
 cat >"$work/tools/date" <<'EOF'
 #!/usr/bin/env bash
 test "$*" = '-u +%s'
-printf '%s\n' 1791680400
+printf '%s\n' "${OPERATIONS_TEST_NOW:-1791680400}"
 EOF
 chmod +x "$work/tools/date"
 jq -n --arg products "$products" '{oss_by_product:($products|split(",")|
@@ -85,42 +85,65 @@ for selection in none controller,cex-runner cex-runner,cex-runner foreign; do
   if bash "$script_dir/research-publication-budget.sh" estimate "$source_sha" "$selection" 744 "$work/invalid-estimate.json" \
     >"$work/out" 2>"$work/err"; then echo 'unsafe catalog selection admitted' >&2; exit 1; fi
 done
-workflow=$root/.github/workflows/acr-publish.yml
-ruby -ryaml - "$workflow" "$work" <<'RUBY'
-w=YAML.safe_load(File.read(ARGV.fetch(0)))
-steps=w.fetch('jobs').fetch('publish').fetch('steps')
-selected=steps.select { |s|s['name']=='Admit cumulative research publication budget before cloud use' }
-abort 'missing or duplicate workflow budget gate' unless selected.length==1
-publication=selected.fetch(0)
-File.write(File.join(ARGV.fetch(1),'workflow-budget.sh'),publication.fetch('run'))
-gate_steps=w.fetch('jobs').fetch('research-environments').fetch('steps')
-early=gate_steps.select {|s|s['name']=='Admit publication budget before manual binary preparation'}
-abort 'missing or duplicate preparation budget gate' unless early.length==1 && gate_steps.index(early.fetch(0))==1
-abort 'preparation budget gate differs or gained conditional bypass' unless early.fetch(0).fetch('env')==publication.fetch('env') && early.fetch(0).fetch('run')==publication.fetch('run') && !early.fetch(0).key?('if')
-File.write(File.join(ARGV.fetch(1),'preparation-budget.sh'),early.fetch(0).fetch('run'))
-RUBY
-run_workflow() {
-  (
-    cd "$root"
-    PATH="$work/tools:$PATH" RUNNER_TEMP="$work" SOURCE_SHA="$source_sha" PRODUCTS="$products" \
-      GITHUB_REPOSITORY=proerror77/monday GITHUB_RUN_ID=456 GITHUB_RUN_NUMBER=123 GITHUB_RUN_ATTEMPT=1 \
-      GITHUB_WORKFLOW_REF=proerror77/monday/.github/workflows/acr-publish.yml@refs/heads/main \
-      MONDAY_RESEARCH_PUBLICATION_BUDGET="$(cat "$1")" \
-      MONDAY_RELEASE_POLICY_JSON="$(cat "$work/oss-policy.json")" \
-      bash "${2:-$work/workflow-budget.sh}" >"$work/out" 2>"$work/err"
-  )
+# Ongoing operating approval is independent of future workflow numbers and
+# sources. Each native envelope captures the actual runtime IDs; attempts do
+# not gain a fresh allowance. The history gate separately rejects prior writes.
+source_committed_at=$(git -C "$root" show -s --format=%ct "$source_sha")
+operations_now=$((source_committed_at+300))
+jq --argjson source_time "$source_committed_at" --argjson now "$operations_now" '
+ .schema="monday.research-publication-operations-policy.v1" | .not_before=($source_time-60) | .expires_at=($now+3600) |
+ .history_anchor_run_id=99 | .history_anchor_run_number=1 | .history_retention_required=true |
+ del(.source_sha,.publisher_run_number,.publisher_run_attempt)' "$work/policy.json" >"$work/operations.json"
+run_operations() {
+  PATH="$work/tools:$PATH" OPERATIONS_TEST_NOW="$operations_now" RUNNER_TEMP="$work" GITHUB_REPOSITORY=proerror77/monday \
+    GITHUB_RUN_ID="${2:-456}" GITHUB_RUN_NUMBER="${3:-123}" GITHUB_RUN_ATTEMPT="${4:-1}" \
+    GITHUB_WORKFLOW_REF=proerror77/monday/.github/workflows/acr-publish.yml@refs/heads/main \
+    MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY="$(cat "$1")" \
+    MONDAY_RELEASE_POLICY_JSON="$(cat "$work/oss-policy.json")" \
+    bash "$script_dir/research-publication-budget.sh" admit-operations "$source_sha" "$products" 744 "$work/operations-admission.json" \
+    >"$work/out" 2>"$work/err"
 }
-run_workflow "$work/policy.json"
-run_workflow "$work/policy.json" "$work/preparation-budget.sh"
-test -s "$work/research-publication-budget-admission.json"
-for expression in 'null' '.max_estimated_micro_cny=1' '.publisher_run_number=124'; do
-  jq "$expression" "$work/policy.json" >"$work/invalid.json"
-  rm -f "$work/research-publication-budget-admission.json" "$work/research-publication-native-budget.json"
-  if run_workflow "$work/invalid.json"; then echo 'workflow budget gate was bypassed' >&2; exit 1; fi
-  test ! -e "$work/research-publication-budget-admission.json"
+run_operations "$work/operations.json"
+jq -e '.admission.approval_kind=="software-operating-allowance" and .admission.publisher_run_id==456 and
+ .admission.aggregate_invoice_cap==false' "$work/operations-admission.json" >/dev/null
+run_operations "$work/operations.json" 987 654
+jq -e '.publisher_run_id==987 and .publisher_run_attempt==1' "$work/research-publication-native-budget.json" >/dev/null
+for expression in 'null' '.unexpected=true' '.not_before=1794268800' '.expires_at=1791680400' \
+ '.history_anchor_run_id=0' '.history_anchor_run_number="1"' '.history_retention_required=false' \
+ '.expires_at=.not_before+604801' '.not_before+=61' '.products=["cex-runner"]' '.schema="foreign"' \
+ '.max_estimated_micro_cny-=1' '.max_oss_requests-=1' '.max_request_body_bytes-=1' \
+ '.max_response_body_bytes-=1' '.max_new_storage_bytes-=1'; do
+  jq "$expression" "$work/operations.json" >"$work/invalid.json"
+  rm -f "$work/operations-admission.json" "$work/research-publication-native-budget.json"
+  if run_operations "$work/invalid.json"; then echo 'unsafe operating allowance admitted' >&2; exit 1; fi
+  test ! -e "$work/operations-admission.json"
   test ! -e "$work/research-publication-native-budget.json"
-  if run_workflow "$work/invalid.json" "$work/preparation-budget.sh"; then echo 'preparation budget gate was bypassed' >&2; exit 1; fi
-  test ! -e "$work/research-publication-budget-admission.json"
+done
+rm -f "$work/operations-admission.json" "$work/research-publication-native-budget.json"
+if run_operations "$work/operations.json" 456 123 2; then echo 'retry received new allowance' >&2; exit 1; fi
+test ! -e "$work/operations-admission.json"
+test ! -e "$work/research-publication-native-budget.json"
+# Empty/invalid/expired/insufficient approval stops at archive readiness. No GH
+# or OSS request is permitted, while the OCI lane has no readiness dependency.
+cat >"$work/tools/gh" <<'MOCK'
+#!/usr/bin/env bash
+printf 'unapproved archive made a network request\n' >>"$READINESS_NETWORK_LOG"
+exit 91
+MOCK
+chmod +x "$work/tools/gh"
+for expression in 'null' '.expires_at=1791680400' '.max_estimated_micro_cny=1' '.max_oss_requests=1'; do
+  jq "$expression" "$work/operations.json" >"$work/invalid.json"
+  : >"$work/readiness-output"
+  PATH="$work/tools:$PATH" OPERATIONS_TEST_NOW="$operations_now" READINESS_NETWORK_LOG="$work/network-log" RUNNER_TEMP="$work" \
+    GITHUB_REPOSITORY=proerror77/monday GITHUB_RUN_ID=456 GITHUB_RUN_NUMBER=123 GITHUB_RUN_ATTEMPT=1 \
+    GITHUB_WORKFLOW_REF=proerror77/monday/.github/workflows/acr-publish.yml@refs/heads/main \
+    MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY="$(cat "$work/invalid.json")" \
+    MONDAY_RESEARCH_AUTOMATIC_PUBLICATION='{}' MONDAY_RESEARCH_RELEASE_POLICY="$(cat "$work/oss-policy.json")" \
+    MONDAY_RELEASE_SIGNING_KEY_PRESENT=true \
+    bash "$script_dir/research-archive-readiness.sh" "$source_sha" "$products" '{"include":[]}' "$work/readiness-output" \
+    >"$work/out" 2>"$work/err"
+  grep -Fqx ready=false "$work/readiness-output"
+  test ! -e "$work/network-log"
 done
 cp "$work/oss-policy.json" "$work/valid-oss-policy.json"
 for expression in '.oss_by_product.controller.region="cn-hangzhou"' \
@@ -134,5 +157,5 @@ reject "$work/policy.json"
 printf '{invalid\n' >"$work/oss-policy.json"
 reject "$work/policy.json"
 printf 'Budget: same-source static inventory, exact-boundary admission and %s negative approvals passed\n' "$((negatives+5))"
-printf 'Both actual workflow gates: admitted boundaries and three denied configurations each passed\n'
+printf 'Operating allowance: automatic runtime binding, denied renewal and archive-only readiness passed\n'
 printf 'Foreign regions, accelerated endpoints, malformed and multiple price targets rejected\n'

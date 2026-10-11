@@ -27,6 +27,7 @@ def inventory:
      new_storage_bytes:$upload, recipes:$recipes}] as $allocations |
   {schema:"monday.research-publication-estimate.v1", repository:$repository,
    source_sha:$source_sha, source_archive:{bytes:$source_bytes,sha256:$source_digest},
+   source_committed_at:$source_committed_at,
    products:$selected, basis:"catalog-static-upper-bound", executable_bound_bytes:536870912,
    metadata_bound_bytes:1048576, small_response_bound_bytes:4096,
    allocations:$allocations,
@@ -51,8 +52,8 @@ def price:
     continued_storage_micro_cny_per_hour:($storage_gb*198),
     free_quota_assumed:false, invoice_hard_cap:false,
     response_overhead_model_bytes_per_request:65536}};
-def admit:
-  . as $estimate | $policy as $p |
+def admit_policy($p):
+  . as $estimate |
   require(($p|type)=="object" and
     ($p|keys)==["currency","expires_at","max_estimated_micro_cny","max_new_storage_bytes",
       "max_oss_requests","max_request_body_bytes","max_response_body_bytes","price_model",
@@ -92,7 +93,42 @@ def native_budget:
      response_payload_bytes:.total.response_body_bytes},
    allocations:[.allocations[]|{product,limits:{requests:.native_requests,
      request_payload_bytes:.request_body_bytes,response_payload_bytes:.response_body_bytes}}]};
+def admit_operations:
+  # Ongoing software operating authorization has no human-guessed SHA/run IDs.
+  # It is a bound per new source, not a global account or research/trading cap.
+  . as $estimate | $policy as $p |
+  require(($p|type)=="object" and ($p|keys)==["currency","expires_at","history_anchor_run_id",
+    "history_anchor_run_number","history_retention_required","max_estimated_micro_cny",
+    "max_new_storage_bytes","max_oss_requests","max_request_body_bytes","max_response_body_bytes",
+    "not_before","price_model","products","publisher_workflow","repository","schema","storage_hours"];
+    "one software operating allowance required") |
+  require($p.schema=="monday.research-publication-operations-policy.v1" and $p.repository==$repository and
+    $p.publisher_workflow==".github/workflows/acr-publish.yml" and $p.currency=="CNY" and
+    $p.price_model==.pricing.model and $p.storage_hours==$storage_hours and
+    ($p.products|type)=="array" and ($p.products|sort|unique)==$p.products and
+    ($p.products|length)>0 and all($p.products[]; .=="cex-runner" or .=="controller" or .=="prediction-runner") and
+    all(.products[]; . as $product | $p.products|index($product)); "operating scope or price model differs") |
+  require(($p.history_anchor_run_id|integer(1;9007199254740991)) and
+    ($p.history_anchor_run_number|integer(1;9007199254740991)) and $p.history_retention_required==true;
+    "retained publication history anchor required") |
+  require(($p.not_before|integer(1;1794268800)) and ($p.expires_at|integer(1;1794268800)) and
+    $p.not_before<=$now and $p.expires_at>$now and $p.expires_at>$p.not_before and
+    $p.expires_at-$p.not_before<=604800 and $now<1794268800; "operating allowance or price model expired") |
+  require((.source_committed_at|integer(1;1794268800)) and
+    .source_committed_at>=$p.not_before and .source_committed_at<=$now;
+    "pre-window or future source requires manual reconciliation") |
+  # Adapt public authorization to the existing strict native envelope. Runtime
+  # identities are captured here, before any OIDC/STS/OSS request.
+  ($p + {schema:"monday.research-publication-budget-policy.v1",source_sha:$source_sha,
+    products:$estimate.products,publisher_run_number:$run_number,publisher_run_attempt:$attempt}
+    | del(.not_before,.history_anchor_run_id,.history_anchor_run_number,.history_retention_required)) as $bound |
+  admit_policy($bound) |
+  .admission.approval_kind="software-operating-allowance" |
+  .admission.operating_policy=$p |
+  .admission.aggregate_invoice_cap=false |
+  .admission.retry_reconciliation_basis="retained-monotonic-github-history";
 if $mode=="estimate" then inventory | price
-elif $mode=="admit" then admit
+elif $mode=="admit" then admit_policy($policy)
+elif $mode=="admit-operations" then admit_operations
 elif $mode=="native" then native_budget
 else error("invalid budget mode") end
