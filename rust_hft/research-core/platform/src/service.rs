@@ -422,46 +422,61 @@ impl Reconciler {
             locked.task.stop(State::Cancelled, false)?;
         }
         if locked.task.state == State::Stopping {
+            let task = locked.task.clone();
             let lease = locked
                 .task
                 .lease
                 .as_ref()
                 .context("stop lacks execution lease")?
                 .clone();
+            let mut mutation =
+                crate::provider_operations::ProviderMutation::new(self.ledger.clone(), locked);
             if self
                 .kubernetes
-                .stop(&locked.task.spec, &lease, locked.task.execution.as_ref())
+                .stop(&task.spec, &lease, task.execution.as_ref(), &mut mutation)
                 .await?
+                == crate::execution::StopOutcome::Stopped
             {
-                if locked.task.spec.kind
-                    == hft_research_worker_contracts::task::TaskKind::CexCampaign
-                {
+                if task.spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
                     let issuer = self
                         .issuer
                         .as_ref()
                         .context("Campaign cleanup lacks controlled issuer")?;
-                    let issued = locked.recover_attempt_identity_for_cleanup(issuer).await?;
-                    if !self
+                    let issued = mutation
+                        .locked_mut()
+                        .await?
+                        .recover_attempt_identity_for_cleanup(issuer)
+                        .await?;
+                    if self
                         .kubernetes
                         .cleanup_attempt_identity(
-                            &locked.task.spec,
+                            &task.spec,
                             &lease,
-                            locked.task.attempt_identity.as_ref(),
+                            task.attempt_identity.as_ref(),
                             issued.as_ref(),
+                            &mut mutation,
                         )
                         .await?
+                        == crate::execution::StopOutcome::AwaitingEvidence
                     {
-                        locked.commit("identity_cleanup_pending").await?;
+                        mutation
+                            .into_locked()
+                            .await?
+                            .commit("identity_cleanup_pending")
+                            .await?;
                         return Ok(true);
                     }
                     if let Some(issued) = issued {
                         issuer.cleanup(issued)?;
                     }
                 }
+                locked = mutation.into_locked().await?;
                 if self.ledger.admission(&locked.task.spec).await?.is_none() {
                     locked.task.stop(State::Cancelled, false)?;
                 }
                 locked.task.stopped(lease.attempt, lease.fence)?;
+            } else {
+                locked = mutation.into_locked().await?;
             }
             locked.commit("stop_reconciled").await?;
             return Ok(true);
@@ -521,20 +536,38 @@ impl Reconciler {
                 } else {
                     None
                 };
-            let (handle, attempt_identity) = self
+            let task = locked.task.clone();
+            let remaining_ms = task.deadline_ms.context("launch lacks deadline")? - locked.now_ms;
+            let mut mutation =
+                crate::provider_operations::ProviderMutation::new(self.ledger.clone(), locked);
+            let outcome = self
                 .kubernetes
                 .launch(
-                    &locked.task.spec,
-                    &lease,
+                    &task,
                     &acceptance,
-                    locked.task.checkpoint.as_ref(),
-                    locked.task.deadline_ms.context("launch lacks deadline")? - locked.now_ms,
+                    remaining_ms,
                     issued.as_ref(),
+                    &mut mutation,
                 )
                 .await?;
+            locked = mutation.into_locked().await?;
+            let (handle, attempt_identity) = match outcome {
+                crate::execution::LaunchOutcome::Ready(handle, identity) => {
+                    (handle, identity.map(|reference| *reference))
+                }
+                crate::execution::LaunchOutcome::AwaitingEvidence => {
+                    locked.commit("provider_create_unknown").await?;
+                    return Ok(true);
+                }
+                crate::execution::LaunchOutcome::Rejected => {
+                    locked.task.stop(State::Failed, false)?;
+                    locked.commit("provider_create_rejected_or_unsent").await?;
+                    return Ok(true);
+                }
+            };
             locked.task.attempt_identity = attempt_identity;
             let now = locked.refresh_clock().await?;
-            if locked.task.expire(now)? {
+            if locked.task.expire(now)? || locked.task.state != State::Launching {
                 // Resource identity is still recovered by name during stopping.
                 locked.commit("launch_expired").await?;
                 return Ok(true);

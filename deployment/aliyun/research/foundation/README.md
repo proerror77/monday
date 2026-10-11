@@ -30,7 +30,7 @@ PVC 在缩容和 StatefulSet 删除后保留。PG/CH/objects/native-state/delive
 
 用独立 schema owner 按顺序安装 platform `sql/postgres.sql`、`verified_build_release.sql`、`build_import_admission.sql`、
 `session_deliveries.sql`、`artifact_gateway.sql`、`native_admission.sql`、
-`native_request_revocation.sql`、`native_campaign_inputs.sql`、`native_terminal_retirement.sql`，最后安装 `postgres/roles.sql`。
+`native_request_revocation.sql`、`native_campaign_inputs.sql`、`native_terminal_retirement.sql`、`provider_create_operations.sql`，最后安装 `postgres/roles.sql` 和新增的 `postgres/provider_create_roles.sql`。
 Native admission 迁移最后替换 artifact permit，保留 fence、lease、deadline、撤销与暂停检查，并加原生有效期和租户检查。
 `authority.mode` 必须仍为 `paused`；所有 backend 仍为 disabled。
 NOLOGIN 角色没有密码，也没有互相继承。经过独立审查的 login identity 才能获得对应角色。
@@ -145,7 +145,7 @@ cluster-wide 权限。Kubernetes token 仍由受控 operator 投影并核对主�
 不是另一个 Kubernetes 命名空间授权。
 
 离线安装顺序为 postgres、verified_build_release、build_import_admission、session_deliveries、artifact_gateway、
-native_admission、native_request_revocation、native_campaign_inputs、native_terminal_retirement，最后安装 roles.sql。
+native_admission、native_request_revocation、native_campaign_inputs、native_terminal_retirement、provider_create_operations，最后安装 roles.sql 和 provider_create_roles.sql。
 应用身份不写 native admission/revocation；Session 仅 UPDATE(session_sha256) 用于行锁。
 immutable_sessions trigger 继续拒绝实际文档修改，DELETE 没有授权。
 
@@ -177,3 +177,5 @@ mode0700。它使用 OSS importer 的短期 reader session 格式：`publisher=f
 与 AttemptWriter 仍使用原 artifact Gateway。空 Gateway PVC 不再要求另行转存
 发行程序。OSS 校验失败仍阻止 launch；它不改变 PG 登记、原生 grant、撤销、
 预算或 holdout 准入。离线测试使用本地 OSS 替身，生产启用仍需实际 OSS/网络读回。
+
+Provider create 迁移必须在 paused 且旧 reconciler 全部静默后执行。新 attempt 会原子建立创建记录；旧 active attempt 缺少记录时按 unknown 处理，不能用一次 GET 404 释放配额。迁移不回填 never-sent 事实，不启用 authority，不授权云端执行。迁移、最小角色安装和恢复证据需要单独 Runtime Gate。

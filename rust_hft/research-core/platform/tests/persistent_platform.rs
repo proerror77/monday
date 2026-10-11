@@ -26,7 +26,11 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
         NATIVE_REQUEST_REVOCATION_MIGRATION,
         NATIVE_CAMPAIGN_INPUTS_MIGRATION,
         hft_research_platform::retirement::MIGRATION,
+        hft_research_platform::provider_operations::MIGRATION,
         include_str!("../../../../deployment/aliyun/research/foundation/postgres/roles.sql"),
+        include_str!(
+            "../../../../deployment/aliyun/research/foundation/postgres/provider_create_roles.sql"
+        ),
     ] {
         sqlx_core::raw_sql::raw_sql(migration)
             .execute(&pool)
@@ -38,6 +42,34 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
     .fetch_one(&pool)
     .await?;
     assert_eq!(mode, "paused");
+    for role in [
+        "monday_research_submitter",
+        "monday_research_session_host",
+        "monday_research_artifact_gateway",
+        "monday_research_prepare_worker",
+        "monday_research_definition_writer",
+        "monday_research_release_importer",
+        "monday_research_native_admission",
+        "monday_research_terminal_retirement",
+    ] {
+        let writes: bool = sqlx_core::query_scalar::query_scalar("SELECT has_table_privilege($1,'research.provider_create_operations','INSERT,UPDATE,DELETE')").bind(role).fetch_one(&pool).await?;
+        assert!(!writes, "non-reconciler received provider create authority");
+        let mut tx = pool.begin().await?;
+        sqlx_core::raw_sql::raw_sql(&format!("SET LOCAL ROLE {role}"))
+            .execute(&mut *tx)
+            .await?;
+        assert!(sqlx_core::query::query(
+            "UPDATE research.provider_create_operations SET state='observed'"
+        )
+        .execute(&mut *tx)
+        .await
+        .is_err());
+        tx.rollback().await?;
+    }
+    let reconciler: bool = sqlx_core::query_scalar::query_scalar("SELECT has_table_privilege('monday_research_reconciler','research.provider_create_operations','SELECT') AND has_table_privilege('monday_research_reconciler','research.provider_create_operations','INSERT') AND has_table_privilege('monday_research_reconciler','research.provider_create_operations','UPDATE') AND NOT has_table_privilege('monday_research_reconciler','research.provider_create_operations','DELETE')").fetch_one(&pool).await?;
+    assert!(reconciler);
+    let public_access: bool = sqlx_core::query_scalar::query_scalar("SELECT has_table_privilege('public','research.provider_create_operations','SELECT,INSERT,UPDATE,DELETE')").fetch_one(&pool).await?;
+    assert!(!public_access);
     let experiment = "e".repeat(64);
     let session = "f".repeat(64);
     sqlx_core::query::query("INSERT INTO research.experiments(experiment_sha256,tenant,document) VALUES ($1,'role-fixture','{\"schema_fixture\":true}')").bind(&experiment).execute(&pool).await?;
@@ -265,6 +297,42 @@ async fn paused_database_roles_enforce_real_read_write_and_lock_boundaries() -> 
         flags,
         "independent approval owner role must not provision login/admin authority"
     );
+    // SQL-only schema fixture, not an admitted scientific Campaign. A resolved
+    // execution cannot settle while the separately expected Secret is unknown.
+    sqlx_core::query::query("UPDATE research.tasks SET state='stopping',document=$1 WHERE task_id=$2")
+        .bind(serde_json::json!({"id":task,"state":"stopping","attempt":1,"fence":1,"spec":{"kind":"cex_campaign"},"schema_fixture":true}))
+        .bind(&task).execute(&pool).await?;
+    let settle = "UPDATE research.tasks SET state='cancelled',document=jsonb_set(document,'{state}','\"cancelled\"') WHERE task_id=$1";
+    assert!(sqlx_core::query::query(settle)
+        .bind(&task)
+        .execute(&pool)
+        .await
+        .is_err());
+    for kind in ["execution", "identity"] {
+        sqlx_core::query::query("INSERT INTO research.provider_create_operations(task_id,attempt,fence,kind,cluster,namespace,resource_name,task_revision,state) VALUES($1,1,1,$2,'fixture','research',$2,1,'not_started')")
+            .bind(&task).bind(kind).execute(&pool).await?;
+        if kind == "execution" {
+            assert!(sqlx_core::query::query(settle)
+                .bind(&task)
+                .execute(&pool)
+                .await
+                .is_err());
+        }
+    }
+    sqlx_core::query::query("UPDATE research.provider_create_operations SET state='pending',request_sha256=$1,public_request='{\"kind\":\"Secret\"}',secret_data_sha256=$2 WHERE task_id=$3 AND kind='identity'")
+        .bind("e".repeat(64)).bind("f".repeat(64)).bind(&task).execute(&pool).await?;
+    assert!(sqlx_core::query::query(settle)
+        .bind(&task)
+        .execute(&pool)
+        .await
+        .is_err());
+    assert!(sqlx_core::query::query("UPDATE research.tasks SET state='queued',document=jsonb_set(document,'{state}','\"queued\"') WHERE task_id=$1").bind(&task).execute(&pool).await.is_err());
+    assert!(sqlx_core::query::query("UPDATE research.provider_create_operations SET state='not_started',request_sha256=NULL,public_request=NULL,secret_data_sha256=NULL WHERE task_id=$1 AND kind='identity'").bind(&task).execute(&pool).await.is_err());
+    sqlx_core::query::query("UPDATE research.provider_create_operations SET state='observed',observed_uid='fixture-secret' WHERE task_id=$1 AND kind='identity'").bind(&task).execute(&pool).await?;
+    sqlx_core::query::query(settle)
+        .bind(&task)
+        .execute(&pool)
+        .await?;
     pool.close().await;
     Ok(())
 }

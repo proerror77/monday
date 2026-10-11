@@ -110,8 +110,8 @@ impl PreparationPermit {
 }
 
 pub struct LockedTask {
-    tx: Transaction<'static, Postgres>,
-    revision: i64,
+    pub(crate) tx: Transaction<'static, Postgres>,
+    pub(crate) revision: i64,
     pub task: Task,
     pub now_ms: i64,
 }
@@ -1063,14 +1063,14 @@ impl Ledger {
                     task.claim(owner, now_ms, lease_ms)?;
                     let id = task.id.clone();
                     // Persist the original attempt/deadline BEFORE provider I/O.
-                    LockedTask {
+                    let mut claimed = LockedTask {
                         tx,
                         revision: row.get("revision"),
                         task,
                         now_ms,
-                    }
-                    .commit("claimed")
-                    .await?;
+                    };
+                    crate::provider_operations::initialize(&mut claimed).await?;
+                    claimed.commit("claimed").await?;
                     return self.lock_id(&id).await.map(Some);
                 }
             }

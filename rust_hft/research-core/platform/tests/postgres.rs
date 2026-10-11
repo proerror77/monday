@@ -310,6 +310,236 @@ where
 }
 
 #[cfg(feature = "publisher")]
+async fn assert_provider_create_operations<F, A>(
+    ledger: &Ledger,
+    pool: &sqlx_postgres::PgPool,
+    url: &str,
+    template: TaskSpec,
+    admit: A,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+    A: Fn(TaskSpec) -> F,
+{
+    use hft_research_platform::provider_operations::{
+        CreateDecision, CreateKind, ProviderMutation,
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::timeout;
+    let original_run = ledger
+        .run_for_tenant("fixture", &template.run_manifest_sha256)
+        .await?;
+    for (index, case) in [
+        "slow-post-cancel",
+        "crash-before-send",
+        "cancel-before-send",
+        "two-controllers",
+        "rejected-403",
+        "rejected-422",
+        "unknown-500",
+        "expired-before-send",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx_core::query::query("UPDATE research.authority SET mode='postgres',concurrency_limit=1,legacy_quiescence_sha256=$1,migration_receipt_sha256=$2")
+            .bind(hash('a')).bind(hash('b')).execute(pool).await?;
+        let mut spec = template.clone();
+        spec.timeout_ms = 30_000;
+        spec.max_attempts = 1;
+        spec.command.push(format!("provider-{case}"));
+        let mut run = original_run.clone();
+        run.seed = 2000 + index as u64;
+        run.command = spec.command.clone();
+        spec.run_manifest_sha256 = ledger.register_run("fixture", &run).await?;
+        admit(spec.clone()).await?;
+        let id = ledger
+            .submit("fixture", &format!("provider-{case}"), spec)
+            .await?;
+        let mut locked = ledger
+            .lock_next("provider-fixture", 30_000)
+            .await?
+            .context("provider fixture not claimed")?;
+        anyhow::ensure!(locked.task.id == id);
+        if case == "expired-before-send" {
+            locked.task.lease.as_mut().unwrap().expires_ms = locked.now_ms - 1;
+        }
+        let task = locked.task.clone();
+        let lease = task.lease.as_ref().unwrap();
+        let body = hft_research_platform::execution::render(
+            &task.spec,
+            lease,
+            &ledger.acceptance(&task.spec).await?,
+        )?;
+        let mut mutation = ProviderMutation::new(ledger.clone(), locked);
+        let decision = if case == "cancel-before-send" {
+            // Queue cancellation behind a deliberately stalled intent write.
+            // Once that write commits, cancellation wins before permit recheck.
+            sqlx_core::raw_sql::raw_sql("CREATE FUNCTION research.fixture_create_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.state='not_started' AND NEW.state='pending' THEN PERFORM pg_advisory_xact_lock(791011); END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_create_barrier BEFORE UPDATE ON research.provider_create_operations FOR EACH ROW EXECUTE FUNCTION research.fixture_create_barrier();").execute(pool).await?;
+            let mut barrier = pool.begin().await?;
+            sqlx_core::query::query("SELECT pg_advisory_xact_lock(791011)")
+                .execute(&mut *barrier)
+                .await?;
+            let result = {
+                let begin = mutation.begin_create(CreateKind::Execution, &body);
+                tokio::pin!(begin);
+                assert!(timeout(Duration::from_millis(60), &mut begin)
+                    .await
+                    .is_err());
+                let cancel = ledger.cancel(&id);
+                tokio::pin!(cancel);
+                assert!(timeout(Duration::from_millis(60), &mut cancel)
+                    .await
+                    .is_err());
+                barrier.rollback().await?;
+                let (decision, cancelled) = tokio::join!(begin, cancel);
+                cancelled?;
+                decision?
+            };
+            sqlx_core::raw_sql::raw_sql("DROP TRIGGER fixture_create_barrier ON research.provider_create_operations; DROP FUNCTION research.fixture_create_barrier();").execute(pool).await?;
+            assert!(matches!(result, CreateDecision::ResolvedAbsent));
+            result
+        } else {
+            mutation.begin_create(CreateKind::Execution, &body).await?
+        };
+
+        let mut response = body.clone();
+        response["metadata"]["uid"] = serde_json::json!(format!("original-{index}"));
+        let resolved_without_object = matches!(
+            case,
+            "cancel-before-send" | "expired-before-send" | "rejected-403" | "rejected-422"
+        );
+        match decision {
+            CreateDecision::FirstSend(permit) => {
+                match case {
+                    "rejected-403" | "rejected-422" => {
+                        mutation
+                            .record_rejection(
+                                permit,
+                                if case == "rejected-403" { 403 } else { 422 },
+                            )
+                            .await?
+                    }
+                    "unknown-500" => assert!(mutation.record_rejection(permit, 500).await.is_err()),
+                    _ => drop(permit), // Crash/lost response cannot recreate this value.
+                }
+            }
+            CreateDecision::ResolvedAbsent => {
+                assert!(matches!(case, "cancel-before-send" | "expired-before-send"))
+            }
+            CreateDecision::ReadbackOnly => anyhow::bail!("new Attempt lost its FirstSend"),
+        }
+        if case == "slow-post-cancel" {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let (started, waiting) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let bytes = serde_json::to_vec(&response)?;
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut buffer = [0; 65536];
+                let count = socket.read(&mut buffer).await?;
+                anyhow::ensure!(std::str::from_utf8(&buffer[..count])?.starts_with("POST /create "));
+                let _ = started.send(());
+                released.await?;
+                socket.write_all(format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).as_bytes()).await?;
+                socket.write_all(&bytes).await?;
+                Ok::<_, anyhow::Error>(())
+            });
+            let request = reqwest::Client::builder()
+                .no_proxy()
+                .retry(reqwest::retry::never())
+                .timeout(Duration::from_secs(5))
+                .build()?
+                .post(format!("http://{address}/create"))
+                .json(&body)
+                .send();
+            let request = tokio::spawn(request);
+            timeout(Duration::from_secs(2), waiting).await??;
+            timeout(Duration::from_millis(500), ledger.cancel(&id))
+                .await
+                .context("slow POST blocked cancellation")??;
+            assert_eq!(ledger.read(&id).await?.state, State::Stopping);
+            assert!(!mutation.permits_absence(CreateKind::Execution).await?);
+            let active: i64 = sqlx_core::query_scalar::query_scalar("SELECT count(*) FROM research.tasks WHERE state IN ('launching','running','stopping')").fetch_one(pool).await?;
+            assert_eq!(active, 1, "unknown POST released quota");
+            let _ = release.send(());
+            response = request.await??.json().await?;
+            server.await??;
+        }
+        if matches!(case, "crash-before-send" | "two-controllers") {
+            drop(mutation);
+            let reconnected = Ledger::connect(url).await?;
+            let recovered = reconnected
+                .lock_next("provider-fixture", 30_000)
+                .await?
+                .unwrap();
+            mutation = ProviderMutation::new(reconnected, recovered);
+            // A changed heartbeat/body is never a second request identity.
+            let mut altered = body.clone();
+            altered["spec"]["activeDeadlineSeconds"] = serde_json::json!(1);
+            assert!(matches!(
+                mutation
+                    .begin_create(CreateKind::Execution, &altered)
+                    .await?,
+                CreateDecision::ReadbackOnly
+            ));
+        }
+        ledger.cancel(&id).await?;
+        if !resolved_without_object {
+            assert!(!mutation.permits_absence(CreateKind::Execution).await?);
+            let mut attempted = mutation.into_locked().await?;
+            attempted.task.stopped(task.attempt, task.fence)?;
+            let failure = attempted
+                .commit("fixture_forbidden_absence_refund")
+                .await
+                .unwrap_err();
+            assert!(failure.to_string().contains("unresolved provider create"));
+            assert_eq!(ledger.read(&id).await?.state, State::Stopping);
+            let current = ledger.lock_next("provider-fixture", 30_000).await?.unwrap();
+            mutation = ProviderMutation::new(ledger.clone(), current);
+            let mut foreign = response.clone();
+            foreign["metadata"]["labels"]["monday.io/fence"] = serde_json::json!("999");
+            assert!(mutation
+                .record_observation(CreateKind::Execution, &foreign)
+                .await
+                .is_err());
+            mutation
+                .record_observation(CreateKind::Execution, &response)
+                .await?;
+            // UID is already durable even if the controller dies before DELETE.
+            let stored: String = sqlx_core::query_scalar::query_scalar("SELECT observed_uid FROM research.provider_create_operations WHERE task_id=$1 AND kind='execution'").bind(&id).fetch_one(pool).await?;
+            assert_eq!(stored, response["metadata"]["uid"].as_str().unwrap());
+        }
+        assert!(mutation.permits_absence(CreateKind::Execution).await?);
+        let mut drained = mutation.into_locked().await?;
+        drained.task.stopped(task.attempt, task.fence)?;
+        drained.commit("fixture_original_create_resolved").await?;
+        assert!(ledger.read(&id).await?.state.terminal());
+        let original_hash: String = sqlx_core::query_scalar::query_scalar("SELECT request_sha256 FROM research.provider_create_operations WHERE task_id=$1 AND kind='execution'").bind(&id).fetch_one(pool).await?;
+        assert_eq!(original_hash, identity(&body)?);
+        assert!(sqlx_core::query::query(
+            "UPDATE research.provider_create_operations SET request_sha256=$1 WHERE task_id=$2"
+        )
+        .bind(hash('f'))
+        .bind(&id)
+        .execute(pool)
+        .await
+        .is_err());
+        assert!(sqlx_core::query::query(
+            "DELETE FROM research.provider_create_operations WHERE task_id=$1"
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .is_err());
+        println!("PASS provider create: {case}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "publisher")]
 async fn assert_parallel_maintenance(
     ledger: &Ledger,
     pool: &sqlx_postgres::PgPool,
@@ -467,6 +697,9 @@ async fn postgres_platform_integration_inner() -> anyhow::Result<()> {
     )
     .execute(&pool)
     .await?;
+    sqlx_core::raw_sql::raw_sql(hft_research_platform::provider_operations::MIGRATION)
+        .execute(&pool)
+        .await?;
     let ledger = Ledger::connect(&url).await?;
     let view = PublishedView {
         prepared_id: hash('a'),
@@ -1855,6 +2088,7 @@ async fn postgres_platform_integration_inner() -> anyhow::Result<()> {
     drain.task.stopped(drain.task.attempt, drain.task.fence)?;
     drain.commit("fixture_readback_setup_drained").await?;
     let template = ledger.read(&result_id).await?.spec;
-    assert_detached_readbacks(&ledger, &pool, &url, template, &admit).await?;
+    assert_detached_readbacks(&ledger, &pool, &url, template.clone(), &admit).await?;
+    assert_provider_create_operations(&ledger, &pool, &url, template, &admit).await?;
     Ok(())
 }

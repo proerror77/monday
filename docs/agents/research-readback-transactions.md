@@ -17,29 +17,64 @@ authority witnesses and native/manual revocation. It can narrow a deadline but
 cannot reset it. Cancellation, another writer or an expired fence discards the
 readback; losing a heartbeat drops its in-flight I/O future.
 
-## Provider mutations still hold locks
+## Provider creation and cancellation
 
-`launch`, `stop` and late-identity cleanup retain task/admission serialization and
-the shared authority lock. This orders a provider mutation against cancellation
-and revocation. Removing those locks alone could commit cancellation before a
-late POST creates the worker. An unresolved launch initially retains Launching.
-The existing stop path can accept an absent resource and empty Pod list without
-durable evidence that a timed-out POST has finished. That leaves a late-create
-race; this readback change does not establish provider-operation quiescence.
+Ordinary reconciler provider GET, POST and DELETE calls run outside PG row
+locks. `ProviderMutation` reacquires the current Task for short journal changes;
+it never writes a pre-I/O snapshot over a later cancellation or revision.
 
-The existing provider client has a 15-second timeout per HTTP request. This is
-not a 15-second limit for the entire mutation. A Campaign launch can make up to
-seven requests: static configuration, late identity and Job creation/readback.
-Stop plus late-identity cleanup can make up to five. Local identity and PG work
-adds to those request bounds. Pause and new claims can still wait for these
-mutation sections. This change does not claim that every I/O path is lock-free.
+A claim atomically inserts one NotStarted execution operation, plus a second
+identity operation for CEX Campaigns. The key binds task, Attempt, fence,
+cluster, namespace and original resource name. Immediately before its first
+POST, the controller persists Pending and the exact request SHA. Job/Sandbox
+records retain the original non-secret body, including launch lease, deadline,
+checkpoint and Secret UID. Secret records retain metadata and data SHA only.
+No credential body enters PG.
 
-Further separation requires a durable operation claim before releasing locks.
-That claim must bind the original task, attempt, fence, provider name and known
-UID. Cancellation records stop intent while retaining the allocation. A timeout
-must reconcile that same operation before retrying a POST or accepting absence.
-An unknown request cannot mint a replacement resource or refund its allocation.
-Such a change needs its own launch/cancel/stop interleaving tests.
+After that commit, the same controller reacquires authority, Task and admission,
+checks current lease/deadline/revocations and verifies the committed revision.
+Only that successful NotStarted-to-Pending caller can receive one in-memory
+FirstSend permit. It releases the transaction before HTTP. Cancellation before
+permit issuance records NotSent only when that original caller knows it has
+not invoked HTTP. A restarted or competing controller cannot infer NotSent.
+A crash after Pending commits but before send is therefore conservatively
+unknown; it has no automatic absence-based recovery.
+
+FirstSend issuance is the admission ordering point. Cancellation or revocation
+can commit while that already-authorized request is in flight, including the
+small interval before send. It moves the Task toward Stopping and retains its
+allocation. It does not authorize another POST. HTTP timeouts, 408/409/429 and
+all 5xx remain Pending. Only explicit API rejection statuses resolve Rejected.
+The HTTP client disables automatic retries.
+
+Recovery only GETs the original resource. It compares all authored execution
+fields against the stored first request, tolerates only established API defaults
+and quantity normalization, and fixes the observed UID. Heartbeat expiry changes
+cannot regenerate an original request hash. A matching UID is committed before
+DELETE, whose UID precondition prevents deleting a replacement resource.
+An absent Pending Job, Sandbox or Secret remains unresolved. Terminal/requeue
+updates have a SQL guard requiring every expected create to be resolved; even
+a caller bypassing the Rust stop path cannot refund an unknown create.
+Known-never-started, original-caller NotSent, definite rejection or observed UID
+may pass the create barrier, but resource/Pod termination and identity cleanup
+must still pass their own readbacks. This does not add a new retry policy.
+
+The additive migration and minimal reconciler-only grants are offline assets.
+Install them paused after all old writers are quiescent. Existing active attempts
+with no operation record remain unknown: there is no fabricated never-sent
+backfill, credential publication, or production migration in this change.
+Independent operator evidence is required to resolve historical/crash ambiguity.
+
+The provider client retains a 15-second timeout per HTTP request, not a global
+15-second transaction. The change removes those network waits from ordinary
+reconciler transactions. Kubernetes `activeDeadlineSeconds` is relative to
+provider creation, so GET/POST or server delays can move its wall-clock end.
+Preserving the original request does not prove an exact absolute process cutoff.
+PG lease/deadline and native credential checks govern their admission/publication
+boundaries; actual process termination still requires independent provider/Pod
+readback. This change does not claim that a late worker cannot begin computing.
+Operator-only terminal-retirement and native Session startup have separate
+serialization contracts and are not changed here.
 
 ## Validation
 
@@ -48,8 +83,13 @@ dropping pending I/O after losing its revision. The existing PostgreSQL contract
 uses an isolated `monday_foundation_test` database and a delayed loopback GET.
 It checks unrelated claims/cancel/pause, exact-revision conflicts, expiry,
 replacement fences, actual connection termination and concurrent renewal.
-The GET fixture and PG checks prove lock and state behavior; they do not prove
-production OSS connectivity or a real Kubernetes mutation.
+Real disposable PG tests also cover a slow POST with concurrent cancellation,
+crash before send, the intent/permit cancellation interval, competing controllers,
+definite rejection, unknown 5xx, expiry, immutable request identity and settlement
+rejection. Loopback provider fixtures cover late Job/Sandbox/Secret appearance,
+API defaulting, body/UID substitution and one POST per operation. Independent PG
+role tests reject non-reconciler writes. These tests prove local protocol and
+transaction behavior, not production OSS or Kubernetes acceptance.
 
 The implementation reuses PR #1352's short-claim and heartbeat work, then extends
 it to Build downloads and provider observation with exact revision checks.
