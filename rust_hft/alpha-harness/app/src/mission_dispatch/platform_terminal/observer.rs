@@ -372,7 +372,7 @@ pub(super) fn verify_retained_witness(
         authority_keys,
         release_keys,
     )?;
-    hft_research_platform::terminal_audit::verify_terminal_audit(&trust, signed)?;
+    hft_research_platform::terminal_audit::verify_terminal_audit(trust, signed)?;
     ensure!(
         signed.evidence == *expected && signed.key_id == key_id,
         "retained terminal witness changed original audit, issuer or signer role"
