@@ -14,13 +14,13 @@ use data::binance_market_tape_artifact::{
     VerifiedBinanceMarketTapeSeries,
 };
 use data::binance_spot_reference::SpotInstrumentRules;
+use hft_cex_research_input::feature_matrix::{DataModality, PointInTimeFeatureRow};
 use hft_collector::binance_spot_reference_artifact::{
     verify_spot_reference_artifact, PublishedSpotReferenceArtifact,
 };
 use hft_collector::binance_usdm_reference_artifact::{
     verify_reference_artifact_read_only_current_batch, PublishedReferenceArtifact,
 };
-use hft_collector::{DataModality, PointInTimeFeatureRow};
 use hft_core::{top5_book_features, TOP5_DEPTH};
 use hft_research_manifest::sequence::{
     SequenceDatasetV1, SequenceFrameV1, SequenceInputSpecV1, SequenceShardV1,

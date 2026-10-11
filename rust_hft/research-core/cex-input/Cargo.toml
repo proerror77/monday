@@ -7,6 +7,7 @@ publish = false
 
 [features]
 default = []
+feature-jsonl = ["serde_json/float_roundtrip"]
 streaming = ["dep:hft-research-manifest"]
 market-parquet = ["streaming", "dep:hft-prepared-market-io"]
 

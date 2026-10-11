@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use data::binance_lob_replay::source_revision;
-use hft_collector::{read_feature_rows, FeatureDatasetManifest};
+use hft_cex_research_input::feature_matrix::{read_feature_rows, FeatureDatasetManifest};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
 use parquet::schema::parser::parse_message_type;

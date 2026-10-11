@@ -127,6 +127,13 @@ implementation; the input crate has no database or provider dependency.
 Prediction event/settlement inputs remain in their prediction owner. A shared
 Cargo owner does not make CEX time-horizon labels valid for event settlement.
 
+The explicit `feature-jsonl` input feature owns the existing PIT JSONL types,
+validation and IO. Materializers and CEX consumers use this single implementation.
+It preserves historical v2 reads, v3 writes, byte identity and PIT clocks.
+The feature does not include acquisition, providers or database dependencies.
+Collector telemetry and operator/data helpers still enter the CEX worker graph;
+this input move alone does not establish a standalone scientific worker.
+
 `hft-prepared-market-io` is the shared owner of bounded numerical Parquet IO.
 Its feature/target shard writers and `FeatureParquetReader`/`TargetParquetReader`
 serve the data-service producer and CEX streaming consumers. The original codec

@@ -8,7 +8,6 @@ pub mod binance_spot_reference_collector;
 pub mod binance_usdm_reference_artifact;
 pub mod binance_usdm_reference_collector;
 pub mod binance_usdm_reference_upload;
-pub mod feature_matrix;
 pub mod lob_archiver;
 pub mod polymarket_evidence_artifact;
 pub mod polymarket_parity;
@@ -22,10 +21,6 @@ pub mod research_inventory;
 pub mod research_memory;
 pub mod source_catalog;
 
-pub use feature_matrix::{
-    import_feature_dataset, import_feature_dataset_for_reuse, read_feature_rows, DataModality,
-    FeatureDatasetManifest, FeatureLabelSpec, ImportedFeatureDataset, PointInTimeFeatureRow,
-};
 pub use source_catalog::{
     acquire_dataset, source_catalog, CandleInterval, DataAcquisitionMission, DatasetManifest,
     DatasetTimeBounds, OhlcvTraceRow, QualityReport, QualityRequirements, SourceCapability,
