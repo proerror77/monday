@@ -299,7 +299,10 @@ for id in data-pipelines prediction-markets research-core research-core--platfor
 done
 bash "$root/.github/scripts/research-release-products.sh" recipes prediction-runner | jq -s '{recipes:.}' >"$work/subset-inputs"
 FIXTURE="$work" PATH="$work/bin:$PATH" bash "$work/repo/.github/scripts/research-cache-layout.sh" cleanup "$work/subset-inputs"
-[[ $(grep -vc -- '--no-deps' "$work/metadata-calls") == 8 ]]
+expected_metadata_calls=$(jq -s '.[0].recipes + [.[1]] | length' \
+  "$root/.github/scripts/research-release-products.json" \
+  "$root/.github/scripts/research-release-tools.json")
+[[ $(grep -vc -- '--no-deps' "$work/metadata-calls") == "$expected_metadata_calls" ]]
 grep -q -- '--features ploy-research/db' "$work/metadata-calls"
 grep -q -- '--features hft-research-platform/publisher' "$work/metadata-calls"
 if grep -q -- '--all-features' "$work/metadata-calls"; then echo 'cleanup used a feature union' >&2; exit 1; fi
