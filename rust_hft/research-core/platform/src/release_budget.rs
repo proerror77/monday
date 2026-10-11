@@ -1,6 +1,7 @@
 //! Publication request and application payload reservations. These are not billable wire bytes.
 //! A durable reservation precedes each send. Failures never refund it.
 use crate::{
+    build_objects::BudgetReference as Reference,
     orchestrator::Artifact,
     release::{ReleaseProducer, SourceArchive},
 };
@@ -177,7 +178,7 @@ impl Inventory {
                 && self
                     .publisher_prefixes
                     .iter()
-                    .all(|p| crate::release_oss::exact_prefix(p))
+                    .all(|p| crate::build_objects::exact_prefix(p))
                 && self
                     .publisher_prefixes
                     .contains(&format!("research/sources/{}/", binding.source_sha))
@@ -260,16 +261,6 @@ impl Inventory {
                 .context("response budget overflow")?,
         })
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Reference {
-    pub ledger_path: PathBuf,
-    pub envelope_sha256: String,
-    pub binding_sha256: String,
-    pub device: u64,
-    pub inode: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
