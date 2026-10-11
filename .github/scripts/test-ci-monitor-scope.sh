@@ -40,6 +40,12 @@ end
 end
 abort 'direct selector consults publication history' if prediction.fetch('image-smoke-selector').to_s.include?('select-main-research-scope')
 abort 'gate ignores carried jobs' unless prediction.fetch('prediction-markets-gate').to_s.include?('needs.research-image-scope.outputs.jobs')
+diagnostic = "github.event_name == 'workflow_dispatch' && inputs.research_cache_probe"
+abort 'probe can replace the required release gate' unless prediction.fetch('prediction-markets-gate').fetch('name') ==
+  "${{ #{diagnostic} && 'Research build A/B diagnostic gate' || 'Prediction Markets CI gate' }}"
+document = YAML.safe_load(File.read("#{repo}/.github/workflows/ploy-ci.yml"))
+abort 'probe can cancel ordinary CI' unless document.fetch('concurrency').fetch('group').include?("#{diagnostic} && 'research-cache-probe-'")
+File.write("#{work}/diagnostic-plan.sh", prediction.fetch('image-smoke-selector').fetch('steps').find { |step| step['id']=='scope' }.fetch('run'))
 {
   'ci.yml'=>'scope', 'ploy-ci.yml'=>'image-smoke-scope', 'security-enabled.yml'=>'security-scope'
 }.each do |file, job|
@@ -48,6 +54,45 @@ abort 'gate ignores carried jobs' unless prediction.fetch('prediction-markets-ga
   File.write("#{work}/#{file}.sh", run)
 end
 RUBY
+
+# Execute the real workflow plan. Probe dispatch must never invoke the broad planner.
+probe_repo="$work/probe-repo"
+mkdir -p "$probe_repo/.github/scripts" "$probe_repo/rust_hft/prediction-markets"
+cp "$script_dir/research-release-products.sh" "$script_dir/research-release-products.json" "$probe_repo/.github/scripts/"
+cat >"$probe_repo/.github/scripts/select-rust-ci-scope.sh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >"${ORDINARY_PLAN_CALLED:?}"
+printf 'jobs=,ploy/workflow-lint,\nresearch_product=none\nselection_complete=true\n' >>"$GITHUB_OUTPUT"
+STUB
+chmod +x "$probe_repo/.github/scripts/select-rust-ci-scope.sh"
+for probe in true false '' invalid; do
+  for event in workflow_dispatch push pull_request; do
+    output="$work/probe-$event-${probe:-absent}.out"
+    called="$output.ordinary"
+    code=0
+    (cd "$probe_repo/rust_hft/prediction-markets" &&
+      RESEARCH_CACHE_PROBE=$probe GITHUB_EVENT_NAME=$event GITHUB_OUTPUT="$output" \
+      ORDINARY_PLAN_CALLED="$called" BASE_SHA=base HEAD_SHA=head bash "$work/diagnostic-plan.sh") \
+      >"$work/probe.stdout" 2>"$work/probe.stderr" || code=$?
+    if [[ $probe == true && $event == workflow_dispatch ]]; then
+      [[ $code == 0 && ! -e $called ]]
+      grep -Fqx 'jobs=,ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,' "$output"
+      grep -Fqx 'research_product=cex-runner,controller,prediction-runner' "$output"
+      grep -Fqx selection_complete=true "$output"
+    elif [[ $probe == false || -z $probe ]]; then
+      [[ $code == 0 ]]
+      grep -Fqx -- "--event $event --base base --head head" "$called"
+    else
+      [[ $code != 0 && ! -e $called && ! -s $output ]]
+    fi
+  done
+done
+
+# Diagnostic success cannot satisfy the production publication check reader.
+printf '%s\n' '{"check_runs":[{"id":1,"name":"Research build A/B diagnostic gate","status":"completed","conclusion":"success","app":{"slug":"github-actions","id":15368}}]}' >"$work/probe-checks.json"
+bash "$script_dir/read-release-required-checks.sh" "$work/probe-checks.json" "$work/probe-release-state"
+grep -Fqx prediction_conclusion=missing "$work/probe-release-state"
 
 for file in ci.yml ploy-ci.yml security-enabled.yml; do
   for result in success failure; do
@@ -63,6 +108,31 @@ for file in ci.yml ploy-ci.yml security-enabled.yml; do
       bash -e "$work/$file.sh" >"$work/stdout" 2>"$work/stderr" || code=$?
     if [[ $result == success ]]; then [[ $code == 0 && -s $output ]];
     else [[ $code != 0 && ! -s $output ]]; fi
+  done
+done
+
+# A complete diagnostic plan still requires every selected job and planner.
+probe_jobs=',ploy/workflow-lint,ploy/research-image-binaries,ploy/research-image-smoke,'
+for complete in false ''; do
+  output="$work/incomplete-${complete:-missing}.out"
+  if SELECTOR_RESULT=success SELECTED_COMPLETE=$complete SELECTED_JOBS="$probe_jobs" GITHUB_OUTPUT="$output" \
+      bash -e "$work/ploy-ci.yml.sh" >"$work/incomplete.log" 2>&1; then
+    echo 'incomplete diagnostic plan was accepted' >&2; exit 1
+  fi
+  [[ ! -s $output ]]
+done
+probe_needs='{"image-smoke-selector":{"result":"success"},"image-smoke-scope":{"result":"success"},"research-image-scope":{"result":"success"},"workflow-lint":{"result":"success"},"research-image-binaries":{"result":"success"},"research-image-smoke":{"result":"success"}}'
+printf '%s' "$probe_needs" | bash "$script_dir/verify-ci-gate.sh" --job-prefix ploy --expected-jobs "$probe_jobs"
+for job in image-smoke-selector image-smoke-scope research-image-scope workflow-lint research-image-binaries research-image-smoke; do
+  for result in skipped failure cancelled missing; do
+    payload=$(jq -c --arg job "$job" --arg result "$result" \
+      'if $result=="missing" then del(.[$job]) else .[$job].result=$result end' <<<"$probe_needs")
+    # Planner absence is represented as a failed dependency by Actions. Test
+    # selected job absence separately through the expected plan.
+    if [[ $result == missing && $job == *scope || $result == missing && $job == *selector ]]; then continue; fi
+    if printf '%s' "$payload" | bash "$script_dir/verify-ci-gate.sh" --job-prefix ploy --expected-jobs "$probe_jobs" >"$work/probe-gate.out" 2>&1; then
+      echo "diagnostic gate accepted $job=$result" >&2; exit 1
+    fi
   done
 done
 

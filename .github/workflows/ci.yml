@@ -460,6 +460,9 @@ jobs:
             args+=(-p "$package")
           done
           "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test "${args[@]}" --locked
+          if [[ ",$package_list," == *",hft-cex-research-input,"* ]]; then
+            "$GITHUB_WORKSPACE/rust_hft/scripts/cargo-scoped.sh" test -p hft-cex-research-input --locked --features feature-jsonl
+          fi
           clippy_args=()
           for package in "${packages[@]}"; do
             [[ ",${{ needs.scope.outputs.loop_packages }}," == *",$package,"* ]] || clippy_args+=(-p "$package")
