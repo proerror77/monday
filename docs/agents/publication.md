@@ -92,7 +92,15 @@ builds the union once; each image copies only its own executable subset and read
 those exact bytes back from the registry. Prediction's Job uses
 `monday-prediction-worker`, not the CEX harness.
 
-Controller asset changes build only its four required executables. CEX and
+Controller asset changes build only its four required executables.
+Release issuer and capability tools have a separate credential-free producer and
+`research-release-tools-SOURCE_SHA` artifact. Its manifest binds the exact source,
+workflow/run/attempt/job, pinned compiler environment, locked release profile and
+executable hashes. ACR and the independent ACK importer download and verify these
+tools from the original software run. Publisher-only changes do not select a
+research image or advance image/source publication baselines. Existing image and
+approved archive carry still produces tools for that same source. Missing or
+mismatched tools block use; publication never recompiles debug replacements. CEX and
 Prediction source changes select their owning products through the Cargo graph.
 Each image has its own authenticated publication baseline, so unpublished work
 survives later main commits and another product's successful publication. Old

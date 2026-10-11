@@ -73,6 +73,10 @@ assert_flag() {
 assert_jobs() {
   local output=$1 expected=$2
   local actual
+  # Every expected image producer also requires its same-source release tools.
+  if [[ ,$expected, == *,ploy/research-image-binaries,* && ,$expected, != *,ploy/research-release-tools,* ]]; then
+    expected+=,ploy/research-release-tools
+  fi
   if grep -Eq '^clippy_(loop|handoff)=true$' "$output" && ! grep -Fqx 'jobs=,,' "$output"; then expected="${expected:+$expected,}ci/clippy-strict"; fi
   if grep -Fqx 'control=true' "$output"; then
     expected="${expected:+$expected,}ci/control-contracts"
@@ -133,6 +137,7 @@ lib = 'rust_hft/research-core/platform/src/lib.rs'
 source = 'rust_hft/research-core/platform/src/release_oss.rs'
 consumer = 'rust_hft/alpha-harness/app/Cargo.toml'
 recipe = '.github/scripts/research-release-products.json'
+tools_recipe = '.github/scripts/research-release-tools.json'
 def check(value, message)
   raise ArgumentError, message unless value
 end
@@ -154,7 +159,7 @@ end
 git('init', '-q')
 git('config', 'user.name', 'CI scope contract')
 git('config', 'user.email', 'ci@example.invalid')
-current = [platform, lock, lib, consumer, recipe].map { |p| [p, File.read(File.join(root, p))] }.to_h
+current = [platform, lock, lib, consumer, recipe, tools_recipe].map { |p| [p, File.read(File.join(root, p))] }.to_h
 current[source] = "// publisher source fixture\n"
 dependency = Tomlrb.parse(current[platform]).fetch('dependencies').fetch('roxmltree')
 next_version = dependency.fetch('version').sub(/\d+\z/) { |v| (v.to_i + 1).to_s }
@@ -186,13 +191,16 @@ plan = lambda do |label, starting, edits, expected, event: 'push', supplied_base
   check(status.success?, "#{label}: selector failed: #{errors}")
   values = File.readlines(output).map { |line| line.chomp.split('=', 2) }.to_h
   if expected == 'publisher'
-    check(values['research_product'] == 'controller', "#{label}: expected controller; got #{values}")
-    check(values['owning_packages'] == ',hft-research-platform,', "#{label}: unrelated owners selected")
+    check(values['research_product'] == 'none', "#{label}: expected no image product; got #{values}")
+    check(values['owning_packages'] == ',,', "#{label}: unrelated owners selected")
+    %w[ci/rust ci/research-foundation ploy/research-image-binaries ploy/research-image-smoke].each do |job|
+      check(!values.fetch('jobs').include?(",#{job},"), "#{label}: selected unrelated #{job}")
+    end
     check(JSON.parse(values.fetch('image_matrix')) == {'include' => []}, "#{label}: unrelated runtime images selected")
     %w[loop handoff focused collector control production_trading_image production_collector_image].each do |flag|
       check(values[flag] == 'false', "#{label}: unexpected #{flag}")
     end
-    %w[ci/rust ci/research-foundation ploy/research-image-binaries ploy/research-image-smoke].each do |job|
+    %w[ploy/research-release-tools].each do |job|
       check(values.fetch('jobs').include?(",#{job},"), "#{label}: omitted #{job}")
     end
   else
@@ -244,7 +252,7 @@ end
   aliased_consumer = current[consumer].sub(/^hft-research-platform = .*$/, 'platform-client = { workspace = true }').sub("[features]\n", "[features]\npublisher-client = [\"platform-client?/publisher\"]\n")
   plan.call('workspace-alias-feature-publisher', full, {source => current[source] + "// edit\n", 'rust_hft/Cargo.toml' => workspace_alias, consumer => aliased_consumer}, 'broad', event: event, selected_paths: [source])
   plan.call('shared-profile-with-source', full, {source => current[source] + "// edit\n", platform => current[platform].sub('lto = "thin"', 'lto = false')}, 'broad', event: event, selected_paths: [source])
-  plan.call('recipe-feature', full, {source => current[source] + "// edit\n", recipe => current[recipe].sub('"features": "publisher"', '"features": "control"')}, 'broad', event: event, selected_paths: [source])
+  plan.call('recipe-feature', full, {source => current[source] + "// edit\n", tools_recipe => current[tools_recipe].sub('"features": "publisher"', '"features": "control"')}, 'broad', event: event, selected_paths: [source])
   plan.call('shared-source', full, {source => current[source] + "// edit\n", 'rust_hft/research-core/platform/src/build.rs' => "// shared build change\n"}, 'broad', event: event)
   plan.call('no-base', full, {platform => changed_manifest}, 'broad', event: event, supplied_base: false)
   unavailable = File.join(tmp, 'without-toml-parser')
@@ -260,7 +268,7 @@ puts 'Publisher-only and conservative fallback scope contracts passed'
 # remain in their existing contracts. Test cumulative source impact only.
 isolated = File.join(tmp, 'publisher-carry', '.github', 'scripts')
 FileUtils.mkdir_p(File.join(isolated, 'vendor'))
-%w[select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json local-lock-impact.sh].each do |name|
+%w[select-main-research-scope.sh select-rust-ci-scope.sh image-build-plan.sh research-release-products.sh research-release-products.json research-release-tools.json local-lock-impact.sh].each do |name|
   FileUtils.cp(File.join(root, '.github', 'scripts', name), File.join(isolated, name))
 end
 FileUtils.cp_r(File.join(root, '.github', 'scripts', 'vendor', 'tomlrb'), File.join(isolated, 'vendor'))
@@ -268,7 +276,7 @@ lookup = File.join(isolated, 'read-research-publish-baseline.sh')
 File.write(lookup, "#!/usr/bin/env bash\nset -euo pipefail\ncp \"$PUBLISHER_BASELINES\" \"$2\"\n")
 baselines = File.join(tmp, 'publisher-carry-baselines.json')
 File.write(baselines, JSON.generate(%w[cex-runner controller prediction-runner].map { |name| [name, full] }.to_h))
-[['publisher', {source => current[source] + "// unpublished XML change\n"}, 'controller'],
+[['publisher', {source => current[source] + "// unpublished XML change\n"}, 'none'],
  ['vendor', {'.github/scripts/vendor/tomlrb/lib/future.rb' => "# parser fixture\n"}, 'cex-runner,controller,prediction-runner']].each do |label, edits, expected|
   git('reset', '--hard', full)
   edits.each { |path, value| write.call(path, value) }
@@ -702,7 +710,7 @@ job_cases=(
   'research-dockerfile|pull_request|research-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
   'campaign-controller-dockerfile|pull_request|campaign-controller-dockerfile.txt|ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans'
   'unknown-docker|pull_request|unknown-docker.txt|ci/rust-shell-scripts,ci/rust,ci/research-foundation,ci/market-recorder-contract,ci/deployment-artifacts,ci/polymarket-evidence-compiler-image,ci/rust-hft-engine-fast-lane,ci/node-install,ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/rust-format,ploy/safety-scans,ploy/audit,ploy/rust-control-plane,ploy/rust-runner-lean,ploy/rust-runner-full,ploy/rust-market-data,ploy/rust-research-heavy,ploy/frontend,ploy/integration-regressions,ploy/architecture-contracts|hft-prediction-research-worker,hft-prediction-research-operator'
-  'prediction-workflow|pull_request|prediction-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
+  'prediction-workflow|pull_request|prediction-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/research-release-tools'
   'platform-smoke-runner|pull_request|platform-smoke-runner.txt|ploy/integration-regressions,ploy/workflow-lint'
   'platform-smoke-runner-push|push|platform-smoke-runner.txt|ploy/integration-regressions,ploy/workflow-lint'
   'root-node|pull_request|root-node.txt|ci/node-install'
@@ -735,7 +743,7 @@ job_cases=(
   'live-push|push|live.txt|ci/rust,ci/deployment-artifacts'
   'trading-dockerfile-push|push|trading-dockerfile.txt|ci/deployment-artifacts'
   'research-deployment-push|push|research-deployment.txt|ci/deployment-artifacts'
-  'acr-workflow-push|push|acr-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
+  'acr-workflow-push|push|acr-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/research-release-tools'
   'full|push|collector.txt|ci/rust,ci/polymarket-evidence-compiler-image,ploy/research-image-binaries,ploy/research-image-smoke,ci/deployment-artifacts'
 )
 for job_case in "${job_cases[@]}"; do
@@ -846,6 +854,7 @@ for kind in ack release; do
     for event in pull_request push; do
       scoped=$(run_case infrastructure "$event" infrastructure.txt)
       expected='ci/ci-contracts,ploy/workflow-lint'
+      [[ $path != .github/workflows/acr-publish.yml ]] || expected+=',ploy/research-release-tools'
       [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
       assert_jobs "$scoped" "$expected"
       assert_owning_packages "$scoped" ''
@@ -854,7 +863,9 @@ for kind in ack release; do
       done
       # Policy-only source still receives repository security scans; it has no
       # dependency/toolchain impact and must not trigger Cargo or image audits.
-      if [[ $path == *.md ]]; then
+      if [[ $path == .github/workflows/acr-publish.yml ]]; then
+        assert_security_jobs "$scoped" 'security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/cargo-machete,security/secret-detection'
+      elif [[ $path == *.md ]]; then
         assert_security_jobs "$scoped" 'security/secret-detection'
       else
         assert_security_jobs "$scoped" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
@@ -862,21 +873,21 @@ for kind in ack release; do
     done
   done
 done
-# All 20 actual PR 1266 paths, including this fixture, must remain policy-only
-# on both PR and main push. Mixed source/image inputs retain their own gates.
+# These workflow paths also validate the independent tools producer. They do
+# not add an image product; mixed source/image inputs retain their own gates.
 for event in pull_request push; do
   ack_flow_pr=$(run_case "ack-flow-pr-$event" "$event" ack-flow-pr-1266.txt)
-  expected='ci/ci-contracts,ploy/workflow-lint'
+  expected='ci/ci-contracts,ploy/workflow-lint,ploy/research-release-tools'
   [[ $event == pull_request ]] && expected+=',ploy/commit-hygiene'
   assert_jobs "$ack_flow_pr" "$expected"
-  assert_security_jobs "$ack_flow_pr" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+  assert_security_jobs "$ack_flow_pr" 'security/sast-semgrep,security/cargo-audit,security/secret-presence,security/license-check,security/cargo-machete,security/secret-detection'
   assert_owning_packages "$ack_flow_pr" ''
   for flag in loop handoff json ondo collector control focused toolchain clippy_loop clippy_handoff; do
     assert_flag "$ack_flow_pr" "$flag" false
   done
   cat "$fixtures/ack-flow-pr-1266.txt" "$fixtures/collector.txt" >"$tmp_dir/ack-flow-pr-with-collector.txt"
   ack_flow_mixed=$(run_case "ack-flow-collector-$event" "$event" ack-flow-pr-with-collector.txt)
-  expected='ci/ci-contracts,ploy/workflow-lint,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts'
+  expected='ci/ci-contracts,ploy/workflow-lint,ci/rust,ci/polymarket-evidence-compiler-image,ci/deployment-artifacts,ploy/research-release-tools'
   if [[ $event == pull_request ]]; then expected+=',ploy/commit-hygiene';
   else expected+=',ploy/research-image-binaries,ploy/research-image-smoke'; fi
   assert_jobs "$ack_flow_mixed" "$expected"
@@ -1130,9 +1141,9 @@ for event in pull_request push; do
   isolated_platform=$(run_case "isolated-platform-$event" "$event" control-owner.txt "$tmp_dir/isolated-platform.metadata")
   assert_owning_packages "$isolated_platform" hft-research-platform
   grep -Fqx 'loop_packages=,,' "$isolated_platform"
-  grep -Fqx 'research_product=controller' "$isolated_platform"
-  grep -Eq '^jobs=.*,(ploy/research-image-binaries),' "$isolated_platform"
-  grep -Eq '^jobs=.*,(ploy/research-image-smoke),' "$isolated_platform"
+  grep -Fqx 'research_product=none' "$isolated_platform"
+  grep -Eq '^jobs=.*,(ploy/research-release-tools),' "$isolated_platform"
+  if grep -Eq '^jobs=.*,(ploy/research-image-(binaries|smoke)),' "$isolated_platform"; then exit 1; fi
 done
 
 same_suite=$(run_case same-suite pull_request same-suite.txt)

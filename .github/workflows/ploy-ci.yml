@@ -249,6 +249,50 @@ jobs:
       - name: Test ACR publish workflow contract
         run: ../../.github/scripts/test-acr-publish-workflow.sh
 
+  research-release-tools:
+    name: Research release tools
+    needs: research-image-scope
+    if: ${{ contains(needs.research-image-scope.outputs.jobs, ',ploy/research-release-tools,') }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: .
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: 1.98.1
+      - name: Install release tool build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends clang mold pkg-config gh jq ruby binutils
+      - name: Restore release tool dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rust_hft/research-core/platform -> target/release-tools
+          shared-key: research-release-tools-1.98.1-bookworm-v1
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build and verify immutable release tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/build-research-release-tools.sh
+      - name: Upload immutable release tools
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: research-release-tools-${{ github.sha }}
+          path: ${{ runner.temp }}/research-release-tools.tar
+          if-no-files-found: error
+          retention-days: 7
+
   research-image-binaries:
     name: Research image binaries
     needs: research-image-scope
@@ -993,6 +1037,7 @@ jobs:
       - commit-hygiene
       - workflow-lint
       - research-image-binaries
+      - research-release-tools
       - research-image-smoke
       - rust-format
       - safety-scans

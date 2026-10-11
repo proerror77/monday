@@ -18,8 +18,13 @@ cache_recipes() {
          (.package | name) and (.features | type == "string") and
          (.binaries | type == "array" and length > 0 and all(.[];name))) | not) or
        (.recipes | map(.manifest) | unique) != ["data-pipelines/Cargo.toml", "prediction-markets/Cargo.toml",
-         "research-core/Cargo.toml", "research-core/platform/Cargo.toml"]
-    then error("unadmitted research cache catalog") else .recipes end' "$root/.github/scripts/research-release-products.json"
+         "research-core/Cargo.toml"]
+    then error("unadmitted research cache catalog")
+    # Keep the existing fourth cache target and its external dependencies.
+    # This descriptor is for metadata cleanup only, never an image build recipe.
+    else .recipes + [{manifest:"research-core/platform/Cargo.toml",
+      package:"hft-research-platform",features:"publisher",
+      binaries:["research-release-publisher","research-release-capability"]}] end' "$root/.github/scripts/research-release-products.json"
 }
 cache_manifests() {
   cache_recipes | jq -r 'map(.manifest)|unique|.[]'
