@@ -116,6 +116,19 @@ pub struct LockedTask {
     pub now_ms: i64,
 }
 
+/// An opaque committed task revision for read-only external I/O. It grants no
+/// provider mutation. Only a successful reacquisition admits applying its result.
+#[derive(Clone)]
+pub struct ReadbackSnapshot {
+    task: Task,
+    revision: i64,
+}
+impl ReadbackSnapshot {
+    pub fn task(&self) -> &Task {
+        &self.task
+    }
+}
+
 /// Retains the registered Session row lock until the native child is admitted.
 /// Snapshot registration takes the conflicting row lock before appending a tip.
 pub struct LockedSessionCheckpoint {
@@ -993,13 +1006,12 @@ impl Ledger {
         Ok(serde_json::from_value(value)?)
     }
 
-    /// Locks remain held through the bounded provider call. Lease/fence and PG
-    /// row serialization prevent two reconcilers from launching/cancelling the
-    /// same attempt concurrently. A crashed client rolls back; deterministic
-    /// resource names make the next readback recover the same launch.
+    /// Claims serialize briefly on the authority row and recheck capacity.
+    /// Maintenance uses a shared authority lock so unrelated tasks can progress
+    /// concurrently while their own task rows fence each reconciliation.
     pub async fn lock_next(&self, owner: &str, lease_ms: i64) -> Result<Option<LockedTask>> {
         let mut tx = self.pool.begin().await?;
-        let authority = query("SELECT mode,concurrency_limit,legacy_quiescence_sha256,migration_receipt_sha256 FROM research.authority WHERE singleton FOR UPDATE").fetch_one(&mut *tx).await?;
+        let authority = query("SELECT mode,concurrency_limit,legacy_quiescence_sha256,migration_receipt_sha256 FROM research.authority WHERE singleton").fetch_one(&mut *tx).await?;
         let admitted = authority.get::<String, _>("mode") == "postgres"
             && authority
                 .get::<Option<String>, _>("legacy_quiescence_sha256")
@@ -1008,7 +1020,6 @@ impl Ledger {
                 .get::<Option<String>, _>("migration_receipt_sha256")
                 .is_some_and(|s| crate::valid_digest(&s));
         let limit: i32 = authority.get("concurrency_limit");
-        let now_ms = clock(&mut tx).await?;
         // Expired attempts count against quota until their process trees stop.
         let active: i64 = query_scalar(
             "SELECT count(*) FROM research.tasks WHERE state IN ('launching','running','stopping')",
@@ -1016,34 +1027,69 @@ impl Ledger {
         .fetch_one(&mut *tx)
         .await?;
         if admitted && active < i64::from(limit) {
-            let row = query("SELECT document,revision FROM research.tasks WHERE state='queued' ORDER BY created_at,task_id FOR UPDATE SKIP LOCKED LIMIT 1").fetch_optional(&mut *tx).await?;
-            if let Some(row) = row {
-                let mut task: Task = serde_json::from_value(row.get("document"))?;
-                if task.expire(now_ms)? {
+            // Serialize only new claims. Re-read both authority and capacity
+            // after waiting, because another reconciler may have used the last
+            // slot while this transaction waited for the row lock.
+            let authority = query("SELECT mode,concurrency_limit,legacy_quiescence_sha256,migration_receipt_sha256 FROM research.authority WHERE singleton FOR UPDATE").fetch_one(&mut *tx).await?;
+            let claim_admitted = authority.get::<String, _>("mode") == "postgres"
+                && authority
+                    .get::<Option<String>, _>("legacy_quiescence_sha256")
+                    .is_some_and(|s| crate::valid_digest(&s))
+                && authority
+                    .get::<Option<String>, _>("migration_receipt_sha256")
+                    .is_some_and(|s| crate::valid_digest(&s));
+            let claim_limit: i32 = authority.get("concurrency_limit");
+            let now_ms = clock(&mut tx).await?;
+            let active: i64 = query_scalar(
+                "SELECT count(*) FROM research.tasks WHERE state IN ('launching','running','stopping')",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if claim_admitted && active < i64::from(claim_limit) {
+                let row = query("SELECT document,revision FROM research.tasks WHERE state='queued' ORDER BY created_at,task_id FOR UPDATE SKIP LOCKED LIMIT 1").fetch_optional(&mut *tx).await?;
+                if let Some(row) = row {
+                    let mut task: Task = serde_json::from_value(row.get("document"))?;
+                    if task.expire(now_ms)? {
+                        LockedTask {
+                            tx,
+                            revision: row.get("revision"),
+                            task,
+                            now_ms,
+                        }
+                        .commit("queued_deadline_expired")
+                        .await?;
+                        return Ok(None);
+                    }
+                    task.claim(owner, now_ms, lease_ms)?;
+                    let id = task.id.clone();
+                    // Persist the original attempt/deadline BEFORE provider I/O.
                     LockedTask {
                         tx,
                         revision: row.get("revision"),
                         task,
                         now_ms,
                     }
-                    .commit("queued_deadline_expired")
+                    .commit("claimed")
                     .await?;
-                    return Ok(None);
+                    return self.lock_id(&id).await.map(Some);
                 }
-                task.claim(owner, now_ms, lease_ms)?;
-                let id = task.id.clone();
-                // Persist the original attempt/deadline BEFORE provider I/O.
-                LockedTask {
-                    tx,
-                    revision: row.get("revision"),
-                    task,
-                    now_ms,
-                }
-                .commit("claimed")
-                .await?;
-                return self.lock_id(&id).await.map(Some);
             }
         }
+        tx.rollback().await?;
+        self.lock_maintenance(owner).await
+    }
+
+    async fn lock_maintenance(&self, owner: &str) -> Result<Option<LockedTask>> {
+        let mut tx = self.pool.begin().await?;
+        let authority = query("SELECT mode,legacy_quiescence_sha256,migration_receipt_sha256 FROM research.authority WHERE singleton FOR SHARE").fetch_one(&mut *tx).await?;
+        let admitted = authority.get::<String, _>("mode") == "postgres"
+            && authority
+                .get::<Option<String>, _>("legacy_quiescence_sha256")
+                .is_some_and(|s| crate::valid_digest(&s))
+            && authority
+                .get::<Option<String>, _>("migration_receipt_sha256")
+                .is_some_and(|s| crate::valid_digest(&s));
+        let now_ms = clock(&mut tx).await?;
         let row = query("SELECT document,revision FROM research.tasks WHERE state IN ('launching','running','stopping') AND (state='stopping' OR document->'lease'->>'owner'=$1 OR (document->'lease'->>'expires_ms')::bigint <= $2) ORDER BY updated_at,task_id FOR UPDATE SKIP LOCKED LIMIT 1")
             .bind(owner).bind(now_ms).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
@@ -1062,19 +1108,24 @@ impl Ledger {
         }))
     }
 
-    async fn lock_id(&self, id: &str) -> Result<LockedTask> {
+    pub(crate) async fn lock_id(&self, id: &str) -> Result<LockedTask> {
         let mut tx = self.pool.begin().await?;
-        let mode: String =
-            query_scalar("SELECT mode FROM research.authority WHERE singleton FOR SHARE")
-                .fetch_one(&mut *tx)
-                .await?;
+        let authority = query("SELECT mode,legacy_quiescence_sha256,migration_receipt_sha256 FROM research.authority WHERE singleton FOR SHARE")
+            .fetch_one(&mut *tx).await?;
+        let admitted = authority.get::<String, _>("mode") == "postgres"
+            && authority
+                .get::<Option<String>, _>("legacy_quiescence_sha256")
+                .is_some_and(|s| crate::valid_digest(&s))
+            && authority
+                .get::<Option<String>, _>("migration_receipt_sha256")
+                .is_some_and(|s| crate::valid_digest(&s));
         let row = query("SELECT document,revision FROM research.tasks WHERE task_id=$1 FOR UPDATE")
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
         let now_ms = clock(&mut tx).await?;
         let mut task: Task = serde_json::from_value(row.get("document"))?;
-        if mode != "postgres" && !task.state.terminal() {
+        if !admitted && !task.state.terminal() {
             task.stop(State::Cancelled, false)?;
         }
         Ok(LockedTask {
@@ -1083,6 +1134,76 @@ impl Ledger {
             task,
             now_ms,
         })
+    }
+
+    /// Reacquire only the exact committed revision read outside the transaction.
+    /// Cancellation, pause, expiry and revocation discard the observation.
+    pub async fn reacquire_readback(
+        &self,
+        expected: &ReadbackSnapshot,
+    ) -> Result<Option<LockedTask>> {
+        let mut locked = self.lock_id(&expected.task.id).await?;
+        if locked.revision != expected.revision || locked.task != expected.task {
+            if locked.task.state == State::Stopping {
+                locked.commit("readback_superseded").await?;
+            }
+            return Ok(None);
+        }
+        ensure!(
+            matches!(locked.task.state, State::Launching | State::Running),
+            "readback snapshot is not an active attempt"
+        );
+        let now = locked.refresh_clock().await?;
+        if locked.task.expire(now)? {
+            locked.commit("readback_attempt_expired").await?;
+            return Ok(None);
+        }
+        let Some(native_deadline) = locked.native_request_deadline_ms().await? else {
+            locked.task.stop(State::Cancelled, false)?;
+            locked.commit("readback_admission_revoked").await?;
+            return Ok(None);
+        };
+        // Admission locking can wait behind an import. Its old clock cannot
+        // revive a lease which expired while that lock was unavailable.
+        let now = locked.refresh_clock().await?;
+        if locked.task.expire(now)? {
+            locked.commit("readback_attempt_expired").await?;
+            return Ok(None);
+        }
+        if native_deadline <= now {
+            locked.task.stop(State::Cancelled, false)?;
+            locked.commit("readback_admission_expired").await?;
+            return Ok(None);
+        }
+        let deadline = locked
+            .task
+            .deadline_ms
+            .as_mut()
+            .context("active attempt lacks deadline")?;
+        *deadline = (*deadline).min(native_deadline);
+        Ok(Some(locked))
+    }
+
+    /// Renew only the same committed revision. The next snapshot includes this
+    /// pulse's revision, so another reader cannot silently overwrite its lease.
+    pub async fn renew_readback_lease(
+        &self,
+        expected: &ReadbackSnapshot,
+        lease_ms: i64,
+    ) -> Result<Option<ReadbackSnapshot>> {
+        let Some(mut locked) = self.reacquire_readback(expected).await? else {
+            return Ok(None);
+        };
+        let current = locked
+            .task
+            .lease
+            .as_ref()
+            .context("active attempt lacks lease")?
+            .clone();
+        locked.task.heartbeat(&current, locked.now_ms, lease_ms)?;
+        Ok(Some(
+            locked.commit_readback("readback_lease_renewed").await?,
+        ))
     }
 
     pub async fn cancel(&self, id: &str) -> Result<()> {
@@ -1109,6 +1230,34 @@ impl Ledger {
 }
 
 impl LockedTask {
+    /// Persist deadline and lease changes, then release every row lock before
+    /// reading external bytes or provider status. Reacquisition is mandatory.
+    pub async fn release_for_readback(self) -> Result<ReadbackSnapshot> {
+        self.commit_readback("readback_started").await
+    }
+
+    async fn commit_readback(self, event: &str) -> Result<ReadbackSnapshot> {
+        ensure!(
+            matches!(self.task.state, State::Launching | State::Running),
+            "readback requires an active attempt"
+        );
+        let lease = self.task.lease.as_ref().context("readback lacks lease")?;
+        ensure!(
+            lease.task_id == self.task.id
+                && lease.attempt == self.task.attempt
+                && lease.fence == self.task.fence
+                && self.task.deadline_ms.is_some(),
+            "readback attempt identity mismatch"
+        );
+        self.task.check_lease(lease, self.now_ms)?;
+        let snapshot = ReadbackSnapshot {
+            task: self.task.clone(),
+            revision: self.revision.checked_add(1).context("revision overflow")?,
+        };
+        self.commit(event).await?;
+        Ok(snapshot)
+    }
+
     pub async fn issue_attempt_identity(
         &mut self,
         issuer: &crate::artifact_identity::AttemptIdentityIssuer,
