@@ -28,7 +28,7 @@ grep -F -- '/usr/local/bin/bybit-options-archiver' "$dockerfile" >/dev/null
 grep -F -- 'artifact/bybit-options-archiver' "$acr_workflow" >/dev/null
 grep -F -- 'bybit-options-archiver.sha256' "$acr_workflow" >/dev/null
 # shellcheck disable=SC2016 # literal workflow expression, must not expand
-grep -F -- 'bybit-options-archiver ${{ needs.selector.outputs.source_sha }}' \
+grep -F -- 'bybit-options-archiver ${{ needs.ordinary-selector.outputs.source_sha }}' \
   "$acr_workflow" >/dev/null
 
 # Defect 1: fail-closed disk/spool gates must be wired into Config and the
