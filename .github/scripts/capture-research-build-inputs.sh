@@ -8,6 +8,8 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 test "$(uname -s)" = Linux
 test "$(uname -m)" = x86_64
+test "${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:?}" = "$root/.github/scripts/research-release-linker.sh"
+test -x "$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
 # Native hosted Ubuntu bytes cannot be executed by the existing bookworm image.
 # This admission runs before the expensive build and keys the actual native ABI.
 test "$(sed -n 's/^ID=//p' /etc/os-release)" = debian
@@ -32,7 +34,7 @@ for variable in CC CXX AR LD CFLAGS CXXFLAGS LDFLAGS RUSTC_BOOTSTRAP CARGO_BUILD
   BINDGEN_EXTRA_CLANG_ARGS PROTOC PROTOC_INCLUDE CMAKE_TOOLCHAIN_FILE; do
   printf '%s=%s\n' "$variable" "${!variable-}" >>"$work/native"
 done
-for command in clang cmake mold pkg-config protoc zstd zstdmt unzstd; do "$command" --version >>"$work/native"; done
+for command in clang cmake mold pkg-config protoc zstd zstdmt unzstd time; do "$command" --version >>"$work/native"; done
 # Bind relevant Cargo overrides without capturing registry or service secrets.
 for variable in RUSTC RUSTDOC RUSTC_WORKSPACE_WRAPPER CARGO_INCREMENTAL; do
   printf '%s=%s\n' "$variable" "${!variable-}" >>"$work/flags"
@@ -64,6 +66,7 @@ recipes=$(bash "$root/.github/scripts/research-release-products.sh" recipes "${2
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
 cat "$root/.github/scripts/build-research-release.sh" \
   "$root/.github/scripts/build-research-recipes.sh" \
+  "$root/.github/scripts/research-release-linker.sh" \
   "$root/.github/scripts/research-cache-layout.sh" \
   "$root/.github/scripts/research-release-products.sh" \
   "$root/.github/scripts/research-release-products.json" \

@@ -643,7 +643,7 @@ for path in "${paths[@]}"; do
       select_job ploy/workflow-lint
       continue
       ;;
-    .github/scripts/research-release-products.sh|.github/scripts/research-release-products.json|.github/scripts/test-research-release-products.sh|.github/scripts/research-release-bundle.rb|.github/scripts/research-release-source-sha.sh|.github/scripts/test-research-checkout-ownership.sh|.github/scripts/verify-research-runtime-abi.sh|.github/scripts/test-research-runtime-abi.sh|.github/scripts/research-cache-layout.sh|.github/scripts/test-research-cache-layout.sh|.github/scripts/build-research-release.sh|.github/scripts/build-research-recipes.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/verify-research-product-image.sh|.github/scripts/test-research-product-image.sh|.github/scripts/verify-research-controller-image.sh|.github/scripts/test-research-controller-image.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
+    .github/scripts/research-release-products.sh|.github/scripts/research-release-products.json|.github/scripts/test-research-release-products.sh|.github/scripts/research-release-bundle.rb|.github/scripts/research-release-source-sha.sh|.github/scripts/test-research-checkout-ownership.sh|.github/scripts/verify-research-runtime-abi.sh|.github/scripts/test-research-runtime-abi.sh|.github/scripts/research-cache-layout.sh|.github/scripts/test-research-cache-layout.sh|.github/scripts/build-research-release.sh|.github/scripts/build-research-recipes.sh|.github/scripts/research-release-linker.sh|.github/scripts/capture-research-build-inputs.sh|.github/scripts/research-image-smoke.sh|.github/scripts/verify-research-product-image.sh|.github/scripts/test-research-product-image.sh|.github/scripts/verify-research-controller-image.sh|.github/scripts/test-research-controller-image.sh|.github/scripts/download-research-release.sh|.github/scripts/test-download-research-release.sh)
       select_research_image_jobs
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
@@ -698,7 +698,7 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
-    .github/scripts/test-ci-owner-cache.sh|.github/scripts/write-ci-rust-evidence.sh|.github/scripts/verify-ci-rust-evidence.sh|.github/scripts/wait-ci-rust-evidence.sh|.github/scripts/test-ci-rust-evidence.sh|.github/scripts/check-collector-test-presence.sh)
+    .github/scripts/test-research-release-linker.sh|.github/scripts/test-ci-owner-cache.sh|.github/scripts/write-ci-rust-evidence.sh|.github/scripts/verify-ci-rust-evidence.sh|.github/scripts/wait-ci-rust-evidence.sh|.github/scripts/test-ci-rust-evidence.sh|.github/scripts/check-collector-test-presence.sh)
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
       continue

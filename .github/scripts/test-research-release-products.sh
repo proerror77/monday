@@ -85,7 +85,7 @@ bash "$root/.github/scripts/test-research-product-image.sh"
 # binaries. Only the target recorded by compiler inputs may reach the archive.
 fixture="$work/producer"
 mkdir -p "$fixture/.github/scripts" "$fixture/rust_hft" "$fixture/bin" "$fixture/output"
-for script in research-cache-layout.sh build-research-release.sh build-research-recipes.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
+for script in research-cache-layout.sh build-research-release.sh build-research-recipes.sh research-release-linker.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
   cp "$root/.github/scripts/$script" "$fixture/.github/scripts/$script"
 done
 cp "$root/rust_hft/workspaces.json" "$fixture/rust_hft/workspaces.json"
@@ -97,6 +97,24 @@ done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
 printf '#!/usr/bin/env bash\nexit 0\n' >"$fixture/.github/scripts/verify-research-runtime-abi.sh"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "1111111111111111111111111111111111111111"\n' >"$fixture/bin/git"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" 7\n' >"$fixture/bin/gh"
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$fixture/.github/scripts/research-release-linker.sh"
+export MONDAY_CACHE_RESTORED_KEY=fixture-compatible-main-cache
+cat >"$fixture/bin/time" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+while [[ $1 == --* ]]; do
+  case $1 in
+    --quiet) shift ;;
+    --format) shift 2 ;;
+    --output) output=$2; shift 2 ;;
+    *) exit 92 ;;
+  esac
+done
+status=0
+"$@" || status=$?
+printf '{"wall_seconds":0.5,"user_seconds":0.3,"system_seconds":0.1,"max_rss_kib":1024,"exit_code":%s}\n' "$status" >"$output"
+exit "$status"
+MOCK
 # The producer targets Linux. Inject host metrics only in this test fixture.
 export MONDAY_TEST_AWK MONDAY_TEST_CPUINFO_FILE MONDAY_TEST_CARGO_BUILD_LOG
 MONDAY_TEST_AWK=$(command -v awk)
@@ -129,15 +147,20 @@ if [[ $1 == metadata ]]; then
 fi
 printf 'build\n' >>"${MONDAY_TEST_CARGO_BUILD_LOG:?}"
 [[ ${FAIL_RECIPE:-0} != 1 ]] || exit 37
-target='' binaries=()
+target='' package='' timings=false binaries=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) target=$2; shift ;;
     --bin) binaries+=("$2"); shift ;;
+    -p) package=$2; shift ;;
+    --timings) timings=true ;;
   esac
   shift
 done
 test "$target" = "$(jq -r .target "$MONDAY_BUILD_INPUTS_FILE")"
+[[ $timings == true && -d ${MONDAY_RESEARCH_LINK_TIMINGS_DIR:?} ]]
+mkdir -p "$CARGO_TARGET_DIR/cargo-timings"
+printf '<html>recipe: %s</html>\n' "$package" >"$CARGO_TARGET_DIR/cargo-timings/cargo-timing.html"
 mkdir -p "$CARGO_TARGET_DIR/$target/release"
 for binary in "${binaries[@]}"; do
   printf 'fresh target executable: %s\n' "$binary" >"$CARGO_TARGET_DIR/$target/release/$binary"
@@ -161,8 +184,18 @@ printf 'PASS: controller-only release builds five admitted executables including
 jq -es 'length==9 and ([.[].phase]|sort)==["after-cache-lookup","after-cache-lookup","after-cache-lookup","dependency-warm-local","dependency-warm-local","dependency-warm-local","warm-local","warm-local","warm-local"]
   and ([.[].compilation_inputs_sha256]|unique|length)==1
   and all(.[]; .source_sha=="1111111111111111111111111111111111111111" and .compiler_artifacts>0
-    and .runner.cpu_model=="Monday fixture CPU" and .runner.logical_cpus==8)' \
+    and .runner.cpu_model=="Monday fixture CPU" and .runner.logical_cpus==8
+    and .success==true and .exit_code==0 and .resource_usage.max_rss_kib==1024
+    and .run_id=="42" and .run_attempt=="2" and .producer_job_id=="7"
+    and .cache_restored_key=="fixture-compatible-main-cache" and .linker=="clang -fuse-ld=mold")' \
   "$fixture/output/research-recipe-probe/timings.jsonl" >/dev/null
+for phase in after-cache-lookup warm-local dependency-warm-local; do
+  for package in alpha-harness hft-collector hft-research-platform; do
+    prefix="$fixture/output/research-recipe-probe/$phase-$package"
+    grep -Fq "recipe: $package" "$prefix-timing.html"
+    [[ -s $prefix.jsonl && -s $prefix-resources.json && -d $prefix-links ]]
+  done
+done
 # A missing metrics input must fail before Cargo, timings, or release creation.
 mkdir -p "$fixture/cpuinfo-failed-output"
 if MONDAY_TEST_CPUINFO_FILE="$fixture/missing-cpuinfo" MONDAY_TEST_CARGO_BUILD_LOG="$fixture/cpuinfo-failed-builds" \
@@ -175,6 +208,15 @@ grep -Fq "$fixture/missing-cpuinfo" "$work/rejection"
 [[ ! -e $fixture/cpuinfo-failed-builds ]]
 [[ ! -e $fixture/cpuinfo-failed-output/research-recipe-probe/timings.jsonl ]]
 [[ ! -e $fixture/cpuinfo-failed-output/research-image-release.tar ]]
+# A caller cannot silently replace the admitted linker after input capture.
+if CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=unadmitted-linker \
+  MONDAY_TEST_CARGO_BUILD_LOG="$fixture/wrong-linker-builds" PATH="$fixture/bin:$PATH" \
+  RUNNER_TEMP="$fixture/wrong-linker-output" MONDAY_SOURCE_REVISION="$sha" \
+  MONDAY_BUILD_INPUTS_FILE="$fixture/inputs.json" \
+  bash "$fixture/.github/scripts/build-research-recipes.sh" controller after-cache-lookup; then
+  echo 'unadmitted linker accepted by the producer' >&2; exit 1
+fi
+[[ ! -e $fixture/wrong-linker-builds ]]
 # A compiler failure must block the producer before artifact creation.
 mkdir -p "$fixture/failed-output"
 if FAIL_RECIPE=1 PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/failed-output" GITHUB_REPOSITORY=fixture/monday \
@@ -182,6 +224,9 @@ if FAIL_RECIPE=1 PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/failed-output" 
   echo 'compiler failure accepted by the producer' >&2; exit 1
 fi
 [[ ! -e $fixture/failed-output/research-image-release.tar ]]
+jq -es 'length==1 and .[0].success==false and .[0].exit_code==37 and .[0].resource_usage.exit_code==37' \
+  "$fixture/failed-output/research-recipe-probe/timings.jsonl" >/dev/null
+[[ ! -e $fixture/failed-output/research-recipe-probe/after-cache-lookup-alpha-harness-timing.html ]]
 jq '.recipes=[]' "$fixture/inputs.json" >"$fixture/wrong-inputs.json"
 if PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/failed-output" MONDAY_SOURCE_REVISION="$sha" \
   MONDAY_BUILD_INPUTS_FILE="$fixture/wrong-inputs.json" bash "$fixture/.github/scripts/build-research-recipes.sh" controller after-cache-lookup; then

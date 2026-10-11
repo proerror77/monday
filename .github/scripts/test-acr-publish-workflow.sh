@@ -166,7 +166,11 @@ repo_root = File.expand_path('../..', File.dirname(ARGV[0]))
   abort 'release builder lost bookworm ABI binding' unless job.fetch('container').fetch('image') == 'rust:1.98.1-bookworm@sha256:c49256cbe5ea0188bc658a689500d70c41eb51f009a7a7be209caf60a944f3ec'
   dependencies = job.fetch('steps').find { |step| step.fetch('name','') == 'Install build dependencies' }.fetch('run')
   abort 'bookworm release uses Ubuntu package sources' if dependencies.include?('install-ubuntu-packages.sh')
-  %w[gh jq ruby binutils zstd].each { |tool| abort "bookworm release dependency missing: #{tool}" unless dependencies.split.include?(tool) }
+  %w[gh jq ruby binutils zstd time clang mold].each { |tool| abort "bookworm release dependency missing: #{tool}" unless dependencies.split.include?(tool) }
+  linker = job.fetch('steps').find { |step| step['name']=='Configure release linker' }
+  capture = job.fetch('steps').find { |step| step['id']=='build-inputs' }
+  abort 'release linker is not bound before capture' unless linker && job.fetch('steps').index(linker)<job.fetch('steps').index(capture)
+  abort 'release linker uses a host-side expression path' unless linker.fetch('run').include?('CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=%s/.github/scripts/research-release-linker.sh') && linker.fetch('run').include?('"$GITHUB_WORKSPACE" >> "$GITHUB_ENV"')
   abort 'release compiles whole workspace' if job.to_s.include?('--workspace') || job.to_s.include?('--all-features')
   abort 'release lost bounded native builder' unless job.fetch('steps').any? { |s|s.fetch('run','').include?('build-research-release.sh') }
   job.fetch('steps').each do |step|
@@ -184,6 +188,7 @@ cache_environment = lambda do |doc, job|
   doc.fetch('env',{}).merge(job.fetch('env',{})).select { |name,_| name.match?(/\A(CARGO|CC|CFLAGS|CXX|CMAKE|RUST)/) }
 end
 abort 'manual dependency restore uses a different compiler environment' unless cache_environment.call(acr,manual_builder)==cache_environment.call(ploy,prediction_builder)
+abort 'manual release linker differs' unless find_step.call(manual_builder,'Configure release linker')==find_step.call(prediction_builder,'Configure release linker')
 abort 'manual dependency restore uses different native packages' unless find_step.call(manual_builder,'Install build dependencies').fetch('run')==find_step.call(prediction_builder,'Install build dependencies').fetch('run')
 toolchain = lambda { |job| job.fetch('steps').find { |step| step.fetch('uses','').start_with?('dtolnay/rust-toolchain@') } }
 abort 'manual dependency restore uses a different Rust toolchain' unless toolchain.call(manual_builder)==toolchain.call(prediction_builder)
@@ -215,14 +220,20 @@ abort 'manual timing evidence omits actual cache restore status' unless manual_b
 timings = find_step.call(manual_builder,'Upload recipe timing evidence')
 abort 'manual timing evidence lost source, attempt or recipe measurements' unless timings.fetch('with')=={
   'name'=>'research-recipe-timings-${{ needs.selector.outputs.source_sha }}-${{ github.run_attempt }}',
-  'path'=>'${{ runner.temp }}/research-recipe-probe/timings.jsonl',
+  'path'=>'${{ runner.temp }}/research-recipe-probe/',
   'if-no-files-found'=>'error', 'retention-days'=>7
 }
+abort 'Prediction omits unit/linker timing evidence' unless find_step.call(prediction_builder,'Upload recipe timing evidence').dig('with','path')==timings.dig('with','path')
+[prediction_builder,manual_builder].each do |job|
+  build=find_step.call(job,'Build immutable research release')
+  abort 'restored cache key is not recorded' unless build.dig('env','MONDAY_CACHE_RESTORED_KEY')=='${{ steps.research-cache.outputs.cache-matched-key }}'
+end
 abort 'cross-run source readback missing' unless acr.fetch('jobs').fetch('publish').fetch('steps').any? { |s|s.fetch('run','').include?('download-research-release.sh') }
 abort 'release relationship changed' unless acr.fetch('jobs').fetch('research-release-complete').fetch('needs') == ['selector','publish','research-environments']
 RUBY
 bash "$script_dir/test-research-runtime-abi.sh"
 bash "$script_dir/test-research-checkout-ownership.sh"
+bash "$script_dir/test-research-release-linker.sh"
 # Preserve authenticated exact-source native three-workflow admission.
 grep -Fq 'Read authenticated release admission' "$workflow"
 grep -Fq '.github/scripts/read-acr-publish-source.sh "$SOURCE_SHA" "$GITHUB_RUN_ID"' "$workflow"
