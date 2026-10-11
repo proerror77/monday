@@ -27,7 +27,7 @@ pub mod preparation;
 pub mod release;
 #[cfg(feature = "publisher")]
 pub mod release_budget;
-#[cfg(feature = "publisher")]
+#[cfg(feature = "control")]
 pub mod release_oss;
 #[cfg(feature = "publisher")]
 pub mod release_publisher;

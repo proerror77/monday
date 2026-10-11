@@ -26,6 +26,8 @@ pub struct Inventory {
     pub session_checkpoint_sha256: Option<String>,
     pub cluster: String,
     pub kube_api_ip: std::net::IpAddr,
+    pub build_oss: crate::release_oss::OssLocation,
+    pub build_oss_ips: Vec<std::net::IpAddr>,
     pub tenant: String,
     pub codex_sha256: String,
     pub experiment_sha256: String,
@@ -130,6 +132,16 @@ impl Inventory {
                 .is_none_or(|digest| valid_digest(digest)),
             "invalid registered recovery checkpoint identity"
         );
+        self.build_oss.validate()?;
+        ensure!(
+            !self.build_oss_ips.is_empty()
+                && self.build_oss_ips.len() <= 16
+                && self
+                    .build_oss_ips
+                    .iter()
+                    .all(|ip| !ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback()),
+            "explicit OSS endpoint addresses required"
+        );
         let api_ip = match self.kube_api_ip {
             std::net::IpAddr::V4(ip) => ip.to_string(),
             std::net::IpAddr::V6(ip) => format!("[{ip}]"),
@@ -157,6 +169,9 @@ impl Inventory {
             ("__CLUSTER__", &self.cluster),
             ("__KUBE_API_IP__", &api_ip),
             ("__KUBE_API_CIDR__", &cidr),
+            ("__BUILD_OSS_BUCKET__", &self.build_oss.bucket),
+            ("__BUILD_OSS_REGION__", &self.build_oss.region),
+            ("__BUILD_OSS_ENDPOINT__", &self.build_oss.endpoint),
             ("__TENANT__", &self.tenant),
             ("__CODEX_SHA256__", &self.codex_sha256),
             ("__EXPERIMENT_SHA256__", &self.experiment_sha256),
@@ -178,6 +193,16 @@ impl Inventory {
             ensure!(!rendered.contains("__"), "unresolved deployment input");
             assets.insert(filename.to_owned(),rendered);
         }
+        // Only the control pod receives software-store egress. Scientific and
+        // Session pods retain their existing private-network policy.
+        assets.insert("build-oss-network.json".into(), serde_json::to_string_pretty(&serde_json::json!({
+            "apiVersion":"networking.k8s.io/v1", "kind":"NetworkPolicy",
+            "metadata":{"name":"monday-foundation-build-objects","namespace":"monday-research"},
+            "spec":{"podSelector":{"matchLabels":{"app":"monday-foundation-control"}},
+                "policyTypes":["Egress"], "egress":[{"to":self.build_oss_ips.iter().map(|ip|
+                    serde_json::json!({"ipBlock":{"cidr":format!("{}/{}",ip,if ip.is_ipv4(){32}else{128})}})
+                ).collect::<Vec<_>>(), "ports":[{"protocol":"TCP","port":443}]}]}
+        }))?);
         let install =
             include_str!("../../../../deployment/aliyun/research/foundation/install-tls.sh");
         assets.insert("postgres-configmap.json".into(),configmap("monday-foundation-postgres", &[("install-tls.sh",install),("pg_hba.conf",include_str!("../../../../deployment/aliyun/research/foundation/postgres/pg_hba.conf"))])?);
@@ -253,6 +278,12 @@ mod tests {
             session_checkpoint_sha256: None,
             cluster: "fixture".into(),
             kube_api_ip: "127.0.0.1".parse()?,
+            build_oss: crate::release_oss::OssLocation {
+                bucket: "fixture".into(),
+                region: "ap-northeast-1".into(),
+                endpoint: "https://fixture.oss-ap-northeast-1-internal.aliyuncs.com/".into(),
+            },
+            build_oss_ips: vec!["10.0.0.10".parse()?],
             tenant: "fixture".into(),
             codex_sha256: "b".repeat(64),
             experiment_sha256: "c".repeat(64),
@@ -272,6 +303,25 @@ mod tests {
         serde_json::from_str::<crate::service::ServiceConfig>(&assets["service.json"])?;
         let service: crate::service::ServiceConfig = serde_json::from_str(&assets["service.json"])?;
         assert!(!service.terminal_retirement.enabled);
+        assert_eq!(service.build_oss, inventory.build_oss);
+        assert_eq!(
+            service.build_oss_session_file.to_str(),
+            Some("/run/broker/private/build-reader.json")
+        );
+        let network: serde_json::Value = serde_json::from_str(&assets["build-oss-network.json"])?;
+        assert_eq!(
+            network["spec"]["podSelector"]["matchLabels"]["app"],
+            "monday-foundation-control"
+        );
+        assert_eq!(
+            network["spec"]["egress"][0]["to"],
+            serde_json::json!([{"ipBlock":{"cidr":"10.0.0.10/32"}}])
+        );
+        assert_eq!(
+            network["spec"]["egress"][0]["ports"],
+            serde_json::json!([{"protocol":"TCP","port":443}])
+        );
+
         let issuer = service
             .attempt_identity
             .context("missing configured issuer")?;
