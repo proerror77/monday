@@ -12,6 +12,8 @@ pub mod artifact_io;
 #[cfg(feature = "control")]
 pub mod block_objects;
 pub mod build;
+#[cfg(feature = "control")]
+pub mod build_objects;
 #[cfg(feature = "native-admission")]
 pub mod campaign;
 pub mod campaign_result;

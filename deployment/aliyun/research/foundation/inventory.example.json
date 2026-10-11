@@ -20,5 +20,13 @@
   "workspace_claim": "REPLACE_WITH_EXISTING_VERIFIED_GIT_WORKSPACE_CLAIM",
   "workspace_source_revision": "REPLACE_WITH_REVIEWED_GIT_SOURCE_COMMIT",
   "issuer_storage": "REPLACE_WITH_APPROVED_ISSUER_JOURNAL_GI_QUANTITY",
-  "session_checkpoint_sha256": null
+  "session_checkpoint_sha256": null,
+  "build_oss": {
+    "bucket": "REPLACE_WITH_EXISTING_RELEASE_BUCKET",
+    "region": "REPLACE_WITH_RELEASE_REGION",
+    "endpoint": "REPLACE_WITH_BOUND_HTTPS_OSS_ENDPOINT"
+  },
+  "build_oss_ips": [
+    "REPLACE_WITH_REVIEWED_ENDPOINT_IP"
+  ]
 }
