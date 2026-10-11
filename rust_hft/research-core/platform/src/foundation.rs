@@ -246,6 +246,11 @@ impl Inventory {
         if let Some(checkpoint) = &self.session_checkpoint_sha256 {
             assets.insert("session-resume.patch.json".into(), serde_json::to_string_pretty(&serde_json::json!([{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["resume","/config/session.json",checkpoint,"/state/checkpoints/native.json"]}]))?);
         }
+        assets.insert(
+            "provider_create_operations.sql".into(),
+            crate::provider_operations::MIGRATION.into(),
+        );
+        assets.insert("provider_create_roles.sql".into(), include_str!("../../../../deployment/aliyun/research/foundation/postgres/provider_create_roles.sql").into());
         assets.insert("broker-tools.paused.json".into(), "[]\n".into());
         assets.insert("broker-artifacts.paused.json".into(), "[]\n".into());
         Ok(assets)

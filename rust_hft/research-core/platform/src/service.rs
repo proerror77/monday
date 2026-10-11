@@ -2,13 +2,44 @@
 //! no dependency on workflow_run, Actions artifacts, or CI resource controllers.
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use {
-    crate::execution::Kubernetes, crate::execution::Observation, crate::orchestrator::State,
-    crate::orchestrator::Task, crate::postgres::Ledger, crate::sha256,
+    crate::execution::Kubernetes,
+    crate::execution::Observation,
+    crate::orchestrator::State,
+    crate::orchestrator::Task,
+    crate::postgres::{Ledger, LockedTask},
+    crate::sha256,
     hft_research_worker_contracts::execution::Backend,
     hft_research_worker_contracts::task::ResultReceipt,
 };
+
+type LeasePulse<S> = Pin<Box<dyn Future<Output = Result<Option<S>>> + Send>>;
+
+/// Keep a readback alive while its committed snapshot can be renewed. An
+/// unsuccessful renewal drops the in-flight HTTP future without applying it.
+async fn readback_with_heartbeats<S: Clone, T>(
+    snapshot: &mut S,
+    reads: impl Future<Output = Result<T>>,
+    period: Duration,
+    mut renew: impl FnMut(S) -> LeasePulse<S>,
+) -> Result<Option<T>> {
+    tokio::pin!(reads);
+    let mut pulse = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    pulse.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            result = &mut reads => return result.map(Some),
+            _ = pulse.tick() => {
+                let Some(next) = renew(snapshot.clone()).await? else {
+                    return Ok(None);
+                };
+                *snapshot = next;
+            }
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -346,6 +377,31 @@ pub struct Reconciler {
 }
 
 impl Reconciler {
+    async fn readback<T, F: Future<Output = Result<T>>>(
+        &self,
+        locked: LockedTask,
+        read: impl FnOnce(Task) -> F,
+    ) -> Result<Option<(LockedTask, T)>> {
+        let mut snapshot = locked.release_for_readback().await?;
+        let reads = read(snapshot.task().clone());
+        let period = Duration::from_millis((self.lease_ms / 3).clamp(1, 10_000) as u64);
+        let ledger = self.ledger.clone();
+        let lease_ms = self.lease_ms;
+        let Some(result) =
+            readback_with_heartbeats(&mut snapshot, reads, period, move |expected| {
+                let ledger = ledger.clone();
+                Box::pin(async move { ledger.renew_readback_lease(&expected, lease_ms).await })
+            })
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .ledger
+            .reacquire_readback(&snapshot)
+            .await?
+            .map(|locked| (locked, result)))
+    }
     /// One bounded reconciliation. Caller waits interruptibly between polls.
     pub async fn tick(&self) -> Result<bool> {
         let Some(mut locked) = self.ledger.lock_next(&self.owner, self.lease_ms).await? else {
@@ -366,64 +422,87 @@ impl Reconciler {
             locked.task.stop(State::Cancelled, false)?;
         }
         if locked.task.state == State::Stopping {
+            let task = locked.task.clone();
             let lease = locked
                 .task
                 .lease
                 .as_ref()
                 .context("stop lacks execution lease")?
                 .clone();
+            let mut mutation =
+                crate::provider_operations::ProviderMutation::new(self.ledger.clone(), locked);
             if self
                 .kubernetes
-                .stop(&locked.task.spec, &lease, locked.task.execution.as_ref())
+                .stop(&task.spec, &lease, task.execution.as_ref(), &mut mutation)
                 .await?
+                == crate::execution::StopOutcome::Stopped
             {
-                if locked.task.spec.kind
-                    == hft_research_worker_contracts::task::TaskKind::CexCampaign
-                {
+                if task.spec.kind == hft_research_worker_contracts::task::TaskKind::CexCampaign {
                     let issuer = self
                         .issuer
                         .as_ref()
                         .context("Campaign cleanup lacks controlled issuer")?;
-                    let issued = locked.recover_attempt_identity_for_cleanup(issuer).await?;
-                    if !self
+                    let issued = mutation
+                        .locked_mut()
+                        .await?
+                        .recover_attempt_identity_for_cleanup(issuer)
+                        .await?;
+                    if self
                         .kubernetes
                         .cleanup_attempt_identity(
-                            &locked.task.spec,
+                            &task.spec,
                             &lease,
-                            locked.task.attempt_identity.as_ref(),
+                            task.attempt_identity.as_ref(),
                             issued.as_ref(),
+                            &mut mutation,
                         )
                         .await?
+                        == crate::execution::StopOutcome::AwaitingEvidence
                     {
-                        locked.commit("identity_cleanup_pending").await?;
+                        mutation
+                            .into_locked()
+                            .await?
+                            .commit("identity_cleanup_pending")
+                            .await?;
                         return Ok(true);
                     }
                     if let Some(issued) = issued {
                         issuer.cleanup(issued)?;
                     }
                 }
+                locked = mutation.into_locked().await?;
                 if self.ledger.admission(&locked.task.spec).await?.is_none() {
                     locked.task.stop(State::Cancelled, false)?;
                 }
                 locked.task.stopped(lease.attempt, lease.fence)?;
+            } else {
+                locked = mutation.into_locked().await?;
             }
             locked.commit("stop_reconciled").await?;
             return Ok(true);
         }
-        let mut lease = locked
-            .task
-            .lease
-            .as_ref()
-            .context("active task lacks lease")?
-            .clone();
         if locked.task.state == State::Launching {
-            let build = self.ledger.build_for_task(&locked.task).await?;
-            crate::build_objects::BuildReader::from_file(
-                &self.build_oss,
-                &self.build_oss_session_file,
-            )?
-            .verify_build(&build)
-            .await?;
+            let Some((current, ())) = self
+                .readback(locked, |task| async move {
+                    let build = self.ledger.build_for_task(&task).await?;
+                    crate::build_objects::BuildReader::from_file(
+                        &self.build_oss,
+                        &self.build_oss_session_file,
+                    )?
+                    .verify_build(&build)
+                    .await
+                })
+                .await?
+            else {
+                return Ok(true);
+            };
+            locked = current;
+            let mut lease = locked
+                .task
+                .lease
+                .as_ref()
+                .context("launch readback lost its lease")?
+                .clone();
             let now = locked.refresh_clock().await?;
             if locked.task.expire(now)? {
                 locked.commit("build_readback_expired").await?;
@@ -457,20 +536,38 @@ impl Reconciler {
                 } else {
                     None
                 };
-            let (handle, attempt_identity) = self
+            let task = locked.task.clone();
+            let remaining_ms = task.deadline_ms.context("launch lacks deadline")? - locked.now_ms;
+            let mut mutation =
+                crate::provider_operations::ProviderMutation::new(self.ledger.clone(), locked);
+            let outcome = self
                 .kubernetes
                 .launch(
-                    &locked.task.spec,
-                    &lease,
+                    &task,
                     &acceptance,
-                    locked.task.checkpoint.as_ref(),
-                    locked.task.deadline_ms.context("launch lacks deadline")? - locked.now_ms,
+                    remaining_ms,
                     issued.as_ref(),
+                    &mut mutation,
                 )
                 .await?;
+            locked = mutation.into_locked().await?;
+            let (handle, attempt_identity) = match outcome {
+                crate::execution::LaunchOutcome::Ready(handle, identity) => {
+                    (handle, identity.map(|reference| *reference))
+                }
+                crate::execution::LaunchOutcome::AwaitingEvidence => {
+                    locked.commit("provider_create_unknown").await?;
+                    return Ok(true);
+                }
+                crate::execution::LaunchOutcome::Rejected => {
+                    locked.task.stop(State::Failed, false)?;
+                    locked.commit("provider_create_rejected_or_unsent").await?;
+                    return Ok(true);
+                }
+            };
             locked.task.attempt_identity = attempt_identity;
             let now = locked.refresh_clock().await?;
-            if locked.task.expire(now)? {
+            if locked.task.expire(now)? || locked.task.state != State::Launching {
                 // Resource identity is still recovered by name during stopping.
                 locked.commit("launch_expired").await?;
                 return Ok(true);
@@ -480,34 +577,54 @@ impl Reconciler {
             locked.commit("launched").await?;
             return Ok(true);
         }
-        let handle = locked
+        let Some((current, (observed, readback, checkpoint))) = self
+            .readback(locked, |task| async move {
+                let handle = task
+                    .execution
+                    .as_ref()
+                    .context("missing execution handle")?;
+                let observed = self.kubernetes.observe(handle).await?;
+                let mut readback = None;
+                let mut checkpoint = None;
+                if !matches!(observed, Observation::Failed | Observation::Gone) {
+                    let complete = observed == Observation::Succeeded
+                        || task.spec.profile.backend == Backend::AgentSandbox;
+                    if complete {
+                        readback = self.artifacts.receipt(&task).await?;
+                    }
+                    if readback.is_none() {
+                        checkpoint = self.artifacts.checkpoint(&task).await?;
+                    }
+                }
+                Ok((observed, readback, checkpoint))
+            })
+            .await?
+        else {
+            return Ok(true);
+        };
+        locked = current;
+        let mut lease = locked
             .task
-            .execution
+            .lease
             .as_ref()
-            .context("missing execution handle")?;
-        let observed = self.kubernetes.observe(handle).await?;
+            .context("execution readback lost its lease")?
+            .clone();
         match observed {
             Observation::Failed | Observation::Gone => locked.task.stop(State::Failed, true)?,
             Observation::Succeeded | Observation::Running | Observation::Pending => {
-                // A ready Sandbox still requires a worker terminal receipt.
-                // Scientific Jobs additionally require Kubernetes completion.
-                let complete = observed == Observation::Succeeded
-                    || locked.task.spec.profile.backend == Backend::AgentSandbox;
-                if complete {
-                    if let Some(readback) = self.artifacts.receipt(&locked.task).await? {
-                        if let Some(science) = &readback.campaign {
-                            self.ledger
-                                .validate_campaign_result(&locked.task, science)
-                                .await?;
-                        }
-                        let now = locked.refresh_clock().await?;
-                        if !locked.task.expire(now)? {
-                            locked.task.stage_result(&lease, now, readback.receipt)?;
-                        }
+                if let Some(readback) = readback {
+                    if let Some(science) = &readback.campaign {
+                        self.ledger
+                            .validate_campaign_result(&locked.task, science)
+                            .await?;
+                    }
+                    let now = locked.refresh_clock().await?;
+                    if !locked.task.expire(now)? {
+                        locked.task.stage_result(&lease, now, readback.receipt)?;
                     }
                 }
                 if locked.task.state == State::Running {
-                    if let Some(checkpoint) = self.artifacts.checkpoint(&locked.task).await? {
+                    if let Some(checkpoint) = checkpoint {
                         let now = locked.refresh_clock().await?;
                         if !locked.task.expire(now)? {
                             locked.task.stage_checkpoint(&lease, now, checkpoint)?;
@@ -575,6 +692,32 @@ mod tests {
         hft_research_worker_contracts::task::TaskKind,
         hft_research_worker_contracts::task::TaskSpec,
     };
+
+    #[tokio::test]
+    async fn lost_readback_revision_drops_inflight_io() -> Result<()> {
+        struct Inflight(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Inflight {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Inflight(dropped.clone());
+        let read = async move {
+            let _guard = guard;
+            std::future::pending::<Result<()>>().await
+        };
+        let mut revision = 1_u64;
+        let result =
+            readback_with_heartbeats(&mut revision, read, Duration::from_millis(5), |_| {
+                Box::pin(async { Ok(None) })
+            })
+            .await?;
+        assert!(result.is_none());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(revision, 1);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn prepared_receipt_verifies_each_key_even_when_digests_match() -> Result<()> {
@@ -690,6 +833,7 @@ mod tests {
                     let received = received.clone();
                     async move {
                         *received.lock().unwrap().entry(key.clone()).or_default() += 1;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
                         match objects.get(&key) {
                             Some(bytes) => (reqwest::StatusCode::OK, bytes.clone()),
                             None => (reqwest::StatusCode::NOT_FOUND, Vec::new()),
@@ -707,12 +851,34 @@ mod tests {
             base,
             token: "fixture".into(),
         };
-        let result = gateway.receipt(&task).await;
+        let mut heartbeat_task = task.clone();
+        let pulses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pulse_count = pulses.clone();
+        let result = readback_with_heartbeats(
+            &mut heartbeat_task,
+            gateway.receipt(&task),
+            Duration::from_millis(50),
+            move |mut expected| {
+                let pulse_count = pulse_count.clone();
+                Box::pin(async move {
+                    pulse_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let lease = expected
+                        .lease
+                        .as_mut()
+                        .context("fixture task lacks lease")?;
+                    lease.expires_ms += 1000;
+                    Ok(Some(expected))
+                })
+            },
+        )
+        .await;
         server.abort();
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("artifact readback rejected"));
+        assert!(pulses.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(heartbeat_task.lease.unwrap().expires_ms > lease.expires_ms);
         assert_eq!(requests.lock().unwrap().get(&block_key), Some(&1));
         Ok(())
     }

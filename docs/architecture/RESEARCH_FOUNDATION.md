@@ -29,7 +29,7 @@ flowchart LR
   CH -->|版本化只读 block| JOB
 ```
 
-实线已有 Rust 实现或明确的外部存储接口；Session transport、原生治理导入器、OSS gateway 的生产部署、现有科学 worker 的新输入适配和灰度启用仍待接入。图没有把这些外部接口画成已部署资源。
+实线表示已有 Rust 实现或明确的外部存储接口。Session stdio transport、原生签名导入、Campaign typed inputs 和终态桥接已有代码；云端部署、权限、provider 验收和灰度启用仍需独立证据。图不表示这些资源已部署。
 
 | 负载 | 安放判断 | 当前启用条件 |
 |---|---|---|
@@ -71,7 +71,7 @@ flowchart LR
 
 Run 是固定科学调用：Experiment、BuildArtifact、配置摘要、命令、数据 manifest、seed、evaluator、evaluation protocol、fit identity。Run 同时验证其源码和镜像与引用的 Build 一致。Task 必须引用已注册 Run；同一 Run 最多一个计算 Task，Attempt 只重试原请求，不能变更产物或参数。多个参数 Run 可以引用同一 Build。
 
-计算 Pod 直接调用 `/usr/local/bin/<已发布二进制>`；PG Run admission 拒绝 `cargo` 或任意 shell 作为直接入口。reconciler 每次 launch（包括 retry）读取已注册 Build，并从受控 artifact gateway 流式核验二进制大小/摘要，再检查租期、截止时间和撤销状态。缺失或错误产物不能触发 launch。OCI digest 与内含二进制的绑定来自独立的 trusted release verifier；通用 Agent API 无权出具这个证明。
+计算 Pod 直接调用 `/usr/local/bin/<已发布二进制>`；PG Run admission 拒绝 `cargo` 或任意 shell 作为直接入口。reconciler 每次 launch（包括 retry）读取已注册 Build，并从只读 OSS BuildReader 流式核验二进制大小/摘要，再检查租期、截止时间和撤销状态。缺失或错误产物不能触发 launch。OCI digest 与内含二进制的绑定来自独立的 trusted release verifier；通用 Agent API 无权出具这个证明。
 
 `.github/scripts/build-research-release.sh` 使用精确 `-p` / `--bin` / `--features`，没有默认 `--workspace` / `--all-features`。一份产品清单绑定已有 runner 与 Campaign controller。controller 资产单改时只构建产品清单所需的四个程序，并验证其 source、依赖和 OCI 可执行字节。发行工具 `research-release-capability` 与 `research-release-publisher` 由 `build-research-release-tools.sh` 根据独立 recipe 构建，存入 release-tools artifact；它们不进入 controller OCI。发布工作流下载前验证 producer、source、recipe 与实际可执行字节身份。不同科学变异的 BuildSpec 可以缩小到实际科学 crate/binary。Cargo 依赖图重建受影响 crate，链接仍有成本。本分支没有编译耗时基准，不承诺加速倍数。
 
@@ -85,7 +85,7 @@ Build 的生产写入只走 `research-release-publisher oss-import SOURCE_ROOT B
 
 只读 `scope-plan ROOT SOURCE SOFTWARE_RUN SOFTWARE_PRODUCTS PRODUCT POLICY` 在 publisher/STSes 存在前从已完成的真实 compiler producer 计算精确 source/Build prefixes，作为独立 RAM 审批材料。实际 CI issuance 仍验证当前 main/三 gate/active publisher、实际 OCI 字节，签名前后独立读回。IAM、PG 安装和 ACK 可信挂载仍需具体部署批准及真实负测；没有自动新 Build 的 RSI 授权更新者。
 
-生产构建调度、变异 workspace 的源码归档上传、原生发布 verifier 出具此签名，以及 release 向 PG 的自动投影仍待接入。现有 CI bundle 能构建一次并被 smoke/发布复用；新 PG 合同能让多个 Run/Attempt 复用已导入的同一产物。不能据此声称已有自动 Agent 变异 → Build → 科学执行闭环。
+固定产品的 CI producer、release 签名、发布回读与受独立审批约束的 PG Build importer 已有实现。CI bundle 能构建一次并被 smoke/发布复用；多个 Run/Attempt 能复用已导入的同一产物。任意 Agent 代码变异的自动授权更新和生产闭环未由这些代码或本次验证证明。
 
 ## 数据：CH 数值准备、版本化出口、bounded 共享
 
@@ -113,21 +113,25 @@ Build 的生产写入只走 `research-release-publisher oss-import SOURCE_ROOT B
 
 该链目前是 bounded pilot：100,000 行、128 MiB Parquet、64 staging tables/target partitions。它仅接受录制边界严格相接的来源；一般连续文件的时间与序列边界、跨 session/gap 标记仍需生产合同。不能据此宣称已导入滚动一月、全部资产或完整交易所深度。原始 OSS 继续现有 30 天生命周期，不补缺口或延长保留；实验与模型审计记录独立保留。
 
-原有 CPU MLP trainer 已能直接消费 `SharedInput` 的 Train exit；`train-contract-model --prepared-view VIEW --prepared-root ROOT` 通过固定 training request 绑定整个 published view、SQL/列顺序、标的、horizon 与 cutoff。缓存准入后不生成 JSON rows spool，也不重复哈希输入；availability/maturity 向上取整至 native 毫秒时钟，窗口边界不可无声取整。仍使用既有 Burn 算法、优化限制、purge/embargo 与 fit-only diagnostics。科学 CLI 的 Run/config 下载和最终 manifest 写入、normalized ingestion 到 research preparation tables 的版本化投影、原生 evaluation/Campaign settlement 投影仍未完成。prepare、tiny fixture 或转换回执均不是训练或终态科学成果。
+原有 CPU MLP trainer 已能直接消费 `SharedInput` 的 Train exit；`train-contract-model --prepared-view VIEW --prepared-root ROOT` 通过固定 training request 绑定整个 published view、SQL/列顺序、标的、horizon 与 cutoff。缓存准入后不生成 JSON rows spool，也不重复哈希输入；availability/maturity 向上取整至 native 毫秒时钟，窗口边界不可无声取整。仍使用既有 Burn 算法、优化限制、purge/embargo 与 fit-only diagnostics。原生 Campaign 的固定 Run/config、typed input 绑定、结果归档与独立 terminal observer 已有实现；normalized ingestion 到 research preparation tables 的生产投影和真实科学运行仍需验收。prepare、tiny fixture 或转换回执均不是训练或终态科学成果。
 
 ## PG 单权威、任务和终态
 
-`sql/postgres.sql` 是离线迁移，安装后 authority 为 `paused`、backend 为 disabled。连接服务不会迁移或启用。提交必须具有旧 writer 停止证明和迁移回读证明；新任务/结果不存在 DuckDB fallback。旧 CEX DuckDB 科学实现仍存在，是待迁移的旧入口，不能与新 PG authority 双活。
+`sql/postgres.sql` 是离线迁移，安装后 authority 为 `paused`、backend 为 disabled。连接服务不会迁移或启用。提交必须具有旧 writer 停止证明和迁移回读证明；新任务/结果不存在 DuckDB fallback。代码已分离两个写者职责：旧 CEX DuckDB ledger 保留原生 grant、family/study 预算预留和追加审计；执行权完成 transfer 后，PG 独占该 Task 的 Attempt、lease/fence、provider 生命周期和结果事务。二者不能同时执行同一个 reservation。
 
-trusted native governance verifier 必须预先导入 exact TaskSpec 的科学 grant、预算/资源 reservation 和 release-admission receipts。服务与 Agent 没有 issuance/revocation 写权限。当前只实现投影合同与读取校验，尚未接入原生签名/grant verifier、预算扣账或 closed-family evaluator。Holdout 在通用 submit 中始终拒绝。SHA 引用本身不等于已验证签名或已扣预算。
+原生 producer 已实现这条代码路径：先验证 grant、预算 reservation、实际 Build/data 和固定 TaskSpec，再追加 `PlatformTransferred`，最后发布并读回签名 admission。`platform_transfer.rs`、`platform_budget.rs` 和 ledger state guards 拒绝已转移 reservation 被旧 dispatcher 再次 claim，也拒绝旧 `AttemptSettled` 绕过独立平台结算。转移或 PG 导入失败不会退还原生预算。PG 的 `NativeAdmissionTrust::verify` 校验 Ed25519 和完整 evidence；独立 importer 投影 admission、typed Campaign inputs 和撤销事实。reconciler、worker 和通用 Agent 没有签发或撤销权限。
+
+独立 terminal observer 已实现 PG 终态、原 Job/Pod、controlled identity、native result 和归档的回读路径；验证通过后生成 source ledger 的 platform terminal audit，并可发布签名 terminal witness 供机械 retirement 消费。该桥接保留原预算扣账，不因 PG 终态或清理自动 refund。Holdout 仍由独立 closed-family evaluator 的原生合同控制，通用 submit 始终拒绝。签名、SHA 引用和成功导入各自只证明对应边界，不能替代真实科学运行。
+
+这些是 Code 能力；本次没有安装生产 migration、授予角色、证明旧 writer 静默或启用 PG/backend。删除旧执行入口仍需实际迁移、旧队列/lease drain、恢复和独立读回证据；本变更不宣称该退役已完成。
 
 claim 使用 PG 事务、行锁、revision/fence 和全局 quota。Launching、Running 和 Stopping 都占用并发额度。资源过期后，额度仍保留到进程停止得到确认。
 
-控制器先提交 durable claim，再调用 provider。重连时读取同名资源，并核对 UID、标签和完整 annotations。超时不能产生另一个 resource identity。首次 claim 确定总截止时间，retry 和 queued retry 都不能重置它。
+控制器先提交 claim 和每个预期资源的创建记录。首次 claim 确定总截止时间，retry 和 queued retry 都不能重置它。Build、artifact 和 provider 只读 I/O 从已提交的 revision snapshot 开始，在事务外执行；重新取得当前 revision、lease/deadline、authority 和撤销状态后才能应用结果。
 
-当前认领使用短事务，provider reconciliation 仍持有 task/global authority 锁。这会串行化 I/O，是明确的吞吐限制。扩容前需要实现基于 revision 的 outbox reconciliation。
+普通 reconciler 的 provider POST/DELETE 也不持 PG 行锁。`provider_create_operations.sql` 在 POST 前持久化原 task/attempt/fence、资源名和 request SHA；Job/Sandbox 保存原始无秘密 body，Secret 只保存 metadata 与 data 摘要。唯一 FirstSend 由短事务验证后发放；随后取消可立即进入 Stopping，已发放请求仍按 Pending 保留配额。恢复只 GET 原资源，不重 POST，不用 heartbeat 后的 lease 重造原 hash。匹配原 body 的 UID 必须提交后才 DELETE。未知创建的一次 404 不能确认停止；SQL guard 拒绝在任何预期 create 未解决时落终态或重新排队。K8s 的相对 activeDeadlineSeconds 不能证明精确墙钟截止；PG/native 准入与发布检查、实际进程停止读回是不同证据。本变更不声称迟到 worker 无法开始计算。详见 [readback 与创建事务](../agents/research-readback-transactions.md)。
 
-取消/超时/重试经过 Stopping。provider foreground delete 绑定 UID，资源不存在且对应 task/attempt/fence 的 Pod 列表为空后才能确认 process-tree stop。TTL、Job 消失或 Session turn interrupt 不是科学 cancel 成功。receipt 必须绑定 task、attempt、fence、输入、source、image、fit，实际 artifacts 和 checkpoint 经独立字节验证；只有停止确认后 PG 才落终态 result，Prepare 同事务发布 view。checkpoint 对当前 attempt 单调，retry 保留已验证 checkpoint，旧 fence 和晚到结果拒绝。
+取消/超时/重试经过 Stopping。provider foreground delete 绑定 UID。每个 create 先有已确认的未发送、拒绝或原 UID 证据；随后资源不存在且对应 task/attempt/fence 的 Pod 列表为空，才可确认 process-tree stop。已自然终止的保留 Job 走独立的全进程终止校验。TTL、Job 消失或 Session turn interrupt 不是科学 cancel 成功。receipt 必须绑定 task、attempt、fence、输入、source、image、fit，实际 artifacts 和 checkpoint 经独立字节验证；只有停止确认后 PG 才落终态 result，Prepare 同事务发布 view。checkpoint 对当前 attempt 单调，retry 保留已验证 checkpoint，旧 fence 和晚到结果拒绝。
 
 receipt 中每个 artifact key 都要回读。同摘要与大小不能替代另一个 key 的验证。DataView 仅通过 reconciler 的 receipt 回读和停止确认发布；CLI 没有直接登记 manifest 的入口。
 
@@ -196,18 +200,18 @@ Source observer 的真实发表/readback、云 provider 验收和生产启用仍
 
 新服务直接依赖 SQLx core/PostgreSQL driver；不解析未用 MySQL/RSA/SQLite 驱动，也未新增 audit ignore。
 
-本地验证：platform 数据/生命周期/Build/API/RPC 合同，shared typed replay 的 backtest owning tests，strict Clippy、fmt、selector/native CI evidence/release/source readback/workflow 合同。PG 和 CH daemon 未在 Mac 安装，真实 SQL/RowBinary/事务测试在 disposable CI services 执行；它们不是真实研究或云端 acceptance。精确本地命令、commit 和 CI 结果见 PR Validation。
+本地验证：platform 数据/生命周期/Build/API/RPC 合同，shared typed replay 的 backtest owning tests，strict Clippy、fmt、selector/native CI evidence/release/source readback/workflow 合同。PG 事务、角色和创建/取消竞争已在本地一次性 PostgreSQL 容器验证；CH RowBinary/事务仍使用其独立 fixture。它们不是真实研究或云端 acceptance。精确本地命令、commit 和 CI 结果见 PR Validation。
 
 最小真实 vertical slice 的依赖顺序：
 
 1. Tokyo/ACK 基础设施独立 Gate：东京 Pro 资格/价格、ACS 容量、K8s/CRD/runtime 兼容、容器 command/log/取消和 UID 回读。当前东京底座未验收，禁止以本代码代替 Gate。
-2. 专用 PG 角色、paused schema、native grant/预算/签名导入器、旧 writer quiescence 与一次迁移回读；默认保持 paused。
+2. 验收专用 PG 角色、paused schema、新增 provider-create migration 和已有 native grant/预算/签名桥接；完成旧 writer quiescence 与迁移回读，默认保持 paused。旧 active Attempt 缺少 create journal 时按 unknown 保留，不回填为未发送。
 3. 规范化 source receipt 与 persistent CH ingestion/版本 SQL；最小经过批准的数据切片仅准备一个 view，重复请求复用同一逻辑 manifest；CH/OSS 内容独立回读。
 4. Build 的源码归档、scoped 编译、contained binaries/OCI 验证和发布证明投影；两组参数 Run 引用同一 Build，强制基础设施 retry 仍保留同一 Build、总 deadline、fit/checkpoint provenance。
-5. 接入一条真实原生科学 worker 的 typed input、固定 Run/config、native scientific terminal manifest / Campaign settlement；prepare 或退出码 0 不算科学成功。先 CPU Job，验收 stale receipt、取消/retry、controller 重启/幂等及实际 artifact 丢失。
-6. 再接 Coding Agent app-server 的持久 Session、native-state恢复、审批与受控工具/完成 wake；Session turn interrupt 与 Job cancel 分别验证。
-7. 灰度启用：只开放一个 tenant，concurrency=1，使用明确批准的预算。重新读回旧 writer 已停的证明，再启用 PG。旧、新 ledger 不能同时写入。
-8. 回滚：先 pause 新 authority，再 cancel/drain 所有任务。独立证明新进程树全部停止后，以当前恢复/迁移证明恢复旧 authority。保留新 ledger 与 append-only 证据。
+5. 对已有原生科学 worker 桥接执行一条真实 typed input、固定 Run/config、native terminal manifest / Campaign settlement 验收；prepare 或退出码 0 不算科学成功。先 CPU Job，验收 stale receipt、取消/retry、controller 重启/幂等及实际 artifact 丢失。
+6. 再验收已有 Coding Agent app-server transport 的持久 Session、native-state恢复、审批与受控工具/完成 wake；Session turn interrupt 与 Job cancel 分别验证。
+7. 灰度启用：只开放一个 tenant，concurrency=1，使用明确批准的预算。重新读回旧执行 writer 已停的证明，再启用 PG。同一 reservation 不能由旧 dispatcher 与 PG 同时执行；原生预算与追加审计仍由 source ledger 写入。
+8. 回滚：先 pause 新 authority，再 cancel/drain 所有任务。独立证明新进程树全部停止后，以当前恢复/迁移证明恢复旧 authority。已转移 reservation 仍受 transfer guard 约束；恢复服务不能撤销 transfer 或重开旧 Attempt。保留新 ledger 与 append-only 证据。
 
 CI 的私有 ACK 回执等待已由 native jobs 取代。默认分支切换须验证当前 source 的 required checks 和实际发布字节。ACK 资源租期、队列、停止、恢复和 signer 属于独立运行合同。退役这些生产控制前，必须 drain 原队列与 lease，独立证明停止和恢复，并确认旧 receipt 不再被消费。CI 合并或镜像发布不能代替这些运行验收。
 
