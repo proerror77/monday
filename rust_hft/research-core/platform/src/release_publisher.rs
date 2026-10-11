@@ -508,6 +508,15 @@ pub struct ReleaseGateway {
     base: reqwest::Url,
     token: String,
 }
+fn body_read_error(error: anyhow::Error, exceeded: &str, interrupted: &str) -> anyhow::Error {
+    if error.downcast_ref::<crate::transport::BodyReadError>()
+        == Some(&crate::transport::BodyReadError::PayloadLimitExceeded)
+    {
+        anyhow::anyhow!(exceeded.to_owned())
+    } else {
+        anyhow::anyhow!(interrupted.to_owned())
+    }
+}
 impl ReleaseGateway {
     pub fn oss(config: &crate::release_oss::OssConfig, session: &Path) -> Result<Self> {
         let mut transport = Self::new(&config.endpoint, "unused".into())?;
@@ -540,7 +549,13 @@ impl ReleaseGateway {
             .map_err(|_| anyhow::anyhow!("release read unavailable"))?
             .error_for_status()
             .map_err(|_| anyhow::anyhow!("release evidence missing"))?;
-        crate::transport::BoundedBody::new(response, limit)
+        crate::transport::BoundedBody::new(response, limit).map_err(|error| {
+            body_read_error(
+                error,
+                "release readback exceeds bound",
+                "release read interrupted",
+            )
+        })
     }
 
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
@@ -603,11 +618,9 @@ impl ReleaseGateway {
     async fn get_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<T> {
         let mut response = self.get(key, MAX_JSON).await?;
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| anyhow::anyhow!("release read interrupted"))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            body_read_error(error, "proof exceeds bound", "release read interrupted")
+        })? {
             ensure!(
                 bytes.len() + chunk.len() <= MAX_JSON as usize,
                 "proof exceeds bound"
@@ -620,11 +633,13 @@ impl ReleaseGateway {
         let mut response = self.get(&artifact.key, artifact.bytes).await?;
         let mut digest = Sha256::new();
         let mut size = 0;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| anyhow::anyhow!("release readback interrupted"))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            body_read_error(
+                error,
+                "release readback exceeds bound",
+                "release readback interrupted",
+            )
+        })? {
             size += chunk.len() as u64;
             ensure!(size <= artifact.bytes, "release readback exceeds bound");
             digest.update(&chunk);
@@ -2048,6 +2063,34 @@ pub async fn import_oss_build(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[tokio::test]
+    async fn release_readback_distinguishes_missing_overlong_and_interrupted_bodies() -> Result<()>
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (wire,expected) in [
+            (&b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\nmissing!\r\n0\r\n\r\n"[..], "release readback exceeds bound"),
+            (&b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nmissing!"[..], "release readback exceeds bound"),
+            (&b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..], "release evidence missing"),
+            (&b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ncut"[..], "release readback interrupted"),
+        ] {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address=listener.local_addr()?;
+            let server=tokio::spawn(async move {
+                let (mut socket,_)=listener.accept().await.unwrap();
+                let mut request=[0;4096];assert!(socket.read(&mut request).await.unwrap()>0);
+                socket.write_all(wire).await.unwrap();
+            });
+            // Cleartext loopback fixture only. Public constructors still reject HTTP.
+            let gateway=ReleaseGateway {
+                oss:None, client:crate::transport::TlsConfig::default().client(std::time::Duration::from_secs(2),false)?,
+                base:format!("http://{address}/").parse()?,token:"synthetic-reader".into(),
+            };
+            let artifact=Artifact {key:"research/sources/fixture/source.tar".into(),sha256:sha256(b"data"),bytes:4};
+            assert_eq!(gateway.verify(&artifact).await.unwrap_err().to_string(),expected);
+            server.await?;
+        }
+        Ok(())
+    }
     #[test]
     fn github_pagination_preserves_all_streamed_pages_and_rejects_bad_output() {
         let output = b"{\"jobs\":[]}\n{\"jobs\":[{\"id\":567}]}\n";
