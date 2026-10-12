@@ -10,6 +10,7 @@ module ResearchOciDelivery
   REPOSITORIES = {'cex-runner'=>'research-runner', 'controller'=>'campaign-cycle-controller',
                   'prediction-runner'=>'prediction-research-runner'}.freeze
   MAX_BYTES = 1_048_576
+  MAX_COLLECTION_ENTRIES = 10_000
 
   class Reader
     def initialize(repository)
@@ -47,15 +48,32 @@ module ResearchOciDelivery
 
     def api(path, collection = nil)
       args = ['gh', 'api', '--method', 'GET']
-      args += ['--paginate', '--slurp'] if collection
-      result = JSON.parse(command(*args, "repos/#{@repository}/#{path}"))
-      return result unless collection
-      raise 'invalid OCI evidence pages' unless result.is_a?(Array) && !result.empty? &&
-        result.all? { |p| p.is_a?(Hash) && p[collection].is_a?(Array) && p['total_count'].is_a?(Integer) }
-      entries = result.flat_map { |p| p.fetch(collection) }
-      ids = entries.map { |e| e.is_a?(Hash) && e['id'] }
-      raise 'incomplete OCI evidence pages' unless result.all? { |p| p['total_count'] == entries.size } &&
-        ids.all? { |id| id.is_a?(Integer) && id.positive? } && ids.uniq == ids
+      return JSON.parse(command(*args, "repos/#{@repository}/#{path}")) unless collection
+      # Bound each response without truncating retained publication history.
+      # A changing total, short page or duplicate identity rejects the read.
+      entries = []
+      identities = {}
+      total = nil
+      page = 1
+      loop do
+        separator = path.include?('?') ? '&' : '?'
+        result = JSON.parse(command(*args, "repos/#{@repository}/#{path}#{separator}page=#{page}"))
+        raise 'invalid OCI evidence pages' unless result.is_a?(Hash) &&
+          result[collection].is_a?(Array) && result['total_count'].is_a?(Integer) &&
+          result['total_count'].between?(0, MAX_COLLECTION_ENTRIES)
+        total ||= result['total_count']
+        batch = result.fetch(collection)
+        raise 'incomplete OCI evidence pages' unless result['total_count'] == total &&
+          batch.size == [100, total - entries.size].min
+        batch.each do |entry|
+          id = entry.is_a?(Hash) && entry['id']
+          raise 'incomplete OCI evidence pages' unless id.is_a?(Integer) && id.positive? && !identities[id]
+          identities[id] = true
+        end
+        entries.concat(batch)
+        break if entries.size == total
+        page += 1
+      end
       entries
     end
 

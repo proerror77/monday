@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
+require 'rbconfig'
 require_relative 'research-oci-delivery'
 
 class ResearchOciDeliveryTest < Minitest::Test
@@ -18,8 +19,11 @@ class ResearchOciDeliveryTest < Minitest::Test
       return super unless args[0]=='gh'
       path = args.last
       @calls << path
-      value = @responses.fetch(path) { raise "unexpected fixture request" }
+      page = path[/[?&]page=(\d+)\z/, 1]
+      key = page ? path.sub(/[?&]page=\d+\z/, '') : path
+      value = @responses.fetch(key) { raise "unexpected fixture request" }
       raise 'fixture request denied' if value == :failure
+      value = value.fetch(Integer(page)-1) if page && value.is_a?(Array)
       value.is_a?(String) ? value : JSON.generate(value)
     end
   end
@@ -236,6 +240,76 @@ class ResearchOciDeliveryTest < Minitest::Test
 
   def test_duplicate_pagination_ids_and_totals_are_rejected
     @reader.responses[@runs_path] = [{'total_count'=>2,'workflow_runs'=>[@run,@run]}]
+    assert_raises(RuntimeError) { find }
+  end
+
+  def test_large_history_is_complete_across_bounded_responses
+    pages = Array.new(2) do |page|
+      {'total_count'=>200,'workflow_runs'=>Array.new(100) do |index|
+        {'id'=>page*100+index+1,'unused_metadata'=>'x'*50_000}
+      end}
+    end
+    assert_operator JSON.generate(pages).bytesize, :>, ResearchOciDelivery::MAX_BYTES*8
+    reader = Class.new(ResearchOciDelivery::Reader) do
+      attr_accessor :page_files
+      def command(*args, **options)
+        return super unless args.first=='gh'
+        page = Integer(args.last[/page=(\d+)\z/,1])
+        super(RbConfig.ruby,'-e','STDOUT.write(File.binread(ARGV.fetch(0)))',page_files.fetch(page-1),**options)
+      end
+    end.new('fixture/repo')
+    reader.page_files=pages.each_with_index.map do |page,index|
+      path=File.join(@dir,"large-page-#{index}.json")
+      File.write(path,JSON.generate(page)); path
+    end
+    entries=reader.api('actions/workflows/acr-publish.yml/runs?per_page=100','workflow_runs')
+    assert_equal (1..200).to_a,entries.map { |entry| entry['id'] }
+    assert entries.all? { |entry| entry['unused_metadata'].size==50_000 }
+    pages.first['workflow_runs'].first['unused_metadata']='x'*(ResearchOciDelivery::MAX_BYTES*8)
+    File.write(reader.page_files.first,JSON.generate(pages.first))
+    error=assert_raises(RuntimeError) do
+      reader.api('actions/workflows/acr-publish.yml/runs?per_page=100','workflow_runs')
+    end
+    assert_equal 'OCI evidence response too large',error.message
+  end
+
+  def test_later_page_failure_total_drift_short_page_and_duplicates_reject_history
+    first={'total_count'=>101,'workflow_runs'=>Array.new(100) { |i| {'id'=>i+1} }}
+    last={'total_count'=>101,'workflow_runs'=>[{'id'=>101}]}
+    @reader.responses[@runs_path]=[first,last]
+    assert_equal 101,@reader.api(@runs_path.sub('repos/fixture/repo/',''),'workflow_runs').size
+    [last.merge('total_count'=>102),last.merge('workflow_runs'=>[]),
+     last.merge('workflow_runs'=>[{'id'=>1}])].each do |bad|
+      @reader.responses[@runs_path]=[first,bad]
+      assert_raises(RuntimeError) { @reader.api(@runs_path.sub('repos/fixture/repo/',''),'workflow_runs') }
+    end
+    @reader.responses[@runs_path]=[first,'not-json']
+    assert_raises(JSON::ParserError) { @reader.api(@runs_path.sub('repos/fixture/repo/',''),'workflow_runs') }
+    @reader.responses[@runs_path]=[first]
+    assert_raises(IndexError) { @reader.api(@runs_path.sub('repos/fixture/repo/',''),'workflow_runs') }
+  end
+
+  def test_archive_consumption_before_anchor_on_last_page_is_retained
+    archive_history
+    history=(1..205).map do |ordinal|
+      @run.merge('id'=>1000+ordinal,'run_number'=>ordinal,'head_sha'=>'b'*40,
+                 'status'=>'completed','conclusion'=>'success','created_at'=>'2026-10-11T00:50:00Z')
+    end
+    history[0]['head_sha']=SOURCE
+    history[-1].merge!('head_sha'=>SOURCE,'status'=>'in_progress','conclusion'=>nil)
+    ENV['GITHUB_RUN_ID']='1205'; ENV['GITHUB_RUN_NUMBER']='205'
+    ENV['MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY']=JSON.generate(
+      'history_anchor_run_id'=>1203,'history_anchor_run_number'=>203,'not_before'=>1791680000)
+    @reader.responses[@history_path]=history.reverse.each_slice(100).map do |page|
+      {'total_count'=>history.size,'workflow_runs'=>page}
+    end
+    @reader.responses['repos/fixture/repo/actions/runs/1001/attempts/1/jobs?per_page=100']=[{
+      'total_count'=>1,'jobs'=>[@job.merge('run_id'=>1001,'name'=>'Publish research-runner')]}]
+    assert @reader.archive_started?(SOURCE,'cex-runner')
+  end
+
+  def test_unbounded_total_is_not_clipped_to_a_safe_empty_history
+    @reader.responses[@runs_path]=[{'total_count'=>ResearchOciDelivery::MAX_COLLECTION_ENTRIES+1,'workflow_runs'=>[]}]
     assert_raises(RuntimeError) { find }
   end
 
