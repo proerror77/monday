@@ -49,6 +49,9 @@ struct Args {
     /// Exact reference triplets already bound by USD-M materialization.
     #[arg(long)]
     reference: Vec<PathBuf>,
+    /// Select one verified PIT recovery series before any fit; gaps remain rejected.
+    #[arg(long)]
+    pit_series_id: Option<u64>,
     /// Digest from the external artifact/Build; this diagnostic cannot authenticate it.
     #[arg(long)]
     executable_sha256: String,
@@ -129,10 +132,11 @@ fn run(a: Args, cycle: bool) -> Result<()> {
                 .context("PIT input requires --materialization-sha256")?,
             &a.reference,
             &spec.protocol,
+            a.pit_series_id,
         )?;
         (rows, Some(receipt))
     } else {
-        if a.materialization.is_some() || !a.reference.is_empty() {
+        if a.materialization.is_some() || !a.reference.is_empty() || a.pit_series_id.is_some() {
             bail!("materialization/reference options require PIT input");
         }
         (

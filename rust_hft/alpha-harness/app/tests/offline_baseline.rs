@@ -86,6 +86,91 @@ fn pit_cli_requires_bound_materialization_before_any_fit() {
 }
 
 #[test]
+fn predeclared_short_segment_cycle_runs_six_fits_without_opening_the_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("synthetic-short-segment");
+    assert!(
+        cli(&["synthetic-fixture", "--output", fixture.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let input = fixture.join("synthetic-rows.json");
+    let spec = fixture.join("synthetic-spec.json");
+    let mut rows: Value = serde_json::from_slice(&fs::read(&input).unwrap()).unwrap();
+    rows.as_array_mut().unwrap().truncate(235);
+    for row in rows.as_array_mut().unwrap() {
+        row["features"]["book_imbalance_top5"] = row["features"]["book_imbalance"].clone();
+        row["fee_bps"] = 5.0.into();
+    }
+    fs::write(&input, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let mut configuration: Value = serde_json::from_slice(&fs::read(&spec).unwrap()).unwrap();
+    configuration["protocol"]["walk_forward"]["initial_train_rows"] = 50.into();
+    configuration["protocol"]["walk_forward"]["validation_rows"] = 30.into();
+    configuration["protocol"]["walk_forward"]["fold_count"] = 2.into();
+    configuration["protocol"]["walk_forward"]["sealed_holdout_rows"] = 20.into();
+    configuration["protocol"]["costs"]["fee_bps"] = 5.0.into();
+    configuration["protocol"]["costs"]["slippage_bps"] = 2.0.into();
+    configuration["evaluator"]["multiple_testing_trials"] = 2.into();
+    fs::write(&spec, serde_json::to_vec(&configuration).unwrap()).unwrap();
+    let output = dir.path().join("short-cycle");
+    let result = run_command(
+        "cycle",
+        &input,
+        &spec,
+        &output,
+        &digest(&fs::read(&input).unwrap()),
+        "synthetic",
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&fs::read(output.join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["fit_count"], 6);
+    assert_eq!(report["automatic_iterations"], 1);
+    assert_eq!(
+        report["baseline"]["folds"][0]["partition"]["validation"],
+        serde_json::json!({"start":55,"end":85})
+    );
+    assert_eq!(
+        report["successor"]["report"]["folds"][0]["partition"]["validation"],
+        serde_json::json!({"start":130,"end":160})
+    );
+    assert_eq!(
+        report["baseline"]["protocol"]["walk_forward"]["sealed_holdout_rows"],
+        20
+    );
+    assert_eq!(report["statistical_strategy_acceptance"], false);
+    let original_report = fs::read(output.join("report.json")).unwrap();
+    for row in rows.as_array_mut().unwrap().iter_mut().skip(215) {
+        row["label"] = (-99.0).into();
+        row["features"]["book_imbalance"] = 500.0.into();
+        row["features"]["book_imbalance_top5"] = (-500.0).into();
+    }
+    fs::write(&input, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let poisoned_output = dir.path().join("poisoned-sealed-tail");
+    let poisoned = run_command(
+        "cycle",
+        &input,
+        &spec,
+        &poisoned_output,
+        &digest(&fs::read(&input).unwrap()),
+        "synthetic",
+    );
+    assert!(
+        poisoned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&poisoned.stderr)
+    );
+    assert_eq!(
+        fs::read(poisoned_output.join("report.json")).unwrap(),
+        original_report
+    );
+}
+
+#[test]
 fn offline_cycle_preserves_lineage_reproducibility_budget_and_history_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = dir.path().join("explicit-synthetic-cycle");

@@ -23,6 +23,17 @@ pub struct DiagnosticPitReceipt {
     pub reference_data_sha256: Vec<String>,
     pub funding_method: &'static str,
     pub compute_authority_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_series: Option<DiagnosticSeriesSelection>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiagnosticSeriesSelection {
+    pub original_series_id: u64,
+    pub original_input_rows: usize,
+    pub selected_rows: usize,
+    pub original_row_range: std::ops::Range<usize>,
+    pub original_rows_sha256: String,
 }
 
 /// Convert the byte-bound PIT artifact, retaining its original clocks and labels.
@@ -34,6 +45,7 @@ pub fn load_pit_rows(
     materialization_sha256: &str,
     references: &[PathBuf],
     protocol: &EvaluationProtocolV1,
+    selected_series_id: Option<u64>,
 ) -> Result<(Vec<ResearchRow>, DiagnosticPitReceipt)> {
     let feature_bytes = read_bounded(feature, 32 * 1024 * 1024)?;
     let materialization_bytes = read_bounded(materialization, 1024 * 1024)?;
@@ -83,6 +95,7 @@ pub fn load_pit_rows(
         protocol.costs.funding_bps == 0.0,
         "PIT diagnostic currently supports verified no-settlement intervals only"
     );
+    let (rows, selected_series) = select_series(rows, selected_series_id)?;
     let mut reference_hashes = Vec::new();
     let funding_method = match m.market.as_str() {
         "spot" => {
@@ -155,8 +168,41 @@ pub fn load_pit_rows(
         reference_data_sha256: reference_hashes,
         funding_method,
         compute_authority_verified: false,
+        selected_series,
     };
     Ok((rows, receipt))
+}
+
+fn select_series(
+    mut rows: Vec<ResearchRow>,
+    selected: Option<u64>,
+) -> Result<(Vec<ResearchRow>, Option<DiagnosticSeriesSelection>)> {
+    let Some(id) = selected else {
+        return Ok((rows, None));
+    };
+    ensure!(id > 0, "PIT series id must be positive");
+    let first = rows
+        .iter()
+        .position(|row| row.series_id == id)
+        .context("requested PIT series is absent")?;
+    let end = rows.iter().rposition(|row| row.series_id == id).unwrap() + 1;
+    ensure!(
+        rows[first..end].iter().all(|row| row.series_id == id),
+        "PIT series selection cannot bridge another series"
+    );
+    let receipt = DiagnosticSeriesSelection {
+        original_series_id: id,
+        original_input_rows: rows.len(),
+        selected_rows: end - first,
+        original_row_range: first..end,
+        original_rows_sha256: digest(&serde_json::to_vec(&rows[first..end])?),
+    };
+    rows = rows[first..end].to_vec();
+    // A new single-series view has local id1. Preserve original identity in its receipt.
+    for row in &mut rows {
+        row.series_id = 1;
+    }
+    Ok((rows, Some(receipt)))
 }
 
 #[derive(Deserialize)]
@@ -286,6 +332,7 @@ mod tests {
                 materialization_hash,
                 &[],
                 &protocol(),
+                None,
             )
         };
         let (rows, receipt) = load(&input_hash, &materialization_hash).unwrap();
@@ -315,6 +362,7 @@ mod tests {
             &digest(&std::fs::read(&fixture.materialization_path).unwrap()),
             &[],
             &protocol(),
+            None,
         );
         assert!(result
             .unwrap_err()
@@ -332,6 +380,7 @@ mod tests {
             &digest(&std::fs::read(&fixture.materialization_path).unwrap()),
             &[],
             &protocol(),
+            None,
         )
         .unwrap();
         let row = rows[0].clone();
@@ -365,5 +414,47 @@ mod tests {
         let mut later = row;
         later.available_time += TimeDelta::seconds(2);
         assert!(verify_no_settlement(&[later], &[mark]).is_ok());
+    }
+
+    #[test]
+    fn explicit_series_selection_preserves_original_identity_and_never_joins_segments() {
+        let fixture = Fixture::spot(300);
+        let (first, _) = load_pit_rows(
+            &fixture.feature_path,
+            &digest(&std::fs::read(&fixture.feature_path).unwrap()),
+            &fixture.materialization_path,
+            &digest(&std::fs::read(&fixture.materialization_path).unwrap()),
+            &[],
+            &protocol(),
+            None,
+        )
+        .unwrap();
+        let mut second = first.clone();
+        for row in &mut second {
+            row.series_id = 2;
+            row.available_time += TimeDelta::seconds(400);
+            row.label_available_time += TimeDelta::seconds(400);
+        }
+        let mut original = first;
+        original.extend(second.clone());
+        let (selected, receipt) = select_series(original.clone(), Some(2)).unwrap();
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt.original_series_id, 2);
+        assert_eq!(receipt.original_input_rows, 600);
+        assert_eq!(receipt.original_row_range, 300..600);
+        assert_eq!(
+            receipt.original_rows_sha256,
+            digest(&serde_json::to_vec(&second).unwrap())
+        );
+        for (actual, expected) in selected.iter().zip(second) {
+            assert_eq!(actual.series_id, 1);
+            assert_eq!(actual.available_time, expected.available_time);
+            assert_eq!(actual.label_available_time, expected.label_available_time);
+            assert_eq!(actual.features, expected.features);
+            assert_eq!(actual.label, expected.label);
+        }
+        assert!(select_series(original.clone(), Some(3)).is_err());
+        original[350].series_id = 1;
+        assert!(select_series(original, Some(2)).is_err());
     }
 }
