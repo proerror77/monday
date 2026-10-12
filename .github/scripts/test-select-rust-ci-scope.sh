@@ -31,6 +31,8 @@ run_case() {
 printf '%s\n' package-lock.json >"$tmp_dir/root-node.txt"
 printf '%s\n' .github/workflows/security.yml >"$tmp_dir/unknown-workflow.txt"
 printf '%s\n' .github/workflows/security-enabled.yml >"$tmp_dir/security-workflow.txt"
+printf '%s\n' .github/scripts/cargo-audit-summary.sh >"$tmp_dir/audit-summary.txt"
+printf '%s\n' .github/scripts/test-cargo-audit-summary.sh >"$tmp_dir/audit-summary-tests.txt"
 printf '%s\n' .github/scripts/run-prediction-platform-smoke.sh >"$tmp_dir/platform-smoke-runner.txt"
 printf '%s\n' .github/scripts/run-prediction-market-data-contracts.sh >"$tmp_dir/market-data-runner.txt"
 printf '%s\n' .github/scripts/run-prediction-research-contracts.sh >"$tmp_dir/research-runner.txt"
@@ -725,6 +727,8 @@ job_cases=(
   'root-node|pull_request|root-node.txt|ci/node-install'
   'security-workflow|pull_request|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'security-workflow-push|push|security-workflow.txt|ci/ci-contracts,ploy/workflow-lint'
+  'audit-summary|pull_request|audit-summary.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
+  'audit-summary-tests|pull_request|audit-summary-tests.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene'
   'control-scheduling|pull_request|control-scheduling.txt|ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans'
   'ci-owner-cache|pull_request|ci-owner-cache.txt|ci/rust,ci/ci-contracts,ploy/workflow-lint,ploy/commit-hygiene,ploy/safety-scans,ci/deployment-artifacts'
   'ci-owner-cache-test|pull_request|ci-owner-cache-test.txt|ci/ci-contracts,ploy/workflow-lint'
@@ -1166,6 +1170,8 @@ all_security_jobs='security/sast-semgrep,security/cargo-audit,security/secret-pr
 assert_security_jobs "$tmp_dir/docs.out" 'security/secret-detection'
 assert_security_jobs "$tmp_dir/security-workflow.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/security-workflow-push.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/audit-summary.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
+assert_security_jobs "$tmp_dir/audit-summary-tests.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/root-node.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/unknown-nested.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
 assert_security_jobs "$tmp_dir/lob-control.out" 'security/sast-semgrep,security/secret-presence,security/secret-detection'
