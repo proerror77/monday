@@ -30,6 +30,11 @@ on:
         required: true
         default: false
         type: boolean
+      build_only:
+        description: Build CEX binaries and release tools without image or signed publication
+        required: true
+        default: false
+        type: boolean
       source_test_source_sha:
         description: Exact source commit for a non-production Cargo source-test image
         required: false
@@ -81,6 +86,28 @@ jobs:
         with:
           ref: refs/heads/main
           fetch-depth: 0
+
+      - name: Validate build-only preparation
+        id: build-mode
+        env:
+          BUILD_ONLY: ${{ inputs.build_only }}
+          EVENT_NAME: ${{ github.event_name }}
+          CURRENT_REF: ${{ github.ref }}
+          TARGET: ${{ inputs.target }}
+          REBUILD: ${{ inputs.rebuild_research_runner }}
+        run: |
+          set -euo pipefail
+          case "${BUILD_ONLY:-}" in
+            true)
+              [[ "$EVENT_NAME" == workflow_dispatch && "$CURRENT_REF" == refs/heads/main &&
+                 "$TARGET" == research-runner && "$REBUILD" == true ]] || {
+                echo 'Build-only preparation requires main, research-runner and explicit rebuild' >&2
+                exit 2
+              }
+              ;;
+            false|'') ;;
+            *) echo 'Invalid build-only input' >&2; exit 2 ;;
+          esac
 
       - name: Read original CI source from Release
         id: release-source
@@ -180,7 +207,7 @@ jobs:
           bash .github/scripts/select-acr-image-matrix.sh
 
   ordinary-selector:
-    if: github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == 'hft-trading' || inputs.target == 'binance-lob-archiver' || inputs.target == 'polymarket-raw-ops' || inputs.target == 'polymarket-evidence-compiler' || inputs.target == 'polymarket-market-recorder')
+    if: inputs.build_only != true && github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == 'hft-trading' || inputs.target == 'binance-lob-archiver' || inputs.target == 'polymarket-raw-ops' || inputs.target == 'polymarket-evidence-compiler' || inputs.target == 'polymarket-market-recorder')
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.ordinary_matrix }}
@@ -211,7 +238,7 @@ jobs:
 
   research-environments:
     needs: selector
-    if: needs.selector.outputs.research_products != ''
+    if: inputs.build_only != true && needs.selector.outputs.research_products != ''
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -366,7 +393,7 @@ jobs:
       contents: read
       pull-requests: read
     needs: [selector, research-runner-binaries]
-    if: always() && needs.selector.result == 'success' && needs.selector.outputs.research_products != '' && (needs.selector.outputs.research_mode == 'artifact' || needs.research-runner-binaries.result == 'success')
+    if: always() && inputs.build_only != true && needs.selector.result == 'success' && needs.selector.outputs.research_products != '' && (needs.selector.outputs.research_mode == 'artifact' || needs.research-runner-binaries.result == 'success')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -536,7 +563,7 @@ jobs:
       id-token: write
       pull-requests: read
     needs: [selector, research-runner-binaries, research-release-tools, publish-research-images, research-environments]
-    if: always() && needs.selector.result == 'success' && needs.research-environments.result == 'success' && needs.research-environments.outputs.ready == 'true' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'
+    if: always() && inputs.build_only != true && needs.selector.result == 'success' && needs.research-environments.result == 'success' && needs.research-environments.outputs.ready == 'true' && needs.selector.outputs.publish_target != 'none' && needs.selector.outputs.publish_target != 'research-source-test'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -737,7 +764,7 @@ jobs:
       contents: read
       pull-requests: read
     needs: ordinary-selector
-    if: always() && needs.ordinary-selector.result == 'success' && needs.ordinary-selector.outputs.matrix != '{"include":[]}'
+    if: always() && inputs.build_only != true && needs.ordinary-selector.result == 'success' && needs.ordinary-selector.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1282,7 +1309,7 @@ jobs:
   research-release-complete:
     name: Research products published [${{ needs.research-environments.outputs.archive_products }}] (${{ needs.selector.outputs.source_sha }})
     needs: [selector, publish, research-environments]
-    if: always() && needs.selector.result == 'success' && needs.publish.result == 'success' && needs.research-environments.outputs.archive_products != ''
+    if: always() && inputs.build_only != true && needs.selector.result == 'success' && needs.publish.result == 'success' && needs.research-environments.outputs.archive_products != ''
     runs-on: ubuntu-latest
     steps:
       - name: Record verified product publication
@@ -1296,7 +1323,7 @@ jobs:
 
   publish-source-test:
     needs: selector
-    if: needs.selector.outputs.publish_target == 'research-source-test'
+    if: inputs.build_only != true && needs.selector.outputs.publish_target == 'research-source-test'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:

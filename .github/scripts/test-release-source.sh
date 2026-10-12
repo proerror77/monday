@@ -119,7 +119,7 @@ grep -Fqx 'jobs=,ci/ci-contracts,ploy/commit-hygiene,ploy/workflow-lint,' "$work
 printf 'PASS: exact Release/CI attempts preserve original source and reject missing, stale or ambiguous metadata\n'
 [[ ${1:-} != --metadata-only ]] || exit 0
 
-ruby -ryaml - "$root/.github/workflows/release.yml" "$root/.github/workflows/acr-publish.yml" <<'RUBY'
+ruby -ryaml -ropen3 -rostruct - "$root/.github/workflows/release.yml" "$root/.github/workflows/acr-publish.yml" <<'RUBY'
 release, acr = ARGV.map { |file| YAML.load_file(file) }
 condition = acr.fetch('jobs').fetch('selector').fetch('if')
 github_context = Struct.new(:event_name, :event)
@@ -139,6 +139,47 @@ run_context = Struct.new(:event, :head_branch, :conclusion)
     event_context.new(run_context.new(source_event, branch, conclusion)))
   actual = eval(condition, binding, ARGV[1])
   abort "unexpected ACR route for #{[event_name, source_event, branch, conclusion]}" unless actual == expected
+end
+input = acr.fetch('on', acr[true]).fetch('workflow_dispatch').fetch('inputs').fetch('build_only')
+abort 'build-only must be opt-in' unless input.fetch('type') == 'boolean' && input.fetch('default') == false
+selector_steps = acr.fetch('jobs').fetch('selector').fetch('steps')
+build_mode = selector_steps.find { |s| s['id'] == 'build-mode' }
+admission_index = selector_steps.index { |s| s['id'] == 'admission' }
+abort 'build-only validation must precede admission' unless build_mode && selector_steps.index(build_mode) < admission_index
+base_env = {'BUILD_ONLY'=>'true', 'EVENT_NAME'=>'workflow_dispatch', 'CURRENT_REF'=>'refs/heads/main',
+            'TARGET'=>'research-runner', 'REBUILD'=>'true'}
+[
+  [{}, true], [{'BUILD_ONLY'=>'false', 'TARGET'=>'hft-trading', 'REBUILD'=>'false'}, true],
+  [{'BUILD_ONLY'=>'', 'EVENT_NAME'=>'workflow_run'}, true], [{'BUILD_ONLY'=>'invalid'}, false],
+  [{'CURRENT_REF'=>'refs/heads/develop'}, false], [{'EVENT_NAME'=>'workflow_run'}, false],
+  [{'TARGET'=>'all'}, false], [{'TARGET'=>'research-source-test'}, false], [{'REBUILD'=>'false'}, false]
+].each do |changes, accepted|
+  _, _, status = Open3.capture3(base_env.merge(changes), 'bash', '-c', build_mode.fetch('run'))
+  abort "invalid build-only boundary #{changes}" unless status.success? == accepted
+end
+def always; true; end
+outputs = OpenStruct.new(research_products: 'cex-runner', research_mode: 'rebuild',
+  publish_target: 'research-runner', matrix: '{"include":[{}]}', ready: 'true', archive_products: 'cex-runner')
+success = OpenStruct.new(result: 'success', outputs: outputs)
+needs = OpenStruct.new(selector: success, research_runner_binaries: success, research_environments: success,
+                      ordinary_selector: success, publish: success)
+github = OpenStruct.new(event_name: 'workflow_dispatch')
+inputs = OpenStruct.new(build_only: true, target: 'hft-trading')
+blocked = %w[ordinary-selector research-environments publish-research-images publish publish-ordinary research-release-complete publish-source-test]
+blocked.each do |id|
+  expression = acr.fetch('jobs').fetch(id).fetch('if').gsub(/needs\.([a-z][a-z0-9-]*)/) { "needs.#{$1.tr('-', '_')}" }
+  outputs.publish_target = 'research-source-test' if id == 'publish-source-test'
+  abort "build-only reaches #{id}" unless eval(expression, binding, ARGV[1]) == false
+  inputs.build_only = false
+  abort "normal publication path changed for #{id}" unless eval(expression, binding, ARGV[1]) == true
+  inputs.build_only = true
+end
+%w[research-runner-binaries research-release-tools].each do |id|
+  job = acr.fetch('jobs').fetch(id)
+  abort "build-only lost #{id}" unless eval(job.fetch('if'), binding, ARGV[1]) == true
+  permissions = job.fetch('permissions', acr.fetch('permissions'))
+  abort "compiler can mint credentials #{id}" if permissions.key?('id-token')
+  abort "compiler has write permission #{id}" if permissions.values.any? { |value| value != 'read' }
 end
 marker = release.fetch('jobs').fetch('source')
 abort 'original admission name changed' unless release.dig('jobs','admit','name') == 'Admit release'
