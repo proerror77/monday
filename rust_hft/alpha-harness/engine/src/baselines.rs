@@ -7,6 +7,8 @@ use crate::{
 use alpha_domain::{canonical_json_hash, CexBaselineArtifactV1, CexBaselineModelV1};
 
 mod classic;
+#[cfg(any(feature = "fitting", feature = "offline-diagnostic"))]
+pub mod diagnostic;
 #[cfg(feature = "fitting")]
 pub(crate) use classic::fit_ridge;
 #[cfg(all(test, feature = "fitting"))]

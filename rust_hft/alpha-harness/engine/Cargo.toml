@@ -6,6 +6,7 @@ edition = "2021"
 publish = false
 
 [features]
+offline-diagnostic = []
 default = ["kernel", "fitting"]
 fitting = ["dep:hft-research-ml"]
 kernel = ["dep:alpha-store"]

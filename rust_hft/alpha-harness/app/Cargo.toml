@@ -6,9 +6,10 @@ edition = "2021"
 publish = false
 
 [features]
+offline-diagnostic = ["alpha-engine/offline-diagnostic"]
 default = ["operator"]
 operator = ["hft-cex-research-input/preparation-cli", "alpha-engine/llm", "dep:hft-research-dispatch-io", "dep:hft-research-platform"]
-scientific = ["alpha-engine/fitting", "dep:hft-cex-search-driver"]
+scientific = ["alpha-engine/fitting", "dep:hft-cex-search-driver", "offline-diagnostic"]
 onnx-compatibility = ["operator", "dep:alpha-onnx-evaluator"]
 
 [dependencies]
@@ -47,6 +48,16 @@ zip = { version = "6", default-features = false, features = ["deflate"] }
 name = "alpha-harness"
 path = "src/main.rs"
 required-features = ["operator"]
+
+[[bin]]
+name = "monday-offline-baseline"
+path = "src/bin/offline_baseline.rs"
+required-features = ["offline-diagnostic"]
+
+[[test]]
+name = "offline_baseline"
+path = "tests/offline_baseline.rs"
+required-features = ["offline-diagnostic"]
 
 [dev-dependencies]
 hft-research-platform = { path = "../../research-core/platform", default-features = false, features = ["native-admission", "release-verification"] }
