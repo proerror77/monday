@@ -2,12 +2,18 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
+fn executable() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_monday-offline-baseline")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_monday-offline-baseline")))
+}
+
 fn cli(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_monday-offline-baseline"))
+    Command::new(executable())
         .args(args)
         .env_remove("MONDAY_EXECUTION_HOST")
         .output()
@@ -29,6 +35,8 @@ fn run(input: &Path, spec: &Path, output: &Path, sha: &str, kind: &str) -> Outpu
         output.to_str().unwrap(),
         "--input-kind",
         kind,
+        "--executable-sha256",
+        &digest(&fs::read(executable()).unwrap()),
     ])
 }
 
@@ -65,9 +73,14 @@ fn offline_baseline_reproduces_and_rejects_tamper_overwrite_and_local_history() 
         assert_eq!(manifest["report_sha256"], digest(&bytes));
         assert_eq!(
             manifest["executable_sha256"],
-            digest(&fs::read(env!("CARGO_BIN_EXE_monday-offline-baseline")).unwrap())
+            digest(&fs::read(executable()).unwrap())
         );
         assert_eq!(manifest["campaign_acceptance"], false);
+        assert_eq!(manifest["executable_sha256_verified_by_diagnostic"], false);
+        assert_eq!(
+            manifest["executable_digest_source"],
+            "external_artifact_declaration"
+        );
         assert_eq!(report["statistical_strategy_acceptance"], false);
         let ledger = report["out_of_sample_accounting"]["ledger"]
             .as_array()

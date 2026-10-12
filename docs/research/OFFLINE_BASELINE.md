@@ -14,11 +14,14 @@ MONDAY_SOURCE_REVISION="$(git rev-parse HEAD)" \
 BIN=rust_hft/research-core/target/debug/monday-offline-baseline
 "$BIN" synthetic-fixture --output synthetic-fixture
 SHA=$(shasum -a 256 synthetic-fixture/synthetic-rows.json | cut -d ' ' -f 1)
+EXE_SHA=$(shasum -a 256 "$BIN" | cut -d ' ' -f 1)
 "$BIN" run --input synthetic-fixture/synthetic-rows.json --input-sha256 "$SHA" \
   --spec synthetic-fixture/synthetic-spec.json --input-kind synthetic \
+  --executable-sha256 "$EXE_SHA" \
   --output synthetic-result-1
 "$BIN" run --input synthetic-fixture/synthetic-rows.json --input-sha256 "$SHA" \
   --spec synthetic-fixture/synthetic-spec.json --input-kind synthetic \
+  --executable-sha256 "$EXE_SHA" \
   --output synthetic-result-2
 cmp synthetic-result-1/report.json synthetic-result-2/report.json
 ```
@@ -35,7 +38,7 @@ One complete all-fold OOS evaluation uses the existing horizon policy and native
 
 Upstream feature/materialization evidence must establish causal provenance. Names and timestamps alone cannot authenticate that a feature excluded future information. Actual historical byte hashes, native replay, scoped coverage, receive-time availability and funding applicability must be independently verified in ACK before preparing historical rows.
 
-`report.json` contains models, partitions, regression metrics and the full OOS cost/equity ledger. `manifest.json` binds input/spec/report/executable hashes, embedded `MONDAY_SOURCE_REVISION`, input kind and external authority reference. Without that build variable, the source is explicitly `unbound-local-code`; the executable hash still identifies exact local bytes. New result directories and create-new files reject overwrite. Diagnostic status is explicit and Campaign, deployment and statistical strategy acceptance remain false.
+`report.json` contains models, partitions, regression metrics and the full OOS cost/equity ledger. `manifest.json` records verified input/spec/report hashes and the externally declared executable hash, embedded `MONDAY_SOURCE_REVISION`, input kind and external authority reference. Without that build variable, the source is explicitly `unbound-local-code`; the caller's declared executable digest is explicitly unauthenticated by this driver. The external Build admission must bind that digest to the exact executable before real launch; the driver does not trust current_exe() or its path for identity. New result directories and create-new files reject overwrite. Diagnostic status is explicit and Campaign, deployment and statistical strategy acceptance remain false.
 
 ## Placement and authority
 

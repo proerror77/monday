@@ -34,6 +34,9 @@ struct Args {
     input: PathBuf,
     #[arg(long)]
     input_sha256: String,
+    /// Digest from the external artifact/Build; this diagnostic cannot authenticate it.
+    #[arg(long)]
+    executable_sha256: String,
     #[arg(long)]
     spec: PathBuf,
     #[arg(long)]
@@ -56,6 +59,8 @@ struct Manifest<'a> {
     spec_sha256: String,
     report_sha256: String,
     executable_sha256: String,
+    executable_digest_source: &'static str,
+    executable_sha256_verified_by_diagnostic: bool,
     external_lease_reference: &'a Option<String>,
     compute_authority_verified_by_diagnostic: bool,
     campaign_acceptance: bool,
@@ -67,6 +72,14 @@ fn main() -> Result<()> {
     }
 }
 fn run(a: Args) -> Result<()> {
+    if a.executable_sha256.len() != 64
+        || !a
+            .executable_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        bail!("declared executable SHA256 must contain 64 lowercase hex characters");
+    }
     if a.input_kind == "historical"
         && (std::env::var("MONDAY_EXECUTION_HOST").as_deref() != Ok("ack")
             || a.lease_reference
@@ -106,7 +119,9 @@ fn run(a: Args) -> Result<()> {
         input_sha256: hash(&bytes),
         spec_sha256: hash(&spec_bytes),
         report_sha256: hash(&output),
-        executable_sha256: hash(&fs::read(std::env::current_exe()?)?),
+        executable_sha256: a.executable_sha256.clone(),
+        executable_digest_source: "external_artifact_declaration",
+        executable_sha256_verified_by_diagnostic: false,
         external_lease_reference: &a.lease_reference,
         compute_authority_verified_by_diagnostic: false,
         campaign_acceptance: false,
