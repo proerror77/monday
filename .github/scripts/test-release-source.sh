@@ -97,6 +97,7 @@ done
 for update in '.[0].jobs=[]' '.[0].jobs += .[0].jobs' '. + .' '.[0].jobs[0].run_id=999' \
   '.[0].jobs[0].run_attempt=1' '.[0].jobs[0].head_sha="wrong"' \
   '.[0].jobs[0].status="in_progress"' '.[0].jobs[0].conclusion="failure"' \
+  '.[0].jobs[0].conclusion="skipped"' \
   '.[0].jobs[0].name="Release source v1 [invalid] [100/3]"' \
   '.[0].jobs[0].name |= sub("100/3";"100/1")' \
   'del(.[0].jobs[0].run_attempt)' 'del(.[0].jobs[0].head_sha)' '.[0].jobs=null'; do
@@ -120,6 +121,25 @@ printf 'PASS: exact Release/CI attempts preserve original source and reject miss
 
 ruby -ryaml - "$root/.github/workflows/release.yml" "$root/.github/workflows/acr-publish.yml" <<'RUBY'
 release, acr = ARGV.map { |file| YAML.load_file(file) }
+condition = acr.fetch('jobs').fetch('selector').fetch('if')
+github_context = Struct.new(:event_name, :event)
+event_context = Struct.new(:workflow_run)
+run_context = Struct.new(:event, :head_branch, :conclusion)
+# Evaluate the actual workflow guard for native event values. The skipped
+# Release must not enter the reader; failed GHCR and manual recovery remain eligible.
+[
+  ['workflow_run', 'workflow_run', 'main', 'skipped', false],
+  ['workflow_run', 'workflow_run', 'main', 'success', true],
+  ['workflow_run', 'workflow_run', 'main', 'failure', true],
+  ['workflow_run', 'workflow_run', 'develop', 'success', false],
+  ['workflow_run', 'push', 'main', 'success', false],
+  ['workflow_dispatch', nil, nil, nil, true]
+].each do |event_name, source_event, branch, conclusion, expected|
+  github = github_context.new(event_name,
+    event_context.new(run_context.new(source_event, branch, conclusion)))
+  actual = eval(condition, binding, ARGV[1])
+  abort "unexpected ACR route for #{[event_name, source_event, branch, conclusion]}" unless actual == expected
+end
 marker = release.fetch('jobs').fetch('source')
 abort 'original admission name changed' unless release.dig('jobs','admit','name') == 'Admit release'
 abort 'marker depends on publication' if marker.key?('needs')
