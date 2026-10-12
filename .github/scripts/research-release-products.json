@@ -8,7 +8,8 @@
       "binance-market-tape-slicer",
       "binance-replay-parquet-materializer",
       "clickhouse-analytics-materializer",
-      "monday-cex-prepare"
+      "monday-cex-prepare",
+      "monday-offline-baseline"
     ],
     "prediction-runner": [
       "monday-prediction-research",
@@ -36,6 +37,14 @@
       "features": "",
       "binaries": [
         "alpha-harness"
+      ]
+    },
+    {
+      "manifest": "research-core/Cargo.toml",
+      "package": "alpha-harness",
+      "features": "offline-diagnostic",
+      "binaries": [
+        "monday-offline-baseline"
       ]
     },
     {
