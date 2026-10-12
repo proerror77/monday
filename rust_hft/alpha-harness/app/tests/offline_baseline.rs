@@ -51,6 +51,41 @@ fn run_command(
 }
 
 #[test]
+fn pit_cli_requires_bound_materialization_before_any_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("synthetic");
+    assert!(
+        cli(&["synthetic-fixture", "--output", fixture.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let input = fixture.join("synthetic-rows.json");
+    let output = dir.path().join("must-not-exist");
+    let result = cli(&[
+        "run",
+        "--input",
+        input.to_str().unwrap(),
+        "--input-sha256",
+        &digest(&fs::read(&input).unwrap()),
+        "--input-format",
+        "pit-jsonl",
+        "--spec",
+        fixture.join("synthetic-spec.json").to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--input-kind",
+        "synthetic",
+        "--executable-sha256",
+        &digest(&fs::read(executable()).unwrap()),
+    ]);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("PIT input requires --materialization")
+    );
+    assert!(!output.exists());
+}
+
+#[test]
 fn offline_cycle_preserves_lineage_reproducibility_budget_and_history_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = dir.path().join("explicit-synthetic-cycle");

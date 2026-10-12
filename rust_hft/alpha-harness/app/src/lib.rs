@@ -1,5 +1,7 @@
 mod cli;
 mod data_mission;
+#[cfg(feature = "offline-diagnostic")]
+pub mod diagnostic_input;
 #[cfg(any(feature = "operator", test))]
 mod governance;
 #[cfg(feature = "operator")]

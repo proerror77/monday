@@ -39,6 +39,16 @@ struct Args {
     input: PathBuf,
     #[arg(long)]
     input_sha256: String,
+    #[arg(long, default_value = "native-json", value_parser = ["native-json", "pit-jsonl"])]
+    input_format: String,
+    /// Required for PIT input; native replay validation is reused.
+    #[arg(long, requires = "materialization_sha256")]
+    materialization: Option<PathBuf>,
+    #[arg(long, requires = "materialization")]
+    materialization_sha256: Option<String>,
+    /// Exact reference triplets already bound by USD-M materialization.
+    #[arg(long)]
+    reference: Vec<PathBuf>,
     /// Digest from the external artifact/Build; this diagnostic cannot authenticate it.
     #[arg(long)]
     executable_sha256: String,
@@ -69,6 +79,8 @@ struct Manifest<'a> {
     external_lease_reference: &'a Option<String>,
     compute_authority_verified_by_diagnostic: bool,
     campaign_acceptance: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pit_input: Option<alpha_harness::diagnostic_input::DiagnosticPitReceipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     automatic_iterations: Option<usize>,
 }
@@ -103,10 +115,31 @@ fn run(a: Args, cycle: bool) -> Result<()> {
     if hash(&bytes) != a.input_sha256 {
         bail!("prepared input SHA256 mismatch");
     }
-    let rows: Vec<ResearchRow> =
-        serde_json::from_slice(&bytes).context("expected native prepared-row JSON array")?;
     let spec_bytes = read_bounded(&a.spec, 256 * 1024)?;
     let spec: DiagnosticBaselineSpec = serde_json::from_slice(&spec_bytes)?;
+    let (rows, pit_input): (Vec<ResearchRow>, _) = if a.input_format == "pit-jsonl" {
+        let (rows, receipt) = alpha_harness::diagnostic_input::load_pit_rows(
+            &a.input,
+            &a.input_sha256,
+            a.materialization
+                .as_deref()
+                .context("PIT input requires --materialization")?,
+            a.materialization_sha256
+                .as_deref()
+                .context("PIT input requires --materialization-sha256")?,
+            &a.reference,
+            &spec.protocol,
+        )?;
+        (rows, Some(receipt))
+    } else {
+        if a.materialization.is_some() || !a.reference.is_empty() {
+            bail!("materialization/reference options require PIT input");
+        }
+        (
+            serde_json::from_slice(&bytes).context("expected native prepared-row JSON array")?,
+            None,
+        )
+    };
     let (output, fit_count, automatic_iterations) = if cycle {
         let report = run_diagnostic_cycle(rows, &spec).map_err(anyhow::Error::msg)?;
         (
@@ -146,6 +179,7 @@ fn run(a: Args, cycle: bool) -> Result<()> {
         external_lease_reference: &a.lease_reference,
         compute_authority_verified_by_diagnostic: false,
         campaign_acceptance: false,
+        pit_input,
         automatic_iterations,
     };
     write("manifest.json", &serde_json::to_vec_pretty(&m)?)?;
