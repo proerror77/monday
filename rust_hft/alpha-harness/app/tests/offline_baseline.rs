@@ -101,6 +101,17 @@ fn offline_cycle_preserves_lineage_reproducibility_budget_and_history_boundary()
         assert_eq!(manifest["input_kind"], "synthetic");
         assert_eq!(manifest["campaign_acceptance"], false);
         assert_eq!(manifest["compute_authority_verified_by_diagnostic"], false);
+        let feedback_at = chrono::DateTime::parse_from_rfc3339(
+            report["successor"]["feedback_available_until"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let prediction_at = chrono::DateTime::parse_from_rfc3339(
+            report["successor"]["first_prediction_at"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(prediction_at > feedback_at + chrono::TimeDelta::seconds(5));
     }
     assert_eq!(
         fs::read(first.join("report.json")).unwrap(),

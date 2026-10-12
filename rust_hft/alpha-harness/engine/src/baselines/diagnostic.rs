@@ -76,6 +76,8 @@ pub struct DiagnosticSuccessor {
     pub parent_report_sha256: String,
     pub parent_score: f64,
     pub parent_gate_reasons: Vec<String>,
+    pub feedback_available_until: chrono::DateTime<chrono::Utc>,
+    pub first_prediction_at: chrono::DateTime<chrono::Utc>,
     pub spec: DiagnosticBaselineSpec,
     pub spec_sha256: String,
     pub report: DiagnosticBaselineReport,
@@ -90,9 +92,11 @@ pub fn run_diagnostic_cycle(
     if spec.features != ["book_imbalance"]
         || spec.protocol.walk_forward.fold_count != 2
         || spec.evaluator.multiple_testing_trials != 2
+        || spec.protocol.calendar.is_some()
     {
         return Err(
-            "cycle requires book_imbalance, two folds and two predeclared hypotheses".into(),
+            "cycle requires book_imbalance, two ordinary folds and two predeclared hypotheses"
+                .into(),
         );
     }
     // Missing causal depth fails before consuming any fit; never fabricate it.
@@ -102,6 +106,49 @@ pub fn run_diagnostic_cycle(
             .is_none_or(|value| !value.is_finite())
     }) {
         return Err("cycle requires causally materialized book_imbalance_top5".into());
+    }
+    // Freeze the successor's later window from actual validated partitions,
+    // before fitting. It must not score the data that selected its hypothesis.
+    let prepared =
+        prepare_dataset(rows.clone(), &spec.protocol).map_err(|error| error.to_string())?;
+    let context = prepared.engine_context();
+    let feedback_available_until = context
+        .folds()
+        .iter()
+        .flat_map(|fold| fold.validation.clone())
+        .map(|index| context.rows()[index].label_available_time)
+        .max()
+        .ok_or("baseline has no feedback window")?;
+    let mut next_spec = spec.clone();
+    next_spec.features = vec!["book_imbalance_top5".into()];
+    next_spec.protocol.walk_forward.initial_train_rows = context
+        .folds()
+        .last()
+        .ok_or("baseline has no final partition")?
+        .embargo
+        .end;
+    let next_prepared = prepare_dataset(rows.clone(), &next_spec.protocol)
+        .map_err(|error| format!("successor window is invalid before any fit: {error}"))?;
+    let next_context = next_prepared.engine_context();
+    let first_prediction_at =
+        next_context.rows()[next_context.folds()[0].validation.start].available_time;
+    let embargo_millis = spec
+        .protocol
+        .labels
+        .observation_frequency_millis
+        .checked_mul(
+            u64::try_from(spec.protocol.walk_forward.embargo_rows)
+                .map_err(|_| "embargo overflow")?,
+        )
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or("feedback embargo overflow")?;
+    let feedback_deadline = feedback_available_until
+        .checked_add_signed(chrono::TimeDelta::milliseconds(embargo_millis))
+        .ok_or("feedback embargo clock overflow")?;
+    if first_prediction_at <= feedback_deadline {
+        return Err(
+            "successor predictions must follow parent label availability and embargo".into(),
+        );
     }
     let digest = |value: &DiagnosticBaselineReport| {
         alpha_domain::canonical_json_hash(value).map_err(|error| error.to_string())
@@ -125,17 +172,17 @@ pub fn run_diagnostic_cycle(
     let successor = if feedback.passed {
         None
     } else {
-        let mut next_spec = spec.clone();
-        next_spec.features = vec!["book_imbalance_top5".into()];
         let spec_sha256 =
             alpha_domain::canonical_json_hash(&next_spec).map_err(|error| error.to_string())?;
         let report = run_diagnostic_baseline(rows, &next_spec)?;
         fit_count += report.fit_count;
         Some(DiagnosticSuccessor {
-            rule: "top_five_after_native_development_gate_rejection_v1".into(),
+            rule: "later_top_five_after_native_development_gate_rejection_v1".into(),
             parent_report_sha256: parent_sha256,
             parent_score: feedback.score,
             parent_gate_reasons: feedback.failure_reasons.clone(),
+            feedback_available_until,
+            first_prediction_at,
             spec: next_spec,
             spec_sha256,
             report,
@@ -465,6 +512,8 @@ mod tests {
         assert_eq!(child.spec.features, ["book_imbalance_top5"]);
         let mut expected = spec.clone();
         expected.features = vec!["book_imbalance_top5".into()];
+        expected.protocol.walk_forward.initial_train_rows =
+            report.baseline.folds.last().unwrap().partition.embargo.end;
         assert_eq!(
             serde_json::to_vec(&child.spec).unwrap(),
             serde_json::to_vec(&expected).unwrap()
@@ -473,6 +522,20 @@ mod tests {
         assert!(!feedback.passed);
         assert_eq!(child.parent_score, feedback.score);
         assert_eq!(child.parent_gate_reasons, feedback.failure_reasons);
+        let observed_feedback_time = report
+            .baseline
+            .folds
+            .iter()
+            .flat_map(|fold| fold.partition.validation.clone())
+            .map(|index| rows[index].label_available_time)
+            .max()
+            .unwrap();
+        assert_eq!(child.feedback_available_until, observed_feedback_time);
+        assert!(child.first_prediction_at > child.feedback_available_until + TimeDelta::seconds(5));
+        assert_eq!(
+            child.first_prediction_at,
+            rows[child.report.folds[0].partition.validation.start].available_time
+        );
         assert_eq!(
             child.parent_report_sha256,
             alpha_domain::canonical_json_hash(&report.baseline).unwrap()
@@ -525,5 +588,47 @@ mod tests {
         let mut gap = rows;
         gap.remove(50);
         assert!(run_diagnostic_cycle(gap, &spec).is_err());
+    }
+
+    #[test]
+    fn diagnostic_cycle_future_successor_labels_cannot_change_parent_feedback_or_plan() {
+        let (rows, spec) = cycle_fixture();
+        let first = run_diagnostic_cycle(rows.clone(), &spec).unwrap();
+        let child = first.successor.as_ref().unwrap();
+        let mut changed = rows;
+        for fold in &child.report.folds {
+            for row in &mut changed[fold.partition.validation.clone()] {
+                row.label += 0.1;
+            }
+        }
+        let second = run_diagnostic_cycle(changed, &spec).unwrap();
+        assert_eq!(
+            alpha_domain::canonical_json_hash(&first.baseline).unwrap(),
+            alpha_domain::canonical_json_hash(&second.baseline).unwrap()
+        );
+        let changed_child = second.successor.as_ref().unwrap();
+        assert_eq!(
+            child.parent_report_sha256,
+            changed_child.parent_report_sha256
+        );
+        assert_eq!(child.spec_sha256, changed_child.spec_sha256);
+        assert_eq!(
+            child.report.folds[0].model,
+            changed_child.report.folds[0].model
+        );
+        assert_ne!(
+            child.report.folds[0].out_of_sample,
+            changed_child.report.folds[0].out_of_sample
+        );
+    }
+
+    #[test]
+    fn diagnostic_cycle_requires_a_later_window_before_consuming_fits() {
+        let (mut rows, spec) = cycle_fixture();
+        rows.truncate(230);
+        assert!(run_diagnostic_baseline(rows.clone(), &spec).is_ok());
+        assert!(run_diagnostic_cycle(rows, &spec)
+            .unwrap_err()
+            .contains("successor window is invalid before any fit"));
     }
 }
