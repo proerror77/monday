@@ -109,6 +109,36 @@ jq -e '.admission.approval_kind=="software-operating-allowance" and .admission.p
  .admission.aggregate_invoice_cap==false' "$work/operations-admission.json" >/dev/null
 run_operations "$work/operations.json" 987 654
 jq -e '.publisher_run_id==987 and .publisher_run_attempt==1' "$work/research-publication-native-budget.json" >/dev/null
+# Fixed-source authorization uses the same real archive/history lane. A new
+# native envelope cannot widen it to any other source, even inside its window.
+jq --arg source "$source_sha" '.schema="monday.research-publication-source-policy.v1" |
+ .source_sha=$source' "$work/operations.json" >"$work/source-policy.json"
+run_operations "$work/source-policy.json"
+jq -e --arg source "$source_sha" '.source_sha==$source and
+ .admission.approval_kind=="single-source-software-allowance" and
+ .admission.operating_policy.source_sha==$source and
+ .admission.approved_limits.source_sha==$source and .admission.aggregate_invoice_cap==false' \
+ "$work/operations-admission.json" >/dev/null
+PATH="$work/tools:$PATH" OPERATIONS_TEST_NOW="$operations_now" GITHUB_REPOSITORY=proerror77/monday \
+ MONDAY_RESEARCH_PUBLICATION_OPERATIONS_POLICY="$(cat "$work/source-policy.json")" \
+ bash "$script_dir/research-publication-budget.sh" check-operations-scope "$source_sha" "$products" 744 "$work/source-scope.json"
+jq -e '.archive_scope.scheduling_only and (has("admission")|not)' "$work/source-scope.json" >/dev/null
+for expression in '.source_sha=("a"*40)' '.source_sha=null' '.source_sha=123' \
+ '.source_sha=("A"*40)' 'del(.source_sha)' \
+ '.schema="monday.research-publication-operations-policy.v1"'; do
+  jq "$expression" "$work/source-policy.json" >"$work/invalid-source-policy.json"
+  rm -f "$work/operations-admission.json" "$work/research-publication-native-budget.json"
+  if run_operations "$work/invalid-source-policy.json"; then echo 'fixed-source approval admitted wrong source/schema' >&2; exit 1; fi
+  test ! -e "$work/operations-admission.json"
+  test ! -e "$work/research-publication-native-budget.json"
+done
+# The original broader schema must not silently acquire or ignore a source key.
+jq --arg source "$source_sha" '.source_sha=$source' "$work/operations.json" >"$work/invalid-source-policy.json"
+if run_operations "$work/invalid-source-policy.json"; then echo 'operating schema ignored unexpected source restriction' >&2; exit 1; fi
+rm -f "$work/operations-admission.json" "$work/research-publication-native-budget.json"
+if run_operations "$work/source-policy.json" 456 123 2; then echo 'fixed-source policy renewed a retry' >&2; exit 1; fi
+test ! -e "$work/operations-admission.json"
+test ! -e "$work/research-publication-native-budget.json"
 # Each source reserves the whole authorized set, even when different runs
 # publish one product at a time. The fixed shares sum to the same caps in either
 # order, including separate per-product currency/storage rounding.
@@ -195,7 +225,8 @@ exit 91
 MOCK
 chmod +x "$work/tools/gh"
 archive_signer_present=true
-for expression in 'null' '.expires_at=1791680400' '.max_estimated_micro_cny=1' '.max_oss_requests=1'; do
+for expression in 'null' '.expires_at=1791680400' '.max_estimated_micro_cny=1' '.max_oss_requests=1' \
+ '.schema="monday.research-publication-source-policy.v1" | .source_sha=("a"*40)'; do
   jq "$expression" "$work/operations.json" >"$work/invalid.json"
   : >"$work/readiness-output"
   PATH="$work/tools:$PATH" OPERATIONS_TEST_NOW="$operations_now" READINESS_NETWORK_LOG="$work/network-log" RUNNER_TEMP="$work" \
@@ -222,4 +253,5 @@ printf '{invalid\n' >"$work/oss-policy.json"
 reject "$work/policy.json"
 printf 'Budget: same-source static inventory, exact-boundary admission and %s negative approvals passed\n' "$((negatives+5))"
 printf 'Operating allowance: automatic runtime binding, denied renewal and archive-only readiness passed\n'
+printf 'Fixed-source allowance: exact source/schema, native binding, retry and network-free foreign-source rejection passed\n'
 printf 'Foreign regions, accelerated endpoints, malformed and multiple price targets rejected\n'

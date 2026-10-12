@@ -98,15 +98,21 @@ def native_budget:
    allocations:[.allocations[]|{product,limits:{requests:.native_requests,
      request_payload_bytes:.request_body_bytes,response_payload_bytes:.response_body_bytes}}]};
 def operating_allocation:
-  # Ongoing software operating authorization has no human-guessed SHA/run IDs.
-  # It is a bound per new source, not a global account or research/trading cap.
+  # The source policy narrows this existing history/accounting lane to one SHA.
+  # Neither policy grants a provider invoice or research/trading budget cap.
   . as $estimate | $policy as $p |
-  require(($p|type)=="object" and ($p|keys)==["currency","expires_at","history_anchor_run_id",
+  ["currency","expires_at","history_anchor_run_id",
     "history_anchor_run_number","history_retention_required","max_estimated_micro_cny",
     "max_new_storage_bytes","max_oss_requests","max_request_body_bytes","max_response_body_bytes",
-    "not_before","price_model","products","publisher_workflow","repository","schema","storage_hours"];
+    "not_before","price_model","products","publisher_workflow","repository","schema","storage_hours"] as $keys |
+  ($p.schema=="monday.research-publication-source-policy.v1") as $fixed_source |
+  require(($p|type)=="object" and ($p|keys)==
+    (($keys + (if $fixed_source then ["source_sha"] else [] end)) | sort);
     "one software operating allowance required") |
-  require($p.schema=="monday.research-publication-operations-policy.v1" and $p.repository==$repository and
+  require(($fixed_source and $p.source_sha==$source_sha) or
+    ($p.schema=="monday.research-publication-operations-policy.v1");
+    "publication approval does not permit this source") |
+  require($p.repository==$repository and
     $p.publisher_workflow==".github/workflows/acr-publish.yml" and $p.currency=="CNY" and
     $p.price_model==.pricing.model and $p.storage_hours==$storage_hours and
     ($p.products|type)=="array" and ($p.products|sort|unique)==$p.products and
@@ -140,7 +146,8 @@ def admit_operations:
     max_request_body_bytes:$estimate.total.request_body_bytes,
     max_response_body_bytes:$estimate.total.response_body_bytes,
     max_new_storage_bytes:$estimate.total.new_storage_bytes}) |
-  .admission.approval_kind="software-operating-allowance" |
+  .admission.approval_kind=(if $p.schema=="monday.research-publication-source-policy.v1"
+    then "single-source-software-allowance" else "software-operating-allowance" end) |
   .admission.operating_policy=$p |
   .admission.source_allocation=($bound_reservation | {products,total,pricing}) |
   .admission.allocation_basis="fixed-approved-products-per-source" |
