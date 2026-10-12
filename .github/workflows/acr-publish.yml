@@ -59,7 +59,8 @@ concurrency:
 
 jobs:
   selector:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'workflow_run' && github.event.workflow_run.head_branch == 'main')
+    # Scheduled CI leaves Release skipped. Failed GHCR releases retain independent ACR admission.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'workflow_run' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.conclusion != 'skipped')
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
