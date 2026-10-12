@@ -44,6 +44,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo --config 'build.rustc-wrapper=""' build \
     --manifest-path data-pipelines/Cargo.toml --release --locked \
     -p hft-cex-data-preparation --bin monday-cex-prepare \
+    && MONDAY_SOURCE_REVISION="$SOURCE_REVISION" cargo --config 'build.rustc-wrapper=""' build \
+    --manifest-path research-core/Cargo.toml --release --locked \
+    -p alpha-harness --features offline-diagnostic --bin monday-offline-baseline \
+    && install -D -m 0755 /work/target/release/monday-offline-baseline /out/bin/monday-offline-baseline \
     && install -D -m 0755 /work/target/release/monday-cex-prepare /out/bin/monday-cex-prepare \
     && install -D -m 0755 /work/target/release/hft-backtest /out/bin/hft-backtest \
     && install -D -m 0755 /work/target/release/alpha-harness /out/bin/alpha-harness \
@@ -73,6 +77,8 @@ ENV ALPHA_HARNESS_BIN=/usr/local/bin/alpha-harness
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hft-backtest"]
 
 FROM runtime-base AS prebuilt
+
+COPY --chmod=0755 research-bin/monday-offline-baseline /usr/local/bin/monday-offline-baseline
 
 COPY --chmod=0755 research-bin/monday-cex-prepare /usr/local/bin/monday-cex-prepare
 
