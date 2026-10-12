@@ -44,6 +44,118 @@ pub struct DiagnosticBaselineReport {
     pub folds: Vec<DiagnosticFold>,
     pub out_of_sample_accounting: PositionEvaluationReport,
 }
+
+/// A predeclared two-hypothesis technical study. It cannot complete a Campaign.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticCycleReport {
+    pub schema: String,
+    pub lineage_digest_encoding: String,
+    pub diagnostic_only: bool,
+    pub deployment_authority: bool,
+    pub statistical_strategy_acceptance: bool,
+    pub fit_limit: usize,
+    pub fit_count: usize,
+    pub automatic_iterations: usize,
+    pub baseline_spec: DiagnosticBaselineSpec,
+    pub baseline: DiagnosticBaselineReport,
+    pub reproducibility: DiagnosticRepeat,
+    pub successor: Option<DiagnosticSuccessor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticRepeat {
+    pub report_sha256: String,
+    pub repeated_report_sha256: String,
+    pub byte_identical: bool,
+    pub fit_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticSuccessor {
+    pub rule: String,
+    pub parent_report_sha256: String,
+    pub parent_score: f64,
+    pub parent_gate_reasons: Vec<String>,
+    pub spec: DiagnosticBaselineSpec,
+    pub spec_sha256: String,
+    pub report: DiagnosticBaselineReport,
+}
+
+/// No tuning or retries: two baseline folds, their identical repeat, and at most
+/// two successor folds. Feedback sees only the native development/OOS report.
+pub fn run_diagnostic_cycle(
+    rows: Vec<ResearchRow>,
+    spec: &DiagnosticBaselineSpec,
+) -> Result<DiagnosticCycleReport, String> {
+    if spec.features != ["book_imbalance"]
+        || spec.protocol.walk_forward.fold_count != 2
+        || spec.evaluator.multiple_testing_trials != 2
+    {
+        return Err(
+            "cycle requires book_imbalance, two folds and two predeclared hypotheses".into(),
+        );
+    }
+    // Missing causal depth fails before consuming any fit; never fabricate it.
+    if rows.iter().any(|row| {
+        row.features
+            .get("book_imbalance_top5")
+            .is_none_or(|value| !value.is_finite())
+    }) {
+        return Err("cycle requires causally materialized book_imbalance_top5".into());
+    }
+    let digest = |value: &DiagnosticBaselineReport| {
+        alpha_domain::canonical_json_hash(value).map_err(|error| error.to_string())
+    };
+    let baseline = run_diagnostic_baseline(rows.clone(), spec)?;
+    let repeated = run_diagnostic_baseline(rows.clone(), spec)?;
+    let first_bytes = serde_json::to_vec(&baseline).map_err(|error| error.to_string())?;
+    let repeated_bytes = serde_json::to_vec(&repeated).map_err(|error| error.to_string())?;
+    if first_bytes != repeated_bytes {
+        return Err("baseline repeat changed model/report bytes; successor is blocked".into());
+    }
+    let parent_sha256 = digest(&baseline)?;
+    let reproducibility = DiagnosticRepeat {
+        report_sha256: parent_sha256.clone(),
+        repeated_report_sha256: digest(&repeated)?,
+        byte_identical: true,
+        fit_count: repeated.fit_count,
+    };
+    let mut fit_count = baseline.fit_count + repeated.fit_count;
+    let feedback = &baseline.out_of_sample_accounting.evaluation;
+    let successor = if feedback.passed {
+        None
+    } else {
+        let mut next_spec = spec.clone();
+        next_spec.features = vec!["book_imbalance_top5".into()];
+        let spec_sha256 =
+            alpha_domain::canonical_json_hash(&next_spec).map_err(|error| error.to_string())?;
+        let report = run_diagnostic_baseline(rows, &next_spec)?;
+        fit_count += report.fit_count;
+        Some(DiagnosticSuccessor {
+            rule: "top_five_after_native_development_gate_rejection_v1".into(),
+            parent_report_sha256: parent_sha256,
+            parent_score: feedback.score,
+            parent_gate_reasons: feedback.failure_reasons.clone(),
+            spec: next_spec,
+            spec_sha256,
+            report,
+        })
+    };
+    Ok(DiagnosticCycleReport {
+        schema: "monday.offline_ridge_diagnostic_cycle.v1".into(),
+        lineage_digest_encoding: "monday.canonical_json_sha256".into(),
+        diagnostic_only: true,
+        deployment_authority: false,
+        statistical_strategy_acceptance: false,
+        fit_limit: 6,
+        fit_count,
+        automatic_iterations: usize::from(successor.is_some()),
+        baseline_spec: spec.clone(),
+        baseline,
+        reproducibility,
+        successor,
+    })
+}
 fn regression(rows: &[ResearchRow], p: &[f64], r: Range<usize>) -> RegressionMetrics {
     let n = r.len() as f64;
     RegressionMetrics {
@@ -327,5 +439,91 @@ mod tests {
             .ledger
             .iter()
             .all(|p| p.target_position == 0.0));
+    }
+
+    fn cycle_fixture() -> (Vec<ResearchRow>, DiagnosticBaselineSpec) {
+        let (mut rows, mut spec) = fixture();
+        spec.protocol.walk_forward.fold_count = 2;
+        spec.evaluator.multiple_testing_trials = 2;
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.features
+                .insert("book_imbalance_top5".into(), (index as f64 / 11.0).sin());
+        }
+        (rows, spec)
+    }
+
+    #[test]
+    fn diagnostic_cycle_binds_feedback_and_executes_only_the_predeclared_successor() {
+        let (rows, spec) = cycle_fixture();
+        let report = run_diagnostic_cycle(rows.clone(), &spec).unwrap();
+        assert_eq!(report.fit_count, 6);
+        assert_eq!(report.automatic_iterations, 1);
+        assert!(report.reproducibility.byte_identical);
+        assert_eq!(report.reproducibility.fit_count, 2);
+        let child = report.successor.as_ref().unwrap();
+        assert_eq!(child.report.fit_count, 2);
+        assert_eq!(child.spec.features, ["book_imbalance_top5"]);
+        let mut expected = spec.clone();
+        expected.features = vec!["book_imbalance_top5".into()];
+        assert_eq!(
+            serde_json::to_vec(&child.spec).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        let feedback = &report.baseline.out_of_sample_accounting.evaluation;
+        assert!(!feedback.passed);
+        assert_eq!(child.parent_score, feedback.score);
+        assert_eq!(child.parent_gate_reasons, feedback.failure_reasons);
+        assert_eq!(
+            child.parent_report_sha256,
+            alpha_domain::canonical_json_hash(&report.baseline).unwrap()
+        );
+        assert_eq!(
+            child.spec_sha256,
+            alpha_domain::canonical_json_hash(&child.spec).unwrap()
+        );
+        let expected_child = run_diagnostic_baseline(rows, &child.spec).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&child.report).unwrap(),
+            serde_json::to_vec(&expected_child).unwrap()
+        );
+        assert!(!report.deployment_authority);
+        assert!(!report.statistical_strategy_acceptance);
+    }
+
+    #[test]
+    fn diagnostic_cycle_sealed_tail_cannot_change_feedback_models_or_successor() {
+        let (rows, spec) = cycle_fixture();
+        let first = run_diagnostic_cycle(rows.clone(), &spec).unwrap();
+        let mut changed = rows;
+        for row in &mut changed[280..] {
+            row.label = -0.9;
+            row.features.insert("book_imbalance".into(), -0.99);
+            row.features.insert("book_imbalance_top5".into(), 0.99);
+        }
+        let second = run_diagnostic_cycle(changed, &spec).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn diagnostic_cycle_rejects_unplanned_trials_features_depth_and_gaps() {
+        let (rows, spec) = cycle_fixture();
+        let mut wrong = spec.clone();
+        wrong.protocol.walk_forward.fold_count = 3;
+        assert!(run_diagnostic_cycle(rows.clone(), &wrong).is_err());
+        wrong = spec.clone();
+        wrong.evaluator.multiple_testing_trials = 1;
+        assert!(run_diagnostic_cycle(rows.clone(), &wrong).is_err());
+        wrong = spec.clone();
+        wrong.features.push("mid_price".into());
+        assert!(run_diagnostic_cycle(rows.clone(), &wrong).is_err());
+        let mut missing = rows.clone();
+        missing[0].features.remove("book_imbalance_top5");
+        assert!(run_diagnostic_cycle(missing, &spec).is_err());
+        let mut gap = rows;
+        gap.remove(50);
+        assert!(run_diagnostic_cycle(gap, &spec).is_err());
     }
 }
