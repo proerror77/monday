@@ -10,9 +10,9 @@ products=cex-runner,controller,prediction-runner
 bash "$script_dir/research-publication-budget.sh" estimate "$source_sha" "$products" 744 "$work/estimate.json"
 jq -e '
  .basis=="catalog-static-upper-bound" and .source_archive.bytes>0 and
- [.allocations[].executable_count]==[8,1,5] and [.allocations[].build_count]==[5,1,3] and
- [.allocations[].native_requests]==[78,21,51] and
- .total.object_count==44 and .total.oss_requests==138 and .total.native_requests==150 and
+ [.allocations[].executable_count]==[9,1,5] and [.allocations[].build_count]==[6,1,3] and
+ [.allocations[].native_requests]==[90,21,51] and
+ .total.object_count==48 and .total.oss_requests==150 and .total.native_requests==162 and
  .total.request_body_bytes==(.allocations|map(.request_body_bytes)|add) and
  .total.response_body_bytes==(.allocations|map(.response_body_bytes)|add) and
  .pricing.estimated_micro_cny==(.pricing.request_micro_cny+.pricing.egress_micro_cny+.pricing.storage_micro_cny) and
@@ -46,7 +46,7 @@ run_admit() {
 run_admit "$work/policy.json"
 jq -e '.admission.single_run and .admission.publisher_run_id==456 and .admission.publisher_run_number==123' \
   "$work/admission.json" >/dev/null
-jq -e '.schema=="monday.oss-publication-budget.v1" and .limits.requests==150 and
+jq -e '.schema=="monday.oss-publication-budget.v1" and .limits.requests==162 and
  .publisher_run_id==456 and .publisher_run_attempt==1 and .expires_at_ms==1791684000000 and
  .publication_namespaces==["research/builds/","research/sources/"] and
  .limits.requests==(.allocations|map(.limits.requests)|add) and
@@ -120,7 +120,7 @@ jq --slurpfile estimate "$work/pair-estimate.json" '
  .max_request_body_bytes=$estimate[0].total.request_body_bytes |
  .max_response_body_bytes=$estimate[0].total.response_body_bytes |
  .max_new_storage_bytes=$estimate[0].total.new_storage_bytes' "$work/operations.json" >"$work/pair-policy.json"
-jq -e '.total.oss_requests==91' "$work/pair-estimate.json" >/dev/null
+jq -e '.total.oss_requests==103' "$work/pair-estimate.json" >/dev/null
 for order in 'cex-runner controller' 'controller cex-runner'; do
   run=500
   for product in $order; do
@@ -152,7 +152,7 @@ done
 # Both single-product estimates individually fit these underfunded source caps;
 # neither may spend until the complete fixed set fits. A failed sibling does not
 # return its reserved share to the other product.
-for expression in '.max_oss_requests=90' '.max_estimated_micro_cny-=1' \
+for expression in '.max_oss_requests=102' '.max_estimated_micro_cny-=1' \
  '.max_request_body_bytes-=1' '.max_response_body_bytes-=1' '.max_new_storage_bytes-=1'; do
   jq "$expression" "$work/pair-policy.json" >"$work/undersized-pair-policy.json"
   for product in cex-runner controller; do
