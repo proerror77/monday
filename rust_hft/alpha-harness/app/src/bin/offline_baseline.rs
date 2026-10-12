@@ -1,6 +1,8 @@
 //! Diagnostic entry point. It neither authenticates a lease nor completes a Campaign.
 use alpha_engine::{
-    baselines::diagnostic::{run_diagnostic_baseline, DiagnosticBaselineSpec},
+    baselines::diagnostic::{
+        run_diagnostic_baseline, run_diagnostic_cycle, DiagnosticBaselineSpec,
+    },
     evaluation::ResearchRow,
 };
 use anyhow::{bail, Context, Result};
@@ -27,6 +29,9 @@ enum Command {
     },
     /// Fit train-only Ridge folds and account for complete walk-forward OOS positions.
     Run(Args),
+    /// Repeat two baseline folds, then execute one predeclared score-driven successor.
+    /// Diagnostic only; requires an independently admitted six-fit ACK envelope.
+    Cycle(Args),
 }
 #[derive(clap::Args)]
 struct Args {
@@ -64,14 +69,17 @@ struct Manifest<'a> {
     external_lease_reference: &'a Option<String>,
     compute_authority_verified_by_diagnostic: bool,
     campaign_acceptance: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    automatic_iterations: Option<usize>,
 }
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::SyntheticFixture { output } => synthetic_fixture(output),
-        Command::Run(args) => run(args),
+        Command::Run(args) => run(args, false),
+        Command::Cycle(args) => run(args, true),
     }
 }
-fn run(a: Args) -> Result<()> {
+fn run(a: Args, cycle: bool) -> Result<()> {
     if a.executable_sha256.len() != 64
         || !a
             .executable_sha256
@@ -99,8 +107,17 @@ fn run(a: Args) -> Result<()> {
         serde_json::from_slice(&bytes).context("expected native prepared-row JSON array")?;
     let spec_bytes = read_bounded(&a.spec, 256 * 1024)?;
     let spec: DiagnosticBaselineSpec = serde_json::from_slice(&spec_bytes)?;
-    let report = run_diagnostic_baseline(rows, &spec).map_err(anyhow::Error::msg)?;
-    let output = serde_json::to_vec_pretty(&report)?;
+    let (output, fit_count, automatic_iterations) = if cycle {
+        let report = run_diagnostic_cycle(rows, &spec).map_err(anyhow::Error::msg)?;
+        (
+            serde_json::to_vec_pretty(&report)?,
+            report.fit_count,
+            Some(report.automatic_iterations),
+        )
+    } else {
+        let report = run_diagnostic_baseline(rows, &spec).map_err(anyhow::Error::msg)?;
+        (serde_json::to_vec_pretty(&report)?, report.fit_count, None)
+    };
     fs::create_dir(&a.output)?;
     let write = |name: &str, data: &[u8]| -> Result<()> {
         let mut file = fs::OpenOptions::new()
@@ -113,7 +130,11 @@ fn run(a: Args) -> Result<()> {
     };
     write("report.json", &output)?;
     let m = Manifest {
-        schema: "monday.offline_ridge_diagnostic_manifest.v1",
+        schema: if cycle {
+            "monday.offline_ridge_diagnostic_cycle_manifest.v1"
+        } else {
+            "monday.offline_ridge_diagnostic_manifest.v1"
+        },
         source_revision: option_env!("MONDAY_SOURCE_REVISION").unwrap_or("unbound-local-code"),
         input_kind: &a.input_kind,
         input_sha256: hash(&bytes),
@@ -125,13 +146,15 @@ fn run(a: Args) -> Result<()> {
         external_lease_reference: &a.lease_reference,
         compute_authority_verified_by_diagnostic: false,
         campaign_acceptance: false,
+        automatic_iterations,
     };
     write("manifest.json", &serde_json::to_vec_pretty(&m)?)?;
-    println!(
-        "{}",
-        serde_json::json!({"diagnostic_only":true,"fit_count":report.fit_count,
- "report_sha256":m.report_sha256,"campaign_acceptance":false})
-    );
+    let mut summary = serde_json::json!({"diagnostic_only":true,"fit_count":fit_count,
+      "report_sha256":m.report_sha256,"campaign_acceptance":false});
+    if let Some(iterations) = automatic_iterations {
+        summary["automatic_iterations"] = iterations.into();
+    }
+    println!("{summary}");
     Ok(())
 }
 
