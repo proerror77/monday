@@ -74,11 +74,7 @@ fn offline_baseline_reproduces_and_rejects_tamper_overwrite_and_local_history() 
             .unwrap();
         assert_eq!(ledger.len(), 90);
         for fold in 1..=3 {
-            let terminal = ledger
-                .iter()
-                .filter(|p| p["fold_index"] == fold)
-                .next_back()
-                .unwrap();
+            let terminal = ledger.iter().rfind(|p| p["fold_index"] == fold).unwrap();
             assert_eq!(terminal["target_position"], 0.0);
         }
     }
