@@ -765,6 +765,7 @@ for path in "${paths[@]}"; do
     .github/workflows/ci.yml|.github/workflows/ploy-ci.yml|.github/workflows/security-enabled.yml|\
     .github/workflows/test-install-ubuntu-packages.sh|\
     .github/scripts/select-rust-ci-scope.sh|.github/scripts/research-workspace-locks.sh|.github/scripts/check-rust-workspace-reports.sh|.github/scripts/verify-ci-rust-same-run.sh|.github/scripts/test-ci-rust-same-run.sh|\
+    .github/scripts/cargo-audit-summary.sh|.github/scripts/test-cargo-audit-summary.sh|\
     .github/scripts/local-lock-impact.sh|.github/scripts/test-local-lock-impact.mjs|\
     .github/scripts/image-build-plan.sh|.github/scripts/test-image-build-plan.sh|\
     .github/scripts/save-tested-image.sh|.github/scripts/read-tested-image.sh|.github/scripts/test-tested-image.sh|\

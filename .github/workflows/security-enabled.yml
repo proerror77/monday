@@ -479,6 +479,10 @@ jobs:
           name: sbom
           path: sbom
 
+      - name: Check audit summary parser
+        if: ${{ always() }}
+        run: bash .github/scripts/test-cargo-audit-summary.sh
+
       - name: Generate summary
         if: ${{ always() }}
         env:
@@ -495,9 +499,7 @@ jobs:
             echo ""
 
             if [ -f cargo-audit-results/audit-results.json ]; then
-              CRITICAL=$(jq -r '.vulnerabilities.list[]? | select(.advisory.severity=="critical") | .advisory.id' cargo-audit-results/audit-results.json 2>/dev/null | wc -l)
-              HIGH=$(jq -r '.vulnerabilities.list[]? | select(.advisory.severity=="high") | .advisory.id' cargo-audit-results/audit-results.json 2>/dev/null | wc -l)
-              echo "- **Cargo Audit**: Critical=$CRITICAL, High=$HIGH"
+              bash .github/scripts/cargo-audit-summary.sh cargo-audit-results/audit-results.json "$CARGO_AUDIT_RESULT"
             else
               echo "- **Cargo Audit**: $CARGO_AUDIT_RESULT"
             fi
