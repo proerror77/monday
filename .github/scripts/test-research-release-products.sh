@@ -13,11 +13,11 @@ products="$root/.github/scripts/research-release-products.sh"
 bash "$products" recipes prediction-runner >"$work/prediction-recipes"
 jq -s -e 'length==3 and all(.[]; .manifest=="prediction-markets/Cargo.toml") and any(.[]; .package=="ploy-research" and (.binaries|length)==3) and any(.[]; .package=="hft-prediction-research-worker" and .binaries==["monday-prediction-worker"]) and any(.[]; .package=="hft-prediction-research-operator" and .binaries==["monday-prediction-operator"])' "$work/prediction-recipes" >/dev/null
 bash "$products" recipes cex-runner >"$work/cex-recipes"
-jq -s -e 'length==6 and any(.[]; .package=="hft-cex-data-preparation" and .manifest=="data-pipelines/Cargo.toml" and .binaries==["monday-cex-prepare"]) and any(.[]; .package=="hft-cex-research-worker" and .binaries==["monday-cex-worker"]) and all(.[]; .package!="ploy-research" and .manifest!="prediction-markets/Cargo.toml")' "$work/cex-recipes" >/dev/null
-jq -s -e 'any(.[]; .package=="alpha-harness" and .features=="offline-diagnostic" and .binaries==["monday-offline-baseline"]) and any(.[]; .package=="alpha-harness" and .features=="" and .binaries==["alpha-harness"])' "$work/cex-recipes" >/dev/null
-[[ $(bash "$products" binaries cex-runner | wc -l) -eq 9 ]]
-[[ $(bash "$products" binaries all | wc -l) -eq 14 ]]
-[[ $(bash "$products" binaries cex-runner,controller | wc -l) -eq 9 ]]
+jq -s -e 'length==5 and any(.[]; .package=="hft-cex-data-preparation" and .manifest=="data-pipelines/Cargo.toml" and .binaries==["monday-cex-prepare"]) and any(.[]; .package=="hft-cex-research-worker" and .binaries==["monday-cex-worker"]) and all(.[]; .package!="ploy-research" and .manifest!="prediction-markets/Cargo.toml")' "$work/cex-recipes" >/dev/null
+jq -s -e 'all(.[]; (.binaries|index("monday-offline-baseline"))==null) and any(.[]; .package=="alpha-harness" and .features=="" and .binaries==["alpha-harness"])' "$work/cex-recipes" >/dev/null
+[[ $(bash "$products" binaries cex-runner | wc -l) -eq 8 ]]
+[[ $(bash "$products" binaries all | wc -l) -eq 13 ]]
+[[ $(bash "$products" binaries cex-runner,controller | wc -l) -eq 8 ]]
 [[ $(bash "$products" merge controller prediction-runner) == controller,prediction-runner ]]
 for invalid in runner paired '' 'cex-runner,cex-runner' 'prediction-runner,unknown' 'all,controller'; do
   if bash "$products" normalize "$invalid" >"$work/rejection" 2>&1; then
