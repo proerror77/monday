@@ -155,13 +155,9 @@ owner=${manifest%/Cargo.toml}
 timings="$work/$phase-${owner//\//--}.timings.jsonl"
 while IFS= read -r recipe; do
   package=$(jq -r .package <<<"$recipe")
-  args=(build --manifest-path "$manifest" --target x86_64-unknown-linux-gnu --release --locked --jobs "$cargo_jobs" -p "$package")
-  features=$(jq -r .features <<<"$recipe")
-  [[ -z $features ]] || args+=(--features "$features")
-  while IFS= read -r binary; do args+=(--bin "$binary"); done < <(jq -r '.binaries[]' <<<"$recipe")
   start=$(date +%s)
   recipe_target=$(bash "$root/.github/scripts/research-cache-layout.sh" target-dir "$(jq -r .manifest <<<"$recipe")")
-  CARGO_TARGET_DIR="$recipe_target" cargo "${args[@]}" --message-format json-render-diagnostics >"$work/$phase-$package.jsonl"
+  CARGO_TARGET_DIR="$recipe_target" bash "$root/.github/scripts/compile-research-recipe.sh" "$recipe" "$cargo_jobs" >"$work/$phase-$package.jsonl"
   jq -es 'any(.[]; .reason=="compiler-artifact") and any(.[]; .reason=="build-finished" and .success==true)' \
     "$work/$phase-$package.jsonl" >/dev/null
   seconds=$(( $(date +%s) - start ))

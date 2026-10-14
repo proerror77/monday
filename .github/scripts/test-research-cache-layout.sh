@@ -24,9 +24,9 @@ while IFS= read -r manifest; do
   printf 'fixture lock\n' >"$compat_repo/rust_hft/${manifest%Cargo.toml}Cargo.lock"
 done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
 # Use the real compiler recipe input path, not a fabricated recipe digest.
-for script in build-research-release.sh build-research-recipes.sh research-release-products.sh \
+for script in build-research-release.sh build-research-recipes.sh capture-research-build-inputs.sh research-release-products.sh \
   research-release-source-sha.sh research-workspace-locks.sh verify-research-runtime-abi.sh \
-  verify-research-runner-binaries.sh; do
+  verify-research-runner-binaries.sh research-native-dependency-inputs.rb compile-research-recipe.sh; do
   cp "$root/.github/scripts/$script" "$compat_repo/.github/scripts/"
 done
 cp "$root/.github/scripts/research-image-release-artifact.sh" "$compat_repo/.github/scripts/"
@@ -54,6 +54,33 @@ fixture_inputs() {
       compiler:$digest,native:$digest,flags:$digest,profiles:$profiles,recipe:$recipe,
       builder_image:("rust:fixture@sha256:"+$digest),recipes:$recipes,workspace_profiles:$owners,locks:$locks}'
 }
+# Metadata fixtures exercise identity derivation without compiling DuckDB.
+original_path=$PATH
+mkdir -p "$work/native-bin"
+cat >"$work/native-bin/cargo" <<'NATIVE_CARGO'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == metadata ]]
+cat "$MONDAY_NATIVE_FIXTURE"
+NATIVE_CARGO
+chmod +x "$work/native-bin/cargo"
+export MONDAY_NATIVE_FIXTURE="$work/native-metadata.json"
+export PATH="$work/native-bin:$PATH"
+cat >"$MONDAY_NATIVE_FIXTURE" <<'NATIVE_JSON'
+{"packages":[{"id":"native","name":"libduckdb-sys","version":"1.10504.0","source":"registry+https://github.com/rust-lang/crates.io-index"},{"id":"cc","name":"cc","version":"1.2.0","source":"registry+https://github.com/rust-lang/crates.io-index"}],"resolve":{"nodes":[{"id":"native","features":["bundled"],"dependencies":["cc"]},{"id":"cc","features":[],"dependencies":[]}]}}
+NATIVE_JSON
+cp "$MONDAY_NATIVE_FIXTURE" "$work/native-original.json"
+native_fixture_locks() {
+  ruby -rjson - "$MONDAY_NATIVE_FIXTURE" "$compat_repo/rust_hft" <<'NATIVE_LOCKS'
+metadata, root = ARGV
+lock = "version = 3\n" + JSON.parse(File.read(metadata)).fetch('packages').map do |package|
+  "[[package]]\nname=#{package.fetch('name').to_json}\nversion=#{package.fetch('version').to_json}\nsource=#{package.fetch('source').to_json}\nchecksum=\"#{'1' * 64}\"\n"
+end.join
+Dir.glob("#{root}/**/Cargo.lock").each { |path| File.write(path, lock) }
+NATIVE_LOCKS
+}
+native_fixture_locks
+cp "$compat_repo/rust_hft/research-core/Cargo.lock" "$work/original-fixture-lock"
 fixture_inputs >"$work/full.json"
 cp "$work/full.json" "$work/full-before.json"
 bash "$compat_helper" compatibility-inputs "$work/full.json" >"$work/compat.json"
@@ -99,22 +126,56 @@ bash "$artifact" verify "$release" "$source_sha" 42 "$compat_repo/rust_hft" 1 7 
 cp "$work/catalog-original" "$catalog"
 printf '\n# changed compiler orchestration\n' >>"$compat_repo/.github/scripts/build-research-recipes.sh"
 fixture_inputs >"$work/changed.json"
-check_identity_change isolate
+check_identity_change reuse
 cp "$root/.github/scripts/build-research-recipes.sh" "$compat_repo/.github/scripts/"
+for script in build-research-release.sh verify-research-runtime-abi.sh verify-research-runner-binaries.sh; do
+  printf '\n# packaging or validation text change\n' >>"$compat_repo/.github/scripts/$script"
+  fixture_inputs >"$work/changed.json"
+  check_identity_change reuse
+  cp "$root/.github/scripts/$script" "$compat_repo/.github/scripts/"
+done
+for script in compile-research-recipe.sh research-cache-layout.sh; do
+  printf '\n# changed actual compile or cleanup contract\n' >>"$compat_repo/.github/scripts/$script"
+  fixture_inputs >"$work/changed.json"
+  check_identity_change isolate
+  cp "$root/.github/scripts/$script" "$compat_repo/.github/scripts/"
+done
 printf 'PASS: valid catalog edit preserves dependency identity, changes exact inputs and rejects old artifact recipes\n'
+# Cargo-resolved native version/source/features and build dependencies must isolate.
+for update in '.packages[0].version="1.10505.0"' '.packages[0].source="git+https://example.invalid/duckdb#1234"' \
+  '.resolve.nodes[0].features=["bundled","json"]' '.packages[1].version="1.3.0"'; do
+  jq "$update" "$work/native-original.json" >"$MONDAY_NATIVE_FIXTURE"
+  native_fixture_locks
+  bash "$compat_helper" compatibility-inputs "$work/full.json" >"$work/native-changed.json"
+  [[ $(sha256sum "$work/native-changed.json" | awk '{print $1}') != "$compat_sha" ]]
+done
+cp "$work/native-original.json" "$MONDAY_NATIVE_FIXTURE"
+native_fixture_locks
+jq '.packages += [{id:"business",name:"unrelated-business",version:"2.0.0",source:null}]' \
+  "$work/native-original.json" >"$MONDAY_NATIVE_FIXTURE"
+bash "$compat_helper" compatibility-inputs "$work/full.json" >"$work/native-unrelated.json"
+cmp "$work/compat.json" "$work/native-unrelated.json"
+cp "$work/native-original.json" "$MONDAY_NATIVE_FIXTURE"
+ruby - "$compat_repo/rust_hft/research-core/Cargo.lock" <<'NATIVE_CHECKSUM'
+path = ARGV.fetch(0)
+File.write(path, File.read(path).sub('1' * 64, '2' * 64))
+NATIVE_CHECKSUM
+bash "$compat_helper" compatibility-inputs "$work/full.json" >"$work/native-checksum.json"
+[[ $(sha256sum "$work/native-checksum.json" | awk '{print $1}') != "$compat_sha" ]]
+native_fixture_locks
 # Local feature and lock changes remain in complete provenance, not the restore prefix.
 cp "$compat_repo/rust_hft/alpha-harness/app/Cargo.toml" "$work/leaf-before"
 printf '[features]\ndefault=["scientific"]\n' >"$compat_repo/rust_hft/alpha-harness/app/Cargo.toml"
 fixture_inputs >"$work/changed.json"
 check_identity_change reuse
 cp "$work/leaf-before" "$compat_repo/rust_hft/alpha-harness/app/Cargo.toml"
-printf 'new fixture lock\n' >"$compat_repo/rust_hft/research-core/Cargo.lock"
+printf '\n# unrelated lock metadata\n' >>"$compat_repo/rust_hft/research-core/Cargo.lock"
 fixture_inputs >"$work/changed.json"
 check_identity_change reuse
-printf 'fixture lock\n' >"$compat_repo/rust_hft/research-core/Cargo.lock"
+cp "$work/original-fixture-lock" "$compat_repo/rust_hft/research-core/Cargo.lock"
 
 changed_digest=$(printf 'changed environment\n' | sha256sum | awk '{print $1}')
-for field in compiler native flags recipe; do
+for field in compiler native flags; do
   jq -S --arg field "$field" --arg digest "$changed_digest" '.[$field]=$digest' "$work/full.json" >"$work/changed.json"
   check_identity_change isolate
 done
@@ -269,6 +330,7 @@ end
 abort 'producer cache namespaces drifted' unless restores.uniq.length == 1
 RUBY
 printf 'PASS: dependency compatibility identity, provenance preservation and fail-closed input contracts\n'
+export PATH="$original_path"
 [[ ${1:-} != --compatibility-key ]] || exit 0
 
 bash "$root/.github/scripts/research-release-products.sh" recipes all | jq -s '{recipes:.}' >"$work/inputs"

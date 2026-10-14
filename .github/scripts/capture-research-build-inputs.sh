@@ -29,8 +29,18 @@ for variable in CC CXX AR LD CFLAGS CXXFLAGS LDFLAGS RUSTC_BOOTSTRAP CARGO_BUILD
   LIBRARY_PATH LD_LIBRARY_PATH CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH \
   PKG_CONFIG PKG_CONFIG_PATH PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR \
   OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_STATIC \
-  BINDGEN_EXTRA_CLANG_ARGS PROTOC PROTOC_INCLUDE CMAKE_TOOLCHAIN_FILE; do
+  BINDGEN_EXTRA_CLANG_ARGS PROTOC PROTOC_INCLUDE CMAKE_TOOLCHAIN_FILE \
+  DUCKDB_STATIC DUCKDB_LIB_DIR DUCKDB_INCLUDE_DIR DUCKDB_DOWNLOAD_LIB \
+  RANLIB ARFLAGS CXXSTDLIB CRATE_CC_NO_DEFAULTS CC_SHELL_ESCAPED_FLAGS \
+  CMAKE_GENERATOR CMAKE_MAKE_PROGRAM CMAKE_PREFIX_PATH; do
   printf '%s=%s\n' "$variable" "${!variable-}" >>"$work/native"
+done
+# cc-rs also accepts target-specific compiler and flag overrides.
+while IFS= read -r variable; do
+  printf '%s=%s\n' "$variable" "$(printenv "$variable")" >>"$work/native"
+done < <(env | awk -F= '$1 ~ /^(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|ARFLAGS|CXXSTDLIB)_(x86_64|x86-64)/ || $1 ~ /^(HOST|TARGET)_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|ARFLAGS|CXXSTDLIB)$/ {print $1}' | LC_ALL=C sort)
+for command in cc c++ ar ld ranlib; do
+  sha256sum "$(command -v "$command")" >>"$work/native"
 done
 for command in clang cmake mold pkg-config protoc zstd zstdmt unzstd; do "$command" --version >>"$work/native"; done
 # Bind relevant Cargo overrides without capturing registry or service secrets.
@@ -78,6 +88,8 @@ jq -S -n --arg compiler "$(sha256sum "$work/compiler" | awk '{print $1}')" \
 if [[ -n ${GITHUB_OUTPUT:-} ]]; then printf 'cache_sha256=%s\n' "$(sha256sum "$output" | awk '{print $1}')" >>"$GITHUB_OUTPUT"; fi
 # This separate restore identity does not replace the complete v3 provenance.
 bash "$root/.github/scripts/research-cache-layout.sh" compatibility-inputs "$output" >"$work/dependency-cache-inputs.json"
+# Retain a small, public native identity summary in the producer log.
+jq -c '.native_dependencies.closures[] | {owner,duckdb:[.packages[] | select(.name=="libduckdb-sys") | {name,version,checksum,features}]}' "$work/dependency-cache-inputs.json"
 if [[ -n ${GITHUB_OUTPUT:-} ]]; then
   printf 'dependency_cache_sha256=%s\n' "$(sha256sum "$work/dependency-cache-inputs.json" | awk '{print $1}')" >>"$GITHUB_OUTPUT"
 fi

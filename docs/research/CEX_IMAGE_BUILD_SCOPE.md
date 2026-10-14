@@ -33,9 +33,15 @@ See [CAMPAIGN_PREPARATION_REUSE.md](CAMPAIGN_PREPARATION_REUSE.md).
 The release profile, target, compiler, native environment and workspace inputs remain
 bound to compilation provenance. Cargo targets stay isolated by owning workspace.
 The changed recipe list remains part of exact build inputs and artifact validation.
-The dependency restore identity hashes compiler scripts separately from the product
-catalog. Packaging-only selection changes can reuse compatible dependency bytes.
-Changing compiler scripts still isolates the cache; this migration starts a new key.
+The dependency restore identity binds the small compiler helper, cache cleanup,
+compiler, native environment, flags and owning-workspace profiles.
+Cargo metadata resolves DuckDB's version, immutable source, features and dependency
+closure. Native closure changes isolate the dependency cache.
+Business source, unrelated resolved packages, packaging and smoke scripts remain
+outside this identity. Complete recipe provenance still binds those scripts.
+This migration starts a new key. Branch CI cannot populate trusted main caches.
+The historical main run restored dependencies and marked DuckDB artifacts fresh;
+its 13m48s recipe phase does not establish that every main build was cold.
 Dependency cache reuse does not authenticate executable bytes: builds still produce,
 hash and smoke-test the complete selected product at the admitted source revision.
 No research-profile executable is presented as a release artifact.
@@ -57,3 +63,13 @@ must not be added together. A draft PR provides no merge-to-ACR measurement.
 Further separation of preparation, operator and scientific images requires a complete
 consumer and signed-product protocol change. This patch preserves that boundary.
 The 10–15 minute small-change target remains unproven until comparable CI measurements exist.
+
+The existing diagnostic run 38525297670 tested commit
+`4e64020efbda664eef46790de8373c4b6c5368aa` on one EPYC 9V45 runner with four CPUs.
+Its cold recipe phase took 1481s. Full local reuse took 2s.
+After removing local compilation bytes, serial rebuilding took 568s and parallel
+rebuilding took 502s. DuckDB artifacts stayed fresh in both dependency-warm phases;
+local packages rebuilt and the binary hashes agreed.
+These are recipe timings, not full CI or publication timings.
+The runner differs from the historical EPYC 7763 baseline. This is not an old/new
+code speedup estimate. The dependency identity patch still needs its own CI validation.
