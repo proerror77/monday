@@ -29,18 +29,7 @@ for script in build-research-release.sh build-research-recipes.sh research-relea
   verify-research-runner-binaries.sh; do
   cp "$root/.github/scripts/$script" "$compat_repo/.github/scripts/"
 done
-bash "$compat_repo/.github/scripts/research-cache-layout.sh" recipe-inputs >"$work/compiler-recipe"
-jq '.products.controller=[] | .recipes[0].binaries=["changed-selection"]' \
-  "$compat_repo/.github/scripts/research-release-products.json" >"$work/changed-catalog"
-cp "$work/changed-catalog" "$compat_repo/.github/scripts/research-release-products.json"
-bash "$compat_repo/.github/scripts/research-cache-layout.sh" recipe-inputs >"$work/catalog-recipe"
-cmp "$work/compiler-recipe" "$work/catalog-recipe"
-printf '\n# changed compiler orchestration\n' >>"$compat_repo/.github/scripts/build-research-recipes.sh"
-bash "$compat_repo/.github/scripts/research-cache-layout.sh" recipe-inputs >"$work/changed-compiler-recipe"
-if cmp -s "$work/compiler-recipe" "$work/changed-compiler-recipe"; then
-  echo 'compiler orchestration change reused recipe identity' >&2; exit 1
-fi
-cp "$root/.github/scripts/research-release-products.json" "$compat_repo/.github/scripts/"
+cp "$root/.github/scripts/research-image-release-artifact.sh" "$compat_repo/.github/scripts/"
 printf '[features]\ndefault=[]\n' >"$compat_repo/rust_hft/alpha-harness/app/Cargo.toml"
 git -C "$compat_repo" init -q
 git -C "$compat_repo" add rust_hft
@@ -58,10 +47,11 @@ fixture_inputs() {
   digest=$(printf 'compiler/native fixture\n' | sha256sum | awk '{print $1}')
   jq -Sn --arg digest "$digest" --arg profiles "$(sha256sum "$work/profiles" | awk '{print $1}')" \
     --argjson owners "$profiles" \
+    --arg recipe "$(bash "$compat_helper" recipe-inputs | sha256sum | awk '{print $1}')" \
     --argjson locks "$(bash "$root/.github/scripts/research-workspace-locks.sh" "$compat_repo/rust_hft")" \
-    --argjson recipes "$(bash "$root/.github/scripts/research-release-products.sh" recipes "${1:-cex-runner,controller}" | jq -s .)" \
+    --argjson recipes "$(bash "$compat_repo/.github/scripts/research-release-products.sh" recipes "${1:-cex-runner,controller}" | jq -s .)" \
     '{schema:"monday.compilation-inputs.v3",target:"x86_64-unknown-linux-gnu",profile:"release",
-      compiler:$digest,native:$digest,flags:$digest,profiles:$profiles,recipe:$digest,
+      compiler:$digest,native:$digest,flags:$digest,profiles:$profiles,recipe:$recipe,
       builder_image:("rust:fixture@sha256:"+$digest),recipes:$recipes,workspace_profiles:$owners,locks:$locks}'
 }
 fixture_inputs >"$work/full.json"
@@ -77,6 +67,41 @@ check_identity_change() {
   actual=$(sha256sum "$work/changed-compat.json" | awk '{print $1}')
   if [[ $expected == reuse ]]; then [[ $actual == "$compat_sha" ]]; else [[ $actual != "$compat_sha" ]]; fi
 }
+# A valid catalog edit changes exact provenance, not dependency compatibility.
+# Both feature sets build the same operator binary; only the recipe identity differs.
+catalog="$compat_repo/.github/scripts/research-release-products.json"
+cp "$catalog" "$work/catalog-original"
+release="$work/catalog-release"
+mkdir -p "$release/research-bin"
+while IFS= read -r binary; do
+  printf 'catalog fixture executable: %s\n' "$binary" >"$release/research-bin/$binary"
+  chmod 0755 "$release/research-bin/$binary"
+done < <(bash "$compat_repo/.github/scripts/research-release-products.sh" binaries cex-runner,controller)
+artifact="$compat_repo/.github/scripts/research-image-release-artifact.sh"
+source_sha=1111111111111111111111111111111111111111
+MONDAY_BUILD_INPUTS_FILE="$work/full.json" bash "$artifact" create "$release" "$source_sha" 42 "$compat_repo/rust_hft" 1 7 cex-runner,controller
+bash "$artifact" verify "$release" "$source_sha" 42 "$compat_repo/rust_hft" 1 7 cex-runner,controller
+bash "$compat_helper" recipe-inputs >"$work/compiler-recipe"
+jq '(.recipes[] | select(.package=="alpha-harness" and .binaries==["alpha-harness"]) | .features)="operator"' \
+  "$work/catalog-original" >"$catalog"
+fixture_inputs >"$work/changed.json"
+check_identity_change reuse
+bash "$compat_helper" recipe-inputs >"$work/catalog-recipe"
+cmp "$work/compiler-recipe" "$work/catalog-recipe"
+if bash "$artifact" verify "$release" "$source_sha" 42 "$compat_repo/rust_hft" 1 7 cex-runner,controller >"$work/rejection" 2>&1; then
+  echo 'old catalog recipes were accepted as current provenance' >&2; exit 1
+fi
+# The same executable fixture with current provenance is valid. This isolates
+# the rejection above to the recipe change, rather than an unrelated fixture error.
+rm "$release/research-image-release.json"
+MONDAY_BUILD_INPUTS_FILE="$work/changed.json" bash "$artifact" create "$release" "$source_sha" 42 "$compat_repo/rust_hft" 1 7 cex-runner,controller
+bash "$artifact" verify "$release" "$source_sha" 42 "$compat_repo/rust_hft" 1 7 cex-runner,controller
+cp "$work/catalog-original" "$catalog"
+printf '\n# changed compiler orchestration\n' >>"$compat_repo/.github/scripts/build-research-recipes.sh"
+fixture_inputs >"$work/changed.json"
+check_identity_change isolate
+cp "$root/.github/scripts/build-research-recipes.sh" "$compat_repo/.github/scripts/"
+printf 'PASS: valid catalog edit preserves dependency identity, changes exact inputs and rejects old artifact recipes\n'
 # Local feature and lock changes remain in complete provenance, not the restore prefix.
 cp "$compat_repo/rust_hft/alpha-harness/app/Cargo.toml" "$work/leaf-before"
 printf '[features]\ndefault=["scientific"]\n' >"$compat_repo/rust_hft/alpha-harness/app/Cargo.toml"

@@ -33,6 +33,10 @@ catalog=JSON.parse(File.read(File.join(root,'.github/scripts/research-release-pr
   prebuilt=text.split(/^FROM runtime-base AS prebuilt\s*$/,2).fetch(1).split(/^FROM /,2).first
   copied=prebuilt.scan(/^COPY --chmod=0755 research-bin\/(\S+) \/usr\/local\/bin\/(\S+)$/)
   abort "unexpected prebuilt COPY: #{product}" unless copied.all? { |source,target| source==target } && copied.map(&:first).sort==catalog.fetch(product).sort
+  builder=text.split(/^FROM .* AS runtime-base\s*$/,2).first
+  installed=builder.scan(/install -D -m 0755 (\S+) \/out\/bin\/(\S+)/)
+  target=product=='cex-runner' ? '/work/target/release' : '/work/target/prediction-markets/release'
+  abort "unexpected source install: #{product}" unless installed.all? { |source,binary| source=="#{target}/#{binary}" } && installed.map(&:last).sort==catalog.fetch(product).sort
   foreign=catalog.fetch(product=='cex-runner' ? 'prediction-runner' : 'cex-runner')
   abort "source builder imports another domain: #{product}" if foreign.any? { |binary| text.include?(binary) }
 end
