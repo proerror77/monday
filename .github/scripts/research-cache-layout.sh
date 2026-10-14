@@ -38,6 +38,16 @@ validate_recipes() {
       (.binaries|type == "array" and length>0 and all(.[];name)))' "$1" >/dev/null
 }
 case ${1:?command required} in
+  recipe-inputs)
+    # Bind compiler orchestration and cleanup, independently of product selection.
+    # Exact selected recipes remain in compilation inputs and artifact admission.
+    for script in build-research-release.sh build-research-recipes.sh research-cache-layout.sh \
+      research-release-products.sh research-release-source-sha.sh research-workspace-locks.sh \
+      verify-research-runtime-abi.sh verify-research-runner-binaries.sh; do
+      cat "$root/.github/scripts/$script"
+    done
+    find "$root/.github/scripts/vendor/tomlrb/lib" -type f -name '*.rb' -print0 | LC_ALL=C sort -z | xargs -0 cat
+    ;;
   compatibility-inputs)
     # Keep local dependency choices in provenance and Cargo's exact cache suffix.
     # The restore prefix still binds every admitted compiler, native and profile input.

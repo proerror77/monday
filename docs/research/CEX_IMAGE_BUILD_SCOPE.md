@@ -33,6 +33,9 @@ See [CAMPAIGN_PREPARATION_REUSE.md](CAMPAIGN_PREPARATION_REUSE.md).
 The release profile, target, compiler, native environment and workspace inputs remain
 bound to compilation provenance. Cargo targets stay isolated by owning workspace.
 The changed recipe list remains part of exact build inputs and artifact validation.
+The dependency restore identity hashes compiler scripts separately from the product
+catalog. Packaging-only selection changes can reuse compatible dependency bytes.
+Changing compiler scripts still isolates the cache; this migration starts a new key.
 Dependency cache reuse does not authenticate executable bytes: builds still produce,
 hash and smoke-test the complete selected product at the admitted source revision.
 No research-profile executable is presented as a release artifact.

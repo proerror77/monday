@@ -62,17 +62,9 @@ while IFS= read -r manifest; do
 done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
 recipes=$(bash "$root/.github/scripts/research-release-products.sh" recipes "${2:-all}" | jq -s .)
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
-cat "$root/.github/scripts/build-research-release.sh" \
-  "$root/.github/scripts/build-research-recipes.sh" \
-  "$root/.github/scripts/research-cache-layout.sh" \
-  "$root/.github/scripts/research-release-products.sh" \
-  "$root/.github/scripts/research-release-products.json" \
-  "$root/.github/scripts/research-release-source-sha.sh" \
-  "$root/.github/scripts/research-workspace-locks.sh" \
-  "$root/.github/scripts/verify-research-runtime-abi.sh" \
-  "$root/.github/scripts/verify-research-runner-binaries.sh" >"$work/recipe"
-# Bind the fixed CI parser implementation alongside the build recipe.
-find "$root/.github/scripts/vendor/tomlrb/lib" -type f -name '*.rb' -print0 | LC_ALL=C sort -z | xargs -0 cat >>"$work/recipe"
+# The selected recipes below bind catalog contents to exact provenance.
+# Packaging-only catalog edits must not invalidate compatible dependencies.
+bash "$root/.github/scripts/research-cache-layout.sh" recipe-inputs >"$work/recipe"
 jq -S -n --arg compiler "$(sha256sum "$work/compiler" | awk '{print $1}')" \
   --arg native "$(sha256sum "$work/native" | awk '{print $1}')" \
   --arg flags "$(sha256sum "$work/flags" | awk '{print $1}')" \

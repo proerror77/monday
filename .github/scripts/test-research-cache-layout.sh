@@ -23,6 +23,24 @@ while IFS= read -r manifest; do
   cp "$root/rust_hft/$manifest" "$compat_repo/rust_hft/$manifest"
   printf 'fixture lock\n' >"$compat_repo/rust_hft/${manifest%Cargo.toml}Cargo.lock"
 done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
+# Use the real compiler recipe input path, not a fabricated recipe digest.
+for script in build-research-release.sh build-research-recipes.sh research-release-products.sh \
+  research-release-source-sha.sh research-workspace-locks.sh verify-research-runtime-abi.sh \
+  verify-research-runner-binaries.sh; do
+  cp "$root/.github/scripts/$script" "$compat_repo/.github/scripts/"
+done
+bash "$compat_repo/.github/scripts/research-cache-layout.sh" recipe-inputs >"$work/compiler-recipe"
+jq '.products.controller=[] | .recipes[0].binaries=["changed-selection"]' \
+  "$compat_repo/.github/scripts/research-release-products.json" >"$work/changed-catalog"
+cp "$work/changed-catalog" "$compat_repo/.github/scripts/research-release-products.json"
+bash "$compat_repo/.github/scripts/research-cache-layout.sh" recipe-inputs >"$work/catalog-recipe"
+cmp "$work/compiler-recipe" "$work/catalog-recipe"
+printf '\n# changed compiler orchestration\n' >>"$compat_repo/.github/scripts/build-research-recipes.sh"
+bash "$compat_repo/.github/scripts/research-cache-layout.sh" recipe-inputs >"$work/changed-compiler-recipe"
+if cmp -s "$work/compiler-recipe" "$work/changed-compiler-recipe"; then
+  echo 'compiler orchestration change reused recipe identity' >&2; exit 1
+fi
+cp "$root/.github/scripts/research-release-products.json" "$compat_repo/.github/scripts/"
 printf '[features]\ndefault=[]\n' >"$compat_repo/rust_hft/alpha-harness/app/Cargo.toml"
 git -C "$compat_repo" init -q
 git -C "$compat_repo" add rust_hft
