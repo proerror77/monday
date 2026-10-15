@@ -761,6 +761,13 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
+    .github/scripts/cargo-license-tool.sh|.github/scripts/test-cargo-license-tool.sh)
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      select_security_job security/license-check
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
     .github/workflows/market-tape-seal-benchmark.yml|.github/workflows/release-rust.yml|\
     .github/workflows/ci.yml|.github/workflows/ploy-ci.yml|.github/workflows/security-enabled.yml|\
     .github/workflows/test-install-ubuntu-packages.sh|\
