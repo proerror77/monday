@@ -137,14 +137,14 @@ jobs:
         with:
           toolchain: 1.98.1
 
-      - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: rust_hft
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
+      # Match the observed source-installed version without compiling the tool
+      # on each runner. The pinned installer verifies its release checksum.
       - name: Install cargo-audit
-        run: cargo install --locked cargo-audit
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-audit@0.22.2
+          checksum: true
+          fallback: none
 
       - name: Run security audit
         run: |
@@ -305,7 +305,11 @@ jobs:
           toolchain: 1.98.1
 
       - name: Install cargo-machete
-        run: cargo install --locked cargo-machete --version 0.9.2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-machete@0.9.2
+          checksum: true
+          fallback: none
 
       - name: Check unused dependencies
         run: |
