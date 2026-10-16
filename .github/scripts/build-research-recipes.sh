@@ -157,17 +157,26 @@ while IFS= read -r recipe; do
   package=$(jq -r .package <<<"$recipe")
   start=$(date +%s)
   recipe_target=$(bash "$root/.github/scripts/research-cache-layout.sh" target-dir "$(jq -r .manifest <<<"$recipe")")
-  CARGO_TARGET_DIR="$recipe_target" bash "$root/.github/scripts/compile-research-recipe.sh" "$recipe" "$cargo_jobs" >"$work/$phase-$package.jsonl"
+  # Cargo emits dirty reasons to stderr; keep stdout as compiler JSON only.
+  # Logging belongs to orchestration, not the dependency compilation identity.
+  fingerprint_log="$work/$phase-$package.fingerprint.log"
+  status=0
+  { CARGO_LOG=cargo::core::compiler::fingerprint=info CARGO_TERM_COLOR=never \
+      CARGO_TARGET_DIR="$recipe_target" bash "$root/.github/scripts/compile-research-recipe.sh" "$recipe" "$cargo_jobs" \
+      >"$work/$phase-$package.jsonl"; } 2>&1 | tee "$fingerprint_log" >&2 || status=$?
+  (( status == 0 )) || exit "$status"
   jq -es 'any(.[]; .reason=="compiler-artifact") and any(.[]; .reason=="build-finished" and .success==true)' \
     "$work/$phase-$package.jsonl" >/dev/null
   seconds=$(( $(date +%s) - start ))
   jq -s -c --arg cache_match "$cache_match" --arg phase "$phase" --arg source "$source_sha" --arg inputs "$inputs_sha" \
     --argjson requested_concurrency "${MONDAY_RESEARCH_BUILD_CONCURRENCY:-2}" \
     --argjson cargo_jobs "$cargo_jobs" --argjson concurrency "$concurrency" \
+    --rawfile diagnostics "$fingerprint_log" \
     --argjson runner "$runner_context" --arg recipe_target "$recipe_target" --argjson recipe "$recipe" --argjson seconds "$seconds" \
     '{phase:$phase,runner:$runner,recipe_target:$recipe_target,cache_exact_match:$cache_match,source_sha:$source,compilation_inputs_sha256:$inputs,recipe:$recipe,seconds:$seconds,
       scheduler:{requested_owner_concurrency:$requested_concurrency,owner_concurrency:$concurrency,cargo_jobs:$cargo_jobs},
       compiler_artifacts:([.[]|select(.reason=="compiler-artifact")]|length),
+      native_fingerprint_diagnostics:[$diagnostics|split("\n")[]|select(contains("fingerprint") and contains("libduckdb"))],
       native_artifacts:[.[]|select(.reason=="compiler-artifact" and (.package_id|contains("libduckdb-sys")))|{package_id,target:.target.name,fresh}],
       fresh:([.[]|select(.reason=="compiler-artifact" and .fresh==true)]|length),
       rebuilt:([.[]|select(.reason=="compiler-artifact" and .fresh==false)]|length)}' \

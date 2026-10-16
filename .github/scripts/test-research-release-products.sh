@@ -147,6 +147,9 @@ if [[ $1 == metadata ]]; then
   jq -n --arg root "$PWD" '{packages:[{name:"alpha-harness",manifest_path:($root+"/alpha-harness/Cargo.toml"),targets:[{name:"alpha_harness"}]}]}'
   exit
 fi
+[[ ${CARGO_LOG:-} == cargo::core::compiler::fingerprint=info ]]
+[[ ${CARGO_TERM_COLOR:-} == never ]]
+printf ' INFO cargo::core::compiler::fingerprint: fingerprint error for libduckdb-sys: missing fixture fingerprint\n' >&2
 printf 'build\n' >>"${MONDAY_TEST_CARGO_BUILD_LOG:?}"
 [[ ${FAIL_RECIPE:-0} != 1 ]] || exit 37
 target='' manifest='' package='' features='' jobs='' binaries=()
@@ -222,6 +225,7 @@ jq --argjson count "$(bash "$products" recipes controller | jq -s length)" -es '
   and ([.[].phase]|unique)==["after-cache-lookup","dependency-warm-parallel","dependency-warm-serial","warm-local"]
   and ([.[].compilation_inputs_sha256]|unique|length)==1
   and ([.[].build_inputs]|unique|length)==1
+  and all(.[]; (.native_fingerprint_diagnostics|length)==1 and (.native_fingerprint_diagnostics[0]|contains("libduckdb-sys")))
   and all(.[]; .build_inputs.profile=="release" and .build_inputs.target=="x86_64-unknown-linux-gnu" and .phase_seconds>=0)
   and all(.[]|select(.phase=="dependency-warm-serial"); .scheduler.requested_owner_concurrency==1 and .scheduler.owner_concurrency==1 and .scheduler.cargo_jobs==8)
   and all(.[]|select(.phase=="dependency-warm-parallel"); .scheduler.requested_owner_concurrency==2 and .scheduler.owner_concurrency==1 and .scheduler.cargo_jobs==8)
