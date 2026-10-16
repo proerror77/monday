@@ -761,6 +761,13 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
+    .github/actions/sqlx-cli-tool/*|.github/scripts/sqlx-cli-tool.sh|.github/scripts/test-sqlx-cli-tool.sh|.github/scripts/verify-sqlx-cli-postgres.sh)
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      select_job ploy/sqlx-cli-equivalence
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
     .github/scripts/cargo-license-tool.sh|.github/scripts/test-cargo-license-tool.sh)
       select_job ci/ci-contracts
       select_job ploy/workflow-lint

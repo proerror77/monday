@@ -1,0 +1,39 @@
+name: PostgreSQL rustls SQLx CLI
+description: Restore or build the pinned PostgreSQL-only rustls CLI profile
+inputs:
+  probe:
+    description: Use an isolated branch diagnostic cache on explicit manual runs
+    default: 'false'
+outputs:
+  cache-hit:
+    description: Exact executable cache hit
+    value: ${{ steps.restore.outputs.cache-hit }}
+  key:
+    description: Tool/compiler/platform cache identity
+    value: ${{ steps.prepare.outputs.key }}
+runs:
+  using: composite
+  steps:
+    - name: Prepare SQLx CLI cache
+      id: prepare
+      shell: bash
+      env:
+        SQLX_CACHE_PROBE: ${{ inputs.probe }}
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/sqlx-cli-tool.sh" prepare
+    - name: Restore SQLx CLI
+      id: restore
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        key: ${{ steps.prepare.outputs.key }}
+        path: ${{ steps.prepare.outputs.path }}
+    - name: Install or verify SQLx CLI
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/sqlx-cli-tool.sh" install "$CACHE_HIT"
+    - name: Save SQLx CLI
+      if: steps.restore.outputs.cache-hit != 'true' && steps.prepare.outputs.save_allowed == 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        key: ${{ steps.prepare.outputs.key }}
+        path: ${{ steps.prepare.outputs.path }}
