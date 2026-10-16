@@ -761,6 +761,23 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
+    .github/actions/sqlx-cli-tool/*|.github/scripts/sqlx-cli-tool.sh|.github/scripts/test-sqlx-cli-tool.sh|.github/scripts/verify-sqlx-cli-postgres.sh)
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      select_job ploy/sqlx-cli-equivalence
+      select_job ploy/rust-control-plane
+      select_job ploy/rust-market-data
+      select_job ploy/rust-research-heavy
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
+    .github/scripts/cargo-license-tool.sh|.github/scripts/test-cargo-license-tool.sh)
+      select_job ci/ci-contracts
+      select_job ploy/workflow-lint
+      select_security_job security/license-check
+      [[ $event == pull_request ]] && select_job ploy/commit-hygiene
+      continue
+      ;;
     .github/workflows/market-tape-seal-benchmark.yml|.github/workflows/release-rust.yml|\
     .github/workflows/ci.yml|.github/workflows/ploy-ci.yml|.github/workflows/security-enabled.yml|\
     .github/workflows/test-install-ubuntu-packages.sh|\

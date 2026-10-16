@@ -6,15 +6,11 @@ cd "$(dirname "$0")/../../rust_hft/prediction-markets"
 : "${DATABASE_URL:?ephemeral PostgreSQL URL required}"
 : "${PLOY_TEST_DATABASE_URL:?ephemeral PostgreSQL test URL required}"
 : "${SQLX_CLI_VERSION:?pinned SQLx CLI version required}"
+[[ $(sqlx --version) == "sqlx-cli $SQLX_CLI_VERSION" ]] || { echo 'pinned SQLx CLI is not prepared' >&2; exit 2; }
 
 cargo check --locked -p ploy-market-data --features live --lib
 cargo test --locked -p ploy-market-data --features live --lib
 
-cargo install sqlx-cli \
-  --locked \
-  --version "${SQLX_CLI_VERSION}" \
-  --no-default-features \
-  --features rustls,postgres
 sqlx migrate run
 
 # Reuse the live lib test above. Missing or renamed tests must fail this lane.

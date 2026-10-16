@@ -292,7 +292,35 @@ rm "$work/prior-attempt"
 publisher "$head"
 printf 'PASS: failed OSS/sibling jobs retain only delivered products; reruns retain original image attempt; images never imply signed Builds\n'
 
+# Keep production timers intact while testing their requested values. Only
+# read_baseline loads this shim; production entry points do not configure it.
+# The hanging gh process still hits a real timeout and real process-group kill.
+cat >"$work/retry-clock.rb" <<'RUBY'
+require 'timeout'
+module RetryFixtureTimeout
+  def timeout(seconds, *args, &block)
+    raise "unexpected GET timeout: #{seconds}" unless seconds == 45
+    super(1, *args, &block)
+  end
+end
+Timeout.singleton_class.prepend(RetryFixtureTimeout)
+module RetryFixtureSleep
+  def sleep(seconds)
+    return super unless Thread.current == Thread.main
+    File.open(ENV.fetch('RETRY_TIMING_LOG'), 'a') { |log| log.puts(seconds) }
+    0
+  end
+end
+Object.prepend(RetryFixtureSleep)
+RUBY
+assert_delays() {
+  : >"$work/expected-delays"
+  for delay; do printf '%s\n' "$delay" >>"$work/expected-delays"; done
+  cmp "$work/expected-delays" "$work/retry-timing"
+}
+
 # Partial failed responses must be discarded before a bounded GET retry.
+retry_started=$SECONDS
 reader="$root/.github/scripts/read-research-publish-baseline.sh"
 retry_fixture() {
   publisher "$head"
@@ -300,11 +328,16 @@ retry_fixture() {
   printf '%s\n' "$2" >"$work/api-failure-count"
   printf '%s\n' "${3:-runs}" >"$work/api-failure-target"
   : >"$work/api-calls"
+  : >"$work/retry-timing"
   rm -f "$work/retry-baseline"
 }
-read_baseline() { bash "$reader" "$head" "$work/retry-baseline" 2>"$work/retry-log"; }
+read_baseline() {
+  RUBYOPT="${RUBYOPT:+$RUBYOPT }-r$work/retry-clock.rb" RETRY_TIMING_LOG="$work/retry-timing" \
+    bash "$reader" "$head" "$work/retry-baseline" 2>"$work/retry-log"
+}
 retry_fixture 502 1
 read_baseline
+assert_delays 1
 jq -e --arg sha "$head" 'all(.[]; .==$sha)' "$work/retry-baseline" >/dev/null
 [[ $(grep -c '^runs$' "$work/api-calls") == 2 ]]
 grep -Fq 'resource=workflow_runs attempt=1 status=502 retry=true' "$work/retry-log"
@@ -313,9 +346,11 @@ if grep -Fq 'private debug' "$work/retry-log"; then
 fi
 retry_fixture 503 1 pair
 read_baseline
+assert_delays 1
 [[ $(grep -c '^pair$' "$work/api-calls") == 2 ]]
 retry_fixture hang 1
 read_baseline
+assert_delays 1
 [[ $(grep -c '^runs$' "$work/api-calls") == 2 ]]
 grep -Fq 'status=timeout retry=true' "$work/retry-log"
 if kill -0 "$(cat "$work/api-hang-pid")" 2>/dev/null; then
@@ -324,11 +359,13 @@ fi
 for status in 500 502 503 504; do
   retry_fixture "$status" 10
   if read_baseline; then echo 'persistent GET failure admitted' >&2; exit 1; fi
+  assert_delays 1 2
   [[ $(grep -c '^runs$' "$work/api-calls") == 3 && ! -e $work/retry-baseline ]]
 done
 for status in 401 403 404 429; do
   retry_fixture "$status" 10
   if read_baseline; then echo 'permanent API rejection retried or admitted' >&2; exit 1; fi
+  assert_delays
   [[ $(grep -c '^runs$' "$work/api-calls") == 1 && ! -e $work/retry-baseline ]]
 done
 rm "$work/api-failure"
@@ -340,6 +377,7 @@ for broken in '[{}]' '[]' 'not JSON'; do
   : >"$work/api-calls"
   rm -f "$work/retry-baseline"
   if read_baseline; then echo 'malformed pagination admitted' >&2; exit 1; fi
+  assert_delays
   [[ $(grep -c '^runs$' "$work/api-calls") == 1 && ! -e $work/retry-baseline ]]
 done
 cp "$work/complete-runs" "$work/runs"
@@ -360,3 +398,4 @@ rm -f "$work/retry-baseline"
 if read_baseline; then echo 'truncated run history admitted' >&2; exit 1; fi
 [[ ! -e $work/retry-baseline ]]
 printf 'PASS: bounded GET retry discards partial bytes; permanent failures, incomplete pages and mismatched identities fail closed\n'
+printf 'retry_fixture elapsed_seconds=%s\n' "$((SECONDS - retry_started))"
