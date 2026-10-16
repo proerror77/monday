@@ -765,6 +765,9 @@ for path in "${paths[@]}"; do
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
       select_job ploy/sqlx-cli-equivalence
+      select_job ploy/rust-control-plane
+      select_job ploy/rust-market-data
+      select_job ploy/rust-research-heavy
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;

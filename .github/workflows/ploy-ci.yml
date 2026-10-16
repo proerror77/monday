@@ -274,6 +274,10 @@ jobs:
         working-directory: .
         run: bash .github/scripts/test-research-cache-layout.sh
 
+      - name: Test SQLx CLI cache contracts
+        working-directory: .
+        run: bash .github/scripts/test-sqlx-cli-tool.sh
+
       - name: Test ACR publish workflow contract
         run: ../../.github/scripts/test-acr-publish-workflow.sh
 
@@ -658,12 +662,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install SQLx CLI
-        run: |
-          cargo install sqlx-cli \
-            --locked \
-            --version "${SQLX_CLI_VERSION}" \
-            --no-default-features \
-            --features rustls,postgres
+        uses: ./.github/actions/sqlx-cli-tool
 
       - name: Prepare database schema
         env:
@@ -845,6 +844,9 @@ jobs:
           shared-key: rust-market-data-${{ steps.cache-info.outputs.rust }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install SQLx CLI
+        uses: ./.github/actions/sqlx-cli-tool
+
       - name: Verify market-data and ephemeral database contracts
         working-directory: .
         run: bash .github/scripts/run-prediction-market-data-contracts.sh
@@ -881,6 +883,9 @@ jobs:
           workspaces: rust_hft/prediction-markets
           key: prediction-research-heavy
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install SQLx CLI
+        uses: ./.github/actions/sqlx-cli-tool
+
       - name: Verify research and ephemeral database contracts
         working-directory: .
         run: bash .github/scripts/run-prediction-research-contracts.sh
