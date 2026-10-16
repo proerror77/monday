@@ -247,16 +247,18 @@ abort 'loop step still runs cargo test' if loop.fetch('run').include?('cargo-sco
 abort 'loop step does not wait for shards' unless loop.fetch('run').include?('loop-nextest-wait.sh')
 archive = jobs.fetch('rust_loop_nextest_archive')
 abort 'archive must depend only on scope' unless archive.fetch('needs') == 'scope'
-cache = archive.fetch('steps').find { |step| step['uses'].to_s.include?('Swatinem/rust-cache@') }
-abort 'archive cache key drifted' unless cache && cache.dig('with', 'key') == 'loop-nextest-research-owner-v2-${{ steps.cache-info.outputs.rust }}'
-cache_pairs = cache.dig('with', 'workspaces').lines.map(&:strip).reject(&:empty?).map { |line| line.split(/\s*->\s*/) }
-abort 'archive cleanup must use only the research owner' unless cache_pairs.length == 1 && cache_pairs[0][0] == 'rust_hft/research-core'
-cache_source, cache_target = cache_pairs.fetch(0)
-abort 'archive cache target is missing' unless cache_target
-target = Pathname.new(cache_source).join(cache_target).cleanpath.to_s
-build_target = archive.fetch('env').fetch('CARGO_TARGET_DIR').delete_prefix('${{ github.workspace }}/')
-abort 'archive cache does not cover its Cargo target' unless target == build_target
-abort 'archive cache save drifted' unless cache.dig('with', 'save-if') == "${{ github.ref == 'refs/heads/main' }}"
+archive_steps = archive.fetch('steps')
+cache = archive_steps.find { |step| step['uses'].to_s.start_with?('actions/cache/restore@') }
+save = archive_steps.find { |step| step['uses'].to_s.start_with?('actions/cache/save@') }
+abort 'archive must retain its path native dependency' unless cache && save && archive.dig('env', 'MONDAY_CARGO_TARGET_LAYOUT') == 'owning-workspace-v1'
+abort 'archive cache key drifted' unless cache.dig('with', 'key') == 'loop-nextest-${{ steps.cache-info.outputs.key }}'
+abort 'archive restore/save identities differ' unless %w[key path].all? { |key| cache.dig('with',key) == save.dig('with',key) }
+abort 'archive compatible restore missing' unless cache.dig('with','restore-keys') == 'loop-nextest-${{ steps.cache-info.outputs.compat_prefix }}'
+cleanup = archive_steps.index { |step| step['run'].to_s.include?('ci-owner-cache.sh" cleanup') }
+abort 'archive cache must clean local application bytes before save' unless cleanup && cleanup < archive_steps.index(save)
+abort 'archive cache is not main/success bound' unless save.fetch('if').include?("github.ref == 'refs/heads/main' && success()")
+prepare = archive_steps.index { |step| step['run'].to_s.include?('prepare-research-native-source.sh') }
+abort 'archive native source preparation must precede restore' unless prepare && prepare < archive_steps.index(cache)
 shard = jobs.fetch('rust_loop_nextest_shard')
 abort 'shard must depend only on the archive' unless shard.fetch('needs') == 'rust_loop_nextest_archive'
 abort 'shard fail-fast must stay off' unless shard.dig('strategy', 'fail-fast') == false

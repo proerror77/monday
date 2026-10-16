@@ -13,11 +13,11 @@ products="$root/.github/scripts/research-release-products.sh"
 bash "$products" recipes prediction-runner >"$work/prediction-recipes"
 jq -s -e 'length==3 and all(.[]; .manifest=="prediction-markets/Cargo.toml") and any(.[]; .package=="ploy-research" and (.binaries|length)==3) and any(.[]; .package=="hft-prediction-research-worker" and .binaries==["monday-prediction-worker"]) and any(.[]; .package=="hft-prediction-research-operator" and .binaries==["monday-prediction-operator"])' "$work/prediction-recipes" >/dev/null
 bash "$products" recipes cex-runner >"$work/cex-recipes"
-jq -s -e 'length==6 and any(.[]; .package=="hft-cex-data-preparation" and .manifest=="data-pipelines/Cargo.toml" and .binaries==["monday-cex-prepare"]) and any(.[]; .package=="hft-cex-research-worker" and .binaries==["monday-cex-worker"]) and all(.[]; .package!="ploy-research" and .manifest!="prediction-markets/Cargo.toml")' "$work/cex-recipes" >/dev/null
-jq -s -e 'any(.[]; .package=="alpha-harness" and .features=="offline-diagnostic" and .binaries==["monday-offline-baseline"]) and any(.[]; .package=="alpha-harness" and .features=="" and .binaries==["alpha-harness"])' "$work/cex-recipes" >/dev/null
-[[ $(bash "$products" binaries cex-runner | wc -l) -eq 9 ]]
-[[ $(bash "$products" binaries all | wc -l) -eq 14 ]]
-[[ $(bash "$products" binaries cex-runner,controller | wc -l) -eq 9 ]]
+jq -s -e 'length==5 and any(.[]; .package=="hft-cex-data-preparation" and .manifest=="data-pipelines/Cargo.toml" and .binaries==["monday-cex-prepare"]) and any(.[]; .package=="hft-cex-research-worker" and .binaries==["monday-cex-worker"]) and all(.[]; .package!="ploy-research" and .manifest!="prediction-markets/Cargo.toml")' "$work/cex-recipes" >/dev/null
+jq -s -e 'all(.[]; (.binaries|index("monday-offline-baseline"))==null) and any(.[]; .package=="alpha-harness" and .features=="" and .binaries==["alpha-harness"])' "$work/cex-recipes" >/dev/null
+[[ $(bash "$products" binaries cex-runner | wc -l) -eq 8 ]]
+[[ $(bash "$products" binaries all | wc -l) -eq 13 ]]
+[[ $(bash "$products" binaries cex-runner,controller | wc -l) -eq 8 ]]
 [[ $(bash "$products" merge controller prediction-runner) == controller,prediction-runner ]]
 for invalid in runner paired '' 'cex-runner,cex-runner' 'prediction-runner,unknown' 'all,controller'; do
   if bash "$products" normalize "$invalid" >"$work/rejection" 2>&1; then
@@ -33,6 +33,10 @@ catalog=JSON.parse(File.read(File.join(root,'.github/scripts/research-release-pr
   prebuilt=text.split(/^FROM runtime-base AS prebuilt\s*$/,2).fetch(1).split(/^FROM /,2).first
   copied=prebuilt.scan(/^COPY --chmod=0755 research-bin\/(\S+) \/usr\/local\/bin\/(\S+)$/)
   abort "unexpected prebuilt COPY: #{product}" unless copied.all? { |source,target| source==target } && copied.map(&:first).sort==catalog.fetch(product).sort
+  builder=text.split(/^FROM .* AS runtime-base\s*$/,2).first
+  installed=builder.scan(/install -D -m 0755 (\S+) \/out\/bin\/(\S+)/)
+  target=product=='cex-runner' ? '/work/target/release' : '/work/target/prediction-markets/release'
+  abort "unexpected source install: #{product}" unless installed.all? { |source,binary| source=="#{target}/#{binary}" } && installed.map(&:last).sort==catalog.fetch(product).sort
   foreign=catalog.fetch(product=='cex-runner' ? 'prediction-runner' : 'cex-runner')
   abort "source builder imports another domain: #{product}" if foreign.any? { |binary| text.include?(binary) }
 end
@@ -88,7 +92,7 @@ bash "$root/.github/scripts/test-research-product-image.sh"
 # binaries. Only the target recorded by compiler inputs may reach the archive.
 fixture="$work/producer"
 mkdir -p "$fixture/.github/scripts" "$fixture/rust_hft" "$fixture/bin" "$fixture/output"
-for script in research-cache-layout.sh build-research-release.sh build-research-recipes.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
+for script in research-cache-layout.sh build-research-release.sh build-research-recipes.sh compile-research-recipe.sh research-release-source-sha.sh research-release-products.sh research-release-products.json research-workspace-locks.sh research-image-release-artifact.sh verify-research-runner-binaries.sh research-release-bundle.rb; do
   cp "$root/.github/scripts/$script" "$fixture/.github/scripts/$script"
 done
 cp "$root/rust_hft/workspaces.json" "$fixture/rust_hft/workspaces.json"
@@ -143,6 +147,9 @@ if [[ $1 == metadata ]]; then
   jq -n --arg root "$PWD" '{packages:[{name:"alpha-harness",manifest_path:($root+"/alpha-harness/Cargo.toml"),targets:[{name:"alpha_harness"}]}]}'
   exit
 fi
+[[ ${CARGO_LOG:-} == cargo::core::compiler::fingerprint=info ]]
+[[ ${CARGO_TERM_COLOR:-} == never ]]
+printf ' INFO cargo::core::compiler::fingerprint: fingerprint error for libduckdb-sys: missing fixture fingerprint\n' >&2
 printf 'build\n' >>"${MONDAY_TEST_CARGO_BUILD_LOG:?}"
 [[ ${FAIL_RECIPE:-0} != 1 ]] || exit 37
 target='' manifest='' package='' features='' jobs='' binaries=()
@@ -171,6 +178,17 @@ File.open(file, 'a') { |out| out.flock(File::LOCK_EX); out.puts(JSON.generate(re
 RUBY
   }
   event start
+  if [[ ${MONDAY_TEST_CARGO_MODE:-} == reclaim && $package == alpha-harness ]]; then
+    # Hold the slow owner until the supervisor observes both fast owners exit.
+    # Its current invocation keeps two jobs; only its next recipe may use four.
+    released=0
+    for ((wait_count=0; wait_count<200; wait_count++)); do
+      leases=("$RUNNER_TEMP"/research-recipe-jobs.*/research-core.jobs)
+      if [[ ${#leases[@]} == 1 && -f ${leases[0]} && $(cat "${leases[0]}") == 4 ]]; then released=1; break; fi
+      sleep 0.05
+    done
+    (( released == 1 )) || { echo 'final owner never reclaimed idle CPUs' >&2; exit 95; }
+  fi
   if [[ ${MONDAY_TEST_CARGO_MODE:-} == fail-and-cancel || ${MONDAY_TEST_CARGO_MODE:-} == interrupted ]]; then
     if [[ $package == hft-collector ]]; then
       ruby -e 'Signal.trap("TERM") {}; File.write(ARGV[0], Process.pid.to_s); sleep 30' "${MONDAY_TEST_COMPILER_PID:?}" &
@@ -218,6 +236,7 @@ jq --argjson count "$(bash "$products" recipes controller | jq -s length)" -es '
   and ([.[].phase]|unique)==["after-cache-lookup","dependency-warm-parallel","dependency-warm-serial","warm-local"]
   and ([.[].compilation_inputs_sha256]|unique|length)==1
   and ([.[].build_inputs]|unique|length)==1
+  and all(.[]; (.native_fingerprint_diagnostics|length)==1 and (.native_fingerprint_diagnostics[0]|contains("libduckdb-sys")))
   and all(.[]; .build_inputs.profile=="release" and .build_inputs.target=="x86_64-unknown-linux-gnu" and .phase_seconds>=0)
   and all(.[]|select(.phase=="dependency-warm-serial"); .scheduler.requested_owner_concurrency==1 and .scheduler.owner_concurrency==1 and .scheduler.cargo_jobs==8)
   and all(.[]|select(.phase=="dependency-warm-parallel"); .scheduler.requested_owner_concurrency==2 and .scheduler.owner_concurrency==1 and .scheduler.cargo_jobs==8)
@@ -283,8 +302,40 @@ events.sort_by { |event| event.fetch('at') }.each do |event|
 end
 abort 'independent owners never overlapped' unless maximum == 2 && active.empty?
 RUBY
-jq --argjson count "$(bash "$products" recipes all | jq -s length)" -es 'length==$count and all(.[]; .scheduler.owner_concurrency==2 and .scheduler.cargo_jobs==2)' \
+jq --argjson count "$(bash "$products" recipes all | jq -s length)" -es 'length==$count and all(.[]; .scheduler.owner_concurrency==2 and (.scheduler.cargo_jobs==2 or .scheduler.cargo_jobs==4))' \
   "$fixture/parallel-output/research-recipe-probe/timings.jsonl" >/dev/null
+
+# Reclaim only after both other owners exit, without changing an in-flight build.
+rm -f "$MONDAY_TEST_CARGO_EVENTS"
+mkdir -p "$fixture/reclaim-output"
+MONDAY_TEST_CARGO_MODE=reclaim PATH="$fixture/bin:$PATH" RUNNER_TEMP="$fixture/reclaim-output" MONDAY_SOURCE_REVISION="$sha" \
+  MONDAY_BUILD_INPUTS_FILE="$fixture/all-inputs.json" CARGO_BUILD_JOBS=4 \
+  bash "$fixture/.github/scripts/build-research-recipes.sh" all after-cache-lookup >"$work/reclaim.log"
+ruby -rjson - "$MONDAY_TEST_CARGO_EVENTS" <<'RUBY'
+events = File.readlines(ARGV[0]).map { |line| JSON.parse(line) }.sort_by { |event| event.fetch('at') }
+active = {}
+reclaimed = false
+events.each do |event|
+  owner = event.fetch('manifest')
+  if event.fetch('event') == 'start'
+    abort 'overlapping owner target writes' if active.key?(owner)
+    if event.fetch('package') == 'alpha-harness'
+      abort 'in-flight budget changed' unless event.fetch('jobs') == 2
+    elsif event.fetch('package') == 'hft-cex-research-worker'
+      abort 'idle CPUs were not reclaimed' unless event.fetch('jobs') == 4 && active.empty?
+      reclaimed = true
+    end
+    active[owner] = event.fetch('jobs')
+  else
+    abort 'completion without owner' unless active.delete(owner)
+  end
+  abort 'CPU or owner budget exceeded' unless active.length <= 2 && active.values.sum <= 4
+end
+abort 'reclaim evidence incomplete' unless reclaimed && active.empty?
+RUBY
+jq -es 'any(.[]; .recipe.package=="hft-cex-research-worker" and .scheduler.cargo_jobs==4)' \
+  "$fixture/reclaim-output/research-recipe-probe/timings.jsonl" >/dev/null
+[[ -z $(find "$fixture/reclaim-output" -name 'research-recipe-jobs.*' -print) ]]
 
 # Low available memory reduces overlap. Explicit serial mode uses the same recipes.
 printf 'MemAvailable: 4194304 kB\n' >"$MONDAY_TEST_MEMINFO_FILE"
@@ -306,6 +357,7 @@ MONDAY_TEST_CARGO_MODE=fail-and-cancel PATH="$fixture/bin:$PATH" RUNNER_TEMP="$f
   GITHUB_REPOSITORY=fixture/monday GITHUB_RUN_ID=42 MONDAY_BUILD_INPUTS_FILE="$fixture/all-inputs.json" \
   bash "$fixture/.github/scripts/build-research-release.sh" all >"$work/cancel.log" 2>&1 || code=$?
 [[ $code == 37 && ! -e $fixture/cancel-output/research-image-release.tar ]]
+[[ -z $(find "$fixture/cancel-output" -name 'research-recipe-jobs.*' -print) ]]
 for pid_file in "$MONDAY_TEST_COMPILER_PID" "$MONDAY_TEST_FAILED_COMPILER_PID"; do
   compiler_pid=$(cat "$pid_file")
   # PID 1 may retain an exited orphan as a zombie; it cannot execute anymore.
@@ -356,6 +408,7 @@ ensure
 end
 RUBY
 [[ ! -e $fixture/interrupted-output/research-image-release.tar ]]
+[[ -z $(find "$fixture/interrupted-output" -name 'research-recipe-jobs.*' -print) ]]
 
 # Invalid resource requests fail before starting a compiler.
 for request in cpu concurrency; do

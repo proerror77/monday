@@ -4,6 +4,7 @@
 set -euo pipefail
 output=${1:?output JSON required}
 root=$(cd "$(dirname "$0")/../.." && pwd)
+bash "$root/.github/scripts/prepare-research-native-source.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 test "$(uname -s)" = Linux
@@ -29,8 +30,18 @@ for variable in CC CXX AR LD CFLAGS CXXFLAGS LDFLAGS RUSTC_BOOTSTRAP CARGO_BUILD
   LIBRARY_PATH LD_LIBRARY_PATH CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH \
   PKG_CONFIG PKG_CONFIG_PATH PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR \
   OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_STATIC \
-  BINDGEN_EXTRA_CLANG_ARGS PROTOC PROTOC_INCLUDE CMAKE_TOOLCHAIN_FILE; do
+  BINDGEN_EXTRA_CLANG_ARGS PROTOC PROTOC_INCLUDE CMAKE_TOOLCHAIN_FILE \
+  DUCKDB_STATIC DUCKDB_LIB_DIR DUCKDB_INCLUDE_DIR DUCKDB_DOWNLOAD_LIB \
+  RANLIB ARFLAGS CXXSTDLIB CRATE_CC_NO_DEFAULTS CC_SHELL_ESCAPED_FLAGS \
+  CMAKE_GENERATOR CMAKE_MAKE_PROGRAM CMAKE_PREFIX_PATH; do
   printf '%s=%s\n' "$variable" "${!variable-}" >>"$work/native"
+done
+# cc-rs also accepts target-specific compiler and flag overrides.
+while IFS= read -r variable; do
+  printf '%s=%s\n' "$variable" "$(printenv "$variable")" >>"$work/native"
+done < <(env | awk -F= '$1 ~ /^(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|ARFLAGS|CXXSTDLIB)_(x86_64|x86-64)/ || $1 ~ /^(HOST|TARGET)_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|ARFLAGS|CXXSTDLIB)$/ {print $1}' | LC_ALL=C sort)
+for command in cc c++ ar ld ranlib; do
+  sha256sum "$(command -v "$command")" >>"$work/native"
 done
 for command in clang cmake mold pkg-config protoc zstd zstdmt unzstd; do "$command" --version >>"$work/native"; done
 # Bind relevant Cargo overrides without capturing registry or service secrets.
@@ -62,17 +73,9 @@ while IFS= read -r manifest; do
 done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
 recipes=$(bash "$root/.github/scripts/research-release-products.sh" recipes "${2:-all}" | jq -s .)
 locks=$("$root/.github/scripts/research-workspace-locks.sh" "$root/rust_hft")
-cat "$root/.github/scripts/build-research-release.sh" \
-  "$root/.github/scripts/build-research-recipes.sh" \
-  "$root/.github/scripts/research-cache-layout.sh" \
-  "$root/.github/scripts/research-release-products.sh" \
-  "$root/.github/scripts/research-release-products.json" \
-  "$root/.github/scripts/research-release-source-sha.sh" \
-  "$root/.github/scripts/research-workspace-locks.sh" \
-  "$root/.github/scripts/verify-research-runtime-abi.sh" \
-  "$root/.github/scripts/verify-research-runner-binaries.sh" >"$work/recipe"
-# Bind the fixed CI parser implementation alongside the build recipe.
-find "$root/.github/scripts/vendor/tomlrb/lib" -type f -name '*.rb' -print0 | LC_ALL=C sort -z | xargs -0 cat >>"$work/recipe"
+# The selected recipes below bind catalog contents to exact provenance.
+# Packaging-only catalog edits must not invalidate compatible dependencies.
+bash "$root/.github/scripts/research-cache-layout.sh" recipe-inputs >"$work/recipe"
 jq -S -n --arg compiler "$(sha256sum "$work/compiler" | awk '{print $1}')" \
   --arg native "$(sha256sum "$work/native" | awk '{print $1}')" \
   --arg flags "$(sha256sum "$work/flags" | awk '{print $1}')" \
@@ -86,6 +89,8 @@ jq -S -n --arg compiler "$(sha256sum "$work/compiler" | awk '{print $1}')" \
 if [[ -n ${GITHUB_OUTPUT:-} ]]; then printf 'cache_sha256=%s\n' "$(sha256sum "$output" | awk '{print $1}')" >>"$GITHUB_OUTPUT"; fi
 # This separate restore identity does not replace the complete v3 provenance.
 bash "$root/.github/scripts/research-cache-layout.sh" compatibility-inputs "$output" >"$work/dependency-cache-inputs.json"
+# Retain a small, public native identity summary in the producer log.
+jq -c '.native_dependencies.closures[] | {owner,duckdb:[.packages[] | select(.name=="libduckdb-sys") | {name,version,checksum,features}]}' "$work/dependency-cache-inputs.json"
 if [[ -n ${GITHUB_OUTPUT:-} ]]; then
   printf 'dependency_cache_sha256=%s\n' "$(sha256sum "$work/dependency-cache-inputs.json" | awk '{print $1}')" >>"$GITHUB_OUTPUT"
 fi

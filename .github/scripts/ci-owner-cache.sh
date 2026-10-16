@@ -130,14 +130,18 @@ begin
     "rust_hft/workspaces.json", ".github/scripts/ci-owner-cache.sh",
     ".github/scripts/test-rust-workspaces.sh", ".github/scripts/check-collector-test-presence.sh",
     ".github/workflows/ci.yml", ".github/scripts/select-rust-ci-scope.sh",
-    "deployment/aliyun/test-polymarket-raw-ops-control-plane.sh"]
+    "deployment/aliyun/test-polymarket-raw-ops-control-plane.sh", ".github/scripts/prepare-research-native-source.sh"]
   parser = Dir.glob("#{root}/.github/scripts/vendor/tomlrb/lib/**/*.rb").sort.to_h do |path|
     [path.delete_prefix("#{root}/"), file_digest(path)]
   end
   abort 'missing Cargo TOML parser' if parser.empty?
-  compatibility = {schema: 'monday.ci-owner-cache-compat.v2', compiler: compiler, target: host,
+  native_root = "#{root}/rust_hft/native/libduckdb-sys"
+  native_files = Dir.glob("#{native_root}/**/*", File::FNM_DOTMATCH).select { |path| File.file?(path) }.sort
+  abort 'native patch contains symlinks' if native_files.any? { |path| File.symlink?(path) }
+  native_patch = native_files.to_h { |path| [path.delete_prefix(native_root + '/'), file_digest(path)] }
+  compatibility = {native_patch: native_patch, native_preparation: file_digest("#{root}/.github/scripts/prepare-research-native-source.sh"), schema: 'monday.ci-owner-cache-compat.v3', compiler: compiler, target: host,
     profile: 'dev-test', native: native, flags: flags, configs: configs, profiles: profiles, owners: admitted, parser: parser}
-  prefix = "rust_hft-ci-owner-v2-#{digest(compatibility)}-"
+  prefix = "rust_hft-ci-owner-v3-#{digest(compatibility)}-"
   exact = {coverage: coverage, manifests: manifests, configs: configs,
     helpers: helpers.to_h { |path| [path, file_digest("#{root}/#{path}")] }}
   puts "compat_prefix=#{prefix}"
@@ -188,7 +192,8 @@ if [[ $mode == native-input ]]; then
       CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH PKG_CONFIG PKG_CONFIG_PATH \
       PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR BINDGEN_EXTRA_CLANG_ARGS \
       OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_STATIC \
-      PROTOC PROTOC_INCLUDE CMAKE_TOOLCHAIN_FILE; do
+      PROTOC PROTOC_INCLUDE CMAKE_TOOLCHAIN_FILE \
+      DUCKDB_STATIC DUCKDB_LIB_DIR DUCKDB_INCLUDE_DIR DUCKDB_DOWNLOAD_LIB; do
       printf '%s=%s\n' "$variable" "${!variable-}"
     done
   } >"$work/native"
@@ -205,11 +210,11 @@ while IFS= read -r manifest; do
     --locked --all-features --format-version 1 >>"$work/metadata.jsonl"
 done <<<"$manifests"
 jq -se --arg root "$root/" \
-  '[.[].packages[]|select(.source == null or (.manifest_path|startswith($root)))|.name,.targets[].name]|unique|
+  '[.[].packages[]|select((.source == null or (.manifest_path|startswith($root))) and (.manifest_path != ($root+"rust_hft/native/libduckdb-sys/Cargo.toml")))|.name,.targets[].name]|unique|
    if length>0 then . else error("no repository-local compilation packages") end' \
   "$work/metadata.jsonl" >"$work/local-names.json"
 jq -s --arg root "$root/" \
-  '[.[].packages[]|select(.source != null and (.manifest_path|startswith($root)|not))|.name,.targets[].name]|unique' \
+  '[.[].packages[]|select((.source != null and (.manifest_path|startswith($root)|not)) or (.name == "libduckdb-sys" and .manifest_path == ($root+"rust_hft/native/libduckdb-sys/Cargo.toml")))|.name,.targets[].name]|unique' \
   "$work/metadata.jsonl" >"$work/external-names.json"
 ruby -rjson -rfileutils - "$root" "$work/local-names.json" "$work/external-names.json" <<'RUBY'
 root, names_file, external_file = ARGV

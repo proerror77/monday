@@ -52,6 +52,8 @@ fi
 native_before=$(PATH="$work/native-bin:$PATH" bash "$root/.github/scripts/ci-owner-cache.sh" native-input)
 native_after=$(PATH="$work/native-bin:$PATH" CXXFLAGS=-DFIXTURE_NATIVE_INPUT_CHANGED bash "$root/.github/scripts/ci-owner-cache.sh" native-input)
 [[ $native_before != "$native_after" ]]
+native_duckdb=$(PATH="$work/native-bin:$PATH" DUCKDB_LIB_DIR=/fixture/other-duckdb bash "$root/.github/scripts/ci-owner-cache.sh" native-input)
+[[ $native_before != "$native_duckdb" ]]
 # A narrow first save must not become an exact hit for wider coverage.
 plan=$(jq -cn '{handoff:"false",json:"false",ondo:"false",collector:"false",control:"false",focused:"true",loop:"false",owning_packages:",,",focused_packages:",hft-live,",loop_packages:""}')
 coverage() { MONDAY_CI_CACHE_PLAN="$1" bash "$root/.github/scripts/ci-owner-cache.sh" coverage-input; }
@@ -98,7 +100,7 @@ if [[ $1 == metadata ]]; then
       {id:"hft-data",name:"hft-data",manifest_path:($root+"/rust_hft/data-pipelines/core/Cargo.toml"),targets:[{name:"data"}]}] +
      if $extra then [{id:"vendor",name:"hidden-local",manifest_path:($root+"/vendor/hidden/Cargo.toml"),targets:[{name:"hidden_local"}]},
        {id:"outside",name:"external-local",source:null,manifest_path:"/external/path/Cargo.toml",targets:[{name:"external_local"}]},
-       {id:"registry",name:"libduckdb-sys",source:"registry+https://github.com/rust-lang/crates.io-index",manifest_path:"/registry/libduckdb/Cargo.toml",targets:[{name:"libduckdb_sys"}]},
+       {id:"registry",name:"libduckdb-sys",source:null,manifest_path:($root+"/rust_hft/native/libduckdb-sys/Cargo.toml"),targets:[{name:"libduckdb_sys"}]},
        {id:"encoding",name:"data-encoding",source:"registry+https://github.com/rust-lang/crates.io-index",manifest_path:"/registry/data-encoding/Cargo.toml",targets:[{name:"data_encoding"}]}] else [] end)}'
 else
   [[ ${FAIL_CARGO:-0} != 1 ]] || exit 19
@@ -312,6 +314,11 @@ Dir.mktmpdir('ci-cache-coverage') do |fixture|
   _, _, status = Open3.capture3('git', '-C', fixture, 'add', '.')
   abort 'fixture git add failed' unless status.success?
   baseline = cache_inputs.call(fixture)
+  native_file = "#{fixture}/rust_hft/native/libduckdb-sys/build.rs"
+  FileUtils.mkdir_p(File.dirname(native_file))
+  File.write(native_file, 'changed native source fixture')
+  abort 'native source bytes crossed compatibility boundary' if cache_inputs.call(fixture)['compat_prefix'] == baseline['compat_prefix']
+  FileUtils.rm_f(native_file)
   wide = cache_inputs.call(fixture, plan.merge('focused_packages' => 'hft-live,hft-cex-research-worker'))
   abort 'coverage changed compatible restore prefix' unless wide['compat_prefix'] == baseline['compat_prefix']
   abort 'coverage changed no exact key' if wide['key'] == baseline['key']

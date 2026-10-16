@@ -1,0 +1,88 @@
+# CEX image build scope
+
+The production CEX image packages eight executables through five release recipes.
+The offline diagnostic has a separate local build documented in [OFFLINE_BASELINE.md](OFFLINE_BASELINE.md).
+Removing that executable removes its operator-plus-offline recipe from every CEX image build.
+It does not remove the scientific worker's offline-diagnostic library feature.
+
+## Entry points and dependency boundaries
+
+| Entry | Build owner and features | Packaging decision |
+| --- | --- | --- |
+| `hft-backtest` | research-core; default | Retain the existing Docker entry point. |
+| `alpha-harness` | research-core; default operator | Retain Campaign freeze, finalize and dispatch commands. Controller shares these exact bytes. |
+| `monday-cex-worker` | research-core; scientific, without alpha-harness default features | Retain the admitted Campaign execution entry point. |
+| `monday-offline-baseline` | Explicit local alpha-harness offline-diagnostic build, without defaults | Exclude from production images. No production entry point invokes it. |
+| `lob-pit-materializer` | data-pipelines; collector | Retain materialization script dependency. |
+| `binance-market-tape-slicer` | data-pipelines; collector | Retain materialization script dependency. |
+| `binance-replay-parquet-materializer` | data-pipelines; collector | Retain materialization script dependency. |
+| `clickhouse-analytics-materializer` | data-pipelines; collector | Retain data preparation tooling. |
+| `monday-cex-prepare` | data-pipelines; preparation | Retain preparation and its source-version smoke check. |
+
+The catalog and both Docker build paths must agree. Product tests check the exact
+prebuilt copies, producer archive, binary startup and compiler failure handling.
+The existing dependency graph still propagates shared source changes conservatively.
+No source path is excluded from CI by this change.
+
+## Reuse and identity
+
+Parameter-only experiments reuse an admitted immutable Build and verified prepared inputs.
+Data semantics, including label windows, still invalidate prepared-input reuse.
+See [CAMPAIGN_PREPARATION_REUSE.md](CAMPAIGN_PREPARATION_REUSE.md).
+
+The release profile, target, compiler, native environment and workspace inputs remain
+bound to compilation provenance. Cargo targets stay isolated by owning workspace.
+The changed recipe list remains part of exact build inputs and artifact validation.
+The dependency restore identity binds the small compiler helper, cache cleanup,
+compiler, native environment, flags and owning-workspace profiles.
+Cargo metadata resolves DuckDB's version, immutable source, features and dependency
+closure. Native closure changes isolate the dependency cache.
+Business source, unrelated resolved packages, packaging and smoke scripts remain
+outside this identity. Complete recipe provenance still binds those scripts.
+This migration starts a new key. Branch CI cannot populate trusted main caches.
+The historical main run restored dependencies and marked DuckDB artifacts fresh;
+its 13m48s recipe phase does not establish that every main build was cold.
+Dependency cache reuse does not authenticate executable bytes: builds still produce,
+hash and smoke-test the complete selected product at the admitted source revision.
+No research-profile executable is presented as a release artifact.
+
+## Measurement and remaining scope
+
+The prior reference is Monorepo 38429350564 at 14m19s and Prediction 38429350500
+at 20m51s. Research job 115408859232 took about 15m57s, including 13m52s build.
+The reported merge-to-ACR interval was 24m43s. These are historical observations,
+not a controlled benchmark for this change.
+
+This change reduces nine executables and six recipes to eight and five.
+It does not promise a proportional wall-time reduction: owners run concurrently,
+and the scientific worker still compiles its fitting and offline library closure.
+Use retained recipe timings, exact cache-hit state and runner identity to compare runs.
+Report queue, compilation, packaging and publication separately; overlapping phases
+must not be added together. A draft PR provides no merge-to-ACR measurement.
+
+Further separation of preparation, operator and scientific images requires a complete
+consumer and signed-product protocol change. This patch preserves that boundary.
+The 10–15 minute small-change target remains unproven until comparable CI measurements exist.
+
+The existing diagnostic run 38525297670 tested commit
+`4e64020efbda664eef46790de8373c4b6c5368aa` on one EPYC 9V45 runner with four CPUs.
+Its cold recipe phase took 1481s. Full local reuse took 2s.
+After removing local compilation bytes, serial rebuilding took 568s and parallel
+rebuilding took 502s. DuckDB artifacts stayed fresh in both dependency-warm phases;
+local packages rebuilt and the binary hashes agreed.
+These are recipe timings, not full CI or publication timings.
+The runner differs from the historical EPYC 7763 baseline. This is not an old/new
+code speedup estimate. The dependency identity patch still needs its own CI validation.
+
+## Native resolution deduplication
+
+The catalog repeats Cargo metadata requests for recipes with identical workspace and feature arguments.
+Resolve each distinct command once per identity capture. Keep package-qualified feature requests separate.
+This reduces eight catalog requests to four, before adding the independent publisher request.
+Regression tests compare the resulting native identity with separate per-recipe resolution.
+The memo exists only inside one process. It cannot reuse metadata after source or lockfile changes.
+
+This reduces metadata overhead, not Rust compilation. The helper remains part of the compatibility key.
+Its first CI execution therefore needs a new cache identity. Only successful main builds save trusted bytes.
+A PR rerun cannot establish cross-run warm-cache performance before that identity exists on main.
+Do not interpret same-run diagnostic phases as cross-run cache evidence.

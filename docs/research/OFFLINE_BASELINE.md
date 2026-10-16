@@ -2,6 +2,9 @@
 
 The Rust `monday-offline-baseline` driver fits fixed Ridge folds on prepared native rows and evaluates their full rolling out-of-sample ledger. This diagnostic cannot complete a production Campaign or grant compute authority.
 
+The production `cex-runner` image excludes this diagnostic executable. Build it explicitly with the recipe below.
+Its local output is not a signed production Build or an admitted Campaign runner.
+
 ## Reproduce a local synthetic run
 
 From the repository root:
