@@ -186,7 +186,18 @@ jobs:
           fetch-depth: 0
 
       - name: Install actionlint
-        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.8
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          archive="$work/actionlint.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.8/actionlint_1.7.8_linux_amd64.tar.gz \
+            --output "$archive"
+          echo "be92c2652ab7b6d08425428797ceabeb16e31a781c07bc388456b4e592f3e36a  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$work" actionlint
+          install -D -m 0755 "$work/actionlint" "${HOME}/go/bin/actionlint"
+          "${HOME}/go/bin/actionlint" -version
 
       - name: Validate skill metadata
         working-directory: .
