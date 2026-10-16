@@ -209,6 +209,10 @@ jobs:
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: 1.98.1
+      - name: Verify DuckDB build modes and source freshness guards
+        env:
+          MONDAY_NATIVE_TEST_TARGET: ${{ runner.temp }}/native-mode-target
+        run: bash .github/scripts/test-duckdb-build-modes.sh
       - name: Verify selection, cancellation and aggregate admission
         run: |
           bash .github/scripts/test-collector-control-scheduling.sh
@@ -259,6 +263,7 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_TARGET_DIR: ${{ github.workspace }}/rust_hft/target
       CARGO_INCREMENTAL: "0"
+      MONDAY_CARGO_TARGET_LAYOUT: owning-workspace-v1
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
@@ -275,21 +280,27 @@ jobs:
       - name: Install Linux build tools
         run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" clang mold protobuf-compiler ruby
 
+      - name: Prepare committed native source before cache restore
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/prepare-research-native-source.sh"
+
       - name: Record cache dimensions
         id: cache-info
-        shell: bash
-        run: echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+        env:
+          MONDAY_CI_CACHE_PLAN: ${{ toJSON(needs.scope.outputs) }}
+        run: |
+          native=$(bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" native-input)
+          coverage=$(bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" coverage-input)
+          export MONDAY_CI_CACHE_NATIVE=${native#native=}
+          export MONDAY_CI_CACHE_COVERAGE=${coverage#coverage=}
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" cache-input >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        id: owner-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          # The archive builds research-core. Cleanup must use that owner's
-          # dependency graph, including native DuckDB compilation outputs.
-          workspaces: |
-            rust_hft/research-core -> ../target
-          key: loop-nextest-research-owner-v2-${{ steps.cache-info.outputs.rust }}
-          cache-all-crates: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          path: ${{ steps.cache-info.outputs.cache_paths }}
+          key: loop-nextest-${{ steps.cache-info.outputs.key }}
+          restore-keys: loop-nextest-${{ steps.cache-info.outputs.compat_prefix }}
 
       - name: Install cargo-nextest
         run: bash "$GITHUB_WORKSPACE/.github/scripts/install-cargo-nextest.sh"
@@ -321,6 +332,17 @@ jobs:
             ${{ runner.temp }}/loop-nextest/filter-*.txt
           if-no-files-found: error
           retention-days: 7
+
+      - name: Retain dependencies for the trusted archive cache
+        if: success()
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/ci-owner-cache.sh" cleanup
+
+      - name: Save trusted archive dependencies
+        if: ${{ github.ref == 'refs/heads/main' && success() && steps.owner-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.cache-info.outputs.cache_paths }}
+          key: loop-nextest-${{ steps.cache-info.outputs.key }}
 
   rust_loop_nextest_shard:
     name: Loop nextest shard (${{ matrix.shard }})
@@ -423,6 +445,10 @@ jobs:
       - name: Install Linux build tools
         if: ${{ (needs.scope.outputs.toolchain == 'true') }}
         run: bash "$GITHUB_WORKSPACE/.github/workflows/install-ubuntu-packages.sh" clang mold protobuf-compiler
+
+      - name: Prepare committed native source before cache restore
+        if: ${{ needs.scope.outputs.toolchain == 'true' }}
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/prepare-research-native-source.sh"
 
       - name: Record cache dimensions
         if: ${{ (needs.scope.outputs.toolchain == 'true') }}

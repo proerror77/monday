@@ -4,6 +4,7 @@
 set -euo pipefail
 output=${1:?output JSON required}
 root=$(cd "$(dirname "$0")/../.." && pwd)
+bash "$root/.github/scripts/prepare-research-native-source.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 test "$(uname -s)" = Linux

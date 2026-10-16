@@ -148,3 +148,38 @@ These tests establish scheduling behavior, not elapsed-time improvement.
 Cold native compilation already exceeds the complete target on the measured runners.
 The existing 8m22s same-run dependency-warm recipe result is not complete CI.
 No measured result here establishes a 10–15 minute full delivery outcome.
+
+## Download isolation implementation
+
+The continuation starts from PR head `f82a1ad2` and merges main `4310dc7e`.
+The patch vendors the checksum-verified `libduckdb-sys 1.10504.0` package at
+`rust_hft/native/libduckdb-sys`. Its C++ archive and native compiler backends match upstream bytes. Bindings keep
+upstream code with one trailing blank line removed. The functional changes affect
+only its manifest and downloader cfg gates.
+The license and patch provenance remain beside the source.
+
+Research-core and data-pipelines select this patch. Their lockfiles retain all
+other package versions. Bundled and system linking exclude reqwest and zip.
+The `download` feature retains the upstream downloader and requires the existing
+`DUCKDB_DOWNLOAD_LIB` switch. Requesting a download without that feature fails.
+Prediction retains its independently locked upstream `1.10501.0` package.
+
+Research cache identities hash every native patch file and the resolved native
+closure. The dev/test owner cache also binds patch bytes and source preparation.
+Both cleaners retain this exact native path while deleting application artifacts.
+Loop nextest uses the same owner-cache contract, with its own namespace. This
+avoids Swatinem removing the newly local native dependency before a trusted save.
+PR jobs still cannot save trusted dependency caches.
+
+Fresh CI checkouts normalize native source mtimes before any target restore.
+Preparation rejects dirty source or existing owning targets. Local builds retain
+actual mtimes. This handles local-path freshness without hiding changed source
+bytes from the compatibility identity. Native library ABI, flags, compiler,
+profiles, artifact hashing and offline smoke remain enforced.
+
+Focused checks cover system/downloader compilation, rejection without the
+feature, bundled dependency exclusion, source-byte cache invalidation, cleanup
+retention and source timestamp guards. Actual macOS integration checks use
+`SELECT 42` with the explicit downloader and system linking. The bundled native
+build and complete existing CI are reported separately; fixture and dependency
+graph checks do not establish a 10–15 minute full pipeline.

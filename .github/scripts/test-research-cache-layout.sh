@@ -26,7 +26,7 @@ done < <(jq -r '.workspaces[].manifest' "$root/rust_hft/workspaces.json")
 # Use the real compiler recipe input path, not a fabricated recipe digest.
 for script in build-research-release.sh build-research-recipes.sh capture-research-build-inputs.sh research-release-products.sh \
   research-release-source-sha.sh research-workspace-locks.sh verify-research-runtime-abi.sh \
-  verify-research-runner-binaries.sh research-native-dependency-inputs.rb compile-research-recipe.sh; do
+  verify-research-runner-binaries.sh research-native-dependency-inputs.rb compile-research-recipe.sh prepare-research-native-source.sh; do
   cp "$root/.github/scripts/$script" "$compat_repo/.github/scripts/"
 done
 cp "$root/.github/scripts/research-image-release-artifact.sh" "$compat_repo/.github/scripts/"
@@ -156,7 +156,7 @@ for script in build-research-release.sh verify-research-runtime-abi.sh verify-re
   check_identity_change reuse
   cp "$root/.github/scripts/$script" "$compat_repo/.github/scripts/"
 done
-for script in compile-research-recipe.sh research-cache-layout.sh; do
+for script in compile-research-recipe.sh research-cache-layout.sh prepare-research-native-source.sh; do
   printf '\n# changed actual compile or cleanup contract\n' >>"$compat_repo/.github/scripts/$script"
   fixture_inputs >"$work/changed.json"
   check_identity_change isolate
@@ -185,6 +185,21 @@ NATIVE_CHECKSUM
 bash "$compat_helper" compatibility-inputs "$work/full.json" >"$work/native-checksum.json"
 [[ $(sha256sum "$work/native-checksum.json" | awk '{print $1}') != "$compat_sha" ]]
 native_fixture_locks
+# A path patch binds native archive and build script bytes, not checkout mtimes.
+mkdir -p "$compat_repo/rust_hft/native/libduckdb-sys"
+printf 'native archive fixture' >"$compat_repo/rust_hft/native/libduckdb-sys/duckdb.tar.gz"
+printf 'native build fixture' >"$compat_repo/rust_hft/native/libduckdb-sys/build.rs"
+jq --arg path "$compat_repo/rust_hft/native/libduckdb-sys/Cargo.toml" \
+  '.packages[0].source=null | .packages[0].manifest_path=$path' \
+  "$work/native-original.json" >"$MONDAY_NATIVE_FIXTURE"
+bash "$compat_helper" compatibility-inputs "$work/full.json" >"$work/native-local-before.json"
+for file in duckdb.tar.gz build.rs; do
+  printf 'changed bytes' >>"$compat_repo/rust_hft/native/libduckdb-sys/$file"
+  bash "$compat_helper" compatibility-inputs "$work/full.json" >"$work/native-local-after.json"
+  ! cmp -s "$work/native-local-before.json" "$work/native-local-after.json"
+  cp "$work/native-local-after.json" "$work/native-local-before.json"
+done
+cp "$work/native-original.json" "$MONDAY_NATIVE_FIXTURE"
 # Local feature and lock changes remain in complete provenance, not the restore prefix.
 cp "$compat_repo/rust_hft/alpha-harness/app/Cargo.toml" "$work/leaf-before"
 printf '[features]\ndefault=["scientific"]\n' >"$compat_repo/rust_hft/alpha-harness/app/Cargo.toml"
@@ -381,7 +396,7 @@ jq -n --arg root "$FIXTURE/repo" --argjson extra "$extra" '{packages:([
   {name:"hidden-local",manifest_path:($root+"/vendor/hidden-local/Cargo.toml"),targets:[{name:"hidden_local"}]},
   {name:"outside-local",source:null,manifest_path:"/external/local/Cargo.toml",targets:[{name:"outside_local"}]},
   {name:"data-encoding",source:"registry+https://example.invalid",manifest_path:"/external/registry/data-encoding/Cargo.toml",targets:[{name:"data_encoding"}]},
-  {name:"libduckdb-sys",source:"registry+https://example.invalid",manifest_path:"/external/registry/libduckdb-sys/Cargo.toml",targets:[{name:"libduckdb_sys"}]},
+  {name:"libduckdb-sys",source:null,manifest_path:($root+"/rust_hft/native/libduckdb-sys/Cargo.toml"),targets:[{name:"libduckdb_sys"}]},
   {name:"local-code",source:"registry+https://example.invalid",manifest_path:"/external/registry/local-code/Cargo.toml",targets:[{name:"local_code"}]}
 ] else [] end)}'
 MOCK

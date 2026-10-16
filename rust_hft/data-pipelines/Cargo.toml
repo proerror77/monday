@@ -57,4 +57,5 @@ codegen-units = 1
 debug = false
 
 [patch.crates-io]
+libduckdb-sys = { path = "../native/libduckdb-sys" }
 rust_decimal = { git = "https://github.com/proerror77/monday-rust-decimal-security-694", rev = "4f7bc6f02d7920b6416988914ae86d25f6670b22" }

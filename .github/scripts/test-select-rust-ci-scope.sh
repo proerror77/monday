@@ -708,7 +708,7 @@ manual_scope=$(run_case production-manual workflow_dispatch dev-input.txt "$prod
 assert_flag "$manual_scope" research_product cex-runner,controller,prediction-runner
 assert_flag "$manual_scope" production_trading_image true
 assert_flag "$manual_scope" production_collector_image true
-for helper in compile-research-recipe.sh research-native-dependency-inputs.rb; do
+for helper in compile-research-recipe.sh research-native-dependency-inputs.rb prepare-research-native-source.sh test-duckdb-build-modes.sh; do
   printf '%s\n' ".github/scripts/$helper" >"$tmp_dir/native-compile-helper.txt"
   native_output=$(run_case native-compile-helper pull_request native-compile-helper.txt)
   assert_jobs "$native_output" 'ploy/commit-hygiene,ploy/research-image-binaries,ploy/research-image-smoke,ploy/safety-scans,ci/ci-contracts,ploy/workflow-lint'

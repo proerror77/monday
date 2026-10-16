@@ -43,7 +43,7 @@ case ${1:?command required} in
     # Exact selected recipes remain in compilation inputs and artifact admission.
     for script in build-research-release.sh build-research-recipes.sh capture-research-build-inputs.sh research-cache-layout.sh \
       research-release-products.sh research-release-source-sha.sh research-workspace-locks.sh \
-      verify-research-runtime-abi.sh verify-research-runner-binaries.sh research-native-dependency-inputs.rb compile-research-recipe.sh; do
+      verify-research-runtime-abi.sh verify-research-runner-binaries.sh research-native-dependency-inputs.rb compile-research-recipe.sh prepare-research-native-source.sh; do
       cat "$root/.github/scripts/$script"
     done
     find "$root/.github/scripts/vendor/tomlrb/lib" -type f -name '*.rb' -print0 | LC_ALL=C sort -z | xargs -0 cat
@@ -136,7 +136,7 @@ end
 RUBY
     ruby "$root/.github/scripts/research-native-dependency-inputs.rb" "$root" "$work/cache-recipes.json" >"$work/native-dependencies.json"
     dependency_recipe=$(cat "$root/.github/scripts/compile-research-recipe.sh" "$root/.github/scripts/research-cache-layout.sh" \
-      "$root/.github/scripts/research-native-dependency-inputs.rb" | sha256sum | awk '{print $1}')
+      "$root/.github/scripts/research-native-dependency-inputs.rb" "$root/.github/scripts/prepare-research-native-source.sh" | sha256sum | awk '{print $1}')
     jq -Se --arg dependency_recipe "$dependency_recipe" --slurpfile native_dependencies "$work/native-dependencies.json" --slurpfile owner_profiles "$work/owner-profiles.json" '
       {schema:"monday.dependency-cache-compat.v4",target,profile,compiler,native,flags,
         builder_image,dependency_recipe:$dependency_recipe,owner_profiles:$owner_profiles[0],native_dependencies:$native_dependencies[0]}' "$work/validated.json"
@@ -211,8 +211,10 @@ RUBY
       fi
       cargo metadata --manifest-path "$root/rust_hft/$manifest" --locked --format-version 1 "${metadata_args[@]}" >>"$work/local.jsonl"
     done <<<"$recipes"
-    jq -s --arg root "$root/" '[.[].packages[]|select(.source == null or (.manifest_path|startswith($root)))|.name, .targets[].name]|unique|if length>0 then . else error("no local compilation packages") end' "$work/local.jsonl" >"$work/names.json"
-    jq -s --arg root "$root/" '[.[].packages[]|select(.source != null and (.manifest_path|startswith($root)|not))|.name, .targets[].name]|unique' "$work/local.jsonl" >"$work/external.json"
+    # The reviewed native patch is a dependency. Its complete source enters the
+    # native compatibility identity; application path packages remain excluded.
+    jq -s --arg root "$root/" '[.[].packages[]|select((.source == null or (.manifest_path|startswith($root))) and (.manifest_path != ($root+"rust_hft/native/libduckdb-sys/Cargo.toml")))|.name, .targets[].name]|unique|if length>0 then . else error("no local compilation packages") end' "$work/local.jsonl" >"$work/names.json"
+    jq -s --arg root "$root/" '[.[].packages[]|select((.source != null and (.manifest_path|startswith($root)|not)) or (.name == "libduckdb-sys" and .manifest_path == ($root+"rust_hft/native/libduckdb-sys/Cargo.toml")))|.name, .targets[].name]|unique' "$work/local.jsonl" >"$work/external.json"
     ruby -rjson -rfileutils - "$root" "$work/names.json" "$work/external.json" "$work/cache-recipes.json" <<'RUBY'
 root, names_file, external_file, recipes_file = ARGV
 names = JSON.parse(File.read(names_file)).flat_map { |n| [n, n.tr('-', '_'), "lib#{n.tr('-', '_')}"] }.uniq

@@ -30,6 +30,12 @@ tracked('rust_hft/**/Cargo.toml').each do |relative|
   block = block.split(/^\[/, 2)[0]
   name = block[/^name\s*=\s*"([^"]+)"/, 1]
   next unless name
+  # This checksum-documented native dependency is not an application owner.
+  if relative == 'rust_hft/native/libduckdb-sys/Cargo.toml'
+    abort 'unexpected native patch package' unless name == 'libduckdb-sys' &&
+      block.match?(/^version\s*=\s*"1\.10504\.0"/) && text.match?(/^\[workspace\]/)
+    next
+  end
   declared = block[/^workspace\s*=\s*"([^"]+)"/, 1]
   owner = if declared
             File.expand_path(File.join(declared, 'Cargo.toml'), File.dirname(file))
