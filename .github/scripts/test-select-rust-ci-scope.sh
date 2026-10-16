@@ -1600,9 +1600,9 @@ summary_upload_line=$(grep -nF '      - name: Upload summary' "$security_workflo
 security_gate_line=$(grep -nF '      - name: Require selected security jobs to pass' "$security_workflow" | cut -d: -f1)
 ((security_gate_line > summary_upload_line))
 
-# Release wakeups, the single reusable entry, and the hft-core guard live in
-# test-release-once.sh. This scope test still runs that contract.
-bash "$script_dir/test-release-once.sh"
+# The CI policy job runs release admission through
+# test-research-image-release-artifact.sh, including test-release-once.sh.
+# Keep this selector suite focused on scheduling; do not repeat admission here.
 
 listing_monitor_workflow="$script_dir/../workflows/deploy-listing-monitor.yml"
 expected_listing_monitor_triggers=$(printf '%s\n' 'on:' '  workflow_dispatch:')
