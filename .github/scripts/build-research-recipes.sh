@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compile owners concurrently. Keep each owner's recipes and target writes serial.
 set -euo pipefail
-[[ $# == 2 || $# == 5 ]] || exit 2
+[[ $# == 2 || $# == 6 ]] || exit 2
 product=${1:?product required}
 phase=${2:?recipe measurement phase required}
 [[ $phase == after-cache-lookup || $phase == warm-local || $phase == dependency-warm-serial || $phase == dependency-warm-parallel ]] || exit 2
@@ -58,7 +58,7 @@ if [[ $# == 2 ]]; then
   trap 'cancel_scheduler 143' TERM
   # Background execution lets Bash handle a signal sent only to its own PID.
   # The Ruby supervisor receives that signal and reaps its owned process groups.
-  ruby -rjson - "$root/.github/scripts/build-research-recipes.sh" "$product" "$phase" "$inputs" "$cpus" "$memory_mib" <<'RUBY' &
+  ruby -rjson -rtmpdir -rfileutils - "$root/.github/scripts/build-research-recipes.sh" "$product" "$phase" "$inputs" "$cpus" "$memory_mib" <<'RUBY' &
 script, product, phase, inputs, cpus, memory = ARGV
 cpus, memory = Integer(cpus), Integer(memory)
 requested = ENV.fetch('MONDAY_RESEARCH_BUILD_CONCURRENCY', '2')
@@ -71,6 +71,8 @@ owners = JSON.parse(File.read(inputs)).fetch('recipes').map { |recipe| recipe.fe
 concurrency = [Integer(requested), owners.length, budget, [memory / 4096, 1].max].min
 jobs = budget / concurrency
 pending, active = owners.dup, {}
+lease_root = Dir.mktmpdir('research-recipe-jobs.', ENV.fetch('RUNNER_TEMP'))
+leases = {}
 failed_groups = []
 status = 0
 interrupted = nil
@@ -85,12 +87,24 @@ begin
   until pending.empty? && active.empty?
     while !interrupted && active.length < concurrency && !pending.empty?
       owner = pending.shift
-      pid = Process.spawn('bash', script, product, phase, owner, jobs.to_s, concurrency.to_s, pgroup: true)
+      lease = File.join(lease_root, owner.delete_suffix('/Cargo.toml').tr('/', '-') + '.jobs')
+      File.write(lease, jobs.to_s)
+      pid = Process.spawn('bash', script, product, phase, owner, jobs.to_s, concurrency.to_s, lease, pgroup: true)
       active[pid] = owner
+      leases[pid] = lease
     end
     if interrupted
       status = 128 + Signal.list.fetch(interrupted)
       break
+    end
+    # Increase only the final owner's next recipe. No pending or sibling owner
+    # can claim these CPUs. An in-flight Cargo/cc jobserver keeps its old budget.
+    if pending.empty? && active.length == 1
+      lease = leases.fetch(active.keys.first)
+      unless File.read(lease) == budget.to_s
+        File.write(lease + '.next', budget.to_s)
+        File.rename(lease + '.next', lease)
+      end
     end
     completed = Process.wait2(-1, Process::WNOHANG)
     unless completed
@@ -114,6 +128,7 @@ ensure
   sleep 0.2 unless groups.empty?
   groups.each { |pid| Process.kill('KILL', -pid) rescue Errno::ESRCH }
   groups.each { |pid| Process.wait(pid) rescue Errno::ECHILD }
+  FileUtils.remove_entry(lease_root)
   wake_read.close
   wake_write.close
 end
@@ -147,13 +162,19 @@ RUBY
   [[ $(sha256sum "$inputs" | awk '{print $1}') == "$inputs_sha" ]]
   exit "$status"
 fi
-manifest=$3 cargo_jobs=$4 concurrency=$5
+manifest=$3 cargo_jobs=$4 concurrency=$5 lease=$6
 [[ $cargo_jobs =~ ^[1-9][0-9]*$ && $concurrency =~ ^[12]$ ]]
 (( cargo_jobs * concurrency <= cpus ))
 jq -e --arg manifest "$manifest" 'any(.[]; .manifest==$manifest)' <<<"$recipes" >/dev/null
 owner=${manifest%/Cargo.toml}
 timings="$work/$phase-${owner//\//--}.timings.jsonl"
 while IFS= read -r recipe; do
+  # The supervisor grants a larger budget only after all other owners exit.
+  # Read once per recipe; never change Cargo's budget during compilation.
+  next_jobs=$(cat "$lease")
+  [[ $next_jobs =~ ^[1-9][0-9]*$ ]]
+  (( next_jobs >= cargo_jobs && next_jobs <= cpus ))
+  cargo_jobs=$next_jobs
   package=$(jq -r .package <<<"$recipe")
   start=$(date +%s)
   recipe_target=$(bash "$root/.github/scripts/research-cache-layout.sh" target-dir "$(jq -r .manifest <<<"$recipe")")
