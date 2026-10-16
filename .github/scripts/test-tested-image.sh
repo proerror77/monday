@@ -16,6 +16,27 @@ printf '%s\n' '[{"jobs":[{"id":7,"name":"Container Security - Image Scan (hft-co
 cat >"$scratch/bin/gh" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
+stage=unknown
+case "$*" in
+  api*security-enabled.yml/runs*|api*ci.yml/runs*) stage=workflow-runs ;;
+  api*42/attempts/2/jobs*) stage=producer-jobs ;;
+  api*actions/runs/42) stage=final-run ;;
+  api*42/artifacts*) stage=artifact-list ;;
+  'run download 42 '*) stage=artifact-download ;;
+esac
+if [[ ${TEST_READ_STAGE:-} == "$stage" ]]; then
+  count=0
+  [[ ! -f $FIXTURE_ROOT/retry-count ]] || count=$(cat "$FIXTURE_ROOT/retry-count")
+  count=$((count+1)); printf '%s\n' "$count" >"$FIXTURE_ROOT/retry-count"
+  if (( count <= ${TEST_FAIL_COUNT:-1} )); then
+    if [[ $stage == artifact-download ]]; then
+      mkdir -p "${!#}"; printf partial >"${!#}/partial-only"
+    fi
+    printf '{"partial":'
+    printf 'gh: simulated error (HTTP %s)\n' "${TEST_HTTP_STATUS:-502}" >&2
+    exit "${TEST_EXIT_STATUS:-1}"
+  fi
+fi
 case "$*" in
   api*security-enabled.yml/runs*|api*ci.yml/runs*) cat "$FIXTURE_ROOT/runs.json" ;;
   api*42/attempts/2/jobs*) cat "$FIXTURE_ROOT/jobs.json" ;;
@@ -41,10 +62,29 @@ case "$*" in
   *) exit 92 ;;
 esac
 MOCK
+printf '#!/usr/bin/env bash\nexit 0\n' >"$scratch/bin/sleep"
 chmod +x "$scratch/bin/"*
 export PATH="$scratch/bin:$PATH"
 bash "$root/read-tested-image.sh" "$TEST_SOURCE" "$scratch/good"
 [[ $(cat "$scratch/good/image-id.txt") == "$TEST_IMAGE" ]]
+# Transient failures at every read boundary restart the read with clean bytes.
+for stage in workflow-runs producer-jobs artifact-list artifact-download final-run; do
+  rm -f "$FIXTURE_ROOT/retry-count"
+  TEST_READ_STAGE=$stage TEST_FAIL_COUNT=2 bash "$root/read-tested-image.sh" "$TEST_SOURCE" "$scratch/retry-$stage" >"$scratch/retry-$stage.log" 2>&1
+  [[ $(cat "$FIXTURE_ROOT/retry-count") == 3 ]]
+  [[ $(cat "$scratch/retry-$stage/image-id.txt") == "$TEST_IMAGE" ]]
+  grep -Fq "GitHub read $stage failed (attempt 2/3" "$scratch/retry-$stage.log"
+done
+for code in 500 502 503 504 401 403 404; do
+  rm -f "$FIXTURE_ROOT/retry-count"
+  status=0
+  TEST_READ_STAGE=artifact-list TEST_HTTP_STATUS=$code TEST_FAIL_COUNT=9 TEST_EXIT_STATUS=75 \
+    bash "$root/read-tested-image.sh" "$TEST_SOURCE" "$scratch/exhaust-$code" optional >"$scratch/exhaust-$code.log" 2>&1 || status=$?
+  [[ $status == 1 && ! -e $scratch/exhaust-$code/image-id.txt && ! -e $scratch/exhaust-$code/artifacts.json ]]
+  expected=1; [[ $code != 5* ]] || expected=3
+  [[ $(cat "$FIXTURE_ROOT/retry-count") == "$expected" ]]
+done
+printf 'PASS: bounded transient GET/download retries discard partial bytes; auth, absence and exhausted transport failures cannot authorize rebuild\n'
 # A retained exact-source image after page 1 must be reused. Missing evidence
 # alone permits the explicit manual path to build; incomplete evidence does not.
 cp "$FIXTURE_ROOT/artifacts.json" "$scratch/valid-artifacts.json"
