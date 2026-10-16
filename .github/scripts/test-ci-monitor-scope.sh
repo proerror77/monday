@@ -32,7 +32,7 @@ ancestors = lambda do |id|
 end
 %w[workflow-lint commit-hygiene rust-format safety-scans audit rust-control-plane rust-runner-lean
    rust-runner-full rust-market-data rust-research-heavy frontend integration-regressions
-   strategy-config-contracts architecture-contracts].each do |id|
+   strategy-config-contracts architecture-contracts sqlx-cli-equivalence].each do |id|
   abort "#{id} waits for publication history" if ancestors.call(id).include?('research-image-scope')
 end
 %w[research-image-binaries research-image-smoke prediction-markets-gate].each do |id|
@@ -41,10 +41,13 @@ end
 abort 'direct selector consults publication history' if prediction.fetch('image-smoke-selector').to_s.include?('select-main-research-scope')
 abort 'gate ignores carried jobs' unless prediction.fetch('prediction-markets-gate').to_s.include?('needs.research-image-scope.outputs.jobs')
 diagnostic = "github.event_name == 'workflow_dispatch' && inputs.research_cache_probe"
+sqlx_diagnostic = "github.event_name == 'workflow_dispatch' && inputs.sqlx_cli_probe"
 abort 'probe can replace the required release gate' unless prediction.fetch('prediction-markets-gate').fetch('name') ==
-  "${{ #{diagnostic} && 'Research build A/B diagnostic gate' || 'Prediction Markets CI gate' }}"
+  "${{ #{sqlx_diagnostic} && 'SQLx CLI diagnostic gate' || #{diagnostic} && 'Research build A/B diagnostic gate' || 'Prediction Markets CI gate' }}"
 document = YAML.safe_load(File.read("#{repo}/.github/workflows/ploy-ci.yml"))
 abort 'probe can cancel ordinary CI' unless document.fetch('concurrency').fetch('group').include?("#{diagnostic} && 'research-cache-probe-'")
+abort 'SQLx probe can cancel ordinary CI' unless document.fetch('concurrency').fetch('group').include?("#{sqlx_diagnostic} && 'sqlx-cli-probe-'")
+abort 'SQLx contract missing from aggregate gate' unless prediction.fetch('prediction-markets-gate').fetch('needs').include?('sqlx-cli-equivalence')
 File.write("#{work}/diagnostic-plan.sh", prediction.fetch('image-smoke-selector').fetch('steps').find { |step| step['id']=='scope' }.fetch('run'))
 {
   'ci.yml'=>'scope', 'ploy-ci.yml'=>'image-smoke-scope', 'security-enabled.yml'=>'security-scope'
@@ -72,7 +75,7 @@ for probe in true false '' invalid; do
     called="$output.ordinary"
     code=0
     (cd "$probe_repo/rust_hft/prediction-markets" &&
-      RESEARCH_CACHE_PROBE=$probe GITHUB_EVENT_NAME=$event GITHUB_OUTPUT="$output" \
+      SQLX_CLI_PROBE=false RESEARCH_CACHE_PROBE=$probe GITHUB_EVENT_NAME=$event GITHUB_OUTPUT="$output" \
       ORDINARY_PLAN_CALLED="$called" BASE_SHA=base HEAD_SHA=head bash "$work/diagnostic-plan.sh") \
       >"$work/probe.stdout" 2>"$work/probe.stderr" || code=$?
     if [[ $probe == true && $event == workflow_dispatch ]]; then
@@ -89,10 +92,49 @@ for probe in true false '' invalid; do
   done
 done
 
+# SQLx diagnostics use the same fail-closed plan boundary without broad research.
+for probe in true false '' invalid; do
+  for event in workflow_dispatch push pull_request; do
+    output="$work/sqlx-$event-${probe:-absent}.out"
+    called="$output.ordinary"
+    code=0
+    (cd "$probe_repo/rust_hft/prediction-markets" &&
+      SQLX_CLI_PROBE=$probe RESEARCH_CACHE_PROBE=false GITHUB_EVENT_NAME=$event GITHUB_OUTPUT="$output" \
+      ORDINARY_PLAN_CALLED="$called" BASE_SHA=base HEAD_SHA=head bash "$work/diagnostic-plan.sh") \
+      >"$work/probe.stdout" 2>"$work/probe.stderr" || code=$?
+    if [[ $probe == true && $event == workflow_dispatch ]]; then
+      [[ $code == 0 && ! -e $called ]]
+      grep -Fqx 'jobs=,ploy/sqlx-cli-equivalence,' "$output"
+      grep -Fqx research_product=none "$output"
+      grep -Fqx selection_complete=true "$output"
+    elif [[ $probe == false || -z $probe ]]; then
+      [[ $code == 0 ]]
+      grep -Fqx -- "--event $event --base base --head head" "$called"
+    else
+      [[ $code != 0 && ! -e $called && ! -s $output ]]
+    fi
+  done
+done
+for other_probe in true invalid; do
+  if (cd "$probe_repo/rust_hft/prediction-markets" &&
+    SQLX_CLI_PROBE=true RESEARCH_CACHE_PROBE=$other_probe GITHUB_EVENT_NAME=workflow_dispatch \
+    GITHUB_OUTPUT="$work/conflicting.out" ORDINARY_PLAN_CALLED="$work/conflicting.ordinary" \
+    bash "$work/diagnostic-plan.sh"); then exit 1; fi
+  [[ ! -s $work/conflicting.out && ! -e $work/conflicting.ordinary ]]
+done
+
 # Diagnostic success cannot satisfy the production publication check reader.
-printf '%s\n' '{"check_runs":[{"id":1,"name":"Research build A/B diagnostic gate","status":"completed","conclusion":"success","app":{"slug":"github-actions","id":15368}}]}' >"$work/probe-checks.json"
-bash "$script_dir/read-release-required-checks.sh" "$work/probe-checks.json" "$work/probe-release-state"
-grep -Fqx prediction_conclusion=missing "$work/probe-release-state"
+for name in 'Research build A/B diagnostic gate' 'SQLx CLI diagnostic gate'; do
+  jq -n --arg name "$name" '{check_runs:[{id:1,name:$name,status:"completed",conclusion:"success",app:{slug:"github-actions",id:15368}}]}' >"$work/probe-checks.json"
+  bash "$script_dir/read-release-required-checks.sh" "$work/probe-checks.json" "$work/probe-release-state"
+  grep -Fqx prediction_conclusion=missing "$work/probe-release-state"
+done
+sqlx_needs='{"image-smoke-selector":{"result":"success"},"image-smoke-scope":{"result":"success"},"research-image-scope":{"result":"success"},"sqlx-cli-equivalence":{"result":"success"}}'
+printf '%s' "$sqlx_needs" | bash "$script_dir/verify-ci-gate.sh" --job-prefix ploy --expected-jobs ',ploy/sqlx-cli-equivalence,'
+for result in skipped failure cancelled missing; do
+  payload=$(jq -c --arg result "$result" 'if $result=="missing" then del(."sqlx-cli-equivalence") else ."sqlx-cli-equivalence".result=$result end' <<<"$sqlx_needs")
+  if printf '%s' "$payload" | bash "$script_dir/verify-ci-gate.sh" --job-prefix ploy --expected-jobs ',ploy/sqlx-cli-equivalence,' >"$work/sqlx-gate.log" 2>&1; then exit 1; fi
+done
 
 for file in ci.yml ploy-ci.yml security-enabled.yml; do
   for result in success failure; do

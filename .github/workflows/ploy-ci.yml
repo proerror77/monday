@@ -11,9 +11,13 @@ on:
         description: Compare serial and bounded-parallel recipes with the same warmed dependencies
         type: boolean
         default: false
+      sqlx_cli_probe:
+        description: Compare fresh and cached PostgreSQL/rustls SQLx CLI; not release admission
+        type: boolean
+        default: false
 
 concurrency:
-  group: prediction-markets-${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'research-cache-probe-' || '' }}${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  group: prediction-markets-${{ github.event_name == 'workflow_dispatch' && inputs.sqlx_cli_probe && 'sqlx-cli-probe-' || '' }}${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'research-cache-probe-' || '' }}${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -53,8 +57,19 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           RESEARCH_CACHE_PROBE: ${{ inputs.research_cache_probe }}
+          SQLX_CLI_PROBE: ${{ inputs.sqlx_cli_probe }}
         run: |
           set -euo pipefail
+          case "${SQLX_CLI_PROBE:-}" in
+            true)
+              [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && ${RESEARCH_CACHE_PROBE:-false} == false ]] || exit 2
+              printf '%s\n' 'jobs=,ploy/sqlx-cli-equivalence,' 'research_product=none' \
+                'selection_complete=true' >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            false|'') ;;
+            *) exit 2 ;;
+          esac
           case "${RESEARCH_CACHE_PROBE:-}" in
             true)
               [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || {
@@ -258,6 +273,10 @@ jobs:
       - name: Test research dependency cache boundaries
         working-directory: .
         run: bash .github/scripts/test-research-cache-layout.sh
+
+      - name: Test SQLx CLI cache contracts
+        working-directory: .
+        run: bash .github/scripts/test-sqlx-cli-tool.sh
 
       - name: Test ACR publish workflow contract
         run: ../../.github/scripts/test-acr-publish-workflow.sh
@@ -643,12 +662,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install SQLx CLI
-        run: |
-          cargo install sqlx-cli \
-            --locked \
-            --version "${SQLX_CLI_VERSION}" \
-            --no-default-features \
-            --features rustls,postgres
+        uses: ./.github/actions/sqlx-cli-tool
 
       - name: Prepare database schema
         env:
@@ -830,6 +844,9 @@ jobs:
           shared-key: rust-market-data-${{ steps.cache-info.outputs.rust }}-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install SQLx CLI
+        uses: ./.github/actions/sqlx-cli-tool
+
       - name: Verify market-data and ephemeral database contracts
         working-directory: .
         run: bash .github/scripts/run-prediction-market-data-contracts.sh
@@ -866,6 +883,9 @@ jobs:
           workspaces: rust_hft/prediction-markets
           key: prediction-research-heavy
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install SQLx CLI
+        uses: ./.github/actions/sqlx-cli-tool
+
       - name: Verify research and ephemeral database contracts
         working-directory: .
         run: bash .github/scripts/run-prediction-research-contracts.sh
@@ -1041,8 +1061,41 @@ jobs:
         run: bash .github/scripts/run-prediction-platform-smoke.sh
 
 
+  sqlx-cli-equivalence:
+    name: SQLx CLI PostgreSQL and TLS equivalence
+    needs: image-smoke-scope
+    if: ${{ contains(needs.image-smoke-scope.outputs.jobs, ',ploy/sqlx-cli-equivalence,') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: 1.98.1
+      - name: Test SQLx cache contracts
+        working-directory: .
+        run: bash .github/scripts/test-sqlx-cli-tool.sh
+      - name: Compile the original PostgreSQL rustls CLI baseline
+        run: >-
+          cargo install sqlx-cli --locked --version "$SQLX_CLI_VERSION"
+          --no-default-features --features rustls,postgres --root "$RUNNER_TEMP/sqlx-baseline"
+      - name: Prepare reusable SQLx CLI
+        uses: ./.github/actions/sqlx-cli-tool
+        with:
+          probe: ${{ github.event_name == 'workflow_dispatch' && inputs.sqlx_cli_probe }}
+      - name: Compare PostgreSQL and TLS behavior
+        working-directory: .
+        run: bash .github/scripts/verify-sqlx-cli-postgres.sh "$RUNNER_TEMP/sqlx-baseline/bin/sqlx" "$RUNNER_TEMP/sqlx-cli-tool/bin/sqlx"
+      - name: Retain SQLx equivalence evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sqlx-cli-equivalence
+          path: ${{ runner.temp }}/sqlx-cli-evidence
+          if-no-files-found: error
+
   prediction-markets-gate:
-    name: ${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'Research build A/B diagnostic gate' || 'Prediction Markets CI gate' }}
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.sqlx_cli_probe && 'SQLx CLI diagnostic gate' || github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'Research build A/B diagnostic gate' || 'Prediction Markets CI gate' }}
     needs:
       - image-smoke-selector
       - image-smoke-scope
@@ -1064,6 +1117,7 @@ jobs:
       - integration-regressions
       - strategy-config-contracts
       - architecture-contracts
+      - sqlx-cli-equivalence
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

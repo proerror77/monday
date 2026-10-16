@@ -356,6 +356,10 @@ SH
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'sqlx %s\n' "$*" >>"$CONTRACT_FIXTURE/calls"
+if [[ $* == --version ]]; then
+  if [[ $CONTRACT_CASE == version-failure ]]; then echo 'sqlx-cli 0.9.0'; else echo 'sqlx-cli 0.8.6'; fi
+  exit 0
+fi
 [[ $* == 'migrate run' ]]
 [[ $CONTRACT_CASE != migration-failure ]] || exit 61
 printf 'migrated\n' >"$CONTRACT_FIXTURE/migrated"
@@ -363,7 +367,7 @@ SH
   chmod +x "$fixture/bin/cargo" "$fixture/bin/sqlx"
   local pg_test=predict_fun::tests::postgres_predict_fun_restart_restores_clock_and_persists_failure_readiness
   local scenario
-  for scenario in success missing migration-failure test-failure; do
+  for scenario in success missing migration-failure test-failure version-failure; do
     rm -f "$fixture/migrated" "$fixture/calls" "$fixture/cwd"
     result=0
     PATH="$fixture/bin:$PATH" CONTRACT_FIXTURE="$fixture" CONTRACT_CASE="$scenario" CONTRACT_PG_TEST="$pg_test" \
@@ -376,14 +380,18 @@ SH
         [[ $result == 0 ]]
         [[ $(sort -u "$fixture/cwd") == "$fixture/repo/rust_hft/prediction-markets" ]]
         cat >"$fixture/expected" <<EOF
+sqlx --version
 cargo check --locked -p ploy-market-data --features live --lib
 cargo test --locked -p ploy-market-data --features live --lib
-cargo install sqlx-cli --locked --version 0.8.6 --no-default-features --features rustls,postgres
 sqlx migrate run
 cargo test --locked -p ploy-market-data --features live --lib -- --ignored --list
 cargo test --locked -p ploy-market-data --features live --lib $pg_test -- --ignored --exact
 EOF
         diff -u "$fixture/expected" "$fixture/calls"
+        ;;
+      version-failure)
+        [[ $result != 0 ]]
+        [[ $(cat "$fixture/calls") == 'sqlx --version' ]]
         ;;
       missing|migration-failure)
         [[ $result != 0 ]]
@@ -1347,7 +1355,7 @@ if grep -Fq 'test-polymarket-market-recorder-release.sh' <<<"$rust_job_block"; t
 grep -Fq 'ci-owner-cache.sh" cleanup' <<<"$rust_job_block"
 
 ploy_workflow="$script_dir/../workflows/ploy-ci.yml"
-grep -Fqx "  group: prediction-markets-\${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'research-cache-probe-' || '' }}\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
+grep -Fqx "  group: prediction-markets-\${{ github.event_name == 'workflow_dispatch' && inputs.sqlx_cli_probe && 'sqlx-cli-probe-' || '' }}\${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'research-cache-probe-' || '' }}\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}" "$ploy_workflow"
 grep -Fqx "  cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" "$ploy_workflow"
 [[ $(grep -Fxc '    branches: [main, develop]' "$ploy_workflow") -eq 2 ]]
 if sed -n '/^  push:$/,/^  workflow_dispatch:$/p' "$ploy_workflow" \
@@ -1574,7 +1582,7 @@ grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea186
 grep -Fqx '          EXPECTED_JOBS: ${{ needs.scope.outputs.jobs }}' "$ci_workflow"
 grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh --job-prefix ci --expected-jobs \"\$EXPECTED_JOBS\"" "$ci_workflow"
 grep -Fqx '  prediction-markets-gate:' "$ploy_workflow"
-grep -Fqx "    name: \${{ github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'Research build A/B diagnostic gate' || 'Prediction Markets CI gate' }}" "$ploy_workflow"
+grep -Fqx "    name: \${{ github.event_name == 'workflow_dispatch' && inputs.sqlx_cli_probe && 'SQLx CLI diagnostic gate' || github.event_name == 'workflow_dispatch' && inputs.research_cache_probe && 'Research build A/B diagnostic gate' || 'Prediction Markets CI gate' }}" "$ploy_workflow"
 grep -Fqx '      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0' "$ploy_workflow"
 grep -Fqx '          EXPECTED_JOBS: ${{ needs.research-image-scope.outputs.jobs }}' "$ploy_workflow"
 grep -Fqx "        run: printf '%s' \"\$GATE_NEEDS\" | bash .github/scripts/verify-ci-gate.sh --job-prefix ploy --expected-jobs \"\$EXPECTED_JOBS\"" "$ploy_workflow"

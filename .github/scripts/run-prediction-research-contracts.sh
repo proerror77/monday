@@ -3,6 +3,8 @@
 set -euo pipefail
 SECONDS=0
 cd "$(dirname "$0")/../../rust_hft/prediction-markets"
+: "${SQLX_CLI_VERSION:?pinned SQLx CLI version required}"
+[[ $(sqlx --version) == "sqlx-cli $SQLX_CLI_VERSION" ]] || { echo 'pinned SQLx CLI is not prepared' >&2; exit 2; }
 cargo test --locked -p ploy-feed-loaders --lib
 cargo test --locked -p ploy-research --lib
 cargo test --locked -p ploy-research --no-default-features --features rl --lib model::rl
@@ -27,12 +29,6 @@ CODEX_CLI_BIN="$handoff_root/mock-codex" CODEX_CLI_TIMEOUT_SECS=10 \
   tests::production_writer_evidence_queue_reaches_terminal \
   -- --exact --ignored --test-threads=1 --nocapture
 test -s "$handoff_root/consumer-proof.json"
-
-cargo install sqlx-cli \
-  --locked \
-  --version "${SQLX_CLI_VERSION}" \
-  --no-default-features \
-  --features rustls,postgres
 
 sqlx migrate run
 cargo check --locked -p ploy-research --features db,polars-export,ml,rl,strategy-runtime --lib
