@@ -62,7 +62,7 @@ jobs:
           set -euo pipefail
           case "${SQLX_CLI_PROBE:-}" in
             true)
-              [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && ${RESEARCH_CACHE_PROBE:-false} != true ]] || exit 2
+              [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && ${RESEARCH_CACHE_PROBE:-false} == false ]] || exit 2
               printf '%s\n' 'jobs=,ploy/sqlx-cli-equivalence,' 'research_product=none' \
                 'selection_complete=true' >> "$GITHUB_OUTPUT"
               exit 0
