@@ -61,6 +61,7 @@ cat >"$work/native-bin/cargo" <<'NATIVE_CARGO'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ $1 == metadata ]]
+if [[ -n ${MONDAY_NATIVE_CALLS:-} ]]; then printf '%s\n' "$*" >>"$MONDAY_NATIVE_CALLS"; fi
 cat "$MONDAY_NATIVE_FIXTURE"
 NATIVE_CARGO
 chmod +x "$work/native-bin/cargo"
@@ -80,6 +81,27 @@ Dir.glob("#{root}/**/Cargo.lock").each { |path| File.write(path, lock) }
 NATIVE_LOCKS
 }
 native_fixture_locks
+# Repeated recipes share resolution only when the full Cargo command is identical.
+export MONDAY_NATIVE_CALLS="$work/native-calls"
+bash "$compat_repo/.github/scripts/research-release-products.sh" recipes all | jq -s . >"$work/native-recipes.json"
+ruby "$compat_repo/.github/scripts/research-native-dependency-inputs.rb" "$compat_repo" "$work/native-recipes.json" >"$work/native-deduplicated.json"
+[[ $(wc -l <"$MONDAY_NATIVE_CALLS") -eq 4 ]]
+# Running each recipe separately is the prior behavior and identity oracle.
+: >"$work/native-separate.jsonl"
+while IFS= read -r recipe; do
+  printf '[%s]\n' "$recipe" >"$work/native-single.json"
+  ruby "$compat_repo/.github/scripts/research-native-dependency-inputs.rb" "$compat_repo" "$work/native-single.json" >>"$work/native-separate.jsonl"
+done < <(jq -c '.[]' "$work/native-recipes.json")
+jq -sS '{schema:.[0].schema,closures:([.[].closures[]]|unique)}' "$work/native-separate.jsonl" >"$work/native-expected.json"
+jq -S '.closures |= sort' "$work/native-deduplicated.json" >"$work/native-actual.json"
+cmp "$work/native-expected.json" "$work/native-actual.json"
+# Different package-qualified feature arguments must not share resolution.
+jq '[.[0], (.[0] + {features:"extra"}), (.[1] + {features:"extra"}), .[0]]' "$work/native-recipes.json" >"$work/native-features.json"
+: >"$MONDAY_NATIVE_CALLS"
+ruby "$compat_repo/.github/scripts/research-native-dependency-inputs.rb" "$compat_repo" "$work/native-features.json" >/dev/null
+[[ $(wc -l <"$MONDAY_NATIVE_CALLS") -eq 3 ]]
+unset MONDAY_NATIVE_CALLS
+printf 'PASS: native metadata resolves four distinct commands instead of eight recipes; identity matches separate resolution\n'
 cp "$compat_repo/rust_hft/research-core/Cargo.lock" "$work/original-fixture-lock"
 fixture_inputs >"$work/full.json"
 cp "$work/full.json" "$work/full-before.json"

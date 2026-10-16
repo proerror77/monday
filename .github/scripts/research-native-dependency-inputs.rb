@@ -8,6 +8,9 @@ root, recipes_file = ARGV
 abort 'root and recipes required' unless root && recipes_file
 $LOAD_PATH.unshift("#{root}/.github/scripts/vendor/tomlrb/lib")
 require 'tomlrb'
+# Cargo metadata resolves the workspace. Reuse only identical command arguments.
+# Keep feature selections separate; never union them across recipe invocations.
+resolutions = {}
 records = JSON.parse(File.read(recipes_file)).flat_map do |recipe|
   manifest = recipe.fetch('manifest')
   args = ['cargo', 'metadata', '--manifest-path', "#{root}/rust_hft/#{manifest}",
@@ -17,9 +20,11 @@ records = JSON.parse(File.read(recipes_file)).flat_map do |recipe|
   unless features.empty?
     args += ['--features', features.split(',').map { |feature| "#{recipe.fetch('package')}/#{feature}" }.join(',')]
   end
-  output, status = Open3.capture2(*args, chdir: "#{root}/rust_hft")
-  abort "native dependency resolution failed: #{manifest}" unless status.success?
-  metadata = JSON.parse(output)
+  metadata = resolutions[args] ||= begin
+    output, status = Open3.capture2(*args, chdir: "#{root}/rust_hft")
+    abort "native dependency resolution failed: #{manifest}" unless status.success?
+    JSON.parse(output)
+  end
   packages = metadata.fetch('packages').to_h { |package| [package.fetch('id'), package] }
   nodes = metadata.fetch('resolve').fetch('nodes').to_h { |node| [node.fetch('id'), node] }
   native_roots = packages.values.select { |package| package.fetch('name') == 'libduckdb-sys' }

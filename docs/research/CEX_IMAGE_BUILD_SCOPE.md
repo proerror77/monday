@@ -73,3 +73,16 @@ local packages rebuilt and the binary hashes agreed.
 These are recipe timings, not full CI or publication timings.
 The runner differs from the historical EPYC 7763 baseline. This is not an old/new
 code speedup estimate. The dependency identity patch still needs its own CI validation.
+
+## Native resolution deduplication
+
+The catalog repeats Cargo metadata requests for recipes with identical workspace and feature arguments.
+Resolve each distinct command once per identity capture. Keep package-qualified feature requests separate.
+This reduces eight catalog requests to four, before adding the independent publisher request.
+Regression tests compare the resulting native identity with separate per-recipe resolution.
+The memo exists only inside one process. It cannot reuse metadata after source or lockfile changes.
+
+This reduces metadata overhead, not Rust compilation. The helper remains part of the compatibility key.
+Its first CI execution therefore needs a new cache identity. Only successful main builds save trusted bytes.
+A PR rerun cannot establish cross-run warm-cache performance before that identity exists on main.
+Do not interpret same-run diagnostic phases as cross-run cache evidence.
