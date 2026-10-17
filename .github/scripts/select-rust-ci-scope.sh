@@ -746,7 +746,7 @@ for path in "${paths[@]}"; do
       [[ $event == pull_request ]] && select_job ploy/commit-hygiene
       continue
       ;;
-    .github/scripts/run-collector-control-contracts.sh|.github/scripts/test-collector-control-scheduling.sh)
+    .github/scripts/run-collector-control-contracts.sh|.github/scripts/test-collector-control-scheduling.sh|.github/scripts/check-collector-shells.sh)
       control=true
       select_job ci/ci-contracts
       select_job ploy/workflow-lint
