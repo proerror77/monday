@@ -213,9 +213,8 @@ pub struct NamedFactorExpr {
     pub notes: Vec<String>,
     /// The `name` of the candidate this one was derived from, or `None` for
     /// a root candidate (a domain seed or a settlement-native generated
-    /// formula). This is lineage plumbing only in this stage: it powers
-    /// `TreeTraceNode.parent` and Stage B's `backpropagate()`, but does not
-    /// itself change any reward/scoring behavior.
+    /// formula). This powers descriptive `TreeTraceNode.parent` evidence;
+    /// it cannot advance a search checkpoint or change reward statistics.
     #[serde(default)]
     pub parent_name: Option<String>,
 }
@@ -817,29 +816,13 @@ pub fn mine_domain_autofactors_from_v2(
     target: AutoFactorV2Target,
     options: &AutoFactorOptions,
 ) -> Result<Vec<AutoFactorReport>, AutoFactorError> {
-    mine_domain_autofactors_from_v2_with_mcts_plan(rows, target, options, &[])
-}
-
-pub fn mine_domain_autofactors_from_v2_with_mcts_plan(
-    rows: &[FactorObservationV2],
-    target: AutoFactorV2Target,
-    options: &AutoFactorOptions,
-    mcts_selected_factor_names: &[String],
-) -> Result<Vec<AutoFactorReport>, AutoFactorError> {
-    mine_domain_autofactors_from_v2_with_guidance(
-        rows,
-        target,
-        options,
-        mcts_selected_factor_names,
-        None,
-    )
+    mine_domain_autofactors_from_v2_with_guidance(rows, target, options, None)
 }
 
 pub fn mine_domain_autofactors_from_v2_with_guidance(
     rows: &[FactorObservationV2],
     target: AutoFactorV2Target,
     options: &AutoFactorOptions,
-    mcts_selected_factor_names: &[String],
     llm_prior: Option<&LlmPriorSpec>,
 ) -> Result<Vec<AutoFactorReport>, AutoFactorError> {
     let side_rows = target.review_side().map(|side| {
@@ -863,18 +846,14 @@ pub fn mine_domain_autofactors_from_v2_with_guidance(
     let symbols = autofactor_symbols_from_v2(rows);
     let event_ids = autofactor_event_ids_from_v2(rows);
     let target_name = target.as_str().to_string();
-    let candidates = domain_candidates_for_target_with_guidance(
-        &matrix.input_names(),
-        target,
-        mcts_selected_factor_names,
-        llm_prior,
-    )
-    .into_iter()
-    .map(|mut factor| {
-        factor.target = Some(target_name.clone());
-        factor
-    })
-    .collect::<Vec<_>>();
+    let candidates =
+        domain_candidates_for_target_with_guidance(&matrix.input_names(), target, llm_prior)
+            .into_iter()
+            .map(|mut factor| {
+                factor.target = Some(target_name.clone());
+                factor
+            })
+            .collect::<Vec<_>>();
     let mut reports = mine_autofactors_with_event_ids(
         &candidates,
         &matrix,
@@ -2038,7 +2017,6 @@ pub fn domain_seed_candidates(input_names: &BTreeSet<String>) -> Vec<NamedFactor
 fn domain_candidates_for_target_with_guidance(
     input_names: &BTreeSet<String>,
     target: AutoFactorV2Target,
-    mcts_selected_factor_names: &[String],
     llm_prior: Option<&LlmPriorSpec>,
 ) -> Vec<NamedFactorExpr> {
     let mut out = domain_seed_candidates(input_names);
@@ -2056,26 +2034,6 @@ fn domain_candidates_for_target_with_guidance(
             | AutoFactorV2Target::TradeableFullDepthSettlementPnl
     ) {
         out.extend(bayes_settlement_generated_candidates(input_names));
-    }
-    if !mcts_selected_factor_names.is_empty() {
-        let selected = out
-            .iter()
-            .filter(|candidate| mcts_selected_factor_names.contains(&candidate.name))
-            .cloned()
-            .collect::<Vec<_>>();
-        out.extend(
-            deterministic_mutation_layer(input_names, &selected, target, 3)
-                .into_iter()
-                .map(|mut candidate| {
-                    candidate.name = candidate.name.replacen("mut2_", "mcts_", 1);
-                    candidate.name = candidate.name.replacen("mut_", "mcts_", 1);
-                    candidate.notes.push(
-                        "MCTS-guided expansion from prior mcts-expansion-plan.json selection."
-                            .to_string(),
-                    );
-                    candidate
-                }),
-        );
     }
     if let Some(prior) = llm_prior {
         let base = out.clone();
@@ -4248,7 +4206,6 @@ mod tests {
             &rows,
             AutoFactorV2Target::FullDepthSettlementExecutablePnl,
             &options,
-            &[],
             Some(&prior),
         )
         .expect("reports");
@@ -4303,7 +4260,6 @@ mod tests {
             &rows,
             AutoFactorV2Target::FullDepthSettlementExecutablePnl,
             &options,
-            &[],
             Some(&prior),
         )
         .expect("reports");
@@ -4322,39 +4278,6 @@ mod tests {
         assert_eq!(
             report.parent_name.as_deref(),
             Some("auto_settlement_model_full_depth_settlement_edge_x_near_strike_x_capacity")
-        );
-    }
-
-    #[test]
-    fn mcts_guided_mutations_record_selected_parent_name() {
-        let rows = (0..80).map(synthetic_v2_row).collect::<Vec<_>>();
-        let options = AutoFactorOptions {
-            min_observations: 40,
-            min_window_observations: 10,
-            min_icir: 0.1,
-            ..Default::default()
-        };
-
-        let reports = mine_domain_autofactors_from_v2_with_guidance(
-            &rows,
-            AutoFactorV2Target::FullDepthSettlementExecutablePnl,
-            &options,
-            &["auto_settlement_model_full_depth_settlement_edge".to_string()],
-            None,
-        )
-        .expect("reports");
-        let report = reports
-            .iter()
-            .find(|report| {
-                report
-                    .name
-                    .starts_with("mcts_auto_settlement_model_full_depth_settlement_edge_")
-            })
-            .expect("MCTS-guided mutation");
-
-        assert_eq!(
-            report.parent_name.as_deref(),
-            Some("auto_settlement_model_full_depth_settlement_edge")
         );
     }
 
@@ -4402,7 +4325,6 @@ mod tests {
             &rows,
             AutoFactorV2Target::FullDepthSettlementExecutablePnl,
             &options,
-            &[],
             Some(&prior),
         )
         .expect("reports");

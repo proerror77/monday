@@ -5,15 +5,13 @@
 //! `alpha-harness` workspace.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    normalized_underlying_symbol, LlmPriorSpec, LlmProbabilityBlendSpec,
-    PredictionResearchFeedback, ResearchSnapshot, ResearchSnapshotManifest,
+    normalized_underlying_symbol, LlmPriorSpec, LlmProbabilityBlendSpec, ResearchSnapshot,
+    ResearchSnapshotManifest,
 };
 
 pub const PREDICTION_MISSION_SCHEMA_VERSION: &str = "prediction_research_mission.v2";
@@ -628,7 +626,7 @@ pub fn validate_prediction_snapshot_coverage(
         }
         if row.event_window_secs != PREDICTION_EVENT_WINDOW_SECS {
             return Err(format!(
-                "snapshot event {} has {}s horizon; prediction LoopRun requires {}s",
+                "snapshot event {} has {}s horizon; prediction research requires {}s",
                 row.event_id, row.event_window_secs, PREDICTION_EVENT_WINDOW_SECS
             ));
         }
@@ -878,86 +876,6 @@ pub fn validate_prediction_run_inputs(
     validate_prediction_snapshot_coverage(snapshot, mission)
 }
 
-#[derive(Debug, Clone)]
-pub struct PredictionEvaluationPrior {
-    pub value: LlmPriorSpec,
-    pub artifact_path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub struct PredictionEvaluationRequest {
-    pub mission: PredictionResearchMission,
-    pub snapshot_dir: PathBuf,
-    pub artifact_dir: PathBuf,
-    pub prior: Option<PredictionEvaluationPrior>,
-    pub training_candidate_json: Option<PathBuf>,
-    pub selected_candidate_json: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-pub enum PredictionEvaluationOutcome {
-    Success {
-        feedback: Option<PredictionResearchFeedback>,
-    },
-    Failure {
-        reason: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct PredictionEvaluationOutput {
-    pub outcome: PredictionEvaluationOutcome,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-impl PredictionEvaluationOutput {
-    pub fn success(
-        feedback: Option<PredictionResearchFeedback>,
-        stdout: String,
-        stderr: String,
-    ) -> Self {
-        Self {
-            outcome: PredictionEvaluationOutcome::Success { feedback },
-            stdout,
-            stderr,
-        }
-    }
-
-    pub fn failure(reason: String, stdout: String, stderr: String) -> Self {
-        Self {
-            outcome: PredictionEvaluationOutcome::Failure { reason },
-            stdout,
-            stderr,
-        }
-    }
-}
-
-pub trait PredictionEvaluator {
-    fn evaluate(
-        &mut self,
-        request: &PredictionEvaluationRequest,
-        timeout: Duration,
-    ) -> PredictionEvaluationOutput;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoopRunStatus {
-    Paused,
-    BudgetExhausted,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LoopRunSummary {
-    pub mission_id: String,
-    pub status: LoopRunStatus,
-    pub candidates_evaluated: usize,
-    pub reason: Option<String>,
-    pub state_path: PathBuf,
-}
-
 fn validate_mission_snapshot_binding(
     mission: &PredictionResearchMission,
     manifest: &ResearchSnapshotManifest,
@@ -974,7 +892,7 @@ fn validate_mission_snapshot_binding(
     }
     if !manifest.immutable_input || !manifest.require_official_settlement {
         return Err(
-            "prediction LoopRun requires immutable input and official settlement labels"
+            "prediction research requires immutable input and official settlement labels"
                 .to_string(),
         );
     }
@@ -986,7 +904,7 @@ fn validate_mission_snapshot_binding(
             .any(|symbol| normalized_underlying_symbol(symbol) != requested)
     {
         return Err(format!(
-            "prediction LoopRun requires a snapshot isolated to {requested}; found {:?}",
+            "prediction research requires a snapshot isolated to {requested}; found {:?}",
             manifest.symbols
         ));
     }

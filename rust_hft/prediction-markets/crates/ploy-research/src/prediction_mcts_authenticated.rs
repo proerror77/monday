@@ -11,8 +11,8 @@ use crate::factors_v2::{
     SettlementProbabilityComponentProfile,
 };
 use crate::prediction_loop::{
-    current_prediction_policy_snapshot_id, research_brief_snapshot_id, LoopRunSummary,
-    PredictionResearchMission, PREDICTION_LOOP_TARGET, PREDICTION_MISSION_SCHEMA_VERSION,
+    current_prediction_policy_snapshot_id, research_brief_snapshot_id, PredictionResearchMission,
+    PREDICTION_LOOP_TARGET, PREDICTION_MISSION_SCHEMA_VERSION,
 };
 use crate::prediction_loop_fs::{
     read_verified_artifact_bounded, write_content_addressed_json, ArtifactRef,
@@ -1371,7 +1371,7 @@ pub trait AuthenticatedPredictionMctsEvaluator: sealed::Evaluator {
 }
 
 pub struct AuthenticatedPredictionMctsTrialRun {
-    pub summary: LoopRunSummary,
+    pub summary: crate::prediction_mcts_run::PredictionMctsRunSummary,
     pub receipt: AuthenticatedPredictionResultReceiptRef,
 }
 

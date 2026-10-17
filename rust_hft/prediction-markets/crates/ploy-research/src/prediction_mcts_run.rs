@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::factors_v2::SettlementProbabilityComponentProfile;
 use crate::prediction_loop::{
-    current_prediction_policy_snapshot_id, validate_prediction_mission, LoopRunStatus,
-    LoopRunSummary, PredictionResearchMission, ProposedProbabilityBlend,
+    current_prediction_policy_snapshot_id, validate_prediction_mission, PredictionResearchMission,
+    ProposedProbabilityBlend,
 };
 use crate::prediction_loop_fs::{
     atomic_write_json, canonical_json_bytes, next_attempt_dir, read_json, sha256_hex,
@@ -26,6 +26,22 @@ const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v6";
 const MCTS_SEED: u64 = 7;
 const MCTS_EXPLORATION: f64 = 1.4;
 const MCTS_MAX_DEPTH: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictionMctsRunStatus {
+    Paused,
+    BudgetExhausted,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PredictionMctsRunSummary {
+    pub mission_id: String,
+    pub status: PredictionMctsRunStatus,
+    pub candidates_evaluated: usize,
+    pub reason: Option<String>,
+    pub state_path: PathBuf,
+}
 
 pub trait PredictionMctsRunEvaluator {
     fn evaluate_baseline(
@@ -284,7 +300,7 @@ pub fn run_or_resume_prediction_mcts<E: PredictionMctsRunEvaluator>(
     snapshot_dir: &Path,
     output_dir: &Path,
     evaluator: &mut E,
-) -> Result<LoopRunSummary, String> {
+) -> Result<PredictionMctsRunSummary, String> {
     run_or_resume_prediction_mcts_with_component_profile(
         mission,
         snapshot_dir,
@@ -300,7 +316,7 @@ pub fn run_or_resume_prediction_mcts_with_component_profile<E: PredictionMctsRun
     output_dir: &Path,
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
-) -> Result<LoopRunSummary, String> {
+) -> Result<PredictionMctsRunSummary, String> {
     let identity = PredictionMctsIdentity::from_mission(&mission)?;
     run_or_resume_prediction_mcts_with_identity_and_component_profile(
         mission,
@@ -321,7 +337,7 @@ pub(crate) fn run_or_resume_prediction_mcts_with_identity_and_component_profile<
     output_dir: &Path,
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
-) -> Result<LoopRunSummary, String> {
+) -> Result<PredictionMctsRunSummary, String> {
     identity.reject_unadmitted_legacy_bridge()?;
     run_or_resume_prediction_mcts_core(
         mission,
@@ -344,7 +360,7 @@ pub(crate) fn run_or_resume_authenticated_prediction_mcts<E: PredictionMctsRunEv
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
     immutable_image_identity: &str,
-) -> Result<LoopRunSummary, String> {
+) -> Result<PredictionMctsRunSummary, String> {
     run_or_resume_prediction_mcts_core(
         mission,
         identity,
@@ -367,7 +383,7 @@ fn run_or_resume_prediction_mcts_core<E: PredictionMctsRunEvaluator>(
     evaluator: &mut E,
     component_profile: SettlementProbabilityComponentProfile,
     immutable_image_identity: Option<&str>,
-) -> Result<LoopRunSummary, String> {
+) -> Result<PredictionMctsRunSummary, String> {
     validate_prediction_mission(&mission, &current_prediction_policy_snapshot_id())?;
     identity.validate()?;
     if identity.mission_id != mission.mission_id
@@ -379,9 +395,18 @@ fn run_or_resume_prediction_mcts_core<E: PredictionMctsRunEvaluator>(
     let _lock = OutputLock::acquire(&output_dir)?;
     let state_path = output_dir.join("prediction-mcts-state.json");
     let mut state = if state_path.exists() {
-        let mut state: PredictionMctsRunState = read_json(&state_path)?;
-        if state.version != RUN_STATE_VERSION
-            || state.mission != mission
+        let value: serde_json::Value = read_json(&state_path)?;
+        if value.get("version").and_then(serde_json::Value::as_u64)
+            != Some(u64::from(RUN_STATE_VERSION))
+        {
+            return Err(format!(
+                "prediction MCTS checkpoint uses incompatible state version {}; expected {RUN_STATE_VERSION}; legacy input is not migrated",
+                value.get("version").unwrap_or(&serde_json::Value::Null)
+            ));
+        }
+        let mut state: PredictionMctsRunState = serde_json::from_value(value)
+            .map_err(|error| format!("decode prediction MCTS state: {error}"))?;
+        if state.mission != mission
             || state.identity()? != identity
             || state.immutable_image_identity.as_deref() != immutable_image_identity
         {
@@ -434,7 +459,7 @@ fn run_or_resume_prediction_mcts_core<E: PredictionMctsRunEvaluator>(
             &mission,
             &state_path,
             &state,
-            LoopRunStatus::BudgetExhausted,
+            PredictionMctsRunStatus::BudgetExhausted,
         ));
     }
 
@@ -459,7 +484,7 @@ fn run_or_resume_prediction_mcts_core<E: PredictionMctsRunEvaluator>(
             &mission,
             &state_path,
             &state,
-            LoopRunStatus::BudgetExhausted,
+            PredictionMctsRunStatus::BudgetExhausted,
         ));
     }
 
@@ -500,7 +525,7 @@ fn run_or_resume_prediction_mcts_core<E: PredictionMctsRunEvaluator>(
                 &mission,
                 &state_path,
                 &state,
-                LoopRunStatus::BudgetExhausted,
+                PredictionMctsRunStatus::BudgetExhausted,
             ));
         }
         let candidate = if let Some(pending) = state.pending.clone() {
@@ -597,7 +622,7 @@ fn run_or_resume_prediction_mcts_core<E: PredictionMctsRunEvaluator>(
         &mission,
         &state_path,
         &state,
-        LoopRunStatus::BudgetExhausted,
+        PredictionMctsRunStatus::BudgetExhausted,
     ))
 }
 
@@ -725,19 +750,24 @@ fn pause(
     state_path: &Path,
     state: &mut PredictionMctsRunState,
     reason: String,
-) -> Result<LoopRunSummary, String> {
+) -> Result<PredictionMctsRunSummary, String> {
     state.pause_reason = Some(reason);
     checkpoint(state_path, state)?;
-    Ok(summary(mission, state_path, state, LoopRunStatus::Paused))
+    Ok(summary(
+        mission,
+        state_path,
+        state,
+        PredictionMctsRunStatus::Paused,
+    ))
 }
 
 fn summary(
     mission: &PredictionResearchMission,
     state_path: &Path,
     state: &PredictionMctsRunState,
-    status: LoopRunStatus,
-) -> LoopRunSummary {
-    LoopRunSummary {
+    status: PredictionMctsRunStatus,
+) -> PredictionMctsRunSummary {
+    PredictionMctsRunSummary {
         mission_id: mission.mission_id.clone(),
         status,
         candidates_evaluated: state.training.len(),
@@ -785,8 +815,8 @@ mod tests {
 
     use super::*;
     use crate::prediction_loop::{
-        current_prediction_policy_snapshot_id, research_brief_snapshot_id, LoopRunStatus,
-        PredictionSearchBudget, PREDICTION_LOOP_TARGET, PREDICTION_MISSION_SCHEMA_VERSION,
+        current_prediction_policy_snapshot_id, research_brief_snapshot_id, PredictionSearchBudget,
+        PREDICTION_LOOP_TARGET, PREDICTION_MISSION_SCHEMA_VERSION,
     };
     use crate::prediction_loop_fs::{canonical_json_bytes, sha256_hex};
     use crate::prediction_mcts::{PredictionMctsCandidate, PredictionMctsIdentity};
@@ -915,6 +945,98 @@ mod tests {
     }
 
     #[test]
+    fn mcts_cutover_one_owner_preserves_budget_checkpoint_backpropagation_and_terminal_state() {
+        let output = tempfile::tempdir().unwrap();
+        let mission = mission(2);
+        let snapshot = Path::new("unused-snapshot");
+        let mut interrupted = FakeEvaluator {
+            fail_training: VecDeque::from([true]),
+            ..Default::default()
+        };
+        let paused = run_or_resume_prediction_mcts(
+            mission.clone(),
+            snapshot,
+            output.path(),
+            &mut interrupted,
+        )
+        .unwrap();
+        assert_eq!(paused.status, PredictionMctsRunStatus::Paused);
+        let pending_id = &interrupted.candidate_ids[0];
+        let paused_state: PredictionMctsRunState = read_json(&paused.state_path).unwrap();
+        let pending_checkpoint = paused_state
+            .checkpoint
+            .unwrap()
+            .read_only_artifact()
+            .unwrap();
+        assert_eq!(pending_checkpoint.proposed, 1);
+        assert_eq!(pending_checkpoint.nodes[0].visits, 0);
+        assert_eq!(paused_state.pending.unwrap().candidate_id, *pending_id);
+
+        let mut resumed = FakeEvaluator::default();
+        let terminal =
+            run_or_resume_prediction_mcts(mission.clone(), snapshot, output.path(), &mut resumed)
+                .unwrap();
+        assert_eq!(resumed.candidate_ids[0], *pending_id);
+        assert_eq!(resumed.calls, ["training", "training", "held_out"]);
+        assert_eq!(
+            terminal.candidates_evaluated,
+            mission.search_budget.max_candidates
+        );
+        assert_eq!(terminal.status, PredictionMctsRunStatus::BudgetExhausted);
+        let state: PredictionMctsRunState = read_json(&terminal.state_path).unwrap();
+        let checkpoint = state
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .read_only_artifact()
+            .unwrap();
+        assert_eq!(checkpoint.proposed, 2);
+        assert_eq!(checkpoint.nodes[0].visits, 2);
+        let total_reward: f64 = state
+            .training
+            .iter()
+            .map(|record| record.evaluation.training.reward().unwrap())
+            .sum();
+        assert_eq!(checkpoint.nodes[0].total_reward, total_reward);
+        assert!(state.pending.is_none());
+        assert!(state.held_out_complete);
+        let artifact_path = published_artifact_path(output.path());
+        let artifact_before = std::fs::read(&artifact_path).unwrap();
+        let artifact: serde_json::Value = serde_json::from_slice(&artifact_before).unwrap();
+        assert_eq!(artifact["phase"], "held_out_complete");
+
+        let mut completed = FakeEvaluator::default();
+        let again = run_or_resume_prediction_mcts(mission, snapshot, output.path(), &mut completed)
+            .unwrap();
+        assert_eq!(again.candidates_evaluated, 2);
+        assert!(completed.calls.is_empty());
+        assert_eq!(published_artifact_path(output.path()), artifact_path);
+        assert_eq!(std::fs::read(&artifact_path).unwrap(), artifact_before);
+    }
+
+    #[test]
+    fn mcts_cutover_rejects_unknown_legacy_checkpoint_version_without_rewriting() {
+        let output = tempfile::tempdir().unwrap();
+        let path = output.path().join("prediction-mcts-state.json");
+        // Reject the version before trying to deserialize or reinterpret its payload.
+        let legacy = b"{\"version\":999,\"unknown_legacy_payload\":true}";
+        std::fs::write(&path, legacy).unwrap();
+        let mut evaluator = FakeEvaluator::default();
+        let error = run_or_resume_prediction_mcts(
+            mission(2),
+            Path::new("unused-snapshot"),
+            output.path(),
+            &mut evaluator,
+        )
+        .expect_err("unknown legacy checkpoint must fail closed");
+        assert!(error.contains("incompatible state version 999"));
+        assert!(error.contains("expected 7"));
+        assert!(evaluator.calls.is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), legacy);
+        assert!(!output.path().join("prediction-mcts-artifacts").exists());
+    }
+
+    #[test]
     fn baseline_only_runs_once_without_held_out() {
         let output = temp_dir("baseline");
         let mut evaluator = FakeEvaluator::default();
@@ -927,7 +1049,7 @@ mod tests {
         )
         .expect("baseline-only run");
 
-        assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
+        assert_eq!(summary.status, PredictionMctsRunStatus::BudgetExhausted);
         assert_eq!(evaluator.calls, ["baseline"]);
     }
 
@@ -945,7 +1067,7 @@ mod tests {
             &mut first,
         )
         .expect("retryable pause");
-        assert_eq!(first_summary.status, LoopRunStatus::Paused);
+        assert_eq!(first_summary.status, PredictionMctsRunStatus::Paused);
         let selection_error = authenticated_selection_evidence(
             &output,
             &PredictionMctsIdentity::from_mission(&mission(2)).unwrap(),
@@ -963,7 +1085,7 @@ mod tests {
         )
         .expect("resume pending candidate");
 
-        assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
+        assert_eq!(summary.status, PredictionMctsRunStatus::BudgetExhausted);
         assert_eq!(resumed.candidate_ids[0], pending);
     }
 
@@ -1007,7 +1129,7 @@ mod tests {
         )
         .expect("novelty exhaustion is a normal terminal condition");
 
-        assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
+        assert_eq!(summary.status, PredictionMctsRunStatus::BudgetExhausted);
         assert_eq!(summary.candidates_evaluated, 55);
         assert_eq!(
             evaluator
@@ -1148,7 +1270,7 @@ mod tests {
             &mut resumed,
         )
         .expect("expired run returns a terminal summary");
-        assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
+        assert_eq!(summary.status, PredictionMctsRunStatus::BudgetExhausted);
         assert!(resumed.calls.is_empty());
 
         let artifact: serde_json::Value =

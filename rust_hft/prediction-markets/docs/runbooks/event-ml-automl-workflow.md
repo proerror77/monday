@@ -4,6 +4,12 @@
 > workflow commands below are retained as migration evidence only. They do not
 > define a current Monday deployment or execution path.
 
+Current Alpha Search evaluator artifacts are descriptive. Only
+`monday-prediction-research` advances or resumes MCTS for an admitted Mission
+v4. The evaluator rejects `--alpha-search-state-json`,
+`--formula-mcts-checkpoint-json`, and `--alpha-search-plan-json` with exit
+status `2`; these inputs cannot resume research.
+
 This is the canonical research workflow for PM 5-minute event datasets before
 moving a signal toward DL, RL, backtest optimization, or live dry-run.
 
@@ -390,10 +396,12 @@ GitHub's 10-input dispatch limit.
 When runtime candidate replay evidence should feed the next hosted search,
 pass it separately as
 `options_json.candidate_strategy_replay_run_id=<run-id>` or
-`<run-id>:<artifact-name>`. Do not overload `alpha_search_plan_run_id` for this:
-alpha search plan artifacts are expected to contain `mcts-expansion-plan.json`,
-while runtime replay artifacts are expected to contain
-`candidate-strategy-replay.json`.
+`<run-id>:<artifact-name>`. Runtime replay artifacts contain
+`candidate-strategy-replay.json`. Evaluator Alpha Search bundles contain
+descriptive `search-space.json`, `candidate-expressions.json`,
+`rejected-expressions.json`, `tree-trace.json`, `node-metrics.json`, and
+`search-feedback.json`. These bundles are review evidence, not resumable MCTS
+plans. Use `monday-prediction-research` for the single admitted MCTS path.
 
 Use `--output-dir <dir>` to choose the artifact directory. Without it, the
 runner writes under `<dataset>/workflow_runs/event_ml_<timestamp>`.

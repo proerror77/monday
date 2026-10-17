@@ -129,14 +129,10 @@ pub fn crate_marker() -> &'static str {
 // factor registry uses the same type internally, but does not re-export its own
 // `factors_new::Regime` alias.
 pub use alpha_search::{
-    read_formula_mcts_checkpoint, read_mcts_search_state, root_gene, write_alpha_search_artifacts,
-    write_alpha_search_artifacts_with_state,
-    write_alpha_search_artifacts_with_state_and_runtime_feedback,
-    write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback,
-    AlphaSearchArtifactError, AlphaSearchArtifactSummary, AlphaSearchRuntimeFeedback,
-    AlphaZooEntry, AlphaZooSnapshot, CandidateReplayFactorIdentity, FormulaMctsCheckpoint,
-    FormulaMctsCheckpointNode, MctsSearchStateArtifact, MctsSearchStateNode,
-    FORMULA_MCTS_CHECKPOINT_VERSION, SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
+    root_gene, write_alpha_search_artifacts, write_alpha_search_artifacts_with_runtime_feedback,
+    write_side_bound_alpha_search_artifacts_with_runtime_feedback, AlphaSearchArtifactError,
+    AlphaSearchArtifactSummary, AlphaSearchRuntimeFeedback, AlphaZooEntry, AlphaZooSnapshot,
+    CandidateReplayFactorIdentity, SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
 };
 pub use attribution::{factor_pnl, regime_pnl, AttributionReport, RegimePnl};
 pub use autofactor::{
@@ -145,12 +141,11 @@ pub use autofactor::{
     domain_seed_candidates, evaluate_named_factor, evaluate_reprice_pilot_selection,
     fit_reprice_pilot_selection, format_autofactor_reports, mine_autofactors,
     mine_domain_autofactors_from_v2, mine_domain_autofactors_from_v2_with_guidance,
-    mine_domain_autofactors_from_v2_with_mcts_plan, split_reprice_rows_by_event_cohort,
-    AutoFactorDecision, AutoFactorError, AutoFactorMatrix, AutoFactorOptions, AutoFactorReport,
-    AutoFactorRuntimeContractCatalog, AutoFactorRuntimeFormulaBlocker,
-    AutoFactorRuntimeInputContract, AutoFactorTargetContract, AutoFactorV2Target, FactorExpr,
-    LlmMutationSpec, LlmPriorSpec, LlmProbabilityBlendSpec, NamedFactorExpr, RepricePilotMetrics,
-    RepricePilotSelection,
+    split_reprice_rows_by_event_cohort, AutoFactorDecision, AutoFactorError, AutoFactorMatrix,
+    AutoFactorOptions, AutoFactorReport, AutoFactorRuntimeContractCatalog,
+    AutoFactorRuntimeFormulaBlocker, AutoFactorRuntimeInputContract, AutoFactorTargetContract,
+    AutoFactorV2Target, FactorExpr, LlmMutationSpec, LlmPriorSpec, LlmProbabilityBlendSpec,
+    NamedFactorExpr, RepricePilotMetrics, RepricePilotSelection,
 };
 pub use backtest::{run_binary_backtest, BacktestMetrics, SimulatedFill};
 pub use factors_new::{

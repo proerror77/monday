@@ -6,6 +6,14 @@
 > `crates/ploy-market-data`, the root PLOY CI workflow, and
 > `docs/architecture/RUST_ONLY_RESEARCH.md` at the Monday repository root.
 
+The current evaluator writes descriptive Alpha Search artifacts only.
+Only `monday-prediction-research` advances or resumes MCTS for an admitted
+Mission v4. The evaluator rejects `--alpha-search-state-json`,
+`--formula-mcts-checkpoint-json`, and `--alpha-search-plan-json` with exit
+status `2`. Use a new `--alpha-search-output-dir` for descriptive artifacts.
+Writing into a directory containing retired search state fails with exit
+status `2`.
+
 This document defines Ploy's CI/CD method for mining alpha factors with a
 two-layer search architecture:
 
@@ -439,18 +447,25 @@ that lands on `main`.
 
 ## Required Search Artifact Bundle
 
-Every complete CI/CD alpha-search run should upload:
+The evaluator's descriptive Alpha Search bundle contains the following
+artifacts. MCTS state belongs to `monday-prediction-research` and is not part
+of this evaluator bundle.
 
 - `search-space.json`: feature pool, constants, operators, targets, limits
 - `llm-priors.json`: hypotheses, symbolic seeds, suggested modifications
 - `candidate-expressions.json`: all generated `FactorExpr` candidates
 - `rejected-expressions.json`: invalid or blocked expressions and reasons
-- `tree-trace.json`: parent/child expansions, selected weak dimension, rewards
-- `node-metrics.json`: multi-dimensional scores per node
-- `mcts-expansion-plan.json`: UCB-style branch selection for the next search
-  run, including selected weak dimension and proposed mutation type
+- `tree-trace.json`: descriptive candidate lineage and evaluation trace
+- `node-metrics.json`: descriptive multi-dimensional candidate scores
+- `factor-registry-preview.json`: typed candidate identities and runtime contracts
 - `avoided-subtrees.json`: repeated subtrees blocked or penalized
-- `search-feedback.json`: backtest feedback used by MCTS
+- `search-feedback.json`: descriptive candidate scores and evaluation feedback
+
+Missing descriptive files make the evaluator bundle incomplete. These files
+do not prove MCTS completion.
+
+Historical downstream bundles also included:
+
 - `alpha-search-chain/chain-decision.json`: hosted-workflow continuation
   decision, including whether the next run was dispatched and why the chain
   stopped when it did not continue
@@ -460,9 +475,6 @@ Every complete CI/CD alpha-search run should upload:
   dry-run handoff
 - `autofactor-factor-registry.json`: evaluated factor rows and blockers
 - `autofactor-strategy-handoff.json`: ready/blocked handoff manifest
-
-If any of the search artifacts are missing, the run can still be diagnostic,
-but it is not a complete alpha-search run.
 
 For a quick review across multiple downloaded hosted runs, use:
 
@@ -630,15 +642,11 @@ same-event UP/DOWN rows from being counted as independent deployable trades.
 Diagnostic rows can still be useful for research, but a dry-run handoff must
 pass this event-level gate.
 
-The search layer also consumes these fields before promotion. `node-metrics.json`
-records event uniqueness and top-bucket sweep metrics, `reward` penalizes
-repeated event decisions, missing top-bucket event coverage, high average sweep
-slippage, excessive sweep levels, and low top-bucket fillability, and
-`mcts-expansion-plan.json` routes repeated-event branches to
-`event_uniqueness` / `add_capacity_gate` instead of generic exploitation. This
-keeps MCTS from repeatedly expanding branches that look strong only because
-the same event contributed multiple diagnostic rows or because the entry was
-not realistically executable.
+The descriptive `node-metrics.json` records event uniqueness and top-bucket
+sweep metrics. Candidate scores penalize repeated event decisions, missing
+event coverage, high sweep slippage, excessive sweep levels, and low fillability.
+These artifacts support review; they do not select or expand MCTS branches.
+Only `monday-prediction-research` advances MCTS within the admitted mission.
 
 For settlement targets, AutoFactor scoring itself must be event-level:
 `settlement_executable_pnl`, `full_depth_settlement_executable_pnl`, and
@@ -672,28 +680,19 @@ Current implementation status:
   a candidate cap to keep CI runs bounded.
 - Implemented: workflow upload path for the artifact bundle through both
   Factor Walk-Forward V2 workflows.
-- Implemented: `formula-mcts-checkpoint.json` is the only resumable Formula
-  search state. It records candidate parent lineage, reward statistics, and
-  the existing 12-branch selection budget around the shared UCT kernel.
-  `mcts-state.json` and `mcts-expansion-plan.json` are read-only projections.
-  Invalid lineage, reordered roots, altered budgets, and legacy state versions
-  fail closed rather than being reinterpreted.
-- Implemented: `factor_walk_forward_v2 --alpha-search-plan-json <path>` can
-  consume a prior `mcts-expansion-plan.json` and generate extra `mcts_*`
-  guided mutations for selected branches. The Factor Walk-Forward workflows
-  expose this as `options_json.alpha_search_plan_json`.
-- Implemented: `monday-prediction-evaluator
-  --formula-mcts-checkpoint-json <path>` resumes only from the new checkpoint.
-  `--alpha-search-state-json` is a legacy state input and is rejected
-  with an explicit migration diagnostic.
+- Implemented: evaluator artifacts describe candidate expressions, rejected
+  expressions, lineage, node metrics, and search feedback. They never update
+  MCTS state and cannot resume a search.
+- Implemented: `monday-prediction-research` owns the single MCTS path and its
+  checkpoint within an admitted Mission v4. The evaluator rejects retired
+  checkpoint and plan inputs before evaluation.
 - Implemented: `factor_walk_forward_v2 --alpha-search-llm-prior-json <path>`
   accepts a typed LLM-prior JSON file with bounded mutation requests. The Rust
   layer compiles those requests into existing `FactorExpr` candidates only when
   the requested base factor, feature, mutation type, and constants are valid.
   Unsupported free-form code is ignored rather than evaluated.
-- Implemented: the Factor Walk-Forward workflows can download a prior plan from
-  a previous run with `options_json.alpha_search_plan_run_id`,
-  `alpha_search_plan_artifact_name`, and `alpha_search_plan_target`.
+- Prior evaluator bundles are review inputs only. Use the admitted
+  `monday-prediction-research` mission path to continue MCTS.
 - Implemented: the hosted artifact workflow can dispatch the next search
   iteration automatically with `options_json.chain_next_run=true` and bounded
   `chain_remaining`.
@@ -748,10 +747,7 @@ Current implementation status:
   Rust prediction LoopRun. It writes only a typed prior draft and fails soft
   back to the deterministic closed-loop prior.
 
-The current system is enough to start systematizing alpha discovery in CI: every
-walk-forward run can now expand interpretable bounded multi-depth mutations,
-download or consume a prior MCTS expansion plan, and preserve search space,
-candidates, rejected expressions, node metrics, tree trace, MCTS expansion plan,
-subtree crowding, and feedback artifacts. Hosted artifact runs can also dispatch
-bounded chained follow-up runs with ready-handoff, empty-plan, and reward
-stagnation stop criteria.
+The evaluator preserves descriptive search space, candidates, rejected
+expressions, node metrics, tree trace, subtree crowding, and feedback artifacts.
+It cannot consume a prior MCTS plan or checkpoint. Use
+`monday-prediction-research` for bounded MCTS execution under an admitted mission.
