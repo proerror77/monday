@@ -176,7 +176,23 @@ jobs:
           for script in ../deployment/aliyun/*.sh; do
             bash -n "$script"
           done
-          shellcheck ../deployment/aliyun/*.sh
+          (
+            groups=$(mktemp -d)
+            trap 'rm -rf -- "$groups"' EXIT
+            cat >"$groups/files" <<'SHELLCHECK_GROUPS'
+          ../deployment/aliyun/test-monday-collector-health.sh ../deployment/aliyun/test-recovery-retention-fixture.sh ../deployment/aliyun/host-rust-lob-recovery-queue.sh ../deployment/aliyun/rust-lob-control-plane-lib.sh
+          ../deployment/aliyun/test-rust-lob-retention.sh ../deployment/aliyun/test-recovery-retention-fixture.sh ../deployment/aliyun/host-rust-lob-recovery-queue.sh ../deployment/aliyun/rust-lob-control-plane-lib.sh ../deployment/aliyun/test-rust-lob-recovery-queue.sh
+          ../deployment/aliyun/test-rust-lob-control-plane.sh ../deployment/aliyun/host-rust-lob-controller-release.sh ../deployment/aliyun/test-rust-lob-controller-release.sh ../deployment/aliyun/rust-lob-control-plane-lib.sh
+          ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
+          ../deployment/aliyun/host-rust-lob-shadow-gate.sh ../deployment/aliyun/host-rust-lob-cutover.sh ../deployment/aliyun/rust-lob-control-plane-lib.sh
+          ../deployment/aliyun/host-rust-lob-restore.sh ../deployment/aliyun/host-rust-lob-readback.sh ../deployment/aliyun/publish-rust-lob-pair-release.sh ../deployment/aliyun/test-host-rust-lob-cutover.sh ../deployment/aliyun/test-rust-lob-rollback-unit-bindings.sh ../deployment/aliyun/rust-lob-control-plane-lib.sh
+          ../deployment/aliyun/binance-lob-slice-materialize.sh ../deployment/aliyun/binance-usdm-reference-shadow-gate.sh ../deployment/aliyun/bybit-options-control-plane-lib.sh ../deployment/aliyun/collector-monitor-retained.sh ../deployment/aliyun/host-bybit-options-cutover.sh ../deployment/aliyun/host-collector-health-unit-release.sh ../deployment/aliyun/monday-collector-health.sh ../deployment/aliyun/polymarket-market-tape-canary-monitor.sh ../deployment/aliyun/polymarket-raw-ops-cutover.sh ../deployment/aliyun/polymarket-raw-ops-shadow-gate.sh ../deployment/aliyun/test-binance-fee-cutover.sh ../deployment/aliyun/test-binance-lob-slice-materialize.sh ../deployment/aliyun/test-binance-usdm-reference-host-gate.sh ../deployment/aliyun/test-binance-usdm-reference-shadow-gate.sh ../deployment/aliyun/test-bybit-options-release-contract.sh ../deployment/aliyun/test-collector-health-unit-release.sh ../deployment/aliyun/test-data-completeness-check.sh ../deployment/aliyun/test-polymarket-market-recorder-release.sh ../deployment/aliyun/test-polymarket-market-tape-upload-contract.sh ../deployment/aliyun/test-polymarket-reference-upload-contract.sh ../deployment/aliyun/test-trading-ecs-host-contract.sh ../deployment/aliyun/trading-ecs-hostctl.sh ../deployment/aliyun/binance-fee-cutover.sh ../deployment/aliyun/binance-usdm-reference-cutover.sh ../deployment/aliyun/bybit-options-archiver-deploy.sh ../deployment/aliyun/collector-monitor-release.sh ../deployment/aliyun/data-completeness-check.sh ../deployment/aliyun/host-bybit-options-shadow-gate.sh ../deployment/aliyun/host-collector-monitor-install.sh ../deployment/aliyun/polymarket-market-recorder-deploy.sh ../deployment/aliyun/polymarket-market-tape-upload-watchdog.sh ../deployment/aliyun/polymarket-raw-ops-gate-control.sh ../deployment/aliyun/rust-lob-control-plane.sh ../deployment/aliyun/test-binance-fee-release-contract.sh ../deployment/aliyun/test-binance-usdm-account-release-contract.sh ../deployment/aliyun/test-binance-usdm-reference-release-contract.sh ../deployment/aliyun/test-bybit-options-cutover.sh ../deployment/aliyun/test-bybit-options-shadow-gate.sh ../deployment/aliyun/test-collector-monitor-release.sh ../deployment/aliyun/test-host-bybit-options-cutover.sh ../deployment/aliyun/test-polymarket-market-tape-canary-monitor.sh ../deployment/aliyun/test-polymarket-raw-ops-stage.sh ../deployment/aliyun/test-rust-lob-restore.sh ../deployment/aliyun/test-upload-cpu-limits.sh ../deployment/aliyun/trading-ecs-runtime.sh
+          SHELLCHECK_GROUPS
+            printf '%s\n' ../deployment/aliyun/*.sh | sort >"$groups/expected"
+            tr ' ' '\n' <"$groups/files" | sort -u >"$groups/actual"
+            diff -u "$groups/expected" "$groups/actual"
+            xargs -P4 -L1 shellcheck <"$groups/files"
+          )
           bash ../.github/scripts/run-collector-control-contracts.sh
 
   monitor_contracts:
