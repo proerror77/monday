@@ -5,6 +5,7 @@ pub mod binance_fee_artifact;
 pub mod binance_fee_upload;
 pub mod binance_spot_reference_artifact;
 pub mod binance_spot_reference_collector;
+pub mod binance_usdm_positioning_artifact;
 pub mod binance_usdm_reference_artifact;
 pub mod binance_usdm_reference_collector;
 pub mod binance_usdm_reference_upload;
