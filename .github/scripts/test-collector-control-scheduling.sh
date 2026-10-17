@@ -110,17 +110,32 @@ sed 's/^  test-binance-fee-cutover.sh$/  # test-binance-fee-cutover.sh/' "$runne
 if check_fee 2>"$root/error"; then exit 1; fi
 grep -q 'register the fee cutover contract' "$root/error"
 
-# The static gate keeps every script, including whitespace in names. Its workers
-# must overlap without exceeding four, and any lint error must still fail the gate.
+# Preserve the full source-aware input union and retain a failing static gate.
 lint_runner="$source_root/.github/scripts/check-collector-shells.sh"
 fixture shell-lint
+mkdir -p "$root/bin" "$root/.github/scripts"
+lint_groups="$root/.github/scripts/collector-shellcheck-groups.json"
+cp "$source_root/.github/scripts/collector-shellcheck-groups.json" "$lint_groups"
+while IFS= read -r -d '' file; do
+  printf '#!/usr/bin/env bash\n:\n' >"$root/rust_hft/$file"
+done < <(jq -j '.[][] | . + "\u0000"' "$lint_groups" | sort -zu)
 printf '#!/usr/bin/env bash\n:\n' >"$root/deployment/aliyun/space name.sh"
-mkdir "$root/bin"
+jq '.[-1] += ["../deployment/aliyun/space name.sh"]' "$lint_groups" >"$root/groups.new"
+mv "$root/groups.new" "$lint_groups"
+cp "$lint_groups" "$root/groups.saved"
 cat >"$root/bin/shellcheck" <<'LINT'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ $# == 2 && $1 == -- ]]
+[[ $1 == -- && $# -gt 1 ]]
 shift
+health=false companion=false
+for file in "$@"; do
+  [[ $file != ../deployment/aliyun/test-monday-collector-health.sh ]] || health=true
+  [[ $file != ../deployment/aliyun/test-recovery-retention-fixture.sh ]] || companion=true
+done
+if [[ $health == true && $companion != true ]]; then
+  echo 'missing retention source companion' >&2; exit 38
+fi
 exec 9>>"$LINT_ROOT/lint.lock"
 flock 9
 active=$(cat "$LINT_ROOT/lint.active")
@@ -128,18 +143,21 @@ active=$((active + 1))
 printf '%s\n' "$active" >"$LINT_ROOT/lint.active"
 peak=$(cat "$LINT_ROOT/lint.peak")
 if (( active > peak )); then printf '%s\n' "$active" >"$LINT_ROOT/lint.peak"; fi
-printf '%s\0' "$1" >>"$LINT_ROOT/lint.calls"
+printf '%s\0' "$@" >>"$LINT_ROOT/lint.calls"
+printf '%s\n' "$BASHPID" >>"$LINT_ROOT/lint.workers"
 flock -u 9
 sleep 0.1
 flock 9
 active=$(cat "$LINT_ROOT/lint.active")
 printf '%s\n' "$((active - 1))" >"$LINT_ROOT/lint.active"
 flock -u 9
-if [[ ${1##*/} == ${LINT_FAIL:-} ]]; then exit 37; fi
+for file in "$@"; do
+  if [[ ${file##*/} == ${LINT_FAIL:-} ]]; then exit 37; fi
+done
 LINT
 chmod +x "$root/bin/shellcheck"
 reset_lint() {
-  : >"$root/lint.calls"
+  : >"$root/lint.calls"; : >"$root/lint.workers"
   printf '0\n' >"$root/lint.active"
   printf '0\n' >"$root/lint.peak"
 }
@@ -148,10 +166,11 @@ run_lint() {
     bash "$lint_runner" --root "$root"
 }
 check_lint_coverage() {
-  (cd "$root/rust_hft"; printf '%s\0' ../deployment/aliyun/*.sh) | sort -z >"$root/lint.expected"
-  sort -z "$root/lint.calls" >"$root/lint.actual"
+  (cd "$root/rust_hft" || exit; printf '%s\0' ../deployment/aliyun/*.sh) | sort -z >"$root/lint.expected"
+  sort -zu "$root/lint.calls" >"$root/lint.actual"
   cmp "$root/lint.expected" "$root/lint.actual"
   [[ $(cat "$root/lint.active") == 0 ]]
+  [[ $(wc -l <"$root/lint.workers") -eq $(jq length "$lint_groups") ]]
 }
 reset_lint
 run_lint >"$root/lint.output"
@@ -164,9 +183,25 @@ if run_lint test-trading-ecs-host-contract.sh >"$root/lint.output" 2>&1; then
 fi
 check_lint_coverage
 reset_lint
-printf 'if\n' >"$root/deployment/aliyun/broken.sh"
+jq '.[0] -= ["../deployment/aliyun/test-recovery-retention-fixture.sh"]' "$lint_groups" >"$root/groups.new"
+mv "$root/groups.new" "$lint_groups"
+if run_lint >"$root/lint.output" 2>&1; then
+  echo 'split source companions passed the static gate' >&2; exit 1
+fi
+grep -q 'missing retention source companion' "$root/lint.output"
+cp "$root/groups.saved" "$lint_groups"
+reset_lint
+printf '#!/usr/bin/env bash\n:\n' >"$root/deployment/aliyun/unregistered.sh"
+if run_lint >"$root/lint.output" 2>&1; then
+  echo 'unregistered collector script passed the static gate' >&2; exit 1
+fi
+grep -q 'exact collector script set' "$root/lint.output"
+[[ ! -s $root/lint.calls ]]
+rm "$root/deployment/aliyun/unregistered.sh"
+reset_lint
+printf 'if\n' >"$root/deployment/aliyun/test-trading-ecs-host-contract.sh"
 if run_lint >"$root/lint.output" 2>&1; then
   echo 'invalid shell syntax passed the static gate' >&2; exit 1
 fi
 [[ ! -s $root/lint.calls ]]
-printf 'collector scheduling: coverage, isolation, failures, cancellation, fee admission and bounded lint passed\n'
+printf 'collector scheduling: coverage, isolation, failures, cancellation, fee admission and source-aware lint passed\n'
