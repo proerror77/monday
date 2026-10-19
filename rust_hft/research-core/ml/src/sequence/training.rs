@@ -3,15 +3,15 @@
 use crate::{lock_ndarray_backend, CpuAutodiffBackend, CpuBackend};
 use burn::{
     module::{AutodiffModule, Module, ModuleVisitor, Param},
-    nn::{
-        conv::{Conv1d, Conv1dConfig},
-        loss::{MseLoss, Reduction},
-        Linear, LinearConfig,
-    },
-    optim::{AdamConfig, GradientsParams, Optimizer},
     tensor::{activation::relu, backend::Backend, Tensor, TensorData},
 };
 use burn_ndarray::NdArrayDevice;
+use burn_nn::{
+    conv::{Conv1d, Conv1dConfig},
+    loss::{MseLoss, Reduction},
+    Linear, LinearConfig,
+};
+use burn_optim::{AdamConfig, GradientsParams, Optimizer};
 use burn_store::{BurnpackStore, ModuleSnapshot};
 use hft_cex_research_input::sequence::{SequenceExample, SequenceReader};
 use hft_research_manifest::portable_network::FrozenNetworkV1;

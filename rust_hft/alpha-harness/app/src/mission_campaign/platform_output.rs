@@ -277,7 +277,7 @@ fn actual_archive_entries_with_limit(
         if entry.is_dir() {
             continue;
         }
-        let path = entry.name().to_string();
+        let path = entry.name()?.into_owned();
         if entry.enclosed_name().is_none()
             || path.len() > 256
             || path.contains("..")

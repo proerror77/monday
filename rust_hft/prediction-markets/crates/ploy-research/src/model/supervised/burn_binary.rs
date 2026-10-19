@@ -6,12 +6,13 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use burn::{
-    backend::{Autodiff, NdArray},
     module::{AutodiffModule, Initializer, Module, Param},
-    nn::{loss::BinaryCrossEntropyLossConfig, Linear, LinearConfig},
-    optim::{AdamConfig, GradientsParams, Optimizer},
     tensor::{activation::sigmoid, backend::Backend, Int, Tensor, TensorData},
 };
+use burn_autodiff::Autodiff;
+use burn_ndarray::NdArray;
+use burn_nn::{loss::BinaryCrossEntropyLossConfig, Linear, LinearConfig};
+use burn_optim::{AdamConfig, GradientsParams, Optimizer};
 use burn_store::{BurnpackStore, ModuleSnapshot};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};

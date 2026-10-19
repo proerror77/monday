@@ -1091,9 +1091,14 @@ mod tests {
 
         assert!(fixture.result_path.is_file());
         let archive = ZipArchive::new(File::open(&fixture.result_path).unwrap()).unwrap();
-        let names = archive.file_names().collect::<Vec<_>>();
-        assert!(names.contains(&"results/summary.json"));
-        assert!(names.contains(&"artifacts/execution-evidence.json"));
+        let names = archive
+            .file_names()
+            .map(|name| name.unwrap().into_owned())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "results/summary.json"));
+        assert!(names
+            .iter()
+            .any(|name| name == "artifacts/execution-evidence.json"));
         let evidence: serde_json::Value = serde_json::from_slice(
             &std::fs::read(fixture.root.join("work/artifacts/execution-evidence.json")).unwrap(),
         )
@@ -1326,6 +1331,7 @@ mod tests {
         let archive = ZipArchive::new(File::open(&fixture.result_path).unwrap()).unwrap();
         assert!(archive
             .file_names()
+            .map(|name| name.unwrap().into_owned())
             .any(|name| name == "results/checkpoint.json"));
         std::fs::remove_dir_all(fixture.root).unwrap();
     }

@@ -4722,6 +4722,8 @@ fn decode_verified_execution_report(
         None => {
             if archive
                 .file_names()
+                .collect::<zip::result::ZipResult<Vec<_>>>()?
+                .into_iter()
                 .any(|name| name == "results/native-prepared-inputs.json")
             {
                 bail!("native result readback requires its independently bound finalized request");
@@ -4810,6 +4812,8 @@ fn decode_verified_execution_report(
             {
                 let unexpected_backtest = archive
                     .file_names()
+                    .collect::<zip::result::ZipResult<Vec<_>>>()?
+                    .into_iter()
                     .any(|path| path == format!("results/{name}-supervised-backtest.json"));
                 if baseline.is_some() || candidate.is_some() || unexpected_backtest {
                     bail!("published result contains a model outside its declared scope");
@@ -5288,14 +5292,18 @@ fn validate_model_metric_readback(
     candidates: &std::collections::BTreeMap<&str, CexResearchContentRefV1>,
     native: Option<&crate::mission_campaign::prepared_inputs::VerifiedNativeCampaignPreparedInputs>,
 ) -> anyhow::Result<()> {
-    let calendar_artifacts_present = archive.file_names().any(|name| {
-        matches!(
-            name,
-            "results/calendar-validation.json"
-                | "results/calendar-prediction-diagnostics.json"
-                | "results/calendar-validation-event-replay-receipt.json"
-        )
-    });
+    let calendar_artifacts_present = archive
+        .file_names()
+        .collect::<zip::result::ZipResult<Vec<_>>>()?
+        .into_iter()
+        .any(|name| {
+            matches!(
+                name.as_ref(),
+                "results/calendar-validation.json"
+                    | "results/calendar-prediction-diagnostics.json"
+                    | "results/calendar-validation-event-replay-receipt.json"
+            )
+        });
     if calendar_artifacts_present
         && (mission.spec.evaluation_protocol.calendar.is_none() || selection.is_none())
     {
@@ -5517,7 +5525,9 @@ fn load_native_archive_input(
     .context("native archive is missing its actual prepared collection")?;
     let names = archive
         .file_names()
-        .map(str::to_owned)
+        .collect::<zip::result::ZipResult<Vec<_>>>()?
+        .into_iter()
+        .map(|name| name.into_owned())
         .collect::<std::collections::BTreeSet<_>>();
     if names.len() != archive.len() {
         bail!("native archive contains duplicate entry names");
@@ -5672,7 +5682,12 @@ fn read_optional_bundle_bytes(
     name: &str,
     max_bytes: u64,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    if !archive.file_names().any(|entry| entry == name) {
+    if !archive
+        .file_names()
+        .collect::<zip::result::ZipResult<Vec<_>>>()?
+        .into_iter()
+        .any(|entry| entry == name)
+    {
         return Ok(None);
     }
     read_bundle_bytes(archive, name, max_bytes).map(Some)
@@ -9924,7 +9939,7 @@ pub(crate) mod tests {
             let mut entry = archive.by_index(index).unwrap();
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes).unwrap();
-            entries.push((entry.name().to_string(), bytes));
+            entries.push((entry.name().unwrap().into_owned(), bytes));
         }
         entries
     }

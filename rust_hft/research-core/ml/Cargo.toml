@@ -10,6 +10,9 @@ anyhow = "1"
 hft-cex-research-input = { path = "../cex-input", features = ["streaming", "market-parquet"] }
 hft-research-manifest = { path = "../manifest" }
 burn.workspace = true
+burn-autodiff.workspace = true
+burn-nn.workspace = true
+burn-optim.workspace = true
 burn-ndarray.workspace = true
 burn-store.workspace = true
 clap.workspace = true

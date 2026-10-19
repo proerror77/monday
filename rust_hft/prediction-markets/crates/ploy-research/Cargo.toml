@@ -15,7 +15,7 @@ default = []
 full = ["db", "polars-export", "ml", "rl", "strategy-runtime"]
 db = ["dep:sqlx", "dep:ploy-feed-loaders"]
 polars-export = ["dep:polars"]
-ml = ["dep:burn", "dep:burn-ndarray", "dep:burn-store", "dep:ciborium"]
+ml = ["dep:burn", "dep:burn-autodiff", "dep:burn-nn", "dep:burn-optim", "dep:burn-ndarray", "dep:burn-store", "dep:ciborium"]
 rl = []
 strategy-runtime = []
 
@@ -43,7 +43,11 @@ anyhow = "1"
 fs2 = "0.4"
 hft-search-kernel = { path = "../../../research-core/search-kernel" }
 libc.workspace = true
-burn = { version = "0.20.1", default-features = false, features = ["ndarray", "autodiff", "std"], optional = true }
+# Keep the `burn` name for derive macros; do not resolve unused GPU/Candle backends.
+burn = { package = "burn-core", version = "0.20.1", default-features = false, features = ["std"], optional = true }
+burn-autodiff = { version = "0.20.1", default-features = false, features = ["std"], optional = true }
+burn-nn = { version = "0.20.1", default-features = false, features = ["std"], optional = true }
+burn-optim = { version = "0.20.1", default-features = false, features = ["std"], optional = true }
 burn-ndarray = { version = "0.20.1", optional = true }
 burn-store = { version = "0.20.1", default-features = false, features = ["burnpack", "std"], optional = true }
 ciborium = { version = "0.2", optional = true }

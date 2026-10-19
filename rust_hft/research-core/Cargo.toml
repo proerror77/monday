@@ -20,7 +20,11 @@ tracing-subscriber = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = { version = "1.33", features = ["serde"] }
 clap = { version = "4.0", features = ["derive"] }
-burn = { version = "0.20.1", default-features = false, features = ["ndarray", "autodiff", "std"] }
+# Keep the `burn` name for derive macros; use only the admitted CPU components.
+burn = { package = "burn-core", version = "0.20.1", default-features = false, features = ["std"] }
+burn-autodiff = { version = "0.20.1", default-features = false, features = ["std"] }
+burn-nn = { version = "0.20.1", default-features = false, features = ["std"] }
+burn-optim = { version = "0.20.1", default-features = false, features = ["std"] }
 burn-ndarray = "0.20.1"
 burn-store = { version = "0.20.1", default-features = false, features = ["std", "burnpack"] }
 

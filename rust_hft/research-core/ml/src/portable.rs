@@ -2,13 +2,13 @@
 use crate::CpuBackend;
 use burn::{
     module::Param,
-    nn::{
-        conv::{Conv1d, Conv1dConfig},
-        Linear, LinearConfig,
-    },
     tensor::{backend::Backend, Tensor, TensorData},
 };
 use burn_ndarray::NdArrayDevice;
+use burn_nn::{
+    conv::{Conv1d, Conv1dConfig},
+    Linear, LinearConfig,
+};
 use hft_research_manifest::portable_network::{FrozenCausalConvV1, FrozenLinearV1};
 
 pub(crate) fn linear(model: &Linear<CpuBackend>) -> Result<FrozenLinearV1, String> {

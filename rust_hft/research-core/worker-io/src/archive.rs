@@ -23,7 +23,7 @@ pub fn verify_archive_entries(
     let mut total = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let path = entry.name().to_owned();
+        let path = entry.name()?.into_owned();
         ensure!(
             seen.insert(path.clone())
                 && !entry.is_dir()
@@ -82,6 +82,49 @@ pub fn verify_archive_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_zip_rejects_symlinks_and_invalid_filename_encoding() -> Result<()> {
+        use std::io::{Cursor, Write};
+
+        let reference = ArchiveEntry {
+            path: "results/replay.json".into(),
+            sha256: crate::sha256(b"receipt"),
+            bytes: 7,
+        };
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive.add_symlink(
+            &reference.path,
+            "../../outside.json",
+            zip::write::SimpleFileOptions::default(),
+        )?;
+        let bytes = archive.finish()?.into_inner();
+        assert!(verify_archive_entries(Cursor::new(bytes), &[reference], 1024).is_err());
+
+        let name = "results/é.json";
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive.start_file(name, zip::write::SimpleFileOptions::default())?;
+        archive.write_all(b"receipt")?;
+        let mut bytes = archive.finish()?.into_inner();
+        // Corrupt the UTF-8 filename in both headers, leaving the payload intact.
+        let offsets = bytes
+            .windows(name.len())
+            .enumerate()
+            .filter_map(|(index, value)| (value == name.as_bytes()).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(offsets.len(), 2);
+        for offset in offsets {
+            bytes[offset + "results/".len()] = 0xff;
+        }
+        let reference = ArchiveEntry {
+            path: name.into(),
+            sha256: crate::sha256(b"receipt"),
+            bytes: 7,
+        };
+        assert!(verify_archive_entries(Cursor::new(bytes), &[reference], 1024).is_err());
+        Ok(())
+    }
+
     #[test]
     fn native_zip_entry_claims_require_actual_bytes_and_bounded_coverage() -> Result<()> {
         use std::io::{Cursor, Write};

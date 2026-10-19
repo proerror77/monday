@@ -1,13 +1,13 @@
 use crate::{CpuAutodiffBackend, CpuBackend};
 use burn::{
     module::{Module, ModuleVisitor, Param},
-    nn::{
-        conv::{Conv1d, Conv1dConfig},
-        Linear, LinearConfig,
-    },
-    optim::GradientsParams,
     tensor::{activation::relu, backend::Backend, Tensor},
 };
+use burn_nn::{
+    conv::{Conv1d, Conv1dConfig},
+    Linear, LinearConfig,
+};
+use burn_optim::GradientsParams;
 use hft_research_manifest::market_encoder::MarketEncoderSpecV1;
 use sha2::{Digest, Sha256};
 

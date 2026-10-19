@@ -2,14 +2,14 @@ use super::{artifacts::*, network::*};
 use crate::{lock_ndarray_backend, CpuAutodiffBackend, CpuBackend};
 use burn::{
     module::AutodiffModule,
-    nn::{
-        loss::{MseLoss, Reduction},
-        LinearConfig,
-    },
-    optim::{AdamConfig, GradientsParams, Optimizer},
     tensor::{backend::Backend, Tensor, TensorData},
 };
 use burn_ndarray::NdArrayDevice;
+use burn_nn::{
+    loss::{MseLoss, Reduction},
+    LinearConfig,
+};
+use burn_optim::{AdamConfig, GradientsParams, Optimizer};
 use hft_cex_research_input::market_encoder::{
     fit_market_scaling, MarketFeatureReader, MarketTaskReader, Moments, UnlabeledSequenceExample,
 };

@@ -10,17 +10,17 @@ pub mod sequence;
 pub mod shared_input;
 
 use burn::{
-    backend::{Autodiff, NdArray},
     config::Config,
     module::{AutodiffModule, Module, Param},
-    nn::{
-        loss::{MseLoss, Reduction},
-        Linear, LinearConfig,
-    },
-    optim::{AdamConfig, GradientsParams, Optimizer},
     tensor::{activation::relu, backend::Backend, Tensor, TensorData},
 };
-use burn_ndarray::NdArrayDevice;
+use burn_autodiff::Autodiff;
+use burn_ndarray::{NdArray, NdArrayDevice};
+use burn_nn::{
+    loss::{MseLoss, Reduction},
+    Linear, LinearConfig,
+};
+use burn_optim::{AdamConfig, GradientsParams, Optimizer};
 use burn_store::{BurnpackStore, ModuleSnapshot};
 pub use hft_research_manifest::mlp_training::{
     MlpConvergenceDiagnosticsV1, MlpConvergencePolicyV1, MlpConvergenceStatusV1,
