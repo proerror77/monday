@@ -7234,7 +7234,7 @@ pub(crate) mod tests {
                 .compression_method(zip::CompressionMethod::Deflated);
             for index in 0..source.len() {
                 let mut entry = source.by_index(index).unwrap();
-                let name = entry.name().to_string();
+                let name = entry.name().unwrap().into_owned();
                 if mutation == 0 && name == block_entry {
                     continue;
                 }
@@ -9208,7 +9208,7 @@ pub(crate) mod tests {
             let mut entry = archive.by_index(index).unwrap();
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes).unwrap();
-            entries.insert(entry.name().to_string(), bytes);
+            entries.insert(entry.name().unwrap().into_owned(), bytes);
         }
         mutate(&mut entries);
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));

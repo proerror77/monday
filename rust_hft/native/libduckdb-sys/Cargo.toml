@@ -150,6 +150,6 @@ optional = true
 
 [build-dependencies.zip]
 optional = true
-version = "6"
+version = "9.0.5"
 features = ["deflate"]
 default-features = false

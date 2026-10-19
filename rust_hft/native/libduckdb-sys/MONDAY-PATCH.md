@@ -12,8 +12,9 @@ compilation do not compile these dependencies. Set both the feature and
 feature, that environment variable fails with an actionable error.
 Bundled mode retains precedence over the download environment variable.
 
-The owning research-core and data-pipelines manifests select this patch.
-Prediction keeps its distinct locked upstream version.
+The research-core, data-pipelines, and prediction-markets manifests select this patch.
+The optional downloader uses zip 9.0.5 or later, including the extraction fixes
+for RUSTSEC-2026-0367, RUSTSEC-2026-0368, and RUSTSEC-2026-0369.
 The native cache identity binds every patch file, features, dependency checksums,
 compiler, ABI, flags and profiles. Only this exact native path is retained during
 cache cleanup. Application path dependencies are still removed.

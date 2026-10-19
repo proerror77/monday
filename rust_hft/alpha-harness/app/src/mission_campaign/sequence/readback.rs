@@ -145,7 +145,7 @@ pub(crate) fn verify_artifact_inventory(
     let mut actual = BTreeSet::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        if entry.is_dir() || !actual.insert(entry.name().to_owned()) {
+        if entry.is_dir() || !actual.insert(entry.name()?.into_owned()) {
             bail!("unexpected sequence archive entry");
         }
     }
