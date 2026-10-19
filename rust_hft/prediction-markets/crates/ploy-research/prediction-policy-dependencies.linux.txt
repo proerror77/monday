@@ -1,9 +1,9 @@
 prediction-policy-dependencies.v6
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:3a889c1998e3299569e681db3b0fea5e2ccdd2bdb2e5b436e2e8c1ff5ea8cf97
-input:Cargo.toml=sha256:a19d33379eee9a01a9a151f6a7a53997447ae5422895ee846d6b23b43a01be81
-input:crates/ploy-research/Cargo.toml=sha256:8e05407a5cfc3d7f37bf9af6f275e4163074df02cd346ccd32af76cca4b6d54b
+input:Cargo.lock=sha256:689c4ddaba3c03d8af41eed1af2b3383ff989ad21c46d2b183833b50f5b8cca5
+input:Cargo.toml=sha256:eafe138aea00a7e67911d22d9a01955c5ea2f8b2e3a02d56f24ed26ae5b002b7
+input:crates/ploy-research/Cargo.toml=sha256:210df4f9ff6bc0959fa130706ae889b8f504b14cac152c116f743f55ce489c16
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
 input:crates/ploy-market-data/Cargo.toml=sha256:e6938c0663c42a96546dae42ddfb1751f66bb92ec78f3bd82d4958885429a6e5
@@ -16,7 +16,7 @@ input:../risk-control/oms-core/Cargo.toml=sha256:62ddf714dfdd4870c2dd2b194ebaa61
 input:../risk-control/portfolio-core/Cargo.toml=sha256:7aa5c2f8524cf8007bb84733a2d90280915a74f74ba22020a42745360629c2fe
 input:../shared/Cargo.toml=sha256:acc7f47aecfd4f37350958bee832cc13a99ba75431574859ed2fc8b2d5259a0c
 input:../data-pipelines/Cargo.toml=sha256:fd3d96e893d4af02bc1d6a1e8b2dc132b785738ae344a7f2101c41856c431415
-input:../research-core/Cargo.toml=sha256:df9d5a0a6e16012d6e7dfa1f51b1dd119a7c190cabec2866beb28c3c0db0fb82
+input:../research-core/Cargo.toml=sha256:459f933f74c66597b8595355148f38c8b4b5fe19773b3c2f5df5132e1234e1a7
 input:../runtime/Cargo.toml=sha256:11b6cae8ef4fe0019c778a0767016b4cfc0c92fb30e0bea5f051e00522a52cbf
 input:../research-core/search-kernel/Cargo.toml=sha256:d5a4731c11fce22c0e358097bd38fb05a674659ac2afbd7c72112285093bdec6
 input:../research-core/manifest/Cargo.toml=sha256:4f363d2986d847f42cf4191bcb0bafe09af97a173a1fea5f81354ae217bcd1dc

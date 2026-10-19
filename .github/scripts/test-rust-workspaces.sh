@@ -57,7 +57,7 @@ check_cex_products() {
   cargo tree --manifest-path "$root/rust_hft/data-pipelines/Cargo.toml" \
     -p hft-cex-data-preparation --locked --edges normal --prefix none --color never \
     --format '{p}|{f}|' >"$work/cex-preparation.tree"
-  if grep -Eq '^(alpha-|burn |ort |hft-(research-platform|research-dispatch-io|research-ml|cex-research-worker|execution-adapter-[a-z-]+) )' "$work/cex-preparation.tree"; then
+  if grep -Eq '^(alpha-|burn(-[a-z-]+)? |ort |hft-(research-platform|research-dispatch-io|research-ml|cex-research-worker|execution-adapter-[a-z-]+) )' "$work/cex-preparation.tree"; then
     cex_graph_failure 'data preparation must exclude research execution, scheduling and trading' "$work/cex-preparation.tree"
   fi
 
@@ -73,8 +73,13 @@ check_cex_products() {
   if ! grep -q '^hft-research-ml ' "$work/cex-worker.tree"; then
     cex_graph_failure 'worker must include hft-research-ml' "$work/cex-worker.tree"
   fi
-  if ! grep -q '^burn ' "$work/cex-worker.tree"; then
-    cex_graph_failure 'worker must include Burn' "$work/cex-worker.tree"
+  for package in burn-core burn-autodiff burn-ndarray burn-nn burn-optim; do
+    if ! grep -q "^$package " "$work/cex-worker.tree"; then
+      cex_graph_failure "worker must include $package" "$work/cex-worker.tree"
+    fi
+  done
+  if grep -Eq '^burn(-candle|-cuda|-rocm|-wgpu|-router)? ' "$work/cex-worker.tree"; then
+    cex_graph_failure 'worker must use direct CPU components without the backend facade' "$work/cex-worker.tree"
   fi
   check_cex_feature worker "$work/cex-worker.tree" alpha-harness scientific enabled
   check_cex_feature worker "$work/cex-worker.tree" alpha-engine kernel enabled
@@ -133,9 +138,15 @@ for profile in default db full; do
     echo 'prediction research pulls the CEX input, evaluator or control chain' >&2; exit 1
   fi
   # Prove the full graph includes science and export, beyond the db-only graph.
-  if [[ $profile == full ]] &&
-    { ! grep -q '^burn ' "$work/prediction.tree" || ! grep -q '^polars ' "$work/prediction.tree"; }; then
-    echo 'prediction full graph is missing training or columnar export dependencies' >&2; exit 1
+  if [[ $profile == full ]]; then
+    for package in burn-core burn-autodiff burn-ndarray burn-nn burn-optim polars; do
+      if ! grep -q "^$package " "$work/prediction.tree"; then
+        echo "prediction full graph is missing $package" >&2; exit 1
+      fi
+    done
+    if grep -Eq '^burn(-candle|-cuda|-rocm|-wgpu|-router)? ' "$work/prediction.tree"; then
+      echo 'prediction training must use direct CPU components' >&2; exit 1
+    fi
   fi
 done
 for profile in default researcher-verification control,gateway,publisher,researcher-verification; do
@@ -170,7 +181,7 @@ fi
 for features in formula-strategy,binance full; do
   cargo tree --manifest-path "$root/rust_hft/runtime/Cargo.toml" -p hft-live \
     --no-default-features --features "$features" --locked --edges normal --prefix none >"$work/live.tree"
-  if grep -E '^(alpha-(domain|engine|store|onnx-evaluator|harness) |burn |hft-(collector|research-platform|research-ml) )' "$work/live.tree"; then
+  if grep -E '^(alpha-(domain|engine|store|onnx-evaluator|harness) |burn(-[a-z-]+)? |hft-(collector|research-platform|research-ml) )' "$work/live.tree"; then
     echo 'live imports research control, evaluation or training' >&2; exit 1
   fi
 done
@@ -179,7 +190,7 @@ for selection in 'data-pipelines/Cargo.toml hft-collector' 'data-pipelines/Cargo
   read -r manifest package <<<"$selection"
   cargo tree --manifest-path "$root/rust_hft/$manifest" -p "$package" \
     --locked --edges normal --prefix none >"$work/depth.tree"
-  if grep -E '^(hft-engine |alpha-(domain|engine|onnx-evaluator|harness) |burn |ort |hft-(research-ml|research-platform|execution-adapter-[a-z-]+) )' "$work/depth.tree"; then
+  if grep -E '^(hft-engine |alpha-(domain|engine|onnx-evaluator|harness) |burn(-[a-z-]+)? |ort |hft-(research-ml|research-platform|execution-adapter-[a-z-]+) )' "$work/depth.tree"; then
     echo 'depth acquisition imports runtime engine, science or execution authority' >&2; exit 1
   fi
 done
@@ -201,7 +212,7 @@ for package in hft-research-artifacts hft-research-dispatch-io hft-prediction-re
   case $package in hft-research-artifacts|hft-research-dispatch-io) owner=shared ;; *) owner=prediction-markets ;; esac
   cargo tree --manifest-path "$root/rust_hft/$owner/Cargo.toml" \
     -p "$package" --locked --edges normal --prefix none >"$work/worker.tree"
-  if grep -E '^(alpha-(domain|engine|harness|onnx-evaluator) |burn |ort |hft-(collector|backtest|research-platform|research-ml|execution-adapter-[a-z-]+) )' "$work/worker.tree"; then
+  if grep -E '^(alpha-(domain|engine|harness|onnx-evaluator) |burn(-[a-z-]+)? |ort |hft-(collector|backtest|research-platform|research-ml|execution-adapter-[a-z-]+) )' "$work/worker.tree"; then
     echo 'Prediction/artifact worker imports acquisition, CEX research, control, training or execution' >&2; exit 1
   fi
   if [[ $package == hft-research-artifacts || $package == hft-prediction-research-worker ]] &&
@@ -211,7 +222,7 @@ for package in hft-research-artifacts hft-research-dispatch-io hft-prediction-re
 done
 cargo tree --manifest-path "$root/rust_hft/runtime/Cargo.toml" \
   -p hft-strategy-probability-reversal --locked --edges normal --prefix none >"$work/probability.tree"
-if grep -E '^(alpha-(domain|engine|harness|store|onnx-evaluator) |burn |ort |sqlx-|axum |reqwest |hft-(collector|research-platform|research-ml|execution-adapter-[a-z-]+) )' "$work/probability.tree"; then
+if grep -E '^(alpha-(domain|engine|harness|store|onnx-evaluator) |burn(-[a-z-]+)? |ort |sqlx-|axum |reqwest |hft-(collector|research-platform|research-ml|execution-adapter-[a-z-]+) )' "$work/probability.tree"; then
   echo 'fixed probability strategy imports science, control, transport or execution' >&2; exit 1
 fi
 printf 'workspace ownership, scoped commands, feature rejection and thin closures passed\n'
