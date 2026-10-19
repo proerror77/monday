@@ -3,12 +3,17 @@
 //! `RecordingFeed` wraps any other feed and appends each `MarketUpdate` to an
 //! NDJSON log. `RecordedFeed` replays the exact same update sequence back into
 //! the strategy runtime.
+//! Broadcast gaps mark lifecycle state uncertain for the rest of the recorder
+//! session. Query them by decoding lines as [`RecordedTapeRecord`]. Replay
+//! rejects these tapes instead of treating their missing updates as complete.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -16,6 +21,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
+use super::live::capture_recording_lag;
 use crate::traits::{Feed, MarketUpdate};
 use polymarket_tape_contract::{
     tape_seal_path, MarketTapeManifestBuilder, PolymarketTapeSeal, TapeFileIdentity, TapeQuote,
@@ -143,6 +149,28 @@ pub struct RecordedMarketUpdate {
     pub update: MarketUpdate,
 }
 
+/// Tape integrity evidence. A broadcast gap may contain lifecycle updates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecordedGap {
+    BroadcastLag {
+        /// Cumulative session skips observed when this marker was written.
+        skipped_updates: u64,
+    },
+}
+
+/// One tape line. Gap markers are metadata, never fabricated market updates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RecordedTapeRecord {
+    Update(RecordedMarketUpdate),
+    Gap {
+        sequence: u64,
+        recorded_at: DateTime<Utc>,
+        gap: RecordedGap,
+    },
+}
+
 #[derive(Serialize)]
 struct BorrowedRecord<'a> {
     sequence: u64,
@@ -168,6 +196,12 @@ enum AppendOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecordedFeedError {
+    #[error("market-update log {path} has a broadcast gap at sequence {sequence}: {skipped_updates} skipped updates; lifecycle state is uncertain")]
+    Gap {
+        path: PathBuf,
+        sequence: u64,
+        skipped_updates: u64,
+    },
     #[error("failed to open market-update log {path}: {source}")]
     Open {
         path: PathBuf,
@@ -203,6 +237,8 @@ struct MarketUpdateLogWriter {
     seal_builder: Option<MarketTapeManifestBuilder>,
     line_buffer: Vec<u8>,
     last_cache_advice_bytes: u64,
+    skipped_updates: u64,
+    gap_recorded: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -371,7 +407,36 @@ impl MarketUpdateLogWriter {
             seal_builder: seal_policy.map(|_| MarketTapeManifestBuilder::new()),
             line_buffer: Vec::with_capacity(4096),
             last_cache_advice_bytes: 0,
+            skipped_updates: 0,
+            gap_recorded: false,
         })
+    }
+
+    fn append_gap(&mut self, skipped_updates: u64) -> io::Result<()> {
+        self.skipped_updates = self.skipped_updates.saturating_add(skipped_updates);
+        // One marker already marks this whole tape uncertain. Bound metadata
+        // even when repeated lag leaves every resumed quote ineligible.
+        if self.gap_recorded {
+            return Ok(());
+        }
+        let record = RecordedTapeRecord::Gap {
+            sequence: self.next_sequence,
+            recorded_at: Utc::now(),
+            gap: RecordedGap::BroadcastLag {
+                skipped_updates: self.skipped_updates,
+            },
+        };
+        self.line_buffer.clear();
+        serde_json::to_writer(&mut self.line_buffer, &record).map_err(io::Error::other)?;
+        self.line_buffer.push(b'\n');
+        // Integrity evidence must survive filters and data limits. Never seal
+        // a tape with uncertain lifecycle state as a complete market dataset.
+        self.seal_builder = None;
+        self.writer.write_all(&self.line_buffer)?;
+        self.bytes_written += u64::try_from(self.line_buffer.len()).unwrap_or(u64::MAX);
+        self.next_sequence += 1;
+        self.gap_recorded = true;
+        self.flush()
     }
 
     fn append(&mut self, update: &MarketUpdate) -> io::Result<AppendOutcome> {
@@ -571,6 +636,11 @@ impl MarketUpdateLogWriter {
             }
         }
         self.seal_builder = self.seal_policy.map(|_| MarketTapeManifestBuilder::new());
+        self.gap_recorded = false;
+        if self.skipped_updates > 0 {
+            // Rotation cannot recover a discovery or expiry that the ring lost.
+            self.append_gap(0)?;
+        }
         info!(
             active = %self.path.display(),
             rotated = %rotated.display(),
@@ -602,6 +672,7 @@ pub struct RecordingFeed<F> {
     quote_token_end_times: HashMap<String, DateTime<Utc>>,
     active_event_updates: HashMap<String, MarketUpdate>,
     pending_failed_quote_tokens: HashMap<String, DateTime<Utc>>,
+    pending_skipped_updates: Arc<AtomicU64>,
 }
 
 impl<F> RecordingFeed<F> {
@@ -648,6 +719,7 @@ impl<F> RecordingFeed<F> {
             quote_token_end_times: HashMap::new(),
             active_event_updates: HashMap::new(),
             pending_failed_quote_tokens: HashMap::new(),
+            pending_skipped_updates: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -789,13 +861,44 @@ impl<F> RecordingFeed<F> {
     }
 }
 
+impl<F> Drop for RecordingFeed<F> {
+    fn drop(&mut self) {
+        // A cancelled poll may have observed lag before returning an update.
+        let skipped_updates = self.pending_skipped_updates.swap(0, Ordering::Relaxed);
+        if skipped_updates > 0 {
+            if let Some(writer) = self.writer.as_mut() {
+                if let Err(error) = writer.append_gap(skipped_updates) {
+                    error!(error = %error, "Could not persist broadcast gap on recorder drop");
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl<F> Feed for RecordingFeed<F>
 where
     F: Feed,
 {
     async fn next(&mut self) -> Option<MarketUpdate> {
-        let update = self.inner.next().await?;
+        let update =
+            capture_recording_lag(Arc::clone(&self.pending_skipped_updates), self.inner.next())
+                .await;
+        let skipped_updates = self.pending_skipped_updates.swap(0, Ordering::Relaxed);
+        if skipped_updates > 0 {
+            if let Some(writer) = self.writer.as_mut() {
+                if let Err(error) = writer.append_gap(skipped_updates) {
+                    error!(
+                        path = %writer.path.display(),
+                        error = %error,
+                        "Could not persist broadcast gap; closing recording feed",
+                    );
+                    self.writer = None;
+                    return None;
+                }
+            }
+        }
+        let update = update?;
         let rotation_due = self
             .writer
             .as_ref()
@@ -1000,14 +1103,27 @@ impl RecordedFeed {
                 continue;
             }
 
-            let record = serde_json::from_str::<RecordedMarketUpdate>(&line).map_err(|source| {
+            let record = serde_json::from_str::<RecordedTapeRecord>(&line).map_err(|source| {
                 RecordedFeedError::Parse {
                     path: path.clone(),
                     line: idx + 1,
                     source,
                 }
             })?;
-            updates.push_back(record.update);
+            match record {
+                RecordedTapeRecord::Update(record) => updates.push_back(record.update),
+                RecordedTapeRecord::Gap {
+                    sequence,
+                    gap: RecordedGap::BroadcastLag { skipped_updates },
+                    ..
+                } => {
+                    return Err(RecordedFeedError::Gap {
+                        path,
+                        sequence,
+                        skipped_updates,
+                    });
+                }
+            }
         }
 
         info!(
@@ -1399,6 +1515,261 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<RecordedMarketUpdate>(line).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn lag_spanning_event_discovered_writes_gap_marker() {
+        use crate::feed::{LagPolicy, LiveFeed};
+        use tokio::sync::broadcast;
+
+        let now = Utc::now();
+        let (tx, rx) = broadcast::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tape.ndjson");
+        let mut feed = RecordingFeed::with_policy(
+            Box::new(LiveFeed::with_lag_policy(rx, LagPolicy::SkipAndContinue)) as Box<dyn Feed>,
+            &path,
+            RecordingPolicy {
+                include_kinds: vec![RecordingKind::EventDiscovered, RecordingKind::Quote],
+                event_scoped_quotes: true,
+                ..RecordingPolicy::default()
+            },
+        )
+        .unwrap();
+
+        // Overwrite discovery before the recorder polls the real broadcast ring.
+        tx.send(MarketUpdate::EventDiscovered {
+            event_id: "missed".into(),
+            symbol: "BTCUSDT".into(),
+            up_token: "missed-up".into(),
+            down_token: "missed-down".into(),
+            end_time: now + Duration::minutes(5),
+            window_secs: 300,
+            price_to_beat: Some(dec!(100000)),
+            resolved_up_won: None,
+        })
+        .unwrap();
+        let quote = MarketUpdate::Quote {
+            token_id: "missed-up".into(),
+            bid: Some(dec!(0.49)),
+            ask: Some(dec!(0.51)),
+            bid_size: Some(dec!(10)),
+            ask_size: Some(dec!(11)),
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            ts: now + Duration::seconds(1),
+        };
+        tx.send(quote.clone()).unwrap();
+        assert_eq!(feed.next().await, Some(quote));
+        assert!(feed.active_event_updates.is_empty());
+        assert!(feed.event_tokens.is_empty());
+        assert!(feed.quote_token_end_times.is_empty());
+
+        // Integrity markers must be visible even when the resumed quote is filtered.
+        let tape = fs::read_to_string(&path).unwrap();
+        let records: Vec<serde_json::Value> = tape
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1, "lag must leave an explicit tape marker");
+        assert_eq!(records[0]["sequence"], 0);
+        assert_eq!(records[0]["gap"]["kind"], "broadcast_lag");
+        assert_eq!(records[0]["gap"]["skipped_updates"], 1);
+        // More lag must not grow an otherwise empty, filtered tape without bound.
+        for _ in 0..3 {
+            for _ in 0..2 {
+                tx.send(MarketUpdate::Quote {
+                    token_id: "missed-up".into(),
+                    bid: None,
+                    ask: None,
+                    bid_size: None,
+                    ask_size: None,
+                    bid_levels: Vec::new(),
+                    ask_levels: Vec::new(),
+                    ts: now + Duration::seconds(2),
+                })
+                .unwrap();
+            }
+            assert!(feed.next().await.is_some());
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), tape);
+        assert_eq!(feed.writer.as_ref().unwrap().skipped_updates, 4);
+        let typed: RecordedTapeRecord = serde_json::from_str(tape.lines().next().unwrap()).unwrap();
+        assert!(matches!(
+            typed,
+            RecordedTapeRecord::Gap {
+                sequence: 0,
+                gap: RecordedGap::BroadcastLag { skipped_updates: 1 },
+                ..
+            }
+        ));
+        assert!(matches!(
+            RecordedFeed::from_path(&path),
+            Err(RecordedFeedError::Gap {
+                sequence: 0,
+                skipped_updates: 1,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn lag_gap_marker_survives_time_and_size_rotation() {
+        use crate::feed::{LagPolicy, LiveFeed};
+        use tokio::sync::broadcast;
+
+        for rotate_on_limit in [false, true] {
+            let now = Utc::now();
+            let (tx, rx) = broadcast::channel(1);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("market-updates.ndjson");
+            let mut feed = RecordingFeed::with_policy(
+                LiveFeed::with_lag_policy(rx, LagPolicy::SkipAndContinue),
+                &path,
+                RecordingPolicy {
+                    rotate_seconds: Some(3600),
+                    rotate_on_limit,
+                    limits: RecordingLimits {
+                        max_records: rotate_on_limit.then_some(2),
+                        max_bytes: None,
+                    },
+                    event_scoped_quotes: true,
+                    ..RecordingPolicy::default()
+                },
+            )
+            .unwrap();
+            tx.send(MarketUpdate::EventDiscovered {
+                event_id: "missed".into(),
+                symbol: "BTCUSDT".into(),
+                up_token: "missed-up".into(),
+                down_token: "missed-down".into(),
+                end_time: now + Duration::minutes(5),
+                window_secs: 300,
+                price_to_beat: None,
+                resolved_up_won: None,
+            })
+            .unwrap();
+            let resumed = MarketUpdate::SpotPrice {
+                symbol: "BTCUSDT".into(),
+                price: dec!(100000),
+                ts: now,
+            };
+            tx.send(resumed.clone()).unwrap();
+            assert_eq!(feed.next().await, Some(resumed.clone()));
+            if !rotate_on_limit {
+                let writer = feed.writer.as_mut().unwrap();
+                writer.rotation_bucket = writer.rotation_bucket.map(|bucket| bucket - 1);
+            }
+            tx.send(resumed.clone()).unwrap();
+            assert_eq!(feed.next().await, Some(resumed.clone()));
+            assert!(feed.writer.as_ref().unwrap().seal_builder.is_none());
+            drop(feed);
+
+            let rotated = rotated_tapes_for(&path);
+            assert_eq!(rotated.len(), 1);
+            assert!(!tape_seal_path(&rotated[0]).unwrap().exists());
+            for tape in [&rotated[0], &path] {
+                let records: Vec<RecordedTapeRecord> = fs::read_to_string(tape)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(records.len(), 2);
+                assert!(matches!(
+                    records[0],
+                    RecordedTapeRecord::Gap {
+                        sequence: 0,
+                        gap: RecordedGap::BroadcastLag { skipped_updates: 1 },
+                        ..
+                    }
+                ));
+                assert!(
+                    matches!(&records[1], RecordedTapeRecord::Update(record) if record.sequence == 1 && record.update == resumed)
+                );
+                assert!(matches!(
+                    RecordedFeed::from_path(tape),
+                    Err(RecordedFeedError::Gap { .. })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gap_marker_write_failure_closes_recorder() {
+        use crate::feed::{LagPolicy, LiveFeed};
+        use tokio::sync::broadcast;
+
+        let (tx, rx) = broadcast::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tape.ndjson");
+        let mut feed = RecordingFeed::new(
+            LiveFeed::with_lag_policy(rx, LagPolicy::SkipAndContinue),
+            &path,
+        )
+        .unwrap();
+        // A read-only file makes the mandatory marker write fail on every host.
+        feed.writer.as_mut().unwrap().writer = BufWriter::new(File::open(&path).unwrap());
+        for price in [dec!(100000), dec!(100001)] {
+            tx.send(MarketUpdate::SpotPrice {
+                symbol: "BTCUSDT".into(),
+                price,
+                ts: Utc::now(),
+            })
+            .unwrap();
+        }
+        assert!(feed.next().await.is_none());
+        assert!(feed.writer.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_lagged_poll_preserves_gap_marker_on_drop() {
+        use crate::feed::{LagPolicy, LiveFeed};
+        use tokio::sync::broadcast;
+
+        struct PendingAfterLive(LiveFeed);
+        #[async_trait]
+        impl Feed for PendingAfterLive {
+            async fn next(&mut self) -> Option<MarketUpdate> {
+                let _ = self.0.next().await;
+                std::future::pending().await
+            }
+        }
+
+        let (tx, rx) = broadcast::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tape.ndjson");
+        let mut feed = RecordingFeed::new(
+            PendingAfterLive(LiveFeed::with_lag_policy(rx, LagPolicy::SkipAndContinue)),
+            &path,
+        )
+        .unwrap();
+        for price in [dec!(100000), dec!(100001)] {
+            tx.send(MarketUpdate::SpotPrice {
+                symbol: "BTCUSDT".into(),
+                price,
+                ts: Utc::now(),
+            })
+            .unwrap();
+        }
+        {
+            let mut next = Box::pin(feed.next());
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(next.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(feed.pending_skipped_updates.load(Ordering::Relaxed), 1);
+        drop(feed);
+        let tape = fs::read_to_string(&path).unwrap();
+        let record: RecordedTapeRecord = serde_json::from_str(tape.trim()).unwrap();
+        assert!(matches!(
+            record,
+            RecordedTapeRecord::Gap {
+                gap: RecordedGap::BroadcastLag { skipped_updates: 1 },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
