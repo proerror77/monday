@@ -173,10 +173,7 @@ jobs:
       - name: Verify collector release shell contracts
         working-directory: rust_hft
         run: |
-          for script in ../deployment/aliyun/*.sh; do
-            bash -n "$script"
-          done
-          shellcheck ../deployment/aliyun/*.sh
+          bash ../.github/scripts/check-collector-shells.sh
           bash ../.github/scripts/run-collector-control-contracts.sh
 
   monitor_contracts:
