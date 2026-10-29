@@ -135,3 +135,7 @@ CI jobs and the applicable production gate.
 - [Prediction-market module](rust_hft/prediction-markets/README.md)
 
 DuckDB is the local research control-plane source of truth. Raw and large derived market data belongs in content-addressed trace/Parquet artifacts; ClickHouse is optional analytics storage, not control-plane authority.
+
+## Optional local Blaze experiment
+
+See [Blaze local development](docs/blaze-local-development.md) for scoped commands and comparison steps.
