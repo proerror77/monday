@@ -66,7 +66,7 @@ Engine tests cover old timestamps, train-only fitting under validation-label mut
 
 July objects now return 404 and are excluded. The technical candidate is BTCUSDT in two adjacent USD-M LOB/trade segments, 2026-10-10 05:00–05:10 UTC. Metadata declares checkpoint/trade coverage/stream continuity. Actual byte hashes and native replay remain unverified. Ten minutes can exercise the chain; it cannot establish statistical validity.
 
-The release catalog and CEX Dockerfile now prepare a separate offline-diagnostic recipe and binary. The shared alpha-harness/Controller recipe remains unchanged; the existing native release recipe uses Cargo default features plus offline-diagnostic, unlike the local no-default build. PR release transport/ABI/smoke evidence does not issue a signed Build: current-main CI, ACR/OSS publication and independent ACK import still apply. The public repository policy currently lacks oss_by_product; that configuration remains with its existing owner.
+`monday-offline-baseline` has no production release-catalog recipe and is absent from the CEX image. Build it locally with the explicit no-default-features recipe above. Local build and smoke evidence do not issue a signed Build or authorize an ACK run; publication and compute admission remain separate prerequisites.
 
 The designated existing ECS worker is stopped in StopCharging mode; stale ACK inventory is not readiness proof. A new scoped effective lease, verified Build, readiness and any separately approved bounded worker start/stop remain prerequisites. RMB10 is a requested ceiling, not a proven billing enforcer. The old H1 184/184 ledger and sealed views remain untouched. Source preservation has separate approval.
 
